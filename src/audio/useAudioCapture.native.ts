@@ -13,7 +13,8 @@ export function useAudioCapture(): AudioCapture {
   const [meter, setMeter] = useState<number[]>(Array.from({ length: 37 }, () => 0.08));
   const [hasPending, setHasPending] = useState(false);
   const activeCapture = useRef(false);
-  const pending = useRef<{ uri: string; durationSeconds: number } | null>(null);
+  const pending = useRef<{ uri: string; durationSeconds: number; capturedAt: string; captureTimeZone: string } | null>(null);
+  const captureAnchor = useRef<{ capturedAt: string; captureTimeZone: string } | null>(null);
 
   useEffect(() => {
     if (status !== 'recording' || recording.metering === undefined) return;
@@ -33,6 +34,7 @@ export function useAudioCapture(): AudioCapture {
       await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true, shouldPlayInBackground: false });
       await recorder.prepareToRecordAsync();
       recorder.record();
+      captureAnchor.current = { capturedAt: new Date().toISOString(), captureTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC' };
       activeCapture.current = true;
       setElapsed(0); setStatus('recording');
     } catch (e) {
@@ -51,7 +53,7 @@ export function useAudioCapture(): AudioCapture {
       await recorder.stop();
       const uri = recorder.getStatus().url;
       if (!uri) throw new Error('The device did not finish writing the recording. Your saved notes were not changed.');
-      pending.current = { uri, durationSeconds };
+      pending.current = { uri, durationSeconds, ...(captureAnchor.current ?? { capturedAt: new Date().toISOString(), captureTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC' }) };
       setHasPending(true);
       activeCapture.current = false;
       setStatus('idle');
@@ -60,7 +62,7 @@ export function useAudioCapture(): AudioCapture {
     } catch (e) {
       const partialUri = recorder.getStatus().url;
       if (partialUri) {
-        pending.current = { uri: partialUri, durationSeconds };
+        pending.current = { uri: partialUri, durationSeconds, ...(captureAnchor.current ?? { capturedAt: new Date().toISOString(), captureTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC' }) };
         setHasPending(true);
         activeCapture.current = false;
         setStatus('idle');
@@ -79,11 +81,11 @@ export function useAudioCapture(): AudioCapture {
       uri = recorder.getStatus().url ?? undefined;
     }
     if (uri) await FileSystem.deleteAsync(uri, { idempotent: true });
-    pending.current = null; setHasPending(false); activeCapture.current = false;
+    pending.current = null; captureAnchor.current = null; setHasPending(false); activeCapture.current = false;
     await setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true }).catch(() => undefined);
     setElapsed(0); setStatus('idle'); setError('');
   }, [recorder]);
-  const commit = useCallback((uri: string) => { if (pending.current?.uri === uri) { pending.current = null; setHasPending(false); } }, []);
+  const commit = useCallback((uri: string) => { if (pending.current?.uri === uri) { pending.current = null; captureAnchor.current = null; setHasPending(false); } }, []);
   const play = useCallback(async (uri: string) => {
     player.replace(uri); player.play();
   }, [player]);

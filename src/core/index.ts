@@ -1,8 +1,52 @@
 /** Stable application contracts shared by the UI, services, and storage. */
+import type { AssistantCitation, AssistantDecision } from '../assistant';
 
 export type NoteStatus = 'recorded' | 'processed' | 'error';
 export type ProposalKind = 'task' | 'reminder' | 'email' | 'event' | 'memory';
 export type ProposalStatus = 'draft' | 'approved' | 'dispatching' | 'unknown' | 'failed' | 'accepted' | 'simulated' | 'executed' | 'dismissed';
+export type AssistIntent = 'assist' | 'summarize' | 'answer' | 'extract';
+
+export type AssistCitation = AssistantCitation;
+export type AssistDecision = AssistantDecision;
+
+export interface NoteAssistResult {
+  noteId: string;
+  sourceRevision: number;
+  intent: AssistIntent;
+  question?: string;
+  fingerprint: string;
+  analyzedAt: string;
+  capturedAt: string;
+  captureTimeZone: string;
+  summary: string;
+  answer: string;
+  decisions: AssistDecision[];
+  citations: AssistCitation[];
+  clarifications: string[];
+  proposalIds: string[];
+  source: 'provider' | 'offline_preview';
+  includedSourceIds: string[];
+  includedSources: { id: string; title: string; excerpt?: string }[];
+  omittedSourceIds: string[];
+  omittedSourceCount: number;
+  sourceVersions: Record<string, string>;
+  answeredAsOf?: string;
+  answerTimeZone?: string;
+  stale?: boolean;
+}
+
+export interface LocalTask {
+  id: string;
+  title: string;
+  body: string;
+  status: 'open' | 'completed';
+  createdAt: string;
+  completedAt?: string;
+  dueAt?: string;
+  sourceNoteId: string;
+  sourceRevision: number;
+  proposalId: string;
+}
 
 export interface Note {
   id: string;
@@ -11,11 +55,14 @@ export interface Note {
   audioUri?: string;
   durationSeconds: number;
   createdAt: string;
+  capturedAt?: string;
   status: NoteStatus;
   /** Increments whenever the transcript changes; approvals bind to this source revision. */
   revision: number;
   /** Persisted identity of the last analysis inputs, so retries/reloads do not repeat paid calls. */
   processingFingerprint?: string;
+  captureTimeZone?: string;
+  analysis?: NoteAssistResult;
 }
 
 export interface ProposalEvidence {
@@ -24,6 +71,30 @@ export interface ProposalEvidence {
   end?: number;
   confidence?: number;
   source?: string;
+}
+
+export interface ProposalSourceProvenance {
+  sourceId: string;
+  revision: number;
+  sourceVersion: string;
+}
+
+/** Immutable analysis dependencies captured when this individual proposal was created. */
+export interface ProposalProvenance {
+  version: 1;
+  assistContractVersion: string;
+  analysisFingerprint: string;
+  noteId: string;
+  noteRevision: number;
+  capturedAt: string;
+  captureTimeZone: string;
+  intent: AssistIntent;
+  question?: string;
+  sources: ProposalSourceProvenance[];
+  policySources: ProposalSourceProvenance[];
+  settingsFingerprint: string;
+  answeredAsOf?: string;
+  expiresAt?: string;
 }
 
 export interface Proposal {
@@ -41,6 +112,12 @@ export interface Proposal {
   notificationRevision?: number;
   /** Stable idempotency key for provider event creation, persisted before dispatch. */
   eventTransactionId?: string;
+  /** Stable same-source action identity used to prevent reprocessing from resurrecting consumed suggestions. */
+  sourceActionKey?: string;
+  provenance?: ProposalProvenance;
+  requiresRebuild?: boolean;
+  /** Synchronous canonical dependency snapshot rechecked after connector preparation and before fetch. */
+  dispatchDependencyProjection?: string;
   accountId?: string;
   recipients: string[];
   calendarId?: string;
@@ -203,6 +280,8 @@ export interface AppSettings {
   openAiDeployment?: string;
   model?: string;
   maxContextTokens: number;
+  /** Hard serialized request-body size limit in UTF-8 bytes; token counts remain estimates. */
+  maxRequestBytes: number;
   maxOutputTokens: number;
   monthlyBudgetUsd: number;
   reasoningEffort: 'none' | 'low';
@@ -235,6 +314,7 @@ export interface UsageLedger {
 export interface AppState {
   notes: Note[];
   proposals: Proposal[];
+  tasks: LocalTask[];
   accounts: Account[];
   calendars: Calendar[];
   documents: ContextDocument[];
@@ -244,12 +324,17 @@ export interface AppState {
   mailbox: MailboxSnapshotMessage[];
   calendarEvents: CalendarEventSnapshot[];
   syncStates: Record<string, AccountSyncState>;
+  /** Opaque refs only; internal cleanup bookkeeping excluded from user export. */
+  pendingCredentialCleanup: { tokenRef: string; reason: 'replaced' | 'disconnected' | 'orphan'; createdAt: string; lastError?: string }[];
 }
 
 export interface SaveNoteInput {
   transcript: string;
   audioUri?: string;
   durationSeconds?: number;
+  /** Recording start timestamp when available; otherwise the note save time is used. */
+  capturedAt?: string;
+  captureTimeZone?: string;
 }
 
 export type ProposalPatch = Partial<Pick<Proposal,
@@ -281,15 +366,21 @@ export interface AppController {
   saveNote(input: SaveNoteInput): Promise<Note>;
   updateTranscript(id: string, text: string): Promise<Note>;
   processNote(id: string): Promise<Proposal[]>;
+  assistNote(id: string, options?: { intent?: AssistIntent; question?: string; forceRefresh?: boolean }): Promise<NoteAssistResult>;
+  refreshAnalysisStatus(noteId: string): Promise<NoteAssistResult | undefined>;
+  checkProposalFreshness(id: string): Promise<{ current: boolean; reason?: string }>;
   transcribeNote(id: string): Promise<Note>;
   editProposal(id: string, patch: ProposalPatch): Promise<Proposal>;
   approveProposal(id: string): Promise<Proposal>;
   executeProposal(id: string): Promise<Proposal>;
   dismissProposal(id: string): Promise<Proposal>;
+  completeTask(id: string): Promise<LocalTask>;
+  reopenTask(id: string): Promise<LocalTask>;
   saveDocument(path: string, content: string): Promise<ContextDocument>;
   saveSettings(patch: SettingsPatch): Promise<AppSettings>;
   saveAccount(config: AccountConfig): Promise<Account>;
-  installVerifiedAccount(config: AccountConfig, result: OAuthInstallResult, tokenRef: string): Promise<Account>;
+  installVerifiedAccount(config: AccountConfig, result: OAuthInstallResult): Promise<Account>;
+  retryCredentialCleanup(): Promise<void>;
   disconnectAccount(id: string): Promise<Account>;
   saveCalendar(config: CalendarConfig): Promise<Calendar>;
   syncAccount(id: string, options?: { continue?: boolean }): Promise<AccountSyncState>;

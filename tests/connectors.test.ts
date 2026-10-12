@@ -382,7 +382,10 @@ describe('provider connector clients', () => {
     const fetcherMock = vi.fn(async (url: RequestInfo | URL) => String(url) === 'https://oauth2.googleapis.com/token'
       ? response({ access_token: 'fresh', expires_in: 3600, scope: 'openid' })
       : response({ sub: 'stable-user' }));
-    await expect(exchangeAuthorizationCode({ provider: 'google', clientId: '123.apps.googleusercontent.com', redirectUri: 'com.googleusercontent.apps.123:/oauthredirect', requestedCapabilities: [] },
-      { authorizationCode: 'code', codeVerifier: 'A'.repeat(43), requestedScopes: ['openid'] }, { fetcher: fetcherMock as typeof fetch })).resolves.toMatchObject({ result: { identity: { providerNamespace: 'google', clientId: '123.apps.googleusercontent.com' } } });
+    const exchange = await exchangeAuthorizationCode({ provider: 'google', clientId: '123.apps.googleusercontent.com', redirectUri: 'com.googleusercontent.apps.123:/oauthredirect', requestedCapabilities: [] },
+      { authorizationCode: 'code', codeVerifier: 'A'.repeat(43), requestedScopes: ['openid'] }, { fetcher: fetcherMock as typeof fetch });
+    expect(exchange.result.identity).toEqual({ providerNamespace: 'google', clientId: '123.apps.googleusercontent.com', subject: 'stable-user' });
+    expect(exchange.result.refreshToken).toBeUndefined();
+    expect(exchange.token.refreshToken).toBeUndefined();
   });
 });

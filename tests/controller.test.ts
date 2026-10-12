@@ -1,16 +1,20 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { AppState, Proposal } from '../src/core';
 import { AppControllerImpl } from '../src/services/controller';
 import type { StateStore } from '../src/storage/contracts';
 import { AzureOpenAIClient } from '../src/services/azure';
 import { cancelReminderNotification, reminderNotificationId, requestReminderNotification } from '../src/services/notifications';
 import type { OAuthBridgeResult, StoredOAuthToken } from '../src/connectors';
+import { withCredentialLock } from '../src/connectors';
+import * as Crypto from 'expo-crypto';
 
 class MemoryStore implements StateStore {
   value?: AppState;
   failNext = false;
+  saves = 0;
   async load() { return this.value ? structuredClone(this.value) : undefined; }
   async save(state: AppState) {
+    this.saves += 1;
     if (this.failNext) { this.failNext = false; throw new Error('disk full'); }
     this.value = structuredClone(state);
   }
@@ -35,6 +39,26 @@ describe('application state controller', () => {
     expect(fresh.sourceRevision).toBe(app.getSnapshot().notes[0].revision);
   });
 
+  it('rechecks a proposal’s own provenance before review and persists invalidation only when it changes', async () => {
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store);
+    await app.load();
+    const note = await app.saveNote({ transcript: 'I need to buy groceries tomorrow.' });
+    const [proposal] = await app.processNote(note.id);
+    await app.approveProposal(proposal.id);
+    await app.saveDocument('memory/RULES.md', 'Never create reminders without a time.');
+    const stale = await app.checkProposalFreshness(proposal.id);
+    expect(stale).toMatchObject({ current: false });
+    expect(app.getSnapshot().proposals.find((item) => item.id === proposal.id)).toMatchObject({
+      status: 'draft', requiresRebuild: true, approvedPayloadDigest: undefined,
+    });
+    const saveCount = store.saves;
+    const repeated = await app.checkProposalFreshness(proposal.id);
+    expect(repeated.current).toBe(false);
+    expect(store.saves).toBe(saveCount);
+    await expect(app.approveProposal(proposal.id)).rejects.toThrow(/run assist again/i);
+  });
+
   it('persists locally and reloads a saved note', async () => {
     const store = new MemoryStore();
     const first = new AppControllerImpl(store);
@@ -49,7 +73,7 @@ describe('application state controller', () => {
     const store = new MemoryStore();
     const identity = { providerNamespace: 'google' as const, clientId: 'google-client', subject: 'provider-subject' };
     const token: StoredOAuthToken = { accessToken: 'test-access', expiresAt: Date.now() + 600_000, identity };
-    const tokenStore = { async get(ref: string) { return ref === 'secure-ref' ? structuredClone(token) : null; }, async set() {} };
+    const tokenStore = { async get() { return structuredClone(token); }, async set() {} };
     const result: OAuthBridgeResult = {
       provider: 'google', accessToken: token.accessToken, expiresAt: token.expiresAt,
       grantedScopes: ['openid', 'https://www.googleapis.com/auth/gmail.readonly'],
@@ -78,7 +102,7 @@ describe('application state controller', () => {
       connectorFactory: () => connector as never,
     });
     await app.load();
-    const account = await app.installVerifiedAccount({ provider: 'google', displayName: 'Ignored label', email: 'other@example.com' }, result, 'secure-ref');
+    const account = await app.installVerifiedAccount({ provider: 'google', displayName: 'Ignored label', email: 'other@example.com' }, result);
     expect(account).toMatchObject({ connected: true, authStatus: 'connected', email: 'user@example.com', capabilities: ['mail.read'] });
     const partial = await app.syncAccount(account.id);
     expect(partial).toMatchObject({ status: 'partial', messagesCursor: 'saved-cursor', messagesPartial: true });
@@ -88,6 +112,105 @@ describe('application state controller', () => {
     expect(resumedCursor).toBe('saved-cursor');
     expect(complete).toMatchObject({ status: 'idle', messagesPartial: false });
     expect(app.getSnapshot().mailbox).toHaveLength(1);
+  });
+
+  it('stages OAuth credentials in the controller and durably replaces the prior token only after verification', async () => {
+    const store = new MemoryStore();
+    const identity = { providerNamespace: 'google' as const, clientId: 'google-client', subject: 'staged-subject' };
+    const tokens = new Map<string, StoredOAuthToken>();
+    const deleted: string[] = [];
+    let failDelete = true;
+    let verificationGate: Promise<void> | undefined;
+    let verificationEntered: (() => void) | undefined;
+    const tokenStore = {
+      async get(ref: string) { return tokens.get(ref) ? structuredClone(tokens.get(ref)!) : null; },
+      async set(ref: string, token: StoredOAuthToken) { tokens.set(ref, structuredClone(token)); },
+    };
+    const result: OAuthBridgeResult = {
+      provider: 'google', accessToken: 'first-access', refreshToken: 'long-lived-refresh', expiresAt: Date.now() + 600_000,
+      grantedScopes: ['openid', 'https://www.googleapis.com/auth/gmail.readonly'],
+      requestedCapabilities: ['mail.read'], capabilities: ['mail.read'], identity, displayName: 'Staged User', email: 'staged@example.com',
+    };
+    const app = new AppControllerImpl(store, {}, {
+      tokenStore, deleteToken: async (ref) => {
+        if (failDelete) { failDelete = false; throw new Error('secure store unavailable'); }
+        deleted.push(ref); tokens.delete(ref);
+      },
+      clientIds: { google: 'google-client' }, verifyOAuthResult: async () => {
+        if (verificationGate) { verificationEntered?.(); await verificationGate; verificationGate = undefined; }
+        return true;
+      },
+      connectorFactory: () => ({ async verifyOAuthIdentity() { return true; } }) as never,
+    });
+    await app.load();
+    const first = await app.installVerifiedAccount({ provider: 'google', displayName: '', email: '' }, result);
+    const oldRef = first.tokenRef!;
+    expect(tokens.get(oldRef)?.refreshToken).toBe('long-lived-refresh');
+
+    let refreshLockEntered!: () => void;
+    let releaseRefreshLock!: () => void;
+    const refreshLocked = new Promise<void>((resolve) => { refreshLockEntered = resolve; });
+    const releaseLock = new Promise<void>((resolve) => { releaseRefreshLock = resolve; });
+    const simulatedRefresh = withCredentialLock(tokenStore, oldRef, async () => {
+      const old = tokens.get(oldRef)!;
+      tokens.set(oldRef, { ...old, refreshToken: 'rotated-refresh' });
+      refreshLockEntered();
+      await releaseLock;
+    });
+    await refreshLocked;
+    let verifyEntered!: () => void;
+    let releaseVerification!: () => void;
+    const verificationWaiting = new Promise<void>((resolve) => { verifyEntered = resolve; });
+    verificationGate = new Promise<void>((resolve) => { releaseVerification = resolve; });
+    const reauth = { ...result, accessToken: 'second-access', refreshToken: undefined, expiresAt: Date.now() + 900_000 };
+    verificationEntered = verifyEntered;
+    const installing = app.installVerifiedAccount({ id: first.id, provider: 'google', displayName: '', email: '' }, reauth);
+    await verificationWaiting;
+    releaseVerification();
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    releaseRefreshLock();
+    await simulatedRefresh;
+    const second = await installing;
+    expect(second.tokenRef).not.toBe(oldRef);
+    expect(tokens.get(second.tokenRef!)?.refreshToken).toBe('rotated-refresh');
+    expect(deleted).toEqual([]);
+    expect(tokens.has(oldRef)).toBe(true);
+    expect(app.getSnapshot().pendingCredentialCleanup).toMatchObject([{ tokenRef: oldRef, reason: 'replaced', lastError: expect.any(String) }]);
+    expect(app.getSnapshot().accounts[0]).toMatchObject({ connected: true, tokenRef: second.tokenRef });
+    await app.retryCredentialCleanup();
+    expect(deleted).toEqual([oldRef]);
+    expect(tokens.has(oldRef)).toBe(false);
+    expect(app.getSnapshot().pendingCredentialCleanup).toEqual([]);
+  });
+
+  it('includes mailbox facts only when their stored composite identity matches the verified account', async () => {
+    const store = new MemoryStore();
+    const identity = { providerNamespace: 'google' as const, clientId: 'google-client', subject: 'mail-subject' };
+    const token: StoredOAuthToken = { accessToken: 'test-access', expiresAt: Date.now() + 600_000, identity };
+    const setup = new AppControllerImpl(store);
+    await setup.load();
+    const account = await setup.saveAccount({ provider: 'google', displayName: 'Mail', email: 'mail@example.com' });
+    const note = await setup.saveNote({ transcript: 'Check the latest email.' });
+    const persisted = store.value!;
+    Object.assign(persisted.accounts[0], { connected: true, authStatus: 'connected', identity, tokenRef: 'mail-token', capabilities: ['mail.read'], capabilityLimits: ['mail.read'] });
+    const accountIdentity = 'google:google-client:mail-subject:';
+    persisted.mailbox = [
+      { id: 'valid-row', accountId: account.id, providerMessageId: 'provider-message', identityKey: `${accountIdentity}:provider-message`, subject: 'Shipment update', from: 'store@example.com', receivedAt: '2026-10-12T01:00:00Z', snippet: 'Your package is arriving today.' },
+      { id: 'wrong-row', accountId: account.id, providerMessageId: 'other-message', identityKey: 'different-account:other-message', subject: 'Private', snippet: 'Must not be included.' },
+    ];
+    const fetcher = async () => new Response(JSON.stringify({ output: [{ content: [{ type: 'output_text', text: JSON.stringify({
+      summary: 'The shipment update says the package is arriving today.', answer: 'It is arriving today.', decisions: [], citations: [], clarifications: [], proposals: [],
+    }) }] }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    const app = new AppControllerImpl(store, { openAi: new AzureOpenAIClient(fetcher as typeof fetch, async () => 'test-key') }, {
+      tokenStore: { async get(ref) { return ref === 'mail-token' ? structuredClone(token) : null; }, async set() {} },
+      connectorFactory: () => ({}) as never,
+    });
+    await app.load();
+    expect(app.getSnapshot().accounts[0].connected).toBe(true);
+    await app.saveSettings({ mode: 'provider', openAiEndpoint: 'https://example.openai.azure.com', openAiDeployment: 'gpt-6-luna' });
+    const analysis = await app.assistNote(note.id, { intent: 'answer', question: 'What does the shipment update email say?' });
+    expect(Object.keys(analysis.sourceVersions)).toContain(`mail:${encodeURIComponent(accountIdentity)}:${encodeURIComponent('provider-message')}`);
+    expect(Object.keys(analysis.sourceVersions).some((sourceId) => sourceId.includes('wrong-row') || sourceId.includes('other-message'))).toBe(false);
   });
 
   it('reuses a configured same-provider account entry when installing its verified identity', async () => {
@@ -109,7 +232,7 @@ describe('application state controller', () => {
     });
     await app.load();
     const placeholder = await app.saveAccount({ provider: 'google', displayName: 'Personal Google', email: 'placeholder@example.com' });
-    const installed = await app.installVerifiedAccount({ id: placeholder.id, provider: 'google', displayName: '', email: '' }, result, 'secure-ref');
+    const installed = await app.installVerifiedAccount({ id: placeholder.id, provider: 'google', displayName: '', email: '' }, result);
     expect(installed.id).toBe(placeholder.id);
     expect(installed).toMatchObject({ connected: true, authStatus: 'connected', identity });
     expect(app.getSnapshot().accounts).toHaveLength(1);
@@ -145,7 +268,7 @@ describe('application state controller', () => {
       connectorFactory: () => connector as never,
     });
     await app.load();
-    const account = await app.installVerifiedAccount({ provider: 'google', displayName: '', email: '' }, result, 'secure-ref');
+    const account = await app.installVerifiedAccount({ provider: 'google', displayName: '', email: '' }, result);
     const partial = await app.syncAccount(account.id);
     expect(partial.status).toBe('partial');
     expect(eventReads).toBe(19);
@@ -168,22 +291,40 @@ describe('application state controller', () => {
       requestedCapabilities: ['mail.send'], capabilities: ['mail.send'], identity, displayName: 'Verified', email: 'user@example.com',
     };
     let verifiedEnvelope = false;
+    let externalWrites = 0;
+    let pauseWrite = false;
+    let releaseWrite: (() => void) | undefined;
+    let writeStarted: (() => void) | undefined;
     const connector = {
       async verifyOAuthIdentity() { return true; },
-      async sendEmail(_account: unknown, envelope: unknown, verifier: { verify(value: never): Promise<boolean> }) {
+      async sendEmail(_account: unknown, envelope: unknown, verifier: { verify(value: never): Promise<boolean>; verifyBeforeDispatch(value: never): boolean }) {
         verifiedEnvelope = await verifier.verify(envelope as never);
+        if (pauseWrite) {
+          pauseWrite = false;
+          writeStarted?.();
+          await new Promise<void>((resolve) => { releaseWrite = resolve; });
+        }
+        if (!verifier.verifyBeforeDispatch(envelope as never)) throw new Error('Approved action changed before provider dispatch.');
+        externalWrites++;
         return { status: 'accepted' as const, id: 'provider-reference' };
       },
     };
-    const app = new AppControllerImpl(store, {}, {
+    const transcript = 'Email Alex about the meeting.';
+    const sourceVersion = `1:${await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, transcript.normalize('NFC'))}`;
+    const fetcher = async () => new Response(JSON.stringify({ output: [{ content: [{ type: 'output_text', text: JSON.stringify({
+      summary: 'Email Alex about the meeting.', answer: '', decisions: [],
+      citations: [{ sourceId: 'transcript', revision: 1, sourceVersion, quote: transcript }], clarifications: [],
+      proposals: [{ kind: 'email', title: 'Meeting', body: 'Let us meet tomorrow.', recipients: ['alex@example.com'], dueAt: null, evidence: [transcript] }],
+    }) }] }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    const app = new AppControllerImpl(store, { openAi: new AzureOpenAIClient(fetcher as typeof fetch, async () => 'test-key') }, {
       tokenStore, deleteToken: async () => undefined, clientIds: { google: 'google-client' },
       verifyOAuthResult: async () => true, connectorFactory: () => connector as never,
     });
     await app.load();
-    const account = await app.installVerifiedAccount({ provider: 'google', displayName: '', email: '' }, result, 'secure-ref');
-    const note = await app.saveNote({ transcript: 'Email Alex about the meeting.' });
+    const account = await app.installVerifiedAccount({ provider: 'google', displayName: '', email: '' }, result);
+    await app.saveSettings({ mode: 'provider', openAiEndpoint: 'https://example.openai.azure.com', openAiDeployment: 'gpt-6-luna' });
+    const note = await app.saveNote({ transcript });
     const [draft] = await app.processNote(note.id);
-    await app.saveSettings({ mode: 'provider' });
     await app.editProposal(draft.id, { accountId: account.id, email: {
       operation: 'send', to: ['alex@example.com'], cc: [], bcc: [], subject: 'Meeting', text: 'Let us meet tomorrow.', attachments: [],
     } });
@@ -193,13 +334,29 @@ describe('application state controller', () => {
     expect(executed).toMatchObject({ status: 'accepted', remoteOperation: 'send', remoteId: 'provider-reference', simulated: false });
     expect(executed.lastError).toBeUndefined();
     expect(app.getSnapshot().activity.some((item) => /Completion or delivery is not confirmed/.test(item.message))).toBe(true);
+
+    const secondNote = await app.saveNote({ transcript });
+    const [secondDraft] = await app.processNote(secondNote.id);
+    await app.editProposal(secondDraft.id, { accountId: account.id, email: {
+      operation: 'send', to: ['alex@example.com'], cc: [], bcc: [], subject: 'Meeting', text: 'Let us meet tomorrow.', attachments: [],
+    } });
+    await app.approveProposal(secondDraft.id);
+    pauseWrite = true;
+    const writeBegan = new Promise<void>((resolve) => { writeStarted = resolve; });
+    const pendingExecution = app.executeProposal(secondDraft.id);
+    await writeBegan;
+    await app.saveDocument('memory/RULES.md', '# Rules\n\nDo not send meeting emails.\n');
+    releaseWrite?.();
+    const blocked = await pendingExecution;
+    expect(blocked).toMatchObject({ status: 'failed', lastError: expect.stringMatching(/changed before provider dispatch/i) });
+    expect(externalWrites).toBe(1);
   });
 
   it('marks volatile or missing credentials for reauthentication after reload and clears approvals before disconnect', async () => {
     const store = new MemoryStore();
     const identity = { providerNamespace: 'google' as const, clientId: 'google-client', subject: 'provider-subject' };
     const token: StoredOAuthToken = { accessToken: 'test-access', expiresAt: Date.now() + 600_000, identity };
-    const tokenStore = { async get(ref: string) { return ref === 'secure-ref' ? structuredClone(token) : null; }, async set() {} };
+    const tokenStore = { async get() { return structuredClone(token); }, async set() {} };
     const result: OAuthBridgeResult = {
       provider: 'google', accessToken: token.accessToken, expiresAt: token.expiresAt,
       grantedScopes: ['openid', 'https://www.googleapis.com/auth/gmail.readonly'],
@@ -214,7 +371,7 @@ describe('application state controller', () => {
     };
     const app = new AppControllerImpl(store, {}, integration);
     await app.load();
-    const account = await app.installVerifiedAccount({ provider: 'google', displayName: '', email: '' }, result, 'secure-ref');
+    const account = await app.installVerifiedAccount({ provider: 'google', displayName: '', email: '' }, result);
     const note = await app.saveNote({ transcript: 'Email Alex the meeting notes.' });
     const [proposal] = await app.processNote(note.id);
     await app.editProposal(proposal.id, { accountId: account.id, email: {
@@ -226,7 +383,7 @@ describe('application state controller', () => {
     expect(reloaded.getSnapshot().accounts[0]).toMatchObject({ connected: false, authStatus: 'reauth_required', capabilities: [] });
     expect(reloaded.getSnapshot().proposals[0]).toMatchObject({ status: 'draft', approvedPayloadDigest: undefined });
     await reloaded.disconnectAccount(account.id);
-    expect(deleted).toBe('secure-ref');
+    expect(deleted).toBe(account.tokenRef);
     const stillStored = store.value!.accounts[0];
     expect(stillStored).toMatchObject({ connected: false, authStatus: 'configured', tokenRef: undefined });
   });
@@ -323,12 +480,113 @@ describe('application state controller', () => {
     expect(profile).toContain('Lee prefers email');
   });
 
+  it('creates one independent local task, supports completion and reopening, and migrates legacy executed tasks', async () => {
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store);
+    await app.load();
+    const note = await app.saveNote({ transcript: 'I need to finish the report.' });
+    const [proposal] = await app.processNote(note.id);
+    expect(proposal.kind).toBe('task');
+    await app.approveProposal(proposal.id);
+    await app.executeProposal(proposal.id);
+    expect(app.getSnapshot().tasks).toHaveLength(1);
+    expect(app.getSnapshot().tasks[0]).toMatchObject({ id: proposal.id, status: 'open', sourceNoteId: note.id });
+    await app.completeTask(proposal.id);
+    expect(app.getSnapshot().tasks[0].status).toBe('completed');
+    await app.reopenTask(proposal.id);
+    expect(app.getSnapshot().tasks[0].status).toBe('open');
+    const reloaded = new AppControllerImpl(store);
+    await reloaded.load();
+    expect(reloaded.getSnapshot().tasks).toHaveLength(1);
+
+    const legacy = new MemoryStore();
+    legacy.value = structuredClone(store.value!);
+    legacy.value!.tasks = [];
+    legacy.value!.proposals[0].status = 'executed';
+    const migrated = new AppControllerImpl(legacy);
+    await migrated.load();
+    expect(migrated.getSnapshot().tasks).toHaveLength(1);
+    expect(migrated.getSnapshot().tasks[0]).toMatchObject({ id: proposal.id, status: 'open' });
+  });
+
+  it('persists answer-mode assistance with stable capture time and reuses it after reload', async () => {
+    vi.useFakeTimers();
+    try {
+      const requestTime = '2026-10-12T23:14:00.000Z';
+      vi.setSystemTime(new Date(requestTime));
+      let calls = 0;
+      const requestBodies: string[] = [];
+      const transcript = 'The review call is tomorrow at ten.';
+      const sourceVersion = `1:${await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, transcript.normalize('NFC'))}`;
+      const fetcher = async (_input: RequestInfo | URL, init?: RequestInit) => {
+        calls += 1;
+        requestBodies.push(String(init?.body ?? ''));
+        return new Response(JSON.stringify({
+          output: [{ content: [{ type: 'output_text', text: JSON.stringify({
+            summary: 'A review call is planned.', answer: 'Tomorrow at ten in the recording timezone.',
+            decisions: [], citations: [{ sourceId: 'transcript', revision: 1, sourceVersion, quote: 'tomorrow at ten' }],
+            clarifications: [], proposals: [],
+          }) }] }], usage: { input_tokens: 10, output_tokens: 5 },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      };
+      const store = new MemoryStore();
+      const createProvider = () => new AzureOpenAIClient(fetcher as typeof fetch, async () => 'test-key');
+      const app = new AppControllerImpl(store, { openAi: createProvider() });
+      await app.load();
+      await app.saveSettings({ mode: 'provider', openAiEndpoint: 'https://example.openai.azure.com', openAiDeployment: 'gpt-6-luna' });
+      const note = await app.saveNote({ transcript, capturedAt: '2026-10-12T01:00:00.000Z', captureTimeZone: 'Asia/Singapore' });
+      const analysis = await app.assistNote(note.id, { intent: 'answer', question: 'When is the review call?' });
+      expect(analysis).toMatchObject({ intent: 'answer', question: 'When is the review call?', capturedAt: '2026-10-12T01:00:00.000Z', captureTimeZone: 'Asia/Singapore', answeredAsOf: requestTime, source: 'provider' });
+      expect(requestBodies[0]).toContain(`anchored separately to ${requestTime}`);
+      expect(app.getSnapshot().notes[0].analysis?.answer).toMatch(/tomorrow at ten/i);
+
+      const reloaded = new AppControllerImpl(store, { openAi: createProvider() });
+      await reloaded.load();
+      vi.setSystemTime(new Date('2026-10-12T23:14:59.000Z'));
+      const cached = await reloaded.assistNote(note.id, { intent: 'answer', question: 'When is the review call?' });
+      expect(cached.fingerprint).toBe(analysis.fingerprint);
+      expect(cached.answeredAsOf).toBe(requestTime);
+      expect(calls).toBe(1);
+
+      const nextBucketTime = '2026-10-12T23:15:00.000Z';
+      vi.setSystemTime(new Date(nextBucketTime));
+      const refreshed = await reloaded.assistNote(note.id, { intent: 'answer', question: 'When is the review call?' });
+      expect(refreshed.answeredAsOf).toBe(nextBucketTime);
+      expect(refreshed.fingerprint).not.toBe(analysis.fingerprint);
+      expect(calls).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('preserves saved assistance on load and misses cache after the assist contract version changes', async () => {
+    const store = new MemoryStore();
+    const first = new AppControllerImpl(store);
+    await first.load();
+    const note = await first.saveNote({ transcript: 'I decided to call Sam.' });
+    const original = await first.assistNote(note.id, { intent: 'summarize' });
+    const oldFingerprint = JSON.parse(original.fingerprint) as Record<string, unknown>;
+    oldFingerprint.contractVersion = 'older-contract';
+    store.value!.notes.find((item) => item.id === note.id)!.analysis!.fingerprint = JSON.stringify(oldFingerprint);
+
+    const reloaded = new AppControllerImpl(store);
+    await reloaded.load();
+    expect(reloaded.getSnapshot().notes.find((item) => item.id === note.id)?.analysis?.fingerprint).toBe(JSON.stringify(oldFingerprint));
+    const checked = await reloaded.refreshAnalysisStatus(note.id);
+    expect(checked?.stale).toBe(true);
+
+    const refreshed = await reloaded.assistNote(note.id, { intent: 'summarize' });
+    expect(refreshed.fingerprint).not.toBe(JSON.stringify(oldFingerprint));
+    expect((JSON.parse(refreshed.fingerprint) as { contractVersion: string }).contractVersion).toBe('assist-v2');
+  });
+
   it('retains uncertain prior retry charges and actual estimates after a later provider success', async () => {
     let fail = true;
     const fetcher = async () => {
       if (fail) return new Response('unauthorized', { status: 401 });
+      const sourceVersion = `1:${await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, 'I need to call Sam tomorrow.')}`;
       return new Response(JSON.stringify({
-        output: [{ content: [{ type: 'output_text', text: JSON.stringify({ proposals: [{ kind: 'task', title: 'Call Sam', body: 'Call Sam tomorrow', recipients: [], dueAt: null, evidence: ['I need to call Sam tomorrow.'] }] }) }] }],
+        output: [{ content: [{ type: 'output_text', text: JSON.stringify({ summary: 'Call Sam tomorrow.', answer: '', decisions: [], citations: [{ sourceId: 'transcript', revision: 1, sourceVersion, quote: 'I need to call Sam tomorrow.' }], clarifications: [], proposals: [{ kind: 'task', title: 'Call Sam', body: 'Call Sam tomorrow', recipients: [], dueAt: null, evidence: ['I need to call Sam tomorrow.'] }] }) }] }],
         usage: { input_tokens: 10, output_tokens: 5 },
       }), { status: 200, headers: { 'content-type': 'application/json' } });
     };
@@ -349,8 +607,9 @@ describe('application state controller', () => {
     let calls = 0;
     const fetcher = async () => {
       calls += 1;
+      const sourceVersion = `1:${await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, 'I need to call Sam tomorrow.')}`;
       return new Response(JSON.stringify({
-        output: [{ content: [{ type: 'output_text', text: JSON.stringify({ proposals: [{ kind: 'task', title: 'Call Sam', body: 'Call Sam tomorrow', recipients: [], dueAt: null, evidence: ['I need to call Sam tomorrow.'] }] }) }] }],
+        output: [{ content: [{ type: 'output_text', text: JSON.stringify({ summary: 'Call Sam tomorrow.', answer: '', decisions: [], citations: [{ sourceId: 'transcript', revision: 1, sourceVersion, quote: 'I need to call Sam tomorrow.' }], clarifications: [], proposals: [{ kind: 'task', title: 'Call Sam', body: 'Call Sam tomorrow', recipients: [], dueAt: null, evidence: ['I need to call Sam tomorrow.'] }] }) }] }],
         usage: { input_tokens: 10, output_tokens: 5 },
       }), { status: 200, headers: { 'content-type': 'application/json' } });
     };
@@ -380,7 +639,7 @@ describe('application state controller', () => {
     const fetcher = async () => {
       calls += 1;
       return new Response(JSON.stringify({
-        output: [{ content: [{ type: 'output_text', text: JSON.stringify({ proposals: [] }) }] }],
+        output: [{ content: [{ type: 'output_text', text: JSON.stringify({ summary: 'No actions.', answer: '', decisions: [], citations: [], clarifications: [], proposals: [] }) }] }],
         usage: { input_tokens: 10, output_tokens: 5 },
       }), { status: 200, headers: { 'content-type': 'application/json' } });
     };
@@ -395,6 +654,92 @@ describe('application state controller', () => {
     await reloaded.load();
     expect(await reloaded.processNote(note.id)).toEqual([]);
     expect(calls).toBe(1);
+  });
+
+  it('does not resurrect an edited and executed task when context changes for the same transcript sentence', async () => {
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store);
+    await app.load();
+    const note = await app.saveNote({ transcript: 'I need to buy groceries tomorrow. I need to call Sam tomorrow. I prefer short replies.' });
+    const first = await app.processNote(note.id);
+    const groceries = first.find((proposal) => proposal.kind === 'task' && /groceries/i.test(proposal.title));
+    expect(groceries).toBeDefined();
+    await app.editProposal(groceries!.id, { title: 'Buy groceries after work' });
+    await app.approveProposal(groceries!.id);
+    await app.executeProposal(groceries!.id);
+
+    await app.saveDocument('memory/PROFILE.md', '# Profile\n\nI prefer detailed planning.\n');
+    const refreshed = await app.processNote(note.id);
+    expect(refreshed.some((proposal) => proposal.id === groceries!.id)).toBe(false);
+    expect(app.getSnapshot().proposals.filter((proposal) => proposal.kind === 'task' && proposal.sourceRevision === note.revision && /groceries/i.test(proposal.title)).map(({ id, title, status, sourceActionKey }) => ({ id, title, status, sourceActionKey }))).toHaveLength(1);
+    expect(app.getSnapshot().tasks.filter((task) => task.sourceNoteId === note.id && /groceries/i.test(task.title))).toHaveLength(1);
+    expect(refreshed.some((proposal) => proposal.kind === 'task' && /call Sam/i.test(proposal.title))).toBe(true);
+    expect(app.getSnapshot().proposals.filter((proposal) => proposal.kind === 'memory' && /short replies/i.test(proposal.body))).toHaveLength(1);
+  });
+
+  it('stores a provider response as stale and creates no proposals when a selected source changes in flight', async () => {
+    let release!: () => void;
+    let requestStarted!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const started = new Promise<void>((resolve) => { requestStarted = resolve; });
+    const text = 'I need to call Alex tomorrow.';
+    const fetcher = vi.fn(async () => {
+      requestStarted();
+      await held;
+      const sourceVersion = `1:${await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, text.normalize('NFC'))}`;
+      return new Response(JSON.stringify({ output: [{ content: [{ type: 'output_text', text: JSON.stringify({
+        summary: 'Call Alex.', answer: '', decisions: [],
+        citations: [{ sourceId: 'transcript', revision: 1, sourceVersion, quote: text }], clarifications: [],
+        proposals: [{ kind: 'task', title: 'Call Alex', body: 'Call Alex tomorrow.', recipients: [], dueAt: null, evidence: [text] }],
+      }) }] }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    });
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store, { openAi: new AzureOpenAIClient(fetcher as typeof fetch, async () => 'test-key') });
+    await app.load();
+    await app.saveSettings({ mode: 'provider', openAiEndpoint: 'https://example.openai.azure.com', openAiDeployment: 'gpt-6-luna' });
+    const note = await app.saveNote({ transcript: text });
+    const assist = app.assistNote(note.id);
+    await started;
+    await app.saveDocument('memory/PROFILE.md', '# Profile\n\nChanged while the response was pending.\n');
+    release();
+    const result = await assist;
+    expect(result.stale).toBe(true);
+    expect(result.clarifications.at(-1)).toMatch(/context changed/i);
+    expect(app.getSnapshot().proposals).toHaveLength(0);
+  });
+
+  it('marks a saved answer stale after a task used in its snapshot is completed', async () => {
+    const app = new AppControllerImpl(new MemoryStore());
+    await app.load();
+    const taskNote = await app.saveNote({ transcript: 'I need to buy groceries.' });
+    const [taskProposal] = await app.processNote(taskNote.id);
+    await app.approveProposal(taskProposal.id);
+    await app.executeProposal(taskProposal.id);
+    const questionNote = await app.saveNote({ transcript: 'How many open tasks are there?' });
+    const analysis = await app.assistNote(questionNote.id, { intent: 'answer', question: 'How many open tasks are there?' });
+    expect(Object.keys(analysis.sourceVersions).some((id) => id.startsWith('task:'))).toBe(true);
+    const task = app.getSnapshot().tasks.find((item) => item.id === taskProposal.id)!;
+    await app.completeTask(task.id);
+    const refreshed = await app.refreshAnalysisStatus(questionNote.id);
+    expect(refreshed?.stale).toBe(true);
+  });
+
+  it('does not persist an unchanged freshness check and cannot apply it over a newer analysis', async () => {
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store);
+    await app.load();
+    const note = await app.saveNote({ transcript: 'I decided to call Alex tomorrow.' });
+    const original = await app.assistNote(note.id);
+    const savesBeforeCheck = store.saves;
+    const unchanged = await app.refreshAnalysisStatus(note.id);
+    expect(unchanged?.stale).toBeFalsy();
+    expect(store.saves).toBe(savesBeforeCheck);
+
+    const statusCheck = app.refreshAnalysisStatus(note.id);
+    const latest = await app.assistNote(note.id, { intent: 'summarize', forceRefresh: true });
+    await statusCheck;
+    expect(app.getSnapshot().notes.find((item) => item.id === note.id)?.analysis?.fingerprint).toBe(latest.fingerprint);
+    expect(app.getSnapshot().notes.find((item) => item.id === note.id)?.analysis?.fingerprint).not.toBe(original.fingerprint);
   });
 
   it('migrates account configuration without trusting UI connection flags and validates structured remote payloads', async () => {

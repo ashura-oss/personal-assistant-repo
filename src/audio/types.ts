@@ -8,7 +8,7 @@ export interface AudioCapture {
   start(): Promise<void>;
   pause(): Promise<void>;
   resume(): Promise<void>;
-  stop(): Promise<{ uri: string; durationSeconds: number } | null>;
+  stop(): Promise<{ uri: string; durationSeconds: number; capturedAt: string; captureTimeZone: string } | null>;
   cancel(): Promise<void>;
   commit(uri: string): void;
   play(uri: string): Promise<void>;

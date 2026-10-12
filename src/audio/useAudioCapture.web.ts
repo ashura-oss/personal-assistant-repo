@@ -15,7 +15,8 @@ export function useAudioCapture(): AudioCapture {
   const elapsedBeforePause = useRef(0);
   const audioContext = useRef<AudioContext | null>(null);
   const raf = useRef<number | null>(null);
-  const pending = useRef<{ blob: Blob; uri: string; durationSeconds: number } | null>(null);
+  const pending = useRef<{ blob: Blob; uri: string; durationSeconds: number; capturedAt: string; captureTimeZone: string } | null>(null);
+  const captureAnchor = useRef<{ capturedAt: string; captureTimeZone: string } | null>(null);
   const currentPlayer = useRef<HTMLAudioElement | null>(null);
   const playerObjectUrl = useRef<string | null>(null);
 
@@ -36,7 +37,9 @@ export function useAudioCapture(): AudioCapture {
       const mimeType = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4'].find(t => MediaRecorder.isTypeSupported(t));
       recorder.current = new MediaRecorder(media, mimeType ? { mimeType } : undefined);
       recorder.current.ondataavailable = e => { if (e.data.size) chunks.current.push(e.data); };
-      recorder.current.start(250); startAt.current = Date.now(); setDurationSeconds(0); setStatus('recording');
+      recorder.current.start(250); startAt.current = Date.now();
+      captureAnchor.current = { capturedAt: new Date(startAt.current).toISOString(), captureTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC' };
+      setDurationSeconds(0); setStatus('recording');
       if (window.AudioContext) {
         const context = new AudioContext(); audioContext.current = context;
         const source = context.createMediaStreamSource(media); const analyser = context.createAnalyser(); analyser.fftSize = 128; source.connect(analyser);
@@ -63,7 +66,7 @@ export function useAudioCapture(): AudioCapture {
     if (pending.current) {
       await putAudio(pending.current.uri.replace(/^indexeddb-audio:/, ''), pending.current.blob);
       setStatus('idle'); setDurationSeconds(pending.current.durationSeconds);
-      return { uri: pending.current.uri, durationSeconds: pending.current.durationSeconds };
+      return { uri: pending.current.uri, durationSeconds: pending.current.durationSeconds, capturedAt: pending.current.capturedAt, captureTimeZone: pending.current.captureTimeZone };
     }
     const active = recorder.current;
     if (!active || status === 'idle') return null;
@@ -79,20 +82,20 @@ export function useAudioCapture(): AudioCapture {
       stream.current?.getTracks().forEach(track => track.stop()); stream.current = null; closeMeter();
     }
     const uri = `indexeddb-audio:${crypto.randomUUID()}`;
-    pending.current = { blob, uri, durationSeconds: duration };
+    pending.current = { blob, uri, durationSeconds: duration, ...(captureAnchor.current ?? { capturedAt: new Date().toISOString(), captureTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC' }) };
     setHasPending(true);
     recorder.current = null; setStatus('idle'); setDurationSeconds(duration);
     await putAudio(uri.replace(/^indexeddb-audio:/, ''), blob);
-    return { uri, durationSeconds: duration };
+    return { uri, durationSeconds: duration, capturedAt: pending.current.capturedAt, captureTimeZone: pending.current.captureTimeZone };
   }, [status]);
   const cancel = useCallback(async () => {
     const active = recorder.current;
     if (active && active.state !== 'inactive') await new Promise<void>(resolve => { active.onstop = () => resolve(); active.stop(); });
     stream.current?.getTracks().forEach(track => track.stop()); stream.current = null; closeMeter();
     if (pending.current) await removeAudio(pending.current.uri).catch(() => undefined);
-    pending.current = null; setHasPending(false); recorder.current = null; chunks.current = []; setStatus('idle'); setDurationSeconds(0); setError('');
+    pending.current = null; captureAnchor.current = null; setHasPending(false); recorder.current = null; chunks.current = []; setStatus('idle'); setDurationSeconds(0); setError('');
   }, []);
-  const commit = useCallback((uri: string) => { if (pending.current?.uri === uri) { pending.current = null; setHasPending(false); } }, []);
+  const commit = useCallback((uri: string) => { if (pending.current?.uri === uri) { pending.current = null; captureAnchor.current = null; setHasPending(false); } }, []);
   const play = useCallback(async (uri: string) => {
     currentPlayer.current?.pause();
     currentPlayer.current?.removeAttribute('src');

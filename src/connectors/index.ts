@@ -95,6 +95,24 @@ export interface CalendarSummary { id: string; name: string; writable: boolean; 
 export interface CalendarEventSummary { id: string; subject?: string; start?: string; end?: string; timeZone?: string; }
 
 const refreshLocks = new WeakMap<OAuthTokenStore, Map<string, Promise<StoredOAuthToken>>>();
+const credentialLocks = new WeakMap<OAuthTokenStore, Map<string, Promise<void>>>();
+
+/** Serializes refresh, reconnect installation, and deletion for one stored provider credential. */
+export async function withCredentialLock<T>(store: OAuthTokenStore, tokenRef: string, work: () => Promise<T>): Promise<T> {
+  let locks = credentialLocks.get(store);
+  if (!locks) { locks = new Map(); credentialLocks.set(store, locks); }
+  const previous = locks.get(tokenRef) ?? Promise.resolve();
+  let release!: () => void;
+  const tail = new Promise<void>((resolve) => { release = resolve; });
+  const queuedTail = previous.catch(() => undefined).then(() => tail);
+  locks.set(tokenRef, queuedTail);
+  await previous.catch(() => undefined);
+  try { return await work(); }
+  finally {
+    release();
+    if (locks.get(tokenRef) === queuedTail) locks.delete(tokenRef);
+  }
+}
 
 function accountIdentity(account: Account): NonNullable<Account['identity']> {
   if (!account.tokenRef || !account.identity?.subject || account.identity.providerNamespace !== account.provider || !account.identity.clientId ||
@@ -194,7 +212,7 @@ export class ConnectorClient {
 
   private async token(account: Account, guard?: RequestGuard, signal?: AbortSignal): Promise<StoredOAuthToken> {
     this.assertConnectionCurrent(account);
-    const identity = accountIdentity(account);
+    accountIdentity(account);
     if (account.authStatus !== 'connected') throw new Error('Account requires authentication.');
     const token = await this.deps.tokenStore.get(account.tokenRef!);
     if (!token) throw new Error('Account token is missing.');
@@ -301,14 +319,15 @@ export class ConnectorClient {
     const lockKey = account.tokenRef!;
     const active = locks.get(lockKey);
     if (active) return active;
-    const operation = (async () => {
+    const operation = withCredentialLock(this.deps.tokenStore, lockKey, async () => {
+      this.assertConnectionCurrent(account);
       const current = await this.deps.tokenStore.get(account.tokenRef!);
       if (!current) return this.reauth(account, 'reauth_required', 'Account token is missing.');
       assertIdentity(account, current);
       const concurrentlyRotated = current.accessToken !== token.accessToken;
       if (current.expiresAt > this.now() + 60_000 && (!force || concurrentlyRotated)) return current;
       return this.refresh(account, current, accountIdentity(account), guard, signal);
-    })();
+    });
     locks.set(lockKey, operation);
     try { return await operation; }
     finally { if (locks.get(lockKey) === operation) locks.delete(lockKey); }

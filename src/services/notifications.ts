@@ -1,13 +1,13 @@
 import { Platform } from 'react-native';
 import type { Proposal } from '../core';
 
-export type ReminderAlertResult = { status: 'scheduled'; notificationId: string } | { status: 'disabled' | 'unavailable' };
+export type ReminderAlertResult = { status: 'scheduled'; notificationId: string } | { status: 'disabled' | 'unavailable' | 'blocked' | 'expired' };
 export const reminderNotificationId = (proposal: Pick<Proposal, 'id' | 'revision'>) => `reminder-${proposal.id}-${proposal.revision}`;
 
 interface NotificationBridge {
   SchedulableTriggerInputTypes: { DATE: unknown };
   requestPermissionsAsync(): Promise<{ status: string }>;
-  getAllScheduledNotificationsAsync(): Promise<Array<{ identifier: string }>>;
+  getAllScheduledNotificationsAsync(): Promise<{ identifier: string }[]>;
   scheduleNotificationAsync(input: { identifier: string; content: { title: string; body: string; data: Record<string, string | number> }; trigger: unknown }): Promise<string>;
   cancelScheduledNotificationAsync(identifier: string): Promise<void>;
 }
@@ -32,6 +32,7 @@ export async function requestReminderNotification(
   proposal: Proposal,
   platform: string = Platform.OS,
   loadBridge: () => Promise<NotificationBridge> = async () => await import('expo-notifications') as unknown as NotificationBridge,
+  guard: () => boolean = () => true,
 ): Promise<ReminderAlertResult> {
   if (platform === 'web') return { status: 'unavailable' };
   if (!proposal.dueAt || !Number.isFinite(Date.parse(proposal.dueAt))) return { status: 'disabled' };
@@ -39,9 +40,13 @@ export async function requestReminderNotification(
     const Notifications = await loadBridge();
     const permission = await Notifications.requestPermissionsAsync();
     if (permission.status !== 'granted') return { status: 'disabled' };
+    if (!guard()) return { status: 'blocked' };
+    if (Date.parse(proposal.dueAt) <= Date.now()) return { status: 'expired' };
     const identifier = reminderNotificationId(proposal);
     const existing = await Notifications.getAllScheduledNotificationsAsync();
     const prior = existing.find((item) => item.identifier === identifier);
+    if (!guard()) return { status: 'blocked' };
+    if (Date.parse(proposal.dueAt) <= Date.now()) return { status: 'expired' };
     if (prior) return { status: 'scheduled', notificationId: prior.identifier };
     const notificationId = await Notifications.scheduleNotificationAsync({
       identifier,
