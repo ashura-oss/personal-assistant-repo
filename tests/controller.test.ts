@@ -265,6 +265,129 @@ describe('application state controller', () => {
     expect(app.getSnapshot().dispatchRecords.find((record) => record.proposalId === disconnectDraft.id)).toMatchObject({ outcome: 'rejected', rejectionCode: 'precondition_failed' });
   });
 
+  it('loads bounded selected mail text, keeps note context separate, reuses content cache across composer revisions, and fences changed policy before POST', async () => {
+    const store = new MemoryStore();
+    const identity = { providerNamespace: 'google' as const, clientId: 'text-client', subject: 'text-subject' };
+    const tokens = new Map<string, StoredOAuthToken>();
+    const text = 'Thanks, I will review the notes.\r\nI prefer concise replies. e\u0301';
+    const observedAt = new Date().toISOString();
+    let providerCalls = 0;
+    let blockKey = false;
+    let keyStarted!: () => void;
+    let releaseKey!: () => void;
+    const reply = JSON.stringify({ text: 'Thanks, I will review the notes.' });
+    const openAi = new AzureOpenAIClient(async (_url, init) => {
+      providerCalls += 1;
+      const body = JSON.parse(String(init?.body));
+      const userText = body.input[1].content[0].text as string;
+      if (userText.includes('SELECTED NOTE CONTEXT')) expect(userText).toContain('I prefer concise replies.');
+      return new Response(JSON.stringify({ status: 'completed', output: [{ content: [{ type: 'output_text', text: reply }] }], usage: { input_tokens: 40, output_tokens: 12 } }), { status: 200 });
+    }, async () => {
+      if (!blockKey) return 'fixture-openai-key';
+      blockKey = false;
+      keyStarted();
+      await new Promise<void>((resolve) => { releaseKey = resolve; });
+      return 'fixture-openai-key';
+    });
+    const connector = {
+      async verifyOAuthIdentity() { return true; },
+      async readSelectedMessageText(_account: unknown, providerMessageId: string) {
+        return {
+          status: 'available', message: {
+            id: providerMessageId, idFormat: 'gmail' as const, threadId: 'text-thread', subject: 'Review notes',
+            from: 'Sam <sam@example.test>', senderEmail: 'sam@example.test', receivedAt: observedAt,
+            snippet: 'Please review.', replyMetadataComplete: true, internetMessageId: '<text-1@example.test>',
+            providerVersion: 'history-1', sizeEstimate: new TextEncoder().encode(text).length, sizeCheckedAt: observedAt,
+            replyTo: ['sam@example.test'], to: ['me@example.test'], cc: [],
+          }, text, bytes: new TextEncoder().encode(text).length, representation: 'plain' as const,
+          completeness: 'complete_text' as const, reasons: [], checkedAt: observedAt, extractionVersion: 'mail-text-v1' as const,
+        };
+      },
+    };
+    const tokenStore = {
+      async get(ref: string) { const value = tokens.get(ref); return value ? structuredClone(value) : null; },
+      async set(ref: string, value: StoredOAuthToken) { tokens.set(ref, structuredClone(value)); },
+    };
+    const integration = { tokenStore, deleteToken: async () => undefined, clientIds: { google: 'text-client' }, verifyOAuthResult: async () => true, connectorFactory: () => connector as never };
+    let app = new AppControllerImpl(store, { openAi }, integration);
+    await app.load();
+    const account = await app.installVerifiedAccount({ provider: 'google', displayName: 'Mail', email: '' }, {
+      provider: 'google', accessToken: 'access', expiresAt: Date.now() + 600_000,
+      grantedScopes: ['openid', 'https://www.googleapis.com/auth/gmail.readonly'], requestedCapabilities: ['mail.read'],
+      capabilities: ['mail.read'], identity, displayName: 'Mail', email: 'me@example.test',
+    });
+    const message = {
+      id: 'text-local', accountId: account.id, providerMessageId: 'text-provider', identityKey: 'google:text-client:text-subject:',
+      verifiedIdentityKey: 'google:text-client:text-subject:', connectionGeneration: account.connectionGeneration, idFormat: 'gmail' as const,
+      threadId: 'text-thread', subject: 'Review notes', from: 'Sam <sam@example.test>', senderEmail: 'sam@example.test', receivedAt: observedAt,
+      snippet: 'Please review.', replyMetadataComplete: true, internetMessageId: '<text-1@example.test>', providerVersion: 'history-1',
+      replyTo: ['sam@example.test'], to: ['me@example.test'], cc: [], observedAt,
+    };
+    store.value!.mailbox.push(message);
+    await store.save(store.value!);
+    app = new AppControllerImpl(store, { openAi }, integration);
+    await app.load();
+    await app.saveSettings({ mode: 'provider', openAiEndpoint: 'https://example.openai.azure.com', openAiDeployment: 'gpt-6-luna' });
+    const source = await app.getMailReplySource(message.id);
+    const loaded = await app.loadMailReplyText({ messageId: message.id, sourceDigest: source.source!.sourceDigest });
+    expect(loaded.status).toBe('current');
+    expect(loaded.snapshot?.text).toBe('Thanks, I will review the notes.\nI prefer concise replies. é');
+    expect(loaded.snapshot?.bytes).toBe(new TextEncoder().encode(loaded.snapshot!.text).length);
+    store.failNext = true;
+    await expect(app.loadMailReplyText({ messageId: message.id, sourceDigest: loaded.snapshot!.sourceDigest })).rejects.toThrow(/disk full/i);
+    expect(app.getSnapshot().selectedMailTexts[0].text).toBe(loaded.snapshot!.text);
+    const note = await app.saveNote({ transcript: 'I prefer concise replies.' });
+    const input = {
+      messageId: message.id, sourceDigest: loaded.snapshot!.sourceDigest, textDigest: loaded.snapshot!.textDigest!, mode: 'reply' as const,
+      to: ['sam@example.test'], cc: [], brief: 'Say that I will check.', composerRevision: 1, noteId: note.id, noteRevision: note.revision,
+    };
+    const originalDigest = Crypto.digestStringAsync.bind(Crypto);
+    let releaseSourceHash!: () => void;
+    let sourceHashStarted!: () => void;
+    const sourceHashGate = new Promise<void>((resolve) => { sourceHashStarted = resolve; });
+    let gateFirstHash = true;
+    const digestSpy = vi.spyOn(Crypto, 'digestStringAsync').mockImplementation(async (algorithm, data, options) => {
+      if (gateFirstHash) {
+        gateFirstHash = false;
+        sourceHashStarted();
+        await new Promise<void>((resolve) => { releaseSourceHash = resolve; });
+      }
+      return originalDigest(algorithm, data, options);
+    });
+    try {
+      const staleBeforeBodyValidation = app.generateMailReplyText(input);
+      await sourceHashGate;
+      const internal = app as unknown as { mutate: (operation: (draft: AppState) => void) => Promise<void> };
+      await internal.mutate((draft) => { draft.mailbox.find((item) => item.id === message.id)!.providerVersion = 'history-raced'; });
+      releaseSourceHash();
+      await expect(staleBeforeBodyValidation).resolves.toMatchObject({ status: 'stale' });
+      expect(providerCalls).toBe(0);
+      expect(app.getSnapshot().usage.attemptsToday).toBe(0);
+      await internal.mutate((draft) => { draft.mailbox.find((item) => item.id === message.id)!.providerVersion = 'history-1'; });
+    } finally {
+      releaseSourceHash?.();
+      digestSpy.mockRestore();
+    }
+    const first = await app.generateMailReplyText(input);
+    const cached = await app.generateMailReplyText({ ...input, composerRevision: 2 });
+    expect(first).toMatchObject({ status: 'current', composerRevision: 1, fromCache: false });
+    expect(cached).toMatchObject({ status: 'current', composerRevision: 2, fromCache: true });
+    expect(providerCalls).toBe(1);
+    expect(app.getSnapshot().proposals).toEqual([]);
+    expect(app.getSnapshot().dispatchRecords).toEqual([]);
+
+    blockKey = true;
+    const started = new Promise<void>((resolve) => { keyStarted = resolve; });
+    const staleGeneration = app.generateMailReplyText({ ...input, composerRevision: 3, brief: 'A different explicit brief.' });
+    await started;
+    await app.saveDocument('memory/RULES.md', 'Use a formal tone.');
+    releaseKey();
+    await expect(staleGeneration).resolves.toMatchObject({ status: 'stale', composerRevision: 3 });
+    expect(providerCalls).toBe(1);
+    expect(app.getSnapshot().usage.attemptsToday).toBe(1);
+    expect(app.getSnapshot().usage.unknownCharges).toBe(1);
+  });
+
   it('invalidates approval after an edit and keeps source revisions tied to the original note', async () => {
     const store = new MemoryStore();
     const app = new AppControllerImpl(store);

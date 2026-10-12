@@ -8,10 +8,11 @@ const tokenIdentity = { subject: 'sub-1', providerNamespace: 'google' as const, 
 const account: Account = {
   id: 'google-1', provider: 'google', displayName: 'Test', email: 'me@example.test', connected: true,
   authStatus: 'connected', identity: tokenIdentity, tokenRef: 'token:google-1',
+  grantedScopes: ['https://www.googleapis.com/auth/gmail.readonly'],
   capabilities: ['mail.read', 'mail.draft', 'mail.send', 'calendar.read', 'calendar.write'],
 };
 const microsoftIdentity = { subject: 'ms-subject', providerNamespace: 'microsoft' as const, clientId: 'test-ms-client', resourceUserId: 'graph-user-1', tenantId: '12345678-1234-4234-8234-123456789abc' };
-const microsoftAccount: Account = { ...account, id: 'ms-1', provider: 'microsoft', email: 'ms@example.test', identity: microsoftIdentity, tokenRef: 'token:ms-1' };
+const microsoftAccount: Account = { ...account, id: 'ms-1', provider: 'microsoft', email: 'ms@example.test', identity: microsoftIdentity, tokenRef: 'token:ms-1', grantedScopes: ['Mail.Read'] };
 const payload: EmailProposalPayload = { to: ['to@example.test'], cc: ['cc@example.test'], bcc: ['secret@example.test'], subject: 'Résumé ✓', text: 'Hello, 世界', attachments: [] };
 const envelope: ApprovedDispatch = { proposalId: 'proposal-1', revision: 1, sourceRevision: 1, operation: 'send', accountId: account.id, identity: tokenIdentity, payloadDigest: 'a'.repeat(64), title: 'Approved title', body: 'Approved body', payload };
 const verifier = { verify: vi.fn(async () => true), verifyBeforeDispatch: vi.fn(() => true) };
@@ -27,7 +28,7 @@ function replyFixture(provider: 'google' | 'microsoft' = 'google', mode: 'reply'
     ...(provider === 'google' ? { threadId: 'gmail-thread-id' } : {}), internetMessageId: '<original@example.test>', references: '<prior@example.test>',
     subject: 'Résumé ✓', from: 'Alex <alex@example.test>', senderEmail: 'alex@example.test', replyTo: ['reply@example.test'],
     to: ['me@example.test'], cc: ['colleague@example.test'], snippet: 'Earlier message', replyMetadataComplete: true,
-    observedAt: '2026-10-13T02:00:00.000Z', sourceDigest: digest,
+    observedAt: new Date(Date.now()).toISOString(), sourceDigest: digest,
   };
   const replySource: MailReplyProvenance = { version: 2, kind: 'mail_reply', sourceDigest: digest, source, expiresAt: new Date(Date.now() + 3_600_000).toISOString() };
   const payload: EmailProposalPayload = {
@@ -54,6 +55,25 @@ function fixture(options: { token?: StoredOAuthToken; fetcher?: typeof fetch; st
 }
 
 const response = (body: unknown, status = 200) => new Response(body === undefined ? null : JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+const b64url = (value: string) => btoa(value).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+function selectedHeaders() {
+  return [
+    { name: 'Subject', value: 'Original subject' }, { name: 'From', value: 'Alex <alex@example.test>' },
+    { name: 'Reply-To', value: 'reply@example.test' }, { name: 'To', value: 'me@example.test' },
+    { name: 'Cc', value: 'colleague@example.test' }, { name: 'Message-ID', value: '<selected@example.test>' },
+    { name: 'References', value: '<prior@example.test>' }, { name: 'In-Reply-To', value: '<prior@example.test>' },
+  ];
+}
+function gmailSelectedMessage(id = 'gmail-selected', text = 'Selected message body', extra: Record<string, unknown> = {}) {
+  return { id, threadId: 'thread-selected', historyId: 'history-7', sizeEstimate: 1234, snippet: 'Selected snippet', internalDate: String(Date.now()), labelIds: ['INBOX'],
+    payload: { mimeType: 'text/plain', headers: selectedHeaders(), body: { data: b64url(text) } }, ...extra };
+}
+function graphSelectedMessage(id = 'AAMk-selected==', text = 'Selected Graph body', extra: Record<string, unknown> = {}) {
+  return { id, conversationId: 'conversation-selected', changeKey: 'change-7', subject: 'Original subject', body: { contentType: 'text', content: text }, bodyPreview: 'Graph snippet',
+    from: { emailAddress: { address: 'alex@example.test' } }, replyTo: [{ emailAddress: { address: 'reply@example.test' } }],
+    toRecipients: [{ emailAddress: { address: 'me@example.test' } }], ccRecipients: [{ emailAddress: { address: 'colleague@example.test' } }],
+    internetMessageId: '<selected@example.test>', internetMessageHeaders: selectedHeaders(), isRead: false, receivedDateTime: new Date(Date.now() - 60_000).toISOString(), ...extra };
+}
 
 describe('provider connector clients', () => {
   beforeEach(() => { vi.clearAllMocks(); });
@@ -182,7 +202,7 @@ describe('provider connector clients', () => {
       if (url.pathname.endsWith('/deleted')) return response({}, 404);
       const id = url.pathname.split('/').pop();
       const timestamp = id === 'outside-window' ? end : start;
-      return response({ id, threadId: 'thread-1', internalDate: String(timestamp), labelIds: ['INBOX'], snippet: 'short preview', payload: { headers: [
+      return response({ id, threadId: 'thread-1', historyId: 'history-11', sizeEstimate: 250, internalDate: String(timestamp), labelIds: ['INBOX'], snippet: 'short preview', payload: { headers: [
         { name: 'Subject', value: 'Agenda' }, { name: 'From', value: 'Alex <alex@example.test>' },
         { name: 'To', value: 'me@example.test' }, { name: 'Message-ID', value: '<message-1>' },
       ] } });
@@ -191,7 +211,7 @@ describe('provider connector clients', () => {
     const pages: Array<{ items: unknown[]; cursor?: string; count: number; metadata: { unavailableIds: string[]; window: { from: string; to: string }; queryFingerprint: string } }> = [];
     const result = await client.syncMessageWindow(account, { timeMin: new Date(start).toISOString(), timeMax: new Date(end).toISOString(), pageSize: 3, onPage: (items, cursor, count, metadata) => { pages.push({ items, cursor, count, metadata }); } });
     expect(result.items).toHaveLength(1);
-    expect(result.items[0]).toMatchObject({ id: 'in-window', idFormat: 'gmail', senderEmail: 'alex@example.test', replyMetadataComplete: true });
+    expect(result.items[0]).toMatchObject({ id: 'in-window', idFormat: 'gmail', senderEmail: 'alex@example.test', replyMetadataComplete: true, providerVersion: 'history-11', sizeEstimate: 250 });
     expect(result.unavailableIds).toEqual(['deleted']);
     expect(result.partial).toBe(true);
     expect(result.nextCursor).toContain('q=after%3A');
@@ -201,6 +221,153 @@ describe('provider connector clients', () => {
     expect(pages[0].metadata).toMatchObject({ unavailableIds: ['deleted'], window: result.window, queryFingerprint: result.queryFingerprint });
     expect(seen).toHaveLength(4);
     expect(seen.slice(1).every((url) => url.includes('format=metadata'))).toBe(true);
+    const metaUrl = new URL(seen[1]);
+    expect(metaUrl.searchParams.get('fields')).toBe('id,threadId,historyId,sizeEstimate,snippet,internalDate,labelIds,payload(headers)');
+  });
+
+  it('loads a selected Gmail message once from a fresh bounded estimate and returns full-text metadata', async () => {
+    const requested: URL[] = [];
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => { const url = new URL(String(input)); requested.push(url); return response(gmailSelectedMessage()); }) as typeof fetch;
+    const { client } = fixture({ fetcher });
+    const result = await client.readSelectedMessageText(account, 'gmail-selected', { sizeEstimate: 1234, sizeCheckedAt: new Date(Date.now() - 1000).toISOString() });
+    expect(result).toMatchObject({ status: 'available', text: 'Selected message body', bytes: 21, representation: 'plain', completeness: 'complete_text', extractionVersion: 'mail-text-v1' });
+    expect(result.message).toMatchObject({ id: 'gmail-selected', idFormat: 'gmail', threadId: 'thread-selected', providerVersion: 'history-7', sizeEstimate: 1234, replyMetadataComplete: true });
+    expect(requested).toHaveLength(1);
+    expect(requested[0].searchParams.get('format')).toBe('full');
+    expect(requested[0].searchParams.get('fields')).toContain('historyId,sizeEstimate');
+    expect(requested[0].searchParams.get('fields')).toContain('attachmentId');
+    expect(requested[0].searchParams.get('fields')?.match(/parts\(/g)?.length).toBe(12);
+  });
+
+  it('ignores unrelated malformed or long headers while still rejecting malformed selected headers', async () => {
+    const noisyMessage = gmailSelectedMessage();
+    const noisyPayload = noisyMessage.payload as Record<string, unknown>;
+    noisyPayload.headers = [
+      ...selectedHeaders(),
+      { name: 'DKIM-Signature', value: `v=1; ${'signature-data'.repeat(300)}` },
+      { name: 'Received', value: `from relay ${'x'.repeat(5000)}` },
+      { name: 'X-Unrelated', value: { providerExtension: true } },
+    ];
+    const noisyClient = fixture({ fetcher: vi.fn(async () => response(noisyMessage)) as typeof fetch }).client;
+    await expect(noisyClient.readSelectedMessageText(account, 'gmail-selected', { sizeEstimate: 1234, sizeCheckedAt: new Date().toISOString() }))
+      .resolves.toMatchObject({ status: 'available', text: 'Selected message body' });
+
+    const malformedMessage = gmailSelectedMessage();
+    const malformedPayload = malformedMessage.payload as Record<string, unknown>;
+    malformedPayload.headers = [...selectedHeaders().filter((header) => header.name !== 'Subject'), { name: 'Subject', value: 'Injected\r\nX-Evil: yes' }];
+    const malformedClient = fixture({ fetcher: vi.fn(async () => response(malformedMessage)) as typeof fetch }).client;
+    await expect(malformedClient.readSelectedMessageText(account, 'gmail-selected', { sizeEstimate: 1234, sizeCheckedAt: new Date().toISOString() }))
+      .resolves.toMatchObject({ status: 'unavailable', reasons: expect.arrayContaining(['reply_metadata_incomplete']) });
+  });
+
+  it('rejects selected-response JSON with invalid wire UTF-8 and preserves normal Unicode text', async () => {
+    const prefix = new TextEncoder().encode('{"id":"gmail-selected","invalid":"');
+    const suffix = new TextEncoder().encode('"}');
+    const malformedBytes = new Uint8Array(prefix.length + 1 + suffix.length);
+    malformedBytes.set(prefix); malformedBytes[prefix.length] = 0xff; malformedBytes.set(suffix, prefix.length + 1);
+    const invalidGmailClient = fixture({ fetcher: vi.fn(async () => new Response(malformedBytes, { headers: { 'content-type': 'application/json' } })) as typeof fetch }).client;
+    await expect(invalidGmailClient.readSelectedMessageText(account, 'gmail-selected', { sizeEstimate: 1234, sizeCheckedAt: new Date().toISOString() }))
+      .resolves.toMatchObject({ status: 'unavailable', reasons: ['invalid_selected_response_json'] });
+
+    const unicodeGraph = graphSelectedMessage('AAMk-selected==', 'café 🙂');
+    const validGraphClient = fixture({ fetcher: vi.fn(async () => response(unicodeGraph)) as typeof fetch, token: token({ identity: microsoftIdentity }) }).client;
+    await expect(validGraphClient.readSelectedMessageText(microsoftAccount, 'AAMk-selected=='))
+      .resolves.toMatchObject({ status: 'available', text: 'café 🙂', completeness: 'complete_text' });
+
+    const invalidGraphClient = fixture({ fetcher: vi.fn(async () => new Response(malformedBytes, { headers: { 'content-type': 'application/json' } })) as typeof fetch, token: token({ identity: microsoftIdentity }) }).client;
+    await expect(invalidGraphClient.readSelectedMessageText(microsoftAccount, 'AAMk-selected=='))
+      .resolves.toMatchObject({ status: 'unavailable', reasons: ['invalid_selected_response_json'] });
+  });
+
+  it('uses one Gmail size preflight for stale estimates and stops before full retrieval above the cap', async () => {
+    const requested: URL[] = [];
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input)); requested.push(url);
+      return url.searchParams.has('format') ? response(gmailSelectedMessage()) : response({ id: 'gmail-selected', threadId: 'thread-selected', historyId: 'history-8', sizeEstimate: 300 * 1024 });
+    }) as typeof fetch;
+    const { client } = fixture({ fetcher });
+    const result = await client.readSelectedMessageText(account, 'gmail-selected', { sizeEstimate: 12, sizeCheckedAt: new Date(Date.now() - 16 * 60_000).toISOString() });
+    expect(result).toMatchObject({ status: 'unavailable', completeness: 'unavailable', representation: 'none', reasons: ['size_limit'] });
+    expect(result.message).toMatchObject({ providerVersion: 'history-8', sizeEstimate: 300 * 1024 });
+    expect(requested).toHaveLength(1);
+    expect(requested[0].searchParams.get('fields')).toBe('id,threadId,historyId,sizeEstimate');
+    expect(requested[0].searchParams.has('format')).toBe(false);
+  });
+
+  it('uses at most preflight and full GET when the Gmail size estimate is missing', async () => {
+    const requested: URL[] = [];
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input)); requested.push(url);
+      return url.searchParams.has('format') ? response(gmailSelectedMessage()) : response({ id: 'gmail-selected', threadId: 'thread-selected', historyId: 'history-8', sizeEstimate: 1234 });
+    }) as typeof fetch;
+    const { client } = fixture({ fetcher });
+    const result = await client.readSelectedMessageText(account, 'gmail-selected');
+    expect(result.status).toBe('available');
+    expect(requested).toHaveLength(2);
+    expect(requested.map((url) => url.pathname)).toEqual([
+      '/gmail/v1/users/me/messages/gmail-selected', '/gmail/v1/users/me/messages/gmail-selected',
+    ]);
+  });
+
+  it('labels HTML and attachment-only Gmail content as snippets and never fetches attachment IDs', async () => {
+    const requested: string[] = [];
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      requested.push(String(input));
+      const message = gmailSelectedMessage('gmail-selected', 'ignored');
+      (message.payload as Record<string, unknown>) = { mimeType: 'multipart/mixed', headers: selectedHeaders(), parts: [
+        { mimeType: 'text/html', body: { data: b64url('<p>html body</p>') } },
+        { mimeType: 'text/plain', body: { attachmentId: 'external-attachment' } },
+      ] };
+      return response(message);
+    }) as typeof fetch;
+    const { client } = fixture({ fetcher });
+    const result = await client.readSelectedMessageText(account, 'gmail-selected', { sizeEstimate: 1234, sizeCheckedAt: new Date().toISOString() });
+    expect(result).toMatchObject({ status: 'available', text: 'Selected snippet', representation: 'snippet', completeness: 'excerpt' });
+    expect(result.reasons).toEqual(expect.arrayContaining(['html_conversion_unavailable', 'attachment_body_unavailable']));
+    expect(requested).toHaveLength(1);
+    expect(requested.some((url) => url.includes('attachments'))).toBe(false);
+  });
+
+  it('returns unavailable for mismatched Gmail IDs, oversized responses, and failed resource auth without retries', async () => {
+    const mismatch = fixture({ fetcher: vi.fn(async () => response(gmailSelectedMessage('different-id'))) as typeof fetch }).client;
+    const mismatchResult = await mismatch.readSelectedMessageText(account, 'gmail-selected', { sizeEstimate: 1234, sizeCheckedAt: new Date().toISOString() });
+    expect(mismatchResult.status).toBe('unavailable');
+    const oversizedFetcher = vi.fn(async () => new Response('{}', { headers: { 'content-length': String(1024 * 1024 + 1) } })) as typeof fetch;
+    const oversized = fixture({ fetcher: oversizedFetcher }).client;
+    expect(await oversized.readSelectedMessageText(account, 'gmail-selected', { sizeEstimate: 1234, sizeCheckedAt: new Date().toISOString() })).toMatchObject({ status: 'unavailable', reasons: ['response_byte_limit'] });
+    const unauthorizedFetcher = vi.fn(async () => response({ error: 'unauthorized' }, 401)) as typeof fetch;
+    await expect(fixture({ fetcher: unauthorizedFetcher }).client.readSelectedMessageText(account, 'gmail-selected', { sizeEstimate: 1234, sizeCheckedAt: new Date().toISOString() })).rejects.toThrow(/401/);
+    expect(oversizedFetcher).toHaveBeenCalledTimes(1);
+    expect(unauthorizedFetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it('reads one Graph selected message with both preferences and full-body scope, then uses explicit snippet fallback for HTML', async () => {
+    let requestedUrl = '';
+    let prefer = '';
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => { requestedUrl = String(input); prefer = new Headers(init?.headers).get('prefer') ?? ''; return response(graphSelectedMessage()); }) as typeof fetch;
+    const { client } = fixture({ fetcher, token: token({ identity: microsoftIdentity }) });
+    const result = await client.readSelectedMessageText(microsoftAccount, 'AAMk-selected==');
+    expect(result).toMatchObject({ status: 'available', text: 'Selected Graph body', representation: 'plain', completeness: 'complete_text' });
+    expect(result.message).toMatchObject({ id: 'AAMk-selected==', idFormat: 'graph-immutable', providerVersion: 'change-7', replyMetadataComplete: true });
+    expect(requestedUrl).toContain('/me/messages/AAMk-selected%3D%3D?');
+    expect(new URL(requestedUrl).searchParams.get('$select')).toBe('id,conversationId,changeKey,subject,body,bodyPreview,from,replyTo,toRecipients,ccRecipients,internetMessageId,internetMessageHeaders,isRead,receivedDateTime');
+    expect(prefer).toContain('IdType="ImmutableId"');
+    expect(prefer).toContain('outlook.body-content-type="text"');
+    expect(fetcher).toHaveBeenCalledTimes(1);
+
+    const htmlClient = fixture({ fetcher: vi.fn(async () => response(graphSelectedMessage('AAMk-selected==', '', { body: { contentType: 'html', content: '<p>body</p>' } }))) as typeof fetch, token: token({ identity: microsoftIdentity }) }).client;
+    await expect(htmlClient.readSelectedMessageText(microsoftAccount, 'AAMk-selected==')).resolves.toMatchObject({ text: 'Graph snippet', representation: 'snippet', completeness: 'excerpt', reasons: expect.arrayContaining(['html_conversion_unavailable']) });
+  });
+
+  it('refuses Graph Basic-only body reads and mismatched immutable IDs before extra requests', async () => {
+    const basicAccount = { ...microsoftAccount, grantedScopes: ['Mail.ReadBasic'] };
+    const tokenGet = vi.fn(async () => token({ identity: microsoftIdentity }));
+    const fetcher = vi.fn() as typeof fetch;
+    const client = new ConnectorClient({ tokenStore: { get: tokenGet, set: async () => {} }, fetcher });
+    await expect(client.readSelectedMessageText(basicAccount, 'AAMk-selected==')).rejects.toThrow(/Full message body read permission/i);
+    expect(tokenGet).not.toHaveBeenCalled();
+    const mismatch = fixture({ token: token({ identity: microsoftIdentity }), fetcher: vi.fn(async () => response(graphSelectedMessage('other-id'))) as typeof fetch }).client;
+    await expect(mismatch.readSelectedMessageText(microsoftAccount, 'AAMk-selected==')).resolves.toMatchObject({ status: 'unavailable', reasons: ['message_id_mismatch_or_invalid_response'] });
   });
 
   it('does not commit a Gmail page with an invalid message date and validates window cursor query binding', async () => {

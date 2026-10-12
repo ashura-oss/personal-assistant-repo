@@ -298,7 +298,7 @@ export default function App() {
         const selected = isDispatchHistoryDemo
           ? await createDispatchHistoryScenario()
           : isMailSyncDemo
-            ? await createMailSyncScenario()
+            ? await createMailSyncScenario({ mockGeneration: true })
             : productionController;
         if (!mounted) return;
         setController(selected);
@@ -1220,6 +1220,7 @@ export default function App() {
                 proposal={currentReviewProposal}
                 dispatchRecords={state.dispatchRecords}
                 busy={busy}
+                demoMode={isMailSyncDemo}
                 onReconcile={(recordId, input) =>
                   run(async () => {
                     const saved = await controller.reconcileDispatch(
@@ -1300,7 +1301,7 @@ export default function App() {
                     if (!review) return;
                     setReview(await controller.approveProposal(review.id));
                     setNotice(
-                      "Approved for this exact draft. Sending remains a separate step.",
+                      "Approved for this exact version. The action remains a separate step.",
                     );
                   })
                 }
@@ -1326,6 +1327,9 @@ export default function App() {
           messageId={replyMessageId}
           controller={controller}
           busy={busy}
+          demoMode={isMailSyncDemo}
+          notes={state.notes}
+          documents={state.documents}
           onClose={() => setReplyMessageId(null)}
           onSave={saveMailReply}
         />
@@ -1858,9 +1862,9 @@ function LibraryScreen({
         onPress={onExport}
       />
       <Text style={s.disclaimer}>
-        JSON export contains transcripts, settings, and documents, not audio
-        files. Export each recording from its note. Protect exported files as
-        sensitive data.
+        JSON exports include notes, documents, tasks, cached mail and message
+        text, calendars, and action history. Export recordings separately.
+        Protect exported files as private data.
       </Text>
     </ScrollView>
   );

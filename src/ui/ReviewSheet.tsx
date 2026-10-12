@@ -12,6 +12,7 @@ type ReviewSheetProps = {
   proposal: Proposal | null;
   dispatchRecords: DispatchRecord[];
   busy?: boolean;
+  demoMode?: boolean;
   onClose: () => void;
   onEdit: (
     p: Partial<
@@ -62,6 +63,7 @@ function ReviewSheetContent({
   proposal,
   dispatchRecords,
   busy = false,
+  demoMode = false,
   onClose,
   onEdit,
   onApprove,
@@ -75,6 +77,7 @@ function ReviewSheetContent({
   onRetrySourceCheck,
   onReassist,
 }: Omit<ReviewSheetProps, "proposal"> & { proposal: Proposal }) {
+  const previewMode = demoMode || state.settings.mode === "preview";
   const [title, setTitle] = useState(proposal.title);
   const [body, setBody] = useState(proposal.body);
   const [recipients] = useState(proposal.recipients.join(", "));
@@ -187,7 +190,7 @@ function ReviewSheetContent({
   );
   const actionLabel =
     proposal.kind === "email"
-      ? state.settings.mode === "preview"
+      ? previewMode
         ? effectiveEmailOperation === "draft"
           ? mailReply
             ? "Preview reply draft"
@@ -201,7 +204,7 @@ function ReviewSheetContent({
       : proposal.kind === "reminder"
         ? "Schedule reminder"
         : proposal.kind === "event"
-          ? state.settings.mode === "preview"
+          ? previewMode
             ? "Preview calendar action"
             : "Create approved event"
           : proposal.kind === "memory"
@@ -223,7 +226,7 @@ function ReviewSheetContent({
       )
     : undefined;
   const blocked =
-    state.settings.mode !== "preview" &&
+    !previewMode &&
     (proposal.kind === "email"
       ? mailReply
         ? !replyAccount?.capabilities?.includes("mail.draft")
@@ -425,7 +428,7 @@ function ReviewSheetContent({
             Saved excerpt: “{frozenReplySource.snippet || "No excerpt was saved."}”
           </Text>
           <Text style={s.disclaimer}>
-            Source details are checked before approval. The full message body was not saved.
+            Approval rechecks the saved source details. This action preserves the source metadata and excerpt; selected message text is kept separately in the local cache.
           </Text>
         </View>
       ) : null}
@@ -746,11 +749,12 @@ function ReviewSheetContent({
           and time.
         </Text>
       ) : null}
-      {state.settings.mode === "preview" &&
+      {previewMode &&
       (proposal.kind === "email" || proposal.kind === "event") ? (
         <Text style={s.disclaimer}>
-          Preview mode simulates this action. No email will be sent and no
-          external calendar will change.
+          {demoMode
+            ? "Sample preview only. No mailbox draft, email, or calendar change will be created."
+            : "Preview mode simulates this action. No email will be sent and no external calendar will change."}
         </Text>
       ) : null}
       <Text style={s.disclaimer}>

@@ -1,5 +1,6 @@
 import type { Account, AccountCapability, EmailProposalPayload, EventProposalPayload } from '../core';
-import { replyReferences as frozenReplyReferences, validateReplyBinding, type MailReplyProvenance } from '../mailReply';
+import { canonicalMailReplySource, replyReferences as frozenReplyReferences, validateReplyBinding, type MailReplyProvenance } from '../mailReply';
+import { boundGraphText, extractGmailMessageText, type MailTextCompleteness, type MailTextRepresentation } from './mailText';
 import { scopeGrantsCapability } from './oauth';
 
 const GOOGLE_API = 'https://gmail.googleapis.com/gmail/v1/users/me';
@@ -10,6 +11,9 @@ const MAX_PAGES = 3;
 const MAX_DETAILS = 10;
 const MAX_PAGE_SIZE = 50;
 const MAX_ATTACHMENT_BYTES = 3 * 1024 * 1024;
+const MAX_SELECTED_MESSAGE_BYTES = 256 * 1024;
+const MAX_SELECTED_RESPONSE_BYTES = 1024 * 1024;
+const SELECTED_SIZE_FRESH_MS = 15 * 60 * 1000;
 
 export interface StoredOAuthToken {
   accessToken: string;
@@ -93,6 +97,10 @@ export class ProviderWriteRejectedError extends ProviderHttpError {
   }
 }
 
+class ProviderResponseTooLargeError extends Error {
+  constructor() { super('Provider response exceeded the selected-message response bound.'); this.name = 'ProviderResponseTooLargeError'; }
+}
+
 export interface MessageSummary {
   id: string;
   idFormat?: 'gmail' | 'graph-immutable';
@@ -106,12 +114,26 @@ export interface MessageSummary {
   replyMetadataComplete?: boolean;
   internetMessageId?: string;
   providerVersion?: string;
+  sizeEstimate?: number;
+  sizeCheckedAt?: string;
   replyTo?: string[];
   to?: string[];
   cc?: string[];
   references?: string;
   inReplyTo?: string;
   headers?: Array<{ name: string; value: string }>;
+}
+
+export interface SelectedMessageTextResult {
+  status: 'available' | 'unavailable';
+  message?: MessageSummary;
+  text?: string;
+  bytes: number;
+  representation: MailTextRepresentation;
+  completeness: MailTextCompleteness;
+  reasons: string[];
+  checkedAt: string;
+  extractionVersion: 'mail-text-v1';
 }
 
 export interface MessageWindow {
@@ -291,6 +313,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+async function strictSelectedJson(response: Response): Promise<unknown> {
+  const bytes = await response.arrayBuffer();
+  const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes).replace(/^\uFEFF/, '');
+  return JSON.parse(text) as unknown;
+}
+
 function validateCalendarEventPage(value: unknown): asserts value is Array<{
   id: string; subject?: string; summary?: string;
   start?: { dateTime?: string; timeZone?: string; date?: string };
@@ -436,6 +464,84 @@ function graphAddressList(value: unknown): { addresses?: string[]; complete: boo
   return { addresses, complete: true };
 }
 
+function gmailPayloadFields(depth = 0): string {
+  const current = 'mimeType,filename,headers,body(data,size,attachmentId)';
+  return depth >= 12 ? current : `${current},parts(${gmailPayloadFields(depth + 1)})`;
+}
+
+function safeSizeEstimate(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+function selectedHeaderSet(value: unknown): { headers: Array<{ name: string; value: string }>; complete: boolean } {
+  const allowed = new Set(['subject', 'from', 'reply-to', 'to', 'cc', 'message-id', 'references', 'in-reply-to']);
+  if (!Array.isArray(value)) return { headers: [], complete: false };
+  const headers: Array<{ name: string; value: string }> = [];
+  const seen = new Set<string>();
+  let complete = true;
+  for (const item of value) {
+    if (!isRecord(item) || typeof item.name !== 'string') { complete = false; continue; }
+    const name = item.name.trim().toLowerCase();
+    if (!allowed.has(name)) continue;
+    if (typeof item.value !== 'string' || /[\r\n\0]/.test(item.value) || item.value.length > 2000) { complete = false; continue; }
+    if (seen.has(name)) complete = false;
+    seen.add(name);
+    headers.push({ name, value: item.value });
+  }
+  if (headers.length > 8) complete = false;
+  return { headers, complete: complete && headersAreComplete(headers) };
+}
+
+function gmailSelectedSummary(value: unknown, requestedId: string, checkedAt: string): { message?: MessageSummary; payload?: unknown; snippet?: string } {
+  if (!isRecord(value) || typeof value.id !== 'string' || value.id !== requestedId || !isRecord(value.payload)) return {};
+  const headers = selectedHeaderSet(value.payload.headers);
+  const get = (name: string) => headers.headers.find((header) => header.name === name)?.value;
+  const subject = get('subject');
+  const from = get('from');
+  const senderEmail = narrowEmail(from);
+  const replyTo = parseAddressHeader(get('reply-to'));
+  const to = parseAddressHeader(get('to'));
+  const cc = parseAddressHeader(get('cc'));
+  const addressHeaders = headers.headers.filter(({ name }) => ['from', 'reply-to', 'to', 'cc'].includes(name));
+  const threadId = typeof value.threadId === 'string' ? value.threadId : undefined;
+  const providerVersion = typeof value.historyId === 'string' ? value.historyId : undefined;
+  const sizeEstimate = safeSizeEstimate(value.sizeEstimate);
+  const labelsKnown = Array.isArray(value.labelIds) && value.labelIds.every((label) => typeof label === 'string');
+  const timestamp = typeof value.internalDate === 'string' && /^\d{1,16}$/.test(value.internalDate) ? Number(value.internalDate) : NaN;
+  const receivedAt = Number.isFinite(timestamp) && Number.isFinite(new Date(timestamp).getTime()) ? new Date(timestamp).toISOString() : undefined;
+  const internetMessageId = get('message-id');
+  const replyMetadataComplete = Boolean(threadId && subject !== undefined && senderEmail && internetMessageId && validMessageId(internetMessageId) &&
+    headers.complete && labelsKnown && sizeEstimate !== undefined && receivedAt && addressHeaders.every((header) => validAddressHeader(header.value)) &&
+    (get('reply-to') === undefined || replyTo !== undefined) && (get('to') === undefined || to !== undefined) && (get('cc') === undefined || cc !== undefined));
+  const summary: MessageSummary = { id: requestedId, idFormat: 'gmail', threadId, subject, from: from?.slice(0, 1000), senderEmail,
+    receivedAt, snippet: typeof value.snippet === 'string' ? value.snippet.slice(0, 500) : undefined,
+    isRead: labelsKnown ? !(value.labelIds as string[]).includes('UNREAD') : undefined,
+    replyMetadataComplete, internetMessageId, providerVersion, sizeEstimate, sizeCheckedAt: checkedAt,
+    replyTo, to, cc, references: get('references'), inReplyTo: get('in-reply-to'), headers: headers.headers };
+  return { message: summary, payload: value.payload, snippet: summary.snippet };
+}
+
+function graphSelectedSummary(value: unknown, requestedId: string): { message?: MessageSummary; body?: { contentType?: unknown; content?: unknown }; snippet?: string } {
+  if (!isRecord(value) || typeof value.id !== 'string' || value.id !== requestedId) return {};
+  const headers = selectedHeaderSet(value.internetMessageHeaders);
+  const headerMap = new Map(headers.headers.map(({ name, value: headerValue }) => [name, headerValue]));
+  const from = isRecord(value.from) && isRecord(value.from.emailAddress) && typeof value.from.emailAddress.address === 'string' ? value.from.emailAddress.address : undefined;
+  const senderEmail = narrowEmail(from);
+  const replyTo = graphAddressList(value.replyTo); const to = graphAddressList(value.toRecipients); const cc = graphAddressList(value.ccRecipients);
+  const threadId = typeof value.conversationId === 'string' ? value.conversationId : undefined;
+  const providerVersion = typeof value.changeKey === 'string' ? value.changeKey : undefined;
+  const receivedAt = typeof value.receivedDateTime === 'string' && Number.isFinite(Date.parse(value.receivedDateTime)) ? new Date(value.receivedDateTime).toISOString() : undefined;
+  const subject = typeof value.subject === 'string' ? value.subject : undefined;
+  const internetMessageId = typeof value.internetMessageId === 'string' ? value.internetMessageId : undefined;
+  const replyMetadataComplete = Boolean(threadId && providerVersion && receivedAt && subject !== undefined && senderEmail && internetMessageId && validMessageId(internetMessageId) &&
+    headers.complete && replyTo.complete && to.complete && cc.complete && typeof value.isRead === 'boolean');
+  const summary: MessageSummary = { id: requestedId, idFormat: 'graph-immutable', threadId, subject, from, senderEmail, isRead: typeof value.isRead === 'boolean' ? value.isRead : undefined,
+    receivedAt, snippet: typeof value.bodyPreview === 'string' ? value.bodyPreview.slice(0, 500) : undefined, replyMetadataComplete,
+    internetMessageId, providerVersion, replyTo: replyTo.addresses, to: to.addresses, cc: cc.addresses,
+    references: headerMap.get('references'), inReplyTo: headerMap.get('in-reply-to'), headers: headers.headers };
+  return { message: summary, body: isRecord(value.body) ? { contentType: value.body.contentType, content: value.body.content } : undefined, snippet: summary.snippet };
+}
+
 export class ConnectorClient {
   private readonly fetcher: typeof fetch;
   private readonly now: () => number;
@@ -444,7 +550,7 @@ export class ConnectorClient {
     this.now = deps.now ?? Date.now;
   }
 
-  private async boundedFetch(input: RequestInfo | URL, init: RequestInit, guard?: RequestGuard, onDispatched?: () => void, beforeDispatch?: () => void, outerSignal?: AbortSignal): Promise<Response> {
+  private async boundedFetch(input: RequestInfo | URL, init: RequestInit, guard?: RequestGuard, onDispatched?: () => void, beforeDispatch?: () => void, outerSignal?: AbortSignal, responseByteLimit?: number): Promise<Response> {
     const controller = new AbortController();
     const timeout = Math.max(1_000, Math.min(30_000, this.deps.requestTimeoutMs ?? 15_000));
     const timer = setTimeout(() => controller.abort(), timeout);
@@ -456,7 +562,11 @@ export class ConnectorClient {
       beforeDispatch?.();
       onDispatched?.();
       const response = await this.fetcher(input, { ...init, signal: controller.signal });
+      const declaredLength = response.headers.get('content-length');
+      if (responseByteLimit && declaredLength && /^\d+$/.test(declaredLength) && Number(declaredLength) > responseByteLimit) throw new ProviderResponseTooLargeError();
+      // Fetch has already buffered native response bytes when arrayBuffer resolves; this is an application parsing bound, not a network-memory cap.
       const bytes = await response.arrayBuffer();
+      if (responseByteLimit && bytes.byteLength > responseByteLimit) throw new ProviderResponseTooLargeError();
       return new Response(response.status === 204 || response.status === 205 || response.status === 304 ? null : bytes, { status: response.status, statusText: response.statusText, headers: response.headers });
     }
     finally { clearTimeout(timer); outerSignal?.removeEventListener('abort', forwardAbort); }
@@ -547,14 +657,14 @@ export class ConnectorClient {
     if (this.deps.isConnectionCurrent && !this.deps.isConnectionCurrent(account)) throw new Error('Account connection changed during provider work; reconnect before continuing.');
   }
 
-  private async request(account: Account, rawUrl: string, kind: 'mail' | 'calendar', init: RequestInit = {}, retryAuth = true, guard?: RequestGuard, onDispatched?: () => void, signal?: AbortSignal, beforeDispatch?: () => void): Promise<Response> {
+  private async request(account: Account, rawUrl: string, kind: 'mail' | 'calendar', init: RequestInit = {}, retryAuth = true, guard?: RequestGuard, onDispatched?: () => void, signal?: AbortSignal, beforeDispatch?: () => void, responseByteLimit?: number): Promise<Response> {
     const url = safeUrl(rawUrl, account.provider, kind);
     const token = await this.token(account, guard, signal);
     this.assertConnectionCurrent(account);
     let response: Response;
     const requestHeaders = account.provider === 'microsoft' && kind === 'mail' ? graphImmutableHeaders(init) : new Headers(init.headers);
     requestHeaders.set('authorization', `Bearer ${token.accessToken}`);
-    try { response = await this.boundedFetch(url.toString(), { ...init, redirect: 'error', headers: requestHeaders }, guard, onDispatched, beforeDispatch, signal); }
+    try { response = await this.boundedFetch(url.toString(), { ...init, redirect: 'error', headers: requestHeaders }, guard, onDispatched, beforeDispatch, signal, responseByteLimit); }
     catch (error) { throw error; }
     if (response.status !== 401 || !retryAuth) return response;
     // A non-idempotent request is never repeated after an ambiguous response.
@@ -653,9 +763,13 @@ export class ConnectorClient {
       const ids = page.messages ?? [];
       for (const listed of ids) {
         if (typeof listed.id !== 'string' || !listed.id) throw new Error('Gmail returned a message without an ID.');
-        let detail: { id?: string; threadId?: string; snippet?: string; internalDate?: string; labelIds?: string[]; payload?: { headers?: Array<{ name?: string; value?: string }> } };
+        let detail: { id?: string; threadId?: string; historyId?: string; sizeEstimate?: number; snippet?: string; internalDate?: string; labelIds?: string[]; payload?: { headers?: Array<{ name?: string; value?: string }> } };
         try {
-          detail = await this.json(account, `${GOOGLE_API}/messages/${encodeURIComponent(listed.id)}?format=metadata&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=Reply-To&metadataHeaders=To&metadataHeaders=Cc&metadataHeaders=Message-ID&metadataHeaders=References&metadataHeaders=In-Reply-To`, 'mail', undefined, options.guard, options.signal);
+          const detailUrl = new URL(`${GOOGLE_API}/messages/${encodeURIComponent(listed.id)}`);
+          detailUrl.searchParams.set('format', 'metadata');
+          for (const name of ['Subject', 'From', 'Reply-To', 'To', 'Cc', 'Message-ID', 'References', 'In-Reply-To']) detailUrl.searchParams.append('metadataHeaders', name);
+          detailUrl.searchParams.set('fields', 'id,threadId,historyId,sizeEstimate,snippet,internalDate,labelIds,payload(headers)');
+          detail = await this.json(account, detailUrl.toString(), 'mail', undefined, options.guard, options.signal);
         } catch (error) {
           if (error instanceof ProviderHttpError && error.status === 404) { unavailableIds.push(listed.id); continue; }
           throw error;
@@ -680,7 +794,8 @@ export class ConnectorClient {
         pageItems.push({ id: detail.id ?? listed.id, idFormat: 'gmail', threadId: detail.threadId ?? listed.threadId,
           subject: get('subject'), from: from?.slice(0, 1000), senderEmail, receivedAt: new Date(timestamp).toISOString(),
           snippet: detail.snippet?.slice(0, 500), isRead: labelsKnown ? !detail.labelIds!.includes('UNREAD') : undefined,
-          replyMetadataComplete, to, cc, replyTo, internetMessageId: get('message-id')?.slice(0, 1000),
+          replyMetadataComplete, to, cc, replyTo, internetMessageId: get('message-id')?.slice(0, 1000), providerVersion: detail.historyId,
+          sizeEstimate: safeSizeEstimate(detail.sizeEstimate), sizeCheckedAt: new Date(this.now()).toISOString(),
           references: get('references')?.slice(0, 2000), inReplyTo: get('in-reply-to')?.slice(0, 1000), headers });
       }
     } else {
@@ -720,6 +835,105 @@ export class ConnectorClient {
     items.push(...pageItems);
     await options.onPage?.(pageItems, nextCursor, 1, { unavailableIds: [...unavailableIds], window, queryFingerprint });
     return { items, nextCursor, partial: Boolean(nextCursor), window, queryFingerprint, unavailableIds };
+  }
+
+  async readSelectedMessageText(account: Account, providerMessageId: string, options: {
+    sizeEstimate?: number; sizeCheckedAt?: string; guard?: RequestGuard; signal?: AbortSignal;
+  } = {}): Promise<SelectedMessageTextResult> {
+    capability(account, 'mail.read');
+    if ((account.provider !== 'google' && account.provider !== 'microsoft') || !account.grantedScopes ||
+        !scopeGrantsCapability(account.provider, account.grantedScopes, 'mail.read')) throw new Error('Full message body read permission is required.');
+    if (!providerMessageId || providerMessageId.length > 2048 || /[\r\n\0]/.test(providerMessageId)) throw new Error('Selected message identifier is invalid.');
+    const idFormat = account.provider === 'google' ? 'gmail' as const : 'graph-immutable' as const;
+    const initialMessage: MessageSummary = { id: providerMessageId, idFormat };
+    let sizeEstimate: number | undefined;
+    let providerVersion: string | undefined;
+    let checkedAt = new Date(this.now()).toISOString();
+    const unavailable = (reasons: string[], message?: MessageSummary): SelectedMessageTextResult => ({ status: 'unavailable', ...(message ? { message } : {}),
+      bytes: 0, representation: 'none', completeness: 'unavailable', reasons: reasons.slice(0, 16), checkedAt, extractionVersion: 'mail-text-v1' });
+
+    if (account.provider === 'google') {
+      const suppliedEstimate = safeSizeEstimate(options.sizeEstimate);
+      const checkedMs = typeof options.sizeCheckedAt === 'string' ? Date.parse(options.sizeCheckedAt) : NaN;
+      const estimateIsFresh = suppliedEstimate !== undefined && Number.isFinite(checkedMs) && checkedMs <= this.now() && this.now() - checkedMs <= SELECTED_SIZE_FRESH_MS;
+      if (estimateIsFresh) sizeEstimate = suppliedEstimate;
+      else {
+        const preflightUrl = new URL(`${GOOGLE_API}/messages/${encodeURIComponent(providerMessageId)}`);
+        preflightUrl.searchParams.set('fields', 'id,threadId,historyId,sizeEstimate');
+        let preflight: Response;
+        try { preflight = await this.request(account, preflightUrl.toString(), 'mail', { method: 'GET' }, false, options.guard, undefined, options.signal, undefined, MAX_SELECTED_RESPONSE_BYTES); }
+        catch (error) {
+          if (error instanceof ProviderResponseTooLargeError) return unavailable(['response_byte_limit'], initialMessage);
+          throw error;
+        }
+        if (!preflight.ok) throw new ProviderHttpError(preflight.status);
+        let metadata: unknown;
+        try { metadata = await strictSelectedJson(preflight); }
+        catch { return unavailable(['invalid_selected_response_json'], initialMessage); }
+        if (!isRecord(metadata) || metadata.id !== providerMessageId) return unavailable(['preflight_id_mismatch'], initialMessage);
+        sizeEstimate = safeSizeEstimate(metadata.sizeEstimate);
+        providerVersion = typeof metadata.historyId === 'string' ? metadata.historyId : undefined;
+        const threadId = typeof metadata.threadId === 'string' ? metadata.threadId : undefined;
+        if (sizeEstimate === undefined) return unavailable(['size_estimate_unavailable'], { ...initialMessage, threadId, providerVersion });
+        if (sizeEstimate > MAX_SELECTED_MESSAGE_BYTES) return unavailable(['size_limit'], { ...initialMessage, threadId, providerVersion, sizeEstimate, sizeCheckedAt: new Date(this.now()).toISOString() });
+      }
+      if (sizeEstimate !== undefined && sizeEstimate > MAX_SELECTED_MESSAGE_BYTES) return unavailable(['size_limit'], { ...initialMessage, sizeEstimate, sizeCheckedAt: new Date(this.now()).toISOString() });
+
+      const fullUrl = new URL(`${GOOGLE_API}/messages/${encodeURIComponent(providerMessageId)}`);
+      fullUrl.searchParams.set('format', 'full');
+      fullUrl.searchParams.set('fields', `id,threadId,historyId,sizeEstimate,snippet,internalDate,labelIds,payload(${gmailPayloadFields()})`);
+      let response: Response;
+      try { response = await this.request(account, fullUrl.toString(), 'mail', { method: 'GET' }, false, options.guard, undefined, options.signal, undefined, MAX_SELECTED_RESPONSE_BYTES); }
+      catch (error) {
+        if (error instanceof ProviderResponseTooLargeError) return unavailable(['response_byte_limit'], { ...initialMessage, sizeEstimate });
+        throw error;
+      }
+      if (!response.ok) throw new ProviderHttpError(response.status);
+      let data: unknown;
+      try { data = await strictSelectedJson(response); }
+      catch { return unavailable(['invalid_selected_response_json'], { ...initialMessage, sizeEstimate }); }
+      checkedAt = new Date(this.now()).toISOString();
+      const selected = gmailSelectedSummary(data, providerMessageId, checkedAt);
+      if (!selected.message) return unavailable(['message_id_mismatch_or_invalid_response'], initialMessage);
+      const actualEstimate = selected.message.sizeEstimate;
+      if (actualEstimate !== undefined && actualEstimate > MAX_SELECTED_MESSAGE_BYTES) return unavailable(['size_limit'], selected.message);
+      const extracted = extractGmailMessageText(selected.payload, selected.snippet);
+      const reasons = [...extracted.reasons];
+      if (!selected.message.replyMetadataComplete) reasons.push('reply_metadata_incomplete');
+      return { status: selected.message.replyMetadataComplete && extracted.text !== undefined ? 'available' : 'unavailable', message: selected.message,
+        ...(extracted.text !== undefined ? { text: extracted.text } : {}), bytes: extracted.bytes, representation: extracted.representation,
+        completeness: extracted.completeness, reasons: reasons.slice(0, 16), checkedAt, extractionVersion: 'mail-text-v1' };
+    }
+
+    const graphUrl = new URL(`${GRAPH_API}/me/messages/${encodeURIComponent(providerMessageId)}`);
+    graphUrl.searchParams.set('$select', 'id,conversationId,changeKey,subject,body,bodyPreview,from,replyTo,toRecipients,ccRecipients,internetMessageId,internetMessageHeaders,isRead,receivedDateTime');
+    let graphResponse: Response;
+    try {
+      graphResponse = await this.request(account, graphUrl.toString(), 'mail', { method: 'GET', headers: { prefer: 'IdType="ImmutableId", outlook.body-content-type="text"' } }, false,
+        options.guard, undefined, options.signal, undefined, MAX_SELECTED_RESPONSE_BYTES);
+    } catch (error) {
+      if (error instanceof ProviderResponseTooLargeError) return unavailable(['response_byte_limit'], initialMessage);
+      throw error;
+    }
+    if (!graphResponse.ok) throw new ProviderHttpError(graphResponse.status);
+    let graphData: unknown;
+    try { graphData = await strictSelectedJson(graphResponse); }
+    catch { return unavailable(['invalid_selected_response_json'], initialMessage); }
+    checkedAt = new Date(this.now()).toISOString();
+    const selected = graphSelectedSummary(graphData, providerMessageId);
+    if (!selected.message) return unavailable(['message_id_mismatch_or_invalid_response'], initialMessage);
+    const contentType = typeof selected.body?.contentType === 'string' ? selected.body.contentType.toLowerCase() : '';
+    let extracted;
+    if (contentType === 'text' && typeof selected.body?.content === 'string') extracted = boundGraphText(selected.body.content);
+    else {
+      extracted = extractGmailMessageText(undefined, selected.snippet);
+      extracted.reasons = [...extracted.reasons, contentType === 'html' ? 'html_conversion_unavailable' : 'plain_body_unavailable'].slice(0, 16);
+    }
+    const reasons = [...extracted.reasons];
+    if (!selected.message.replyMetadataComplete) reasons.push('reply_metadata_incomplete');
+    return { status: selected.message.replyMetadataComplete && extracted.text !== undefined ? 'available' : 'unavailable', message: selected.message,
+      ...(extracted.text !== undefined ? { text: extracted.text } : {}), bytes: extracted.bytes, representation: extracted.representation,
+      completeness: extracted.completeness, reasons: reasons.slice(0, 16), checkedAt, extractionVersion: 'mail-text-v1' };
   }
 
   private async writeJson(account: Account, url: string, kind: 'mail' | 'calendar', init: RequestInit, beforeDispatch: () => void): Promise<MutationReceipt> {
@@ -911,8 +1125,14 @@ export class ConnectorClient {
   private finalVerify(envelope: ApprovedDispatch, verifier: DispatchVerifier): void {
     if (!verifier.verifyBeforeDispatch(envelope)) throw new Error('Approved action changed before provider dispatch. Review and approve it again.');
     if (envelope.replySource) {
+      try { canonicalMailReplySource(envelope.replySource.source); }
+      catch { throw new Error('Reply source approval is invalid. Review the source and approve the reply again.'); }
+      const now = this.now();
+      const observedAt = Date.parse(envelope.replySource.source.observedAt);
       const expiresAt = Date.parse(envelope.replySource.expiresAt);
-      if (!Number.isFinite(expiresAt) || expiresAt <= this.now()) throw new Error('Reply source approval has expired. Review the source and approve the reply again.');
+      if (!Number.isFinite(observedAt) || observedAt > now || now - observedAt > SELECTED_SIZE_FRESH_MS || !Number.isFinite(expiresAt) || expiresAt <= now) {
+        throw new Error('Reply source approval has expired. Review the source and approve the reply again.');
+      }
     }
   }
 

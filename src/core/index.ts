@@ -285,6 +285,8 @@ export interface MailboxSnapshotMessage {
   replyMetadataComplete?: boolean;
   internetMessageId?: string;
   providerVersion?: string;
+  sizeEstimate?: number;
+  sizeCheckedAt?: string;
   replyTo?: string[];
   to?: string[];
   cc?: string[];
@@ -498,6 +500,66 @@ export interface MailReplySourceResult {
   defaults?: { reply: { to: string[]; cc: string[] }; reply_all: { to: string[]; cc: string[] } };
 }
 
+/** Bounded, selected-message body cache; it is separate from mailbox metadata and never contains credentials. */
+export interface SelectedMailTextSnapshot {
+  version: 1;
+  messageId: string;
+  accountId: string;
+  identityKey: string;
+  identity: NonNullable<Account['identity']>;
+  connectionGeneration: number;
+  providerMessageId: string;
+  idFormat: 'gmail' | 'graph-immutable';
+  sourceDigest: string;
+  providerVersion?: string;
+  checkedAt: string;
+  text?: string;
+  textDigest?: string;
+  bytes: number;
+  extractionVersion: 'mail-text-v1';
+  representation: 'plain' | 'snippet' | 'none';
+  completeness: 'complete_text' | 'excerpt' | 'unavailable';
+  omissionReasons: string[];
+}
+
+export interface MailReplyTextLoadResult {
+  status: 'current' | 'source_changed' | 'stale' | 'unavailable';
+  snapshot?: SelectedMailTextSnapshot;
+}
+
+export interface MailReplyTextCacheResult {
+  status: 'current' | 'stale' | 'missing' | 'unavailable';
+  snapshot?: SelectedMailTextSnapshot;
+}
+
+export interface MailReplyTextGenerationInput {
+  messageId: string;
+  sourceDigest: string;
+  textDigest: string;
+  mode: 'reply' | 'reply_all';
+  to: string[];
+  cc: string[];
+  /** Optional user-authored request, kept distinct from a selected note transcript. */
+  brief: string;
+  composerRevision: number;
+  noteId?: string;
+  noteRevision?: number;
+  forceRefresh?: boolean;
+}
+
+export interface MailReplyTextGenerationResult {
+  status: 'current' | 'stale' | 'source_changed' | 'unavailable';
+  text?: string;
+  requestFingerprint: string;
+  composerRevision: number;
+  generatedAt?: string;
+  fromCache: boolean;
+  submittedContext?: {
+    bytes: number; representation: 'plain' | 'snippet' | 'none'; completeness: 'complete_text' | 'excerpt' | 'unavailable';
+    omissionReasons: string[]; requestBytes: number; briefBytes: number; policyDocuments: string[];
+  };
+}
+
 export interface AppState {
   notes: Note[];
   proposals: Proposal[];
@@ -509,6 +571,7 @@ export interface AppState {
   settings: AppSettings;
   usage: UsageLedger;
   mailbox: MailboxSnapshotMessage[];
+  selectedMailTexts: SelectedMailTextSnapshot[];
   calendarEvents: CalendarEventSnapshot[];
   syncStates: Record<string, AccountSyncState>;
   /** Opaque refs only; internal cleanup bookkeeping excluded from user export. */
@@ -598,4 +661,7 @@ export interface AppController {
   deleteNote(id: string): Promise<void>;
   getMailReplySource(messageId: string): Promise<MailReplySourceResult>;
   createMailReplyProposal(input: { messageId: string; mode: 'reply' | 'reply_all'; sourceDigest: string; text: string; to?: string[]; cc?: string[] }): Promise<Proposal>;
+  loadMailReplyText(input: { messageId: string; sourceDigest: string }): Promise<MailReplyTextLoadResult>;
+  getMailReplyText(messageId: string): Promise<MailReplyTextCacheResult>;
+  generateMailReplyText(input: MailReplyTextGenerationInput): Promise<MailReplyTextGenerationResult>;
 }

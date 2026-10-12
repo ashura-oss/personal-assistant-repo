@@ -5,24 +5,26 @@ import type {
   Calendar, CalendarConfig, ContextDocument, Note, NoteAssistResult, AssistIntent, LocalTask, Proposal, ProposalPatch,
   ProposalProvenance, SaveNoteInput, SettingsPatch, MailboxSnapshotMessage, CalendarEventSnapshot, OAuthInstallResult,
   NoteProposalProvenance, MailReplyProvenance, MailReplySourceSnapshot, MailReplySourceResult,
+  SelectedMailTextSnapshot, MailReplyTextLoadResult, MailReplyTextCacheResult, MailReplyTextGenerationInput, MailReplyTextGenerationResult,
   ProactiveCandidateEntry, ProactiveCandidateSourceResult,
   ProactiveState, SavedProactiveRule,
 } from '../core';
 import { stateStore } from '../storage/platformStorage';
 import type { StateStore } from '../storage/contracts';
 import { writePrivateDocument } from '../storage/documents';
-import { AzureOpenAIClient, AzureSpeechClient, validateAzureEndpoint, type DraftAnalysis } from './azure';
+import { AzureOpenAIClient, AzureSpeechClient, ReplyGenerationError, ReplyGenerationPreDispatchError, validateAzureEndpoint, type DraftAnalysis, type ReplyGenerationUsage } from './azure';
 import { cancelReminderNotification, requestReminderNotification } from './notifications';
 import { removeAudio } from '../audio/readAudio';
 import type {
   ApprovedDispatch, DispatchVerifier, OAuthBridgeResult, StoredOAuthToken, OAuthTokenStore,
-  MessageSummary, MessageWindowPageMetadata, CalendarSummary, SyncPage, MutationReceipt,
+  MessageSummary, SelectedMessageTextResult, RequestGuard, MessageWindowPageMetadata, CalendarSummary, SyncPage, MutationReceipt,
 } from '../connectors';
 import { ConnectorClient, ProviderWriteRejectedError, describeMessageWindowQuery, withCredentialLock } from '../connectors';
 import { scopeGrantsCapability } from '../connectors/oauth';
 import { oauthTokenStore, deleteOAuthToken } from '../auth/tokenStore';
 import { Platform } from 'react-native';
 import { buildLocalSourceSet, buildOfflinePreview, createSourceCatalog, type AssistantSourceInput } from '../assistant';
+import { isMailTextFresh, normalizeMailText, utf8Bytes, validSelectedMailTextSnapshot, MAX_SELECTED_MAIL_TEXT_BYTES, MAIL_TEXT_FRESHNESS_MS } from '../mailText';
 import { appendDispatchReconciliation, createDispatchRecord, recordDispatchOutcome, validateDispatchRecord } from '../dispatch';
 import type { DispatchOutcome, DispatchRecord, DispatchReconciliation } from '../dispatch';
 import { evaluateProactive, type ProactiveTrigger, type QuietHours } from '../proactive';
@@ -80,7 +82,7 @@ function initialState(): AppState {
     notes: [], proposals: [], tasks: [], accounts: [], calendars: [], documents: [], activity: [],
     settings: { ...DEFAULT_SETTINGS },
     usage: { month: day.slice(0, 7), day, requests: 0, attemptsToday: 0, inputTokens: 0, outputTokens: 0, transcriptionSeconds: 0, attempts: 0, unknownCharges: 0, reservedUsd: 0, priceKnown: false, estimatedCostUsd: 0 },
-    mailbox: [], calendarEvents: [], syncStates: {}, pendingCredentialCleanup: [], dispatchRecords: [], dispatchRecordQuarantine: [], mailboxSchemaVersion: 2,
+    mailbox: [], selectedMailTexts: [], calendarEvents: [], syncStates: {}, pendingCredentialCleanup: [], dispatchRecords: [], dispatchRecordQuarantine: [], mailboxSchemaVersion: 2,
     proactive: emptyProactiveState(),
   };
 }
@@ -550,6 +552,9 @@ function normalizeLoadedState(value: unknown): AppState {
   }
   return {
     ...defaults, ...raw, notes, proposals, tasks,
+    selectedMailTexts: Array.isArray(raw.selectedMailTexts)
+      ? raw.selectedMailTexts.filter(validSelectedMailTextSnapshot).slice(0, 20)
+      : [],
     proactive: emptyProactiveState(),
     dispatchRecords, dispatchRecordQuarantine,
     pendingCredentialCleanup: Array.isArray(raw.pendingCredentialCleanup) ? raw.pendingCredentialCleanup.filter((item) =>
@@ -650,6 +655,8 @@ export class AppControllerImpl implements AppController {
   private installingTokenRefs = new Set<string>();
   private proactiveQuarantine?: ProactiveQuarantine;
   private proactiveSourceHashMemo: ProactiveSourceHashMemo = new Map();
+  private mailReplyGenerations = new Map<string, { messageId: string; promise: Promise<MailReplyTextGenerationResult> }>();
+  private mailReplyGenerationCache = new Map<string, MailReplyTextGenerationResult>();
 
   constructor(
     private readonly store: StateStore = stateStore,
@@ -1336,7 +1343,7 @@ export class AppControllerImpl implements AppController {
     if (!options.forceRefresh && note.analysis?.fingerprint === processingFingerprint) return clone(note.analysis);
     let generated: DraftAnalysis;
     if (state.settings.mode === 'provider') {
-      generated = (options.forceRefresh ? undefined : this.analysisCache.get(processingFingerprint)) ?? await this.openAiClient.analyze(note, contextDocs, state.settings, undefined, () => this.recordProviderAttempt('model', state.settings), request, prepared);
+      generated = (options.forceRefresh ? undefined : this.analysisCache.get(processingFingerprint)) ?? await this.openAiClient.analyze(note, contextDocs, state.settings, undefined, async () => { await this.recordProviderAttempt('model', state.settings); }, request, prepared);
       if (options.forceRefresh || !this.analysisCache.has(processingFingerprint)) {
         await this.settleModelUsage(generated, state.settings);
         this.analysisCache.set(processingFingerprint, generated);
@@ -1466,9 +1473,10 @@ export class AppControllerImpl implements AppController {
     return settings.maxAudioSeconds / 60 * settings.speechUsdPerMinute;
   }
 
-  private async recordProviderAttempt(kind: 'model' | 'speech', requestSettings: AppSettings): Promise<void> {
-    await this.mutate((state) => {
+  private async recordProviderAttempt(kind: 'model' | 'speech', requestSettings: AppSettings, guard?: (state: AppState) => void): Promise<{ month: string; day: string; reserve: number }> {
+    return this.mutate((state) => {
       this.rollUsage(state);
+      guard?.(state);
       if (state.usage.attemptsToday >= state.settings.maxCallsPerDay) throw new Error('Daily provider call limit reached. Try again tomorrow or adjust the limit in Settings.');
       const reserve = this.providerReserve(requestSettings, kind);
       const knownRates = kind === 'model'
@@ -1480,10 +1488,23 @@ export class AppControllerImpl implements AppController {
       state.usage.attempts += 1;
       state.usage.unknownCharges += 1;
       state.usage.lastRequestAt = now();
+      return { month: state.usage.month, day: state.usage.day, reserve };
     });
   }
 
-  private async settleModelUsage(usage: DraftAnalysis, requestSettings: AppSettings): Promise<void> {
+  private async rollbackUnsentProviderAttempt(reservation: { month: string; day: string; reserve: number }): Promise<void> {
+    await this.mutate((state) => {
+      if (state.usage.month === reservation.month) {
+        state.usage.unknownCharges = Math.max(0, state.usage.unknownCharges - 1);
+        state.usage.reservedUsd = Math.max(0, state.usage.reservedUsd - reservation.reserve);
+      }
+      if (state.usage.day === reservation.day) state.usage.attemptsToday = Math.max(0, state.usage.attemptsToday - 1);
+      state.usage.attempts = Math.max(0, state.usage.attempts - 1);
+      state.usage.priceKnown = state.usage.unknownCharges === 0 && state.settings.inputUsdPerMillionTokens !== undefined && state.settings.outputUsdPerMillionTokens !== undefined;
+    });
+  }
+
+  private async settleModelUsage(usage: Pick<ReplyGenerationUsage, 'inputTokens' | 'outputTokens' | 'usageEstimated'>, requestSettings: AppSettings): Promise<void> {
     await this.mutate((state) => {
       this.rollUsage(state);
       state.usage.requests += 1;
@@ -1524,7 +1545,7 @@ export class AppControllerImpl implements AppController {
     const sourceRevision = note.revision;
     if (state.settings.mode !== 'provider') throw new Error('Select Provider mode and configure Azure Speech before transcribing.');
     if (state.usage.priceKnown && state.usage.estimatedCostUsd >= state.settings.monthlyBudgetUsd) throw new Error('The configured monthly estimate limit has been reached.');
-    const result = await this.speechClient.transcribe(note, state.settings, undefined, () => this.recordProviderAttempt('speech', state.settings));
+    const result = await this.speechClient.transcribe(note, state.settings, undefined, async () => { await this.recordProviderAttempt('speech', state.settings); });
     await this.settleSpeechUsage(result.durationSeconds, state.settings);
     const updated = await this.mutate(async (draft) => {
       const current = this.note(draft, id);
@@ -2397,6 +2418,315 @@ export class AppControllerImpl implements AppController {
     });
   }
 
+  private selectedMailFence(state: AppState, messageId: string): string | undefined {
+    const message = state.mailbox.find((item) => item.id === messageId);
+    if (!message) return undefined;
+    const account = state.accounts.find((item) => item.id === message.accountId);
+    if (!account) return undefined;
+    return stableJson({
+      accountId: account.id, provider: account.provider, connected: account.connected, authStatus: account.authStatus,
+      tokenRef: account.tokenRef, identity: account.identity, connectionGeneration: account.connectionGeneration,
+      capabilities: account.capabilities, grantedScopes: account.grantedScopes,
+      metadata: canonicalMailboxContent(message),
+    });
+  }
+
+  private selectedMailTextUnavailable(
+    message: MailboxSnapshotMessage, account: Account, sourceDigest: string, reason: string, checkedAt = now(),
+  ): SelectedMailTextSnapshot {
+    return {
+      version: 1, messageId: message.id, accountId: account.id, identityKey: identityKey(account),
+      identity: clone(account.identity!), connectionGeneration: account.connectionGeneration ?? 0,
+      providerMessageId: message.providerMessageId, idFormat: message.idFormat!, sourceDigest,
+      ...(message.providerVersion ? { providerVersion: message.providerVersion } : {}), checkedAt,
+      bytes: 0, extractionVersion: 'mail-text-v1', representation: 'none', completeness: 'unavailable', omissionReasons: [reason],
+    };
+  }
+
+  private async validateCachedMailText(messageId: string): Promise<MailReplyTextCacheResult> {
+    await this.load();
+    const captured = this.snapshot;
+    const saved = captured.selectedMailTexts.find((item) => item.messageId === messageId);
+    if (!saved) return { status: 'missing' };
+    const message = captured.mailbox.find((item) => item.id === messageId);
+    const account = message && captured.accounts.find((item) => item.id === message.accountId);
+    if (!message || !account || !account.connected || account.authStatus !== 'connected' || account.provider === 'local' ||
+        !account.capabilities?.includes('mail.read') || !account.grantedScopes || !scopeGrantsCapability(account.provider, account.grantedScopes, 'mail.read') ||
+        message.providerDeletedAt || message.verifiedIdentityKey !== identityKey(account) || message.connectionGeneration !== account.connectionGeneration ||
+        saved.accountId !== account.id || saved.providerMessageId !== message.providerMessageId || saved.idFormat !== message.idFormat ||
+        saved.connectionGeneration !== account.connectionGeneration || saved.identityKey !== identityKey(account) || !sameAccountIdentity(saved.identity, account.identity)) {
+      if (captured !== this.snapshot) return { status: 'stale' };
+      return { status: 'unavailable' };
+    }
+    let metadata: MailReplySourceResult;
+    try { metadata = await this.currentMailReplySource(captured, messageId); }
+    catch { return { status: 'unavailable' }; }
+    if (captured !== this.snapshot) return { status: 'stale' };
+    if (metadata.status !== 'current' || !metadata.source || metadata.source.sourceDigest !== saved.sourceDigest) {
+      return { status: metadata.status === 'unavailable' ? 'unavailable' : 'stale' };
+    }
+    if (!isMailTextFresh(saved) || !isMailTextFresh({ checkedAt: message.observedAt ?? '' })) return { status: 'stale' };
+    if (saved.completeness === 'unavailable' || !saved.text || !saved.textDigest) return { status: 'unavailable', snapshot: clone(saved) };
+    const digest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, saved.text);
+    if (captured !== this.snapshot) return { status: 'stale' };
+    if (digest.toLowerCase() !== saved.textDigest.toLowerCase() || utf8Bytes(saved.text) !== saved.bytes) return { status: 'unavailable' };
+    return { status: 'current', snapshot: clone(saved) };
+  }
+
+  async getMailReplyText(messageId: string): Promise<MailReplyTextCacheResult> {
+    return this.validateCachedMailText(messageId);
+  }
+
+  async loadMailReplyText(input: { messageId: string; sourceDigest: string }): Promise<MailReplyTextLoadResult> {
+    await this.load();
+    if (!input || typeof input.messageId !== 'string' || !/^[a-f\d]{64}$/i.test(input.sourceDigest)) return { status: 'unavailable' };
+    const captured = this.snapshot;
+    const original = captured.mailbox.find((item) => item.id === input.messageId);
+    const account = original && captured.accounts.find((item) => item.id === original.accountId);
+    if (!original || !account) return { status: 'unavailable' };
+    if (!account.connected || account.authStatus !== 'connected' || account.provider === 'local' || !account.identity ||
+        !account.capabilities?.includes('mail.read') || !account.grantedScopes || !scopeGrantsCapability(account.provider, account.grantedScopes, 'mail.read') ||
+        !original.idFormat || original.providerDeletedAt || original.verifiedIdentityKey !== identityKey(account) || original.connectionGeneration !== account.connectionGeneration) return { status: 'unavailable' };
+    const before = await this.currentMailReplySource(captured, input.messageId);
+    if (captured !== this.snapshot) return { status: 'stale' };
+    if (!before.source || before.status === 'unavailable') return { status: 'unavailable' };
+    if (before.source.sourceDigest.toLowerCase() !== input.sourceDigest.toLowerCase()) return { status: 'source_changed' };
+    if (!this.connector?.readSelectedMessageText) return { status: 'unavailable' };
+    const expectedFence = this.selectedMailFence(captured, input.messageId);
+    if (!expectedFence) return { status: 'unavailable' };
+    const ensureCurrent: RequestGuard = () => {
+      if (this.selectedMailFence(this.snapshot, input.messageId) !== expectedFence) throw new Error('Selected message or connection changed during text loading.');
+    };
+    ensureCurrent();
+    let result: SelectedMessageTextResult;
+    try {
+      result = await this.connector.readSelectedMessageText(clone(account), original.providerMessageId, {
+        sizeEstimate: original.sizeEstimate, sizeCheckedAt: original.sizeCheckedAt, guard: ensureCurrent,
+      });
+    } catch (error) {
+      if (this.selectedMailFence(this.snapshot, input.messageId) !== expectedFence) return { status: 'stale' };
+      throw error;
+    }
+    if (this.selectedMailFence(this.snapshot, input.messageId) !== expectedFence) return { status: 'stale' };
+
+    const checkedAt = now();
+    let updatedMessage: MailboxSnapshotMessage | undefined;
+    let updatedSource: MailReplySourceSnapshot | undefined;
+    const returned = result.message;
+    if (returned && returned.id === original.providerMessageId && returned.idFormat === original.idFormat && returned.replyMetadataComplete === true) {
+      updatedMessage = {
+        ...original, providerMessageId: returned.id, idFormat: returned.idFormat,
+        threadId: returned.threadId, subject: returned.subject ?? '', from: returned.from, senderEmail: returned.senderEmail,
+        receivedAt: returned.receivedAt, snippet: returned.snippet, isRead: returned.isRead,
+        replyMetadataComplete: returned.replyMetadataComplete, internetMessageId: returned.internetMessageId,
+        providerVersion: returned.providerVersion, replyTo: returned.replyTo, to: returned.to, cc: returned.cc,
+        references: returned.references, inReplyTo: returned.inReplyTo, headers: returned.headers,
+        sizeEstimate: returned.sizeEstimate ?? original.sizeEstimate, sizeCheckedAt: checkedAt,
+        observedAt: checkedAt,
+      };
+      try {
+        updatedSource = await createMailReplySource(this.mailReplySourceFromRow(updatedMessage, account, checkedAt), async (canonical) =>
+          Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, canonical, { encoding: Crypto.CryptoEncoding.HEX }));
+      } catch { updatedMessage = undefined; }
+    }
+    if (this.selectedMailFence(this.snapshot, input.messageId) !== expectedFence) return { status: 'stale' };
+
+    let text: string | undefined;
+    let textDigest: string | undefined;
+    let bytes = 0;
+    let representation: SelectedMailTextSnapshot['representation'] = 'none';
+    let completeness: SelectedMailTextSnapshot['completeness'] = 'unavailable';
+    const omissionReasons = [...(result.reasons ?? [])].filter((reason) => typeof reason === 'string').slice(0, 16);
+    if (updatedMessage && updatedSource && typeof result.text === 'string' && ['plain', 'snippet'].includes(result.representation) && ['complete_text', 'excerpt'].includes(result.completeness)) {
+      const rawBytes = utf8Bytes(result.text);
+      const normalized = normalizeMailText(result.text);
+      bytes = utf8Bytes(normalized);
+      if (rawBytes === result.bytes && rawBytes <= MAX_SELECTED_MAIL_TEXT_BYTES && bytes <= MAX_SELECTED_MAIL_TEXT_BYTES) {
+        text = normalized;
+        textDigest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, normalized);
+        representation = result.representation;
+        completeness = result.completeness;
+      } else {
+        omissionReasons.push('text_byte_limit_or_length_mismatch');
+      }
+    }
+    if (this.selectedMailFence(this.snapshot, input.messageId) !== expectedFence) return { status: 'stale' };
+    const sourceForCache = updatedSource ?? before.source;
+    const baseMessage = updatedMessage ?? original;
+    const bodySnapshot: SelectedMailTextSnapshot = text && textDigest ? {
+      version: 1, messageId: original.id, accountId: account.id, identityKey: identityKey(account), identity: clone(account.identity),
+      connectionGeneration: account.connectionGeneration ?? 0, providerMessageId: original.providerMessageId, idFormat: original.idFormat,
+      sourceDigest: sourceForCache.sourceDigest, ...(baseMessage.providerVersion ? { providerVersion: baseMessage.providerVersion } : {}),
+      checkedAt, text, textDigest, bytes, extractionVersion: 'mail-text-v1', representation, completeness, omissionReasons,
+    } : this.selectedMailTextUnavailable(baseMessage, account, sourceForCache.sourceDigest, omissionReasons[0] ?? 'text_unavailable', checkedAt);
+    await this.mutate((state) => {
+      if (this.selectedMailFence(state, input.messageId) !== expectedFence) throw new Error('Selected message changed while text was being saved.');
+      const messageIndex = state.mailbox.findIndex((item) => item.id === input.messageId);
+      const selectedIndex = state.selectedMailTexts.findIndex((item) => item.messageId === input.messageId);
+      if (updatedMessage) state.mailbox[messageIndex] = updatedMessage;
+      if (selectedIndex >= 0) state.selectedMailTexts.splice(selectedIndex, 1);
+      state.selectedMailTexts.unshift(bodySnapshot);
+      state.selectedMailTexts = state.selectedMailTexts.slice(0, 20);
+      if (updatedSource && updatedSource.sourceDigest !== input.sourceDigest) {
+        for (const proposal of state.proposals.filter((item) => item.provenance?.version === 2 && item.provenance.source.localMessageId === input.messageId && ['draft', 'approved', 'failed'].includes(item.status))) {
+          this.invalidate(proposal); proposal.requiresRebuild = true;
+        }
+      }
+    });
+    return {
+      status: updatedSource && updatedSource.sourceDigest !== input.sourceDigest ? 'source_changed' : text ? 'current' : 'unavailable',
+      snapshot: clone(bodySnapshot),
+    };
+  }
+
+  private mailReplyGenerationProjection(
+    state: AppState,
+    messageId: string,
+    sourceDigest: string,
+    textDigest: string,
+    noteId: string | undefined,
+    noteRevision: number | undefined,
+  ): string | undefined {
+    const message = state.mailbox.find((item) => item.id === messageId);
+    const account = message && state.accounts.find((item) => item.id === message.accountId);
+    const body = state.selectedMailTexts.find((item) => item.messageId === messageId);
+    if (!message || !account || !body || !account.connected || account.authStatus !== 'connected' || account.provider === 'local' ||
+        !account.capabilities?.includes('mail.read') || !account.grantedScopes || !scopeGrantsCapability(account.provider, account.grantedScopes, 'mail.read') ||
+        message.providerDeletedAt || message.verifiedIdentityKey !== identityKey(account) || message.connectionGeneration !== (account.connectionGeneration ?? 0) ||
+        body.accountId !== account.id || body.connectionGeneration !== (account.connectionGeneration ?? 0) || body.identityKey !== identityKey(account) ||
+        !sameAccountIdentity(body.identity, account.identity) || body.sourceDigest !== sourceDigest || body.textDigest !== textDigest ||
+        !body.text || !isMailTextFresh(body) || !isMailTextFresh({ checkedAt: message.observedAt ?? '' })) return undefined;
+    const observed = Date.parse(message.observedAt ?? '');
+    if (!Number.isFinite(observed) || Date.now() - observed < 0 || Date.now() - observed >= MAIL_TEXT_FRESHNESS_MS) return undefined;
+    const note = noteId ? state.notes.find((item) => item.id === noteId) : undefined;
+    if (noteId ? !note || note.revision !== noteRevision : noteRevision !== undefined) return undefined;
+    const policy = state.documents.filter((doc) => /^memory\/(?:RULES|ROUTINES)\.md$/i.test(doc.path))
+      .map((doc) => ({ path: doc.path, revision: doc.revision, content: doc.content }));
+    return stableJson({
+      fence: this.selectedMailFence(state, messageId), metadata: canonicalMailboxContent(message), observedAt: message.observedAt,
+      body: { sourceDigest: body.sourceDigest, textDigest: body.textDigest, text: body.text, checkedAt: body.checkedAt, bytes: body.bytes, representation: body.representation, completeness: body.completeness },
+      account: { identity: account.identity, generation: account.connectionGeneration ?? 0, tokenRef: account.tokenRef, capabilities: account.capabilities, grantedScopes: account.grantedScopes },
+      settings: state.settings, policy, note: note ? { id: note.id, revision: note.revision, transcript: note.transcript, capturedAt: note.capturedAt ?? note.createdAt, captureTimeZone: note.captureTimeZone ?? state.settings.timezone } : null,
+    });
+  }
+
+  async generateMailReplyText(input: MailReplyTextGenerationInput): Promise<MailReplyTextGenerationResult> {
+    await this.load();
+    if (!input || !Number.isSafeInteger(input.composerRevision) || input.composerRevision < 0 || !['reply', 'reply_all'].includes(input.mode)) throw new Error('Reply composer version or mode is invalid.');
+    const validationSnapshot = this.snapshot;
+    const source = await this.currentMailReplySource(validationSnapshot, input.messageId);
+    if (this.snapshot !== validationSnapshot) return { status: 'stale', requestFingerprint: '', composerRevision: input.composerRevision, fromCache: false };
+    if (source.status !== 'current' || !source.source || source.source.sourceDigest !== input.sourceDigest) return { status: source.status === 'stale' ? 'stale' : 'source_changed', requestFingerprint: '', composerRevision: input.composerRevision, fromCache: false };
+    const cachedBody = await this.getMailReplyText(input.messageId);
+    if (this.snapshot !== validationSnapshot) return { status: 'stale', requestFingerprint: '', composerRevision: input.composerRevision, fromCache: false };
+    if (cachedBody.status !== 'current' || !cachedBody.snapshot || cachedBody.snapshot.textDigest !== input.textDigest || cachedBody.snapshot.sourceDigest !== input.sourceDigest) return { status: cachedBody.status === 'stale' ? 'stale' : 'source_changed', requestFingerprint: '', composerRevision: input.composerRevision, fromCache: false };
+    const state = validationSnapshot;
+    const account = state.accounts.find((item) => item.id === source.source!.accountId);
+    if (!account || account.provider === 'local' || !account.connected || account.authStatus !== 'connected' || !account.capabilities?.includes('mail.read') || !account.grantedScopes || !scopeGrantsCapability(account.provider, account.grantedScopes, 'mail.read')) return { status: 'unavailable', requestFingerprint: '', composerRevision: input.composerRevision, fromCache: false };
+    if (state.settings.mode !== 'provider') throw new Error('Switch to Provider mode to generate a reply.');
+    if (!Array.isArray(input.to) || !Array.isArray(input.cc)) throw new Error('Review the locked recipient list before generating.');
+    const reply = {
+      mode: input.mode, sourceDigest: source.source.sourceDigest, localMessageId: source.source.localMessageId,
+      providerMessageId: source.source.providerMessageId, idFormat: source.source.idFormat,
+      internetMessageId: source.source.internetMessageId, sourceSubject: source.source.subject,
+      ...(source.source.threadId ? { threadId: source.source.threadId } : {}),
+      ...(replyReferences(source.source) ? { references: replyReferences(source.source) } : {}), inReplyTo: source.source.internetMessageId,
+    };
+    validateReplyBinding({ operation: 'draft', to: input.to, cc: input.cc, bcc: [], subject: source.source.subject, text: 'generation-placeholder', attachments: [], reply }, {
+      version: 2, kind: 'mail_reply', sourceDigest: source.source.sourceDigest, source: source.source,
+      expiresAt: new Date(Date.parse(source.source.observedAt) + 15 * 60_000).toISOString(),
+    });
+    const brief = input.brief;
+    let noteContext: string | undefined;
+    let noteCapture: { capturedAt: string; timeZone: string } | undefined;
+    if (input.noteId) {
+      const selectedNote = state.notes.find((item) => item.id === input.noteId);
+      if (!selectedNote || selectedNote.revision !== input.noteRevision || !selectedNote.transcript.trim()) throw new Error('The selected note changed or has no transcript. Reopen the picker and select it again.');
+      noteContext = selectedNote.transcript;
+      noteCapture = { capturedAt: selectedNote.capturedAt ?? selectedNote.createdAt, timeZone: selectedNote.captureTimeZone ?? state.settings.timezone };
+    } else if (input.noteRevision !== undefined) throw new Error('A note revision was supplied without a selected note.');
+    if (utf8Bytes(brief) + utf8Bytes(noteContext ?? '') > 4 * 1024) throw new Error('The reply brief and selected note context exceed 4 KiB combined. Shorten the brief or select a shorter note before generating.');
+    const policies = state.documents.filter((doc) => /^memory\/(?:RULES|ROUTINES)\.md$/i.test(doc.path));
+    const policyContext = policies.map((doc) => `### ${doc.path} (revision ${doc.revision})\n${doc.content}`).join('\n\n');
+    if (utf8Bytes(policyContext) > 4 * 1024) throw new Error('RULES.md and ROUTINES.md exceed the 4 KiB guidance limit. Edit them before generating.');
+    const message = state.mailbox.find((item) => item.id === input.messageId);
+    if (!message || !cachedBody.snapshot.text) return { status: 'unavailable', requestFingerprint: '', composerRevision: input.composerRevision, fromCache: false };
+    const capturedProjection = this.mailReplyGenerationProjection(state, input.messageId, input.sourceDigest, input.textDigest, input.noteId, input.noteRevision);
+    if (!capturedProjection) return { status: 'stale', requestFingerprint: '', composerRevision: input.composerRevision, fromCache: false };
+    const settingsFingerprint = stableJson(state.settings);
+    const requestAsOf = new Date().toISOString();
+    const sourceAndText = {
+      sourceDigest: input.sourceDigest, textDigest: input.textDigest, mode: input.mode, to: input.to, cc: input.cc, subject: source.source.subject,
+      brief, noteId: input.noteId ?? null, noteRevision: input.noteRevision ?? null,
+      noteDigest: noteContext === undefined ? null : await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, noteContext),
+      noteCapture: noteCapture ?? null, accountIdentity: source.source.identity, connectionGeneration: source.source.connectionGeneration,
+      policy: policies.map((doc) => ({ path: doc.path, revision: doc.revision, content: doc.content })),
+      settingsFingerprint, queryBucket: Math.floor(Date.parse(requestAsOf) / (15 * 60_000)),
+    };
+    const requestFingerprint = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, stableJson(sourceAndText));
+    const currentProjection = () => this.mailReplyGenerationProjection(this.snapshot, input.messageId, input.sourceDigest, input.textDigest, input.noteId, input.noteRevision);
+    const disclosure = {
+      bytes: cachedBody.snapshot.bytes, representation: cachedBody.snapshot.representation, completeness: cachedBody.snapshot.completeness,
+      omissionReasons: [...cachedBody.snapshot.omissionReasons], briefBytes: utf8Bytes(brief) + utf8Bytes(noteContext ?? ''), policyDocuments: policies.map((doc) => doc.path), requestBytes: 0,
+    };
+    if (!input.forceRefresh) {
+      const saved = this.mailReplyGenerationCache.get(requestFingerprint);
+      if (saved && saved.generatedAt && Date.now() - Date.parse(saved.generatedAt) >= 0 && Date.now() - Date.parse(saved.generatedAt) < 15 * 60_000) {
+        if (currentProjection() !== capturedProjection) return { status: 'stale', requestFingerprint, composerRevision: input.composerRevision, fromCache: false };
+        return { ...clone(saved), composerRevision: input.composerRevision, fromCache: true };
+      }
+    }
+    const inflight = this.mailReplyGenerations.get(requestFingerprint);
+    if (inflight) {
+      const joined = await inflight.promise;
+      if (currentProjection() !== capturedProjection) return { status: 'stale', requestFingerprint, composerRevision: input.composerRevision, fromCache: false };
+      return { ...joined, composerRevision: input.composerRevision, fromCache: true };
+    }
+    if ([...this.mailReplyGenerations.values()].some((item) => item.messageId === input.messageId)) throw new Error('Another Generate request for this message is still running. Wait for it to finish.');
+    const capturedSettings = clone(state.settings);
+    const generation = (async (): Promise<MailReplyTextGenerationResult> => {
+      let generated: Awaited<ReturnType<AzureOpenAIClient['generateReply']>>;
+      let reservation: { month: string; day: string; reserve: number } | undefined;
+      const assertProjection = (current: AppState = this.snapshot) => {
+        if (this.mailReplyGenerationProjection(current, input.messageId, input.sourceDigest, input.textDigest, input.noteId, input.noteRevision) !== capturedProjection) {
+          throw new ReplyGenerationPreDispatchError('Selected message, note, settings, or guidance changed before generation. Review the context and try again.');
+        }
+      };
+      try {
+        generated = await this.openAiClient.generateReply({
+          sourceText: cachedBody.snapshot!.text!, sourceRepresentation: cachedBody.snapshot!.representation,
+          sourceCompleteness: cachedBody.snapshot!.completeness, subject: source.source!.subject,
+          to: [...input.to], cc: [...input.cc], brief, noteContext, policyContext, asOf: requestAsOf, timeZone: capturedSettings.timezone,
+          ...(noteCapture ? { noteCapture } : {}),
+        }, capturedSettings, async () => {
+          reservation = await this.recordProviderAttempt('model', capturedSettings, (current) => assertProjection(current));
+        }, () => assertProjection());
+      } catch (error) {
+        if (error instanceof ReplyGenerationError && error.usage) await this.settleModelUsage(error.usage, capturedSettings);
+        if (error instanceof ReplyGenerationPreDispatchError) {
+          if (reservation) await this.rollbackUnsentProviderAttempt(reservation);
+          return { status: 'stale', requestFingerprint, composerRevision: input.composerRevision, fromCache: false };
+        }
+        throw error;
+      }
+      await this.settleModelUsage(generated, capturedSettings);
+      if (currentProjection() !== capturedProjection) {
+        return { status: 'stale', requestFingerprint, composerRevision: input.composerRevision, fromCache: false, submittedContext: { ...disclosure, requestBytes: generated.requestBytes } };
+      }
+      const output: MailReplyTextGenerationResult = {
+        status: 'current', text: generated.text, requestFingerprint, composerRevision: input.composerRevision,
+        generatedAt: now(), fromCache: false,
+        submittedContext: { ...disclosure, requestBytes: generated.requestBytes },
+      };
+      this.mailReplyGenerationCache.set(requestFingerprint, clone(output));
+      while (this.mailReplyGenerationCache.size > 10) this.mailReplyGenerationCache.delete(this.mailReplyGenerationCache.keys().next().value!);
+      return output;
+    })();
+    this.mailReplyGenerations.set(requestFingerprint, { messageId: input.messageId, promise: generation });
+    try { return await generation; }
+    finally { if (this.mailReplyGenerations.get(requestFingerprint)?.promise === generation) this.mailReplyGenerations.delete(requestFingerprint); }
+  }
+
   private async acquireSyncSlot(): Promise<() => void> {
     if (this.activeSyncCount < 2) { this.activeSyncCount++; return () => {
       const next = this.syncQueue.shift();
@@ -2623,7 +2953,8 @@ export class AppControllerImpl implements AppController {
             threadId: item.threadId, subject: item.subject, from: item.from, senderEmail: item.senderEmail,
             receivedAt: item.receivedAt, snippet: item.snippet, isRead: item.isRead,
             replyMetadataComplete: item.replyMetadataComplete, internetMessageId: item.internetMessageId,
-            providerVersion: item.providerVersion, replyTo: item.replyTo, to: item.to, cc: item.cc,
+            providerVersion: item.providerVersion, sizeEstimate: item.sizeEstimate, sizeCheckedAt: item.sizeCheckedAt,
+            replyTo: item.replyTo, to: item.to, cc: item.cc,
             references: item.references, inReplyTo: item.inReplyTo, headers: item.headers,
             observedAt: timestamp,
           };

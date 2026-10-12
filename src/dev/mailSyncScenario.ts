@@ -13,6 +13,9 @@ const PREVIEW_CLIENT_ID = "still-mail-preview-client.invalid";
 const PREVIEW_ACCESS_TOKEN = "still-mail-preview-token-not-a-credential";
 const PREVIEW_SUBJECT = "still-mail-preview-subject";
 const PREVIEW_SCOPE = "https://www.googleapis.com/auth/gmail.readonly";
+const MOCK_OPENAI_KEY = "still-mail-preview-openai-key-not-a-credential";
+const MOCK_OPENAI_ORIGIN = "https://still-preview.openai.azure.com";
+const MOCK_OPENAI_DEPLOYMENT = "gpt-6-luna";
 
 class MemoryStateStore implements StateStore {
   private value?: AppState;
@@ -62,7 +65,7 @@ function jsonResponse(data: unknown): Response {
 }
 
 /** A narrow read-only fixture: every other URL, method, or credential is rejected. */
-function makeFixtureFetcher(): typeof fetch {
+function makeFixtureFetcher(mockGeneration: boolean): typeof fetch {
   let firstPages = 0;
   const baseDate = Date.now();
   const allowedMessageIds = new Set([
@@ -80,6 +83,69 @@ function makeFixtureFetcher(): typeof fetch {
     const authorization = new Headers(
       init?.headers ?? (input instanceof Request ? input.headers : undefined),
     ).get("authorization");
+
+    if (url.origin === MOCK_OPENAI_ORIGIN) {
+      if (!mockGeneration || method !== "POST" || url.pathname !== "/openai/v1/responses" || url.search !== "?api-version=v1") {
+        throw new Error("The sample reply fixture rejected an unapproved OpenAI request.");
+      }
+      const headers = new Headers(init?.headers);
+      if (headers.get("api-key") !== MOCK_OPENAI_KEY || headers.get("content-type") !== "application/json") {
+        throw new Error("The sample reply fixture rejected an unexpected request credential or content type.");
+      }
+      const bodyText = typeof init?.body === "string" ? init.body : "";
+      if (!bodyText || new TextEncoder().encode(bodyText).length > 24_000) {
+        throw new Error("The sample reply fixture rejected an empty or oversized request.");
+      }
+      let body: any;
+      try { body = JSON.parse(bodyText); } catch { throw new Error("The sample reply fixture rejected invalid JSON."); }
+      const schema = body?.text?.format;
+      const expectedSchema = {
+        type: "json_schema",
+        name: "mail_reply_body",
+        strict: true,
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          required: ["text"],
+          properties: { text: { type: "string" } },
+        },
+      };
+      const input = body?.input;
+      const roleNames = Array.isArray(input) ? input.map((item: any) => item?.role) : [];
+      const messageShapeIsTextOnly = Array.isArray(input) && input.every((item: any) =>
+        item && typeof item === "object" && Array.isArray(item.content) && item.content.length === 1 &&
+        item.content[0]?.type === "input_text" && typeof item.content[0]?.text === "string",
+      );
+      const inputText = Array.isArray(input)
+        ? input.flatMap((item: any) => Array.isArray(item?.content) ? item.content : []).map((item: any) => item?.text).filter((value: unknown) => typeof value === "string")
+        : [];
+      const inputBytes = inputText.reduce((total: number, value: string) => total + new TextEncoder().encode(value).length, 0);
+      const allowedBodyKeys = ["input", "max_output_tokens", "model", "reasoning", "store", "text", "tools"];
+      if (
+        stableFixtureJson(Object.keys(body ?? {}).sort()) !== stableFixtureJson(allowedBodyKeys) ||
+        body?.model !== MOCK_OPENAI_DEPLOYMENT || body?.store !== false ||
+        !Array.isArray(body?.tools) || body.tools.length !== 0 ||
+        !["none", "low"].includes(body?.reasoning?.effort) ||
+        !Number.isSafeInteger(body?.max_output_tokens) || body.max_output_tokens < 1 || body.max_output_tokens > 2400 ||
+        stableFixtureJson(schema) !== stableFixtureJson(expectedSchema) ||
+        JSON.stringify(roleNames) !== JSON.stringify(["developer", "user"]) ||
+        !messageShapeIsTextOnly || inputText.length !== 2 || inputBytes > 23_744 ||
+        !inputText[1].includes("Project discussion: Could you send the revised timeline by Friday?")
+      ) {
+        throw new Error("The sample reply fixture rejected a request outside the text-only reply contract.");
+      }
+      return jsonResponse({
+        status: "completed",
+        output: [{
+          type: "message",
+          content: [{
+            type: "output_text",
+            text: JSON.stringify({ text: "Thanks for sharing this. I’ll review the details and follow up." }),
+          }],
+        }],
+        usage: { input_tokens: 0, output_tokens: 0 },
+      });
+    }
     if (
       method !== "GET" ||
       authorization !== `Bearer ${PREVIEW_ACCESS_TOKEN}`
@@ -118,22 +184,33 @@ function makeFixtureFetcher(): typeof fetch {
           : messageId === "sample-newer-head-page"
             ? "Weekly project update"
             : `Archived sample message ${messageId.includes("second") ? "B" : "A"}`;
+      const format = url.searchParams.get("format");
+      if (format !== "metadata" && format !== "full") {
+        throw new Error("The sample mail fixture rejected an unrecognized message format.");
+      }
+      const headers = [
+        { name: "Subject", value: subject },
+        { name: "From", value: "Morgan Sample <morgan@sample.invalid>" },
+        { name: "To", value: "reader@sample.invalid" },
+        { name: "Cc", value: "project.partner@sample.invalid" },
+        { name: "Reply-To", value: "morgan-replies@sample.invalid" },
+        { name: "Message-ID", value: `<${messageId}@sample.invalid>` },
+      ];
       return jsonResponse({
         id: messageId,
         threadId: `thread-${messageId}`,
+        historyId: "sample-history-20261013",
+        sizeEstimate: 96,
         snippet:
           "Project planning message for a fictional local mailbox preview. No real mailbox was contacted.",
         internalDate: String(receivedAt),
         labelIds: unread ? ["INBOX", "UNREAD"] : ["INBOX"],
         payload: {
-          headers: [
-            { name: "Subject", value: subject },
-            { name: "From", value: "Morgan Sample <morgan@sample.invalid>" },
-            { name: "To", value: "reader@sample.invalid" },
-            { name: "Cc", value: "project.partner@sample.invalid" },
-            { name: "Reply-To", value: "morgan-replies@sample.invalid" },
-            { name: "Message-ID", value: `<${messageId}@sample.invalid>` },
-          ],
+          mimeType: format === "full" ? "text/plain" : "multipart/alternative",
+          headers,
+          ...(format === "full"
+            ? { body: { size: 66, data: "UHJvamVjdCBkaXNjdXNzaW9uOiBDb3VsZCB5b3Ugc2VuZCB0aGUgcmV2aXNlZCB0aW1lbGluZSBieSBGcmlkYXk_" } }
+            : {}),
         },
       });
     }
@@ -188,6 +265,15 @@ function makeFixtureFetcher(): typeof fetch {
   };
 }
 
+function stableFixtureJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableFixtureJson).join(",")}]`;
+  if (typeof value === "object" && value !== null) {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableFixtureJson(record[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
 function equalIdentity(
   left: OAuthBridgeResult["identity"] | StoredOAuthToken["identity"],
   right: OAuthBridgeResult["identity"] | StoredOAuthToken["identity"],
@@ -196,8 +282,9 @@ function equalIdentity(
 }
 
 /** Starts the real controller and connector over memory plus a closed fixture allowlist. */
-export async function createMailSyncScenario() {
+export async function createMailSyncScenario(options: { mockGeneration?: boolean } = {}) {
   assertMailPreviewEnabled();
+  const mockGeneration = options.mockGeneration === true;
   const store = new MemoryStateStore();
   const identity: NonNullable<OAuthInstallResult["identity"]> = {
     providerNamespace: "google",
@@ -225,7 +312,7 @@ export async function createMailSyncScenario() {
       tokenMap.set(tokenRef, structuredClone(token));
     },
   };
-  const fixtureFetcher = makeFixtureFetcher();
+  const fixtureFetcher = makeFixtureFetcher(mockGeneration);
   const controller = new AppControllerImpl(
     store,
     {
@@ -233,7 +320,10 @@ export async function createMailSyncScenario() {
         fetcher: blockedFetch,
         readKey: blockedKey,
       }),
-      openAi: new AzureOpenAIClient(blockedFetch, blockedKey),
+      openAi: new AzureOpenAIClient(
+        mockGeneration ? fixtureFetcher : blockedFetch,
+        mockGeneration ? async () => MOCK_OPENAI_KEY : blockedKey,
+      ),
     },
     {
       tokenStore,
@@ -271,6 +361,15 @@ export async function createMailSyncScenario() {
   );
 
   await controller.load();
+  if (mockGeneration) {
+    await controller.saveSettings({
+      mode: "provider",
+      openAiEndpoint: MOCK_OPENAI_ORIGIN,
+      openAiDeployment: MOCK_OPENAI_DEPLOYMENT,
+      model: "gpt-6-luna",
+      reasoningEffort: "none",
+    });
+  }
   await controller.installVerifiedAccount(
     {
       id: "sample-mail-account",
