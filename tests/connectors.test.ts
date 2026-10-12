@@ -351,6 +351,42 @@ describe('provider connector clients', () => {
     await expect(client.readCalendarEvents(microsoftAccount, 'different-calendar', { cursor: urls[2] })).rejects.toThrow(/outside the allowed API/i);
   });
 
+  it('certifies only strict UTC Graph calendar dateTimes and retains the UTC preference across continuation pages', async () => {
+    const urls: string[] = [];
+    const prefers: Array<string | null> = [];
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      urls.push(url.toString());
+      prefers.push(new Headers(init?.headers).get('prefer'));
+      if (url.searchParams.has('startDateTime')) return response({ value: [
+        { id: 'valid-utc', start: { dateTime: '2026-10-13T10:30:00.125', timeZone: 'UTC' }, end: { dateTime: '2026-10-13T11:30:00', timeZone: 'UTC' } },
+        { id: 'wrong-zone', start: { dateTime: '2026-10-13T10:30:00', timeZone: 'Asia/Singapore' }, end: { dateTime: '2026-10-13T11:30:00', timeZone: 'UTC' } },
+        { id: 'missing-zone', start: { dateTime: '2026-10-13T10:30:00' }, end: { dateTime: '2026-10-13T11:30:00', timeZone: 'UTC' } },
+        { id: 'invalid-day', start: { dateTime: '2026-02-30T10:30:00', timeZone: 'UTC' }, end: { dateTime: '2026-10-13T11:30:00Z', timeZone: 'UTC' } },
+      ], '@odata.nextLink': 'https://graph.microsoft.com/v1.0/me/calendars/calendar-1/calendarView?next=one' });
+      return response({ value: [] });
+    }) as typeof fetch;
+    const { client } = fixture({ token: token({ identity: microsoftIdentity }), fetcher });
+    const events = await client.readCalendarEvents(microsoftAccount, 'calendar-1');
+    expect(events.items[0]).toMatchObject({ startUtcCertified: true, endUtcCertified: true });
+    expect(events.items[1].startUtcCertified).toBeUndefined();
+    expect(events.items[2].startUtcCertified).toBeUndefined();
+    expect(events.items[3].startUtcCertified).toBeUndefined();
+    expect(events.items[3].endUtcCertified).toBeUndefined();
+    expect(prefers).toEqual(['outlook.timezone="UTC"', 'outlook.timezone="UTC"']);
+    expect(urls).toHaveLength(2);
+  });
+
+  it('rejects malformed and oversized calendar pages before saving a continuation cursor', async () => {
+    for (const value of [undefined, { nope: true }, Array.from({ length: 51 }, (_, index) => ({ id: `event-${index}` })), [{ id: '' }]]) {
+      const fetcher = vi.fn(async () => response({ value, '@odata.nextLink': 'https://graph.microsoft.com/v1.0/me/calendars/calendar-1/calendarView?next=one' })) as typeof fetch;
+      const { client } = fixture({ token: token({ identity: microsoftIdentity }), fetcher });
+      const onPage = vi.fn();
+      await expect(client.readCalendarEvents(microsoftAccount, 'calendar-1', { onPage })).rejects.toThrow(/calendar event/i);
+      expect(onPage).not.toHaveBeenCalled();
+    }
+  });
+
   it('encodes Google holiday calendar IDs as opaque path segments', async () => {
     const id = 'en.usa#holiday@group.v.calendar.google.com';
     let requested = '';

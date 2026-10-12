@@ -174,7 +174,7 @@ export type RequestGuard = () => void;
 export type PageCallback<T> = (items: T[], nextCursor: string | undefined, pagesRead: number) => void | Promise<void>;
 
 export interface CalendarSummary { id: string; name: string; writable: boolean; }
-export interface CalendarEventSummary { id: string; subject?: string; start?: string; end?: string; timeZone?: string; }
+export interface CalendarEventSummary { id: string; subject?: string; start?: string; end?: string; timeZone?: string; startUtcCertified?: boolean; endUtcCertified?: boolean; }
 
 const refreshLocks = new WeakMap<OAuthTokenStore, Map<string, Promise<StoredOAuthToken>>>();
 const credentialLocks = new WeakMap<OAuthTokenStore, Map<string, Promise<void>>>();
@@ -264,6 +264,49 @@ function emailList(values: string[], label: string): string[] {
 function calendarKey(value: string): string {
   if (!value || value.length > 1024 || /^[.]\.?$/.test(value) || /[\u0000-\u001f\u007f]/.test(value)) throw new Error('Invalid calendar identifier.');
   return encodeURIComponent(value);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function validateCalendarEventPage(value: unknown): asserts value is Array<{
+  id: string; subject?: string; summary?: string;
+  start?: { dateTime?: string; timeZone?: string; date?: string };
+  end?: { dateTime?: string; timeZone?: string; date?: string };
+}> | undefined {
+  if (value === undefined) return;
+  if (!Array.isArray(value)) throw new Error('Provider returned an invalid calendar event page.');
+  if (value.length > MAX_PAGE_SIZE) throw new Error('Provider returned more calendar events than the requested page size; page was not committed.');
+  for (const event of value) {
+    if (!isRecord(event) || typeof event.id !== 'string' || !event.id ||
+        (event.subject !== undefined && typeof event.subject !== 'string') ||
+        (event.summary !== undefined && typeof event.summary !== 'string')) {
+      throw new Error('Provider returned a malformed calendar event; page was not committed.');
+    }
+    for (const field of ['start', 'end'] as const) {
+      const time = event[field];
+      if (time === undefined) continue;
+      if (!isRecord(time) || (time.dateTime !== undefined && typeof time.dateTime !== 'string') ||
+          (time.timeZone !== undefined && typeof time.timeZone !== 'string') || (time.date !== undefined && typeof time.date !== 'string')) {
+        throw new Error('Provider returned malformed calendar event time data; page was not committed.');
+      }
+    }
+  }
+}
+
+/** Graph's UTC preference yields offset-free timestamps; certify only strict, valid UTC wall-clock values. */
+function isStrictUtcDateTime(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,7}))?$/.exec(value);
+  if (!match) return false;
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText] = match;
+  const year = Number(yearText); const month = Number(monthText); const day = Number(dayText);
+  const hour = Number(hourText); const minute = Number(minuteText); const second = Number(secondText);
+  if (month < 1 || month > 12 || hour > 23 || minute > 59 || second > 59) return false;
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const monthDays = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return day >= 1 && day <= monthDays[month - 1];
 }
 
 function graphImmutableHeaders(init: RequestInit): Headers {
@@ -733,15 +776,20 @@ export class ConnectorClient {
         ? new URL(`${GOOGLE_CALENDAR}/calendars/${encodedCalendarId}/events?maxResults=${MAX_PAGE_SIZE}&singleEvents=true&orderBy=startTime&timeMin=${encodeURIComponent(min)}&timeMax=${encodeURIComponent(max)}`)
         : new URL(`${GRAPH_API}/me/calendars/${encodedCalendarId}/calendarView?startDateTime=${encodeURIComponent(min)}&endDateTime=${encodeURIComponent(max)}&$top=${MAX_PAGE_SIZE}&$select=id,subject,start,end`);
       if (account.provider === 'google') {
-        const data = await this.json<{ items?: Array<{ id: string; summary?: string; start?: { dateTime?: string; timeZone?: string }; end?: { dateTime?: string } }>; nextPageToken?: string }>(account, url.toString(), 'calendar', undefined, options.guard, options.signal);
-        const pageItems = (data.items ?? []).slice(0, MAX_PAGE_SIZE).map((e) => ({ id: e.id, subject: e.summary, start: e.start?.dateTime, end: e.end?.dateTime, timeZone: e.start?.timeZone }));
+        const data = await this.json<{ items?: unknown; nextPageToken?: string }>(account, url.toString(), 'calendar', undefined, options.guard, options.signal);
+        validateCalendarEventPage(data.items);
+        const pageItems = (data.items ?? []).map((e) => ({ id: e.id, subject: e.summary, start: e.start?.dateTime, end: e.end?.dateTime, timeZone: e.start?.timeZone }));
         items.push(...pageItems);
         next = data.nextPageToken ? `${GOOGLE_CALENDAR}/calendars/${encodedCalendarId}/events?maxResults=${MAX_PAGE_SIZE}&singleEvents=true&orderBy=startTime&timeMin=${encodeURIComponent(min)}&timeMax=${encodeURIComponent(max)}&pageToken=${encodeURIComponent(data.nextPageToken)}` : undefined;
         pagesRead++;
         await options.onPage?.(pageItems, next, pagesRead);
       } else {
-        const data = await this.json<{ value?: Array<{ id: string; subject?: string; start?: { dateTime?: string; timeZone?: string }; end?: { dateTime?: string } }>; '@odata.nextLink'?: string }>(account, url.toString(), 'calendar', { headers: { prefer: 'outlook.timezone="UTC"' } }, options.guard, options.signal);
-        const pageItems = (data.value ?? []).slice(0, MAX_PAGE_SIZE).map((e) => ({ id: e.id, subject: e.subject, start: e.start?.dateTime, end: e.end?.dateTime, timeZone: e.start?.timeZone }));
+        const data = await this.json<{ value?: unknown; '@odata.nextLink'?: string }>(account, url.toString(), 'calendar', { headers: { prefer: 'outlook.timezone="UTC"' } }, options.guard, options.signal);
+        if (!Array.isArray(data.value)) throw new Error('Microsoft returned an invalid calendar event page.');
+        validateCalendarEventPage(data.value);
+        const pageItems = (data.value ?? []).map((e) => ({ id: e.id, subject: e.subject, start: e.start?.dateTime, end: e.end?.dateTime, timeZone: e.start?.timeZone,
+          startUtcCertified: e.start?.timeZone === 'UTC' && isStrictUtcDateTime(e.start?.dateTime) ? true : undefined,
+          endUtcCertified: e.end?.timeZone === 'UTC' && isStrictUtcDateTime(e.end?.dateTime) ? true : undefined }));
         items.push(...pageItems);
         next = data['@odata.nextLink']; if (next) safeUrl(next, account.provider, 'calendar', expectedPath);
         pagesRead++;
