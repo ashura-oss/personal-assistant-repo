@@ -21,9 +21,9 @@ const MAX_DEFERRED = 200;
 const MAX_CANDIDATE_OUTPUT = MAX_ACTIVE_TOTAL + MAX_DEFERRED;
 const DAY_MS = 86_400_000;
 const EMAIL = /^[^\s<>@,;]+@[^\s<>@,;]+\.[^\s<>@,;]+$/;
-const TIMESTAMP_OFFSET = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?(?:Z|[+-]\d{2}:\d{2})$/i;
-const TIMESTAMP_OFFSET_PARTS = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?(Z|[+-](\d{2}):(\d{2}))$/i;
-const TIMESTAMP_NAIVE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?$/;
+const TIMESTAMP_OFFSET = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,7})?)?(?:Z|[+-]\d{2}:\d{2})$/i;
+const TIMESTAMP_OFFSET_PARTS = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,7}))?)?(Z|[+-](\d{2}):(\d{2}))$/i;
+const TIMESTAMP_NAIVE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,7}))?)?$/;
 
 function fail(message: string): never { throw new Error(message); }
 function string(value: unknown, label: string, max: number): string {
@@ -41,15 +41,18 @@ function assertTimeZone(value: string): void {
 }
 function isCalendarDateValid(year: number, month: number, day: number, hour: number, minute: number, second: number): boolean {
   if (month < 1 || month > 12 || day < 1 || hour > 23 || minute > 59 || second > 59) return false;
-  return day <= new Date(Date.UTC(year, month, 0)).getUTCDate();
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const monthDays = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return day <= monthDays[month - 1];
 }
 function parseTimestamp(value: string | undefined, certifiedUtcNaive: boolean | undefined, label: string): number | undefined {
   if (value === undefined) return undefined;
   if (TIMESTAMP_OFFSET.test(value)) {
     const parts = TIMESTAMP_OFFSET_PARTS.exec(value)!;
-    const [, y, m, d, h, min, sec = '0', , zone, zoneHour = '0', zoneMinute = '0'] = parts;
+    const [, y, m, d, h, min, sec = '0', fraction = '0', zone, zoneHour = '0', zoneMinute = '0'] = parts;
     if (!isCalendarDateValid(Number(y), Number(m), Number(d), Number(h), Number(min), Number(sec)) || Number(zoneHour) > 23 || Number(zoneMinute) > 59) fail(`${label} is invalid.`);
-    const date = Date.parse(value);
+    const normalized = fraction === '0' ? value : value.replace(`.${fraction}`, `.${fraction.slice(0, 3).padEnd(3, '0')}`);
+    const date = Date.parse(normalized);
     if (!Number.isFinite(date)) fail(`${label} is invalid.`);
     return date;
   }
@@ -58,7 +61,10 @@ function parseTimestamp(value: string | undefined, certifiedUtcNaive: boolean | 
     const [, y, m, d, h, min, sec = '0', fraction = '0'] = match;
     const year = Number(y), month = Number(m), day = Number(d), hour = Number(h), minute = Number(min), second = Number(sec);
     if (!isCalendarDateValid(year, month, day, hour, minute, second)) fail(`${label} is invalid.`);
-    return Date.UTC(year, month - 1, day, hour, minute, second, Number(fraction.padEnd(3, '0')));
+    const date = new Date(0);
+    date.setUTCFullYear(year, month - 1, day);
+    date.setUTCHours(hour, minute, second, Number(fraction.slice(0, 3).padEnd(3, '0')));
+    return date.getTime();
   }
   fail(`${label} must include an offset, or be explicitly certified as UTC.`);
 }
@@ -360,3 +366,5 @@ export function evaluateProactive(input: EvaluateProactiveInput): ProactiveEvalu
 }
 
 export { sourceId as proactiveSourceId };
+export { computeProactiveNextCheckAt } from './boundaries';
+export type { ComputeProactiveNextCheckInput } from './boundaries';
