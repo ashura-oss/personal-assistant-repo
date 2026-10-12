@@ -1,6 +1,6 @@
 import React from 'react';
 import { Pressable, Text, TextInput, View } from 'react-native';
-import { Ionicons } from '@expo/vector-icons';
+import Ionicons from '@expo/vector-icons/Ionicons';
 import { C, s } from './theme';
 
 export function IconButton({ name, onPress, label, color = C.text }: { name: React.ComponentProps<typeof Ionicons>['name']; onPress: () => void; label: string; color?: string }) {
