@@ -15,7 +15,15 @@ import { stateStore } from '../storage/platformStorage';
 import type { StateStore } from '../storage/contracts';
 import { writePrivateDocument } from '../storage/documents';
 import { AzureOpenAIClient, AzureSpeechClient, ReplyGenerationError, ReplyGenerationPreDispatchError, validateAzureEndpoint, type DraftAnalysis, type ReplyGenerationUsage } from './azure';
-import { cancelReminderNotification, requestReminderNotification } from './notifications';
+import {
+  createNotificationBackend, isMatchingPending, isOwnedLegacyReminderCancellation, NotificationBackendError,
+} from './notificationBackend';
+import {
+  emptyReminderState, legacyReminderIdentifier, notificationContentForIntent, reminderNotificationIdentifier,
+  reminderPayloadForDigest, validateReminderPayload, validateReminderRecord, validateReminderState,
+} from '../reminders';
+import type { LegacyReminderCancellation, ReminderIntent, ReminderPayload, ReminderRecord, ReminderState } from '../reminders';
+import type { NotificationBackend, PendingNotificationRequest } from './notificationBackend';
 import { removeAudio } from '../audio/readAudio';
 import type { AudioRecoveryMetadata, RecordingRecoveryService, StagedRecording } from '../audio/recovery.types';
 import { MAX_DURATION_SECONDS, MAX_RECOVERY_BYTES, RECOVERY_FORMATS, safeAudioFileName } from '../audio/formats';
@@ -66,12 +74,28 @@ function isoWeek(date: string): string {
   return `${weekYear}-W${String(week).padStart(2, '0')}`;
 }
 const clone = <T,>(value: T): T => structuredClone(value);
+function boundedReminderTitle(value: string | undefined): string {
+  const safe = value?.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!safe) return 'Reminder';
+  let result = '';
+  let bytes = 0;
+  let characters = 0;
+  for (const point of safe) {
+    const pointBytes = new TextEncoder().encode(point).length;
+    if (characters >= 200 || bytes + pointBytes > 512) break;
+    result += point;
+    bytes += pointBytes;
+    characters += 1;
+  }
+  return result.trim() || 'Reminder';
+}
 function stateEntityIds(state: AppState): Set<string> {
   return new Set([
     ...state.notes.map((item) => item.id), ...state.tasks.map((item) => item.id),
     ...state.proposals.map((item) => item.id), ...state.activity.map((item) => item.id),
     ...state.accounts.map((item) => item.id), ...state.calendars.map((item) => item.id),
     ...state.mailbox.map((item) => item.id), ...state.calendarEvents.map((item) => item.id),
+    ...state.reminders.records.map((item) => item.id), ...state.reminders.intents.map((item) => item.id),
     ...state.dispatchRecords.map((item) => item.id), ...state.importedBackups.flatMap((item) => [
       item.id, ...item.noteLinks.map((link) => link.noteId), ...item.taskLinks.map((link) => link.taskId),
       ...item.documents.map((document) => document.id), ...item.history.map((entry) => entry.id),
@@ -161,7 +185,7 @@ function initialState(): AppState {
     settings: { ...DEFAULT_SETTINGS },
     usage: { month: day.slice(0, 7), day, requests: 0, attemptsToday: 0, inputTokens: 0, outputTokens: 0, transcriptionSeconds: 0, attempts: 0, unknownCharges: 0, reservedUsd: 0, priceKnown: false, estimatedCostUsd: 0 },
     mailbox: [], selectedMailTexts: [], calendarEvents: [], syncStates: {}, pendingCredentialCleanup: [], dispatchRecords: [], dispatchRecordQuarantine: [], mailboxSchemaVersion: 2,
-    proactive: emptyProactiveState(), importedBackups: [], knowledge: emptyKnowledgeState(),
+    proactive: emptyProactiveState(), importedBackups: [], knowledge: emptyKnowledgeState(), reminders: emptyReminderState(newId()),
   };
 }
 
@@ -598,7 +622,7 @@ function createProposalProvenance(input: {
   };
 }
 
-function normalizeLoadedState(value: unknown): AppState & { backupImportQuarantine?: unknown[]; knowledgeQuarantine?: unknown[] } {
+function normalizeLoadedState(value: unknown): AppState & { backupImportQuarantine?: unknown[]; knowledgeQuarantine?: unknown[]; reminderQuarantine?: unknown[] } {
   const defaults = initialState();
   if (!value || typeof value !== 'object') throw new Error('Saved app data is not a valid state snapshot. It was preserved for recovery.');
   const raw = value as Partial<AppState>;
@@ -743,6 +767,14 @@ function normalizeLoadedState(value: unknown): AppState & { backupImportQuaranti
   }
   const tasks = [...savedTasks, ...migratedTasks.filter((task) => !savedTasks.some((saved) => saved.id === task.id))];
   const settings = { ...DEFAULT_SETTINGS, ...rawSettings, timezone: validTimezone(rawSettings.timezone), maxRequestBytes };
+  let reminders: ReminderState;
+  const retainedReminderQuarantine = (value as { reminderQuarantine?: unknown }).reminderQuarantine;
+  const reminderQuarantine: unknown[] = Array.isArray(retainedReminderQuarantine) ? clone(retainedReminderQuarantine) : retainedReminderQuarantine === undefined ? [] : [retainedReminderQuarantine];
+  if (raw.reminders === undefined) reminders = emptyReminderState(newId());
+  else {
+    try { reminders = validateReminderState(raw.reminders); }
+    catch { reminders = emptyReminderState(newId()); reminderQuarantine.push(raw.reminders); }
+  }
   const dispatchRecords: DispatchRecord[] = [];
   const dispatchRecordQuarantine: AppState['dispatchRecordQuarantine'] = Array.isArray(raw.dispatchRecordQuarantine)
     ? raw.dispatchRecordQuarantine.map((item) => item && typeof item === 'object' && 'raw' in item && 'quarantinedAt' in item
@@ -768,6 +800,11 @@ function normalizeLoadedState(value: unknown): AppState & { backupImportQuaranti
     ...(knowledgeQuarantine.length ? { knowledgeQuarantine } : {}),
     knowledgeRecoveryStatus: knowledgeQuarantine.length
       ? { message: 'Some saved knowledge could not be validated and is held privately.' as const }
+      : undefined,
+    reminders,
+    ...(reminderQuarantine.length ? { reminderQuarantine } : {}),
+    reminderRecoveryStatus: reminderQuarantine.length
+      ? { quarantined: true as const, message: 'Some reminder data could not be validated and is held privately. New reminders are disabled until recovery.' as const }
       : undefined,
     ...(backupImportQuarantine.length ? { backupImportQuarantine } : {}),
     backupRecoveryStatus: backupImportQuarantine.length
@@ -850,6 +887,7 @@ export interface ControllerIntegrationDependencies {
     onAuthStatus: (accountId: string, status: Account['authStatus']) => Promise<void>,
   ) => ConnectorClient;
   recordingRecovery?: RecordingRecoveryService;
+  reminderBackend?: NotificationBackend;
 }
 
 interface BackupImportSession {
@@ -925,6 +963,7 @@ export class AppControllerImpl implements AppController {
   private proactiveQuarantine?: ProactiveQuarantine;
   private backupImportQuarantine: unknown[] = [];
   private knowledgeQuarantine: unknown[] = [];
+  private reminderQuarantine: unknown[] = [];
   private proactiveSourceHashMemo: ProactiveSourceHashMemo = new Map();
   private mailReplyGenerations = new Map<string, { messageId: string; promise: Promise<MailReplyTextGenerationResult> }>();
   private mailReplyGenerationCache = new Map<string, MailReplyTextGenerationResult>();
@@ -934,6 +973,12 @@ export class AppControllerImpl implements AppController {
   private recordingAttachmentJobs = new Map<string, Promise<Note>>();
   private recordingAttachmentReceipts = new Map<string, RecordingAttachmentReceipt>();
   private recordingRecoveryPromise?: Promise<RecordingRecoveryService>;
+  private readonly reminderBackend: NotificationBackend;
+  private reminderReconcileJob?: Promise<void>;
+  private reminderReconcileAgain = false;
+  private readonly verifiedReminderForeground = new Map<string, string>();
+  private reminderJobs = new Map<string, Promise<ReminderRecord>>();
+  private reminderLegacyJobs = new Map<string, Promise<void>>();
   private draftAllocatedIds = new WeakMap<AppState, Set<string>>();
 
   constructor(
@@ -946,6 +991,7 @@ export class AppControllerImpl implements AppController {
     this.connector = integration.tokenStore && integration.connectorFactory
       ? integration.connectorFactory(integration.tokenStore, (accountId, status) => this.handleConnectorAuthStatus(accountId, status))
       : undefined;
+    this.reminderBackend = integration.reminderBackend ?? createNotificationBackend();
   }
 
   private async getRecordingRecoveryService(): Promise<RecordingRecoveryService> {
@@ -967,18 +1013,20 @@ export class AppControllerImpl implements AppController {
   }
 
   private persistedState(state: AppState): AppState {
-    const result = { ...state } as AppState & { proactiveQuarantine?: unknown; backupImportQuarantine?: unknown[]; knowledgeQuarantine?: unknown[] };
+    const result = { ...state } as AppState & { proactiveQuarantine?: unknown; backupImportQuarantine?: unknown[]; knowledgeQuarantine?: unknown[]; reminderQuarantine?: unknown[] };
     if (this.proactiveQuarantine) result.proactiveQuarantine = clone(this.proactiveQuarantine);
     if (this.backupImportQuarantine.length) result.backupImportQuarantine = clone(this.backupImportQuarantine);
     if (this.knowledgeQuarantine.length) result.knowledgeQuarantine = clone(this.knowledgeQuarantine);
+    if (this.reminderQuarantine.length) result.reminderQuarantine = clone(this.reminderQuarantine);
     return result;
   }
 
   private publicState(state: AppState): AppState {
-    const result = clone(state) as AppState & { proactiveQuarantine?: unknown; backupImportQuarantine?: unknown; knowledgeQuarantine?: unknown };
+    const result = clone(state) as AppState & { proactiveQuarantine?: unknown; backupImportQuarantine?: unknown; knowledgeQuarantine?: unknown; reminderQuarantine?: unknown };
     delete result.proactiveQuarantine;
     delete result.backupImportQuarantine;
     delete result.knowledgeQuarantine;
+    delete result.reminderQuarantine;
     return result;
   }
 
@@ -1102,6 +1150,7 @@ export class AppControllerImpl implements AppController {
       const draft = clone(this.state);
       const result = await operation(draft);
       await this.evaluateProactiveDraft(draft);
+      draft.reminders = validateReminderState(draft.reminders);
       await this.store.save(this.persistedState(draft));
       this.state = draft;
       this.snapshot = deepFreeze(this.publicState(draft));
@@ -1121,6 +1170,7 @@ export class AppControllerImpl implements AppController {
       const { changed, result } = await operation(draft);
       if (changed) {
         await this.evaluateProactiveDraft(draft);
+        draft.reminders = validateReminderState(draft.reminders);
         await this.store.save(this.persistedState(draft));
         this.state = draft;
         this.snapshot = deepFreeze(this.publicState(draft));
@@ -1418,12 +1468,15 @@ export class AppControllerImpl implements AppController {
   }
 
   private async loadInternal(): Promise<void> {
+    this.verifiedReminderForeground.clear();
     const loaded = await this.store.load();
     const normalized = loaded ? normalizeLoadedState(loaded) : initialState();
     this.backupImportQuarantine = clone((normalized as AppState & { backupImportQuarantine?: unknown[] }).backupImportQuarantine ?? []);
     delete (normalized as AppState & { backupImportQuarantine?: unknown[] }).backupImportQuarantine;
     this.knowledgeQuarantine = clone((normalized as AppState & { knowledgeQuarantine?: unknown[] }).knowledgeQuarantine ?? []);
     delete (normalized as AppState & { knowledgeQuarantine?: unknown[] }).knowledgeQuarantine;
+    this.reminderQuarantine = clone((normalized as AppState & { reminderQuarantine?: unknown[] }).reminderQuarantine ?? []);
+    delete (normalized as AppState & { reminderQuarantine?: unknown[] }).reminderQuarantine;
     this.state = normalized;
     const persisted = loaded as (AppState & { proactiveQuarantine?: unknown }) | undefined;
     const proactive = normalizeProactiveData(persisted?.proactive, persisted?.proactiveQuarantine);
@@ -1948,7 +2001,10 @@ export class AppControllerImpl implements AppController {
     const policySources = policyCatalog.sources.map((source) => ({ sourceId: source.id, revision: source.revision, sourceVersion: source.version }));
     const memorySuggestionFingerprint = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, processingFingerprint, { encoding: Crypto.CryptoEncoding.HEX });
     const created: Proposal[] = generated.proposals.map((draft) => ({
-      id: newId(), noteId: note.id, ...draft, status: 'draft', revision: 1,
+      id: newId(), noteId: note.id, ...draft,
+      ...(draft.kind === 'reminder' && draft.dueAt && Number.isFinite(Date.parse(draft.dueAt))
+        ? { dueAt: new Date(Math.floor(Date.parse(draft.dueAt) / 1000) * 1000).toISOString() } : {}),
+      status: 'draft', revision: 1,
       recipients: [...draft.recipients], sourceRevision: note.revision, evidence: draft.evidence.map((item) => ({ ...item })),
       sourceActionKey: sourceActionKey(note, draft.kind, draft.evidence),
       provenance: createProposalProvenance({ analysisFingerprint: processingFingerprint, note, intent, question, knowledgeSelection, sourceVersions: generated.sourceVersions, policySources, settings: state.settings, answeredAsOf }),
@@ -2173,10 +2229,13 @@ export class AppControllerImpl implements AppController {
   }
 
   async editProposal(id: string, patch: ProposalPatch): Promise<Proposal> {
-    const priorReminder = this.snapshot.proposals.find((item) => item.id === id);
     const result = await this.mutate(async (state) => {
       const proposal = this.proposal(state, id);
       if (['executed', 'accepted', 'simulated', 'dispatching', 'unknown', 'dismissed'].includes(proposal.status)) throw new Error('This proposal can no longer be edited.');
+      if (proposal.kind === 'reminder') {
+        const revision = proposal.notificationRevision ?? proposal.revision;
+        await this.enqueueLegacyReminderCancellation(state, proposal.id, revision);
+      }
       if (proposal.provenance?.version === 2) {
         const locked = proposal.email?.reply;
         if (!locked || proposal.email?.operation !== 'draft' || (patch.accountId !== undefined && patch.accountId !== proposal.accountId) ||
@@ -2196,9 +2255,7 @@ export class AppControllerImpl implements AppController {
       addActivity(state, 'proposal_created', 'Suggestion edited. Review and approve the updated details.', { proposalId: id, noteId: proposal.noteId });
       return proposal;
     });
-    if (priorReminder?.kind === 'reminder') {
-      await cancelReminderNotification({ id, revision: priorReminder.notificationRevision ?? priorReminder.revision });
-    }
+    if (result.kind === 'reminder') await this.reconcileReminderAlerts();
     return result;
   }
 
@@ -2244,7 +2301,12 @@ export class AppControllerImpl implements AppController {
           proposal.event = { ...proposal.event, title, description: proposal.event.description ?? proposal.body };
         }
       }
-      if (proposal.kind === 'reminder' && proposal.dueAt && !Number.isFinite(Date.parse(proposal.dueAt))) throw new Error('Enter a valid reminder date and time.');
+      if (proposal.kind === 'reminder' && proposal.dueAt) {
+        if (!Number.isFinite(Date.parse(proposal.dueAt))) throw new Error('Enter a valid reminder date and time.');
+        if (new Date(proposal.dueAt).toISOString() !== proposal.dueAt || !proposal.dueAt.endsWith('.000Z')) {
+          throw new Error('Edit this reminder time to whole seconds, then approve it again.');
+        }
+      }
       proposal.status = 'approved';
       proposal.approvedRevision = proposal.revision;
       proposal.approvedPayloadDigest = await approvedDigest(proposal, state);
@@ -2272,6 +2334,26 @@ export class AppControllerImpl implements AppController {
       if (proposal.kind === 'reminder') {
         if (!proposal.dueAt) throw new Error('Add a date and time before saving this reminder.');
         if (Date.parse(proposal.dueAt) <= Date.now()) throw new Error('Reminder time must be in the future.');
+        if (new Date(proposal.dueAt).toISOString() !== proposal.dueAt || !proposal.dueAt.endsWith('.000Z')) throw new Error('This older reminder uses an unverified fractional time. Edit its time and approve it again.');
+        if (proposal.provenance?.version !== 1 || !proposal.noteId || !Number.isSafeInteger(proposal.sourceRevision)) throw new Error('This reminder has no verifiable source note. Run Assist again before saving it.');
+        const note = state.notes.find((item) => item.id === proposal.noteId);
+        const transcriptVersion = proposal.provenance.sources.find((source) => source.sourceId === 'transcript')?.sourceVersion;
+        const quote = proposal.evidence.find((item) => item.quote)?.quote;
+        if (!note || !transcriptVersion || !quote) throw new Error('The reminder source evidence is incomplete. Run Assist again before saving it.');
+        let reminder = state.reminders.records.find((item) => item.origin.kind === 'note' && item.origin.proposalId === proposal.id && item.status !== 'cancelled');
+        if (!reminder) {
+          if (state.reminders.records.length >= 500) throw new Error('Reminder storage is full. Export or delete an old reminder first.');
+          const time = now();
+          const payload = validateReminderPayload({ title: proposal.title, body: proposal.body, dueAt: proposal.dueAt,
+            displayTimeZone: state.settings.timezone, privacyMode: 'private' });
+          const origin: ReminderRecord['origin'] = { kind: 'note', noteId: note.id, proposalId: proposal.id, proposalRevision: proposal.revision,
+            sourceRevision: proposal.sourceRevision!, sourceVersion: transcriptVersion, quote };
+          const approvedBase = { ...payload, id: this.freshStateId(state), revision: 1, origin, status: 'approved' as const,
+            createdAt: time, updatedAt: time, approvedRevision: 1 };
+          reminder = validateReminderRecord({ ...approvedBase, approvedPayloadDigest: await this.reminderApprovalDigest(approvedBase as ReminderRecord) });
+          state.reminders.records.unshift(reminder);
+        }
+        proposal.reminderId = reminder.id;
       }
       if (await approvedDigest(proposal, state) !== proposal.approvedPayloadDigest) throw new Error('The approved content or destination changed. Review and approve it again.');
       if (proposal.kind === 'event' && !proposal.eventTransactionId) proposal.eventTransactionId = newId();
@@ -2299,15 +2381,19 @@ export class AppControllerImpl implements AppController {
 
     let result: ProposalStatusOutcome;
     if (claimed.kind === 'reminder') {
-      const alert = await requestReminderNotification(claimed, undefined, undefined, () =>
-        this.proposalDependencyProjection(this.snapshot, claimed) === approvedDependencyProjection);
-      result = alert.status === 'blocked' || alert.status === 'expired'
-        ? { status: 'failed', message: alert.status === 'expired' ? 'Reminder time passed while alert permission was being checked. Review and approve a future time.' : 'The reminder source context changed before scheduling. Run Assist again and review the suggestion.' }
-        : { status: 'executed', notificationId: alert.status === 'scheduled' ? alert.notificationId : undefined, message: alert.status === 'scheduled'
-          ? 'Reminder saved locally and an alert was scheduled on this device.'
-          : alert.status === 'unavailable'
-            ? 'Reminder saved locally. This browser does not provide alerts after its tab is closed.'
-            : 'Reminder saved locally; alerts are disabled on this device.' };
+      try {
+        const reminder = this.snapshot.reminders.records.find((item) => item.id === claimed.reminderId);
+        if (!reminder) throw new Error('The reminder ledger record was not saved.');
+        const saved = await this.saveApprovedReminder(reminder.id, { expectedRevision: reminder.revision });
+        const intent = saved.currentIntentId ? this.snapshot.reminders.intents.find((item) => item.id === saved.currentIntentId) : undefined;
+        result = { status: 'executed', notificationId: intent?.observed === 'pending' ? intent.identifier : undefined,
+          message: intent?.observed === 'pending' ? 'Reminder saved locally and the alert is pending on this device.'
+            : intent?.observed === 'unavailable' ? 'Reminder saved locally. This platform does not provide background alerts.'
+              : intent?.observed === 'delivery_unknown' ? 'Reminder saved locally, but its alert outcome is unknown.'
+                : 'Reminder saved locally; alerts are blocked or could not be verified.' };
+      } catch (error) {
+        result = { status: 'failed', message: error instanceof Error ? error.message : 'Could not save the reminder.' };
+      }
     } else if (claimed.kind === 'task') {
       result = { status: 'executed', message: 'Task saved locally on this device.' };
     } else if (claimed.kind === 'memory') {
@@ -2408,7 +2494,6 @@ export class AppControllerImpl implements AppController {
       }
     }
 
-    let cancelReminder = false;
     let committed: Proposal | undefined;
     try {
       committed = await this.mutate((state) => {
@@ -2450,9 +2535,8 @@ export class AppControllerImpl implements AppController {
           addActivity(state, 'error', `Dispatch receipt saved while preserving the proposal’s newer state: ${result.message}`, { proposalId: frozenRecord!.proposalId, noteId: proposal.noteId });
           return proposal;
         }
-        if ((proposal.kind === 'task' || proposal.kind === 'reminder') && result.status === 'executed' &&
+        if (proposal.kind === 'task' && result.status === 'executed' &&
             this.proposalDependencyProjection(state, proposal) !== approvedDependencyProjection) {
-          cancelReminder = proposal.kind === 'reminder';
           result = { status: 'failed', message: 'The source context changed before this local action was committed. Run Assist again and review the suggestion.' };
         }
         proposal.status = result.status;
@@ -2472,11 +2556,7 @@ export class AppControllerImpl implements AppController {
         addActivity(state, result.status === 'simulated' ? 'simulation' : result.status === 'failed' || result.status === 'unknown' ? 'error' : 'local_action', result.message, { proposalId: id, noteId: proposal.noteId });
         return proposal;
       });
-    } catch (error) {
-      if (claimed.kind === 'reminder') await cancelReminderNotification(claimed);
-      throw error;
-    }
-    if (cancelReminder) await cancelReminderNotification(claimed);
+    } catch (error) { throw error; }
     if (!committed && frozenRecord) {
       // Preserve a truthful result for the caller even if the local proposal was removed;
       // the durable dispatch history remains the canonical receipt.
@@ -2681,6 +2761,603 @@ export class AppControllerImpl implements AppController {
     if (current.availability === 'unavailable') return { status: 'unavailable', candidate: entry.candidate };
     if (current.freshness !== 'fresh' || current.sourceVersion !== entry.candidate.sourceVersion) return { status: 'stale', candidate: entry.candidate };
     return { status: 'current', candidate: entry.candidate, source: current };
+  }
+
+  private assertReminderWritable(): void {
+    if (this.reminderQuarantine.length) throw new Error('Saved reminder data is held for recovery. New reminder changes are disabled until it is repaired.');
+  }
+
+  private reminder(state: AppState, id: string): ReminderRecord {
+    const record = state.reminders.records.find((item) => item.id === id);
+    if (!record) throw new Error('Reminder was not found.');
+    return record;
+  }
+
+  private assertReminderOriginCurrent(state: AppState, origin: ReminderRecord['origin'], allowSaved = false): void {
+    if (allowSaved) return;
+    if (origin.kind === 'manual') return;
+    if (origin.kind === 'note') {
+      const note = state.notes.find((item) => item.id === origin.noteId);
+      if (!note || note.revision !== origin.sourceRevision || !note.analysis || note.analysis.sourceRevision !== origin.sourceRevision || note.analysis.stale) {
+        throw new Error('The source note changed. Refresh the reminder source before approving or saving it.');
+      }
+      const version = note.analysis.sourceVersions.transcript;
+      if (version !== origin.sourceVersion || !note.transcript.includes(origin.quote)) throw new Error('The source note evidence is no longer current. Refresh the reminder source.');
+      return;
+    }
+    const record = state.reminders.records.find((item) => item.origin.kind === 'proactive' && item.origin.candidate.id === origin.candidate.id);
+    const candidate = state.proactive.candidates.find((item) => item.candidate.id === origin.candidate.id);
+    const rule = state.proactive.rules.find((item) => item.id === origin.rule.id);
+    if (!allowSaved && (!candidate || candidate.presentation !== 'active' || !rule?.enabled || rule.revision !== origin.rule.revision || rule.version !== origin.rule.version || Date.parse(origin.expiresAt) <= Date.now())) {
+      throw new Error('This proactive suggestion is no longer current. Refresh its source before approving or saving it.');
+    }
+    if (!allowSaved && candidate?.candidate.sourceVersion !== origin.candidate.sourceVersion) throw new Error('The proactive source changed. Refresh it before approving or saving.');
+    if (record && record.id === '') throw new Error('Reminder source could not be verified.');
+    if (origin.binding) {
+      const account = state.accounts.find((item) => item.id === origin.binding!.accountId);
+      if (!allowSaved && (!account || !account.connected || account.authStatus !== 'connected' || identityKey(account) !== origin.binding.identityKey || (account.connectionGeneration ?? 0) !== origin.binding.connectionGeneration)) {
+        throw new Error('The source account changed. Refresh the reminder source before approving or saving it.');
+      }
+    }
+  }
+
+  private async verifyProactiveReminderOrigin(origin: Extract<ReminderRecord['origin'], { kind: 'proactive' }>): Promise<void> {
+    await this.evaluateLocalCandidates();
+    const captured = this.snapshot;
+    const entry = captured.proactive.candidates.find((item) => item.candidate.id === origin.candidate.id);
+    const rule = captured.proactive.rules.find((item) => item.id === origin.rule.id);
+    if (!entry || entry.presentation !== 'active' || !rule?.enabled || rule.revision !== origin.rule.revision || rule.version !== origin.rule.version || Date.parse(origin.expiresAt) <= Date.now()) {
+      throw new Error('This proactive suggestion is no longer current. Refresh its source before approving or saving it.');
+    }
+    const fresh = await this.getProactiveCandidateSource(origin.candidate.id);
+    if (this.snapshot !== captured || fresh.status !== 'current' || fresh.source?.sourceVersion !== origin.candidate.sourceVersion ||
+        stableJson(fresh.source) !== stableJson(origin.source)) throw new Error('The proactive source changed. Refresh it before approving or saving.');
+    if (origin.binding) {
+      const account = captured.accounts.find((item) => item.id === origin.binding!.accountId);
+      if (!account || !account.connected || account.authStatus !== 'connected' || identityKey(account) !== origin.binding.identityKey || (account.connectionGeneration ?? 0) !== origin.binding.connectionGeneration) {
+        throw new Error('The source account changed. Refresh the reminder source before approving or saving it.');
+      }
+    }
+  }
+
+  private async reminderApprovalDigest(record: ReminderRecord): Promise<string> {
+    const payload = { title: record.title, body: record.body, dueAt: record.dueAt, displayTimeZone: record.displayTimeZone, privacyMode: record.privacyMode };
+    return Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256,
+      JSON.stringify({ id: record.id, revision: record.revision, payload: reminderPayloadForDigest(payload), origin: record.origin }),
+      { encoding: Crypto.CryptoEncoding.HEX });
+  }
+
+  private async setReminderIntent(state: AppState, record: ReminderRecord, desired: 'scheduled' | 'cancelled', observed: ReminderIntent['observed'] = 'unconfirmed'): Promise<ReminderIntent> {
+    const prior = state.reminders.intents.filter((item) => item.reminderId === record.id);
+    const epoch = prior.reduce((maximum, item) => Math.max(maximum, item.epoch), 0) + 1;
+    const payload: ReminderPayload = validateReminderPayload({ title: record.title, body: record.body, dueAt: record.dueAt,
+      displayTimeZone: record.displayTimeZone, privacyMode: record.privacyMode });
+    const payloadDigest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, reminderPayloadForDigest(payload), { encoding: Crypto.CryptoEncoding.HEX });
+    const time = now();
+    const intent: ReminderIntent = {
+      id: this.freshStateId(state), reminderId: record.id, reminderRevision: record.revision, epoch,
+      identifier: reminderNotificationIdentifier(state.reminders.installationId, record.id, epoch), payloadDigest,
+      payload, desired, observed, createdAt: time, updatedAt: time,
+    };
+    state.reminders.intents.unshift(intent);
+    record.currentIntentId = intent.id;
+    return intent;
+  }
+
+  private cancellationForCurrentIntent(state: AppState, record: ReminderRecord): void {
+    const intent = record.currentIntentId ? state.reminders.intents.find((item) => item.id === record.currentIntentId) : undefined;
+    if (intent?.desired === 'scheduled') {
+      intent.desired = 'cancelled'; intent.observed = 'unconfirmed'; intent.updatedAt = now(); delete intent.errorCode;
+    }
+  }
+
+  async createReminderDraft(input: import('../core').ReminderDraftInput = {}): Promise<ReminderRecord> {
+    await this.load();
+    let candidateOrigin: ReminderRecord['origin'] = { kind: 'manual' };
+    if (input.candidateId) {
+      const source = await this.getProactiveCandidateSource(input.candidateId);
+      if (source.status !== 'current' || !source.candidate || !source.source) throw new Error('This proactive suggestion is no longer current. Refresh candidates before creating a reminder.');
+      const captured = this.snapshot;
+      const rule = captured.proactive.rules.find((item) => item.id === source.candidate!.ruleId);
+      if (!rule?.enabled) throw new Error('The proactive rule is no longer enabled.');
+      const account = source.source.accountId ? captured.accounts.find((item) => item.id === source.source!.accountId) : undefined;
+      candidateOrigin = {
+        kind: 'proactive', candidate: clone(source.candidate), rule: { id: rule.id, revision: rule.revision, version: rule.version, name: rule.name },
+        source: clone(source.source), ...(account ? { binding: { accountId: account.id, namespace: account.provider, identityKey: identityKey(account), connectionGeneration: account.connectionGeneration ?? 0 } } : {}),
+        capturedAt: now(), expiresAt: new Date(Date.now() + 15 * 60_000).toISOString(),
+      };
+    }
+    const dueAt = input.dueAt ?? new Date(Math.ceil((Date.now() + 60 * 60_000) / 60_000) * 60_000).toISOString();
+    const sourceTitle = candidateOrigin.kind === 'proactive'
+      ? candidateOrigin.source.kind === 'task' ? candidateOrigin.source.title
+        : candidateOrigin.source.subject
+      : undefined;
+    const payload = validateReminderPayload({ title: input.title ?? (candidateOrigin.kind === 'proactive' ? boundedReminderTitle(sourceTitle) : 'Reminder'),
+      body: input.body ?? '', dueAt, displayTimeZone: input.displayTimeZone ?? validTimezone(this.snapshot.settings.timezone), privacyMode: input.privacyMode ?? 'private' });
+    return this.mutate((state) => {
+      this.assertReminderWritable();
+      if (candidateOrigin.kind === 'proactive') {
+        const existing = state.reminders.records.find((item) => item.origin.kind === 'proactive' && item.origin.candidate.id === candidateOrigin.candidate.id && ['draft', 'approved', 'saved'].includes(item.status));
+        if (existing) return existing;
+        this.assertReminderOriginCurrent(state, candidateOrigin);
+      }
+      if (state.reminders.records.length >= 500) throw new Error('Reminder storage is full. Export or delete an old reminder first.');
+      const time = now();
+      const record = validateReminderRecord({ ...payload, id: this.freshStateId(state), revision: 1, origin: candidateOrigin, status: 'draft', createdAt: time, updatedAt: time });
+      state.reminders.records.unshift(record);
+      addActivity(state, 'local_action', 'Reminder draft created on this device.');
+      return record;
+    });
+  }
+
+  async updateReminderDraft(id: string, input: import('../core').ReminderDraftPatch): Promise<ReminderRecord> {
+    const result = await this.mutate(async (state) => {
+      this.assertReminderWritable();
+      const record = this.reminder(state, id);
+      if (record.revision !== input.expectedRevision) throw new Error('This reminder changed. Reopen it before editing.');
+      if (record.status !== 'draft' && record.status !== 'approved' && record.status !== 'saved') throw new Error('This reminder can no longer be edited.');
+      const wasSaved = record.status === 'saved';
+      if (wasSaved) this.cancellationForCurrentIntent(state, record);
+      const payload = validateReminderPayload({ title: input.title ?? record.title, body: input.body ?? record.body, dueAt: input.dueAt ?? record.dueAt,
+        displayTimeZone: input.displayTimeZone ?? record.displayTimeZone, privacyMode: input.privacyMode ?? record.privacyMode });
+      Object.assign(record, payload, { revision: record.revision + 1, status: 'draft' as const, updatedAt: now() });
+      delete record.approvedRevision; delete record.approvedPayloadDigest; delete record.currentIntentId;
+      addActivity(state, 'local_action', 'Reminder edited. Approve the updated version before saving it.');
+      return { record, wasSaved };
+    });
+    if (result.wasSaved) await this.reconcileReminderAlerts();
+    return this.reminder(this.snapshot, result.record.id);
+  }
+
+  async refreshReminderSource(id: string, input: { expectedRevision: number }): Promise<ReminderRecord> {
+    const record = this.snapshot.reminders.records.find((item) => item.id === id);
+    if (!record || record.revision !== input.expectedRevision) throw new Error('This reminder changed. Reopen it before refreshing its source.');
+    if (record.origin.kind !== 'proactive') throw new Error('Only proactive reminders have a refreshable source.');
+    const oldOrigin = record.origin;
+    await this.evaluateLocalCandidates();
+    const refreshedSnapshot = this.snapshot;
+    const refreshedEntry = refreshedSnapshot.proactive.candidates.find((item) => item.candidate.ruleId === oldOrigin.candidate.ruleId && item.candidate.sourceId === oldOrigin.candidate.sourceId && item.presentation === 'active');
+    if (!refreshedEntry) throw new Error('The proactive source is not currently available.');
+    const refreshed = await this.getProactiveCandidateSource(refreshedEntry.candidate.id);
+    if (this.snapshot !== refreshedSnapshot || refreshed.status !== 'current' || !refreshed.candidate || !refreshed.source) throw new Error('The proactive source changed while it was refreshing.');
+    const bound = this.snapshot;
+    const rule = bound.proactive.rules.find((item) => item.id === refreshed.candidate!.ruleId);
+    if (!rule?.enabled) throw new Error('The proactive rule is no longer enabled.');
+    const account = refreshed.source.accountId ? bound.accounts.find((item) => item.id === refreshed.source!.accountId) : undefined;
+    const origin: ReminderRecord['origin'] = { kind: 'proactive', candidate: clone(refreshed.candidate), rule: { id: rule.id, revision: rule.revision, version: rule.version, name: rule.name },
+      source: clone(refreshed.source), ...(account ? { binding: { accountId: account.id, namespace: account.provider, identityKey: identityKey(account), connectionGeneration: account.connectionGeneration ?? 0 } } : {}),
+      capturedAt: now(), expiresAt: new Date(Date.now() + 15 * 60_000).toISOString() };
+    const result = await this.mutate((state) => {
+      this.assertReminderWritable();
+      const current = this.reminder(state, id);
+      if (current.revision !== input.expectedRevision || current.origin.kind !== 'proactive') throw new Error('This reminder changed while its source was refreshing.');
+      this.assertReminderOriginCurrent(state, origin);
+      const wasSaved = current.status === 'saved';
+      if (wasSaved) this.cancellationForCurrentIntent(state, current);
+      current.origin = origin; current.revision += 1; current.status = 'draft'; current.updatedAt = now();
+      delete current.approvedRevision; delete current.approvedPayloadDigest; delete current.currentIntentId;
+      return { record: current, wasSaved };
+    });
+    if (result.wasSaved) await this.reconcileReminderAlerts();
+    return this.reminder(this.snapshot, result.record.id);
+  }
+
+  async approveReminder(id: string, input: { expectedRevision: number }): Promise<ReminderRecord> {
+    await this.load();
+    const before = this.reminder(this.snapshot, id);
+    if (before.revision !== input.expectedRevision) throw new Error('This reminder changed. Reopen it before approving.');
+    if (before.origin.kind === 'proactive' && !before.firstSavedAt) await this.verifyProactiveReminderOrigin(before.origin);
+    return this.mutate(async (state) => {
+      this.assertReminderWritable();
+      const record = this.reminder(state, id);
+      if (record.revision !== input.expectedRevision || record.status !== 'draft') throw new Error('Reopen the current reminder draft before approving it.');
+      this.assertReminderOriginCurrent(state, record.origin, Boolean(record.firstSavedAt));
+      this.validateReminderDue(record);
+      const approvedPayloadDigest = await this.reminderApprovalDigest(record);
+      record.status = 'approved'; record.approvedRevision = record.revision; record.approvedPayloadDigest = approvedPayloadDigest; record.updatedAt = now();
+      return record;
+    });
+  }
+
+  private validateReminderDue(record: ReminderRecord): void {
+    const payload = validateReminderPayload({ title: record.title, body: record.body, dueAt: record.dueAt, displayTimeZone: record.displayTimeZone, privacyMode: record.privacyMode });
+    if (Date.parse(payload.dueAt) <= Date.now()) throw new Error('Choose a future reminder time before approving or saving.');
+  }
+
+  async saveApprovedReminder(id: string, input: { expectedRevision: number }): Promise<ReminderRecord> {
+    const jobKey = `${id}:${input.expectedRevision}`;
+    const running = this.reminderJobs.get(jobKey);
+    if (running) return running;
+    const job = this.saveApprovedReminderInternal(id, input.expectedRevision);
+    this.reminderJobs.set(jobKey, job);
+    try { return await job; } finally { if (this.reminderJobs.get(jobKey) === job) this.reminderJobs.delete(jobKey); }
+  }
+
+  private async saveApprovedReminderInternal(id: string, expectedRevision: number): Promise<ReminderRecord> {
+    await this.load(); this.assertReminderWritable();
+    const before = this.reminder(this.snapshot, id);
+    if (before.revision !== expectedRevision || before.status !== 'approved' || before.approvedRevision !== expectedRevision) throw new Error('Approve the current reminder version before saving it.');
+    if (before.origin.kind === 'proactive' && !before.firstSavedAt) await this.verifyProactiveReminderOrigin(before.origin);
+    const permission = await this.reminderBackend.getPermission();
+    const resolved = permission === 'undetermined' ? await this.reminderBackend.requestPermission() : permission;
+    // Permission UI can remain open while the source changes. Rebuild the source projection
+    // after that await; the serialized mutation below then compares it with the committed rule,
+    // candidate, identity, and generation before saving the user's intent.
+    if (before.origin.kind === 'proactive' && !before.firstSavedAt) await this.verifyProactiveReminderOrigin(before.origin);
+    const saved = await this.mutate(async (state) => {
+      this.assertReminderWritable();
+      const record = this.reminder(state, id);
+      if (record.revision !== expectedRevision || record.status !== 'approved' || record.approvedRevision !== expectedRevision || !record.approvedPayloadDigest) throw new Error('This reminder changed while notification permission was checked. Review and approve it again.');
+      this.assertReminderOriginCurrent(state, record.origin, Boolean(record.firstSavedAt));
+      if (record.origin.kind === 'proactive' && !record.firstSavedAt && stableJson(record.origin) !== stableJson(before.origin)) throw new Error('The proactive source changed while notification permission was checked.');
+      if (record.origin.kind === 'note' && !record.firstSavedAt) {
+        const sourceProposalId = record.origin.proposalId;
+        const sourceProposal = state.proposals.find((item) => item.id === sourceProposalId);
+        if (!sourceProposal || sourceProposal.status !== 'dispatching' && sourceProposal.status !== 'approved') throw new Error('The source proposal is no longer available for this reminder save.');
+        await this.validateProposalProvenance(state, sourceProposal);
+      }
+      this.validateReminderDue(record);
+      if (await this.reminderApprovalDigest(record) !== record.approvedPayloadDigest) throw new Error('The approved reminder payload changed. Review and approve it again.');
+      const observed: ReminderIntent['observed'] = resolved === 'authorized' || resolved === 'provisional' ? 'unconfirmed' : resolved === 'unavailable' ? 'unavailable' : 'blocked';
+      const intent = await this.setReminderIntent(state, record, 'scheduled', observed);
+      record.status = 'saved'; record.currentIntentId = intent.id; record.updatedAt = now();
+      record.firstSavedAt ??= record.updatedAt;
+      addActivity(state, 'local_action', 'Approved reminder saved on this device.');
+      return record;
+    });
+    await this.reconcileReminderAlerts();
+    return this.reminder(this.snapshot, saved.id);
+  }
+
+  async retryReminderAlert(id: string, input: { expectedRevision: number }): Promise<ReminderRecord> {
+    await this.load(); this.assertReminderWritable();
+    const before = this.reminder(this.snapshot, id);
+    if (before.status !== 'saved' || before.revision !== input.expectedRevision) throw new Error('Only the current saved reminder can retry its alert.');
+    const permission = await this.reminderBackend.getPermission();
+    if (permission === 'undetermined') await this.reminderBackend.requestPermission();
+    const stateIntent = await this.mutate((state) => {
+      this.assertReminderWritable();
+      const record = this.reminder(state, id);
+      if (record.status !== 'saved' || record.revision !== input.expectedRevision || !record.currentIntentId) throw new Error('This reminder changed while notification permission was checked.');
+      const intent = state.reminders.intents.find((item) => item.id === record.currentIntentId);
+      if (!intent || intent.desired !== 'scheduled') throw new Error('The saved alert intent is unavailable.');
+      intent.observed = 'unconfirmed'; intent.updatedAt = now(); delete intent.errorCode;
+      return intent;
+    });
+    await this.reconcileReminderAlerts();
+    return this.reminder(this.snapshot, stateIntent.reminderId);
+  }
+
+  async cancelReminder(id: string, input: { expectedRevision: number }): Promise<ReminderRecord> {
+    const updated = await this.mutate((state) => {
+      this.assertReminderWritable();
+      const record = this.reminder(state, id);
+      if (record.revision !== input.expectedRevision) throw new Error('This reminder changed. Reopen it before cancelling.');
+      if (record.status === 'cancelled' || record.status === 'completed') return record;
+      this.cancellationForCurrentIntent(state, record);
+      record.revision += 1; record.status = 'cancelled'; record.updatedAt = now(); delete record.currentIntentId;
+      return record;
+    });
+    await this.reconcileReminderAlerts();
+    return this.reminder(this.snapshot, updated.id);
+  }
+
+  async completeReminder(id: string, input: { expectedRevision: number }): Promise<ReminderRecord> {
+    const result = await this.mutate((state) => {
+      this.assertReminderWritable();
+      const record = this.reminder(state, id);
+      if (record.revision !== input.expectedRevision) throw new Error('This reminder changed. Reopen it before marking it done.');
+      if (record.status === 'completed') return record;
+      if (record.status !== 'saved' && record.status !== 'approved') throw new Error('Only an approved or saved reminder can be marked done.');
+      this.cancellationForCurrentIntent(state, record);
+      record.revision += 1; record.status = 'completed'; record.updatedAt = now(); delete record.currentIntentId;
+      return record;
+    });
+    await this.reconcileReminderAlerts();
+    return this.reminder(this.snapshot, result.id);
+  }
+
+  async deleteReminder(id: string, input: { expectedRevision: number }): Promise<void> {
+    await this.mutate(async (state) => {
+      this.assertReminderWritable();
+      const record = this.reminder(state, id);
+      if (record.revision !== input.expectedRevision) throw new Error('This reminder changed. Reopen it before deleting.');
+      this.cancellationForCurrentIntent(state, record);
+      state.reminders.records = state.reminders.records.filter((item) => item.id !== id);
+      addActivity(state, 'local_action', 'Reminder deleted from this device.');
+    });
+    await this.reconcileReminderAlerts();
+  }
+
+  async reconcileReminderAlerts(): Promise<void> {
+    await this.load();
+    if (this.reminderQuarantine.length) return;
+    if (this.reminderReconcileJob) { this.reminderReconcileAgain = true; return this.reminderReconcileJob; }
+    const job = (async () => {
+      await this.reconcileReminderAlertsInternal();
+      if (this.reminderReconcileAgain) {
+        this.reminderReconcileAgain = false;
+        await this.reconcileReminderAlertsInternal();
+      }
+    })();
+    this.reminderReconcileJob = job;
+    try {
+      await job;
+    } finally { if (this.reminderReconcileJob === job) this.reminderReconcileJob = undefined; }
+  }
+
+  private async reconcileReminderAlertsInternal(): Promise<void> {
+    const installationId = this.snapshot.reminders.installationId;
+    try { await this.reminderBackend.installForegroundHandler((notification) => this.isForegroundReminderAllowed(notification)); }
+    catch { /* Foreground delivery is suppressed unless the synchronous ledger projection approves it. */ }
+    let pending: PendingNotificationRequest[];
+    try { pending = await this.reminderBackend.listPending(); }
+    catch { await this.markReminderListFailure(); return; }
+    let listReads = 1;
+    let operations = 0; let canceledAny = false; let scheduledAny = false;
+    const canceledIntentIds: string[] = []; const canceledLegacyIds: string[] = [];
+    for (const item of [...this.snapshot.reminders.intents].filter((intent) => intent.desired === 'cancelled' && intent.observed !== 'absent')) {
+      if (operations >= 16) break;
+      const current = this.snapshot.reminders.intents.find((intent) => intent.id === item.id);
+      if (!current || current.desired !== 'cancelled') continue;
+      const found = pending.find((request) => request.identifier === current.identifier);
+      if (!found) { await this.observeReminderIntent(current.id, 'absent', undefined, 'cancelled'); continue; }
+      const markerIntent = { ...current, desired: 'scheduled' as const };
+      if (!isMatchingPending(markerIntent, found, installationId)) { await this.observeReminderIntent(current.id, 'error', 'unverifiable', 'cancelled'); continue; }
+      await this.markReminderAttempt(current.id); operations += 1;
+      try { await this.reminderBackend.cancel(current.identifier); canceledIntentIds.push(current.id); canceledAny = true; }
+      catch (error) { await this.observeReminderIntent(current.id, 'error', this.reminderErrorCode(error, 'cancel_failed'), 'cancelled'); }
+    }
+    for (const item of [...(this.snapshot.reminders.legacyCancellations ?? [])]) {
+      if (operations >= 16) break;
+      const current = this.snapshot.reminders.legacyCancellations?.find((row) => row.id === item.id);
+      if (!current || current.observed === 'absent') continue;
+      const found = pending.find((request) => request.identifier === current.identifier);
+      if (!found) { await this.observeLegacyReminder(current.id, 'absent'); continue; }
+      if (!isOwnedLegacyReminderCancellation(current, found)) { await this.observeLegacyReminder(current.id, 'error', 'unverifiable'); continue; }
+      await this.markLegacyReminderAttempt(current.id); operations += 1;
+      try { await this.reminderBackend.cancelLegacy(current, found); canceledLegacyIds.push(current.id); canceledAny = true; }
+      catch (error) {
+        const code = this.reminderErrorCode(error, 'cancel_failed');
+        await this.observeLegacyReminder(current.id, 'error', code === 'listing_failed' || code === 'cancel_failed' || code === 'unverifiable' ? code : 'cancel_failed');
+      }
+    }
+    if (canceledAny) {
+      try {
+        pending = await this.reminderBackend.listPending();
+        listReads += 1;
+        for (const id of canceledIntentIds) {
+          const intent = this.snapshot.reminders.intents.find((item) => item.id === id);
+          if (!intent) continue;
+          await this.observeReminderIntent(id, pending.some((item) => item.identifier === intent.identifier) ? 'unconfirmed' : 'absent', undefined, 'cancelled');
+        }
+        for (const id of canceledLegacyIds) {
+          const item = this.snapshot.reminders.legacyCancellations?.find((row) => row.id === id);
+          if (item) await this.observeLegacyReminder(id, pending.some((row) => row.identifier === item.identifier) ? 'unconfirmed' : 'absent');
+        }
+      } catch { await this.markReminderListFailure(); return; }
+    }
+    const permission = await this.reminderBackend.getPermission();
+    for (const item of [...this.snapshot.reminders.intents].filter((intent) => intent.desired === 'scheduled')) {
+      // Keep half of the per-pass native-operation budget for cancellation if Done/Delete
+      // races a schedule that has already entered the platform bridge.
+      if (operations >= 8) break;
+      const current = this.snapshot.reminders.intents.find((intent) => intent.id === item.id);
+      if (!current || current.desired !== 'scheduled' || !current.payload) continue;
+      const record = this.snapshot.reminders.records.find((candidate) => candidate.id === current.reminderId);
+      if (!record || record.status !== 'saved' || record.currentIntentId !== current.id || record.revision !== current.reminderRevision ||
+          stableJson({ title: record.title, body: record.body, dueAt: record.dueAt, displayTimeZone: record.displayTimeZone, privacyMode: record.privacyMode }) !==
+            stableJson({ title: current.payload.title, body: current.payload.body, dueAt: current.payload.dueAt, displayTimeZone: current.payload.displayTimeZone, privacyMode: current.payload.privacyMode })) continue;
+      const blockedByCancellation = this.snapshot.reminders.intents.some((prior) => prior.reminderId === current.reminderId && prior.epoch < current.epoch && prior.desired === 'cancelled' && prior.observed !== 'absent');
+      if (blockedByCancellation) continue;
+      // Persisted shape and ownership are not authorization. Recompute both digests before
+      // trusting a restored intent, and fence the async hash against concurrent state changes.
+      const checkedSnapshot = this.snapshot;
+      let integrityValid = false;
+      try {
+        const payloadDigest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, reminderPayloadForDigest(current.payload), { encoding: Crypto.CryptoEncoding.HEX });
+        const approvalDigest = await this.reminderApprovalDigest(record);
+        integrityValid = payloadDigest === current.payloadDigest && approvalDigest === record.approvedPayloadDigest;
+      } catch { integrityValid = false; }
+      if (!integrityValid || this.snapshot !== checkedSnapshot ||
+          this.snapshot.reminders.intents.find((intent) => intent.id === current.id)?.desired !== 'scheduled' ||
+          this.snapshot.reminders.records.find((candidate) => candidate.id === record.id)?.approvedPayloadDigest !== record.approvedPayloadDigest) {
+        await this.observeReminderIntent(current.id, 'error', 'unverifiable', 'scheduled');
+        continue;
+      }
+      this.verifiedReminderForeground.set(current.id, this.reminderForegroundFingerprint(record, current));
+      const found = pending.find((request) => request.identifier === current.identifier);
+      if (found) {
+        if (isMatchingPending(current, found, installationId)) await this.observeReminderIntent(current.id, 'pending', undefined, 'scheduled');
+        else await this.observeReminderIntent(current.id, 'error', 'unverifiable', 'scheduled');
+        continue;
+      }
+      if (Date.parse(current.payload.dueAt) <= Date.now()) { await this.observeReminderIntent(current.id, 'delivery_unknown', undefined, 'scheduled'); continue; }
+      if (permission === 'unavailable' || this.reminderBackend.platform === 'web') { await this.observeReminderIntent(current.id, 'unavailable', 'permission_unavailable', 'scheduled'); continue; }
+      if (permission === 'denied' || permission === 'undetermined') { await this.observeReminderIntent(current.id, 'blocked', 'permission_denied', 'scheduled'); continue; }
+      await this.markReminderAttempt(current.id); operations += 1;
+      const guard = () => {
+        const latest = this.snapshot.reminders.intents.find((intent) => intent.id === current.id);
+        const owner = this.snapshot.reminders.records.find((candidate) => candidate.id === current.reminderId);
+        return Boolean(latest && latest.payload && latest.payloadDigest === current.payloadDigest && latest.desired === 'scheduled' && latest.epoch === current.epoch && owner?.status === 'saved' &&
+          owner.currentIntentId === latest.id && owner.revision === latest.reminderRevision && owner.approvedPayloadDigest === record.approvedPayloadDigest &&
+          stableJson(reminderPayloadForDigest({ title: owner.title, body: owner.body, dueAt: owner.dueAt, displayTimeZone: owner.displayTimeZone, privacyMode: owner.privacyMode })) ===
+          stableJson(reminderPayloadForDigest(latest.payload)));
+      };
+      try {
+        const latest = this.snapshot.reminders.intents.find((intent) => intent.id === current.id);
+        if (!latest || !guard()) continue;
+        await this.reminderBackend.schedule(latest, installationId, guard);
+        scheduledAny = true;
+        if (this.snapshot.reminders.intents.find((intent) => intent.id === current.id)?.desired === 'cancelled') {
+          if (operations < 16) {
+            await this.markReminderAttempt(current.id);
+            operations += 1;
+            try { await this.reminderBackend.cancel(current.identifier); canceledIntentIds.push(current.id); canceledAny = true; }
+            catch { await this.observeReminderIntent(current.id, 'error', 'cancel_failed', 'cancelled'); }
+          }
+        } else await this.observeReminderIntent(current.id, 'pending', undefined, 'scheduled');
+      } catch (error) {
+        if (guard()) await this.observeReminderIntent(current.id, 'error', this.reminderErrorCode(error, 'schedule_failed'), 'scheduled');
+      }
+    }
+    if (scheduledAny || this.reminderReconcileAgain) {
+      try {
+        pending = await this.reminderBackend.listPending();
+        listReads += 1;
+        for (const id of canceledIntentIds) {
+          const intent = this.snapshot.reminders.intents.find((item) => item.id === id);
+          if (intent?.desired === 'cancelled') await this.observeReminderIntent(id, pending.some((row) => row.identifier === intent.identifier) ? 'unconfirmed' : 'absent', undefined, 'cancelled');
+        }
+        // A different reminder can be deleted while an awaited schedule is in flight.
+        // Sweep every now-cancelled owned intent here, not only the intent whose schedule
+        // just returned, using the cancellation budget reserved by the schedule cap above.
+        const lateCancelledIds: string[] = [];
+        const lateCancelledLegacyIds: string[] = [];
+        for (const item of [...this.snapshot.reminders.intents].filter((intent) => intent.desired === 'cancelled' && intent.observed !== 'absent')) {
+          if (operations >= 16) break;
+          const current = this.snapshot.reminders.intents.find((intent) => intent.id === item.id);
+          if (!current || current.desired !== 'cancelled') continue;
+          const found = pending.find((request) => request.identifier === current.identifier);
+          if (!found) {
+            await this.observeReminderIntent(current.id, 'absent', undefined, 'cancelled');
+            continue;
+          }
+          const markerIntent = { ...current, desired: 'scheduled' as const };
+          if (!isMatchingPending(markerIntent, found, installationId)) {
+            await this.observeReminderIntent(current.id, 'error', 'unverifiable', 'cancelled');
+            continue;
+          }
+          await this.markReminderAttempt(current.id);
+          operations += 1;
+          try {
+            await this.reminderBackend.cancel(current.identifier);
+            lateCancelledIds.push(current.id);
+            canceledAny = true;
+          } catch (error) {
+            await this.observeReminderIntent(current.id, 'error', this.reminderErrorCode(error, 'cancel_failed'), 'cancelled');
+          }
+        }
+        for (const item of [...(this.snapshot.reminders.legacyCancellations ?? [])].filter((entry) => entry.observed !== 'absent')) {
+          if (operations >= 16) break;
+          const current = this.snapshot.reminders.legacyCancellations?.find((entry) => entry.id === item.id);
+          if (!current || current.observed === 'absent') continue;
+          const found = pending.find((request) => request.identifier === current.identifier);
+          if (!found) {
+            await this.observeLegacyReminder(current.id, 'absent');
+            continue;
+          }
+          if (!isOwnedLegacyReminderCancellation(current, found)) {
+            await this.observeLegacyReminder(current.id, 'error', 'unverifiable');
+            continue;
+          }
+          await this.markLegacyReminderAttempt(current.id);
+          operations += 1;
+          try {
+            await this.reminderBackend.cancelLegacy(current, found);
+            lateCancelledLegacyIds.push(current.id);
+          } catch (error) {
+            const code = this.reminderErrorCode(error, 'cancel_failed');
+            await this.observeLegacyReminder(current.id, 'error', code === 'listing_failed' || code === 'cancel_failed' || code === 'unverifiable' ? code : 'cancel_failed');
+          }
+        }
+        if (lateCancelledIds.length || lateCancelledLegacyIds.length) {
+          if (listReads < 3) {
+            pending = await this.reminderBackend.listPending();
+            listReads += 1;
+            for (const id of lateCancelledIds) {
+              const intent = this.snapshot.reminders.intents.find((item) => item.id === id);
+              if (intent?.desired === 'cancelled') await this.observeReminderIntent(id,
+                pending.some((row) => row.identifier === intent.identifier) ? 'unconfirmed' : 'absent', undefined, 'cancelled');
+            }
+            for (const id of lateCancelledLegacyIds) {
+              const cancellation = this.snapshot.reminders.legacyCancellations?.find((item) => item.id === id);
+              if (cancellation) await this.observeLegacyReminder(id,
+                pending.some((row) => row.identifier === cancellation.identifier) ? 'unconfirmed' : 'absent');
+            }
+          } else {
+            for (const id of lateCancelledIds) await this.observeReminderIntent(id, 'unconfirmed', undefined, 'cancelled');
+            for (const id of lateCancelledLegacyIds) await this.observeLegacyReminder(id, 'unconfirmed');
+          }
+        }
+        for (const item of [...this.snapshot.reminders.intents].filter((intent) => intent.desired === 'scheduled' && intent.observed === 'pending')) {
+          const found = pending.find((request) => request.identifier === item.identifier);
+          if (!found) await this.observeReminderIntent(item.id, Date.parse(item.payload?.dueAt ?? '') <= Date.now() ? 'delivery_unknown' : 'unconfirmed', undefined, 'scheduled');
+          else if (!isMatchingPending(item, found, installationId)) await this.observeReminderIntent(item.id, 'error', 'unverifiable', 'scheduled');
+        }
+      } catch { await this.markReminderListFailure(); }
+    }
+  }
+
+  private isForegroundReminderAllowed(notification: { identifier?: string; content: { title?: unknown; body?: unknown; data?: unknown } }): boolean {
+    if (this.reminderQuarantine.length || !notification.identifier || !notification.content.data || typeof notification.content.data !== 'object') return false;
+    const data = notification.content.data as Record<string, unknown>;
+    const intent = this.snapshot.reminders.intents.find((item) => item.identifier === notification.identifier && item.desired === 'scheduled' && item.observed === 'pending');
+    if (!intent || intent.identifier !== reminderNotificationIdentifier(this.snapshot.reminders.installationId, intent.reminderId, intent.epoch)) return false;
+    const owner = this.snapshot.reminders.records.find((record) => record.id === intent.reminderId);
+    if (!owner || owner.status !== 'saved' || owner.currentIntentId !== intent.id || owner.revision !== intent.reminderRevision ||
+        owner.approvedRevision !== owner.revision || !owner.approvedPayloadDigest || !intent.payload ||
+        stableJson(reminderPayloadForDigest({ title: owner.title, body: owner.body, dueAt: owner.dueAt, displayTimeZone: owner.displayTimeZone, privacyMode: owner.privacyMode })) !==
+          stableJson(reminderPayloadForDigest(intent.payload))) return false;
+    if (this.verifiedReminderForeground.get(intent.id) !== this.reminderForegroundFingerprint(owner, intent)) return false;
+    const projection = notificationContentForIntent(intent, this.snapshot.reminders.installationId);
+    const expected = projection.data;
+    return (notification.content.title ?? '') === projection.title && (notification.content.body ?? '') === projection.body &&
+      Object.keys(data).length === Object.keys(expected).length && Object.entries(expected).every(([key, value]) => data[key] === value);
+  }
+
+  private reminderForegroundFingerprint(record: ReminderRecord, intent: ReminderIntent): string {
+    return stableJson({ reminderId: record.id, revision: record.revision, approval: record.approvedPayloadDigest,
+      intentId: intent.id, epoch: intent.epoch, identifier: intent.identifier, payloadDigest: intent.payloadDigest,
+      payload: intent.payload });
+  }
+
+  private async observeReminderIntent(id: string, observed: ReminderIntent['observed'], errorCode?: ReminderIntent['errorCode'], expectedDesired?: ReminderIntent['desired']): Promise<void> {
+    await this.mutate((state) => {
+      const intent = state.reminders.intents.find((item) => item.id === id); if (!intent) return;
+      if (expectedDesired && intent.desired !== expectedDesired) return;
+      intent.observed = observed; intent.updatedAt = now(); intent.observedAt = intent.updatedAt;
+      if (intent.desired === 'cancelled' && observed === 'absent') delete intent.payload;
+      if (errorCode) intent.errorCode = errorCode; else delete intent.errorCode;
+    });
+  }
+
+  private async markReminderAttempt(id: string): Promise<void> {
+    await this.mutate((state) => {
+      const intent = state.reminders.intents.find((item) => item.id === id); if (!intent) throw new Error('Reminder intent was removed before the native operation.');
+      if (intent.desired === 'cancelled' && !state.reminders.records.some((item) => item.id === intent.reminderId)) { /* deletion cancellation is still owned */ }
+      intent.attemptedAt = now(); intent.updatedAt = intent.attemptedAt;
+    });
+  }
+
+  private async observeLegacyReminder(id: string, observed: LegacyReminderCancellation['observed'], errorCode?: LegacyReminderCancellation['errorCode']): Promise<void> {
+    await this.mutate((state) => {
+      const item = state.reminders.legacyCancellations?.find((row) => row.id === id); if (!item) return;
+      item.observed = observed; item.observedAt = now(); if (errorCode) item.errorCode = errorCode; else delete item.errorCode;
+    });
+  }
+
+  private async markLegacyReminderAttempt(id: string): Promise<void> {
+    await this.mutate((state) => { const item = state.reminders.legacyCancellations?.find((row) => row.id === id); if (item) item.attemptedAt = now(); });
+  }
+
+  private async markReminderListFailure(): Promise<void> {
+    await this.mutate((state) => {
+      for (const intent of state.reminders.intents) if (intent.observed === 'unconfirmed') { intent.observed = 'error'; intent.errorCode = 'listing_failed'; intent.updatedAt = now(); }
+      for (const item of state.reminders.legacyCancellations ?? []) if (item.observed === 'unconfirmed') { item.observed = 'error'; item.errorCode = 'listing_failed'; item.observedAt = now(); }
+    });
+  }
+
+  private reminderErrorCode(error: unknown, fallback: ReminderIntent['errorCode']): ReminderIntent['errorCode'] {
+    return error instanceof NotificationBackendError ? error.code : fallback;
+  }
+
+  private async enqueueLegacyReminderCancellation(state: AppState, proposalId: string, revision: number): Promise<void> {
+    const cancellations = state.reminders.legacyCancellations ?? (state.reminders.legacyCancellations = []);
+    if (cancellations.some((item) => item.proposalId === proposalId && item.proposalRevision === revision)) return;
+    if (state.reminders.intents.length + cancellations.length >= 1_000) throw new Error('Reminder recovery history is full. Reconcile or export reminder history before continuing.');
+    cancellations.unshift({ id: this.freshStateId(state), proposalId, proposalRevision: revision,
+      identifier: legacyReminderIdentifier(proposalId, revision), requestedAt: now(), observed: 'unconfirmed' });
   }
 
   private assertKnowledgeWritable(): void {
@@ -4718,16 +5395,21 @@ export class AppControllerImpl implements AppController {
 
   async deleteNote(id: string): Promise<void> {
     const audioUri = this.snapshot.notes.find((note) => note.id === id)?.audioUri;
-    const reminderIds = this.snapshot.proposals.filter((proposal) => proposal.noteId === id && proposal.kind === 'reminder')
-      .flatMap((proposal) => [...new Set([proposal.revision, proposal.notificationRevision].filter((revision): revision is number => typeof revision === 'number'))]
-        .map((revision) => ({ id: proposal.id, revision })));
-    await this.mutate((state) => {
-      if (state.proposals.some((proposal) => proposal.noteId === id && ['dispatching', 'unknown'].includes(proposal.status))) throw new Error('Wait for the in-progress action result before deleting this note.');
+    await this.mutate(async (state) => {
+      if (state.proposals.some((proposal) => proposal.noteId === id && (proposal.kind !== 'reminder' && ['dispatching', 'unknown'].includes(proposal.status)))) throw new Error('Wait for the in-progress external action result before deleting this note.');
+      for (const proposal of state.proposals.filter((item) => item.noteId === id && item.kind === 'reminder')) {
+        const revisions = new Set([proposal.notificationRevision ?? proposal.revision]);
+        for (const revision of revisions) await this.enqueueLegacyReminderCancellation(state, proposal.id, revision);
+      }
+      for (const reminder of state.reminders.records.filter((item) => item.origin.kind === 'note' && item.origin.noteId === id && item.status !== 'cancelled' && item.status !== 'completed')) {
+        this.cancellationForCurrentIntent(state, reminder);
+        reminder.revision += 1; reminder.status = 'cancelled'; reminder.updatedAt = now(); delete reminder.currentIntentId;
+      }
       state.notes = state.notes.filter((item) => item.id !== id);
       state.proposals = state.proposals.filter((item) => item.noteId !== id);
       state.activity = state.activity.filter((item) => item.noteId !== id);
     });
-    await Promise.all(reminderIds.map((proposal) => cancelReminderNotification(proposal)));
+    await this.reconcileReminderAlerts();
     if (audioUri) {
       try { await removeAudio(audioUri); }
       catch { /* Note deletion is canonical; a broken or missing clip is harmless. */ }

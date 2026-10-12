@@ -48,6 +48,7 @@ import { createDispatchHistoryScenario } from "./src/dev/receiptScenario";
 import { createMailSyncScenario } from "./src/dev/mailSyncScenario";
 import { createBackupScenario } from "./src/dev/backupScenario";
 import { createKnowledgeScenario } from "./src/dev/knowledgeScenario";
+import { createReminderPreview } from "./src/dev/reminderPreview";
 import { useAudioCapture } from "./src/audio/useAudioCapture";
 import type { AudioCapture } from "./src/audio/types";
 import {
@@ -73,6 +74,8 @@ import { KnowledgeSection } from "./src/ui/KnowledgeSection";
 import { KnowledgeEntitySheet } from "./src/ui/KnowledgeEntitySheet";
 import { KnowledgeSuggestionSheet } from "./src/ui/KnowledgeSuggestionSheet";
 import { ImportedKnowledgeReview } from "./src/ui/ImportedKnowledgeReview";
+import { ReminderReview } from "./src/ui/ReminderReview";
+import { RemindersSection } from "./src/ui/RemindersSection";
 import { TasksSection } from "./src/ui/TasksSection";
 import { IconButton, Button, Field } from "./src/ui/primitives";
 import { C, s } from "./src/ui/theme";
@@ -82,6 +85,7 @@ import {
   type OAuthProvider,
 } from "./src/auth/browser";
 import { exchangeAuthorizationCode } from "./src/connectors/oauth";
+import type { ReminderIntent, ReminderRecord } from "./src/reminders";
 
 type Tab = "inbox" | "record" | "library";
 
@@ -93,7 +97,8 @@ const isDispatchHistoryDemo = previewScenario === "dispatch-history";
 const isMailSyncDemo = previewScenario === "mail-sync";
 const isBackupImportDemo = previewScenario === "backup-import";
 const isKnowledgeDemo = previewScenario === "knowledge";
-const isIsolatedDemo = isDispatchHistoryDemo || isMailSyncDemo || isBackupImportDemo || isKnowledgeDemo;
+const isReminderDemo = previewScenario === "reminders";
+const isIsolatedDemo = isDispatchHistoryDemo || isMailSyncDemo || isBackupImportDemo || isKnowledgeDemo || isReminderDemo;
 
 function useAppState(appController: AppController) {
   return useSyncExternalStore(
@@ -361,16 +366,21 @@ export default function App() {
   const [controller, setController] =
     useState<AppController>(productionController);
   const state = useAppState(controller);
-  const [tab, setTab] = useState<Tab>(isBackupImportDemo || isKnowledgeDemo ? "library" : isIsolatedDemo ? "inbox" : "record");
+  const [tab, setTab] = useState<Tab>(isBackupImportDemo || isKnowledgeDemo || isReminderDemo ? "library" : isIsolatedDemo ? "inbox" : "record");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [detail, setDetail] = useState<Note | null>(null);
   const [recordingAttachmentNoteId, setRecordingAttachmentNoteId] = useState<string | null>(null);
   const [review, setReview] = useState<Proposal | null>(null);
   const [replyMessageId, setReplyMessageId] = useState<string | null>(null);
+  const [reminderReviewId, setReminderReviewId] = useState<string | null>(null);
+  const [reminderSourceAccountLabel, setReminderSourceAccountLabel] = useState<string | undefined>();
   const [notice, setNotice] = useState("");
   const [isolatedPreviewFailed, setIsolatedPreviewFailed] = useState(false);
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
+  const reminderReviewRecord = reminderReviewId
+    ? state.reminders.records.find((item) => item.id === reminderReviewId)
+    : undefined;
   useProactiveClock(
     controller,
     loading || isIsolatedDemo,
@@ -422,6 +432,8 @@ export default function App() {
               ? await createBackupScenario()
               : isKnowledgeDemo
                 ? await createKnowledgeScenario()
+                : isReminderDemo
+                  ? await createReminderPreview()
             : productionController;
         if (!mounted) return;
         setController(selected);
@@ -708,6 +720,50 @@ export default function App() {
     },
     [],
   );
+  const openReminder = (record: ReminderRecord) => {
+    if (record.origin.kind === "proactive" && record.origin.binding) {
+      const binding = record.origin.binding;
+      const account = state.accounts.find((item) => {
+        const identity = item.identity;
+        if (!identity) return false;
+        const key = [identity.providerNamespace, identity.clientId, identity.subject, identity.resourceUserId ?? ""].join(":");
+        return item.id === binding.accountId && item.provider === binding.namespace && key === binding.identityKey && (item.connectionGeneration ?? 0) === binding.connectionGeneration;
+      });
+      setReminderSourceAccountLabel(account
+        ? `${binding.namespace === "google" ? "Google" : "Microsoft"} · ${account.verifiedEmail || `account label: ${account.displayName}`}`
+        : `${binding.namespace === "google" ? "Google" : "Microsoft"} · original account unavailable`);
+    } else setReminderSourceAccountLabel(undefined);
+    setReminderReviewId(record.id);
+    setTab("library");
+  };
+  const createReminder = async (candidateId?: string) => {
+    const created = await run(() => controller.createReminderDraft(candidateId ? { candidateId } : undefined));
+    if (created) openReminder(created);
+  };
+
+  useEffect(() => {
+    if (loading || isolatedPreviewFailed || (isIsolatedDemo && !isReminderDemo)) return;
+    const reconcile = () => { void controller.reconcileReminderAlerts().catch(() => undefined); };
+    const initial = setTimeout(reconcile, 0);
+    let wasActive = NativeAppState.currentState === "active";
+    const native = NativeAppState.addEventListener("change", (next) => {
+      const active = next === "active";
+      if (!wasActive && active) reconcile();
+      wasActive = active;
+    });
+    let removeWeb: (() => void) | undefined;
+    if (Platform.OS === "web" && typeof document !== "undefined") {
+      let visible = document.visibilityState === "visible";
+      const onVisibility = () => {
+        const nextVisible = document.visibilityState === "visible";
+        if (!visible && nextVisible) reconcile();
+        visible = nextVisible;
+      };
+      document.addEventListener("visibilitychange", onVisibility);
+      removeWeb = () => document.removeEventListener("visibilitychange", onVisibility);
+    }
+    return () => { clearTimeout(initial); native.remove(); removeWeb?.(); };
+  }, [controller, isolatedPreviewFailed, loading]);
   const refreshForegroundMail = useCallback(async () => {
     if (isIsolatedDemo || loading || foregroundMailBusy.current) return;
     foregroundMailBusy.current = true;
@@ -988,7 +1044,9 @@ export default function App() {
                     ? "Sample mail · no external actions"
                     : isBackupImportDemo
                       ? "Sample backup · in-memory only · no external access"
-                      : "Sample knowledge · in-memory only · no external actions"}
+                      : isReminderDemo
+                        ? "Sample reminders · in-memory only · simulated alerts"
+                        : "Sample knowledge · in-memory only · no external actions"}
               </Text>
             </View>
           ) : null}
@@ -1256,6 +1314,7 @@ export default function App() {
                     setNotice("Attention item snoozed.");
                   })
                 }
+                onRemindCandidate={(candidateId) => void createReminder(candidateId)}
                 onGetCandidateSource={(candidateId) =>
                   controller.getProactiveCandidateSource(candidateId)
                 }
@@ -1277,6 +1336,16 @@ export default function App() {
                 previewMode={isIsolatedDemo}
                 sampleBackupMode={isBackupImportDemo}
                 knowledgeDemoMode={isKnowledgeDemo}
+                reminderRecords={state.reminders.records}
+                reminderIntents={state.reminders.intents}
+                reminderRecoveryStatus={state.reminderRecoveryStatus}
+                reminderDemoMode={isReminderDemo}
+                onCreateReminder={() => void createReminder()}
+                onOpenReminder={openReminder}
+                onRetryReminder={(record) => run(() => controller.retryReminderAlert(record.id, { expectedRevision: record.revision }))}
+                onDoneReminder={(record) => run(() => controller.completeReminder(record.id, { expectedRevision: record.revision }))}
+                onCancelReminder={(record) => run(() => controller.cancelReminder(record.id, { expectedRevision: record.revision }))}
+                onDeleteReminder={(record) => run(() => controller.deleteReminder(record.id, { expectedRevision: record.revision }))}
                 onComplete={(id) =>
                   run(async () => {
                     await controller.completeTask(id);
@@ -1552,6 +1621,67 @@ export default function App() {
             onClose={() => setRecordingAttachmentNoteId(null)}
           />
         ) : null}
+        {reminderReviewRecord ? <ReminderReview
+          key={`${reminderReviewRecord.id}:${reminderReviewRecord.revision}`}
+          visible={Boolean(reminderReviewId)}
+          record={reminderReviewRecord}
+          busy={busy}
+          isWeb={Platform.OS === "web"}
+          demoMode={isReminderDemo}
+          canRetry={Boolean(reminderReviewRecord.currentIntentId && (isReminderDemo || ["absent", "blocked", "unavailable", "delivery_unknown", "error"].includes(state.reminders.intents.find((item) => item.id === reminderReviewRecord.currentIntentId)?.observed ?? "unconfirmed")))}
+          alertStatus={(() => {
+            const intent = state.reminders.intents.find((item) => item.id === reminderReviewRecord.currentIntentId);
+            if (isReminderDemo && reminderReviewRecord.status === "saved") return intent?.observed === "pending" ? "A sample alert is simulated." : "The sample alert is not scheduled.";
+            if (Platform.OS === "web" && reminderReviewRecord.status === "saved") return "Browser notifications are unavailable.";
+            if (intent?.observed === "pending") return "Device alert request is pending.";
+            if (intent?.observed === "blocked" || intent?.observed === "unavailable") return "Device alerts are unavailable; the reminder remains saved.";
+            if (intent?.observed === "error") return "The device alert could not be scheduled.";
+            if (intent?.observed === "delivery_unknown") return "Alert outcome needs checking.";
+            if (reminderReviewRecord.status === "saved") return "Alert status could not be confirmed.";
+            const cancellations = state.reminders.intents.filter((item) => item.reminderId === reminderReviewRecord.id && item.desired === "cancelled");
+            if (cancellations.length && cancellations.every((item) => item.observed === "absent")) return "Alert cancellation confirmed.";
+            if (cancellations.some((item) => item.observed === "error" || item.observed === "unavailable")) return "Alert cancellation could not be confirmed.";
+            if (cancellations.length) return "Alert cancellation is still being checked.";
+            return undefined;
+          })()}
+          sourceAccountLabel={reminderSourceAccountLabel}
+          onClose={() => { setReminderReviewId(null); setReminderSourceAccountLabel(undefined); }}
+          onUpdate={(id, payload, expectedRevision) => run(async () => {
+            const updated = await controller.updateReminderDraft(id, { ...payload, expectedRevision });
+            setNotice("Changes saved. Approve this version before saving the reminder.");
+            return updated;
+          })}
+          onRefreshSource={(record) => run(async () => {
+            const updated = await controller.refreshReminderSource(record.id, { expectedRevision: record.revision });
+            setNotice("Source refreshed. Review and approve this reminder again.");
+            return updated;
+          })}
+          onApprove={(record) => run(async () => {
+            const updated = await controller.approveReminder(record.id, { expectedRevision: record.revision });
+            setNotice("Reminder approved. Saving it is a separate step.");
+            return updated;
+          })}
+          onSave={(record) => run(async () => {
+            const updated = await controller.saveApprovedReminder(record.id, { expectedRevision: record.revision });
+            setNotice(isReminderDemo ? "Sample reminder saved. The alert is simulated." : "Reminder saved on this device.");
+            return updated;
+          })}
+          onRetry={(record) => run(async () => {
+            const updated = await controller.retryReminderAlert(record.id, { expectedRevision: record.revision });
+            setNotice(isReminderDemo ? "Sample alert check completed." : "Alert retry completed; review its status below.");
+            return updated;
+          })}
+          onDone={(record) => run(async () => {
+            const updated = await controller.completeReminder(record.id, { expectedRevision: record.revision });
+            setNotice("Reminder marked done.");
+            return updated;
+          })}
+          onCancel={(record) => run(async () => {
+            const updated = await controller.cancelReminder(record.id, { expectedRevision: record.revision });
+            setNotice("Reminder cancelled. Alert removal is checked separately.");
+            return updated;
+          })}
+        /> : null}
         <Modal
           visible={!!doc}
           animationType="slide"
@@ -1858,6 +1988,7 @@ function InboxScreen({
   busy,
   onDismissCandidate,
   onSnoozeCandidate,
+  onRemindCandidate,
   onGetCandidateSource,
 }: {
   proposals: Proposal[];
@@ -1872,6 +2003,7 @@ function InboxScreen({
   busy: boolean;
   onDismissCandidate: (candidateId: string) => void;
   onSnoozeCandidate: (candidateId: string, until: string) => void;
+  onRemindCandidate: (candidateId: string) => void;
   onGetCandidateSource: AppController["getProactiveCandidateSource"];
 }) {
   return (
@@ -1948,6 +2080,7 @@ function InboxScreen({
         busy={busy}
         onDismiss={onDismissCandidate}
         onSnooze={onSnoozeCandidate}
+        onRemind={onRemindCandidate}
         onGetSource={onGetCandidateSource}
       />
       <MailboxSection
@@ -1975,6 +2108,16 @@ function LibraryScreen({
   previewMode,
   sampleBackupMode,
   knowledgeDemoMode,
+  reminderRecords,
+  reminderIntents,
+  reminderRecoveryStatus,
+  reminderDemoMode,
+  onCreateReminder,
+  onOpenReminder,
+  onRetryReminder,
+  onDoneReminder,
+  onCancelReminder,
+  onDeleteReminder,
   onComplete,
   onReopen,
   onOpenNote,
@@ -2010,6 +2153,16 @@ function LibraryScreen({
   previewMode: boolean;
   sampleBackupMode: boolean;
   knowledgeDemoMode: boolean;
+  reminderRecords: ReminderRecord[];
+  reminderIntents: ReminderIntent[];
+  reminderRecoveryStatus?: ReturnType<typeof productionController.getSnapshot>["reminderRecoveryStatus"];
+  reminderDemoMode: boolean;
+  onCreateReminder: () => void;
+  onOpenReminder: (record: ReminderRecord) => void;
+  onRetryReminder: (record: ReminderRecord) => Promise<unknown>;
+  onDoneReminder: (record: ReminderRecord) => Promise<unknown>;
+  onCancelReminder: (record: ReminderRecord) => Promise<unknown>;
+  onDeleteReminder: (record: ReminderRecord) => Promise<unknown>;
   onComplete: (id: string) => void;
   onReopen: (id: string) => void;
   onOpenNote: (n: Note) => void;
@@ -2031,7 +2184,7 @@ function LibraryScreen({
   onRun: <T>(action: () => Promise<T>) => Promise<T | undefined>;
 }) {
   const [importOpen, setImportOpen] = useState(false);
-  const [section, setSection] = useState<'notes' | 'people' | 'projects' | 'memory'>(knowledgeDemoMode ? 'memory' : 'notes');
+  const [section, setSection] = useState<'notes' | 'people' | 'projects' | 'memory' | 'reminders'>(reminderDemoMode ? 'reminders' : knowledgeDemoMode ? 'memory' : 'notes');
   const [entityKind, setEntityKind] = useState<'person' | 'project'>('person');
   const [editingEntityId, setEditingEntityId] = useState<string | null>(null);
   const [editorInstance, setEditorInstance] = useState(0);
@@ -2071,12 +2224,27 @@ function LibraryScreen({
         />
       </View>
       <View style={s.librarySegments} accessibilityRole="tablist">
-        {([['notes', 'Notes'], ['people', 'People'], ['projects', 'Projects'], ['memory', 'Memory']] as const).map(([key, label]) => (
+        {([['notes', 'Notes'], ['people', 'People'], ['projects', 'Projects'], ['memory', 'Memory'], ['reminders', 'Reminders']] as const).map(([key, label]) => (
           <Pressable key={key} accessibilityRole="tab" accessibilityLabel={`${label} library section`} accessibilityState={{ selected: section === key }} onPress={() => setSection(key)} style={[s.librarySegment, section === key && s.librarySegmentActive]}>
             <Text style={[s.librarySegmentText, section === key && s.librarySegmentTextActive]}>{label}</Text>
           </Pressable>
         ))}
       </View>
+      {reminderRecoveryStatus ? <View style={s.analysisStale}><Text style={s.analysisText}>{reminderRecoveryStatus.message}</Text></View> : null}
+      {section === 'reminders' ? <RemindersSection
+        records={reminderRecords}
+        intents={reminderIntents}
+        query={query}
+        busy={busy}
+        isWeb={Platform.OS === 'web'}
+        demoMode={reminderDemoMode}
+        onAdd={onCreateReminder}
+        onOpen={onOpenReminder}
+        onRetry={(record) => { void onRetryReminder(record); }}
+        onDone={(record) => { void onDoneReminder(record); }}
+        onCancel={(record) => { void onCancelReminder(record); }}
+        onDelete={(record) => { void onDeleteReminder(record); }}
+      /> : null}
       {section === 'notes' ? <>
       <TasksSection
         tasks={tasks}
@@ -2141,7 +2309,7 @@ function LibraryScreen({
         label="Import a backup"
         tone="quiet"
         icon="cloud-download-outline"
-        disabled={busy}
+        disabled={busy || previewMode}
         onPress={() => setImportOpen(true)}
       />
       <ImportedBackupsSection
@@ -2184,7 +2352,7 @@ function LibraryScreen({
             void onSetKnowledgeArchived({ kind, id, expectedRevision: revision, archived });
           }}
         />
-      ) : (
+      ) : section === 'memory' ? (
         <>
           {knowledgeRecoveryStatus ? <View style={s.analysisStale}><Text style={s.analysisText}>{knowledgeRecoveryStatus.message}</Text></View> : null}
           <KnowledgeSuggestionSheet
@@ -2198,7 +2366,7 @@ function LibraryScreen({
           />
           <ImportedKnowledgeReview archives={importedBackups} busy={busy} controller={controller} onRun={onRun} />
         </>
-      )}
+      ) : null}
       <BackupImportSheet
         visible={importOpen}
         controller={controller}

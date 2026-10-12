@@ -2,6 +2,7 @@
 import type { AssistantCitation, AssistantDecision } from '../assistant';
 import type { AudioRecoveryMetadata } from '../audio/recovery.types';
 import type { KnowledgeState, KnowledgeEntityKind, KnowledgeFact, ContactClaim, KnowledgeSourceLink, ProjectMember, KnowledgeSuggestion, KnowledgeChange, KnowledgeEvidence } from '../knowledge/types';
+import type { ReminderRecord, ReminderState, ReminderPayload } from '../reminders';
 
 export type NoteStatus = 'recorded' | 'processed' | 'error';
 export type ProposalKind = 'task' | 'reminder' | 'email' | 'event' | 'memory';
@@ -166,6 +167,8 @@ export interface Proposal {
   lastError?: string;
   notificationId?: string;
   notificationRevision?: number;
+  /** Link to the shared local reminder ledger created when this approved proposal is executed. */
+  reminderId?: string;
   /** Stable idempotency key for provider event creation, persisted before dispatch. */
   eventTransactionId?: string;
   /** Stable same-source action identity used to prevent reprocessing from resurrecting consumed suggestions. */
@@ -610,7 +613,14 @@ export interface AppState {
   /** Current, explicitly reviewed structured knowledge; imported archives remain inert. */
   knowledge: KnowledgeState;
   knowledgeRecoveryStatus?: { message: 'Some saved knowledge could not be validated and is held privately.' };
+  /** User-owned local reminders and notification reconciliation intents. */
+  reminders: ReminderState;
+  /** Fixed, non-sensitive notice; malformed reminder rows are retained privately. */
+  reminderRecoveryStatus?: { quarantined: true; message: 'Some reminder data could not be validated and is held privately. New reminders are disabled until recovery.' };
 }
+
+export type ReminderDraftInput = Partial<ReminderPayload> & { candidateId?: string };
+export type ReminderDraftPatch = Partial<ReminderPayload> & { expectedRevision: number };
 
 export interface BackupImportPreview {
   sessionId: string;
@@ -806,6 +816,16 @@ export interface AppController {
   dismissProactiveCandidate(candidateId: string): Promise<ProactiveCandidateEntry>;
   snoozeProactiveCandidate(candidateId: string, until: string): Promise<ProactiveCandidateEntry>;
   getProactiveCandidateSource(candidateId: string): Promise<ProactiveCandidateSourceResult>;
+  createReminderDraft(input?: ReminderDraftInput): Promise<ReminderRecord>;
+  updateReminderDraft(id: string, input: ReminderDraftPatch): Promise<ReminderRecord>;
+  refreshReminderSource(id: string, input: { expectedRevision: number }): Promise<ReminderRecord>;
+  approveReminder(id: string, input: { expectedRevision: number }): Promise<ReminderRecord>;
+  saveApprovedReminder(id: string, input: { expectedRevision: number }): Promise<ReminderRecord>;
+  retryReminderAlert(id: string, input: { expectedRevision: number }): Promise<ReminderRecord>;
+  cancelReminder(id: string, input: { expectedRevision: number }): Promise<ReminderRecord>;
+  completeReminder(id: string, input: { expectedRevision: number }): Promise<ReminderRecord>;
+  deleteReminder(id: string, input: { expectedRevision: number }): Promise<void>;
+  reconcileReminderAlerts(): Promise<void>;
   exportData(): Promise<string>;
   prepareBackupImport(input: string | Uint8Array): Promise<BackupImportPreview>;
   applyBackupImport(input: { sessionId: string; planHash: string }): Promise<import('../backup').ImportedBackupArchive>;

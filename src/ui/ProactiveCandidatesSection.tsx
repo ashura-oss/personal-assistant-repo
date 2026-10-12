@@ -25,6 +25,7 @@ type Props = {
   busy: boolean;
   onDismiss: (candidateId: string) => void;
   onSnooze: (candidateId: string, until: string) => void;
+  onRemind: (candidateId: string) => void;
   onGetSource: AppController["getProactiveCandidateSource"];
 };
 
@@ -94,6 +95,7 @@ export function ProactiveCandidatesSection({
   busy,
   onDismiss,
   onSnooze,
+  onRemind,
   onGetSource,
 }: Props) {
   const [showWaiting, setShowWaiting] = useState(false);
@@ -217,6 +219,12 @@ export function ProactiveCandidatesSection({
                   label="Open saved source"
                   tone="quiet"
                   onPress={() => void openSource(entry)}
+                  disabled={busy}
+                />
+                <Button
+                  label="Remind me"
+                  tone="quiet"
+                  onPress={() => onRemind(entry.candidate.id)}
                   disabled={busy}
                 />
                 <Button

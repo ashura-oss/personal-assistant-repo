@@ -6,6 +6,8 @@ This repository contains the current uncredentialed build and the full product r
 
 People, Projects, and Memory provide local structured personal context. Suggestions retain their evidence and require explicit review; imported knowledge remains archived until the user chooses to add a separate copy. See [the iteration log](docs/ITERATIONS.md) for current scope and verification boundaries.
 
+Still also supports reviewed local reminders from a manual entry, saved note, or fresh attention candidate. Approval and saving are separate steps; after the first save, a reminder is user-owned, and later edits require fresh approval. iOS notification scheduling is implemented but has not been verified on a device. The browser preview uses simulated alerts and cannot promise notifications while closed. Portable backup retains reminder history as inert records, not schedules or approvals. Root verified 314 tests across 23 files, typecheck, and final web and unsigned iOS JavaScript exports; full lint completed with zero errors and 40 warnings. See [the plan](docs/PLAN.md) for details and platform boundaries.
+
 ## Current setup
 
 Requirements: Node.js 22.13 or later, npm, and the Expo SDK 57 toolchain. Use a current iPhone development build for microphone, Keychain, OAuth redirects, and native notification checks. The web preview runs locally and can exercise browser capture and IndexedDB workflows; it does not certify native behavior.

@@ -4,6 +4,7 @@ import { AppControllerImpl } from '../src/services/controller';
 import { buildProactiveSources } from '../src/proactive/adapters';
 import type { StateStore } from '../src/storage/contracts';
 import type { StoredOAuthToken } from '../src/connectors';
+import type { NotificationBackend } from '../src/services/notificationBackend';
 
 class MemoryStore implements StateStore {
   value?: AppState;
@@ -17,9 +18,10 @@ const identity = { providerNamespace: 'google' as const, clientId: 'google-clien
 const token: StoredOAuthToken = { accessToken: 'private-test-token', expiresAt: Date.now() + 60_000, identity };
 const tokenStore = { async get() { return structuredClone(token); }, async set() {} };
 
-async function configuredController(): Promise<{ app: AppControllerImpl; store: MemoryStore; accountId: string }> {
+async function configuredController(reminderBackend?: NotificationBackend): Promise<{ app: AppControllerImpl; store: MemoryStore; accountId: string }> {
   const store = new MemoryStore();
-  const first = new AppControllerImpl(store);
+  const integration = reminderBackend ? { reminderBackend } : {};
+  const first = new AppControllerImpl(store, {}, integration);
   await first.load();
   const account = await first.saveAccount({ provider: 'google', displayName: 'Personal', email: 'person@example.com' });
   const current = store.value!;
@@ -36,7 +38,7 @@ async function configuredController(): Promise<{ app: AppControllerImpl; store: 
     snippet: 'Please handle this urgent item.', receivedAt, observedAt: new Date().toISOString(), replyMetadataComplete: true,
   }];
   await store.save(current);
-  const app = new AppControllerImpl(store, {}, { tokenStore, clientIds: { google: 'google-client' } });
+  const app = new AppControllerImpl(store, {}, { ...integration, tokenStore, clientIds: { google: 'google-client' } });
   await app.load();
   return { app, store, accountId: account.id };
 }
@@ -99,6 +101,98 @@ describe('controller-owned proactive state', () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+
+  it('uses the task or message title for a proactive reminder instead of the matched quote', async () => {
+    const { app, accountId } = await configuredController();
+    await app.saveProactiveRule({
+      name: 'Urgent mail', enabled: true, accountIds: [accountId], trigger: { type: 'keyword', keywords: ['urgent'] },
+    });
+    const candidate = app.getSnapshot().proactive.candidates[0].candidate;
+    const reminder = await app.createReminderDraft({ candidateId: candidate.id });
+    expect(candidate.quote).not.toBe(reminder.title);
+    expect(reminder.title).toBe('Urgent: review');
+  });
+
+  it('rechecks a proactive source after permission UI before saving the reminder intent', async () => {
+    let appRef: AppControllerImpl | undefined;
+    let ruleRef: ReturnType<AppControllerImpl['getSnapshot']>['proactive']['rules'][number] | undefined;
+    const schedule = vi.fn(async () => 'must-not-schedule');
+    const backend: NotificationBackend = {
+      platform: 'mock', getPermission: async () => 'undetermined', requestPermission: async () => {
+        const current = appRef!.getSnapshot().proactive.rules[0];
+        ruleRef = await appRef!.saveProactiveRule({ id: current.id, expectedVersion: current.version, name: 'Renamed while permission was open',
+          enabled: current.enabled, accountIds: current.accountIds, trigger: current.trigger });
+        return 'authorized';
+      }, listPending: async () => [], schedule, cancel: async () => undefined, cancelLegacy: async () => undefined,
+      installForegroundHandler: async () => undefined,
+    };
+    const { app, accountId } = await configuredController(backend);
+    appRef = app;
+    const rule = await app.saveProactiveRule({ name: 'Urgent mail', enabled: true, accountIds: [accountId], trigger: { type: 'keyword', keywords: ['urgent'] } });
+    const candidate = app.getSnapshot().proactive.candidates[0].candidate;
+    const draft = await app.createReminderDraft({ candidateId: candidate.id });
+    const approved = await app.approveReminder(draft.id, { expectedRevision: draft.revision });
+    await expect(app.saveApprovedReminder(approved.id, { expectedRevision: approved.revision })).rejects.toThrow(/no longer current|source changed/i);
+    expect(ruleRef?.version).toBe(rule.version + 1);
+    expect(app.getSnapshot().reminders.records[0].status).toBe('approved');
+    expect(app.getSnapshot().reminders.records[0]).not.toHaveProperty('firstSavedAt');
+    expect(schedule).not.toHaveBeenCalled();
+  });
+
+  it('rejects the first save when a local task source changes while permission is open', async () => {
+    let appRef: AppControllerImpl | undefined;
+    let taskId = '';
+    const schedule = vi.fn(async () => 'must-not-schedule');
+    const notificationBackend: NotificationBackend = {
+      platform: 'mock', getPermission: async () => 'undetermined', requestPermission: async () => {
+        await appRef!.completeTask(taskId);
+        return 'authorized';
+      }, listPending: async () => [], schedule, cancel: async () => undefined, cancelLegacy: async () => undefined,
+      installForegroundHandler: async () => undefined,
+    };
+    const { store } = await configuredController(notificationBackend);
+    const initial = structuredClone(store.value!);
+    taskId = 'permission-race-task';
+    initial.tasks.push({
+      id: taskId, title: 'Submit application', body: 'Submit the application today', status: 'open',
+      createdAt: new Date().toISOString(), dueAt: new Date(Date.now() + 30 * 60_000).toISOString(),
+      sourceNoteId: 'source-note', sourceRevision: 1, proposalId: 'source-proposal',
+    });
+    await store.save(initial);
+    const app = new AppControllerImpl(store, {}, { tokenStore, clientIds: { google: 'google-client' }, reminderBackend: notificationBackend });
+    await app.load();
+    appRef = app;
+    await app.saveProactiveRule({ name: 'Due task', enabled: true, accountIds: [], trigger: { type: 'task_due', minutes: 60 } });
+    const candidate = app.getSnapshot().proactive.candidates.find((entry) => entry.candidate.sourceId.includes(taskId))?.candidate;
+    expect(candidate).toBeDefined();
+    const draft = await app.createReminderDraft({ candidateId: candidate!.id });
+    const approved = await app.approveReminder(draft.id, { expectedRevision: draft.revision });
+
+    await expect(app.saveApprovedReminder(approved.id, { expectedRevision: approved.revision })).rejects.toThrow(/no longer current|source changed/i);
+    expect(app.getSnapshot().tasks.find((task) => task.id === taskId)?.status).toBe('completed');
+    expect(app.getSnapshot().reminders.records.find((record) => record.id === approved.id)).toMatchObject({ status: 'approved' });
+    expect(schedule).not.toHaveBeenCalled();
+  });
+
+  it('keeps a previously saved reminder editable after its original proactive source expires', async () => {
+    const backend: NotificationBackend = {
+      platform: 'mock', getPermission: async () => 'denied', requestPermission: async () => 'denied', listPending: async () => [],
+      schedule: async () => 'must-not-schedule', cancel: async () => undefined, cancelLegacy: async () => undefined, installForegroundHandler: async () => undefined,
+    };
+    const { app, accountId } = await configuredController(backend);
+    const rule = await app.saveProactiveRule({ name: 'Urgent mail', enabled: true, accountIds: [accountId], trigger: { type: 'keyword', keywords: ['urgent'] } });
+    const candidate = app.getSnapshot().proactive.candidates[0].candidate;
+    const draft = await app.createReminderDraft({ candidateId: candidate.id });
+    const approved = await app.approveReminder(draft.id, { expectedRevision: draft.revision });
+    const saved = await app.saveApprovedReminder(approved.id, { expectedRevision: approved.revision });
+    expect(saved.firstSavedAt).toBeTruthy();
+
+    await app.saveProactiveRule({ id: rule.id, expectedVersion: rule.version, name: rule.name, enabled: false, accountIds: rule.accountIds, trigger: rule.trigger });
+    const edited = await app.updateReminderDraft(saved.id, { expectedRevision: saved.revision, title: 'Edited local reminder' });
+    const reapproved = await app.approveReminder(edited.id, { expectedRevision: edited.revision });
+    const savedAgain = await app.saveApprovedReminder(reapproved.id, { expectedRevision: reapproved.revision });
+    expect(savedAgain).toMatchObject({ status: 'saved', title: 'Edited local reminder', firstSavedAt: saved.firstSavedAt });
   });
 
   it('retains exact dismissals across renames, then allows a new eligibility revision to recur', async () => {

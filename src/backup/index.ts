@@ -791,6 +791,10 @@ export function createPortableBackup(state: AppState, metadata: PortableBackupMe
   };
   for (const note of state.notes) history.push(...analysisHistory(note));
   for (const proposal of state.proposals) history.push(proposalHistory(proposal, state.activity));
+  for (const reminder of state.reminders?.records ?? []) history.push({ kind: 'proposal', sourceId: `reminder:${reminder.id}`,
+    title: 'Reminder — imported history',
+    content: [`Title: ${reminder.title}`, `Details: ${reminder.body}`, `Due: ${reminder.dueAt}`, `Display time zone: ${reminder.displayTimeZone}`].join('\n'),
+    status: `${reminder.status} (unverified imported history)`, ...(reminder.createdAt ? { occurredAt: reminder.createdAt } : {}) });
   for (const record of state.dispatchRecords) {
     const payload = record.payload.kind === 'email'
       ? [`Subject: ${record.payload.email.subject}`, `To: ${record.payload.email.to.join(', ')}`, `Cc: ${record.payload.email.cc.join(', ')}`, `Bcc: ${record.payload.email.bcc.join(', ')}`, `Email body: ${record.payload.email.text}`]
