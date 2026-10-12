@@ -1,4 +1,4 @@
-import type { EmailProposalPayload, EventProposalPayload, Proposal, ProposalProvenance } from '../core';
+import type { AnyProposalProvenance, EmailProposalPayload, EventProposalPayload, Proposal } from '../core';
 
 export type DispatchOperation = 'draft' | 'send' | 'event';
 export type DispatchOutcome = 'pending' | 'accepted' | 'unknown' | 'rejected';
@@ -44,12 +44,12 @@ export interface DispatchRecord {
   id: string;
   proposalId: string;
   approvedRevision: number;
-  sourceRevision: number;
+  sourceRevision?: number;
   payloadDigest: string;
   sourceActionKey: string;
   /** Stable across reconnect generations; derived from immutable identity + action + operation. */
   duplicateKey: string;
-  sourceProvenance: ProposalProvenance;
+  sourceProvenance: AnyProposalProvenance;
   operation: DispatchOperation;
   accountId: string;
   account: DispatchAccountSnapshot;
@@ -62,6 +62,7 @@ export interface DispatchRecord {
   outcome: DispatchOutcome;
   outcomeAt?: string;
   rejectionCode?: 'provider_rejected' | 'precondition_failed';
+  replyDraftCheck?: 'matches_approved' | 'differs' | 'unverified';
   remoteId?: string;
   reconciliations: readonly DispatchReconciliationAttestation[];
 }
@@ -79,6 +80,7 @@ export interface DispatchOutcomeInput {
   at: string;
   remoteId?: string;
   rejectionCode?: 'provider_rejected' | 'precondition_failed';
+  replyDraftCheck?: 'matches_approved' | 'differs' | 'unverified';
 }
 
 export type ApprovedEmailPayload = EmailProposalPayload;

@@ -21,6 +21,250 @@ class MemoryStore implements StateStore {
 }
 
 describe('application state controller', () => {
+  it('creates a mail-origin reply from a fresh verified mailbox snapshot without a synthetic note', async () => {
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store);
+    await app.load();
+    const state = structuredClone(app.getSnapshot());
+    const observedAt = new Date().toISOString();
+    const account = {
+      id: 'mail-account', provider: 'google' as const, displayName: 'Work', email: 'display@example.test', verifiedEmail: 'me@example.test',
+      connected: true, authStatus: 'connected' as const, identity: { providerNamespace: 'google' as const, clientId: 'client-1', subject: 'subject-1' },
+      tokenRef: 'test-token-ref', capabilities: ['mail.read' as const], connectionGeneration: 3,
+    };
+    state.accounts.push(account);
+    state.mailbox.push({
+      id: 'local-message-1', accountId: account.id, providerMessageId: 'provider-message-1', identityKey: 'google:client-1:subject-1:',
+      verifiedIdentityKey: 'google:client-1:subject-1:', connectionGeneration: 3, idFormat: 'gmail', threadId: 'thread-1',
+      subject: 'Project update', from: 'Sam <sam@example.test>', senderEmail: 'sam@example.test', receivedAt: observedAt,
+      replyTo: ['sam@example.test'], to: ['me@example.test', 'alex@example.test'], cc: ['alex@example.test', 'casey@example.test'],
+      internetMessageId: '<message-1@example.test>', references: '<parent@example.test>', inReplyTo: '<message-1@example.test>',
+      replyMetadataComplete: true, observedAt,
+    });
+    await store.save(state);
+    const storedToken = { accessToken: 'reply-test-token', expiresAt: Date.now() + 60_000, identity: account.identity };
+    const restored = new AppControllerImpl(store, {}, { tokenStore: { async get() { return structuredClone(storedToken); }, async set() {} } });
+    await restored.load();
+    const sourceResult = await restored.getMailReplySource('local-message-1');
+    expect(sourceResult.status).toBe('current');
+    expect(sourceResult.defaults?.reply).toEqual({ to: ['sam@example.test'], cc: [] });
+    expect(sourceResult.defaults?.reply_all).toEqual({ to: ['sam@example.test', 'alex@example.test'], cc: ['casey@example.test'] });
+    const proposal = await restored.createMailReplyProposal({
+      messageId: 'local-message-1', mode: 'reply_all', sourceDigest: sourceResult.source!.sourceDigest, text: 'Thanks for the update.',
+    });
+    expect(proposal).toMatchObject({ kind: 'email', status: 'draft', provenance: { version: 2, kind: 'mail_reply' } });
+    expect(proposal).not.toHaveProperty('noteId');
+    expect(proposal).not.toHaveProperty('sourceRevision');
+    expect(restored.getSnapshot().notes).toEqual([]);
+    expect(proposal.email).toMatchObject({ operation: 'draft', subject: 'Project update', bcc: [], attachments: [], to: ['sam@example.test', 'alex@example.test'], cc: ['casey@example.test'] });
+    await expect(restored.editProposal(proposal.id, { email: { ...proposal.email!, operation: 'send' } })).rejects.toThrow(/locked/i);
+    const approved = await restored.approveProposal(proposal.id);
+    expect(approved.status).toBe('approved');
+    expect(approved.sourceRevision).toBeUndefined();
+    const another = await restored.createMailReplyProposal({
+      messageId: 'local-message-1', mode: 'reply', sourceDigest: sourceResult.source!.sourceDigest, text: 'A second draft for review.',
+    });
+    const expiryTampered = store.value!.proposals.find((item) => item.id === another.id)!;
+    (expiryTampered.provenance as { expiresAt: string }).expiresAt = new Date(Date.parse(observedAt) + 16 * 60_000).toISOString();
+    await store.save(store.value!);
+    const badExpiry = new AppControllerImpl(store, {}, { tokenStore: { async get() { return structuredClone(storedToken); }, async set() {} } });
+    await badExpiry.load();
+    await expect(badExpiry.approveProposal(another.id)).rejects.toThrow();
+
+    const sourceChangeDraft = await restored.createMailReplyProposal({
+      messageId: 'local-message-1', mode: 'reply', sourceDigest: sourceResult.source!.sourceDigest, text: 'Recheck the source version.',
+    });
+    store.value!.mailbox[0].providerVersion = 'etag-changed';
+    const afterSourceChange = new AppControllerImpl(store, {}, { tokenStore: { async get() { return structuredClone(storedToken); }, async set() {} } });
+    await afterSourceChange.load();
+    await expect(afterSourceChange.approveProposal(sourceChangeDraft.id)).rejects.toThrow(/source message changed/i);
+  });
+
+  it('returns stale when the reply-source hash finishes after the mailbox snapshot changes', async () => {
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store);
+    await app.load();
+    const state = structuredClone(app.getSnapshot());
+    const observedAt = new Date().toISOString();
+    const account = {
+      id: 'mail-account', provider: 'google' as const, displayName: 'Work', email: 'display@example.test', verifiedEmail: 'me@example.test',
+      connected: true, authStatus: 'connected' as const, identity: { providerNamespace: 'google' as const, clientId: 'client-1', subject: 'subject-1' },
+      tokenRef: 'test-token-ref', capabilities: ['mail.read' as const], connectionGeneration: 3,
+    };
+    state.accounts.push(account);
+    state.mailbox.push({
+      id: 'gated-message', accountId: account.id, providerMessageId: 'provider-gated', identityKey: 'google:client-1:subject-1:',
+      verifiedIdentityKey: 'google:client-1:subject-1:', connectionGeneration: 3, idFormat: 'gmail', threadId: 'thread-gated',
+      subject: 'Snapshot race', from: 'Sam <sam@example.test>', senderEmail: 'sam@example.test', receivedAt: observedAt,
+      internetMessageId: '<gated@example.test>', replyTo: ['sam@example.test'], to: ['me@example.test'], cc: [],
+      replyMetadataComplete: true, observedAt,
+    });
+    await store.save(state);
+    const token: StoredOAuthToken = { accessToken: 'gated-access', expiresAt: Date.now() + 600_000, identity: account.identity };
+    const gated = new AppControllerImpl(store, {}, { tokenStore: { async get() { return structuredClone(token); }, async set() {} } });
+    await gated.load();
+    expect((await gated.getMailReplySource('gated-message')).status).toBe('current');
+
+    const realDigest = Crypto.digestStringAsync.bind(Crypto);
+    let digestCalls = 0;
+    let beginDigest!: () => void;
+    let releaseDigest!: () => void;
+    const digestStarted = new Promise<void>((resolve) => { beginDigest = resolve; });
+    const digestGate = new Promise<void>((resolve) => { releaseDigest = resolve; });
+    const digestSpy = vi.spyOn(Crypto, 'digestStringAsync').mockImplementation(async (...args) => {
+      digestCalls += 1;
+      if (digestCalls === 1) {
+        beginDigest();
+        await digestGate;
+      }
+      return realDigest(...args);
+    });
+    try {
+      const pending = gated.getMailReplySource('gated-message');
+      await Promise.race([digestStarted, new Promise<never>((_, reject) => setTimeout(() => reject(new Error('digest did not start')), 500))]);
+      let unsubscribe: () => void = () => undefined;
+      const snapshotChanged = new Promise<void>((resolve) => {
+        unsubscribe = gated.subscribe(() => { unsubscribe(); resolve(); });
+      });
+      const mutation = gated.saveSettings({ timezone: 'Asia/Singapore' });
+      await Promise.race([snapshotChanged, new Promise<never>((_, reject) => setTimeout(() => reject(new Error('mutation did not commit')), 500))]);
+      releaseDigest();
+      await mutation;
+      await expect(pending).resolves.toMatchObject({ status: 'stale' });
+      expect(digestCalls).toBe(1);
+    } finally {
+      releaseDigest();
+      digestSpy.mockRestore();
+    }
+  });
+
+  it('executes frozen mail replies without notes, preserves unknown receipts, and blocks a changed connection before the write', async () => {
+    const store = new MemoryStore();
+    const identity = { providerNamespace: 'google' as const, clientId: 'reply-client', subject: 'reply-subject' };
+    const tokens = new Map<string, StoredOAuthToken>();
+    const tokenStore = {
+      async get(ref: string) { const value = tokens.get(ref); return value ? structuredClone(value) : null; },
+      async set(ref: string, value: StoredOAuthToken) { tokens.set(ref, structuredClone(value)); },
+    };
+    const oauth: OAuthBridgeResult = {
+      provider: 'google', accessToken: 'reply-access', expiresAt: Date.now() + 600_000,
+      grantedScopes: ['openid', 'https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/gmail.compose'],
+      requestedCapabilities: ['mail.read', 'mail.draft'], capabilities: ['mail.read', 'mail.draft'], identity,
+      displayName: 'Reply account', email: 'me@example.test',
+    };
+    let prepareStarted!: () => void;
+    let releasePrepare!: () => void;
+    let pauseNext = false;
+    let attemptedDrafts = 0;
+    let completedProviderWrites = 0;
+    const connector = {
+      async verifyOAuthIdentity() { return true; },
+      async createDraft(_account: unknown, envelope: Record<string, unknown>, verifier: { verify(value: never): Promise<boolean>; verifyBeforeDispatch(value: never): boolean }) {
+        expect(envelope.replySource).toMatchObject({ version: 2, kind: 'mail_reply' });
+        expect(envelope.sourceRevision).toBeUndefined();
+        expect(await verifier.verify(envelope as never)).toBe(true);
+        attemptedDrafts += 1;
+        if (pauseNext) {
+          pauseNext = false;
+          prepareStarted();
+          await new Promise<void>((resolve) => { releasePrepare = resolve; });
+        }
+        if (!verifier.verifyBeforeDispatch(envelope as never)) throw new Error('Approved action changed before provider dispatch.');
+        completedProviderWrites += 1;
+        if (attemptedDrafts === 1) return { status: 'accepted' as const, id: 'provider-draft-1', replyDraftCheck: 'matches_approved' as const };
+        if (attemptedDrafts === 2) return { status: 'unknown' as const };
+        return { status: 'accepted' as const, id: 'unexpected' };
+      },
+    };
+    const integration = {
+      tokenStore, deleteToken: async () => undefined, clientIds: { google: 'reply-client' },
+      verifyOAuthResult: async () => true, connectorFactory: () => connector as never,
+    };
+    const seed = new AppControllerImpl(store, {}, integration);
+    await seed.load();
+    const account = await seed.installVerifiedAccount({ provider: 'google', displayName: '', email: '' }, oauth);
+    const observedAt = new Date().toISOString();
+    const message = {
+      id: 'reply-local-1', accountId: account.id, providerMessageId: 'reply-provider-1', identityKey: 'google:reply-client:reply-subject:',
+      verifiedIdentityKey: 'google:reply-client:reply-subject:', connectionGeneration: account.connectionGeneration, idFormat: 'gmail' as const,
+      threadId: 'reply-thread-1', subject: 'Quarterly update', from: 'Sam <sam@example.test>', senderEmail: 'sam@example.test',
+      internetMessageId: '<reply-1@example.test>', replyTo: ['sam@example.test'], to: ['me@example.test'], cc: [],
+      replyMetadataComplete: true, observedAt,
+    };
+    store.value!.mailbox.push(message);
+    await store.save(store.value!);
+    let app = new AppControllerImpl(store, {}, integration);
+    await app.load();
+    await app.saveSettings({ mode: 'provider' });
+
+    const source = await app.getMailReplySource(message.id);
+    expect(source.status).toBe('current');
+    const acceptedDraft = await app.createMailReplyProposal({ messageId: message.id, mode: 'reply', sourceDigest: source.source!.sourceDigest, text: 'Thanks.' });
+    await app.approveProposal(acceptedDraft.id);
+    const accepted = await app.executeProposal(acceptedDraft.id);
+    expect(accepted).toMatchObject({ status: 'accepted', remoteOperation: 'draft', remoteId: 'provider-draft-1' });
+    expect(app.getSnapshot().dispatchRecords[0]).toMatchObject({
+      operation: 'draft', outcome: 'accepted', replyDraftCheck: 'matches_approved',
+      sourceProvenance: { version: 2, source: { localMessageId: message.id } },
+    });
+    expect(app.getSnapshot().dispatchRecords[0]).not.toHaveProperty('sourceRevision');
+    expect(app.getSnapshot().notes).toEqual([]);
+
+    app = new AppControllerImpl(store, {}, integration);
+    await app.load();
+    expect(app.getSnapshot().dispatchRecords[0].sourceProvenance.version).toBe(2);
+    const unknownDraft = await app.createMailReplyProposal({ messageId: message.id, mode: 'reply_all', sourceDigest: source.source!.sourceDigest, text: 'Another response.' });
+    await app.approveProposal(unknownDraft.id);
+    expect((await app.executeProposal(unknownDraft.id)).status).toBe('unknown');
+    const afterUnknown = new AppControllerImpl(store, {}, integration);
+    await afterUnknown.load();
+    expect(afterUnknown.getSnapshot().dispatchRecords[0]).toMatchObject({ outcome: 'unknown', operation: 'draft' });
+    await expect(afterUnknown.createMailReplyProposal({ messageId: message.id, mode: 'reply_all', sourceDigest: source.source!.sourceDigest, text: 'Different body cannot bypass the guard.' })).rejects.toThrow(/already exists/i);
+    await expect(afterUnknown.executeProposal(unknownDraft.id)).rejects.toThrow(/approve this exact version/i);
+
+    const secondMessage = { ...message, id: 'reply-local-2', providerMessageId: 'reply-provider-2', threadId: 'reply-thread-2', internetMessageId: '<reply-2@example.test>' };
+    store.value!.mailbox.push(secondMessage);
+    await store.save(store.value!);
+    app = new AppControllerImpl(store, {}, integration);
+    await app.load();
+    const secondSource = await app.getMailReplySource(secondMessage.id);
+    const fencedDraft = await app.createMailReplyProposal({ messageId: secondMessage.id, mode: 'reply', sourceDigest: secondSource.source!.sourceDigest, text: 'This should be blocked before write.' });
+    await app.approveProposal(fencedDraft.id);
+    pauseNext = true;
+    const prepared = new Promise<void>((resolve) => { prepareStarted = resolve; });
+    const pending = app.executeProposal(fencedDraft.id);
+    await prepared;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.parse(secondMessage.observedAt) - 1);
+    try {
+      releasePrepare();
+      const blockedByClock = await pending;
+      expect(blockedByClock).toMatchObject({ status: 'failed', lastError: expect.stringMatching(/changed before provider dispatch/i) });
+    } finally {
+      clock.mockRestore();
+    }
+    expect(completedProviderWrites).toBe(2);
+    expect(app.getSnapshot().dispatchRecords.find((record) => record.proposalId === fencedDraft.id)).toMatchObject({ outcome: 'rejected', rejectionCode: 'precondition_failed' });
+
+    const thirdMessage = { ...message, id: 'reply-local-3', providerMessageId: 'reply-provider-3', threadId: 'reply-thread-3', internetMessageId: '<reply-3@example.test>' };
+    store.value!.mailbox.push(thirdMessage);
+    await store.save(store.value!);
+    app = new AppControllerImpl(store, {}, integration);
+    await app.load();
+    const thirdSource = await app.getMailReplySource(thirdMessage.id);
+    const disconnectDraft = await app.createMailReplyProposal({ messageId: thirdMessage.id, mode: 'reply', sourceDigest: thirdSource.source!.sourceDigest, text: 'This should be blocked before write.' });
+    await app.approveProposal(disconnectDraft.id);
+    pauseNext = true;
+    const disconnectPrepared = new Promise<void>((resolve) => { prepareStarted = resolve; });
+    const disconnectPending = app.executeProposal(disconnectDraft.id);
+    await disconnectPrepared;
+    await app.disconnectAccount(account.id);
+    releasePrepare();
+    const blocked = await disconnectPending;
+    expect(blocked).toMatchObject({ status: 'failed', lastError: expect.stringMatching(/changed before provider dispatch/i) });
+    expect(completedProviderWrites).toBe(2);
+    expect(app.getSnapshot().dispatchRecords.find((record) => record.proposalId === disconnectDraft.id)).toMatchObject({ outcome: 'rejected', rejectionCode: 'precondition_failed' });
+  });
+
   it('invalidates approval after an edit and keeps source revisions tied to the original note', async () => {
     const store = new MemoryStore();
     const app = new AppControllerImpl(store);

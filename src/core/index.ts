@@ -80,7 +80,7 @@ export interface ProposalSourceProvenance {
 }
 
 /** Immutable analysis dependencies captured when this individual proposal was created. */
-export interface ProposalProvenance {
+export interface NoteProposalProvenance {
   version: 1;
   assistContractVersion: string;
   analysisFingerprint: string;
@@ -97,9 +97,48 @@ export interface ProposalProvenance {
   expiresAt?: string;
 }
 
+export interface MailReplySourceSnapshot {
+  version: 1;
+  accountId: string;
+  accountEmail: string;
+  verifiedSelfEmail?: string;
+  identity: NonNullable<Account['identity']>;
+  connectionGeneration: number;
+  localMessageId: string;
+  providerMessageId: string;
+  idFormat: 'gmail' | 'graph-immutable';
+  providerVersion?: string;
+  threadId?: string;
+  internetMessageId: string;
+  references?: string;
+  inReplyTo?: string;
+  subject: string;
+  from?: string;
+  senderEmail?: string;
+  replyTo?: string[];
+  to?: string[];
+  cc?: string[];
+  snippet?: string;
+  replyMetadataComplete: true;
+  observedAt: string;
+  sourceDigest: string;
+}
+
+export interface MailReplyProvenance {
+  version: 2;
+  kind: 'mail_reply';
+  sourceDigest: string;
+  source: MailReplySourceSnapshot;
+  expiresAt: string;
+}
+
+/** Backward-compatible name for note-derived provenance; new proposals use the explicit union. */
+export type ProposalProvenance = NoteProposalProvenance;
+export type AnyProposalProvenance = NoteProposalProvenance | MailReplyProvenance;
+
 export interface Proposal {
   id: string;
-  noteId: string;
+  noteId?: string;
   kind: ProposalKind;
   title: string;
   body: string;
@@ -114,7 +153,7 @@ export interface Proposal {
   eventTransactionId?: string;
   /** Stable same-source action identity used to prevent reprocessing from resurrecting consumed suggestions. */
   sourceActionKey?: string;
-  provenance?: ProposalProvenance;
+  provenance?: AnyProposalProvenance;
   requiresRebuild?: boolean;
   /** Synchronous canonical dependency snapshot rechecked after connector preparation and before fetch. */
   dispatchDependencyProjection?: string;
@@ -124,7 +163,7 @@ export interface Proposal {
   accountId?: string;
   recipients: string[];
   calendarId?: string;
-  sourceRevision: number;
+  sourceRevision?: number;
   evidence: ProposalEvidence[];
   dueAt?: string;
   email?: EmailProposalPayload;
@@ -144,6 +183,19 @@ export interface EmailProposalPayload {
   subject: string;
   text: string;
   attachments: { id: string; fileName: string; mimeType: string; sizeBytes: number; sha256: string }[];
+  /** Present only for a metadata-bound reply draft. */
+  reply?: {
+    mode: 'reply' | 'reply_all';
+    sourceDigest: string;
+    localMessageId: string;
+    providerMessageId: string;
+    idFormat: 'gmail' | 'graph-immutable';
+    internetMessageId: string;
+    sourceSubject: string;
+    threadId?: string;
+    references?: string;
+    inReplyTo?: string;
+  };
 }
 
 export interface EventProposalPayload {
@@ -164,6 +216,8 @@ export interface Account {
   provider: 'google' | 'microsoft' | 'local';
   displayName: string;
   email: string;
+  /** Address returned by the verified provider identity flow, if available. */
+  verifiedEmail?: string;
   connected: boolean;
   authStatus: AccountAuthStatus;
   identity?: {
@@ -438,6 +492,12 @@ export interface ProactiveCandidateSourceResult {
   source?: import('../proactive').ProactiveSource;
 }
 
+export interface MailReplySourceResult {
+  status: 'current' | 'stale' | 'unavailable' | 'missing';
+  source?: MailReplySourceSnapshot;
+  defaults?: { reply: { to: string[]; cc: string[] }; reply_all: { to: string[]; cc: string[] } };
+}
+
 export interface AppState {
   notes: Note[];
   proposals: Proposal[];
@@ -536,4 +596,6 @@ export interface AppController {
   getProactiveCandidateSource(candidateId: string): Promise<ProactiveCandidateSourceResult>;
   exportData(): Promise<string>;
   deleteNote(id: string): Promise<void>;
+  getMailReplySource(messageId: string): Promise<MailReplySourceResult>;
+  createMailReplyProposal(input: { messageId: string; mode: 'reply' | 'reply_all'; sourceDigest: string; text: string; to?: string[]; cc?: string[] }): Promise<Proposal>;
 }

@@ -1,4 +1,5 @@
 import type { Account, AccountCapability, EmailProposalPayload, EventProposalPayload } from '../core';
+import { replyReferences as frozenReplyReferences, validateReplyBinding, type MailReplyProvenance } from '../mailReply';
 import { scopeGrantsCapability } from './oauth';
 
 const GOOGLE_API = 'https://gmail.googleapis.com/gmail/v1/users/me';
@@ -54,7 +55,7 @@ export interface ConnectorDependencies {
 export interface ApprovedDispatch {
   proposalId: string;
   revision: number;
-  sourceRevision: number;
+  sourceRevision?: number;
   operation: 'draft' | 'send' | 'event';
   accountId: string;
   identity: NonNullable<Account['identity']>;
@@ -63,6 +64,7 @@ export interface ApprovedDispatch {
   body: string;
   calendarId?: string;
   payload: EmailProposalPayload | EventProposalPayload;
+  replySource?: MailReplyProvenance;
 }
 
 export interface DispatchVerifier {
@@ -71,7 +73,7 @@ export interface DispatchVerifier {
   verifyBeforeDispatch(envelope: ApprovedDispatch): boolean;
 }
 
-export type MutationReceipt = { status: 'accepted'; id?: string } | { status: 'unknown' };
+export type MutationReceipt = { status: 'accepted'; id?: string; replyDraftCheck?: 'matches_approved' | 'differs' | 'unverified' } | { status: 'unknown' };
 
 /** Provider returned a definite non-success HTTP response. */
 export class ProviderHttpError extends Error {
@@ -248,6 +250,25 @@ function encodedSubject(value: string): string {
   if (chunk || !words.length) words.push(`=?UTF-8?B?${utf8b64(chunk)}?=`);
   return words.join('\r\n ');
 }
+function foldedHeader(name: string, value: string): string {
+  const tokens = value.split(/([ \t]+)/).filter(Boolean);
+  let line = `${name}:`;
+  const lines: string[] = [];
+  for (const token of tokens) {
+    if (/^[ \t]+$/.test(token)) {
+      if (line.length + token.length <= 78) line += token;
+      continue;
+    }
+    const separator = line.endsWith(':') ? ' ' : '';
+    if (line.length + separator.length + token.length > 78 && !line.endsWith(':')) {
+      if (line.length > 998) throw new Error(`${name} header exceeds the RFC line limit.`);
+      lines.push(line); line = ` ${token}`;
+    } else line += `${separator}${token}`;
+  }
+  if (line.length > 998) throw new Error(`${name} header exceeds the RFC line limit.`);
+  lines.push(line);
+  return lines.join('\r\n');
+}
 function headerValue(value: string, label: string): string {
   if (/[\r\n\0]/.test(value)) throw new Error(`${label} contains an invalid line break.`);
   if (value !== value.trim()) throw new Error(`${label} contains surrounding whitespace.`);
@@ -359,6 +380,45 @@ function parseAddressHeader(value: string | undefined): string[] | undefined {
   const parts = value.split(',').map((part) => part.trim()).filter(Boolean);
   const addresses = parts.map((part) => narrowEmail(part));
   return parts.length > 0 && addresses.every((address): address is string => Boolean(address)) ? addresses : undefined;
+}
+
+function validMessageId(value: string): boolean {
+  return value.length <= 998 && /^<[^<>\s\u0000-\u0020\u007f]+@[^<>\s\u0000-\u0020\u007f]+>$/.test(value);
+}
+
+function graphRecipients(values: string[]): Array<{ emailAddress: { address: string } }> {
+  return emailList(values, 'reply recipient').map((address) => ({ emailAddress: { address } }));
+}
+
+function graphReplyDraftCheck(message: Record<string, unknown> | undefined, payload: EmailProposalPayload): 'matches_approved' | 'differs' | 'unverified' {
+  if (!message || typeof message.isDraft !== 'boolean' || typeof message.subject !== 'string' || !isRecord(message.body) ||
+      typeof message.body.content !== 'string' || typeof message.body.contentType !== 'string' || !Array.isArray(message.toRecipients) || !Array.isArray(message.ccRecipients) || !Array.isArray(message.bccRecipients)) return 'unverified';
+  const to = graphAddressList(message.toRecipients); const cc = graphAddressList(message.ccRecipients); const bcc = graphAddressList(message.bccRecipients);
+  if (!to.complete || !cc.complete || !bcc.complete) return 'unverified';
+  const normalizeText = (value: string) => value.replace(/\r\n?/g, '\n');
+  const sameAddresses = (actual: string[], expected: string[]) => actual.length === expected.length &&
+    actual.map((address) => address.toLowerCase()).sort().every((address, index) => address === [...expected].map((item) => item.toLowerCase()).sort()[index]);
+  const expectedSubject = payload.reply?.sourceSubject;
+  if (message.isDraft !== true || message.subject !== expectedSubject || message.body.contentType.toLowerCase() !== 'text' || normalizeText(message.body.content) !== normalizeText(payload.text) ||
+      !sameAddresses(to.addresses ?? [], payload.to) || !sameAddresses(cc.addresses ?? [], payload.cc) || !sameAddresses(bcc.addresses ?? [], [])) return 'differs';
+  return 'matches_approved';
+}
+
+function validateReplyPayload(account: Account, payload: EmailProposalPayload, replySource: ApprovedDispatch['replySource']): void {
+  const reply = payload.reply;
+  if (!reply) return;
+  if (!replySource) throw new Error('Reply source approval is missing.');
+  validateReplyBinding(payload, replySource);
+  if (replySource.source.accountId !== account.id || !sameIdentity(replySource.source.identity, accountIdentity(account)) ||
+      replySource.source.connectionGeneration !== (account.connectionGeneration ?? 0) || replySource.source.identity.providerNamespace !== account.provider) {
+    throw new Error('Reply source does not match the current connected account.');
+  }
+  if ((account.provider === 'google' && (reply.idFormat !== 'gmail' || !reply.threadId)) ||
+      (account.provider === 'microsoft' && (reply.idFormat !== 'graph-immutable' || !reply.providerMessageId))) throw new Error('Reply source does not match the connected provider.');
+  if (reply.providerMessageId.length > 2048 || /[\r\n\0]/.test(reply.providerMessageId)) throw new Error('Reply source identifier is invalid.');
+  if (account.provider === 'microsoft' && (!reply.providerMessageId || reply.providerMessageId.length < 8)) throw new Error('Reply source immutable identifier is invalid.');
+  if (account.provider === 'google' && (reply.threadId!.length > 512 || /[\r\n\0]/.test(reply.threadId!))) throw new Error('Reply thread identifier is invalid.');
+  if (!validMessageId(reply.internetMessageId)) throw new Error('Reply source message ID is invalid.');
 }
 
 function graphAddressList(value: unknown): { addresses?: string[]; complete: boolean } {
@@ -803,6 +863,7 @@ export class ConnectorClient {
   async createDraft(account: Account, envelope: ApprovedDispatch, verifier: DispatchVerifier): Promise<MutationReceipt> {
     capability(account, 'mail.draft');
     const payload = await this.verifiedEmail(account, envelope, verifier, 'draft');
+    if (payload.reply) return this.createReplyDraft(account, envelope, verifier, payload);
     if (account.provider === 'google') {
       const raw = await this.gmailRaw(payload);
       return this.writeJson(account, `${GOOGLE_API}/drafts`, 'mail', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ message: { raw } }) }, () => this.finalVerify(envelope, verifier));
@@ -812,6 +873,7 @@ export class ConnectorClient {
   }
 
   async sendEmail(account: Account, envelope: ApprovedDispatch, verifier: DispatchVerifier): Promise<MutationReceipt> {
+    if (isRecord(envelope.payload) && 'reply' in envelope.payload && envelope.payload.reply) throw new Error('Reply proposals can only create a draft.');
     capability(account, 'mail.send');
     const payload = await this.verifiedEmail(account, envelope, verifier, 'send');
     if (account.provider === 'google') {
@@ -848,12 +910,17 @@ export class ConnectorClient {
 
   private finalVerify(envelope: ApprovedDispatch, verifier: DispatchVerifier): void {
     if (!verifier.verifyBeforeDispatch(envelope)) throw new Error('Approved action changed before provider dispatch. Review and approve it again.');
+    if (envelope.replySource) {
+      const expiresAt = Date.parse(envelope.replySource.expiresAt);
+      if (!Number.isFinite(expiresAt) || expiresAt <= this.now()) throw new Error('Reply source approval has expired. Review the source and approve the reply again.');
+    }
   }
 
   private async verifyDispatch(account: Account, envelope: ApprovedDispatch, verifier: DispatchVerifier, operation: ApprovedDispatch['operation']): Promise<void> {
     if (!verifier.verifyBeforeDispatch || !await verifier.verify(envelope) || envelope.operation !== operation || envelope.accountId !== account.id ||
         !sameIdentity(envelope.identity, accountIdentity(account)) || !/^[^\r\n\0]{1,160}$/.test(envelope.proposalId) ||
-        !Number.isInteger(envelope.revision) || envelope.revision < 1 || !Number.isInteger(envelope.sourceRevision) || envelope.sourceRevision < 1 ||
+        !Number.isInteger(envelope.revision) || envelope.revision < 1 ||
+        (envelope.replySource ? envelope.sourceRevision !== undefined : !Number.isInteger(envelope.sourceRevision) || envelope.sourceRevision! < 1) ||
         !/^[a-f0-9]{64}$/i.test(envelope.payloadDigest) || !envelope.title || envelope.title.length > 1000 || envelope.body.length > 100_000 || /[\r\n\0]/.test(envelope.title)) {
       throw new Error('Dispatch approval does not match this account and operation.');
     }
@@ -865,9 +932,49 @@ export class ConnectorClient {
     const p = envelope.payload as EmailProposalPayload;
     if (p.to.length === 0) throw new Error('Email needs at least one To recipient.');
     emailList(p.to, 'To'); emailList(p.cc, 'Cc'); emailList(p.bcc, 'Bcc');
-    headerValue(p.subject, 'Subject');
+    if (p.reply) {
+      if (p.subject.length > 998 || /[\r\n\0]/.test(p.subject) || p.subject !== p.subject.trim()) throw new Error('Reply subject contains an invalid header value.');
+    } else headerValue(p.subject, 'Subject');
     if (p.subject.length > 998 || p.text.length > 100_000 || p.attachments.length > 10) throw new Error('Email payload exceeds limits.');
+    if (p.reply) {
+      if (operation !== 'draft' || envelope.operation !== 'draft') throw new Error('Reply proposals can only create a draft.');
+      validateReplyPayload(account, p, envelope.replySource);
+    }
     return p;
+  }
+
+  private async createReplyDraft(account: Account, envelope: ApprovedDispatch, verifier: DispatchVerifier, payload: EmailProposalPayload): Promise<MutationReceipt> {
+    const reply = payload.reply!;
+    if (account.provider === 'google') {
+      const raw = await this.gmailReplyRaw(payload, envelope.replySource!.source);
+      return this.writeReplyJson(account, `${GOOGLE_API}/drafts`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ message: { raw, threadId: reply.threadId } }) }, () => this.finalVerify(envelope, verifier), 'gmail', reply.threadId);
+    }
+    const action = reply.mode === 'reply_all' ? 'createReplyAll' : 'createReply';
+    const url = `${GRAPH_API}/me/messages/${encodeURIComponent(reply.providerMessageId)}/${action}`;
+    const body = { message: { body: { contentType: 'Text', content: payload.text }, toRecipients: graphRecipients(payload.to), ccRecipients: graphRecipients(payload.cc), bccRecipients: [] } };
+    return this.writeReplyJson(account, url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }, () => this.finalVerify(envelope, verifier), 'graph', undefined, payload);
+  }
+
+  private async writeReplyJson(account: Account, url: string, init: RequestInit, beforeDispatch: () => void, provider: 'gmail' | 'graph', expectedThreadId?: string, payload?: EmailProposalPayload): Promise<MutationReceipt> {
+    let response: Response;
+    let dispatched = false;
+    try { response = await this.request(account, url, 'mail', init, false, undefined, () => { dispatched = true; }, undefined, beforeDispatch); }
+    catch (error) { if (!dispatched) throw error; return { status: 'unknown' }; }
+    if (response.status >= 500) return { status: 'unknown' };
+    if (response.status >= 400 && response.status < 500) throw new ProviderWriteRejectedError(response.status);
+    if (!response.ok) return { status: 'unknown' };
+    const data = await response.json().catch(() => undefined) as Record<string, unknown> | undefined;
+    if (provider === 'gmail') {
+      const id = data && typeof data.id === 'string' && data.id.length > 0 && data.id.length <= 2048 ? data.id : undefined;
+      if (!id) return { status: 'unknown' };
+      const message = data && isRecord(data.message) ? data.message : undefined;
+      const threadId = message && typeof message.threadId === 'string' && message.threadId.length > 0 ? message.threadId : undefined;
+      return { status: 'accepted', id, replyDraftCheck: threadId && threadId !== expectedThreadId ? 'differs' : 'unverified' };
+    }
+    const message = data;
+    const id = message && typeof message.id === 'string' && message.id.length > 0 && message.id.length <= 2048 ? message.id : undefined;
+    if (!id) return { status: 'unknown' };
+    return { status: 'accepted', id, replyDraftCheck: graphReplyDraftCheck(message, payload!) };
   }
 
   private async graphMessage(payload: EmailProposalPayload): Promise<object> {
@@ -877,7 +984,7 @@ export class ConnectorClient {
 
   private async gmailRaw(payload: EmailProposalPayload): Promise<string> {
     const tos = emailList(payload.to, 'To'), ccs = emailList(payload.cc, 'Cc'), bccs = emailList(payload.bcc, 'Bcc');
-    const subject = headerValue(payload.subject, 'Subject');
+    const subject = payload.subject === '' ? '' : headerValue(payload.subject, 'Subject');
     const attachments = await this.checkedAttachments(payload);
     let message: string;
     if (!attachments.length) {
@@ -894,6 +1001,18 @@ export class ConnectorClient {
       parts.push(`--${boundary}--`);
       message = `${headers.join('\r\n')}\r\n\r\n${parts.join('\r\n')}`;
     }
+    return b64(new TextEncoder().encode(message)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+  }
+
+  private async gmailReplyRaw(payload: EmailProposalPayload, source: MailReplyProvenance['source']): Promise<string> {
+    const reply = payload.reply!;
+    const tos = emailList(payload.to, 'To'), ccs = emailList(payload.cc, 'Cc');
+    const subject = headerValue(payload.subject, 'Subject');
+    if (reply.internetMessageId.length + 'In-Reply-To: '.length > 998) throw new Error('In-Reply-To header exceeds the RFC line limit.');
+    const headers = [foldedHeader('To', tos.join(', ')), ...(ccs.length ? [foldedHeader('Cc', ccs.join(', '))] : []), subject === '' ? 'Subject: ' : `Subject: ${encodedSubject(subject)}`,
+      `In-Reply-To: ${reply.internetMessageId}`, foldedHeader('References', frozenReplyReferences(source) ?? reply.internetMessageId),
+      'MIME-Version: 1.0', 'Content-Type: text/plain; charset=UTF-8', 'Content-Transfer-Encoding: base64'];
+    const message = `${headers.join('\r\n')}\r\n\r\n${foldBase64(utf8b64(payload.text))}`;
     return b64(new TextEncoder().encode(message)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
   }
 

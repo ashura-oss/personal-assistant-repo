@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ConnectorClient, describeMessageWindowQuery, messageWindowQueryFingerprint, ProviderHttpError, ProviderWriteRejectedError, type ApprovedDispatch, type OAuthTokenStore, type StoredOAuthToken } from '../src/connectors';
 import { exchangeAuthorizationCode } from '../src/connectors/oauth';
 import type { Account, EmailProposalPayload } from '../src/core';
+import type { MailReplyProvenance } from '../src/mailReply';
 
 const tokenIdentity = { subject: 'sub-1', providerNamespace: 'google' as const, clientId: 'test-google-client', issuer: 'https://accounts.google.com' };
 const account: Account = {
@@ -14,6 +15,32 @@ const microsoftAccount: Account = { ...account, id: 'ms-1', provider: 'microsoft
 const payload: EmailProposalPayload = { to: ['to@example.test'], cc: ['cc@example.test'], bcc: ['secret@example.test'], subject: 'Résumé ✓', text: 'Hello, 世界', attachments: [] };
 const envelope: ApprovedDispatch = { proposalId: 'proposal-1', revision: 1, sourceRevision: 1, operation: 'send', accountId: account.id, identity: tokenIdentity, payloadDigest: 'a'.repeat(64), title: 'Approved title', body: 'Approved body', payload };
 const verifier = { verify: vi.fn(async () => true), verifyBeforeDispatch: vi.fn(() => true) };
+
+function replyFixture(provider: 'google' | 'microsoft' = 'google', mode: 'reply' | 'reply_all' = 'reply') {
+  const selectedAccount = provider === 'google' ? account : microsoftAccount;
+  const identity = selectedAccount.identity!;
+  const idFormat = provider === 'google' ? 'gmail' as const : 'graph-immutable' as const;
+  const digest = 'd'.repeat(64);
+  const source: MailReplyProvenance['source'] = {
+    version: 1, accountId: selectedAccount.id, accountEmail: selectedAccount.email!, identity, connectionGeneration: selectedAccount.connectionGeneration ?? 0,
+    localMessageId: 'local-message-1', providerMessageId: provider === 'google' ? 'gmail-source-id' : 'AAMk-immutable-source==', idFormat,
+    ...(provider === 'google' ? { threadId: 'gmail-thread-id' } : {}), internetMessageId: '<original@example.test>', references: '<prior@example.test>',
+    subject: 'Résumé ✓', from: 'Alex <alex@example.test>', senderEmail: 'alex@example.test', replyTo: ['reply@example.test'],
+    to: ['me@example.test'], cc: ['colleague@example.test'], snippet: 'Earlier message', replyMetadataComplete: true,
+    observedAt: '2026-10-13T02:00:00.000Z', sourceDigest: digest,
+  };
+  const replySource: MailReplyProvenance = { version: 2, kind: 'mail_reply', sourceDigest: digest, source, expiresAt: new Date(Date.now() + 3_600_000).toISOString() };
+  const payload: EmailProposalPayload = {
+    operation: 'draft', to: ['reply@example.test', ...(mode === 'reply_all' ? ['me@example.test'] : [])],
+    cc: mode === 'reply_all' ? ['colleague@example.test'] : [], bcc: [], subject: source.subject, text: 'Approved reply body', attachments: [],
+    reply: { mode, sourceDigest: digest, localMessageId: source.localMessageId, providerMessageId: source.providerMessageId, idFormat,
+      internetMessageId: source.internetMessageId, sourceSubject: source.subject, threadId: source.threadId,
+      references: '<prior@example.test> <original@example.test>', inReplyTo: source.internetMessageId },
+  };
+  const dispatch: ApprovedDispatch = { ...envelope, operation: 'draft', sourceRevision: undefined, accountId: selectedAccount.id, identity,
+    title: 'Reply draft', body: payload.text, payload, replySource };
+  return { selectedAccount, payload, dispatch, replySource };
+}
 
 function token(overrides: Partial<StoredOAuthToken> = {}): StoredOAuthToken {
   return { accessToken: 'access', refreshToken: 'refresh', expiresAt: Date.now() + 600_000, identity: tokenIdentity, ...overrides };
@@ -410,6 +437,153 @@ describe('provider connector clients', () => {
     expect(mime).toContain('=?UTF-8?B?');
     await expect(client.sendEmail(account, { ...envelope, payload: { ...payload, subject: 'hello\r\nBcc: injected@test.test' } }, verifier)).rejects.toThrow(/line break/i);
     expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it('creates a Gmail reply draft in the source thread with locked subject and RFC reply headers', async () => {
+    const fixtureData = replyFixture();
+    let posted: Record<string, unknown> | undefined;
+    let requestedUrl = '';
+    const fetcher = vi.fn(async (url: RequestInfo | URL, init?: RequestInit) => { requestedUrl = String(url); posted = JSON.parse(String(init?.body)); return response({ id: 'draft-1', message: { id: 'new-message', threadId: 'gmail-thread-id' } }); }) as typeof fetch;
+    const { client } = fixture({ fetcher });
+    const result = await client.createDraft(fixtureData.selectedAccount, fixtureData.dispatch, verifier);
+    expect(result).toEqual({ status: 'accepted', id: 'draft-1', replyDraftCheck: 'unverified' });
+    expect(requestedUrl).toBe('https://gmail.googleapis.com/gmail/v1/users/me/drafts');
+    expect(posted?.message).toMatchObject({ threadId: 'gmail-thread-id' });
+    const raw = String((posted?.message as Record<string, unknown>).raw).replace(/-/g, '+').replace(/_/g, '/');
+    const mime = new TextDecoder().decode(Uint8Array.from(atob(raw + '='.repeat((4 - raw.length % 4) % 4)), (c) => c.charCodeAt(0)));
+    expect(mime).toContain('To: reply@example.test');
+    expect(mime).toContain('Subject: =?UTF-8?B?');
+    expect(mime).toContain('In-Reply-To: <original@example.test>');
+    expect(mime).toContain('References: <prior@example.test> <original@example.test>');
+    expect(mime).not.toContain('Bcc:');
+    expect(mime).not.toContain('Content-Disposition: attachment');
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    const wrongThreadFetcher = vi.fn(async () => response({ id: 'draft-2', message: { threadId: 'unexpected-thread' } })) as typeof fetch;
+    const wrongThreadClient = fixture({ fetcher: wrongThreadFetcher }).client;
+    await expect(wrongThreadClient.createDraft(fixtureData.selectedAccount, fixtureData.dispatch, verifier)).resolves.toEqual({ status: 'accepted', id: 'draft-2', replyDraftCheck: 'differs' });
+  });
+
+  it('preserves the frozen Gmail References chain order when the original ID is already in the middle', async () => {
+    const fixtureData = replyFixture();
+    const references = '<prior@example.test> <original@example.test> <later@example.test>';
+    const source = { ...fixtureData.replySource.source, references };
+    const replySource = { ...fixtureData.replySource, source };
+    const payload = { ...fixtureData.payload, reply: { ...fixtureData.payload.reply!, references } };
+    let posted: Record<string, unknown> | undefined;
+    const fetcher = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => { posted = JSON.parse(String(init?.body)); return response({ id: 'draft-ordered', message: { threadId: 'gmail-thread-id' } }); }) as typeof fetch;
+    const client = fixture({ fetcher }).client;
+    await client.createDraft(fixtureData.selectedAccount, { ...fixtureData.dispatch, replySource, payload }, verifier);
+    const raw = String((posted?.message as Record<string, unknown>).raw).replace(/-/g, '+').replace(/_/g, '/');
+    const mime = new TextDecoder().decode(Uint8Array.from(atob(raw + '='.repeat((4 - raw.length % 4) % 4)), (c) => c.charCodeAt(0)));
+    expect(mime).toContain(`References: ${references}`);
+  });
+
+  it('rejects a References physical line over 998 characters before token access', async () => {
+    const fixtureData = replyFixture();
+    const longId = `<${'a'.repeat(990)}@x>`;
+    const references = `${longId} <original@example.test>`;
+    const source = { ...fixtureData.replySource.source, references: longId };
+    const replySource = { ...fixtureData.replySource, source };
+    const payload = { ...fixtureData.payload, reply: { ...fixtureData.payload.reply!, references } };
+    const tokenGet = vi.fn(async () => token());
+    const fetcher = vi.fn() as typeof fetch;
+    const client = new ConnectorClient({ tokenStore: { get: tokenGet, set: async () => {} }, fetcher });
+    await expect(client.createDraft(fixtureData.selectedAccount, { ...fixtureData.dispatch, replySource, payload }, verifier)).rejects.toThrow(/RFC line limit/i);
+    expect(tokenGet).not.toHaveBeenCalled();
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it('rejects reply sends and malformed source bindings before reading a token', async () => {
+    const fixtureData = replyFixture();
+    const tokenGet = vi.fn(async () => token());
+    const fetcher = vi.fn() as typeof fetch;
+    const client = new ConnectorClient({ tokenStore: { get: tokenGet, set: async () => {} }, fetcher });
+    await expect(client.sendEmail(fixtureData.selectedAccount, { ...fixtureData.dispatch, operation: 'send', payload: { ...fixtureData.payload, operation: 'send' } }, verifier)).rejects.toThrow(/only create a draft/i);
+    await expect(client.createDraft(fixtureData.selectedAccount, { ...fixtureData.dispatch, payload: { ...fixtureData.payload, subject: 'Changed subject' } }, verifier)).rejects.toThrow(/bound to the verified original/i);
+    await expect(client.createDraft(fixtureData.selectedAccount, { ...fixtureData.dispatch, payload: { ...fixtureData.payload, reply: { ...fixtureData.payload.reply!, references: '<safe@example.test>\r\nBcc: injected@example.test' } } }, verifier)).rejects.toThrow();
+    await expect(client.createDraft(fixtureData.selectedAccount, { ...fixtureData.dispatch, replySource: { ...fixtureData.replySource, source: { ...fixtureData.replySource.source, accountId: 'different-account' } } }, verifier)).rejects.toThrow(/current connected account/i);
+    expect(tokenGet).not.toHaveBeenCalled();
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it('preserves an empty frozen source subject as an empty Gmail Subject header', async () => {
+    const fixtureData = replyFixture();
+    const source = { ...fixtureData.replySource.source, subject: '' };
+    const replySource = { ...fixtureData.replySource, source };
+    const payload = { ...fixtureData.payload, subject: '', reply: { ...fixtureData.payload.reply!, sourceSubject: '' } };
+    let posted: Record<string, unknown> | undefined;
+    const fetcher = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => { posted = JSON.parse(String(init?.body)); return response({ id: 'empty-subject-draft', message: { threadId: 'gmail-thread-id' } }); }) as typeof fetch;
+    const client = fixture({ fetcher }).client;
+    await client.createDraft(fixtureData.selectedAccount, { ...fixtureData.dispatch, replySource, payload }, verifier);
+    const raw = String((posted?.message as Record<string, unknown>).raw).replace(/-/g, '+').replace(/_/g, '/');
+    const mime = new TextDecoder().decode(Uint8Array.from(atob(raw + '='.repeat((4 - raw.length % 4) % 4)), (c) => c.charCodeAt(0)));
+    expect(mime).toContain('Subject: \r\nIn-Reply-To: <original@example.test>');
+  });
+
+  it('rechecks reply source expiry at the final pre-dispatch fence', async () => {
+    const fixtureData = replyFixture();
+    const replySource = { ...fixtureData.replySource, expiresAt: '2000-01-01T00:00:00.000Z' };
+    const tokenGet = vi.fn(async () => token());
+    const fetcher = vi.fn() as typeof fetch;
+    const client = new ConnectorClient({ tokenStore: { get: tokenGet, set: async () => {} }, fetcher });
+    await expect(client.createDraft(fixtureData.selectedAccount, { ...fixtureData.dispatch, replySource }, verifier)).rejects.toThrow(/source approval has expired/i);
+    expect(tokenGet).toHaveBeenCalledTimes(1);
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it('creates a Graph reply-all draft with the immutable source ID, exact approved body and no extra fields', async () => {
+    const fixtureData = replyFixture('microsoft', 'reply_all');
+    let requestedUrl = '';
+    let posted: Record<string, unknown> | undefined;
+    let prefer = '';
+    const graphDraft = { id: 'graph-draft-1', isDraft: true, subject: fixtureData.payload.subject, body: { contentType: 'Text', content: fixtureData.payload.text },
+      toRecipients: fixtureData.payload.to.map((address) => ({ emailAddress: { address } })),
+      ccRecipients: fixtureData.payload.cc.map((address) => ({ emailAddress: { address } })), bccRecipients: [] };
+    const fetcher = vi.fn(async (url: RequestInfo | URL, init?: RequestInit) => { requestedUrl = String(url); posted = JSON.parse(String(init?.body)); prefer = new Headers(init?.headers).get('prefer') ?? ''; return response(graphDraft); }) as typeof fetch;
+    const { client } = fixture({ fetcher, token: token({ identity: microsoftIdentity }) });
+    const result = await client.createDraft(fixtureData.selectedAccount, fixtureData.dispatch, verifier);
+    expect(requestedUrl).toBe(`https://graph.microsoft.com/v1.0/me/messages/${encodeURIComponent('AAMk-immutable-source==')}/createReplyAll`);
+    expect(prefer).toContain('IdType="ImmutableId"');
+    expect(posted).toEqual({ message: { body: { contentType: 'Text', content: 'Approved reply body' },
+      toRecipients: fixtureData.payload.to.map((address) => ({ emailAddress: { address } })),
+      ccRecipients: fixtureData.payload.cc.map((address) => ({ emailAddress: { address } })), bccRecipients: [] } });
+    expect(result).toEqual({ status: 'accepted', id: 'graph-draft-1', replyDraftCheck: 'matches_approved' });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps Graph mismatch and incomplete draft receipts without persisting provider content', async () => {
+    const fixtureData = replyFixture('microsoft');
+    const base = { id: 'graph-draft-2', isDraft: true, subject: fixtureData.payload.subject, body: { contentType: 'Text', content: fixtureData.payload.text },
+      toRecipients: fixtureData.payload.to.map((address) => ({ emailAddress: { address } })), ccRecipients: [], bccRecipients: [] };
+    const mismatchClient = fixture({ token: token({ identity: microsoftIdentity }), fetcher: vi.fn(async () => response({ ...base, subject: 'Changed subject', body: { contentType: 'Text', content: 'provider secret response text' } })) as typeof fetch }).client;
+    const mismatch = await mismatchClient.createDraft(fixtureData.selectedAccount, fixtureData.dispatch, verifier);
+    expect(mismatch).toEqual({ status: 'accepted', id: 'graph-draft-2', replyDraftCheck: 'differs' });
+    expect(JSON.stringify(mismatch)).not.toContain('provider secret response text');
+    const incompleteClient = fixture({ token: token({ identity: microsoftIdentity }), fetcher: vi.fn(async () => response({ id: 'graph-draft-3' })) as typeof fetch }).client;
+    await expect(incompleteClient.createDraft(fixtureData.selectedAccount, fixtureData.dispatch, verifier)).resolves.toEqual({ status: 'accepted', id: 'graph-draft-3', replyDraftCheck: 'unverified' });
+    const noIdClient = fixture({ token: token({ identity: microsoftIdentity }), fetcher: vi.fn(async () => response({ subject: fixtureData.payload.subject })) as typeof fetch }).client;
+    await expect(noIdClient.createDraft(fixtureData.selectedAccount, fixtureData.dispatch, verifier)).resolves.toEqual({ status: 'unknown' });
+  });
+
+  it('classifies reply write responses safely and never retries ambiguous writes', async () => {
+    const fixtureData = replyFixture();
+    const badRequestFetcher = vi.fn(async () => response({ error: 'bad request' }, 400)) as typeof fetch;
+    await expect(fixture({ fetcher: badRequestFetcher }).client.createDraft(fixtureData.selectedAccount, fixtureData.dispatch, verifier)).rejects.toBeInstanceOf(ProviderWriteRejectedError);
+    const serverFetcher = vi.fn(async () => response({ error: 'uncertain' }, 503)) as typeof fetch;
+    await expect(fixture({ fetcher: serverFetcher }).client.createDraft(fixtureData.selectedAccount, fixtureData.dispatch, verifier)).resolves.toEqual({ status: 'unknown' });
+    expect(badRequestFetcher).toHaveBeenCalledTimes(1);
+    expect(serverFetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it('runs the final reply approval fence after token access and immediately before dispatch', async () => {
+    const fixtureData = replyFixture();
+    let approved = true;
+    const tokenStore: OAuthTokenStore = { get: async () => { approved = false; return token(); }, set: async () => {} };
+    const fetcher = vi.fn(async () => response({ id: 'draft-1', message: { threadId: 'gmail-thread-id' } })) as typeof fetch;
+    const client = new ConnectorClient({ tokenStore, fetcher });
+    const dispatchVerifier = { verify: async () => true, verifyBeforeDispatch: () => approved };
+    await expect(client.createDraft(fixtureData.selectedAccount, fixtureData.dispatch, dispatchVerifier)).rejects.toThrow(/changed before provider dispatch/i);
+    expect(fetcher).not.toHaveBeenCalled();
   });
 
   it('reports a send timeout as unknown and never retries', async () => {

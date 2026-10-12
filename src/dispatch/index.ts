@@ -1,4 +1,5 @@
-import type { Account, Calendar, EmailProposalPayload, EventProposalPayload, Proposal, ProposalProvenance } from '../core';
+import type { Account, AnyProposalProvenance, Calendar, EmailProposalPayload, EventProposalPayload, MailReplyProvenance, NoteProposalProvenance, Proposal } from '../core';
+import { canonicalMailReplySource, validateReplyBinding } from '../mailReply';
 import type {
   CreateDispatchRecordInput, DispatchAccountSnapshot, DispatchCalendarSnapshot, DispatchIdentitySnapshot,
   DispatchOperation, DispatchOutcomeInput, DispatchPayload, DispatchRecord, DispatchReconciliationAttestation,
@@ -68,7 +69,7 @@ function identityActionKey(identity: DispatchIdentitySnapshot, sourceActionKey: 
   return JSON.stringify(['dispatch-v1', identity.providerNamespace, identity.clientId, identity.subject, identity.resourceUserId ?? '', sourceActionKey, operation]);
 }
 
-function sourceList(value: unknown, label: string): ProposalProvenance['sources'] {
+function sourceList(value: unknown, label: string): NoteProposalProvenance['sources'] {
   if (!Array.isArray(value) || value.length > 200) fail(`${label} is invalid.`);
   const result = value.map((raw) => {
     if (!raw || typeof raw !== 'object') fail(`${label} is invalid.`);
@@ -85,15 +86,28 @@ function sourceList(value: unknown, label: string): ProposalProvenance['sources'
   return result;
 }
 
-function snapshotProvenance(value: ProposalProvenance | undefined): ProposalProvenance {
-  if (!value || value.version !== 1) return fail('Dispatch source provenance is missing or unsupported.');
+function snapshotProvenance(value: AnyProposalProvenance | undefined): AnyProposalProvenance {
+  if (!value) return fail('Dispatch source provenance is missing or unsupported.');
+  if (value.version === 2 && value.kind === 'mail_reply') {
+    onlyKeys(value, ['version', 'kind', 'sourceDigest', 'source', 'expiresAt'], 'Mail reply provenance');
+    const source = value.source;
+    onlyKeys(source, ['version', 'accountId', 'accountEmail', 'verifiedSelfEmail', 'identity', 'connectionGeneration', 'localMessageId', 'providerMessageId', 'idFormat', 'providerVersion', 'threadId', 'internetMessageId', 'references', 'inReplyTo', 'subject', 'from', 'senderEmail', 'replyTo', 'to', 'cc', 'snippet', 'replyMetadataComplete', 'observedAt', 'sourceDigest'], 'Mail reply source');
+    onlyKeys(source.identity, ['providerNamespace', 'clientId', 'subject', 'issuer', 'tenantId', 'resourceUserId'], 'Mail reply account identity');
+    if (!HASH.test(value.sourceDigest) || source.sourceDigest.toLowerCase() !== value.sourceDigest.toLowerCase() ||
+        canonicalTime(value.expiresAt, 'Mail reply expiry') !== new Date(Date.parse(source.observedAt) + 15 * 60_000).toISOString()) {
+      fail('Mail reply provenance has invalid digest or expiry.');
+    }
+    canonicalMailReplySource(source);
+    return structuredClone(value);
+  }
+  if (value.version !== 1) return fail('Dispatch source provenance is missing or unsupported.');
   onlyKeys(value, ['version', 'assistContractVersion', 'analysisFingerprint', 'noteId', 'noteRevision', 'capturedAt', 'captureTimeZone', 'intent', 'question', 'sources', 'policySources', 'settingsFingerprint', 'answeredAsOf', 'expiresAt'], 'Dispatch provenance');
   assertRevision(value.noteRevision, 'Provenance note revision');
   const intent = value.intent;
   if (!['assist', 'summarize', 'answer', 'extract'].includes(intent)) fail('Provenance intent is invalid.');
   const sources = sourceList(value.sources, 'Provenance sources');
   const policySources = sourceList(value.policySources, 'Policy provenance sources');
-  const result: ProposalProvenance = {
+  const result: NoteProposalProvenance = {
     version: 1,
     assistContractVersion: cleanString(value.assistContractVersion, 'Assist contract version', 64),
     analysisFingerprint: cleanString(value.analysisFingerprint, 'Analysis fingerprint', 1024 * 1024),
@@ -132,7 +146,7 @@ function projectEmail(value: EmailProposalPayload, operation: 'draft' | 'send'):
     to: value.to.map((item) => email(item, 'To recipient')),
     cc: value.cc.map((item) => email(item, 'Cc recipient')),
     bcc: value.bcc.map((item) => email(item, 'Bcc recipient')),
-    subject, text, attachments,
+    subject, text, attachments, ...(value.reply ? { reply: structuredClone(value.reply) } : {}),
   } };
 }
 
@@ -173,16 +187,25 @@ export function createDispatchRecord(input: CreateDispatchRecordInput): Dispatch
   const dispatchStartedAt = canonicalTime(input.dispatchStartedAt, 'Dispatch start time');
   if (!proposal || (proposal.status !== 'approved' && proposal.status !== 'dispatching') || proposal.approvedRevision !== proposal.revision) fail('Only the exact approved proposal revision can be captured.');
   assertRevision(proposal.revision, 'Approved proposal revision');
-  assertRevision(proposal.sourceRevision, 'Proposal source revision');
-  if (proposal.revision < 1 || proposal.sourceRevision < 1) fail('Approved proposal revision is invalid.');
+  if (proposal.revision < 1) fail('Approved proposal revision is invalid.');
   if (proposal.requiresRebuild) fail('Proposal source requires a rebuild before dispatch capture.');
   const payloadDigest = cleanString(proposal.approvedPayloadDigest, 'Approved payload digest', 64);
   if (!HASH.test(payloadDigest)) fail('Approved payload digest must be a SHA-256 hex digest.');
   const sourceActionKey = cleanString(proposal.sourceActionKey, 'Source action key', 1024 * 1024);
   const sourceProvenance = snapshotProvenance(proposal.provenance);
-  if (proposal.noteId !== sourceProvenance.noteId || proposal.sourceRevision !== sourceProvenance.noteRevision) fail('Proposal source does not match its analysis provenance.');
-  const transcriptSources = sourceProvenance.sources.filter((source) => source.sourceId === 'transcript');
-  if (transcriptSources.length !== 1 || transcriptSources[0].revision !== proposal.sourceRevision) fail('Dispatch provenance must contain the exact transcript source revision.');
+  if (sourceProvenance.version === 1) {
+    if (proposal.noteId !== sourceProvenance.noteId || proposal.sourceRevision !== sourceProvenance.noteRevision) fail('Proposal source does not match its analysis provenance.');
+    const transcriptSources = sourceProvenance.sources.filter((source) => source.sourceId === 'transcript');
+    if (transcriptSources.length !== 1 || transcriptSources[0].revision !== proposal.sourceRevision) fail('Dispatch provenance must contain the exact transcript source revision.');
+    assertRevision(proposal.sourceRevision, 'Proposal source revision');
+    if (proposal.sourceRevision < 1) fail('Approved proposal revision is invalid.');
+  } else if (proposal.noteId !== undefined || proposal.sourceRevision !== undefined || proposal.kind !== 'email') {
+    fail('Mail reply proposals must not use note provenance or artificial source revisions.');
+  }
+  if (proposal.kind === 'email' && proposal.email?.reply) {
+    if (sourceProvenance.version !== 2) fail('Reply draft is missing its original message provenance.');
+    validateReplyBinding(proposal.email, sourceProvenance);
+  } else if (sourceProvenance.version !== 1) fail('Mail reply provenance can only be used by reply drafts.');
   if (proposal.evidence.some((item) => (item.start !== undefined && (!Number.isFinite(item.start) || item.start < 0)) ||
       (item.end !== undefined && (!Number.isFinite(item.end) || item.end < 0)) ||
       (item.start !== undefined && item.end !== undefined && item.end < item.start))) fail('Proposal evidence anchors are invalid.');
@@ -196,12 +219,16 @@ export function createDispatchRecord(input: CreateDispatchRecordInput): Dispatch
   const proposalId = cleanString(proposal.id, 'Proposal ID', 160);
   const title = cleanString(proposal.title, 'Approved title', 1000);
   const body = contentString(proposal.body, 'Approved body', 100_000, true);
-  const common = { version: 1 as const, id, proposalId, approvedRevision: proposal.revision, sourceRevision: proposal.sourceRevision, payloadDigest: payloadDigest.toLowerCase(), sourceActionKey,
+  const common = { version: 1 as const, id, proposalId, approvedRevision: proposal.revision, ...(proposal.sourceRevision !== undefined ? { sourceRevision: proposal.sourceRevision } : {}), payloadDigest: payloadDigest.toLowerCase(), sourceActionKey,
     duplicateKey: '', sourceProvenance, accountId: account.id, account: accountSnapshot, title, body, dispatchStartedAt,
     outcome: 'pending' as const, reconciliations: [] as DispatchReconciliationAttestation[] };
   if (proposal.kind === 'email' && proposal.email?.operation && (proposal.email.operation === 'draft' || proposal.email.operation === 'send')) {
     if (calendar) fail('Email dispatch must not contain a calendar destination.');
     const operation = proposal.email.operation;
+    if (sourceProvenance.version === 2 && (operation !== 'draft' || !proposal.email.reply || account.provider !== sourceProvenance.source.identity.providerNamespace ||
+        account.id !== sourceProvenance.source.accountId || !sameIdentitySnapshot(identity, sourceProvenance.source.identity))) {
+      fail('Mail reply dispatch account does not match the frozen source identity.');
+    }
     const record = { ...common, operation, payload: projectEmail(proposal.email, operation) };
     record.duplicateKey = identityActionKey(identity, sourceActionKey, operation);
     return freezeClone(record);
@@ -220,6 +247,12 @@ export function createDispatchRecord(input: CreateDispatchRecordInput): Dispatch
   return fail('Approved proposal does not contain a supported external operation.');
 }
 
+function sameIdentitySnapshot(a: DispatchIdentitySnapshot, b: MailReplyProvenance['source']['identity']): boolean {
+  return a.providerNamespace === b.providerNamespace && a.clientId === b.clientId && a.subject === b.subject &&
+    (a.issuer ?? '') === (b.issuer ?? '') && (a.tenantId ?? '') === (b.tenantId ?? '') &&
+    (a.resourceUserId ?? '') === (b.resourceUserId ?? '');
+}
+
 /** A provider outcome is terminal; unknown is resolved only by an appended human attestation. */
 export function recordDispatchOutcome(record: DispatchRecord, input: DispatchOutcomeInput): DispatchRecord {
   if (!record || record.version !== 1 || record.outcome !== 'pending') fail('Dispatch outcome is already terminal or the record is invalid.');
@@ -230,8 +263,10 @@ export function recordDispatchOutcome(record: DispatchRecord, input: DispatchOut
   if (input.outcome === 'rejected' && !['provider_rejected', 'precondition_failed'].includes(input.rejectionCode ?? '')) fail('A rejected dispatch requires a bounded rejection code.');
   if (input.outcome !== 'rejected' && input.rejectionCode !== undefined) fail('Only rejected dispatches may carry a rejection code.');
   if (input.outcome === 'accepted' && record.operation === 'event' && !remoteId) fail('Accepted event creation requires its provider event ID.');
+  if (input.replyDraftCheck !== undefined && (record.operation !== 'draft' || record.sourceProvenance.version !== 2 || !['matches_approved', 'differs', 'unverified'].includes(input.replyDraftCheck))) fail('Reply draft check is only valid for mail reply drafts.');
   return freezeClone({ ...record, outcome: input.outcome, outcomeAt: at,
-    ...(input.outcome === 'rejected' ? { rejectionCode: input.rejectionCode } : {}), ...(remoteId ? { remoteId } : {}) });
+    ...(input.outcome === 'rejected' ? { rejectionCode: input.rejectionCode } : {}), ...(remoteId ? { remoteId } : {}),
+    ...(input.outcome === 'accepted' && input.replyDraftCheck ? { replyDraftCheck: input.replyDraftCheck } : {}) });
 }
 
 /** Records a human investigation without changing provider outcome or enabling another send. */
@@ -254,7 +289,7 @@ export function appendDispatchReconciliation(record: DispatchRecord, attestation
 export function validateDispatchRecord(value: unknown): DispatchRecord {
   if (!value || typeof value !== 'object') fail('Dispatch record is invalid.');
   const record = value as DispatchRecord;
-  onlyKeys(record, ['version', 'id', 'proposalId', 'approvedRevision', 'sourceRevision', 'payloadDigest', 'sourceActionKey', 'duplicateKey', 'sourceProvenance', 'operation', 'accountId', 'account', 'calendar', 'title', 'body', 'payload', 'dispatchStartedAt', 'providerIdempotencyKey', 'outcome', 'outcomeAt', 'rejectionCode', 'remoteId', 'reconciliations'], 'Dispatch record');
+  onlyKeys(record, ['version', 'id', 'proposalId', 'approvedRevision', 'sourceRevision', 'payloadDigest', 'sourceActionKey', 'duplicateKey', 'sourceProvenance', 'operation', 'accountId', 'account', 'calendar', 'title', 'body', 'payload', 'dispatchStartedAt', 'providerIdempotencyKey', 'outcome', 'outcomeAt', 'rejectionCode', 'replyDraftCheck', 'remoteId', 'reconciliations'], 'Dispatch record');
   if (record.version !== 1 || !HASH.test(record.payloadDigest) || !['draft', 'send', 'event'].includes(record.operation) || !['pending', 'accepted', 'unknown', 'rejected'].includes(record.outcome)) fail('Dispatch record version, digest, operation, or outcome is invalid.');
   onlyKeys(record.account, ['provider', 'identity', 'displayName', 'email'], 'Dispatch account snapshot');
   onlyKeys(record.account.identity, ['providerNamespace', 'clientId', 'subject', 'issuer', 'tenantId', 'resourceUserId'], 'Dispatch identity');
@@ -266,7 +301,8 @@ export function validateDispatchRecord(value: unknown): DispatchRecord {
     onlyKeys(record.calendar, ['localId', 'providerId', 'name'], 'Dispatch calendar snapshot');
   } else {
     if (record.payload.kind !== 'email') fail('Dispatch email payload kind is invalid.');
-    onlyKeys(record.payload.email, ['to', 'cc', 'bcc', 'subject', 'text', 'attachments'], 'Dispatch email payload');
+    onlyKeys(record.payload.email, ['to', 'cc', 'bcc', 'subject', 'text', 'attachments', 'reply'], 'Dispatch email payload');
+    if (record.payload.email.reply) onlyKeys(record.payload.email.reply, ['mode', 'sourceDigest', 'localMessageId', 'providerMessageId', 'idFormat', 'internetMessageId', 'sourceSubject', 'threadId', 'references', 'inReplyTo'], 'Dispatch reply binding');
     for (const attachment of record.payload.email.attachments) onlyKeys(attachment, ['id', 'fileName', 'mimeType', 'sizeBytes', 'sha256'], 'Dispatch attachment metadata');
     if (record.calendar || record.providerIdempotencyKey) fail('Email dispatch must not contain event-only fields.');
   }
@@ -274,11 +310,12 @@ export function validateDispatchRecord(value: unknown): DispatchRecord {
   for (const attestation of record.reconciliations) onlyKeys(attestation, ['id', 'disposition', 'at', 'note', 'remoteId'], 'Dispatch reconciliation');
   if (record.outcome === 'pending' && (record.outcomeAt || record.remoteId || record.rejectionCode)) fail('Pending dispatch cannot contain a provider outcome.');
 
+  const provenance = snapshotProvenance(record.sourceProvenance);
   const proposal: Proposal = {
-    id: record.proposalId, noteId: record.sourceProvenance.noteId, kind: record.operation === 'event' ? 'event' : 'email',
+    id: record.proposalId, ...(provenance.version === 1 ? { noteId: provenance.noteId } : {}), kind: record.operation === 'event' ? 'event' : 'email',
     title: record.title, body: record.body, status: 'dispatching', revision: record.approvedRevision,
     approvedRevision: record.approvedRevision, approvedPayloadDigest: record.payloadDigest, sourceActionKey: record.sourceActionKey,
-    provenance: record.sourceProvenance, accountId: record.accountId, recipients: [], sourceRevision: record.sourceRevision, evidence: [],
+    provenance, accountId: record.accountId, recipients: [], ...(record.sourceRevision !== undefined ? { sourceRevision: record.sourceRevision } : {}), evidence: [],
     ...(record.operation === 'event' && record.payload.kind === 'event' ? { event: record.payload.event, calendarId: record.calendar?.localId, eventTransactionId: record.providerIdempotencyKey } : {}),
     ...(record.operation !== 'event' && record.payload.kind === 'email' ? { email: { ...record.payload.email, operation: record.operation } } : {}),
   };
@@ -297,6 +334,7 @@ export function validateDispatchRecord(value: unknown): DispatchRecord {
       outcome: record.outcome, at: canonicalTime(record.outcomeAt, 'Dispatch outcome time'),
       ...(record.remoteId ? { remoteId: cleanString(record.remoteId, 'Provider remote ID', 1024) } : {}),
       ...(record.rejectionCode ? { rejectionCode: record.rejectionCode } : {}),
+      ...(record.replyDraftCheck ? { replyDraftCheck: record.replyDraftCheck } : {}),
     });
   }
   for (const attestation of record.reconciliations) canonical = appendDispatchReconciliation(canonical, attestation);

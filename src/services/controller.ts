@@ -4,6 +4,7 @@ import type {
   ForegroundMailRefreshResult, MailCoverageInterval, MailLaneResult, MailSyncWindow,
   Calendar, CalendarConfig, ContextDocument, Note, NoteAssistResult, AssistIntent, LocalTask, Proposal, ProposalPatch,
   ProposalProvenance, SaveNoteInput, SettingsPatch, MailboxSnapshotMessage, CalendarEventSnapshot, OAuthInstallResult,
+  NoteProposalProvenance, MailReplyProvenance, MailReplySourceSnapshot, MailReplySourceResult,
   ProactiveCandidateEntry, ProactiveCandidateSourceResult,
   ProactiveState, SavedProactiveRule,
 } from '../core';
@@ -28,6 +29,7 @@ import { evaluateProactive, type ProactiveTrigger, type QuietHours } from '../pr
 import { computeProactiveNextCheckAt } from '../proactive/boundaries';
 import { buildProactiveSources, proactiveStableValue, type ProactiveSourceHashMemo } from '../proactive/adapters';
 import { emptyProactiveState, normalizeProactiveData, PROACTIVE_INTEGRITY_ERROR, uncertainOnLoad, type ProactiveQuarantine } from '../proactive/state';
+import { canonicalMailReplySource, createMailReplySource, defaultReplyRecipients, replyReferences, validateMailReplySource, validateReplyBinding } from '../mailReply';
 
 const now = () => new Date().toISOString();
 const ASSIST_CONTRACT_VERSION = 'assist-v2';
@@ -251,7 +253,9 @@ function assertNoDuplicateDispatch(state: AppState, candidate: DispatchRecord): 
     const sameAccount = proposal.accountId === candidate.accountId || Boolean(identity && dispatchIdentityMatches(candidate, identity));
     const sameSource = proposal.sourceActionKey
       ? proposal.sourceActionKey === candidate.sourceActionKey
-      : proposal.noteId === candidate.sourceProvenance.noteId && proposal.sourceRevision === candidate.sourceRevision && proposal.kind === (candidate.operation === 'event' ? 'event' : 'email');
+      : candidate.sourceProvenance.version === 1
+        ? proposal.noteId === candidate.sourceProvenance.noteId && proposal.sourceRevision === candidate.sourceRevision && proposal.kind === (candidate.operation === 'event' ? 'event' : 'email')
+        : proposal.kind === 'email' && proposal.provenance?.version === 2 && proposal.provenance.source.sourceDigest === candidate.sourceProvenance.sourceDigest;
     if (!sameAccount || !sameSource) return false;
     if (proposalMail && candidateMail && !operation) return true;
     if (proposal.status === 'unknown' && proposalMail && candidateMail) return true;
@@ -486,7 +490,7 @@ function normalizeLoadedState(value: unknown): AppState {
       });
     };
     const candidateProvenance = proposal.provenance;
-    const provenance = candidateProvenance && candidateProvenance.version === 1 &&
+    const noteProvenance = candidateProvenance && candidateProvenance.version === 1 &&
       candidateProvenance.assistContractVersion === ASSIST_CONTRACT_VERSION &&
       typeof candidateProvenance.analysisFingerprint === 'string' && typeof candidateProvenance.noteId === 'string' &&
       Number.isSafeInteger(candidateProvenance.noteRevision) && typeof candidateProvenance.capturedAt === 'string' &&
@@ -497,22 +501,31 @@ function normalizeLoadedState(value: unknown): AppState {
       (!candidateProvenance.answeredAsOf || Number.isFinite(Date.parse(candidateProvenance.answeredAsOf))) &&
       (!candidateProvenance.expiresAt || Number.isFinite(Date.parse(candidateProvenance.expiresAt)))
       ? candidateProvenance : undefined;
+    const mailProvenance = candidateProvenance && candidateProvenance.version === 2 && candidateProvenance.kind === 'mail_reply' &&
+      typeof candidateProvenance.sourceDigest === 'string' && /^[a-f\d]{64}$/i.test(candidateProvenance.sourceDigest) &&
+      candidateProvenance.source?.version === 1 && candidateProvenance.source.sourceDigest === candidateProvenance.sourceDigest &&
+      typeof candidateProvenance.source.observedAt === 'string' && Number.isFinite(Date.parse(candidateProvenance.source.observedAt)) &&
+      new Date(Date.parse(candidateProvenance.source.observedAt)).toISOString() === candidateProvenance.source.observedAt &&
+      typeof candidateProvenance.expiresAt === 'string' && Number.isFinite(Date.parse(candidateProvenance.expiresAt)) &&
+      candidateProvenance.expiresAt === new Date(Date.parse(candidateProvenance.source.observedAt) + 15 * 60_000).toISOString()
+      ? candidateProvenance : undefined;
+    const provenance = noteProvenance ?? mailProvenance;
     const pending = ['draft', 'approved', 'failed'].includes(proposal.status);
     const requiresRebuild = Boolean(proposal.requiresRebuild || (pending && !provenance));
     return {
       ...proposal, recipients: Array.isArray(proposal.recipients) ? proposal.recipients : [],
       evidence: Array.isArray(proposal.evidence) ? proposal.evidence : [],
       revision: Number.isFinite(proposal.revision) ? proposal.revision : 1,
-      sourceRevision: Number.isFinite(proposal.sourceRevision) ? proposal.sourceRevision : source?.revision ?? 1,
+      ...(provenance?.version === 2 ? {} : { sourceRevision: Number.isFinite(proposal.sourceRevision) ? proposal.sourceRevision : source?.revision ?? 1 }),
       provenance, requiresRebuild,
       ...(requiresRebuild && proposal.status === 'approved' ? { status: 'draft' as const, approvedRevision: undefined, approvedPayloadDigest: undefined } : {}),
       sourceActionKey: proposal.sourceActionKey ?? (source && Array.isArray(proposal.evidence)
-        ? sourceActionKey({ ...source, revision: Number.isFinite(proposal.sourceRevision) ? proposal.sourceRevision : source.revision }, proposal.kind, proposal.evidence)
+        ? sourceActionKey({ ...source, revision: Number.isFinite(proposal.sourceRevision) ? proposal.sourceRevision! : source.revision }, proposal.kind, proposal.evidence)
         : undefined),
     };
   });
-  const migratedTasks: LocalTask[] = proposals.filter((proposal) => proposal.kind === 'task' && ['executed', 'accepted'].includes(proposal.status))
-    .map((proposal) => ({ id: proposal.id, title: proposal.title, body: proposal.body, status: 'open', createdAt: proposal.remoteAcceptedAt ?? now(), dueAt: proposal.dueAt, sourceNoteId: proposal.noteId, sourceRevision: proposal.sourceRevision, proposalId: proposal.id }));
+  const migratedTasks: LocalTask[] = proposals.filter((proposal) => proposal.kind === 'task' && ['executed', 'accepted'].includes(proposal.status) && Boolean(proposal.noteId) && Number.isSafeInteger(proposal.sourceRevision))
+    .map((proposal) => ({ id: proposal.id, title: proposal.title, body: proposal.body, status: 'open', createdAt: proposal.remoteAcceptedAt ?? now(), dueAt: proposal.dueAt, sourceNoteId: proposal.noteId!, sourceRevision: proposal.sourceRevision!, proposalId: proposal.id }));
   const savedTasks: LocalTask[] = Array.isArray(raw.tasks) ? raw.tasks : [];
   const tasks = [...savedTasks, ...migratedTasks.filter((task) => !savedTasks.some((saved) => saved.id === task.id))];
   const settings = { ...DEFAULT_SETTINGS, ...rawSettings, timezone: validTimezone(rawSettings.timezone), maxRequestBytes };
@@ -877,10 +890,11 @@ export class AppControllerImpl implements AppController {
     if (!value) throw new Error('Proposal was not found.');
     return value;
   }
-  private proposalDependencyInputs(state: AppState, proposal: Proposal): { note: Note; provenance: ProposalProvenance; inputs: AssistantSourceInput[]; policyInputs: AssistantSourceInput[] } {
+  private proposalDependencyInputs(state: AppState, proposal: Proposal): { note: Note; provenance: NoteProposalProvenance; inputs: AssistantSourceInput[]; policyInputs: AssistantSourceInput[] } {
     const provenance = proposal.provenance;
     if (!provenance || proposal.requiresRebuild) throw new Error('This saved suggestion has no verifiable source history. Run Assist again before approving it.');
-    if (provenance.version !== 1 || provenance.assistContractVersion !== ASSIST_CONTRACT_VERSION ||
+    if (provenance.version !== 1) throw new Error('Mail reply provenance cannot be used as note provenance.');
+    if (provenance.assistContractVersion !== ASSIST_CONTRACT_VERSION ||
         !provenance.analysisFingerprint || !provenance.capturedAt || !provenance.captureTimeZone ||
         !provenance.settingsFingerprint || !Array.isArray(provenance.sources) || !Array.isArray(provenance.policySources) ||
         !provenance.sources.some((source) => source.sourceId === 'transcript')) {
@@ -897,6 +911,7 @@ export class AppControllerImpl implements AppController {
       });
     };
     if (!validSources(provenance.sources) || !validSources(provenance.policySources)) throw new Error('This suggestion has malformed source fingerprints. Run Assist again before approving it.');
+    if (!proposal.noteId) throw new Error('This suggestion has no source note.');
     const note = this.note(state, proposal.noteId);
     if (provenance.noteId !== proposal.noteId || provenance.noteRevision !== proposal.sourceRevision || note.revision !== proposal.sourceRevision) {
       throw new Error('The source transcript changed. Run Assist again before approving or continuing this action.');
@@ -928,6 +943,7 @@ export class AppControllerImpl implements AppController {
   }
   private proposalDependencyProjection(state: AppState, proposal: Proposal): string | undefined {
     try {
+      if (proposal.provenance?.version === 2) return this.mailReplyDependencyProjection(state, proposal, proposal.provenance);
       const { note, provenance, inputs, policyInputs } = this.proposalDependencyInputs(state, proposal);
       return JSON.stringify({
         contractVersion: ASSIST_CONTRACT_VERSION, analysisFingerprint: provenance.analysisFingerprint,
@@ -940,6 +956,30 @@ export class AppControllerImpl implements AppController {
     } catch { return undefined; }
   }
   private async validateProposalProvenance(state: AppState, proposal: Proposal): Promise<string> {
+    if (proposal.provenance?.version === 2) {
+      const provenance = proposal.provenance;
+      if (proposal.requiresRebuild || proposal.kind !== 'email' || !proposal.email?.reply || proposal.email.operation !== 'draft') throw new Error('This mail reply needs a fresh, explicitly reviewed source before approval.');
+      const account = state.accounts.find((item) => item.id === proposal.accountId);
+      const message = state.mailbox.find((item) => item.id === provenance.source.localMessageId && item.accountId === provenance.source.accountId);
+      if (!account || account.id !== provenance.source.accountId || account.provider !== provenance.source.identity.providerNamespace ||
+          !account.connected || account.authStatus !== 'connected' || !account.capabilities?.includes('mail.read') ||
+          (account.connectionGeneration ?? 0) !== provenance.source.connectionGeneration || !sameAccountIdentity(account.identity, provenance.source.identity) ||
+          !message || message.providerDeletedAt || !message.replyMetadataComplete || message.verifiedIdentityKey !== identityKey(account) ||
+          message.connectionGeneration !== account.connectionGeneration) throw new Error('The source message or verified mailbox connection is no longer available. Refresh the inbox and create a new reply draft.');
+      const age = Date.now() - Date.parse(provenance.source.observedAt);
+      const expiry = Date.parse(provenance.expiresAt);
+      if (!Number.isFinite(expiry) || new Date(expiry).toISOString() !== provenance.expiresAt ||
+          expiry !== Date.parse(provenance.source.observedAt) + 15 * 60_000 || !Number.isFinite(age) || age < 0 || age >= 15 * 60_000 || Date.now() >= expiry) {
+        throw new Error('This reply source is stale. Refresh the inbox and create a new reply draft.');
+      }
+      if (!await validateMailReplySource(provenance.source, async (canonical) => Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, canonical, { encoding: Crypto.CryptoEncoding.HEX }))) {
+        throw new Error('This reply has an invalid frozen source digest. Create a new reply draft.');
+      }
+      const current = this.mailReplySourceFromRow(message, account, provenance.source.observedAt);
+      if (canonicalMailReplySource(current) !== canonicalMailReplySource(provenance.source)) throw new Error('The source message changed. Refresh it and create a new reply draft.');
+      validateReplyBinding(proposal.email, provenance);
+      return this.mailReplyDependencyProjection(state, proposal, provenance);
+    }
     const { inputs, policyInputs, provenance } = this.proposalDependencyInputs(state, proposal);
     const catalog = await createSourceCatalog(inputs, async (bytes) =>
       Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, new TextDecoder().decode(bytes)));
@@ -954,6 +994,68 @@ export class AppControllerImpl implements AppController {
     const projection = this.proposalDependencyProjection(state, proposal);
     if (!projection) throw new Error('The source context could not be verified. Run Assist again before approving this action.');
     return projection;
+  }
+
+  private mailReplySourceFromRow(message: MailboxSnapshotMessage, account: Account, observedAt = message.observedAt ?? ''): MailReplySourceSnapshot {
+    if (!account.identity || !message.idFormat || !message.internetMessageId || !message.replyMetadataComplete) throw new Error('The source message is missing complete reply metadata.');
+    return {
+      version: 1, accountId: account.id, accountEmail: account.email,
+      ...(account.verifiedEmail ? { verifiedSelfEmail: account.verifiedEmail } : {}),
+      identity: clone(account.identity), connectionGeneration: account.connectionGeneration ?? 0,
+      localMessageId: message.id, providerMessageId: message.providerMessageId, idFormat: message.idFormat,
+      ...(message.providerVersion ? { providerVersion: message.providerVersion } : {}),
+      ...(message.threadId ? { threadId: message.threadId } : {}), internetMessageId: message.internetMessageId,
+      ...(message.references !== undefined ? { references: message.references } : {}),
+      ...(message.inReplyTo ? { inReplyTo: message.inReplyTo } : {}), subject: message.subject ?? '',
+      ...(message.from ? { from: message.from } : {}), ...(message.senderEmail ? { senderEmail: message.senderEmail } : {}),
+      ...(message.replyTo ? { replyTo: [...message.replyTo] } : {}), ...(message.to ? { to: [...message.to] } : {}),
+      ...(message.cc ? { cc: [...message.cc] } : {}), ...(message.snippet !== undefined ? { snippet: message.snippet } : {}),
+      replyMetadataComplete: true, observedAt, sourceDigest: '0'.repeat(64),
+    };
+  }
+
+  private mailReplyDependencyProjection(state: AppState, proposal: Proposal, provenance: MailReplyProvenance): string {
+    const account = state.accounts.find((item) => item.id === provenance.source.accountId);
+    const message = state.mailbox.find((item) => item.id === provenance.source.localMessageId && item.accountId === provenance.source.accountId);
+    if (!account || !message || !account.connected || account.authStatus !== 'connected' || !account.capabilities?.includes('mail.read') ||
+        account.connectionGeneration !== provenance.source.connectionGeneration || !sameAccountIdentity(account.identity, provenance.source.identity) ||
+        message.providerDeletedAt || !message.replyMetadataComplete || message.verifiedIdentityKey !== identityKey(account) ||
+        message.connectionGeneration !== account.connectionGeneration) throw new Error('The source message or verified connection is no longer current.');
+    const expiry = Date.parse(provenance.expiresAt);
+    const sourceObserved = Date.parse(provenance.source.observedAt);
+    const age = Date.now() - sourceObserved;
+    if (!Number.isFinite(expiry) || !Number.isFinite(sourceObserved) || new Date(expiry).toISOString() !== provenance.expiresAt ||
+        expiry !== sourceObserved + 15 * 60_000 || !Number.isFinite(age) || age < 0 || age >= 15 * 60_000 || Date.now() >= expiry) {
+      throw new Error('The original message observation has expired.');
+    }
+    const current = this.mailReplySourceFromRow(message, account, provenance.source.observedAt);
+    if (!proposal.email) throw new Error('Reply payload is missing.');
+    validateReplyBinding(proposal.email, provenance);
+    return stableJson({ source: canonicalMailReplySource(current), sourceDigest: provenance.sourceDigest,
+      expiry: provenance.expiresAt, accountGeneration: account.connectionGeneration ?? 0,
+      payload: proposal.email?.reply ?? null, recipients: { to: proposal.email?.to ?? [], cc: proposal.email?.cc ?? [] } });
+  }
+
+  private async currentMailReplySource(state: AppState, messageId: string): Promise<MailReplySourceResult> {
+    const row = state.mailbox.find((item) => item.id === messageId);
+    if (!row) return { status: 'missing' };
+    const account = state.accounts.find((item) => item.id === row.accountId);
+    if (!account || !account.connected || account.authStatus !== 'connected' || !account.capabilities?.includes('mail.read') ||
+        account.provider === 'local' || !account.identity || row.providerDeletedAt || row.verifiedIdentityKey !== identityKey(account) ||
+        row.connectionGeneration !== account.connectionGeneration) return { status: 'unavailable' };
+    let source: MailReplySourceSnapshot;
+    try {
+      source = await createMailReplySource(this.mailReplySourceFromRow(row, account), async (canonical) =>
+        Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, canonical, { encoding: Crypto.CryptoEncoding.HEX }));
+    } catch { return { status: 'unavailable' }; }
+    const age = Date.now() - Date.parse(source.observedAt);
+    if (!Number.isFinite(age) || age < 0 || age >= 15 * 60_000) return { status: 'stale', source };
+    let reply = { to: [] as string[], cc: [] as string[] };
+    let replyAll = { to: [] as string[], cc: [] as string[] };
+    try { reply = defaultReplyRecipients(source, source.verifiedSelfEmail, 'reply'); } catch { /* The user may still choose Reply all. */ }
+    try { replyAll = defaultReplyRecipients(source, source.verifiedSelfEmail, 'reply_all'); } catch { /* The user may still choose Reply. */ }
+    const defaults: NonNullable<MailReplySourceResult['defaults']> = { reply, reply_all: replyAll };
+    return { status: 'current', source, defaults };
   }
   private invalidate(proposal: Proposal): void {
     proposal.revision += 1;
@@ -1319,7 +1421,7 @@ export class AppControllerImpl implements AppController {
         const existing = existingByAction.get(proposal.sourceActionKey!);
         if (!existing || terminalStatuses.includes(existing.status)) {
           selected.push(existing ?? proposal);
-        } else if (!existing.requiresRebuild && existing.provenance?.analysisFingerprint === processingFingerprint) {
+        } else if (!existing.requiresRebuild && existing.provenance?.version === 1 && existing.provenance.analysisFingerprint === processingFingerprint) {
           selected.push(existing);
         } else {
           selected.push({ ...proposal, id: existing.id, revision: existing.revision + 1,
@@ -1458,10 +1560,22 @@ export class AppControllerImpl implements AppController {
 
   async editProposal(id: string, patch: ProposalPatch): Promise<Proposal> {
     const priorReminder = this.snapshot.proposals.find((item) => item.id === id);
-    const result = await this.mutate((state) => {
+    const result = await this.mutate(async (state) => {
       const proposal = this.proposal(state, id);
       if (['executed', 'accepted', 'simulated', 'dispatching', 'unknown', 'dismissed'].includes(proposal.status)) throw new Error('This proposal can no longer be edited.');
-      Object.assign(proposal, patch);
+      if (proposal.provenance?.version === 2) {
+        const locked = proposal.email?.reply;
+        if (!locked || proposal.email?.operation !== 'draft' || (patch.accountId !== undefined && patch.accountId !== proposal.accountId) ||
+            (patch.email && ((patch.email.operation !== undefined && patch.email.operation !== 'draft') || patch.email.subject !== proposal.provenance.source.subject ||
+              patch.email.bcc.length > 0 || patch.email.attachments.length > 0 || (patch.email.reply && stableJson(patch.email.reply) !== stableJson(locked))))) {
+          throw new Error('Reply source, subject, account, draft operation, Bcc, and attachments are locked. Only reply text and recipients can be edited.');
+        }
+        const updatedEmail = patch.email ? { ...patch.email, operation: 'draft' as const, reply: clone(locked), subject: proposal.provenance.source.subject } : undefined;
+        Object.assign(proposal, patch);
+        if (updatedEmail) proposal.email = updatedEmail;
+        else if (proposal.email) proposal.email.reply = clone(locked);
+        await this.validateProposalProvenance(state, proposal);
+      } else Object.assign(proposal, patch);
       proposal.recipients = [...new Set((proposal.recipients ?? []).map((recipient) => recipient.trim()).filter(Boolean))];
       this.invalidate(proposal);
       proposal.status = 'draft';
@@ -1478,10 +1592,13 @@ export class AppControllerImpl implements AppController {
     const result = await this.mutate(async (state) => {
       const proposal = this.proposal(state, id);
       if (proposal.status !== 'draft' && proposal.status !== 'failed') throw new Error('Only a draft or safely failed proposal can be approved.');
-      const note = this.note(state, proposal.noteId);
-      if (proposal.sourceRevision !== note.revision) throw new Error('The source transcript changed. Process the note again before approving.');
+      if (proposal.provenance?.version === 1) {
+        if (!proposal.noteId) throw new Error('The source note is missing. Run Assist again before approving.');
+        const note = this.note(state, proposal.noteId);
+        if (proposal.sourceRevision !== note.revision) throw new Error('The source transcript changed. Process the note again before approving.');
+      } else if (proposal.provenance?.version !== 2) throw new Error('This proposal has no verifiable source. Create it again before approving.');
       await this.validateProposalProvenance(state, proposal);
-      if (!proposal.title.trim() || !proposal.body.trim()) throw new Error('A title and proposed content are required.');
+      if (!proposal.title.trim() || (!proposal.body.trim() && proposal.provenance.version !== 2)) throw new Error('A title and proposed content are required.');
       if (proposal.kind === 'email') {
         if (!proposal.accountId || !(proposal.email?.to.length || proposal.recipients.length)) throw new Error('Choose an account and at least one recipient before approving this email.');
         if (!proposal.email?.operation) throw new Error('Choose Draft in mailbox or Send email before approving this email.');
@@ -1517,11 +1634,11 @@ export class AppControllerImpl implements AppController {
       proposal.status = 'approved';
       proposal.approvedRevision = proposal.revision;
       proposal.approvedPayloadDigest = await approvedDigest(proposal, state);
-      const decision = appendDecision(state, proposal);
+      const decision = proposal.provenance.version === 1 ? appendDecision(state, proposal) : undefined;
       addActivity(state, 'proposal_approved', 'Suggestion approved with its current source, content, account, and destination details.', { proposalId: id, noteId: proposal.noteId });
       return { proposal, decision };
     });
-    await this.mirrorDocument(result.decision);
+    if (result.decision) await this.mirrorDocument(result.decision);
     return result.proposal;
   }
 
@@ -1607,6 +1724,7 @@ export class AppControllerImpl implements AppController {
           proposalId: record.proposalId, revision: record.approvedRevision, sourceRevision: record.sourceRevision, operation,
           accountId: record.accountId, identity: clone(record.account.identity), payloadDigest: record.payloadDigest,
           title: record.title, body: record.body, calendarId: record.calendar?.providerId,
+          ...(record.sourceProvenance.version === 2 ? { replySource: clone(record.sourceProvenance) } : {}),
           payload: record.payload.kind === 'email'
             ? { ...clone(record.payload.email), operation: record.operation === 'draft' || record.operation === 'send' ? record.operation : undefined }
             : clone(record.payload.event),
@@ -1634,12 +1752,15 @@ export class AppControllerImpl implements AppController {
         }, verifyBeforeDispatch: (candidate) => {
           const currentState = this.snapshot;
           const current = currentState.proposals.find((item) => item.id === id);
-          const currentNote = current && currentState.notes.find((item) => item.id === current.noteId);
+          const currentNote = current?.provenance?.version === 1 && current.noteId
+            ? currentState.notes.find((item) => item.id === current.noteId) : undefined;
           const currentAccount = currentState.accounts.find((item) => item.id === record.accountId);
           const expectedCapability = operation === 'draft' ? 'mail.draft' : operation === 'send' ? 'mail.send' : 'calendar.write';
-          if (!current || !currentNote || !currentAccount || currentState.settings.mode !== 'provider' || !recordIsCurrent(currentState, current) ||
+          if (!current || (current.provenance?.version === 1 && !currentNote) || !currentAccount || currentState.settings.mode !== 'provider' || !recordIsCurrent(currentState, current) ||
               current.status !== 'dispatching' || current.approvedRevision !== record.approvedRevision || current.revision !== record.approvedRevision ||
-              current.approvedPayloadDigest !== record.payloadDigest || current.sourceRevision !== currentNote.revision || current.sourceRevision !== record.sourceRevision ||
+              current.approvedPayloadDigest !== record.payloadDigest ||
+              (current.provenance?.version === 1 && (current.sourceRevision !== currentNote?.revision || current.sourceRevision !== record.sourceRevision)) ||
+              (record.sourceProvenance.version === 2 && (current.provenance?.version !== 2 || current.provenance.sourceDigest !== record.sourceProvenance.sourceDigest)) ||
               current.accountId !== record.accountId || currentAccount.authStatus !== 'connected' || !currentAccount.connected ||
               currentAccount.connectionGeneration !== account.connectionGeneration || !currentAccount.capabilities?.includes(expectedCapability) ||
               !sameAccountIdentity(currentAccount.identity, record.account.identity) || !matchesFrozenPayload(current) ||
@@ -1659,7 +1780,7 @@ export class AppControllerImpl implements AppController {
               : await this.connector.createEvent(account, record.calendar!.providerId, envelope, verifier, record.providerIdempotencyKey!);
           result = receipt.status === 'unknown'
             ? { status: 'unknown', operation, dispatchOutcome: 'unknown', message: 'The provider outcome is unknown. Check the destination manually; this action will not be retried.' }
-            : { status: 'accepted', operation, dispatchOutcome: 'accepted', remoteId: receipt.id, message: `The provider accepted the ${operation} request${receipt.id ? ` (reference ${receipt.id})` : ''}. Completion or delivery is not confirmed.` };
+            : { status: 'accepted', operation, dispatchOutcome: 'accepted', remoteId: receipt.id, replyDraftCheck: receipt.replyDraftCheck, message: `The provider accepted the ${operation} request${receipt.id ? ` (reference ${receipt.id})` : ''}. Completion or delivery is not confirmed.` };
         } catch (error) {
           const providerRejected = error instanceof ProviderWriteRejectedError;
           result = {
@@ -1687,6 +1808,7 @@ export class AppControllerImpl implements AppController {
             persistedRecord = recordDispatchOutcome(record, {
               outcome, at: new Date(Math.max(Date.now(), Date.parse(record.dispatchStartedAt))).toISOString(),
               ...(result.remoteId ? { remoteId: result.remoteId } : {}),
+              ...(result.replyDraftCheck ? { replyDraftCheck: result.replyDraftCheck } : {}),
               ...(outcome === 'rejected' ? { rejectionCode: result.rejectionCode ?? 'precondition_failed' } : {}),
             });
             state.dispatchRecords[recordIndex] = persistedRecord;
@@ -1729,8 +1851,8 @@ export class AppControllerImpl implements AppController {
           proposal.notificationId = result.notificationId;
           proposal.notificationRevision = proposal.revision;
         }
-        if (proposal.kind === 'task' && result.status === 'executed' && !state.tasks.some((task) => task.id === proposal.id)) {
-          state.tasks.unshift({ id: proposal.id, title: proposal.title, body: proposal.body, status: 'open', createdAt: now(), dueAt: proposal.dueAt, sourceNoteId: proposal.noteId, sourceRevision: proposal.sourceRevision, proposalId: proposal.id });
+        if (proposal.kind === 'task' && result.status === 'executed' && !state.tasks.some((task) => task.id === proposal.id) && proposal.noteId && Number.isSafeInteger(proposal.sourceRevision)) {
+          state.tasks.unshift({ id: proposal.id, title: proposal.title, body: proposal.body, status: 'open', createdAt: now(), dueAt: proposal.dueAt, sourceNoteId: proposal.noteId, sourceRevision: proposal.sourceRevision!, proposalId: proposal.id });
           markTaskAnalysesStale(state, proposal.id);
         }
         addActivity(state, result.status === 'simulated' ? 'simulation' : result.status === 'failed' || result.status === 'unknown' ? 'error' : 'local_action', result.message, { proposalId: id, noteId: proposal.noteId });
@@ -2018,7 +2140,7 @@ export class AppControllerImpl implements AppController {
       if (prior?.identity && state.proposals.some((item) => item.accountId === id && item.status === 'dispatching')) throw new Error('Wait for the current provider operation to finish before editing this account.');
       const oldTokenRef = prior?.tokenRef;
       const account: Account = { id, provider: config.provider, displayName: config.displayName.trim(), email, connected: false, authStatus: 'configured', identity: prior?.identity, tokenRef: undefined, grantedScopes: [], capabilities: [], syncStatus: 'idle', connectionGeneration: (prior?.connectionGeneration ?? 0) + 1 };
-      if (prior) Object.assign(prior, account); else state.accounts.push(account);
+      if (prior) { Object.assign(prior, account); delete prior.verifiedEmail; } else state.accounts.push(account);
       if (oldTokenRef && !state.pendingCredentialCleanup.some((item) => item.tokenRef === oldTokenRef)) {
         state.pendingCredentialCleanup.push({ tokenRef: oldTokenRef, reason: 'disconnected', createdAt: now() });
       }
@@ -2132,6 +2254,7 @@ export class AppControllerImpl implements AppController {
         const account: Account = {
           id: prior?.id ?? config.id ?? newId(), provider: result.provider,
           displayName: (result.displayName || config.displayName).trim(), email,
+          ...(result.email ? { verifiedEmail: email } : {}),
           connected: true, authStatus: 'connected', identity: clone(result.identity), tokenRef,
           grantedScopes: [...new Set(result.grantedScopes)], capabilities: effectiveCapabilities,
           capabilityLimits: [...result.requestedCapabilities], syncStatus: 'idle', configuredAt: prior?.configuredAt ?? now(),
@@ -2145,7 +2268,7 @@ export class AppControllerImpl implements AppController {
         for (const proposal of state.proposals.filter((item) => item.accountId === account.id && ['draft', 'approved', 'failed'].includes(item.status))) {
           this.invalidate(proposal); proposal.status = 'draft';
         }
-        if (prior) Object.assign(prior, account); else state.accounts.push(account);
+        if (prior) { Object.assign(prior, account); if (!result.email) delete prior.verifiedEmail; } else state.accounts.push(account);
         state.pendingCredentialCleanup = state.pendingCredentialCleanup.filter((item) => item.tokenRef !== tokenRef);
         if (oldTokenRef && oldTokenRef !== tokenRef && !state.pendingCredentialCleanup.some((item) => item.tokenRef === oldTokenRef)) {
           state.pendingCredentialCleanup.push({ tokenRef: oldTokenRef, reason: 'replaced', createdAt: now() });
@@ -2188,6 +2311,7 @@ export class AppControllerImpl implements AppController {
       }
       const oldTokenRef = current.tokenRef;
       current.authStatus = 'configured'; current.connected = false; current.capabilities = []; current.grantedScopes = []; current.syncStatus = 'idle';
+      delete current.verifiedEmail;
       current.tokenRef = undefined;
       current.connectionGeneration = (current.connectionGeneration ?? 0) + 1;
       if (oldTokenRef && !state.pendingCredentialCleanup.some((item) => item.tokenRef === oldTokenRef)) {
@@ -2221,6 +2345,56 @@ export class AppControllerImpl implements AppController {
     const job = this.runSyncAccount(id, options).finally(() => { this.syncJobs.delete(id); this.busySyncAccounts.delete(id); });
     this.syncJobs.set(id, job);
     return job;
+  }
+
+  async getMailReplySource(messageId: string): Promise<MailReplySourceResult> {
+    await this.load();
+    const captured = this.snapshot;
+    const result = await this.currentMailReplySource(captured, messageId);
+    if (captured !== this.snapshot) return { status: 'stale', ...(result.source ? { source: result.source } : {}) };
+    return clone(result);
+  }
+
+  async createMailReplyProposal(input: { messageId: string; mode: 'reply' | 'reply_all'; sourceDigest: string; text: string; to?: string[]; cc?: string[] }): Promise<Proposal> {
+    return this.mutate(async (state) => {
+      if (!input || !['reply', 'reply_all'].includes(input.mode) || typeof input.sourceDigest !== 'string' || !/^[a-f\d]{64}$/i.test(input.sourceDigest)) throw new Error('Reply mode or source digest is invalid. Reopen the message and try again.');
+      const result = await this.currentMailReplySource(state, input.messageId);
+      if (result.status !== 'current' || !result.source || !result.defaults) throw new Error('Refresh this message before creating a reply draft.');
+      if (result.source.sourceDigest.toLowerCase() !== input.sourceDigest.toLowerCase()) throw new Error('The source message changed. Reopen the reply composer and review its current recipients.');
+      if (typeof input.text !== 'string' || input.text.length > 100_000 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(input.text)) throw new Error('Reply text is invalid or too long.');
+      const source = result.source;
+      const account = state.accounts.find((item) => item.id === source.accountId);
+      if (!account) throw new Error('The verified mail account is no longer available.');
+      const defaults = result.defaults[input.mode];
+      const to = input.to ? [...input.to] : [...defaults.to];
+      const cc = input.cc ? [...input.cc] : [...defaults.cc];
+      const provenance: MailReplyProvenance = {
+        version: 2, kind: 'mail_reply', sourceDigest: source.sourceDigest, source,
+        expiresAt: new Date(Date.parse(source.observedAt) + 15 * 60_000).toISOString(),
+      };
+      const reply = {
+        mode: input.mode, sourceDigest: source.sourceDigest, localMessageId: source.localMessageId,
+        providerMessageId: source.providerMessageId, idFormat: source.idFormat,
+        internetMessageId: source.internetMessageId, sourceSubject: source.subject,
+        ...(source.threadId ? { threadId: source.threadId } : {}),
+        ...(replyReferences(source) ? { references: replyReferences(source) } : {}),
+        inReplyTo: source.internetMessageId,
+      } as const;
+      const email = { operation: 'draft' as const, to, cc, bcc: [], subject: source.subject, text: input.text, attachments: [], reply };
+      validateReplyBinding(email, provenance);
+      const sourceActionKey = JSON.stringify(['mail-reply-v1', identityKey(account), source.providerMessageId, input.mode]);
+      const duplicate = state.proposals.some((proposal) => proposal.sourceActionKey === sourceActionKey && ['accepted', 'unknown', 'dispatching'].includes(proposal.status) && !proposal.simulated) ||
+        state.dispatchRecords.some((record) => record.sourceActionKey === sourceActionKey && ['pending', 'accepted', 'unknown'].includes(record.outcome));
+      if (duplicate) throw new Error('A reply draft attempt for this message and mode already exists. Review its history before creating another.');
+      const proposal: Proposal = {
+        id: newId(), kind: 'email', title: source.subject ? `Re: ${source.subject}` : 'Reply draft', body: input.text,
+        status: 'draft', revision: 1, accountId: account.id, recipients: [...to], evidence: [], sourceActionKey,
+        provenance, email,
+      };
+      state.proposals.unshift(proposal);
+      addActivity(state, 'proposal_created', 'Reply draft prepared from the selected mailbox message.', { proposalId: proposal.id });
+      return proposal;
+    });
   }
 
   private async acquireSyncSlot(): Promise<() => void> {
@@ -2723,7 +2897,7 @@ export class AppControllerImpl implements AppController {
   }
 }
 
-type ProposalStatusOutcome = { status: 'executed' | 'simulated' | 'failed' | 'accepted' | 'unknown'; message: string; notificationId?: string; operation?: ApprovedDispatch['operation']; remoteId?: string; dispatchOutcome?: Exclude<DispatchOutcome, 'pending'>; rejectionCode?: 'provider_rejected' | 'precondition_failed' };
+type ProposalStatusOutcome = { status: 'executed' | 'simulated' | 'failed' | 'accepted' | 'unknown'; message: string; notificationId?: string; operation?: ApprovedDispatch['operation']; remoteId?: string; replyDraftCheck?: 'matches_approved' | 'differs' | 'unverified'; dispatchOutcome?: Exclude<DispatchOutcome, 'pending'>; rejectionCode?: 'provider_rejected' | 'precondition_failed' };
 
 const googleClientId = (Platform.OS === 'web' ? process.env.EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID : process.env.EXPO_PUBLIC_GOOGLE_NATIVE_CLIENT_ID)?.trim() ?? '';
 const microsoftClientId = (Platform.OS === 'web' ? process.env.EXPO_PUBLIC_MICROSOFT_WEB_CLIENT_ID : process.env.EXPO_PUBLIC_MICROSOFT_NATIVE_CLIENT_ID)?.trim() ?? '';

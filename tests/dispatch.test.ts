@@ -110,6 +110,43 @@ describe('immutable dispatch records', () => {
     expect(() => validateDispatchRecord({ ...pending, accessToken: 'must-not-persist' })).toThrow(/unsupported fields/i);
   });
 
+  it('freezes and reloads mail-origin reply dispatches without invented note revisions', () => {
+    const observedAt = '2026-10-12T01:00:00.000Z';
+    const digest = 'd'.repeat(64);
+    const source = {
+      version: 1 as const, accountId: 'account-1', accountEmail: 'me@example.test', verifiedSelfEmail: 'me@example.test',
+      identity: googleAccount().identity!, connectionGeneration: 7, localMessageId: 'local-message', providerMessageId: 'provider-message',
+      idFormat: 'gmail' as const, threadId: 'thread-1', internetMessageId: '<original@example.test>',
+      references: '<parent@example.test>', subject: 'Project update', from: 'Sam <sam@example.test>', senderEmail: 'sam@example.test',
+      replyTo: ['sam@example.test'], to: ['me@example.test', 'alex@example.test'], cc: ['casey@example.test'],
+      replyMetadataComplete: true as const, observedAt, sourceDigest: digest,
+    };
+    const provenance = { version: 2 as const, kind: 'mail_reply' as const, sourceDigest: digest, source,
+      expiresAt: '2026-10-12T01:15:00.000Z' };
+    const reply = { mode: 'reply_all' as const, sourceDigest: digest, localMessageId: source.localMessageId,
+      providerMessageId: source.providerMessageId, idFormat: source.idFormat, internetMessageId: source.internetMessageId,
+      sourceSubject: source.subject, threadId: source.threadId, references: '<parent@example.test> <original@example.test>',
+      inReplyTo: source.internetMessageId };
+    const proposal: Proposal = {
+      id: 'mail-reply-proposal', kind: 'email', title: 'Re: Project update', body: 'Thanks for the update.', status: 'approved',
+      revision: 1, approvedRevision: 1, approvedPayloadDigest: 'e'.repeat(64), sourceActionKey: 'mail-action', provenance,
+      accountId: 'account-1', recipients: ['sam@example.test', 'alex@example.test'], evidence: [],
+      email: { operation: 'draft', to: ['sam@example.test', 'alex@example.test'], cc: ['casey@example.test'], bcc: [],
+        subject: source.subject, text: 'Thanks for the update.', attachments: [], reply },
+    };
+    const record = createDispatchRecord({ id: 'mail-dispatch', dispatchStartedAt: startedAt, proposal, account: googleAccount() });
+    expect(record.sourceRevision).toBeUndefined();
+    expect(record.sourceProvenance.version).toBe(2);
+    expect(record.payload.kind === 'email' && record.payload.email.reply).toEqual(reply);
+    const restored = validateDispatchRecord(JSON.parse(JSON.stringify(record)));
+    expect(restored.sourceRevision).toBeUndefined();
+    expect(restored.sourceProvenance.version).toBe(2);
+    expect(restored.payload.kind === 'email' && restored.payload.email.reply).toEqual(reply);
+    const accepted = recordDispatchOutcome(restored, { outcome: 'accepted', at: '2026-10-12T01:02:10.000Z', remoteId: 'draft-1', replyDraftCheck: 'matches_approved' });
+    const acceptedRestored = validateDispatchRecord(JSON.parse(JSON.stringify(accepted)));
+    expect(acceptedRestored).toMatchObject({ outcome: 'accepted', replyDraftCheck: 'matches_approved', remoteId: 'draft-1' });
+  });
+
   it('captures real controller provenance with provider-sized fingerprints and multiline questions', async () => {
     const app = new AppControllerImpl(new MemoryStore());
     await app.load();
@@ -122,10 +159,10 @@ describe('immutable dispatch records', () => {
     const question = 'Who needs the agenda?\nWhich details should I include?';
     await app.assistNote(note.id, { intent: 'answer', question });
     const generated = app.getSnapshot().proposals.find((item) => item.noteId === note.id && item.kind === 'email');
+    if (generated?.provenance?.version !== 1) throw new Error('Expected controller-created note provenance');
     expect(generated?.provenance?.analysisFingerprint.length).toBeGreaterThan(512);
     expect(generated?.provenance?.settingsFingerprint.length).toBeGreaterThan(512);
     expect(generated?.provenance?.question).toBe(question);
-    if (!generated?.provenance) throw new Error('Expected controller-created provenance');
     const proposal: Proposal = {
       ...generated,
       status: 'approved',
@@ -135,6 +172,7 @@ describe('immutable dispatch records', () => {
       email: { operation: 'send', to: ['alex@example.test'], cc: [], bcc: [], subject: 'Agenda', text: 'Here is the agenda.', attachments: [] },
     };
     const record = createDispatchRecord({ id: 'controller-dispatch', dispatchStartedAt: startedAt, proposal, account: googleAccount() });
+    if (record.sourceProvenance.version !== 1) throw new Error('Expected frozen note provenance');
     expect(record.sourceProvenance.analysisFingerprint.length).toBeGreaterThan(512);
     expect(record.sourceProvenance.settingsFingerprint.length).toBeGreaterThan(512);
     expect(record.sourceProvenance.question).toContain('\n');

@@ -1,14 +1,16 @@
 import React from "react";
-import { Text, View } from "react-native";
+import { Pressable, Text, View } from "react-native";
 import type { Account, MailboxSnapshotMessage } from "../core";
 import { C } from "./theme";
 
 export function MailboxSection({
   messages,
   accounts,
+  onReply,
 }: {
   messages: MailboxSnapshotMessage[];
   accounts: Account[];
+  onReply: (messageId: string) => void;
 }) {
   const activeAccounts = accounts.filter(
     (account) =>
@@ -78,6 +80,26 @@ export function MailboxSection({
                   Checked {new Date(message.observedAt).toLocaleString()}
                 </Text>
               ) : null}
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel={`Reply to ${message.subject || "message"}`}
+                accessibilityState={{
+                  disabled: message.replyMetadataComplete !== true,
+                }}
+                disabled={message.replyMetadataComplete !== true}
+                onPress={() => onReply(message.id)}
+                style={[
+                  styles.replyButton,
+                  message.replyMetadataComplete !== true && styles.replyDisabled,
+                ]}
+              >
+                <Text style={styles.replyText}>Reply</Text>
+              </Pressable>
+              {message.replyMetadataComplete !== true ? (
+                <Text style={styles.replyHint}>
+                  Reply details are unavailable for this saved message.
+                </Text>
+              ) : null}
             </View>
           );
         })
@@ -119,5 +141,18 @@ const styles = {
   meta: { color: C.muted, fontSize: 11 },
   snippet: { color: C.text, fontSize: 12, lineHeight: 17 },
   observed: { color: C.muted, fontSize: 10 },
+  replyButton: {
+    alignSelf: "flex-start" as const,
+    minHeight: 44,
+    minWidth: 72,
+    justifyContent: "center" as const,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+    backgroundColor: C.text,
+    marginTop: 4,
+  },
+  replyDisabled: { opacity: 0.45 },
+  replyText: { color: C.bg, fontSize: 12, fontWeight: "600" as const },
+  replyHint: { color: C.muted, fontSize: 10, lineHeight: 15 },
   empty: { color: C.muted, fontSize: 12, lineHeight: 18 },
 };

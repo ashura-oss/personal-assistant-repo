@@ -130,6 +130,8 @@ function makeFixtureFetcher(): typeof fetch {
             { name: "Subject", value: subject },
             { name: "From", value: "Morgan Sample <morgan@sample.invalid>" },
             { name: "To", value: "reader@sample.invalid" },
+            { name: "Cc", value: "project.partner@sample.invalid" },
+            { name: "Reply-To", value: "morgan-replies@sample.invalid" },
             { name: "Message-ID", value: `<${messageId}@sample.invalid>` },
           ],
         },

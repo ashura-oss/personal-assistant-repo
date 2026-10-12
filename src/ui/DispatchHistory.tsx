@@ -135,6 +135,26 @@ function DispatchRecordView({
       ) : null}
       {record.payload.kind === "email" ? (
         <View style={s.analysisBlock}>
+          {record.payload.email.reply ? (
+            <>
+              <Text style={s.analysisSource}>
+                {record.payload.email.reply.mode === "reply_all" ? "Reply all" : "Reply"} draft
+              </Text>
+              {record.sourceProvenance.version === 2 ? (
+                <>
+                  <Text style={s.analysisSource}>
+                    Original sender · {record.sourceProvenance.source.from || record.sourceProvenance.source.senderEmail || "Sender unavailable"}
+                  </Text>
+                  <Text style={s.analysisSource}>
+                    Original subject · {record.sourceProvenance.source.subject || "(no subject)"}
+                  </Text>
+                  <Text style={s.evidenceQuote}>
+                    Saved excerpt: “{record.sourceProvenance.source.snippet || "No excerpt was saved."}”
+                  </Text>
+                </>
+              ) : null}
+            </>
+          ) : null}
           <Text style={s.analysisSource}>
             To · {record.payload.email.to.join(", ")}
           </Text>
@@ -162,6 +182,11 @@ function DispatchRecordView({
                 </Text>
               ))}
             </View>
+          ) : null}
+          {record.payload.email.reply && record.outcome === "accepted" ? (
+            <Text style={s.analysisSource}>
+              Mailbox draft check · {record.replyDraftCheck ? replyDraftCheckLabel(record.replyDraftCheck) : "not available"}. Review the mailbox before relying on this result.
+            </Text>
           ) : null}
         </View>
       ) : (
@@ -311,6 +336,17 @@ function DispatchRecordView({
       ) : null}
     </View>
   );
+}
+
+function replyDraftCheckLabel(value: NonNullable<DispatchRecord["replyDraftCheck"]>) {
+  switch (value) {
+    case "matches_approved":
+      return "matches the approved reply";
+    case "differs":
+      return "differs from the approved reply";
+    case "unverified":
+      return "could not be verified";
+  }
 }
 
 function providerName(provider: DispatchRecord["account"]["provider"]): string {

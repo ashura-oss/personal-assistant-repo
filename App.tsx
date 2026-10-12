@@ -47,6 +47,7 @@ import * as Sharing from "expo-sharing";
 import { loadAudioForUpload } from "./src/audio/readAudio";
 import { ConnectionsSection } from "./src/ui/ConnectionsSection";
 import { MailboxSection } from "./src/ui/MailboxSection";
+import { MailReplyComposer } from "./src/ui/MailReplyComposer";
 import { ProactiveCandidatesSection } from "./src/ui/ProactiveCandidatesSection";
 import { ProactiveRulesSection } from "./src/ui/ProactiveRulesSection";
 import { useProactiveClock } from "./src/ui/useProactiveClock";
@@ -210,7 +211,13 @@ function ProposalCard({
       accessibilityRole="button"
     >
       <View style={s.proposalHead}>
-        <Text style={s.kind}>{proposal.kind.toUpperCase()}</Text>
+        <Text style={s.kind}>
+          {proposal.provenance &&
+          "kind" in proposal.provenance &&
+          proposal.provenance.kind === "mail_reply"
+            ? "REPLY DRAFT"
+            : proposal.kind.toUpperCase()}
+        </Text>
         <Text style={s.status}>{status}</Text>
       </View>
       <Text style={s.proposalTitle}>{proposal.title}</Text>
@@ -241,6 +248,7 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [detail, setDetail] = useState<Note | null>(null);
   const [review, setReview] = useState<Proposal | null>(null);
+  const [replyMessageId, setReplyMessageId] = useState<string | null>(null);
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -628,6 +636,28 @@ export default function App() {
       .getSnapshot()
       .proposals.find((item) => item.id === proposal.id);
     setReview(latest ?? proposal);
+  };
+  const saveMailReply = async (input: {
+    messageId: string;
+    mode: "reply" | "reply_all";
+    sourceDigest: string;
+    text: string;
+    to?: string[];
+    cc?: string[];
+  }) => {
+    if (busyLock.current) return undefined;
+    busyLock.current = true;
+    setBusy(true);
+    setNotice("");
+    try {
+      const proposal = await controller.createMailReplyProposal(input);
+      setInboxFilter("pending");
+      setReview(proposal);
+      return proposal;
+    } finally {
+      busyLock.current = false;
+      setBusy(false);
+    }
   };
   const saveRecording = useCallback(async () => {
     const result = await audio.stop();
@@ -1027,6 +1057,7 @@ export default function App() {
                 proposals={proposals}
                 accounts={state.accounts}
                 mailbox={state.mailbox}
+                onReplyMessage={(messageId) => setReplyMessageId(messageId)}
                 proactive={state.proactive}
                 filter={inboxFilter}
                 setFilter={setInboxFilter}
@@ -1290,6 +1321,14 @@ export default function App() {
             </View>
           </View>
         </Modal>
+        <MailReplyComposer
+          visible={Boolean(replyMessageId)}
+          messageId={replyMessageId}
+          controller={controller}
+          busy={busy}
+          onClose={() => setReplyMessageId(null)}
+          onSave={saveMailReply}
+        />
         <Modal
           visible={!!doc}
           animationType="slide"
@@ -1587,6 +1626,7 @@ function InboxScreen({
   proposals,
   accounts,
   mailbox,
+  onReplyMessage,
   proactive,
   filter,
   setFilter,
@@ -1600,6 +1640,7 @@ function InboxScreen({
   proposals: Proposal[];
   accounts: ReturnType<typeof productionController.getSnapshot>["accounts"];
   mailbox: MailboxSnapshotMessage[];
+  onReplyMessage: (messageId: string) => void;
   proactive: ProactiveState;
   filter: "pending" | "done";
   setFilter: (v: "pending" | "done") => void;
@@ -1686,7 +1727,11 @@ function InboxScreen({
         onSnooze={onSnoozeCandidate}
         onGetSource={onGetCandidateSource}
       />
-      <MailboxSection messages={mailbox} accounts={accounts} />
+      <MailboxSection
+        messages={mailbox}
+        accounts={accounts}
+        onReply={onReplyMessage}
+      />
     </ScrollView>
   );
 }

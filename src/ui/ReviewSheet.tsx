@@ -120,6 +120,14 @@ function ReviewSheetContent({
   const [invitePolicy, setInvitePolicy] = useState(
     proposal.event?.invitePolicy ?? "send",
   );
+  const mailReply =
+    proposal.provenance &&
+    "kind" in proposal.provenance &&
+    proposal.provenance.kind === "mail_reply"
+      ? proposal.provenance
+      : null;
+  const frozenReplySource = mailReply?.source;
+  const effectiveEmailOperation = mailReply ? "draft" : emailOperation;
   const parsedDate =
     dueDate && dueTime ? new Date(`${dueDate}T${dueTime}`) : null;
   const dateValue =
@@ -129,13 +137,14 @@ function ReviewSheetContent({
   const localDue = localDateTime(proposal.dueAt);
   const scheduleInputInvalid = Boolean(dueDate) !== Boolean(dueTime);
   const emailPayload = {
-    operation: emailOperation,
+    operation: mailReply ? ("draft" as const) : emailOperation,
     to: parseCsv(emailTo),
     cc: parseCsv(emailCc),
     bcc: parseCsv(emailBcc),
     subject: emailSubject,
     text: emailText,
     attachments: proposal.email?.attachments ?? [],
+    ...(proposal.email?.reply ? { reply: proposal.email.reply } : {}),
   };
   const eventStart = localIso(eventStartDate, eventStartTime, eventTimeZone);
   const eventEnd = localIso(eventEndDate, eventEndTime, eventTimeZone);
@@ -179,11 +188,15 @@ function ReviewSheetContent({
   const actionLabel =
     proposal.kind === "email"
       ? state.settings.mode === "preview"
-        ? emailOperation === "draft"
-          ? "Preview email draft"
+        ? effectiveEmailOperation === "draft"
+          ? mailReply
+            ? "Preview reply draft"
+            : "Preview email draft"
           : "Preview email send"
-        : emailOperation === "draft"
-          ? "Create approved draft"
+        : effectiveEmailOperation === "draft"
+          ? mailReply
+            ? "Create approved reply draft"
+            : "Create approved draft"
           : "Send approved email"
       : proposal.kind === "reminder"
         ? "Schedule reminder"
@@ -197,13 +210,27 @@ function ReviewSheetContent({
   const chosenCalendar = state.calendars.find(
     (calendar) => calendar.id === calendarId,
   );
+  const replyAccount = frozenReplySource
+    ? state.accounts.find(
+        (account) =>
+          account.id === frozenReplySource.accountId &&
+          account.email === frozenReplySource.accountEmail &&
+          account.connected &&
+          account.authStatus === "connected" &&
+          account.connectionGeneration ===
+            frozenReplySource.connectionGeneration &&
+          sameIdentity(account.identity, frozenReplySource.identity),
+      )
+    : undefined;
   const blocked =
     state.settings.mode !== "preview" &&
     (proposal.kind === "email"
-      ? !chosenAccount?.connected ||
-        !chosenAccount.capabilities?.includes(
-          emailOperation === "draft" ? "mail.draft" : "mail.send",
-        )
+      ? mailReply
+        ? !replyAccount?.capabilities?.includes("mail.draft")
+        : !chosenAccount?.connected ||
+          !chosenAccount.capabilities?.includes(
+            effectiveEmailOperation === "draft" ? "mail.draft" : "mail.send",
+          )
       : proposal.kind === "event"
         ? !chosenAccount?.connected ||
           !chosenCalendar?.connected ||
@@ -383,34 +410,62 @@ function ReviewSheetContent({
       <Text style={s.label}>
         {proposal.kind.toUpperCase()} · {proposal.status.toUpperCase()}
       </Text>
+      {mailReply && frozenReplySource ? (
+        <View style={s.analysisBlock}>
+          <Text style={s.analysisSource}>
+            Reply to {frozenReplySource.from || frozenReplySource.senderEmail || "Sender unavailable"}
+          </Text>
+          <Text style={s.analysisSource}>
+            Original subject · {frozenReplySource.subject || "(no subject)"}
+          </Text>
+          <Text style={s.analysisSource}>
+            Account at review · {frozenReplySource.accountEmail}
+          </Text>
+          <Text style={s.evidenceQuote}>
+            Saved excerpt: “{frozenReplySource.snippet || "No excerpt was saved."}”
+          </Text>
+          <Text style={s.disclaimer}>
+            Source details are checked before approval. The full message body was not saved.
+          </Text>
+        </View>
+      ) : null}
       {proposal.kind === "email" ? (
         <>
-          <Text style={s.label}>Sending account</Text>
-          {state.accounts
-            .filter(
-              (a) => a.provider === "google" || a.provider === "microsoft",
-            )
-            .map((a) => (
-              <Pressable
-                key={a.id}
-                accessibilityRole="radio"
-                accessibilityLabel={`Use ${a.email}`}
-                accessibilityState={{ selected: accountId === a.id }}
-                onPress={() => setAccountId(a.id)}
-                style={[
-                  s.accountChoice,
-                  accountId === a.id && s.accountChoiceSelected,
-                ]}
-              >
-                <Text style={s.accountName}>{a.displayName || a.email}</Text>
-                <Text style={s.accountSub}>
-                  {a.email} ·{" "}
-                  {a.connected ? "Verified" : "Configured · not connected"}
-                </Text>
-              </Pressable>
-            ))}
-          <Text style={s.label}>Email action</Text>
-          <View style={s.pills}>
+          <Text style={s.label}>
+            {mailReply ? "Drafting account" : "Sending account"}
+          </Text>
+          {mailReply && frozenReplySource ? (
+            <View style={s.accountChoice}>
+              <Text style={s.accountName}>{frozenReplySource.accountEmail}</Text>
+              <Text style={s.accountSub}>Frozen to the verified source account</Text>
+            </View>
+          ) : (
+            state.accounts
+              .filter(
+                (a) => a.provider === "google" || a.provider === "microsoft",
+              )
+              .map((a) => (
+                <Pressable
+                  key={a.id}
+                  accessibilityRole="radio"
+                  accessibilityLabel={`Use ${a.email}`}
+                  accessibilityState={{ selected: accountId === a.id }}
+                  onPress={() => setAccountId(a.id)}
+                  style={[
+                    s.accountChoice,
+                    accountId === a.id && s.accountChoiceSelected,
+                  ]}
+                >
+                  <Text style={s.accountName}>{a.displayName || a.email}</Text>
+                  <Text style={s.accountSub}>
+                    {a.email} ·{" "}
+                    {a.connected ? "Verified" : "Configured · not connected"}
+                  </Text>
+                </Pressable>
+              ))
+          )}
+          {!mailReply ? <Text style={s.label}>Email action</Text> : null}
+          {!mailReply ? <View style={s.pills}>
             {(["draft", "send"] as const).map((operation) => (
               <Pressable
                 key={operation}
@@ -432,7 +487,11 @@ function ReviewSheetContent({
                 </Text>
               </Pressable>
             ))}
-          </View>
+          </View> : (
+            <Text style={s.disclaimer}>
+              {proposal.email?.reply?.mode === "reply_all" ? "Reply all" : "Reply"} · Mailbox draft for separate review and approval.
+            </Text>
+          )}
           <Field
             label="To"
             value={emailTo}
@@ -447,18 +506,26 @@ function ReviewSheetContent({
             placeholder="Optional recipients"
             keyboardType="email-address"
           />
-          <Field
-            label="Bcc"
-            value={emailBcc}
-            onChangeText={setEmailBcc}
-            placeholder="Optional recipients"
-            keyboardType="email-address"
-          />
-          <Field
-            label="Subject"
-            value={emailSubject}
-            onChangeText={setEmailSubject}
-          />
+          {!mailReply ? (
+            <Field
+              label="Bcc"
+              value={emailBcc}
+              onChangeText={setEmailBcc}
+              placeholder="Optional recipients"
+              keyboardType="email-address"
+            />
+          ) : null}
+          {mailReply ? (
+            <View style={s.fieldWrap}>
+              <Text style={s.label}>Subject · {emailSubject}</Text>
+            </View>
+          ) : (
+            <Field
+              label="Subject"
+              value={emailSubject}
+              onChangeText={setEmailSubject}
+            />
+          )}
           <Field
             label="Message"
             value={emailText}
@@ -646,7 +713,9 @@ function ReviewSheetContent({
               ? "Checking saved sources…"
               : (sourceCheckError ??
                 sourceCheckReason ??
-                "Some sources changed since this suggestion. Refresh the response before approving or executing it.")}
+                (mailReply
+                  ? "This saved mail source changed or needs a new check. Check recent mail and compose the reply again."
+                  : "Some sources changed since this suggestion. Refresh the response before approving or executing it."))}
           </Text>
           {sourceCheckError && onRetrySourceCheck ? (
             <Button
@@ -655,7 +724,7 @@ function ReviewSheetContent({
               onPress={onRetrySourceCheck}
             />
           ) : null}
-          {sourceStale && !sourceCheckError && !sourceChecking && onReassist ? (
+          {sourceStale && !mailReply && !sourceCheckError && !sourceChecking && onReassist ? (
             <Button
               label="Open note to run Assist"
               tone="quiet"
@@ -691,10 +760,17 @@ function ReviewSheetContent({
       {edited ? (
         <Button
           label="Save edits"
-          disabled={invalidPayload || sourceStale || Boolean(sourceCheckError)}
+          disabled={
+            invalidPayload || sourceStale || sourceChecking || Boolean(sourceCheckError)
+          }
           onPress={() =>
             onEdit({
-              title: proposal.kind === "email" ? emailSubject : title,
+              title:
+                proposal.kind === "email"
+                  ? mailReply
+                    ? proposal.title
+                    : emailSubject
+                  : title,
               body: proposal.kind === "email" ? emailText : body,
               recipients:
                 proposal.kind === "email"
@@ -702,7 +778,10 @@ function ReviewSheetContent({
                   : proposal.kind === "event"
                     ? eventPayload.attendees
                     : parseCsv(recipients),
-              accountId: accountId || undefined,
+              accountId:
+                mailReply && frozenReplySource
+                  ? frozenReplySource.accountId
+                  : accountId || undefined,
               calendarId: calendarId || undefined,
               dueAt:
                 proposal.kind === "event"
@@ -720,13 +799,15 @@ function ReviewSheetContent({
         <Button
           label={
             proposal.kind === "email"
-              ? emailOperation === "draft"
+              ? mailReply
+                ? "Approve reply draft"
+                : effectiveEmailOperation === "draft"
                 ? "Approve email draft"
                 : "Approve email send"
               : `Approve ${proposal.kind} draft`
           }
           disabled={
-            edited || invalidPayload || sourceStale || Boolean(sourceCheckError)
+            edited || invalidPayload || sourceStale || sourceChecking || Boolean(sourceCheckError)
           }
           onPress={onApprove}
         />
@@ -736,7 +817,7 @@ function ReviewSheetContent({
           <Button
             label={actionLabel}
             disabled={
-              blocked || edited || sourceStale || Boolean(sourceCheckError)
+              blocked || edited || sourceStale || sourceChecking || Boolean(sourceCheckError)
             }
             onPress={onExecute}
           />
@@ -769,6 +850,21 @@ function parseCsv(value: string): string[] {
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function sameIdentity(
+  current: import("../core").Account["identity"] | undefined,
+  frozen: NonNullable<import("../core").Account["identity"]>,
+) {
+  return Boolean(
+    current &&
+      current.providerNamespace === frozen.providerNamespace &&
+      current.clientId === frozen.clientId &&
+      current.subject === frozen.subject &&
+      current.issuer === frozen.issuer &&
+      current.tenantId === frozen.tenantId &&
+      current.resourceUserId === frozen.resourceUserId,
+  );
 }
 
 function localIso(
