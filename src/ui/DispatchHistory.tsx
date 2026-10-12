@@ -104,7 +104,9 @@ function DispatchRecordView({
       : record.outcome === "unknown"
         ? "Outcome unknown"
         : record.outcome === "rejected"
-          ? "Provider rejected"
+          ? record.rejectionCode === "precondition_failed"
+            ? "Action stopped"
+            : "Provider rejected"
           : "Dispatch in progress";
 
   return (

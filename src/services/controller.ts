@@ -1,6 +1,7 @@
 import * as Crypto from 'expo-crypto';
 import type {
   Account, AccountConfig, AccountSyncState, AccountCapability, ActivityItem, AppController, AppSettings, AppState,
+  ForegroundMailRefreshResult, MailCoverageInterval, MailLaneResult, MailSyncWindow,
   Calendar, CalendarConfig, ContextDocument, Note, NoteAssistResult, AssistIntent, LocalTask, Proposal, ProposalPatch,
   ProposalProvenance, SaveNoteInput, SettingsPatch, MailboxSnapshotMessage, CalendarEventSnapshot, OAuthInstallResult,
 } from '../core';
@@ -12,9 +13,9 @@ import { cancelReminderNotification, requestReminderNotification } from './notif
 import { removeAudio } from '../audio/readAudio';
 import type {
   ApprovedDispatch, DispatchVerifier, OAuthBridgeResult, StoredOAuthToken, OAuthTokenStore,
-  MessageSummary, CalendarSummary, SyncPage, MutationReceipt,
+  MessageSummary, MessageWindowPageMetadata, CalendarSummary, SyncPage, MutationReceipt,
 } from '../connectors';
-import { ConnectorClient, ProviderWriteRejectedError, withCredentialLock } from '../connectors';
+import { ConnectorClient, ProviderWriteRejectedError, describeMessageWindowQuery, withCredentialLock } from '../connectors';
 import { scopeGrantsCapability } from '../connectors/oauth';
 import { oauthTokenStore, deleteOAuthToken } from '../auth/tokenStore';
 import { Platform } from 'react-native';
@@ -71,12 +72,43 @@ function initialState(): AppState {
     notes: [], proposals: [], tasks: [], accounts: [], calendars: [], documents: [], activity: [],
     settings: { ...DEFAULT_SETTINGS },
     usage: { month: day.slice(0, 7), day, requests: 0, attemptsToday: 0, inputTokens: 0, outputTokens: 0, transcriptionSeconds: 0, attempts: 0, unknownCharges: 0, reservedUsd: 0, priceKnown: false, estimatedCostUsd: 0 },
-    mailbox: [], calendarEvents: [], syncStates: {}, pendingCredentialCleanup: [], dispatchRecords: [], dispatchRecordQuarantine: [],
+    mailbox: [], calendarEvents: [], syncStates: {}, pendingCredentialCleanup: [], dispatchRecords: [], dispatchRecordQuarantine: [], mailboxSchemaVersion: 2,
   };
 }
 
 function emptySyncState(accountId: string): AccountSyncState {
-  return { accountId, status: 'idle', messagesPartial: false, calendarsPartial: false, eventCursors: {}, eventsCompletedAt: {} };
+  return {
+    accountId, status: 'idle', mailHead: { status: 'idle' }, mailBackfill: { status: 'idle' },
+    messagesPartial: false, calendarsPartial: false, eventCursors: {}, eventsCompletedAt: {},
+  };
+}
+
+function interruptMailLanes(sync: AccountSyncState, message: string): void {
+  if (sync.mailHead.status === 'syncing') { sync.mailHead.status = 'error'; sync.mailHead.lastError = message; }
+  if (sync.mailBackfill.status === 'syncing') { sync.mailBackfill.status = 'error'; sync.mailBackfill.lastError = message; }
+}
+
+function mergeCoverage(current: MailCoverageInterval | undefined, incoming: MailCoverageInterval): MailCoverageInterval | undefined {
+  const from = Date.parse(incoming.from);
+  const through = Date.parse(incoming.through);
+  if (!Number.isFinite(from) || !Number.isFinite(through) || through <= from) return current;
+  if (!current) return { from: incoming.from, through: incoming.through };
+  const oldFrom = Date.parse(current.from);
+  const oldThrough = Date.parse(current.through);
+  if (!Number.isFinite(oldFrom) || !Number.isFinite(oldThrough) || oldThrough <= oldFrom) return { from: incoming.from, through: incoming.through };
+  if (from > oldThrough || through < oldFrom) return current;
+  return { from: new Date(Math.min(from, oldFrom)).toISOString(), through: new Date(Math.max(through, oldThrough)).toISOString() };
+}
+
+function canonicalMailboxContent(message: Pick<MailboxSnapshotMessage,
+  'providerMessageId' | 'verifiedIdentityKey' | 'connectionGeneration' | 'idFormat' | 'threadId' | 'subject' | 'from' | 'senderEmail' |
+  'receivedAt' | 'snippet' | 'isRead' | 'replyMetadataComplete' | 'internetMessageId' | 'providerVersion' | 'replyTo' | 'to' | 'cc' |
+  'references' | 'inReplyTo' | 'headers' | 'providerDeletedAt'>): string {
+  const {
+    connectionGeneration: _generation, observedAt: _observedAt, id: _id, accountId: _accountId,
+    identityKey: _identityKey, ...content
+  } = message as MailboxSnapshotMessage;
+  return stableJson(content);
 }
 
 function addActivity(state: AppState, type: ActivityItem['type'], message: string, refs: Partial<ActivityItem> = {}): void {
@@ -249,9 +281,10 @@ function assistContext(state: AppState, note: Note, intent: AssistIntent, questi
     }),
     mailbox: state.mailbox.flatMap((message) => {
       const account = state.accounts.find((item) => item.id === message.accountId);
-      if (!account?.connected || account.authStatus !== 'connected' || !message.providerMessageId) return [];
+      if (!account?.connected || account.authStatus !== 'connected' || !message.providerMessageId || message.providerDeletedAt || message.replyMetadataComplete !== true) return [];
       const accountIdentity = identityKey(account);
-      return message.identityKey === `${accountIdentity}:${message.providerMessageId}`
+      return message.identityKey === `${accountIdentity}:${message.providerMessageId}` &&
+        (!message.verifiedIdentityKey || message.verifiedIdentityKey === accountIdentity)
         ? [{ ...message, identityKey: accountIdentity }]
         : [];
     }),
@@ -408,6 +441,12 @@ function normalizeLoadedState(value: unknown): AppState {
     } : undefined;
     return { ...note, revision: Number.isFinite(note.revision) ? note.revision : 1, capturedAt: note.capturedAt ?? note.createdAt, captureTimeZone: validTimezone(note.captureTimeZone ?? rawSettings.timezone), analysis };
   });
+  if (raw.mailboxSchemaVersion !== 2) {
+    const hasLegacyMicrosoftMailbox = raw.accounts!.some((account) => account.provider === 'microsoft');
+    if (hasLegacyMicrosoftMailbox) for (const note of notes) {
+      if (Object.keys(note.analysis?.sourceVersions ?? {}).some((sourceId) => sourceId.startsWith('mail:'))) note.analysis!.stale = true;
+    }
+  }
   const proposals = raw.proposals.map((proposal) => {
     const source = notes.find((note) => note.id === proposal.noteId);
     const validProvenanceList = (items: unknown): boolean => {
@@ -506,9 +545,33 @@ function normalizeLoadedState(value: unknown): AppState {
     calendars: raw.calendars.map((calendar) => ({ ...calendar, connected: false, writable: false })),
     settings,
     usage: { ...defaults.usage, ...raw.usage },
-    mailbox: Array.isArray(raw.mailbox) ? raw.mailbox : [],
+    mailbox: Array.isArray(raw.mailbox) ? raw.mailbox.filter((message) => raw.mailboxSchemaVersion === 2 ||
+      !raw.accounts!.some((account) => account.id === message.accountId && account.provider === 'microsoft')) : [],
     calendarEvents: Array.isArray(raw.calendarEvents) ? raw.calendarEvents : [],
-    syncStates: raw.syncStates && typeof raw.syncStates === 'object' ? raw.syncStates : {},
+    syncStates: Object.fromEntries(raw.accounts!.map((account) => {
+      const previous = raw.syncStates?.[account.id] as AccountSyncState | undefined;
+      const base = emptySyncState(account.id);
+      const normalized: AccountSyncState = {
+        ...base, ...(previous && typeof previous === 'object' ? previous : {}), accountId: account.id,
+        mailHead: {
+          ...base.mailHead, ...(previous?.mailHead ?? {}),
+          status: previous?.mailHead?.status === 'syncing' ? 'error' : (['idle', 'partial', 'error'].includes(previous?.mailHead?.status ?? '') ? previous!.mailHead!.status : 'idle'),
+          ...(previous?.mailHead?.status === 'syncing' ? { lastError: 'App closed during this mailbox refresh. Run Refresh inbox to try again.' } : {}),
+        },
+        mailBackfill: {
+          ...base.mailBackfill, ...(previous?.mailBackfill ?? {}),
+          status: previous?.mailBackfill?.status === 'syncing' ? 'error' : (['idle', 'partial', 'error'].includes(previous?.mailBackfill?.status ?? '') ? previous!.mailBackfill!.status : 'idle'),
+          ...(previous?.mailBackfill?.status === 'syncing' ? { lastError: 'App closed during this backfill page. Continue to retry the saved window.' } : {}),
+        },
+        eventCursors: previous?.eventCursors && typeof previous.eventCursors === 'object' ? previous.eventCursors : {},
+        eventsCompletedAt: previous?.eventsCompletedAt && typeof previous.eventsCompletedAt === 'object' ? previous.eventsCompletedAt : {},
+      };
+      if (raw.mailboxSchemaVersion !== 2) {
+        normalized.messagesCursor = undefined; normalized.messagesCompletedAt = undefined; normalized.messagesPartial = false; normalized.messagesTimeMin = undefined;
+      }
+      return [account.id, normalized];
+    })),
+    mailboxSchemaVersion: 2,
   };
 }
 
@@ -540,6 +603,9 @@ export class AppControllerImpl implements AppController {
   private activeSyncCount = 0;
   private syncQueue: (() => void)[] = [];
   private syncJobs = new Map<string, Promise<AccountSyncState>>();
+  private mailLaneJobs = new Map<string, Promise<MailLaneResult>>();
+  private foregroundMailJob?: Promise<ForegroundMailRefreshResult>;
+  private busySyncAccounts = new Set<string>();
   private syncGeneration = new Map<string, number>();
   private syncAbortControllers = new Map<string, AbortController>();
   private credentialCleanupJob?: Promise<void>;
@@ -1686,6 +1752,7 @@ export class AppControllerImpl implements AppController {
       }
       const sync = state.syncStates[accountId] ?? emptySyncState(accountId);
       sync.status = 'error'; sync.lastError = 'Account authentication needs attention.';
+      interruptMailLanes(sync, 'Account authentication changed during mail sync. Reconnect and continue explicitly.');
       state.syncStates[accountId] = sync;
       addActivity(state, 'error', `${account.displayName || account.email} needs to reconnect.`);
     });
@@ -1784,6 +1851,7 @@ export class AppControllerImpl implements AppController {
         }
         for (const calendar of state.calendars.filter((item) => item.accountId === account.id)) { calendar.connected = false; calendar.writable = false; }
         state.syncStates[account.id] ??= emptySyncState(account.id);
+        interruptMailLanes(state.syncStates[account.id], 'Account identity changed during mail sync. Refresh the inbox or continue backfill explicitly.');
         addActivity(state, 'local_action', `${account.displayName || account.email} was connected after provider identity verification.`);
         return account;
         });
@@ -1830,6 +1898,7 @@ export class AppControllerImpl implements AppController {
       }
       const sync = state.syncStates[id] ?? emptySyncState(id);
       sync.status = sync.lastStartedAt ? 'partial' : 'idle';
+      interruptMailLanes(sync, 'Account was disconnected during mail sync. Reconnect and continue explicitly.');
       state.syncStates[id] = sync;
       addActivity(state, 'local_action', `${current.displayName || current.email} was disconnected. Pending approvals were cleared.`);
       return current;
@@ -1841,7 +1910,14 @@ export class AppControllerImpl implements AppController {
   async syncAccount(id: string, options: { continue?: boolean } = {}): Promise<AccountSyncState> {
     const active = this.syncJobs.get(id);
     if (active) return active;
-    const job = this.runSyncAccount(id, options).finally(() => this.syncJobs.delete(id));
+    await this.load();
+    const configured = this.snapshot.accounts.find((item) => item.id === id);
+    if (configured?.capabilities?.includes('mail.read') && !configured.capabilities.includes('calendar.read')) {
+      throw new Error('This account has mailbox access. Use Refresh inbox or Continue backfill; this control only syncs calendars.');
+    }
+    if (this.busySyncAccounts.has(id)) throw new Error('Another sync lane is already active for this account. Finish it before starting calendar sync.');
+    this.busySyncAccounts.add(id);
+    const job = this.runSyncAccount(id, options).finally(() => { this.syncJobs.delete(id); this.busySyncAccounts.delete(id); });
     this.syncJobs.set(id, job);
     return job;
   }
@@ -1856,6 +1932,323 @@ export class AppControllerImpl implements AppController {
       const next = this.syncQueue.shift();
       if (next) next(); else this.activeSyncCount--;
     };
+  }
+
+  private tryAcquireSyncSlot(): (() => void) | undefined {
+    if (this.activeSyncCount >= 2) return undefined;
+    this.activeSyncCount++;
+    return () => {
+      const next = this.syncQueue.shift();
+      if (next) next(); else this.activeSyncCount--;
+    };
+  }
+
+  async refreshMailHead(accountId: string, options: { reason?: 'manual' | 'foreground' } = {}): Promise<MailLaneResult> {
+    return this.startMailLane(accountId, 'head', options.reason ?? 'manual');
+  }
+
+  async continueMailBackfill(accountId: string): Promise<MailLaneResult> {
+    return this.startMailLane(accountId, 'backfill', 'manual');
+  }
+
+  refreshForegroundMail(): Promise<ForegroundMailRefreshResult> {
+    if (this.foregroundMailJob) return this.foregroundMailJob;
+    const job = this.runForegroundMail().finally(() => { if (this.foregroundMailJob === job) this.foregroundMailJob = undefined; });
+    this.foregroundMailJob = job;
+    return job;
+  }
+
+  private async runForegroundMail(): Promise<ForegroundMailRefreshResult> {
+    await this.load();
+    const eligible = this.snapshot.accounts
+      .filter((account) => account.connected && account.authStatus === 'connected' && account.capabilities?.includes('mail.read'))
+      .sort((left, right) => (Date.parse(this.snapshot.syncStates[left.id]?.mailHead.lastAttemptAt ?? '') || 0) - (Date.parse(this.snapshot.syncStates[right.id]?.mailHead.lastAttemptAt ?? '') || 0));
+    const attempted: string[] = [];
+    const skipped: ForegroundMailRefreshResult['skipped'] = [];
+    const results: MailLaneResult[] = [];
+    const currentTime = Date.now();
+    for (const account of eligible) {
+      if (this.busySyncAccounts.has(account.id)) { skipped.push({ accountId: account.id, reason: 'another sync lane is active for this account' }); continue; }
+      const lastAttempt = Date.parse(this.snapshot.syncStates[account.id]?.mailHead.lastAttemptAt ?? '');
+      if (Number.isFinite(lastAttempt) && currentTime - lastAttempt < 15 * 60_000) {
+        skipped.push({ accountId: account.id, reason: 'refreshed within the last 15 minutes' }); continue;
+      }
+      if (attempted.length >= 2) { skipped.push({ accountId: account.id, reason: 'foreground run limit reached' }); continue; }
+      const available = this.activeSyncCount < 2;
+      if (!available) { skipped.push({ accountId: account.id, reason: 'both sync slots are busy' }); continue; }
+      attempted.push(account.id);
+      try { results.push(await this.startMailLane(account.id, 'head', 'foreground', true)); }
+      catch (error) { skipped.push({ accountId: account.id, reason: error instanceof Error ? error.message : 'mail refresh was skipped' }); }
+    }
+    return { attempted, skipped, results };
+  }
+
+  private startMailLane(accountId: string, lane: 'head' | 'backfill', reason: 'manual' | 'foreground', doNotQueue = false): Promise<MailLaneResult> {
+    const key = `${accountId}:${lane}`;
+    const sameLane = this.mailLaneJobs.get(key);
+    if (sameLane) return sameLane;
+    if (this.busySyncAccounts.has(accountId)) return Promise.reject(new Error('Another sync lane is already active for this account.'));
+    this.busySyncAccounts.add(accountId);
+    const job = this.runMailLane(accountId, lane, reason, doNotQueue)
+      .finally(() => { this.mailLaneJobs.delete(key); this.busySyncAccounts.delete(accountId); });
+    this.mailLaneJobs.set(key, job);
+    return job;
+  }
+
+  private async runMailLane(accountId: string, lane: 'head' | 'backfill', reason: 'manual' | 'foreground', doNotQueue: boolean): Promise<MailLaneResult> {
+    if (!this.connector) throw new Error('Provider mail sync is not configured.');
+    const release = doNotQueue ? this.tryAcquireSyncSlot() : await this.acquireSyncSlot();
+    if (!release) throw new Error('Both sync slots are busy.');
+    const abortController = new AbortController();
+    this.syncAbortControllers.set(accountId, abortController);
+    const deadlineTimer = setTimeout(() => abortController.abort(new Error('Mail sync reached its 30 second deadline.')), 30_000);
+    let account: Account | undefined;
+    let generation = -1;
+    let window: MailSyncWindow | undefined;
+    let startedAt = now();
+    try {
+      let requests = 0;
+      const started = Date.now();
+      const guard = () => {
+        if (abortController.signal.aborted) throw new Error('Mail sync was cancelled or reached its 30 second deadline.');
+        if (Date.now() - started >= 30_000) throw new Error('Mail sync reached its 30 second deadline.');
+        if (++requests > 20) throw new Error('Mail sync reached its 20 request limit.');
+      };
+      const prepared = await this.mutate((state) => {
+        const currentAccount = state.accounts.find((item) => item.id === accountId);
+        if (!currentAccount || currentAccount.authStatus !== 'connected' || !currentAccount.connected || !currentAccount.capabilities?.includes('mail.read')) {
+          throw new Error('Reconnect this account with mailbox read access before syncing.');
+        }
+        const currentSync = state.syncStates[accountId] ?? emptySyncState(accountId);
+        startedAt = now();
+        const rangeThrough = new Date().toISOString();
+        const rangeFloor = new Date(Date.parse(rangeThrough) - 14 * 86_400_000).toISOString();
+        const backfill = currentSync.mailBackfill;
+        const normalizeCoverage = () => {
+          const coverage = backfill.coverage;
+          if (coverage) {
+            const coverageFrom = Date.parse(coverage.from);
+            const coverageThrough = Date.parse(coverage.through);
+            const floorTime = Date.parse(rangeFloor);
+            if (!Number.isFinite(coverageFrom) || !Number.isFinite(coverageThrough) || coverageThrough <= floorTime) {
+              backfill.coverage = undefined;
+              backfill.olderHistoryNotCheckedBefore = rangeFloor;
+            } else if (coverageFrom < floorTime) {
+              backfill.coverage = { from: rangeFloor, through: coverage.through };
+              backfill.olderHistoryNotCheckedBefore = rangeFloor;
+            }
+          }
+          const needed = Date.parse(backfill.coverageNeededThrough ?? '');
+          if (Number.isFinite(needed) && needed > Date.parse(rangeThrough)) backfill.coverageNeededThrough = rangeThrough;
+          if (backfill.coverage && backfill.coverageNeededThrough && Date.parse(backfill.coverageNeededThrough) <= Date.parse(backfill.coverage.through)) {
+            backfill.coverageNeededThrough = undefined;
+          }
+        };
+        const makeCurrentWindow = () => {
+          const descriptor = describeMessageWindowQuery(currentAccount, { timeMin: rangeFloor, timeMax: rangeThrough, pageSize: 5 });
+          return { from: descriptor.window.from, through: descriptor.window.to, pageSize: descriptor.pageSize, queryFingerprint: descriptor.queryFingerprint } satisfies MailSyncWindow;
+        };
+        if (reason === 'foreground') {
+          const lastAttempt = Date.parse(currentSync.mailHead.lastAttemptAt ?? '');
+          if (Number.isFinite(lastAttempt) && Date.now() - lastAttempt < 15 * 60_000) {
+            throw new Error('This mailbox was refreshed within the last 15 minutes.');
+          }
+        }
+        if (lane === 'head') {
+          normalizeCoverage();
+          window = makeCurrentWindow();
+          currentSync.mailHead = { ...currentSync.mailHead, status: 'syncing', lastAttemptAt: startedAt, window, lastError: undefined };
+          if (currentSync.mailBackfill.activeWindow || currentSync.mailBackfill.coverage) {
+            currentSync.mailBackfill.coverageNeededThrough = this.maxIso(currentSync.mailBackfill.coverageNeededThrough, window.through);
+          }
+        } else {
+          normalizeCoverage();
+          if (backfill.activeWindow) {
+            const active = backfill.activeWindow;
+            let matchesCapturedQuery = false;
+            const activeFrom = Date.parse(active.from);
+            const activeThrough = Date.parse(active.through);
+            const activeWidth = activeThrough - activeFrom;
+            const activeExpired = Number.isFinite(activeThrough) && activeThrough <= Date.parse(rangeFloor);
+            const activeOutOfRange = !Number.isFinite(activeFrom) || !Number.isFinite(activeThrough) || activeWidth <= 0 || activeWidth > 14 * 86_400_000;
+            if (activeExpired || activeOutOfRange) {
+              backfill.activeWindow = undefined;
+              backfill.olderHistoryNotCheckedBefore = rangeFloor;
+              window = makeCurrentWindow();
+            }
+            const retiredActiveWindow = !backfill.activeWindow;
+            if (!retiredActiveWindow) {
+              const validStoredCursor = active.cursor === undefined || typeof active.cursor === 'string' && active.cursor.length > 0 && active.cursor.length <= 8192;
+              if (validStoredCursor && typeof active.from === 'string' && typeof active.through === 'string' &&
+                  typeof active.queryFingerprint === 'string' && Number.isSafeInteger(active.pageSize)) {
+                try {
+                  const expected = describeMessageWindowQuery(currentAccount, { timeMin: active.from, timeMax: active.through, pageSize: active.pageSize });
+                  matchesCapturedQuery = expected.window.from === active.from && expected.window.to === active.through && expected.pageSize === active.pageSize && expected.queryFingerprint === active.queryFingerprint;
+                } catch { /* Malformed persisted windows fail closed and require a fresh explicit backfill. */ }
+              }
+              if (!matchesCapturedQuery) {
+                backfill.activeWindow = undefined;
+                backfill.olderHistoryNotCheckedBefore = rangeFloor;
+                window = makeCurrentWindow();
+              } else {
+                window = { ...active };
+              }
+            }
+          }
+          if (!window) {
+            let from: string;
+            let through: string;
+            if (backfill.coverage && backfill.coverageNeededThrough && Date.parse(backfill.coverageNeededThrough) > Date.parse(backfill.coverage.through)) {
+              from = new Date(Math.max(Date.parse(backfill.coverage.through), Date.parse(rangeFloor))).toISOString();
+              const latestAllowed = Math.min(Date.parse(rangeThrough), Date.parse(from) + 14 * 86_400_000);
+              through = new Date(Math.min(Date.parse(backfill.coverageNeededThrough), latestAllowed)).toISOString();
+            } else {
+              from = rangeFloor; through = rangeThrough;
+            }
+            const descriptor = describeMessageWindowQuery(currentAccount, { timeMin: from, timeMax: through, pageSize: 5 });
+            window = { from: descriptor.window.from, through: descriptor.window.to, pageSize: descriptor.pageSize, queryFingerprint: descriptor.queryFingerprint };
+          }
+          currentSync.mailBackfill = {
+            ...currentSync.mailBackfill, status: 'syncing', activeWindow: window,
+            lastAttemptAt: startedAt, lastError: undefined,
+            ...(currentSync.mailBackfill.coverageNeededThrough ? {} : { coverageNeededThrough: window.through }),
+          };
+        }
+        state.syncStates[accountId] = currentSync;
+        account = clone(currentAccount);
+        generation = currentAccount.connectionGeneration ?? 0;
+        this.syncGeneration.set(accountId, generation);
+        return { account, sync: currentSync };
+      });
+      account = prepared.account;
+      const immutableAccount = account;
+      const immutableWindow = window!;
+      const ensureCurrent = (state: AppState = this.snapshot) => {
+        const current = state.accounts.find((item) => item.id === accountId);
+        if (abortController.signal.aborted || this.syncGeneration.get(accountId) !== generation || !current || !current.connected || current.authStatus !== 'connected' ||
+            current.connectionGeneration !== immutableAccount.connectionGeneration || current.tokenRef !== immutableAccount.tokenRef || !sameAccountIdentity(current.identity, immutableAccount.identity)) {
+          throw new Error('Account connection changed during mail sync; stale pages were discarded.');
+        }
+      };
+      const persistPage = async (items: MessageSummary[], cursor: string | undefined, metadata: MessageWindowPageMetadata) => this.mutate((state) => {
+        ensureCurrent(state);
+        if (metadata.window.from !== immutableWindow.from || metadata.window.to !== immutableWindow.through || metadata.queryFingerprint !== immutableWindow.queryFingerprint) {
+          throw new Error('Provider mail page did not match the captured window and identity.');
+        }
+        const sync = state.syncStates[accountId] ?? emptySyncState(accountId);
+        const key = identityKey(immutableAccount);
+        const timestamp = now();
+        for (const item of items) {
+          if (!item.id) continue;
+          const identityKeyValue = `${key}:${item.id}`;
+          const prior = state.mailbox.find((entry) => entry.accountId === accountId && entry.identityKey === identityKeyValue);
+          const value: MailboxSnapshotMessage = {
+            id: prior?.id ?? newId(), accountId, providerMessageId: item.id, identityKey: identityKeyValue,
+            verifiedIdentityKey: key, connectionGeneration: generation, idFormat: item.idFormat,
+            threadId: item.threadId, subject: item.subject, from: item.from, senderEmail: item.senderEmail,
+            receivedAt: item.receivedAt, snippet: item.snippet, isRead: item.isRead,
+            replyMetadataComplete: item.replyMetadataComplete, internetMessageId: item.internetMessageId,
+            providerVersion: item.providerVersion, replyTo: item.replyTo, to: item.to, cc: item.cc,
+            references: item.references, inReplyTo: item.inReplyTo, headers: item.headers,
+            observedAt: timestamp,
+          };
+          const changed = !prior || canonicalMailboxContent(prior) !== canonicalMailboxContent(value);
+          if (prior) { Object.assign(prior, value); delete prior.providerDeletedAt; } else state.mailbox.push(value);
+          if (changed) markAnalysesStale(state, [`mail:${encodeURIComponent(key)}:${encodeURIComponent(item.id)}`]);
+        }
+        let unavailableCount = 0;
+        for (const id of metadata.unavailableIds) {
+          if (!id) continue;
+          const identityKeyValue = `${key}:${id}`;
+          const prior = state.mailbox.find((entry) => entry.accountId === accountId && entry.identityKey === identityKeyValue);
+          const deletedAt = prior?.providerDeletedAt ?? timestamp;
+          const tombstone: MailboxSnapshotMessage = {
+            id: prior?.id ?? newId(), accountId, providerMessageId: id, identityKey: identityKeyValue,
+            verifiedIdentityKey: key, connectionGeneration: generation, idFormat: immutableAccount.provider === 'microsoft' ? 'graph-immutable' : 'gmail',
+            providerDeletedAt: deletedAt, observedAt: timestamp,
+          };
+          if (!prior || !prior.providerDeletedAt) markAnalysesStale(state, [`mail:${encodeURIComponent(key)}:${encodeURIComponent(id)}`]);
+          if (prior) Object.assign(prior, tombstone); else state.mailbox.push(tombstone);
+          unavailableCount++;
+        }
+        const accountMessages = state.mailbox.filter((entry) => entry.accountId === accountId)
+          .sort((left, right) => (right.receivedAt ?? right.observedAt ?? '').localeCompare(left.receivedAt ?? left.observedAt ?? '')).slice(0, 200);
+        state.mailbox = [...state.mailbox.filter((entry) => entry.accountId !== accountId), ...accountMessages];
+        if (lane === 'head') {
+          sync.mailHead.lastPageCheckedAt = timestamp; sync.mailHead.lastPageSucceededAt = timestamp;
+          sync.mailHead.window = { ...immutableWindow, cursor };
+          sync.mailHead.unavailableCount = (sync.mailHead.unavailableCount ?? 0) + unavailableCount;
+        } else {
+          sync.mailBackfill.lastPageCheckedAt = timestamp; sync.mailBackfill.lastPageSucceededAt = timestamp;
+          sync.mailBackfill.activeWindow = { ...immutableWindow, cursor };
+          sync.mailBackfill.unavailableCount = (sync.mailBackfill.unavailableCount ?? 0) + unavailableCount;
+        }
+        state.syncStates[accountId] = sync;
+      });
+      const page = await this.connector.syncMessageWindow(immutableAccount, {
+        timeMin: immutableWindow.from, timeMax: immutableWindow.through, cursor: immutableWindow.cursor,
+        pageSize: immutableWindow.pageSize, guard, signal: abortController.signal,
+        onPage: (items, cursor, _pagesRead, metadata) => persistPage(items, cursor, metadata),
+      });
+      ensureCurrent();
+      if (page.window.from !== immutableWindow.from || page.window.to !== immutableWindow.through || page.queryFingerprint !== immutableWindow.queryFingerprint) {
+        throw new Error('Provider returned a different mailbox query window.');
+      }
+      const completedAt = now();
+      return await this.mutate((state) => {
+        ensureCurrent(state);
+        const sync = state.syncStates[accountId] ?? emptySyncState(accountId);
+        if (lane === 'head') {
+          sync.mailHead.status = page.partial ? 'partial' : 'idle';
+          sync.mailHead.window = { ...immutableWindow, cursor: page.nextCursor };
+          sync.mailHead.lastPageCheckedAt = completedAt;
+          sync.mailHead.lastPageSucceededAt = completedAt;
+          sync.mailHead.lastError = undefined;
+          if (!page.partial) {
+            sync.mailHead.completeWindow = { from: immutableWindow.from, through: immutableWindow.through };
+            sync.mailBackfill.coverage = mergeCoverage(sync.mailBackfill.coverage, { from: immutableWindow.from, through: immutableWindow.through });
+            if (sync.mailBackfill.coverageNeededThrough && Date.parse(sync.mailBackfill.coverageNeededThrough) <= Date.parse(sync.mailBackfill.coverage?.through ?? '')) {
+              sync.mailBackfill.coverageNeededThrough = undefined;
+            }
+          }
+        } else {
+          sync.mailBackfill.lastPageCheckedAt = completedAt; sync.mailBackfill.lastPageSucceededAt = completedAt;
+          sync.mailBackfill.lastError = undefined;
+          if (page.partial) {
+            sync.mailBackfill.status = 'partial'; sync.mailBackfill.activeWindow = { ...immutableWindow, cursor: page.nextCursor };
+          } else {
+            sync.mailBackfill.coverage = mergeCoverage(sync.mailBackfill.coverage, { from: immutableWindow.from, through: immutableWindow.through });
+            sync.mailBackfill.activeWindow = undefined; sync.mailBackfill.status = 'idle'; sync.mailBackfill.lastCompletedAt = completedAt;
+            if (sync.mailBackfill.coverageNeededThrough && Date.parse(sync.mailBackfill.coverageNeededThrough) <= Date.parse(sync.mailBackfill.coverage?.through ?? '')) {
+              sync.mailBackfill.coverageNeededThrough = undefined;
+            }
+          }
+        }
+        state.syncStates[accountId] = sync;
+        const resultStatus = page.partial ? 'partial' : 'complete';
+        return { accountId, lane, status: resultStatus, state: sync } satisfies MailLaneResult;
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Mail sync failed.';
+      const connectionStillCurrent = account && this.snapshot.accounts.some((item) => item.id === accountId && item.connected && item.connectionGeneration === generation && sameAccountIdentity(item.identity, account!.identity));
+      if (!connectionStillCurrent) throw error;
+      return await this.mutate((state) => {
+        const sync = state.syncStates[accountId] ?? emptySyncState(accountId);
+        if (lane === 'head') { sync.mailHead.status = 'error'; sync.mailHead.lastError = message; }
+        else { sync.mailBackfill.status = 'error'; sync.mailBackfill.lastError = message; }
+        state.syncStates[accountId] = sync;
+        return { accountId, lane, status: 'error', state: sync, message } satisfies MailLaneResult;
+      });
+    } finally {
+      clearTimeout(deadlineTimer);
+      if (this.syncAbortControllers.get(accountId) === abortController) this.syncAbortControllers.delete(accountId);
+      release();
+    }
+  }
+
+  private maxIso(left: string | undefined, right: string): string {
+    if (!left || !Number.isFinite(Date.parse(left)) || Date.parse(right) > Date.parse(left)) return right;
+    return left;
   }
 
   private async runSyncAccount(id: string, options: { continue?: boolean }): Promise<AccountSyncState> {
@@ -1881,10 +2274,8 @@ export class AppControllerImpl implements AppController {
         if (!options.continue) {
           const anchor = new Date().toISOString();
           sync.lastStartedAt = anchor;
-          sync.messagesTimeMin = new Date(Date.parse(anchor) - 14 * 24 * 60 * 60 * 1000).toISOString();
           sync.eventsTimeMin = anchor;
           sync.eventsTimeMax = new Date(Date.parse(anchor) + 14 * 24 * 60 * 60 * 1000).toISOString();
-          sync.messagesCursor = undefined; sync.messagesCompletedAt = undefined; sync.messagesPartial = false;
           sync.calendarsCursor = undefined; sync.calendarsCompletedAt = undefined; sync.calendarsPartial = false;
           sync.eventCursors = {}; sync.eventsCompletedAt = {};
         }
@@ -1895,7 +2286,6 @@ export class AppControllerImpl implements AppController {
       const generation = this.syncGeneration.get(id) ?? account.connectionGeneration ?? 0;
       this.syncGeneration.set(id, generation);
       const tokenRef = account.tokenRef;
-      const canMail = account.capabilities?.includes('mail.read') === true;
       const canCalendar = account.capabilities?.includes('calendar.read') === true;
       const currentConnection = (state: AppState = this.snapshot) => {
         const current = state.accounts.find((item) => item.id === id);
@@ -1909,34 +2299,9 @@ export class AppControllerImpl implements AppController {
       });
       const completedThisRun = (at?: string) => Boolean(at && sync.lastStartedAt && Date.parse(at) >= Date.parse(sync.lastStartedAt));
       try {
-        if (!canMail && !canCalendar) throw new Error('This account has no mailbox or calendar read permission to sync.');
-        const start = sync.messagesTimeMin ?? new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
-        const addMessages = async (items: MessageSummary[], cursor: string | undefined, pagesRead: number) => persist((state) => {
-          const current = state.syncStates[id] ?? emptySyncState(id);
-          const key = identityKey(account);
-          for (const item of items) {
-            if (!item.id) continue;
-            const dedupe = `${key}:${item.id}`;
-            const prior = state.mailbox.find((entry) => entry.accountId === id && entry.identityKey === dedupe);
-            const value: MailboxSnapshotMessage = { id: prior?.id ?? newId(), accountId: id, providerMessageId: item.id, identityKey: dedupe, threadId: item.threadId, subject: item.subject, from: item.from, receivedAt: item.receivedAt, snippet: item.snippet };
-            if (prior) Object.assign(prior, value); else state.mailbox.push(value);
-            markAnalysesStale(state, [`mail:${encodeURIComponent(key)}:${encodeURIComponent(item.id)}`]);
-          }
-          const accountMessages = state.mailbox.filter((entry) => entry.accountId === id).sort((a, b) => (b.receivedAt ?? '').localeCompare(a.receivedAt ?? '')).slice(0, 200);
-          state.mailbox = [...state.mailbox.filter((entry) => entry.accountId !== id), ...accountMessages];
-          current.messagesCursor = cursor; current.messagesPartial = Boolean(cursor); current.status = cursor ? 'partial' : current.status;
-          state.syncStates[id] = current;
-        });
-        const messageComplete = !canMail || completedThisRun(sync.messagesCompletedAt);
-        const messagePage: SyncPage<MessageSummary> = canMail && !messageComplete ? await this.connector.syncMessages(account, {
-          cursor: sync.messagesCursor, pageSize: 25, timeMin: start, guard, signal: abortController.signal, onPage: addMessages,
-        }) : { items: [], pagesRead: 0, partial: sync.messagesPartial, nextCursor: sync.messagesCursor };
-        if (canMail && !messageComplete) await persist((state) => {
-          const current = state.syncStates[id] ?? emptySyncState(id);
-          current.messagesCursor = messagePage.nextCursor; current.messagesPartial = messagePage.partial;
-          if (!messagePage.partial) { current.messagesCursor = undefined; current.messagesCompletedAt = now(); }
-          state.syncStates[id] = current;
-        });
+        if (!canCalendar) throw new Error(account.capabilities?.includes('mail.read')
+          ? 'This account has mailbox access. Use Refresh inbox or Continue backfill; this control only syncs calendars.'
+          : 'This account has no calendar read permission to sync.');
         currentConnection();
         const calendarsComplete = !canCalendar || completedThisRun(sync.calendarsCompletedAt);
         const calendarPage: SyncPage<CalendarSummary> = canCalendar && !calendarsComplete ? await this.connector.listCalendars(account, {
@@ -1968,9 +2333,16 @@ export class AppControllerImpl implements AppController {
               for (const item of items) {
                 if (!item.id) continue;
                 let event = state.calendarEvents.find((entry) => entry.calendarId === calendar.id && entry.providerEventId === item.id);
-                const mapped: CalendarEventSnapshot = { id: event?.id ?? newId(), accountId: id, calendarId: calendar.id, providerEventId: item.id, subject: item.subject, start: item.start, end: item.end, timeZone: item.timeZone };
+                const mapped: CalendarEventSnapshot = {
+                  id: event?.id ?? newId(), accountId: id, calendarId: calendar.id, providerEventId: item.id,
+                  subject: item.subject, start: item.start, end: item.end, timeZone: item.timeZone,
+                  startUtcCertified: item.startUtcCertified === true, endUtcCertified: item.endUtcCertified === true,
+                  observedAt: now(), verifiedIdentityKey: identityKey(account), connectionGeneration: account.connectionGeneration,
+                };
+                const changed = !event || stableJson([event.subject, event.start, event.end, event.timeZone, event.startUtcCertified, event.endUtcCertified]) !==
+                  stableJson([mapped.subject, mapped.start, mapped.end, mapped.timeZone, mapped.startUtcCertified, mapped.endUtcCertified]);
                 if (event) Object.assign(event, mapped); else state.calendarEvents.push(mapped);
-                markAnalysesStale(state, [`calendar-event:${encodeURIComponent(identityKey(account))}:${encodeURIComponent(calendar.providerId!)}:${encodeURIComponent(item.id)}`]);
+                if (changed) markAnalysesStale(state, [`calendar-event:${encodeURIComponent(identityKey(account))}:${encodeURIComponent(calendar.providerId!)}:${encodeURIComponent(item.id)}`]);
               }
               const current = state.syncStates[id] ?? emptySyncState(id); current.eventCursors[calendar.id] = cursor ?? '';
               if (!cursor) { delete current.eventCursors[calendar.id]; current.eventsCompletedAt[calendar.id] = now(); }
@@ -1980,7 +2352,7 @@ export class AppControllerImpl implements AppController {
           anyEventPartial ||= eventPage.partial;
           if (eventPage.partial) break;
         }
-        const complete = !messagePage.partial && !calendarPage.partial && !anyEventPartial;
+        const complete = !calendarPage.partial && !anyEventPartial;
         currentConnection();
         return persist((state) => {
           const current = state.syncStates[id] ?? emptySyncState(id);
@@ -1996,7 +2368,6 @@ export class AppControllerImpl implements AppController {
         if (this.syncGeneration.get(id) !== generation || abortController.signal.aborted && !this.snapshot.accounts.some((item) => item.id === id && item.connected && item.connectionGeneration === account.connectionGeneration)) throw error;
         return persist((state) => {
           const current = state.syncStates[id] ?? emptySyncState(id); current.status = 'partial'; current.lastError = message;
-          if (canMail && !completedThisRun(current.messagesCompletedAt)) current.messagesPartial = true;
           if (canCalendar && !completedThisRun(current.calendarsCompletedAt)) current.calendarsPartial = true;
           const account = state.accounts.find((item) => item.id === id); if (account) account.syncStatus = current.status === 'partial' ? 'partial' : 'error';
           state.syncStates[id] = current; return current;

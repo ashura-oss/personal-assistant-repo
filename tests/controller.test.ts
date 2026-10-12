@@ -4,7 +4,7 @@ import { AppControllerImpl } from '../src/services/controller';
 import type { StateStore } from '../src/storage/contracts';
 import { AzureOpenAIClient } from '../src/services/azure';
 import { cancelReminderNotification, reminderNotificationId, requestReminderNotification } from '../src/services/notifications';
-import { ProviderWriteRejectedError, withCredentialLock, type OAuthBridgeResult, type StoredOAuthToken } from '../src/connectors';
+import { ProviderWriteRejectedError, describeMessageWindowQuery, withCredentialLock, type OAuthBridgeResult, type StoredOAuthToken } from '../src/connectors';
 import * as Crypto from 'expo-crypto';
 
 class MemoryStore implements StateStore {
@@ -83,7 +83,7 @@ describe('application state controller', () => {
     expect(exported).not.toContain('private-corrupt-data');
   });
 
-  it('installs only verifier-approved OAuth identity and resumes sync from persisted page cursors', async () => {
+  it('uses the dedicated mailbox head and backfill lanes with hydrated metadata and persisted cursors', async () => {
     const store = new MemoryStore();
     const identity = { providerNamespace: 'google' as const, clientId: 'google-client', subject: 'provider-subject' };
     const token: StoredOAuthToken = { accessToken: 'test-access', expiresAt: Date.now() + 600_000, identity };
@@ -94,21 +94,35 @@ describe('application state controller', () => {
       requestedCapabilities: ['mail.read'], capabilities: ['mail.read'], identity,
       displayName: 'Verified User', email: 'user@example.com',
     };
-    let page = 0;
+    let backfillCalls = 0;
+    let mailboxCalls = 0;
     let resumedCursor: string | undefined;
+    let legacyMailCalls = 0;
+    let lastCursor: string | undefined;
+    let lastRequestedRange: { from: string; through: string } | undefined;
+    let failNextMail = false;
+    let nextLane: 'head' | 'backfill' = 'head';
+    let summary = { id: 'provider-message', idFormat: 'gmail' as const, subject: 'Meeting', receivedAt: '2026-10-12T01:00:00Z', senderEmail: 'sam@example.com', isRead: false, replyMetadataComplete: true, internetMessageId: '<msg@example.com>', to: ['me@example.com'] };
     const connector = {
       async verifyOAuthIdentity() { return true; },
-      async syncMessages(_account: unknown, options: { cursor?: string; onPage?: (items: unknown[], cursor?: string, pages?: number) => unknown }) {
-        resumedCursor = options.cursor;
-        page++;
-        const cursor = page === 1 ? 'saved-cursor' : undefined;
-        await options.onPage?.([{ id: 'provider-message', subject: 'Meeting', receivedAt: '2026-10-12T01:00:00Z' }], cursor, 1);
-        return { items: [], nextCursor: cursor, pagesRead: 1, partial: Boolean(cursor) };
+      async syncMessages() { legacyMailCalls++; throw new Error('Legacy mailbox sync must not be used.'); },
+      async syncMessageWindow(_account: unknown, options: { timeMin: string; timeMax: string; cursor?: string; pageSize?: number; onPage?: (items: unknown[], cursor: string | undefined, pages: number, metadata: { unavailableIds: string[]; window: { from: string; to: string }; queryFingerprint: string }) => unknown }) {
+        if (failNextMail) { failNextMail = false; throw new Error('provider unavailable'); }
+        expect(options.pageSize).toBe(5);
+        const descriptor = describeMessageWindowQuery(account, { timeMin: options.timeMin, timeMax: options.timeMax, pageSize: options.pageSize });
+        lastRequestedRange = { from: options.timeMin, through: options.timeMax };
+        const isBackfill = nextLane === 'backfill';
+        mailboxCalls++;
+        const cursor = isBackfill && backfillCalls === 0 ? 'saved-backfill-cursor' : undefined;
+        if (isBackfill) { resumedCursor = options.cursor; backfillCalls++; }
+        lastCursor = options.cursor;
+        await options.onPage?.([summary], cursor, 1, { unavailableIds: [], window: { from: descriptor.window.from, to: descriptor.window.to }, queryFingerprint: descriptor.queryFingerprint });
+        return { items: [summary], nextCursor: cursor, pagesRead: 1, partial: Boolean(cursor), window: descriptor.window, queryFingerprint: descriptor.queryFingerprint, unavailableIds: [] };
       },
-      async listCalendars() { return { items: [], pagesRead: 1, partial: false }; },
-      async readCalendarEvents() { throw new Error('No calendars should be requested.'); },
+      async listCalendars() { throw new Error('A mailbox-only account should not list calendars.'); },
+      async readCalendarEvents() { throw new Error('A mailbox-only account should not read calendar events.'); },
     };
-    const app = new AppControllerImpl(store, {}, {
+    let app = new AppControllerImpl(store, {}, {
       tokenStore,
       deleteToken: async () => undefined,
       clientIds: { google: 'google-client' },
@@ -118,14 +132,235 @@ describe('application state controller', () => {
     await app.load();
     const account = await app.installVerifiedAccount({ provider: 'google', displayName: 'Ignored label', email: 'other@example.com' }, result);
     expect(account).toMatchObject({ connected: true, authStatus: 'connected', email: 'user@example.com', capabilities: ['mail.read'] });
-    const partial = await app.syncAccount(account.id);
-    expect(partial).toMatchObject({ status: 'partial', messagesCursor: 'saved-cursor', messagesPartial: true });
+    await expect(app.syncAccount(account.id)).rejects.toThrow(/Refresh inbox or Continue backfill/);
+    nextLane = 'head';
+    const head = await app.refreshMailHead(account.id);
+    expect(head).toMatchObject({ status: 'complete', lane: 'head' });
     expect(app.getSnapshot().mailbox).toHaveLength(1);
-    await expect(app.syncAccount(account.id)).rejects.toThrow(/Choose Continue/);
-    const complete = await app.syncAccount(account.id, { continue: true });
-    expect(resumedCursor).toBe('saved-cursor');
-    expect(complete).toMatchObject({ status: 'idle', messagesPartial: false });
+    expect(app.getSnapshot().mailbox[0]).toMatchObject({ idFormat: 'gmail', senderEmail: 'sam@example.com', isRead: false, replyMetadataComplete: true, to: ['me@example.com'] });
+    const note = await app.saveNote({ transcript: 'Please review the Meeting message from provider-message.' });
+    const sourceId = `mail:${encodeURIComponent('google:google-client:provider-subject:')}:${encodeURIComponent('provider-message')}`;
+    const storedNote = store.value!.notes.find((item) => item.id === note.id)!;
+    storedNote.analysis = { stale: false, sourceVersions: { [sourceId]: `0:${'a'.repeat(64)}` } } as never;
+    app = new AppControllerImpl(store, {}, {
+      tokenStore, deleteToken: async () => undefined, clientIds: { google: 'google-client' },
+      verifyOAuthResult: async () => true, connectorFactory: () => connector as never,
+    });
+    await app.load();
+    nextLane = 'head';
+    await app.refreshMailHead(account.id);
+    expect(app.getSnapshot().notes.find((item) => item.id === note.id)?.analysis?.stale).toBe(false);
+    summary = { ...summary, subject: 'Changed meeting title' };
+    nextLane = 'head';
+    await app.refreshMailHead(account.id);
+    expect(app.getSnapshot().notes.find((item) => item.id === note.id)?.analysis?.stale).toBe(true);
+    const coverageBeforeBackfill = app.getSnapshot().syncStates[account.id].mailBackfill.coverage;
+    nextLane = 'backfill';
+    const partial = await app.continueMailBackfill(account.id);
+    expect(partial).toMatchObject({ status: 'partial', state: { mailBackfill: { status: 'partial', activeWindow: { cursor: 'saved-backfill-cursor' } } } });
+    expect(partial.state.mailBackfill.coverage?.through).toBe(coverageBeforeBackfill?.through);
+    expect(Date.parse(partial.state.mailBackfill.coverage!.from)).toBeGreaterThanOrEqual(Date.parse(coverageBeforeBackfill!.from));
+    const capturedPartialWindow = partial.state.mailBackfill.activeWindow;
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(Date.parse(capturedPartialWindow!.through) + 2 * 86_400_000));
+    nextLane = 'backfill';
+    let complete;
+    try {
+      complete = await app.continueMailBackfill(account.id);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(resumedCursor).toBe('saved-backfill-cursor');
+    expect(lastRequestedRange).toEqual({ from: capturedPartialWindow!.from, through: capturedPartialWindow!.through });
+    expect(complete).toMatchObject({ status: 'complete', state: { mailBackfill: { status: 'idle', coverage: { from: expect.any(String), through: expect.any(String) } } } });
     expect(app.getSnapshot().mailbox).toHaveLength(1);
+    expect(legacyMailCalls).toBe(0);
+    const callsBeforeCooldown = mailboxCalls;
+    const foreground = await app.refreshForegroundMail();
+    expect(foreground).toMatchObject({ attempted: [], skipped: [{ accountId: account.id }] });
+    expect(mailboxCalls).toBe(callsBeforeCooldown);
+    nextLane = 'head';
+    await app.refreshMailHead(account.id, { reason: 'manual' });
+    expect(mailboxCalls).toBe(callsBeforeCooldown + 1);
+    expect(lastCursor).toBeUndefined();
+    const lastGoodCheck = app.getSnapshot().syncStates[account.id].mailHead.lastPageCheckedAt;
+    failNextMail = true;
+    nextLane = 'head';
+    const failed = await app.refreshMailHead(account.id);
+    expect(failed).toMatchObject({ status: 'error', message: 'provider unavailable' });
+    expect(failed.state.mailHead.lastPageCheckedAt).toBe(lastGoodCheck);
+    expect(failed.state.mailHead.lastAttemptAt).toEqual(expect.any(String));
+
+    const persisted = store.value!;
+    persisted.syncStates[account.id].mailBackfill = {
+      status: 'partial', activeWindow: {
+        from: '2026-09-20T00:00:00.000Z', through: '2026-09-21T00:00:00.000Z', pageSize: 5,
+        queryFingerprint: 'stale-identity-or-window', cursor: 'saved-cursor',
+      },
+    };
+    await store.save(persisted);
+    const restored = new AppControllerImpl(store, {}, {
+      tokenStore, deleteToken: async () => undefined, clientIds: { google: 'google-client' },
+      verifyOAuthResult: async () => true, connectorFactory: () => connector as never,
+    });
+    await restored.load();
+    const callsBeforeInvalidCursor = mailboxCalls;
+    nextLane = 'backfill';
+    const invalid = await restored.continueMailBackfill(account.id);
+    expect(invalid.status).toBe('complete');
+    expect(mailboxCalls).toBe(callsBeforeInvalidCursor + 1);
+    expect(restored.getSnapshot().syncStates[account.id].mailBackfill.activeWindow).toBeUndefined();
+    expect(restored.getSnapshot().syncStates[account.id].mailBackfill.olderHistoryNotCheckedBefore).toBe(lastRequestedRange!.from);
+
+    const oldCoverage = structuredClone(store.value!);
+    oldCoverage.syncStates[account.id].mailBackfill = {
+      status: 'idle', coverage: { from: '2024-01-01T00:00:00.000Z', through: '2024-01-14T00:00:00.000Z' },
+      coverageNeededThrough: '2024-03-01T00:00:00.000Z',
+    };
+    await store.save(oldCoverage);
+    const longAbsence = new AppControllerImpl(store, {}, {
+      tokenStore, deleteToken: async () => undefined, clientIds: { google: 'google-client' },
+      verifyOAuthResult: async () => true, connectorFactory: () => connector as never,
+    });
+    await longAbsence.load();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2028-11-01T00:00:00.000Z'));
+    nextLane = 'backfill';
+    let recovered;
+    try {
+      recovered = await longAbsence.continueMailBackfill(account.id);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(recovered.status).toBe('complete');
+    expect(Date.parse(lastRequestedRange!.through) - Date.parse(lastRequestedRange!.from)).toBeLessThanOrEqual(14 * 86_400_000);
+    expect(recovered.state.mailBackfill.olderHistoryNotCheckedBefore).toBe(lastRequestedRange!.from);
+  });
+
+  it('limits foreground mailbox refresh to two accounts and excludes another active lane', async () => {
+    const store = new MemoryStore();
+    const tokens = new Map<string, StoredOAuthToken>();
+    const tokenStore = {
+      async get(ref: string) { return tokens.get(ref) ? structuredClone(tokens.get(ref)!) : null; },
+      async set(ref: string, value: StoredOAuthToken) { tokens.set(ref, structuredClone(value)); },
+    };
+    let calls = 0;
+    let entered: (() => void) | undefined;
+    let finish: (() => void) | undefined;
+    const entry = new Promise<void>((resolve) => { entered = resolve; });
+    const gate = new Promise<void>((resolve) => { finish = resolve; });
+    const connector = {
+      async verifyOAuthIdentity() { return true; },
+      async syncMessageWindow(account: Parameters<typeof describeMessageWindowQuery>[0], options: { timeMin: string; timeMax: string; pageSize?: number; onPage?: (items: unknown[], cursor: undefined, pages: number, metadata: { unavailableIds: string[]; window: { from: string; to: string }; queryFingerprint: string }) => unknown }) {
+        calls++;
+        const descriptor = describeMessageWindowQuery(account, options);
+        await options.onPage?.([], undefined, 1, { unavailableIds: [], window: descriptor.window, queryFingerprint: descriptor.queryFingerprint });
+        if (calls === 1) { entered?.(); await gate; }
+        return { items: [], pagesRead: 1, partial: false, window: descriptor.window, queryFingerprint: descriptor.queryFingerprint, unavailableIds: [] };
+      },
+      async syncMessages() { throw new Error('Legacy mailbox API must not run.'); },
+      async listCalendars() { return { items: [], pagesRead: 1, partial: false }; },
+      async readCalendarEvents() { throw new Error('No calendar reads expected.'); },
+    };
+    const app = new AppControllerImpl(store, {}, {
+      tokenStore,
+      deleteToken: async () => undefined,
+      clientIds: { google: 'google-client' }, verifyOAuthResult: async () => true,
+      connectorFactory: () => connector as never,
+    });
+    await app.load();
+    const ids: string[] = [];
+    for (let index = 0; index < 3; index++) {
+      const identity = { providerNamespace: 'google' as const, clientId: 'google-client', subject: `subject-${index}` };
+      const installed = await app.installVerifiedAccount({ provider: 'google', displayName: `Account ${index}`, email: `a${index}@example.com` }, {
+        provider: 'google', accessToken: `access-${index}`, expiresAt: Date.now() + 600_000,
+        grantedScopes: ['openid', 'https://www.googleapis.com/auth/gmail.readonly'], requestedCapabilities: ['mail.read'], capabilities: ['mail.read'],
+        identity, displayName: `Account ${index}`, email: `a${index}@example.com`,
+      });
+      ids.push(installed.id);
+    }
+    const first = app.refreshMailHead(ids[0]);
+    await entry;
+    await expect(app.continueMailBackfill(ids[0])).rejects.toThrow(/Another sync lane/);
+    const foregroundWhileBusy = await app.refreshForegroundMail();
+    expect(foregroundWhileBusy.attempted).toEqual(ids.slice(1));
+    expect(foregroundWhileBusy.skipped).toContainEqual({ accountId: ids[0], reason: 'another sync lane is active for this account' });
+    expect(foregroundWhileBusy.results).toHaveLength(2);
+    const sameLane = app.refreshMailHead(ids[0]);
+    finish?.();
+    await Promise.all([first, sameLane]);
+    expect(calls).toBe(3);
+  });
+
+  it('migrates legacy Microsoft mailbox cursors and marks dependent analysis stale once', async () => {
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store);
+    await app.load();
+    const account = await app.saveAccount({ provider: 'microsoft', displayName: 'Outlook', email: 'user@example.com' });
+    const note = await app.saveNote({ transcript: 'Reply to the supplier.' });
+    const legacy = structuredClone(app.getSnapshot()) as unknown as Omit<AppState, 'mailboxSchemaVersion'> & { mailboxSchemaVersion: number };
+    (legacy.notes.find((item) => item.id === note.id) as unknown as { analysis: { stale: boolean; sourceVersions: Record<string, string> } }).analysis = {
+      stale: false, sourceVersions: { 'mail:legacy-user:old-message': '0:abc' },
+    };
+    legacy.mailboxSchemaVersion = 1;
+    legacy.mailbox = [{ id: 'old', accountId: account.id, providerMessageId: 'mutable-graph-id', identityKey: 'legacy-user:mutable-graph-id', subject: 'Legacy', receivedAt: '2026-10-10T00:00:00Z' }];
+    legacy.syncStates[account.id] ??= {
+      accountId: account.id, status: 'idle', mailHead: { status: 'idle' }, mailBackfill: { status: 'idle' },
+      messagesPartial: false, calendarsPartial: false, eventCursors: {}, eventsCompletedAt: {},
+    };
+    legacy.syncStates[account.id].messagesCursor = 'old-cursor';
+    legacy.syncStates[account.id].messagesPartial = true;
+    store.value = legacy as AppState;
+    const migrated = new AppControllerImpl(store);
+    await migrated.load();
+    expect(migrated.getSnapshot().mailbox).toEqual([]);
+    expect(migrated.getSnapshot().syncStates[account.id]).toMatchObject({ messagesCursor: undefined, messagesPartial: false });
+    expect(migrated.getSnapshot().notes[0].analysis?.stale).toBe(true);
+    expect(migrated.getSnapshot().mailboxSchemaVersion).toBe(2);
+
+    store.value!.mailbox = [{ id: 'new', accountId: account.id, providerMessageId: 'new-immutable-id', identityKey: 'verified-user:new-immutable-id' }];
+    const afterMigration = new AppControllerImpl(store);
+    await afterMigration.load();
+    expect(afterMigration.getSnapshot().mailbox).toHaveLength(1);
+  });
+
+  it('discards a mailbox page that returns after its verified connection is disconnected', async () => {
+    const store = new MemoryStore();
+    const identity = { providerNamespace: 'google' as const, clientId: 'google-client', subject: 'disconnect-race' };
+    const token: StoredOAuthToken = { accessToken: 'race-access', expiresAt: Date.now() + 600_000, identity };
+    let entered: (() => void) | undefined;
+    let release: (() => void) | undefined;
+    const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const connector = {
+      async verifyOAuthIdentity() { return true; },
+      async syncMessageWindow(account: Parameters<typeof describeMessageWindowQuery>[0], options: { timeMin: string; timeMax: string; pageSize?: number; onPage?: (items: unknown[], cursor: undefined, pages: number, metadata: { unavailableIds: string[]; window: { from: string; to: string }; queryFingerprint: string }) => unknown }) {
+        entered?.(); await gate;
+        const descriptor = describeMessageWindowQuery(account, options);
+        await options.onPage?.([{ id: 'late-message', idFormat: 'gmail', subject: 'Late page', replyMetadataComplete: true }], undefined, 1, { unavailableIds: [], window: descriptor.window, queryFingerprint: descriptor.queryFingerprint });
+        return { items: [], pagesRead: 1, partial: false, window: descriptor.window, queryFingerprint: descriptor.queryFingerprint, unavailableIds: [] };
+      },
+      async listCalendars() { throw new Error('No calendar sync expected.'); },
+      async readCalendarEvents() { throw new Error('No calendar sync expected.'); },
+    };
+    const app = new AppControllerImpl(store, {}, {
+      tokenStore: { async get() { return structuredClone(token); }, async set() {} },
+      deleteToken: async () => undefined, clientIds: { google: 'google-client' }, verifyOAuthResult: async () => true,
+      connectorFactory: () => connector as never,
+    });
+    await app.load();
+    const account = await app.installVerifiedAccount({ provider: 'google', displayName: 'Race', email: 'race@example.com' }, {
+      provider: 'google', accessToken: token.accessToken, expiresAt: token.expiresAt,
+      grantedScopes: ['openid', 'https://www.googleapis.com/auth/gmail.readonly'], requestedCapabilities: ['mail.read'], capabilities: ['mail.read'],
+      identity, displayName: 'Race', email: 'race@example.com',
+    });
+    const pending = app.refreshMailHead(account.id);
+    await enteredPromise;
+    await app.disconnectAccount(account.id);
+    release?.();
+    await expect(pending).rejects.toThrow(/connection changed/i);
+    expect(app.getSnapshot().mailbox).toEqual([]);
+    expect(app.getSnapshot().syncStates[account.id].mailHead).toMatchObject({ status: 'error' });
   });
 
   it('stages OAuth credentials in the controller and durably replaces the prior token only after verification', async () => {
@@ -209,7 +444,7 @@ describe('application state controller', () => {
     Object.assign(persisted.accounts[0], { connected: true, authStatus: 'connected', identity, tokenRef: 'mail-token', capabilities: ['mail.read'], capabilityLimits: ['mail.read'] });
     const accountIdentity = 'google:google-client:mail-subject:';
     persisted.mailbox = [
-      { id: 'valid-row', accountId: account.id, providerMessageId: 'provider-message', identityKey: `${accountIdentity}:provider-message`, subject: 'Shipment update', from: 'store@example.com', receivedAt: '2026-10-12T01:00:00Z', snippet: 'Your package is arriving today.' },
+      { id: 'valid-row', accountId: account.id, providerMessageId: 'provider-message', identityKey: `${accountIdentity}:provider-message`, subject: 'Shipment update', from: 'store@example.com', receivedAt: '2026-10-12T01:00:00Z', snippet: 'Your package is arriving today.', replyMetadataComplete: true },
       { id: 'wrong-row', accountId: account.id, providerMessageId: 'other-message', identityKey: 'different-account:other-message', subject: 'Private', snippet: 'Must not be included.' },
     ];
     const fetcher = async () => new Response(JSON.stringify({ output: [{ content: [{ type: 'output_text', text: JSON.stringify({

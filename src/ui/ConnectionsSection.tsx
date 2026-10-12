@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import { Platform, Pressable, Text, View } from "react-native";
-import type { Account, AccountCapability } from "../core";
+import type { Account, AccountCapability, AccountSyncState } from "../core";
+import { MailSyncControls } from "./MailSyncControls";
 import {
   configuredProviderAuth,
   scopesFor,
@@ -45,7 +46,9 @@ const options: { id: AuthCapability; title: string; description: string }[] = [
 
 type ConnectionsProps = {
   accounts: Account[];
+  syncStates: Record<string, AccountSyncState>;
   busy: boolean;
+  demoMode: boolean;
   onConnect: (
     provider: OAuthProvider,
     capabilities: AccountCapability[],
@@ -53,14 +56,20 @@ type ConnectionsProps = {
   ) => Promise<void>;
   onDisconnect: (accountId: string) => Promise<void>;
   onSync: (accountId: string, continueSync: boolean) => Promise<void>;
+  onRefreshMail: (accountId: string) => void;
+  onContinueMail: (accountId: string) => void;
 };
 
 export function ConnectionsSection({
   accounts,
+  syncStates,
   busy,
+  demoMode,
   onConnect,
   onDisconnect,
   onSync,
+  onRefreshMail,
+  onContinueMail,
 }: ConnectionsProps) {
   const [selected, setSelected] = useState<
     Record<OAuthProvider, AuthCapability[]>
@@ -97,11 +106,13 @@ export function ConnectionsSection({
               {provider === "google" ? "Google" : "Microsoft"}
             </Text>
             <Text style={styles.copy}>
-              {googleWeb
-                ? "Connect Google from the iOS app."
-                : ready
-                  ? "App registration configured for this platform."
-                  : `Not configured · add a public ${Platform.OS === "web" ? "web" : "native"} OAuth client ID and exact redirect URI to the build environment.`}
+              {demoMode
+                ? "Account authorization is disabled in the local sample."
+                : googleWeb
+                  ? "Connect Google from the iOS app."
+                  : ready
+                    ? "App registration configured for this platform."
+                    : `Not configured · add a public ${Platform.OS === "web" ? "web" : "native"} OAuth client ID and exact redirect URI to the build environment.`}
             </Text>
             <Text style={styles.scopeHeading}>Requested access</Text>
             {options.map((option) => {
@@ -112,6 +123,7 @@ export function ConnectionsSection({
                   accessibilityRole="checkbox"
                   accessibilityLabel={`${provider} ${option.title}`}
                   accessibilityState={{ checked }}
+                  disabled={demoMode}
                   onPress={() =>
                     setSelected((current) => {
                       let values = checked
@@ -154,6 +166,7 @@ export function ConnectionsSection({
               accessibilityRole="button"
               accessibilityLabel={`Show ${provider} OAuth registration details`}
               accessibilityState={{ expanded: details[provider] }}
+              disabled={demoMode}
               onPress={() =>
                 setDetails((current) => ({
                   ...current,
@@ -205,13 +218,19 @@ export function ConnectionsSection({
               accessibilityRole="button"
               accessibilityLabel={`Add ${provider} account`}
               accessibilityState={{
-                disabled: busy || !ready || selected[provider].length === 0,
+                disabled:
+                  demoMode || busy || !ready || selected[provider].length === 0,
               }}
-              disabled={busy || !ready || selected[provider].length === 0}
+              disabled={
+                demoMode || busy || !ready || selected[provider].length === 0
+              }
               onPress={() => onConnect(provider, selected[provider])}
               style={[
                 styles.connectButton,
-                (busy || !ready || selected[provider].length === 0) &&
+                (demoMode ||
+                  busy ||
+                  !ready ||
+                  selected[provider].length === 0) &&
                   styles.connectButtonDisabled,
               ]}
             >
@@ -219,72 +238,102 @@ export function ConnectionsSection({
                 Add {provider} account
               </Text>
             </Pressable>
-            {!ready ? (
+            {demoMode ? (
               <Text style={styles.notice}>
-                {googleWeb
-                  ? "Google connection is available in the iOS build."
-                  : "Add setup values to enable sign-in. This does not connect an account."}
+                Sample account only · sign-in and credential entry are disabled.
+              </Text>
+            ) : !ready ? (
+              <Text style={styles.notice}>
+                {demoMode
+                  ? "Sample account only · sign-in and credential entry are disabled."
+                  : googleWeb
+                    ? "Google connection is available in the iOS build."
+                    : "Add setup values to enable sign-in. This does not connect an account."}
               </Text>
             ) : null}
             {configuredAccounts.map((account) => (
               <View key={account.id} style={styles.accountRow}>
                 <Text style={styles.accountEmail}>
-                  {account.displayName || account.email} · {account.email}
+                  {demoMode
+                    ? `Sample account · ${account.email}`
+                    : `${account.displayName || account.email} · ${account.email}`}
                 </Text>
                 <Text style={styles.detail}>
-                  {account.connected
-                    ? `Verified${account.lastSyncedAt ? ` · synced ${new Date(account.lastSyncedAt).toLocaleString()}` : " · not synced yet"}`
-                    : account.authStatus === "reauth_required"
-                      ? "Reconnect required"
-                      : "Configured · not connected"}
+                  {demoMode && account.connected
+                    ? "Sample connection · read only"
+                    : account.connected
+                      ? `Verified${account.lastSyncedAt ? ` · synced ${new Date(account.lastSyncedAt).toLocaleString()}` : " · not synced yet"}`
+                      : account.authStatus === "reauth_required"
+                        ? "Reconnect required"
+                        : "Configured · not connected"}
                 </Text>
                 {account.connected ? (
                   <View style={styles.accountActions}>
-                    <Pressable
-                      accessibilityRole="button"
-                      accessibilityLabel={`Sync ${account.email}`}
-                      accessibilityState={{ disabled: busy }}
-                      disabled={busy}
-                      onPress={() => onSync(account.id, false)}
-                      style={styles.actionButton}
-                    >
-                      <Text style={styles.actionText}>Sync</Text>
-                    </Pressable>
-                    {account.syncStatus === "partial" ? (
+                    {account.capabilities?.includes("calendar.read") ? (
                       <Pressable
                         accessibilityRole="button"
-                        accessibilityLabel={`Continue syncing ${account.email}`}
+                        accessibilityLabel={`Sync calendars for ${account.email}`}
+                        accessibilityState={{ disabled: busy }}
+                        disabled={busy}
+                        onPress={() => onSync(account.id, false)}
+                        style={styles.actionButton}
+                      >
+                        <Text style={styles.actionText}>Sync calendars</Text>
+                      </Pressable>
+                    ) : null}
+                    {account.capabilities?.includes("calendar.read") &&
+                    syncStates[account.id]?.status === "partial" ? (
+                      <Pressable
+                        accessibilityRole="button"
+                        accessibilityLabel={`Continue calendar sync for ${account.email}`}
                         accessibilityState={{ disabled: busy }}
                         disabled={busy}
                         onPress={() => onSync(account.id, true)}
                         style={styles.actionButton}
                       >
-                        <Text style={styles.actionText}>Continue</Text>
+                        <Text style={styles.actionText}>
+                          Continue calendars
+                        </Text>
                       </Pressable>
                     ) : null}
-                    <Pressable
-                      accessibilityRole="button"
-                      accessibilityLabel={`Reconnect ${account.email}`}
-                      accessibilityState={{ disabled: busy || !ready }}
-                      disabled={busy || !ready}
-                      onPress={() =>
-                        onConnect(provider, selected[provider], account.id)
-                      }
-                      style={styles.actionButton}
-                    >
-                      <Text style={styles.actionText}>Reconnect</Text>
-                    </Pressable>
-                    <Pressable
-                      accessibilityRole="button"
-                      accessibilityLabel={`Disconnect ${account.email}`}
-                      accessibilityState={{ disabled: busy }}
-                      disabled={busy}
-                      onPress={() => onDisconnect(account.id)}
-                      style={styles.actionButton}
-                    >
-                      <Text style={styles.actionText}>Disconnect</Text>
-                    </Pressable>
+                    {!demoMode ? (
+                      <Pressable
+                        accessibilityRole="button"
+                        accessibilityLabel={`Reconnect ${account.email}`}
+                        accessibilityState={{ disabled: busy || !ready }}
+                        disabled={busy || !ready}
+                        onPress={() =>
+                          onConnect(provider, selected[provider], account.id)
+                        }
+                        style={styles.actionButton}
+                      >
+                        <Text style={styles.actionText}>Reconnect</Text>
+                      </Pressable>
+                    ) : null}
+                    {!demoMode ? (
+                      <Pressable
+                        accessibilityRole="button"
+                        accessibilityLabel={`Disconnect ${account.email}`}
+                        accessibilityState={{ disabled: busy }}
+                        disabled={busy}
+                        onPress={() => onDisconnect(account.id)}
+                        style={styles.actionButton}
+                      >
+                        <Text style={styles.actionText}>Disconnect</Text>
+                      </Pressable>
+                    ) : null}
                   </View>
+                ) : null}
+                {account.connected &&
+                account.capabilities?.includes("mail.read") ? (
+                  <MailSyncControls
+                    accountId={account.id}
+                    email={account.email}
+                    syncState={syncStates[account.id]}
+                    busy={busy}
+                    onRefresh={onRefreshMail}
+                    onContinue={onContinueMail}
+                  />
                 ) : null}
                 {account.syncStatus === "partial" ? (
                   <Text style={styles.notice}>
@@ -303,9 +352,9 @@ export function ConnectionsSection({
         );
       })}
       <Text style={styles.notice}>
-        Browser access and credentials are memory-only. Native tokens will use
-        Keychain/Keystore only after the connector verifies the account against
-        the provider resource. Request only the access you intend to use.
+        {demoMode
+          ? "Provider sign-in, credential entry, and account changes are disabled in this sample. Mail shown here comes only from a local fixture."
+          : "Browser access and credentials are memory-only. Native tokens will use Keychain/Keystore only after the connector verifies the account against the provider resource. Request only the access you intend to use."}
       </Text>
     </View>
   );

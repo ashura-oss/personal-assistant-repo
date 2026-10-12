@@ -218,11 +218,26 @@ export interface MailboxSnapshotMessage {
   accountId: string;
   providerMessageId: string;
   identityKey: string;
+  verifiedIdentityKey?: string;
+  connectionGeneration?: number;
+  idFormat?: 'gmail' | 'graph-immutable';
   threadId?: string;
   subject?: string;
   from?: string;
+  senderEmail?: string;
   receivedAt?: string;
   snippet?: string;
+  isRead?: boolean;
+  replyMetadataComplete?: boolean;
+  internetMessageId?: string;
+  providerVersion?: string;
+  replyTo?: string[];
+  to?: string[];
+  cc?: string[];
+  references?: string;
+  inReplyTo?: string;
+  headers?: { name: string; value: string }[];
+  observedAt?: string;
   providerDeletedAt?: string;
 }
 
@@ -235,12 +250,71 @@ export interface CalendarEventSnapshot {
   start?: string;
   end?: string;
   timeZone?: string;
+  startUtcCertified?: boolean;
+  endUtcCertified?: boolean;
+  observedAt?: string;
+  verifiedIdentityKey?: string;
+  connectionGeneration?: number;
   providerDeletedAt?: string;
+}
+
+export interface MailSyncWindow {
+  from: string;
+  through: string;
+  pageSize: number;
+  queryFingerprint: string;
+  cursor?: string;
+}
+
+export interface MailCoverageInterval {
+  from: string;
+  through: string;
+}
+
+export interface MailHeadLaneState {
+  status: 'idle' | 'syncing' | 'partial' | 'error';
+  lastAttemptAt?: string;
+  lastPageCheckedAt?: string;
+  lastPageSucceededAt?: string;
+  window?: MailSyncWindow;
+  completeWindow?: MailCoverageInterval;
+  unavailableCount?: number;
+  lastError?: string;
+}
+
+export interface MailBackfillLaneState {
+  status: 'idle' | 'syncing' | 'partial' | 'error';
+  activeWindow?: MailSyncWindow;
+  coverage?: MailCoverageInterval;
+  coverageNeededThrough?: string;
+  olderHistoryNotCheckedBefore?: string;
+  lastAttemptAt?: string;
+  lastPageCheckedAt?: string;
+  lastPageSucceededAt?: string;
+  lastCompletedAt?: string;
+  unavailableCount?: number;
+  lastError?: string;
+}
+
+export interface MailLaneResult {
+  accountId: string;
+  lane: 'head' | 'backfill';
+  status: 'complete' | 'partial' | 'error' | 'idle';
+  state: AccountSyncState;
+  message?: string;
+}
+
+export interface ForegroundMailRefreshResult {
+  attempted: string[];
+  skipped: { accountId: string; reason: string }[];
+  results: MailLaneResult[];
 }
 
 export interface AccountSyncState {
   accountId: string;
   status: 'idle' | 'syncing' | 'partial' | 'error';
+  mailHead: MailHeadLaneState;
+  mailBackfill: MailBackfillLaneState;
   messagesCursor?: string;
   messagesCompletedAt?: string;
   messagesPartial: boolean;
@@ -336,6 +410,8 @@ export interface AppState {
    * Any entry blocks new external writes until receipt history is repaired.
    */
   dispatchRecordQuarantine: { reason: 'invalid_persisted_receipt'; quarantinedAt: string; raw: unknown }[];
+  /** Versioned current mailbox metadata cache; this is independent of immutable dispatch history. */
+  mailboxSchemaVersion: 2;
 }
 
 export interface SaveNoteInput {
@@ -395,6 +471,9 @@ export interface AppController {
   disconnectAccount(id: string): Promise<Account>;
   saveCalendar(config: CalendarConfig): Promise<Calendar>;
   syncAccount(id: string, options?: { continue?: boolean }): Promise<AccountSyncState>;
+  refreshMailHead(accountId: string, options?: { reason?: 'manual' | 'foreground' }): Promise<MailLaneResult>;
+  continueMailBackfill(accountId: string): Promise<MailLaneResult>;
+  refreshForegroundMail(): Promise<ForegroundMailRefreshResult>;
   exportData(): Promise<string>;
   deleteNote(id: string): Promise<void>;
 }

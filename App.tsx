@@ -7,6 +7,7 @@ import React, {
 } from "react";
 import {
   ActivityIndicator,
+  AppState as NativeAppState,
   Alert,
   KeyboardAvoidingView,
   Modal,
@@ -27,9 +28,11 @@ import type {
   AppController,
   AccountCapability,
   LocalTask,
+  MailboxSnapshotMessage,
 } from "./src/core";
 import { controller as productionController } from "./src/services/controller";
 import { createDispatchHistoryScenario } from "./src/dev/receiptScenario";
+import { createMailSyncScenario } from "./src/dev/mailSyncScenario";
 import { useAudioCapture } from "./src/audio/useAudioCapture";
 import type { AudioCapture } from "./src/audio/types";
 import {
@@ -41,6 +44,7 @@ import * as FileSystem from "expo-file-system/legacy";
 import * as Sharing from "expo-sharing";
 import { loadAudioForUpload } from "./src/audio/readAudio";
 import { ConnectionsSection } from "./src/ui/ConnectionsSection";
+import { MailboxSection } from "./src/ui/MailboxSection";
 import { ReviewSheet } from "./src/ui/ReviewSheet";
 import { NoteDetail as NoteDetailView } from "./src/ui/NoteDetail";
 import { TasksSection } from "./src/ui/TasksSection";
@@ -55,10 +59,13 @@ import { exchangeAuthorizationCode } from "./src/connectors/oauth";
 
 type Tab = "inbox" | "record" | "library";
 
-const isDispatchHistoryDemo =
-  typeof __DEV__ !== "undefined" &&
-  __DEV__ &&
-  process.env.EXPO_PUBLIC_PREVIEW_SCENARIO === "dispatch-history";
+const previewScenario =
+  typeof __DEV__ !== "undefined" && __DEV__
+    ? process.env.EXPO_PUBLIC_PREVIEW_SCENARIO
+    : undefined;
+const isDispatchHistoryDemo = previewScenario === "dispatch-history";
+const isMailSyncDemo = previewScenario === "mail-sync";
+const isIsolatedDemo = isDispatchHistoryDemo || isMailSyncDemo;
 
 function useAppState(appController: AppController) {
   return useSyncExternalStore(
@@ -225,15 +232,14 @@ export default function App() {
   const [controller, setController] =
     useState<AppController>(productionController);
   const state = useAppState(controller);
-  const [tab, setTab] = useState<Tab>(
-    isDispatchHistoryDemo ? "inbox" : "record",
-  );
+  const [tab, setTab] = useState<Tab>(isIsolatedDemo ? "inbox" : "record");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [detail, setDetail] = useState<Note | null>(null);
   const [review, setReview] = useState<Proposal | null>(null);
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
+  const foregroundMailBusy = useRef(false);
   const audio = useAudioCapture();
   const [inboxFilter, setInboxFilter] = useState<"pending" | "done">(
     isDispatchHistoryDemo ? "done" : "pending",
@@ -273,7 +279,9 @@ export default function App() {
       try {
         const selected = isDispatchHistoryDemo
           ? await createDispatchHistoryScenario()
-          : productionController;
+          : isMailSyncDemo
+            ? await createMailSyncScenario()
+            : productionController;
         if (!mounted) return;
         setController(selected);
         await selected.load();
@@ -553,6 +561,54 @@ export default function App() {
     },
     [],
   );
+  const refreshForegroundMail = useCallback(async () => {
+    if (isIsolatedDemo || loading || foregroundMailBusy.current) return;
+    foregroundMailBusy.current = true;
+    try {
+      await controller.refreshForegroundMail();
+    } catch (error) {
+      setNotice(messageOf(error));
+    } finally {
+      foregroundMailBusy.current = false;
+    }
+  }, [controller, loading]);
+
+  useEffect(() => {
+    if (loading || isIsolatedDemo) return;
+    const initialRefresh = setTimeout(() => {
+      void refreshForegroundMail();
+    }, 0);
+
+    let previousNativeState = NativeAppState.currentState;
+    const nativeSubscription = NativeAppState.addEventListener(
+      "change",
+      (nextState) => {
+        if (previousNativeState !== "active" && nextState === "active") {
+          void refreshForegroundMail();
+        }
+        previousNativeState = nextState;
+      },
+    );
+
+    let removeWebListener: (() => void) | undefined;
+    if (Platform.OS === "web" && typeof document !== "undefined") {
+      let wasVisible = document.visibilityState === "visible";
+      const onVisibilityChange = () => {
+        const isVisible = document.visibilityState === "visible";
+        if (!wasVisible && isVisible) void refreshForegroundMail();
+        wasVisible = isVisible;
+      };
+      document.addEventListener("visibilitychange", onVisibilityChange);
+      removeWebListener = () =>
+        document.removeEventListener("visibilitychange", onVisibilityChange);
+    }
+
+    return () => {
+      clearTimeout(initialRefresh);
+      nativeSubscription.remove();
+      removeWebListener?.();
+    };
+  }, [loading, refreshForegroundMail]);
   const openNote = (note: Note) => {
     setDetail(note);
     setTab("record");
@@ -615,8 +671,8 @@ export default function App() {
       capabilities: AccountCapability[],
       accountId?: string,
     ) => {
-      if (isDispatchHistoryDemo) {
-        setNotice("Account connections are disabled in sample history mode.");
+      if (isIsolatedDemo) {
+        setNotice("Account connections are disabled in the sample preview.");
         return;
       }
       await run(async () => {
@@ -690,6 +746,36 @@ export default function App() {
     },
     [run, controller],
   );
+  const refreshMailHead = useCallback(
+    (accountId: string) => {
+      void run(async () => {
+        const result = await controller.refreshMailHead(accountId, {
+          reason: "manual",
+        });
+        setNotice(
+          result.message ??
+            (result.status === "error"
+              ? "Recent mail could not be checked. Review the account and try again."
+              : "Recent mail check finished."),
+        );
+      });
+    },
+    [controller, run],
+  );
+  const continueMailBackfill = useCallback(
+    (accountId: string) => {
+      void run(async () => {
+        const result = await controller.continueMailBackfill(accountId);
+        setNotice(
+          result.message ??
+            (result.status === "error"
+              ? "Older mail could not be loaded. Review the account and try again."
+              : "Older mail scan updated."),
+        );
+      });
+    },
+    [controller, run],
+  );
 
   return (
     <SafeAreaProvider>
@@ -706,10 +792,12 @@ export default function App() {
               onPress={() => setSettingsOpen(true)}
             />
           </View>
-          {isDispatchHistoryDemo ? (
+          {isIsolatedDemo ? (
             <View style={s.notice}>
               <Text style={s.noticeText}>
-                Sample history · no external actions
+                {isDispatchHistoryDemo
+                  ? "Sample history · no external actions"
+                  : "Sample mail · no external actions"}
               </Text>
             </View>
           ) : null}
@@ -907,15 +995,15 @@ export default function App() {
               <RecordScreen
                 audio={audio}
                 busy={busy}
-                demoMode={isDispatchHistoryDemo}
+                demoMode={isIsolatedDemo}
                 recent={notes.slice(0, 3)}
                 onOpen={openNote}
                 onSeeAll={() => setTab("library")}
                 onWrite={() => setManualOpen(true)}
                 onStart={() =>
-                  isDispatchHistoryDemo
+                  isIsolatedDemo
                     ? setNotice(
-                        "Microphone recording is disabled in sample history mode.",
+                        "Microphone recording is disabled in the sample preview.",
                       )
                     : run(() => audio.start())
                 }
@@ -928,6 +1016,7 @@ export default function App() {
               <InboxScreen
                 proposals={proposals}
                 accounts={state.accounts}
+                mailbox={state.mailbox}
                 filter={inboxFilter}
                 setFilter={setInboxFilter}
                 mode={state.settings.mode}
@@ -941,6 +1030,7 @@ export default function App() {
                 docs={state.documents}
                 tasks={state.tasks}
                 busy={busy}
+                demoMode={isIsolatedDemo}
                 onComplete={(id) =>
                   run(async () => {
                     await controller.completeTask(id);
@@ -961,8 +1051,9 @@ export default function App() {
                   setDoc(existing ?? d);
                   setDocDraft(existing?.content ?? d.content);
                 }}
-                onExport={() =>
-                  run(async () => {
+                onExport={() => {
+                  if (isIsolatedDemo) return;
+                  void run(async () => {
                     const data = await controller.exportData();
                     if (Platform.OS === "web")
                       downloadText(
@@ -978,8 +1069,8 @@ export default function App() {
                         dialogTitle: "Export Still data",
                       });
                     }
-                  })
-                }
+                  });
+                }}
               />
             )}
           </View>
@@ -1034,7 +1125,9 @@ export default function App() {
               onConnect={connectAccount}
               onDisconnect={disconnectAccount}
               onSync={syncAccount}
-              demoMode={isDispatchHistoryDemo}
+              onRefreshMail={refreshMailHead}
+              onContinueMail={continueMailBackfill}
+              demoMode={isIsolatedDemo}
             />
           </SafeAreaView>
         </Modal>
@@ -1249,7 +1342,7 @@ function RecordScreen({
             </View>
             <Text style={s.micTitle}>Recording disabled</Text>
             <Text style={s.micSub}>
-              Sample history mode never requests microphone access.
+              Sample preview keeps microphone access off.
             </Text>
             <Pressable
               accessibilityRole="button"
@@ -1449,6 +1542,7 @@ function ManualNoteComposer({
 function InboxScreen({
   proposals,
   accounts,
+  mailbox,
   filter,
   setFilter,
   mode,
@@ -1456,6 +1550,7 @@ function InboxScreen({
 }: {
   proposals: Proposal[];
   accounts: ReturnType<typeof productionController.getSnapshot>["accounts"];
+  mailbox: MailboxSnapshotMessage[];
   filter: "pending" | "done";
   setFilter: (v: "pending" | "done") => void;
   mode: AppSettings["mode"];
@@ -1529,6 +1624,7 @@ function InboxScreen({
           </Text>
         </View>
       )}
+      <MailboxSection messages={mailbox} accounts={accounts} />
     </ScrollView>
   );
 }
@@ -1540,6 +1636,7 @@ function LibraryScreen({
   docs,
   tasks,
   busy,
+  demoMode,
   onComplete,
   onReopen,
   onOpenNote,
@@ -1552,6 +1649,7 @@ function LibraryScreen({
   docs: { path: string; content: string }[];
   tasks: LocalTask[];
   busy: boolean;
+  demoMode: boolean;
   onComplete: (id: string) => void;
   onReopen: (id: string) => void;
   onOpenNote: (n: Note) => void;
@@ -1644,9 +1742,12 @@ function LibraryScreen({
       )}
       <View style={{ height: 10 }} />
       <Button
-        label="Export local data"
+        label={
+          demoMode ? "Export unavailable in sample mode" : "Export local data"
+        }
         tone="quiet"
         icon="download-outline"
+        disabled={demoMode}
         onPress={onExport}
       />
       <Text style={s.disclaimer}>
@@ -1672,6 +1773,8 @@ function SettingsScreen({
   onConnect,
   onDisconnect,
   onSync,
+  onRefreshMail,
+  onContinueMail,
 }: {
   state: ReturnType<typeof productionController.getSnapshot>;
   onClose: () => void;
@@ -1684,6 +1787,8 @@ function SettingsScreen({
   ) => Promise<void>;
   onDisconnect: (accountId: string) => Promise<void>;
   onSync: (accountId: string, continueSync: boolean) => Promise<void>;
+  onRefreshMail: (accountId: string) => void;
+  onContinueMail: (accountId: string) => void;
   onSave: (p: Partial<AppSettings>) => Promise<unknown>;
   onSaveAccount: (c: {
     provider: "google" | "microsoft" | "local";
@@ -1859,8 +1964,8 @@ function SettingsScreen({
         {demoMode ? (
           <View style={s.analysisStale}>
             <Text style={s.analysisText}>
-              Sample history mode is in-memory. OAuth, provider keys, and
-              provider requests are disabled.
+              Sample preview uses in-memory data. OAuth, provider keys, and
+              external requests are disabled.
             </Text>
           </View>
         ) : null}
@@ -2165,10 +2270,14 @@ function SettingsScreen({
         />
         <ConnectionsSection
           accounts={state.accounts}
+          syncStates={state.syncStates}
           busy={busy}
+          demoMode={demoMode}
           onConnect={onConnect}
           onDisconnect={onDisconnect}
           onSync={onSync}
+          onRefreshMail={onRefreshMail}
+          onContinueMail={onContinueMail}
         />
         <Text style={s.sectionTitle}>Local data</Text>
         <Text style={s.disclaimer}>

@@ -30,8 +30,21 @@ const blockedKey = async (): Promise<string | null> => {
   );
 };
 
+function assertDispatchPreviewEnabled() {
+  if (
+    typeof __DEV__ === "undefined" ||
+    !__DEV__ ||
+    process.env.EXPO_PUBLIC_PREVIEW_SCENARIO !== "dispatch-history"
+  ) {
+    throw new Error(
+      "The sample receipt scenario is available only in its development preview.",
+    );
+  }
+}
+
 /** Creates a disposable in-memory UI scenario; it never uses the app's persistent store. */
 export async function createDispatchHistoryScenario() {
+  assertDispatchPreviewEnabled();
   const store = new MemoryStateStore();
   const app = new AppControllerImpl(store, {
     speech: new AzureSpeechClient({
