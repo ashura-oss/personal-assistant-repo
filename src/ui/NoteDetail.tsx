@@ -27,6 +27,7 @@ type Props = {
   proposals: Proposal[];
   busy: boolean;
   preview: boolean;
+  demoMode: boolean;
   providerReady: boolean;
   analysisStatusError?: string;
   analysisStatusChecking?: boolean;
@@ -41,6 +42,7 @@ type Props = {
   }) => void;
   onOpenProposals: () => void;
   onTranscribe: () => void;
+  onAttachRecording: () => void;
   onPlay: () => void;
   onExportAudio: () => void;
   onDelete: () => void;
@@ -60,6 +62,7 @@ export function NoteDetail({
   proposals,
   busy,
   preview,
+  demoMode,
   providerReady,
   analysisStatusError,
   analysisStatusChecking,
@@ -70,6 +73,7 @@ export function NoteDetail({
   onAssist,
   onOpenProposals,
   onTranscribe,
+  onAttachRecording,
   onPlay,
   onExportAudio,
   onDelete,
@@ -150,7 +154,7 @@ export function NoteDetail({
               )}${note.captureTimeZone ? ` · ${note.captureTimeZone}` : ""}`}
         </Text>
         <Text style={s.h1Small}>A thought, kept.</Text>
-        {importedAudioMissing ? (
+        {importedAudioMissing && !note.audioUri ? (
           <Text style={s.disclaimer}>
             Imported note · its original recording was not included in the backup.
           </Text>
@@ -173,20 +177,56 @@ export function NoteDetail({
             />
           </View>
         ) : null}
+        {importedAudioMissing && !note.audioUri ? (
+          <View style={s.setupCard}>
+            <Text style={s.setupTitle}>Add a replacement recording</Text>
+            <Text style={s.setupBody}>
+              The original recording is missing. A file you choose cannot be
+              verified as the original, and your transcript will stay unchanged.
+            </Text>
+            <Button
+              label={dirty ? "Save transcript before attaching" : "Attach a recording"}
+              tone="quiet"
+              icon="attach-outline"
+              disabled={busy || dirty}
+              onPress={onAttachRecording}
+            />
+          </View>
+        ) : null}
+        {note.audioAttachment ? (
+          <View style={s.analysisStale}>
+            <Text style={s.analysisText}>User-selected replacement recording</Text>
+            <Text style={s.analysisSource}>
+              Original match unverified · {note.audioAttachment.fileName} · {note.audioAttachment.format.toUpperCase()}
+            </Text>
+            {note.audioAttachment.durationStatus === "unknown" ? (
+              <Text style={s.analysisSource}>
+                Duration could not be measured. Transcription is unavailable for this recording.
+              </Text>
+            ) : null}
+          </View>
+        ) : null}
         {note.audioUri ? (
           <>
             <Button
-              label="Play recording"
+              label={demoMode ? "Playback unavailable in sample preview" : "Play recording"}
               tone="quiet"
               icon="play-circle-outline"
+              disabled={demoMode}
               onPress={onPlay}
             />
             <Button
-              label="Export audio"
+              label={demoMode ? "Audio export unavailable in sample preview" : "Export audio"}
               tone="quiet"
               icon="download-outline"
+              disabled={demoMode}
               onPress={onExportAudio}
             />
+            {demoMode ? (
+              <Text style={s.analysisSource}>
+                This sample keeps attached audio in memory and does not create a playable production recording.
+              </Text>
+            ) : null}
           </>
         ) : null}
         <Field
@@ -209,10 +249,15 @@ export function NoteDetail({
         </Text>
         {note.audioUri && !text.trim() ? (
           <View style={s.setupCard}>
-            <Text style={s.setupTitle}>Transcription requires Azure setup</Text>
+            <Text style={s.setupTitle}>
+              {note.audioAttachment?.durationStatus === "unknown"
+                ? "Transcription unavailable"
+                : "Transcription requires Azure setup"}
+            </Text>
             <Text style={s.setupBody}>
-              You can add a transcript manually now. Configure Azure Speech when
-              credentials are available.
+              {note.audioAttachment?.durationStatus === "unknown"
+                ? "Still could not verify this recording’s duration, so it cannot be sent for transcription. You can write a transcript by hand."
+                : "You can add a transcript manually now. Configure Azure Speech when credentials are available."}
             </Text>
             <Button
               label={
@@ -222,6 +267,7 @@ export function NoteDetail({
               }
               tone="quiet"
               icon="mic-outline"
+              disabled={note.audioAttachment?.durationStatus === "unknown" || demoMode}
               onPress={onTranscribe}
             />
           </View>

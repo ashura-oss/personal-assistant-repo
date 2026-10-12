@@ -7,7 +7,7 @@ import type {
   NoteProposalProvenance, MailReplyProvenance, MailReplySourceSnapshot, MailReplySourceResult,
   SelectedMailTextSnapshot, MailReplyTextLoadResult, MailReplyTextCacheResult, MailReplyTextGenerationInput, MailReplyTextGenerationResult,
   ProactiveCandidateEntry, ProactiveCandidateSourceResult,
-  ProactiveState, SavedProactiveRule,
+  ProactiveState, SavedProactiveRule, RecordingAttachmentPreview,
 } from '../core';
 import { stateStore } from '../storage/platformStorage';
 import type { StateStore } from '../storage/contracts';
@@ -15,6 +15,8 @@ import { writePrivateDocument } from '../storage/documents';
 import { AzureOpenAIClient, AzureSpeechClient, ReplyGenerationError, ReplyGenerationPreDispatchError, validateAzureEndpoint, type DraftAnalysis, type ReplyGenerationUsage } from './azure';
 import { cancelReminderNotification, requestReminderNotification } from './notifications';
 import { removeAudio } from '../audio/readAudio';
+import type { AudioRecoveryMetadata, RecordingRecoveryService, StagedRecording } from '../audio/recovery.types';
+import { MAX_DURATION_SECONDS, MAX_RECOVERY_BYTES, RECOVERY_FORMATS, safeAudioFileName } from '../audio/formats';
 import type {
   ApprovedDispatch, DispatchVerifier, OAuthBridgeResult, StoredOAuthToken, OAuthTokenStore,
   MessageSummary, SelectedMessageTextResult, RequestGuard, MessageWindowPageMetadata, CalendarSummary, SyncPage, MutationReceipt,
@@ -78,6 +80,42 @@ function allocateFreshId(usedIds: Set<string>): string {
     if (!usedIds.has(id)) { usedIds.add(id); return id; }
   }
   throw new Error('Could not allocate a fresh local ID for this backup operation. Try again.');
+}
+function validateRecoveryMetadata(value: unknown, maxDurationSeconds: number): AudioRecoveryMetadata {
+  if (!isRecord(value)) throw new Error('The staged recording metadata is invalid. Select the file again.');
+  const allowed = new Set(['fileName', 'format', 'mimeType', 'byteLength', 'sha256', 'durationStatus', 'durationSeconds']);
+  if (Object.keys(value).some((key) => !allowed.has(key))) throw new Error('The staged recording metadata contains unsupported fields. Select the file again.');
+  const format = value.format;
+  if (typeof format !== 'string' || !Object.hasOwn(RECOVERY_FORMATS, format)) throw new Error('The staged recording format is unsupported.');
+  const recoveryFormat = format as keyof typeof RECOVERY_FORMATS;
+  if (typeof value.fileName !== 'string' || !value.fileName || value.fileName.length > 160 || safeAudioFileName(value.fileName, recoveryFormat) !== value.fileName ||
+      typeof value.mimeType !== 'string' || !RECOVERY_FORMATS[recoveryFormat].mimeAliases.includes(value.mimeType.toLowerCase()) || value.mimeType !== value.mimeType.trim() ||
+      !Number.isSafeInteger(value.byteLength) || (value.byteLength as number) <= 0 || (value.byteLength as number) > MAX_RECOVERY_BYTES ||
+      typeof value.sha256 !== 'string' || !/^[a-f\d]{64}$/i.test(value.sha256)) {
+    throw new Error('The staged recording details are invalid. Select a supported audio file again.');
+  }
+  if (value.durationStatus === 'known') {
+    if (typeof value.durationSeconds !== 'number' || !Number.isFinite(value.durationSeconds) || value.durationSeconds <= 0 || value.durationSeconds > Math.min(MAX_DURATION_SECONDS, maxDurationSeconds)) {
+      throw new Error(`Choose a recording no longer than ${Math.min(MAX_DURATION_SECONDS, maxDurationSeconds)} seconds.`);
+    }
+    return { fileName: value.fileName, format: recoveryFormat, mimeType: value.mimeType, byteLength: value.byteLength as number,
+      sha256: value.sha256.toLowerCase(), durationStatus: 'known', durationSeconds: value.durationSeconds };
+  }
+  if (value.durationStatus === 'unknown' && value.durationSeconds === undefined) {
+    return { fileName: value.fileName, format: recoveryFormat, mimeType: value.mimeType, byteLength: value.byteLength as number,
+      sha256: value.sha256.toLowerCase(), durationStatus: 'unknown' };
+  }
+  throw new Error('The staged recording duration details are invalid. Select the file again.');
+}
+
+function validAudioAttachment(value: unknown): Note['audioAttachment'] | undefined {
+  if (!isRecord(value) || value.kind !== 'user_selected_replacement' || value.originalMatch !== 'unverified' ||
+      typeof value.attachedAt !== 'string' || !Number.isFinite(Date.parse(value.attachedAt)) || new Date(Date.parse(value.attachedAt)).toISOString() !== value.attachedAt) return undefined;
+  try {
+    const metadata = validateRecoveryMetadata({ fileName: value.fileName, format: value.format, mimeType: value.mimeType,
+      byteLength: value.byteLength, sha256: value.sha256, durationStatus: value.durationStatus, durationSeconds: value.durationSeconds }, MAX_DURATION_SECONDS);
+    return { kind: 'user_selected_replacement', originalMatch: 'unverified', ...metadata, attachedAt: value.attachedAt };
+  } catch { return undefined; }
 }
 function assertPortableBackupFits(state: AppState): void {
   const backup = createPortableBackup(state, { exportId: newId(), exportedAt: now() });
@@ -509,8 +547,17 @@ function normalizeLoadedState(value: unknown): AppState & { backupImportQuaranti
       includedSources: Array.isArray(note.analysis.includedSources) ? note.analysis.includedSources : (note.analysis.includedSourceIds ?? []).map((id) => ({ id, title: id })),
       omittedSourceCount: Number.isFinite(note.analysis.omittedSourceCount) ? note.analysis.omittedSourceCount : (note.analysis.omittedSourceIds ?? []).length,
     } : undefined;
-    return { ...note, revision: Number.isFinite(note.revision) ? note.revision : 1, capturedAt: note.capturedAt ?? note.createdAt,
+    const audioAttachment = validAudioAttachment(note.audioAttachment);
+    const normalized: Note = { ...note, revision: Number.isFinite(note.revision) ? note.revision : 1, capturedAt: note.capturedAt ?? note.createdAt,
       captureTimeZone: note.importOrigin?.originalTimeZoneUnknown === true ? 'UTC' : validTimezone(note.captureTimeZone ?? rawSettings.timezone), analysis };
+    if (audioAttachment && note.audioUri && note.importOrigin?.kind === 'backup_import') normalized.audioAttachment = audioAttachment;
+    else if (note.audioAttachment !== undefined || note.importOrigin?.kind === 'backup_import' && Boolean(note.audioUri) && !audioAttachment) {
+      // Never trust an attached file path after discarding its integrity metadata.
+      delete normalized.audioUri;
+      delete normalized.audioAttachment;
+      if (note.importOrigin?.kind === 'backup_import') normalized.importOrigin = { ...note.importOrigin, audioMissing: true };
+    }
+    return normalized;
   });
   if (raw.mailboxSchemaVersion !== 2) {
     const hasLegacyMicrosoftMailbox = raw.accounts!.some((account) => account.provider === 'microsoft');
@@ -707,6 +754,7 @@ export interface ControllerIntegrationDependencies {
     tokenStore: OAuthTokenStore,
     onAuthStatus: (accountId: string, status: Account['authStatus']) => Promise<void>,
   ) => ConnectorClient;
+  recordingRecovery?: RecordingRecoveryService;
 }
 
 interface BackupImportSession {
@@ -725,6 +773,20 @@ interface BackupImportSession {
   documentIds: Record<string, string>;
   historyIds: Record<string, string>;
   appliedArchiveId?: string;
+}
+
+interface RecordingAttachmentSession {
+  preview: RecordingAttachmentPreview;
+  staged: StagedRecording;
+  preparedAtMs: number;
+  status: 'ready' | 'applying' | 'canceling';
+}
+
+interface RecordingAttachmentReceipt {
+  planHash: string;
+  noteId: string;
+  uri: string;
+  sha256: string;
 }
 
 export class AppControllerImpl implements AppController {
@@ -757,6 +819,10 @@ export class AppControllerImpl implements AppController {
   private mailReplyGenerations = new Map<string, { messageId: string; promise: Promise<MailReplyTextGenerationResult> }>();
   private mailReplyGenerationCache = new Map<string, MailReplyTextGenerationResult>();
   private backupImportSessions = new Map<string, BackupImportSession>();
+  private recordingAttachmentSessions = new Map<string, RecordingAttachmentSession>();
+  private recordingAttachmentJobs = new Map<string, Promise<Note>>();
+  private recordingAttachmentReceipts = new Map<string, RecordingAttachmentReceipt>();
+  private recordingRecoveryPromise?: Promise<RecordingRecoveryService>;
 
   constructor(
     private readonly store: StateStore = stateStore,
@@ -770,12 +836,23 @@ export class AppControllerImpl implements AppController {
       : undefined;
   }
 
+  private async getRecordingRecoveryService(): Promise<RecordingRecoveryService> {
+    if (this.integration.recordingRecovery) return this.integration.recordingRecovery;
+    this.recordingRecoveryPromise ??= import('../audio/recovery').then((module) => module.recordingRecoveryService)
+      .catch((error) => { this.recordingRecoveryPromise = undefined; throw error; });
+    return this.recordingRecoveryPromise;
+  }
+
   getSnapshot(): AppState { return this.snapshot; }
   subscribe(listener: (state: AppState) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
   }
-  private emit(): void { for (const listener of this.listeners) listener(this.snapshot); }
+  private emit(): void {
+    for (const listener of this.listeners) {
+      try { listener(this.snapshot); } catch { /* A view callback cannot roll back or reject a durable state commit. */ }
+    }
+  }
 
   private persistedState(state: AppState): AppState {
     const result = { ...state } as AppState & { proactiveQuarantine?: unknown; backupImportQuarantine?: unknown[] };
@@ -1338,6 +1415,162 @@ export class AppControllerImpl implements AppController {
     return result;
   }
 
+  async prepareRecordingAttachment(noteId: string, input: { expectedRevision: number }): Promise<RecordingAttachmentPreview | null> {
+    await this.load();
+    if (!input || !Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 1) throw new Error('Recording recovery confirmation is invalid.');
+    const initial = this.snapshot;
+    const note = initial.notes.find((item) => item.id === noteId);
+    if (!note) throw new Error('Note was not found.');
+    if (note.revision !== input.expectedRevision) throw new Error('The note changed before file selection. Review the current note and try again.');
+    if (note.importOrigin?.kind !== 'backup_import' || note.importOrigin.audioMissing !== true || note.audioUri) {
+      throw new Error('Only an imported note with missing audio can receive a selected replacement recording.');
+    }
+    const maxDurationSeconds = Math.min(MAX_DURATION_SECONDS, initial.settings.maxAudioSeconds);
+    if (!Number.isFinite(maxDurationSeconds) || maxDurationSeconds <= 0) throw new Error('The recording duration limit is invalid in Settings.');
+    const service = await this.getRecordingRecoveryService();
+    const beforePick = this.snapshot.notes.find((item) => item.id === noteId);
+    if (beforePick?.revision !== input.expectedRevision || beforePick.importOrigin?.kind !== 'backup_import' || beforePick.importOrigin.audioMissing !== true || beforePick.audioUri ||
+        this.snapshot.settings.maxAudioSeconds !== initial.settings.maxAudioSeconds) {
+      throw new Error('The note or recording limit changed before file selection. Reopen recording recovery and try again.');
+    }
+    const staged = await service.pickAndStage({ maxDurationSeconds });
+    if (!staged) return null;
+    const cleanupStage = async () => { try { await service.remove(staged); } catch { /* The platform may retain an unreferenced private staging file. */ } };
+    try {
+      if (!staged || typeof staged.uri !== 'string' || !staged.uri || /[\u0000-\u001f\u007f]/.test(staged.uri)) throw new Error('The selected recording could not be staged safely.');
+      const metadata = validateRecoveryMetadata(staged.metadata, maxDurationSeconds);
+      const stagedHandle: StagedRecording = { uri: staged.uri, metadata: clone(metadata) };
+      const current = this.snapshot.notes.find((item) => item.id === noteId);
+      if (current?.revision !== input.expectedRevision || current.importOrigin?.kind !== 'backup_import' || current.importOrigin.audioMissing !== true || current.audioUri ||
+          this.snapshot.settings.maxAudioSeconds !== initial.settings.maxAudioSeconds) {
+        throw new Error('The note or recording limit changed during file selection. Reopen recording recovery and try again.');
+      }
+      const preparedAtMs = Date.now();
+      const sessionId = newId();
+      const planHash = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256,
+        stableJson({ sessionId, noteId, expectedRevision: input.expectedRevision, metadata, preparedAtMs }), { encoding: Crypto.CryptoEncoding.HEX });
+      const afterHash = this.snapshot.notes.find((item) => item.id === noteId);
+      if (afterHash?.revision !== input.expectedRevision || afterHash.importOrigin?.kind !== 'backup_import' || afterHash.importOrigin.audioMissing !== true || afterHash.audioUri ||
+          this.snapshot.settings.maxAudioSeconds !== initial.settings.maxAudioSeconds) {
+        throw new Error('The note or recording limit changed while the attachment preview was being prepared.');
+      }
+      for (const [id, session] of this.recordingAttachmentSessions) {
+        if (session.status === 'ready' && (preparedAtMs < session.preparedAtMs || preparedAtMs - session.preparedAtMs >= 15 * 60_000)) {
+          this.recordingAttachmentSessions.delete(id);
+          void service.remove(session.staged).catch(() => undefined);
+        }
+      }
+      while ([...this.recordingAttachmentSessions.values()].filter((session) => session.status === 'ready').length >= 2) {
+        const oldest = [...this.recordingAttachmentSessions.entries()].find(([, session]) => session.status === 'ready');
+        if (!oldest) break;
+        this.recordingAttachmentSessions.delete(oldest[0]);
+        void service.remove(oldest[1].staged).catch(() => undefined);
+      }
+      const preview: RecordingAttachmentPreview = { ...metadata, sessionId, planHash, noteId, expectedRevision: input.expectedRevision };
+      this.recordingAttachmentSessions.set(sessionId, { preview, staged: stagedHandle, preparedAtMs, status: 'ready' });
+      return clone(preview);
+    } catch (error) {
+      await cleanupStage();
+      throw error;
+    }
+  }
+
+  async attachRecording(input: { sessionId: string; planHash: string }): Promise<Note> {
+    if (!input || typeof input.sessionId !== 'string' || !/^[a-f\d]{64}$/i.test(input.planHash)) throw new Error('Recording attachment confirmation is invalid.');
+    const session = this.recordingAttachmentSessions.get(input.sessionId);
+    if (!session) {
+      const receipt = this.recordingAttachmentReceipts.get(input.sessionId);
+      if (receipt && receipt.planHash === input.planHash) {
+        const current = this.snapshot.notes.find((item) => item.id === receipt.noteId);
+        if (current?.audioUri === receipt.uri && current.audioAttachment?.sha256 === receipt.sha256) return clone(current);
+        throw new Error('The recording attachment is no longer present on this note. Prepare a new selection.');
+      }
+      throw new Error('Recording preview is missing or no longer matches. Select the file again.');
+    }
+    if (session.preview.planHash !== input.planHash) throw new Error('Recording preview is missing or no longer matches. Select the file again.');
+    const existingJob = this.recordingAttachmentJobs.get(input.sessionId);
+    if (existingJob) return existingJob;
+    if (session.status !== 'ready') throw new Error('Recording attachment is already being saved or canceled.');
+    // Claim synchronously, before the async worker awaits load or storage. A concurrent
+    // prepare can then only evict ready previews, never the stage this request owns.
+    session.status = 'applying';
+    const job = this.attachRecordingInternal(input);
+    this.recordingAttachmentJobs.set(input.sessionId, job);
+    void job.then(() => this.recordingAttachmentJobs.delete(input.sessionId), () => this.recordingAttachmentJobs.delete(input.sessionId));
+    return job;
+  }
+
+  private async attachRecordingInternal(input: { sessionId: string; planHash: string }): Promise<Note> {
+    await this.load();
+    const session = this.recordingAttachmentSessions.get(input.sessionId);
+    if (!session || session.status !== 'applying' || session.preview.planHash !== input.planHash) throw new Error('Recording preview is missing or no longer matches. Select the file again.');
+    const atStart = Date.now();
+    if (atStart < session.preparedAtMs || atStart - session.preparedAtMs >= 15 * 60_000) {
+      this.recordingAttachmentSessions.delete(input.sessionId);
+      await (await this.getRecordingRecoveryService()).remove(session.staged).catch(() => undefined);
+      throw new Error('Recording preview expired. Select the file again.');
+    }
+    let committed = false;
+    try {
+      const service = await this.getRecordingRecoveryService();
+      const maxDurationSeconds = Math.min(MAX_DURATION_SECONDS, this.snapshot.settings.maxAudioSeconds);
+      const beforeInspect = this.snapshot.notes.find((item) => item.id === session.preview.noteId);
+      if (beforeInspect?.revision !== session.preview.expectedRevision || beforeInspect.importOrigin?.kind !== 'backup_import' || beforeInspect.importOrigin.audioMissing !== true || beforeInspect.audioUri) {
+        throw new Error('The note changed before the staged recording could be verified. Select the file again.');
+      }
+      const inspected = validateRecoveryMetadata(await service.inspect(session.staged, { maxDurationSeconds }), maxDurationSeconds);
+      const { sessionId: _sessionId, planHash: _planHash, noteId: _noteId, expectedRevision: _revision, ...previewMetadata } = session.preview;
+      if (stableJson(inspected) !== stableJson(previewMetadata)) throw new Error('The staged recording changed after preview. Select it again.');
+      if (session.status !== 'applying') throw new Error('Recording attachment was canceled before it could be saved.');
+      const saved = await this.mutate((state) => {
+        const attachTime = Date.now();
+        if (attachTime < session.preparedAtMs || attachTime - session.preparedAtMs >= 15 * 60_000) throw new Error('Recording preview expired. Select the file again.');
+        if (Math.min(MAX_DURATION_SECONDS, state.settings.maxAudioSeconds) !== maxDurationSeconds) throw new Error('The recording duration limit changed. Select the file again.');
+        const note = state.notes.find((item) => item.id === session.preview.noteId);
+        if (!note || note.revision !== session.preview.expectedRevision || note.importOrigin?.kind !== 'backup_import' || note.importOrigin.audioMissing !== true || note.audioUri) {
+          throw new Error('The note changed before the recording was attached. Review it and select the file again.');
+        }
+        note.audioUri = session.staged.uri;
+        note.audioAttachment = { kind: 'user_selected_replacement', originalMatch: 'unverified', ...inspected, attachedAt: now() };
+        note.durationSeconds = inspected.durationStatus === 'known' ? inspected.durationSeconds! : 0;
+        note.importOrigin = { ...note.importOrigin, audioMissing: false };
+        note.revision += 1;
+        delete note.processingFingerprint;
+        if (note.analysis) note.analysis.stale = true;
+        for (const proposal of state.proposals.filter((item) => item.noteId === note.id && ['draft', 'approved', 'failed'].includes(item.status))) {
+          this.invalidate(proposal);
+          proposal.status = 'draft';
+        }
+        addActivity(state, 'local_action', `A user-selected recording was attached to imported note “${note.title}”. It is not verified as the original file.`, { noteId: note.id });
+        return note;
+      });
+      committed = true;
+      this.recordingAttachmentReceipts.set(input.sessionId, { planHash: input.planHash, noteId: saved.id, uri: session.staged.uri, sha256: inspected.sha256 });
+      while (this.recordingAttachmentReceipts.size > 2) {
+        const oldest = this.recordingAttachmentReceipts.keys().next().value as string | undefined;
+        if (!oldest) break;
+        this.recordingAttachmentReceipts.delete(oldest);
+      }
+      this.recordingAttachmentSessions.delete(input.sessionId);
+      return saved;
+    } catch (error) {
+      if (!committed) {
+        this.recordingAttachmentSessions.delete(input.sessionId);
+        await (await this.getRecordingRecoveryService()).remove(session.staged).catch(() => undefined);
+      }
+      throw error;
+    }
+  }
+
+  async cancelRecordingAttachment(sessionId: string): Promise<void> {
+    const session = this.recordingAttachmentSessions.get(sessionId);
+    if (!session || this.recordingAttachmentReceipts.has(sessionId)) return;
+    if (session.status !== 'ready' || this.recordingAttachmentJobs.has(sessionId)) throw new Error('Recording attachment is already being saved and cannot be canceled.');
+    session.status = 'canceling';
+    this.recordingAttachmentSessions.delete(sessionId);
+    await (await this.getRecordingRecoveryService()).remove(session.staged);
+  }
+
   async confirmImportedNoteTimeZone(noteId: string, input: { timeZone: string; expectedRevision: number }): Promise<Note> {
     await this.load();
     if (!input || typeof input.timeZone !== 'string' || input.timeZone.length > 128 || !Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 1) {
@@ -1684,6 +1917,7 @@ export class AppControllerImpl implements AppController {
     const state = this.snapshot;
     const note = state.notes.find((item) => item.id === id);
     if (!note) throw new Error('Note was not found.');
+    if (note.audioAttachment?.durationStatus === 'unknown') throw new Error('This replacement recording has no verified duration. It cannot be sent for transcription.');
     const sourceRevision = note.revision;
     if (state.settings.mode !== 'provider') throw new Error('Select Provider mode and configure Azure Speech before transcribing.');
     if (state.usage.priceKnown && state.usage.estimatedCostUsd >= state.settings.monthlyBudgetUsd) throw new Error('The configured monthly estimate limit has been reached.');
@@ -1707,13 +1941,27 @@ export class AppControllerImpl implements AppController {
     });
     if (state.settings.audioRetention === 'delete_after_transcription' && note.audioUri) {
       try {
-        await removeAudio(note.audioUri);
-        return await this.mutate((draft) => {
+        const retentionUri = note.audioUri;
+        const detach = await this.mutate((draft) => {
           const current = this.note(draft, id);
+          if (current.revision !== updated.revision || current.audioUri !== retentionUri) return { note: current, detached: false };
           delete current.audioUri;
-          addActivity(draft, 'local_action', 'Original recording deleted after transcription, as configured.', { noteId: id });
-          return current;
+          delete current.audioAttachment;
+          if (current.importOrigin?.kind === 'backup_import') current.importOrigin = { ...current.importOrigin, audioMissing: true };
+          current.revision += 1;
+          delete current.processingFingerprint;
+          if (current.analysis) current.analysis.stale = true;
+          for (const proposal of draft.proposals.filter((item) => item.noteId === id && ['draft', 'approved', 'failed'].includes(item.status))) {
+            this.invalidate(proposal);
+            proposal.status = 'draft';
+          }
+          addActivity(draft, 'local_action', 'Original recording detached after transcription, as configured.', { noteId: id });
+          return { note: current, detached: true };
         });
+        if (detach.detached) {
+          try { await removeAudio(retentionUri); } catch { /* The canonical note no longer references this private clip. */ }
+        }
+        return detach.note;
       } catch {
         return updated;
       }

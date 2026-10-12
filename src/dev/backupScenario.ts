@@ -2,6 +2,7 @@ import type { AppState, Note } from "../core";
 import { AzureOpenAIClient, AzureSpeechClient } from "../services/azure";
 import { AppControllerImpl } from "../services/controller";
 import type { StateStore } from "../storage/contracts";
+import { Platform } from "react-native";
 
 class MemoryStateStore implements StateStore {
   private value?: AppState;
@@ -40,7 +41,18 @@ const denyKeys = async (): Promise<string | null> => {
 /** In-memory preview only; this controller never reads or writes production app state. */
 export async function createBackupScenario() {
   assertBackupPreviewEnabled();
+  if (Platform.OS !== "web") {
+    throw new Error("Recording attachment is available in the isolated browser sample only.");
+  }
+  const { createWebRecordingRecoveryService } = await import("../audio/recovery.web");
   const store = new MemoryStateStore();
+  const stagedAudio = new Map<string, Blob>();
+  const recordingRecovery = createWebRecordingRecoveryService({
+    async put(id, blob) { stagedAudio.set(id, blob); },
+    async get(id) { return stagedAudio.get(id); },
+    async remove(id) { stagedAudio.delete(id); },
+  });
+  const integration = { recordingRecovery };
   const providers = {
     speech: new AzureSpeechClient({ fetcher: denyExternalIO, readKey: denyKeys }),
     openAi: new AzureOpenAIClient(denyExternalIO, denyKeys),
@@ -48,6 +60,7 @@ export async function createBackupScenario() {
   const controller = new AppControllerImpl(
     store,
     providers,
+    integration,
   );
   await controller.load();
 
@@ -72,7 +85,7 @@ export async function createBackupScenario() {
   const seededState = structuredClone(controller.getSnapshot());
   seededState.notes.unshift(existingNote);
   await store.save(seededState);
-  const previewController = new AppControllerImpl(store, providers);
+  const previewController = new AppControllerImpl(store, providers, integration);
   await previewController.load();
   return previewController;
 }

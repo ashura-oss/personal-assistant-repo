@@ -1,5 +1,6 @@
 /** Stable application contracts shared by the UI, services, and storage. */
 import type { AssistantCitation, AssistantDecision } from '../assistant';
+import type { AudioRecoveryMetadata } from '../audio/recovery.types';
 
 export type NoteStatus = 'recorded' | 'processed' | 'error';
 export type ProposalKind = 'task' | 'reminder' | 'email' | 'event' | 'memory';
@@ -67,12 +68,13 @@ export interface Note {
   createdAt: string;
   capturedAt?: string;
   status: NoteStatus;
-  /** Increments whenever the transcript changes; approvals bind to this source revision. */
+  /** Increments whenever transcript or attached recording changes; approvals bind to this source revision. */
   revision: number;
   /** Persisted identity of the last analysis inputs, so retries/reloads do not repeat paid calls. */
   processingFingerprint?: string;
   captureTimeZone?: string;
   analysis?: NoteAssistResult;
+  audioAttachment?: AudioRecoveryMetadata & { kind: 'user_selected_replacement'; originalMatch: 'unverified'; attachedAt: string };
   importOrigin?: { kind: 'backup_import'; archiveId: string; sourceNoteId: string; audioMissing: boolean; originalTimeZoneUnknown?: true; timeZoneConfirmedAt?: string; originUnverified?: true };
 }
 
@@ -628,6 +630,14 @@ export interface BackupImportPreview {
   alreadyImported: boolean;
 }
 
+/** Safe UI disclosure for a staged file; deliberately excludes the private staged URI. */
+export type RecordingAttachmentPreview = AudioRecoveryMetadata & {
+  sessionId: string;
+  planHash: string;
+  noteId: string;
+  expectedRevision: number;
+};
+
 export interface SaveNoteInput {
   transcript: string;
   audioUri?: string;
@@ -665,6 +675,9 @@ export interface AppController {
   load(): Promise<void>;
   saveNote(input: SaveNoteInput): Promise<Note>;
   confirmImportedNoteTimeZone(noteId: string, input: { timeZone: string; expectedRevision: number }): Promise<Note>;
+  prepareRecordingAttachment(noteId: string, input: { expectedRevision: number }): Promise<RecordingAttachmentPreview | null>;
+  attachRecording(input: { sessionId: string; planHash: string }): Promise<Note>;
+  cancelRecordingAttachment(sessionId: string): Promise<void>;
   updateTranscript(id: string, text: string): Promise<Note>;
   processNote(id: string): Promise<Proposal[]>;
   assistNote(id: string, options?: { intent?: AssistIntent; question?: string; forceRefresh?: boolean }): Promise<NoteAssistResult>;

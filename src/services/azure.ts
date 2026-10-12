@@ -66,6 +66,7 @@ export class AzureSpeechClient {
   constructor(private readonly options: AzureSpeechClientOptions) { this.fetcher = options.fetcher ?? fetch; }
 
   async transcribe(note: Note, settings: AppSettings, signal?: AbortSignal, onAttempt?: () => Promise<void>): Promise<{ transcript: string; durationSeconds: number; attempts: number }> {
+    if (note.audioAttachment?.durationStatus === 'unknown') throw new Error('This replacement recording has no verified duration. It cannot be sent for transcription.');
     if (!note.audioUri) throw new Error('This note has no recorded audio to transcribe.');
     if (note.durationSeconds > settings.maxAudioSeconds) throw new Error(`Recording is longer than the ${settings.maxAudioSeconds} second limit.`);
     if (!settings.speechEndpoint) throw new Error('Add an Azure Speech endpoint before transcribing.');

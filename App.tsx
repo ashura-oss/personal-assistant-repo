@@ -57,6 +57,7 @@ import { ReviewSheet } from "./src/ui/ReviewSheet";
 import { NoteDetail as NoteDetailView } from "./src/ui/NoteDetail";
 import { BackupImportSheet } from "./src/ui/BackupImportSheet";
 import { ImportedBackupsSection } from "./src/ui/ImportedBackupsSection";
+import { RecordingAttachmentSheet } from "./src/ui/RecordingAttachmentSheet";
 import { TasksSection } from "./src/ui/TasksSection";
 import { IconButton, Button, Field } from "./src/ui/primitives";
 import { C, s } from "./src/ui/theme";
@@ -157,8 +158,10 @@ function NoteCard({ note, onPress }: { note: Note; onPress: () => void }) {
           />
         </View>
         <Text style={s.noteDate}>
-          {note.audioUri
-            ? `${date} · ${Math.max(1, Math.round(note.durationSeconds))} sec`
+        {note.audioAttachment?.durationStatus === "unknown"
+          ? `${date} · duration unknown`
+          : note.audioUri
+          ? `${date} · ${Math.max(1, Math.round(note.durationSeconds))} sec`
             : date}
         </Text>
         <Ionicons
@@ -258,6 +261,7 @@ export default function App() {
   const [tab, setTab] = useState<Tab>(isBackupImportDemo ? "library" : isIsolatedDemo ? "inbox" : "record");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [detail, setDetail] = useState<Note | null>(null);
+  const [recordingAttachmentNoteId, setRecordingAttachmentNoteId] = useState<string | null>(null);
   const [review, setReview] = useState<Proposal | null>(null);
   const [replyMessageId, setReplyMessageId] = useState<string | null>(null);
   const [notice, setNotice] = useState("");
@@ -342,6 +346,9 @@ export default function App() {
   );
   const activeDetailNote = detail
     ? state.notes.find((note) => note.id === detail.id)
+    : undefined;
+  const recordingAttachmentNote = recordingAttachmentNoteId
+    ? state.notes.find((note) => note.id === recordingAttachmentNoteId)
     : undefined;
   const activeAnalysis = activeDetailNote?.analysis;
   const activeDetailNoteId = activeDetailNote?.id;
@@ -960,6 +967,7 @@ export default function App() {
                 )}
                 busy={busy}
                 preview={state.settings.mode === "preview"}
+                demoMode={isIsolatedDemo}
                 analysisStatusError={
                   analysisStatusError?.key === analysisFreshnessKey
                     ? analysisStatusError.message
@@ -1033,6 +1041,9 @@ export default function App() {
                         );
                       })
                     : setSettingsOpen(true)
+                }
+                onAttachRecording={() =>
+                  setRecordingAttachmentNoteId(detail.id)
                 }
                 providerReady={Boolean(state.settings.speechEndpoint)}
                 onPlay={() => run(() => audio.play(detail.audioUri!))}
@@ -1366,6 +1377,26 @@ export default function App() {
           onClose={() => setReplyMessageId(null)}
           onSave={saveMailReply}
         />
+        {recordingAttachmentNote ? (
+          <RecordingAttachmentSheet
+            key={recordingAttachmentNote.id}
+            visible={Boolean(recordingAttachmentNoteId)}
+            note={recordingAttachmentNote}
+            demoMode={isIsolatedDemo}
+            onPrepare={(noteId, input) =>
+              controller.prepareRecordingAttachment(noteId, input)
+            }
+            onAttach={(input) => controller.attachRecording(input)}
+            onCancelSession={(sessionId) =>
+              controller.cancelRecordingAttachment(sessionId)
+            }
+            onAttached={(updated) => {
+              setDetail(updated);
+              setNotice("Recording attached. Review it before transcription.");
+            }}
+            onClose={() => setRecordingAttachmentNoteId(null)}
+          />
+        ) : null}
         <Modal
           visible={!!doc}
           animationType="slide"
