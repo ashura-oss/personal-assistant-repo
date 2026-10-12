@@ -56,6 +56,20 @@ describe('proactive next-check boundaries', () => {
       .toBe('2026-01-01T00:10:00.000Z');
   });
 
+  it('keeps a proof-bounded seven-day snooze valid after clock rollback', () => {
+    const nowUtc = '2026-01-08T00:00:00.000Z';
+    const r = rule({ type: 'keyword', keywords: ['agenda'] });
+    const base = { namespace: 'google', accountId: 'account-1', providerId: 'message-1' };
+    const source: ProactiveSource = { kind: 'mail', ...base, sourceId: proactiveSourceId(base), sourceVersion: 'mail-v1', availability: 'available', freshness: 'fresh',
+      isRead: false, subject: 'Agenda', receivedAt: '2026-01-07T00:00:00Z' };
+    const snooze = { suppressionKey: JSON.stringify([r.id, source.sourceId]), snoozedAt: '2026-01-10T00:00:00.000Z', until: '2026-01-17T00:00:00Z' };
+    const evaluation = evaluateProactive({ nowUtc, timeZone: 'UTC', rules: [r], sources: [source], snoozes: [snooze] });
+    expect(evaluation.activeCandidates).toEqual([]);
+    expect(evaluation.deferredCandidates).toHaveLength(1);
+    expect(computeProactiveNextCheckAt({ nowUtc, timeZone: 'UTC', rules: [r], sources: [source], snoozes: [snooze] })).toBe('2026-01-17T00:00:00.000Z');
+    expect(() => evaluateProactive({ nowUtc, timeZone: 'UTC', rules: [r], sources: [source], snoozes: [{ ...snooze, until: '2026-01-17T00:00:00.001Z' }] })).toThrow(/seven days/i);
+  });
+
   it('returns null when there is no enabled future boundary and rejects invalid configuration', () => {
     expect(computeProactiveNextCheckAt({ nowUtc: '2026-01-01T00:00:00.000Z', timeZone: 'UTC', rules: [rule({ type: 'task_due', minutes: 5 }, { enabled: false })], sources: [] })).toBeNull();
     expect(() => computeProactiveNextCheckAt({ nowUtc: 'tomorrow', timeZone: 'UTC', rules: [], sources: [] })).toThrow(/canonical UTC/i);

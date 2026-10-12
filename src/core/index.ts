@@ -388,6 +388,56 @@ export interface UsageLedger {
   lastRequestAt?: string;
 }
 
+export type SavedProactiveRule = import('../proactive').ProactiveRule & {
+  /** Optimistic concurrency token; advances for every persisted edit. */
+  version: number;
+  name: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export interface ProactiveCandidateEntry {
+  candidate: import('../proactive').ProactiveCandidate;
+  presentation: 'active' | 'deferred' | 'uncertain';
+}
+
+export interface ProactiveDismissal {
+  candidateId: string;
+  ruleId: string;
+  ruleRevision: number;
+  sourceId: string;
+  sourceVersion: string;
+  dismissedAt: string;
+}
+
+export type ProactiveSnoozeEntry = import('../proactive').ProactiveSnooze & {
+  ruleId: string;
+  sourceId: string;
+  snoozedAt: string;
+};
+
+export interface ProactiveState {
+  schemaVersion: 1;
+  rules: SavedProactiveRule[];
+  candidates: ProactiveCandidateEntry[];
+  dismissals: ProactiveDismissal[];
+  snoozes: ProactiveSnoozeEntry[];
+  lastEvaluation?: {
+    inputFingerprint: string;
+    truncation: import('../proactive').ProactiveEvaluation['truncation'];
+    nextCheckAt?: string;
+    asOf: string;
+  };
+  /** Fixed user-safe message; never contains persisted source or quarantine data. */
+  integrityError?: string;
+}
+
+export interface ProactiveCandidateSourceResult {
+  status: 'current' | 'stale' | 'unavailable' | 'missing';
+  candidate?: import('../proactive').ProactiveCandidate;
+  source?: import('../proactive').ProactiveSource;
+}
+
 export interface AppState {
   notes: Note[];
   proposals: Proposal[];
@@ -412,6 +462,7 @@ export interface AppState {
   dispatchRecordQuarantine: { reason: 'invalid_persisted_receipt'; quarantinedAt: string; raw: unknown }[];
   /** Versioned current mailbox metadata cache; this is independent of immutable dispatch history. */
   mailboxSchemaVersion: 2;
+  proactive: ProactiveState;
 }
 
 export interface SaveNoteInput {
@@ -474,6 +525,15 @@ export interface AppController {
   refreshMailHead(accountId: string, options?: { reason?: 'manual' | 'foreground' }): Promise<MailLaneResult>;
   continueMailBackfill(accountId: string): Promise<MailLaneResult>;
   refreshForegroundMail(): Promise<ForegroundMailRefreshResult>;
+  saveProactiveRule(input: {
+    id?: string; expectedVersion?: number; name: string; enabled: boolean; accountIds: string[];
+    trigger: import('../proactive').ProactiveTrigger; quietHours?: import('../proactive').QuietHours;
+  }): Promise<SavedProactiveRule>;
+  deleteProactiveRule(id: string, expectedVersion: number): Promise<void>;
+  evaluateLocalCandidates(): Promise<ProactiveState>;
+  dismissProactiveCandidate(candidateId: string): Promise<ProactiveCandidateEntry>;
+  snoozeProactiveCandidate(candidateId: string, until: string): Promise<ProactiveCandidateEntry>;
+  getProactiveCandidateSource(candidateId: string): Promise<ProactiveCandidateSourceResult>;
   exportData(): Promise<string>;
   deleteNote(id: string): Promise<void>;
 }

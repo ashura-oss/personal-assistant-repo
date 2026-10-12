@@ -80,6 +80,8 @@ export interface ProactiveCandidate {
 export interface ProactiveSnooze {
   suppressionKey: string;
   until: string;
+  /** Canonical UTC creation-time proof used to keep the seven-day limit stable across clock rollback. */
+  snoozedAt?: string;
 }
 
 export interface EvaluateProactiveInput {

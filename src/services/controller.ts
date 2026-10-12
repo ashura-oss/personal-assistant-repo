@@ -4,6 +4,8 @@ import type {
   ForegroundMailRefreshResult, MailCoverageInterval, MailLaneResult, MailSyncWindow,
   Calendar, CalendarConfig, ContextDocument, Note, NoteAssistResult, AssistIntent, LocalTask, Proposal, ProposalPatch,
   ProposalProvenance, SaveNoteInput, SettingsPatch, MailboxSnapshotMessage, CalendarEventSnapshot, OAuthInstallResult,
+  ProactiveCandidateEntry, ProactiveCandidateSourceResult,
+  ProactiveState, SavedProactiveRule,
 } from '../core';
 import { stateStore } from '../storage/platformStorage';
 import type { StateStore } from '../storage/contracts';
@@ -22,6 +24,10 @@ import { Platform } from 'react-native';
 import { buildLocalSourceSet, buildOfflinePreview, createSourceCatalog, type AssistantSourceInput } from '../assistant';
 import { appendDispatchReconciliation, createDispatchRecord, recordDispatchOutcome, validateDispatchRecord } from '../dispatch';
 import type { DispatchOutcome, DispatchRecord, DispatchReconciliation } from '../dispatch';
+import { evaluateProactive, type ProactiveTrigger, type QuietHours } from '../proactive';
+import { computeProactiveNextCheckAt } from '../proactive/boundaries';
+import { buildProactiveSources, proactiveStableValue, type ProactiveSourceHashMemo } from '../proactive/adapters';
+import { emptyProactiveState, normalizeProactiveData, PROACTIVE_INTEGRITY_ERROR, uncertainOnLoad, type ProactiveQuarantine } from '../proactive/state';
 
 const now = () => new Date().toISOString();
 const ASSIST_CONTRACT_VERSION = 'assist-v2';
@@ -73,6 +79,7 @@ function initialState(): AppState {
     settings: { ...DEFAULT_SETTINGS },
     usage: { month: day.slice(0, 7), day, requests: 0, attemptsToday: 0, inputTokens: 0, outputTokens: 0, transcriptionSeconds: 0, attempts: 0, unknownCharges: 0, reservedUsd: 0, priceKnown: false, estimatedCostUsd: 0 },
     mailbox: [], calendarEvents: [], syncStates: {}, pendingCredentialCleanup: [], dispatchRecords: [], dispatchRecordQuarantine: [], mailboxSchemaVersion: 2,
+    proactive: emptyProactiveState(),
   };
 }
 
@@ -258,6 +265,23 @@ function identityKey(account: Account): string {
   if (!identity?.providerNamespace || !identity.clientId || !identity.subject ||
       (account.provider === 'microsoft' && !identity.resourceUserId)) throw new Error('Verified account identity is incomplete.');
   return [identity.providerNamespace, identity.clientId, identity.subject, identity.resourceUserId ?? ''].join(':');
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value));
+}
+
+function validMailboxCacheRow(value: unknown): value is MailboxSnapshotMessage {
+  if (!isRecord(value)) return false;
+  return typeof value.accountId === 'string' && value.accountId.length > 0 && value.accountId.length <= 256 &&
+    typeof value.providerMessageId === 'string' && value.providerMessageId.length > 0 && value.providerMessageId.length <= 1024;
+}
+
+function validCalendarCacheRow(value: unknown): value is CalendarEventSnapshot {
+  if (!isRecord(value)) return false;
+  return typeof value.accountId === 'string' && value.accountId.length > 0 && value.accountId.length <= 256 &&
+    typeof value.calendarId === 'string' && value.calendarId.length > 0 && value.calendarId.length <= 256 &&
+    typeof value.providerEventId === 'string' && value.providerEventId.length > 0 && value.providerEventId.length <= 1024;
 }
 
 function assistContext(state: AppState, note: Note, intent: AssistIntent, question?: string): { documents: ContextDocument[]; additionalSources: AssistantSourceInput[]; omittedSourceCount: number; omittedSourceIds: string[] } {
@@ -513,6 +537,7 @@ function normalizeLoadedState(value: unknown): AppState {
   }
   return {
     ...defaults, ...raw, notes, proposals, tasks,
+    proactive: emptyProactiveState(),
     dispatchRecords, dispatchRecordQuarantine,
     pendingCredentialCleanup: Array.isArray(raw.pendingCredentialCleanup) ? raw.pendingCredentialCleanup.filter((item) =>
       item && typeof item.tokenRef === 'string' && item.tokenRef.length > 0 && ['replaced', 'disconnected', 'orphan'].includes(item.reason) && typeof item.createdAt === 'string') : [],
@@ -545,9 +570,9 @@ function normalizeLoadedState(value: unknown): AppState {
     calendars: raw.calendars.map((calendar) => ({ ...calendar, connected: false, writable: false })),
     settings,
     usage: { ...defaults.usage, ...raw.usage },
-    mailbox: Array.isArray(raw.mailbox) ? raw.mailbox.filter((message) => raw.mailboxSchemaVersion === 2 ||
-      !raw.accounts!.some((account) => account.id === message.accountId && account.provider === 'microsoft')) : [],
-    calendarEvents: Array.isArray(raw.calendarEvents) ? raw.calendarEvents : [],
+    mailbox: Array.isArray(raw.mailbox) ? raw.mailbox.filter((message): message is MailboxSnapshotMessage => validMailboxCacheRow(message) &&
+      (raw.mailboxSchemaVersion === 2 || !raw.accounts!.some((account) => account.id === message.accountId && account.provider === 'microsoft'))) : [],
+    calendarEvents: Array.isArray(raw.calendarEvents) ? raw.calendarEvents.filter(validCalendarCacheRow) : [],
     syncStates: Object.fromEntries(raw.accounts!.map((account) => {
       const previous = raw.syncStates?.[account.id] as AccountSyncState | undefined;
       const base = emptySyncState(account.id);
@@ -610,6 +635,8 @@ export class AppControllerImpl implements AppController {
   private syncAbortControllers = new Map<string, AbortController>();
   private credentialCleanupJob?: Promise<void>;
   private installingTokenRefs = new Set<string>();
+  private proactiveQuarantine?: ProactiveQuarantine;
+  private proactiveSourceHashMemo: ProactiveSourceHashMemo = new Map();
 
   constructor(
     private readonly store: StateStore = stateStore,
@@ -630,6 +657,129 @@ export class AppControllerImpl implements AppController {
   }
   private emit(): void { for (const listener of this.listeners) listener(this.snapshot); }
 
+  private persistedState(state: AppState): AppState {
+    if (!this.proactiveQuarantine) return state;
+    return { ...state, proactiveQuarantine: clone(this.proactiveQuarantine) } as AppState;
+  }
+
+  private publicState(state: AppState): AppState {
+    const result = clone(state) as AppState & { proactiveQuarantine?: unknown };
+    delete result.proactiveQuarantine;
+    return result;
+  }
+
+  private async evaluateProactiveDraft(state: AppState): Promise<boolean> {
+    if (this.proactiveQuarantine || state.proactive.integrityError) return false;
+    const before = proactiveStableValue(state.proactive);
+    const helperRules = state.proactive.rules.map(({ name: _name, version: _version, createdAt: _createdAt, updatedAt: _updatedAt, ...rule }) => rule);
+    const byRule = new Map(state.proactive.rules.map((rule) => [rule.id, rule]));
+    const enabledRules = helperRules.filter((rule) => rule.enabled);
+    if (enabledRules.length === 0) {
+      state.proactive.candidates = state.proactive.candidates.filter((entry) => byRule.get(entry.candidate.ruleId)?.enabled === true);
+      state.proactive.dismissals = state.proactive.dismissals.filter((item) => {
+        const rule = byRule.get(item.ruleId);
+        return Boolean(rule && item.ruleRevision >= rule.revision);
+      });
+      state.proactive.snoozes = state.proactive.snoozes.filter((item) => Date.parse(item.until) > Date.now() && byRule.has(item.ruleId));
+      delete state.proactive.lastEvaluation;
+      return before !== proactiveStableValue(state.proactive);
+    }
+    const nowDate = new Date();
+    const nowUtc = nowDate.toISOString();
+    const previousCandidates = state.proactive.candidates.map((entry) => entry.candidate);
+    const builtSources = await buildProactiveSources(
+      state,
+      previousCandidates,
+      nowDate.getTime(),
+      this.proactiveSourceHashMemo,
+      (value) => Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, value, { encoding: Crypto.CryptoEncoding.HEX }),
+    );
+    const sources = builtSources.sources;
+    const result = evaluateProactive({
+      nowUtc, timeZone: state.settings.timezone, rules: helperRules, sources, previousCandidates,
+      dismissedCandidateIds: state.proactive.dismissals.map((item) => item.candidateId),
+      snoozes: state.proactive.snoozes.map(({ suppressionKey, until, snoozedAt }) => ({ suppressionKey, until, snoozedAt })),
+      sourceSnapshotComplete: false,
+    });
+    const active = result.activeCandidates.map((candidate) => ({ candidate, presentation: 'active' as const }));
+    const deferred = result.deferredCandidates.map((candidate) => ({ candidate, presentation: 'deferred' as const }));
+    const dismissed = new Set(state.proactive.dismissals.map((item) => item.candidateId));
+    const invalidated = new Set(result.invalidatedIds);
+    const unevaluated = new Set(result.unevaluatedIds);
+    const retainedIds = new Set([...active, ...deferred].map((entry) => entry.candidate.id));
+    const uncertain: ProactiveCandidateEntry[] = [];
+    for (const old of state.proactive.candidates) {
+      const id = old.candidate.id;
+      if (retainedIds.has(id) || dismissed.has(id) || invalidated.has(id) || !unevaluated.has(id)) continue;
+      uncertain.push({ candidate: old.candidate, presentation: 'uncertain' });
+    }
+    const priority = { active: 0, deferred: 1, uncertain: 2 } as const;
+    const candidates = [...active, ...deferred, ...uncertain].sort((a, b) => priority[a.presentation] - priority[b.presentation] ||
+      a.candidate.eligibleAt.localeCompare(b.candidate.eligibleAt) || a.candidate.id.localeCompare(b.candidate.id));
+    const prunedCandidates = Math.max(0, candidates.length - 200);
+    state.proactive.candidates = candidates.slice(0, 200);
+
+    state.proactive.dismissals = state.proactive.dismissals.filter((item) => {
+      const rule = byRule.get(item.ruleId);
+      return Boolean(rule && item.ruleRevision >= rule.revision);
+    });
+    state.proactive.snoozes = state.proactive.snoozes.filter((item) => Date.parse(item.until) > nowDate.getTime() && byRule.has(item.ruleId));
+
+    const observations = [
+      ...state.mailbox.filter(validMailboxCacheRow).map((item) => ['mail', item.accountId, item.providerMessageId, item.observedAt ?? null, item.verifiedIdentityKey ?? null, item.connectionGeneration ?? null]),
+      ...state.calendarEvents.filter(validCalendarCacheRow).map((item) => ['calendar', item.accountId, item.calendarId, item.providerEventId, item.observedAt ?? null, item.verifiedIdentityKey ?? null, item.connectionGeneration ?? null]),
+    ].sort((a, b) => proactiveStableValue(a).localeCompare(proactiveStableValue(b)));
+    const accountState = state.accounts.map((account) => ({
+      id: account.id, connected: account.connected, authStatus: account.authStatus,
+      identity: account.identity ? [account.identity.providerNamespace, account.identity.clientId, account.identity.subject, account.identity.resourceUserId] : null,
+      capabilities: [...(account.capabilities ?? [])].sort(),
+    })).sort((a, b) => a.id.localeCompare(b.id));
+    const semanticInput = proactiveStableValue({
+      rules: helperRules,
+      timeZone: state.settings.timezone,
+      sources: sources.map((source) => [source.sourceId, source.sourceVersion, source.availability, source.freshness]),
+      observations, accountState,
+      dismissals: state.proactive.dismissals.map((item) => [item.candidateId, item.dismissedAt]),
+      snoozes: state.proactive.snoozes.map((item) => [item.suppressionKey, item.until]),
+      output: {
+        active: active.map((entry) => entry.candidate.id), deferred: deferred.map((entry) => entry.candidate.id),
+        invalidated: result.invalidatedIds, unevaluated: result.unevaluatedIds,
+        truncation: { ...result.truncation, sources: result.truncation.sources + builtSources.omittedSourceCount, candidates: result.truncation.candidates + prunedCandidates },
+      },
+    });
+    const inputFingerprint = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, semanticInput, { encoding: Crypto.CryptoEncoding.HEX });
+    const freshnessObservedAt = sources.flatMap((source) => {
+      if (source.freshness !== 'fresh' || source.namespace === 'local' || !source.accountId) return [];
+      const canMatch = enabledRules.some((rule) =>
+        (rule.accountIds.length === 0 || rule.accountIds.includes(source.accountId!)) &&
+        ((source.kind === 'mail' && (rule.trigger.type === 'unread_from' || rule.trigger.type === 'keyword')) ||
+          (source.kind === 'meeting' && rule.trigger.type === 'meeting_soon')));
+      if (!canMatch) return [];
+      if (source.kind === 'mail') return state.mailbox.filter((item) => item.accountId === source.accountId && item.providerMessageId === source.providerId).map((item) => item.observedAt);
+      try {
+        const [calendarProviderId, eventId] = JSON.parse(source.providerId) as [string, string];
+        return state.calendarEvents.filter((event) => event.accountId === source.accountId && event.providerEventId === eventId &&
+          state.calendars.some((calendar) => calendar.id === event.calendarId && (calendar.providerId ?? calendar.id) === calendarProviderId)).map((event) => event.observedAt);
+      } catch { return []; }
+    });
+    const freshnessExpiresAt = freshnessObservedAt.flatMap((observedAt) => {
+      const time = Date.parse(observedAt ?? '');
+      const expiresAt = time + 15 * 60_000;
+      return Number.isFinite(time) && expiresAt > nowDate.getTime() ? [new Date(expiresAt).toISOString()] : [];
+    });
+    const nextCheckAt = computeProactiveNextCheckAt({
+      nowUtc, timeZone: state.settings.timezone, rules: helperRules, sources,
+      snoozes: state.proactive.snoozes.map(({ suppressionKey, until, snoozedAt }) => ({ suppressionKey, until, snoozedAt })), freshnessExpiresAt,
+    }) ?? undefined;
+    const asOf = state.proactive.lastEvaluation?.inputFingerprint === inputFingerprint ? state.proactive.lastEvaluation.asOf : nowUtc;
+    state.proactive.lastEvaluation = {
+      inputFingerprint,
+      truncation: { ...result.truncation, sources: result.truncation.sources + builtSources.omittedSourceCount, candidates: result.truncation.candidates + prunedCandidates },
+      ...(nextCheckAt ? { nextCheckAt } : {}), asOf,
+    };
+    return before !== proactiveStableValue(state.proactive);
+  }
+
   /** Serialize the complete read-modify-write operation; failed writes never mutate committed state. */
   private mutate<T>(operation: (draft: AppState) => T | Promise<T>): Promise<T> {
     const run = this.transactionQueue.then(async () => {
@@ -637,9 +787,10 @@ export class AppControllerImpl implements AppController {
       if (this.loadPromise) await this.loadPromise;
       const draft = clone(this.state);
       const result = await operation(draft);
-      await this.store.save(draft);
+      await this.evaluateProactiveDraft(draft);
+      await this.store.save(this.persistedState(draft));
       this.state = draft;
-      this.snapshot = deepFreeze(clone(draft));
+      this.snapshot = deepFreeze(this.publicState(draft));
       this.emit();
       return clone(result);
     });
@@ -655,9 +806,10 @@ export class AppControllerImpl implements AppController {
       const draft = clone(this.state);
       const { changed, result } = await operation(draft);
       if (changed) {
-        await this.store.save(draft);
+        await this.evaluateProactiveDraft(draft);
+        await this.store.save(this.persistedState(draft));
         this.state = draft;
-        this.snapshot = deepFreeze(clone(draft));
+        this.snapshot = deepFreeze(this.publicState(draft));
         this.emit();
       }
       return clone(result);
@@ -864,6 +1016,11 @@ export class AppControllerImpl implements AppController {
   private async loadInternal(): Promise<void> {
     const loaded = await this.store.load();
     this.state = loaded ? normalizeLoadedState(loaded) : initialState();
+    const persisted = loaded as (AppState & { proactiveQuarantine?: unknown }) | undefined;
+    const proactive = normalizeProactiveData(persisted?.proactive, persisted?.proactiveQuarantine);
+    this.proactiveQuarantine = proactive.quarantine;
+    this.state.proactive = uncertainOnLoad(proactive.state);
+    delete (this.state as AppState & { proactiveQuarantine?: unknown }).proactiveQuarantine;
     for (const account of this.state.accounts) {
       this.state.syncStates[account.id] ??= emptySyncState(account.id);
       if (account.authStatus !== 'connected' || account.provider === 'local') continue;
@@ -915,8 +1072,10 @@ export class AppControllerImpl implements AppController {
     }
     ensureMemoryDocuments(this.state);
     ensurePeriodDocuments(this.state);
-    if (!loaded || JSON.stringify(this.state) !== JSON.stringify(loaded)) await this.store.save(this.state);
-    this.snapshot = deepFreeze(clone(this.state));
+    await this.evaluateProactiveDraft(this.state);
+    const stateToSave = this.persistedState(this.state);
+    if (!loaded || JSON.stringify(stateToSave) !== JSON.stringify(loaded)) await this.store.save(stateToSave);
+    this.snapshot = deepFreeze(this.publicState(this.state));
     this.loaded = true;
     this.emit();
     for (const document of this.state.documents) this.mirrorDirty.add(document.path);
@@ -1644,6 +1803,148 @@ export class AppControllerImpl implements AppController {
       addActivity(state, 'local_action', `Task reopened: ${task.title}.`, { noteId: task.sourceNoteId, proposalId: task.proposalId });
       return task;
     });
+  }
+
+  async saveProactiveRule(input: {
+    id?: string; expectedVersion?: number; name: string; enabled: boolean; accountIds: string[];
+    trigger: ProactiveTrigger; quietHours?: QuietHours;
+  }): Promise<SavedProactiveRule> {
+    if (this.proactiveQuarantine) throw new Error(PROACTIVE_INTEGRITY_ERROR);
+    const name = typeof input.name === 'string' ? input.name.trim() : '';
+    if (!name || name.length > 80 || /[\u0000-\u001f\u007f]/.test(name)) throw new Error('Rule name must contain 1 to 80 printable characters.');
+    if (typeof input.enabled !== 'boolean') throw new Error('Rule enabled must be a boolean.');
+    if (!Array.isArray(input.accountIds) || input.accountIds.length > 64 || input.accountIds.some((id) => typeof id !== 'string' || !id) || new Set(input.accountIds).size !== input.accountIds.length) {
+      throw new Error('Choose up to 64 unique configured accounts.');
+    }
+    const accountIds = [...input.accountIds].sort();
+    if (input.trigger?.type === 'task_due' && accountIds.length) throw new Error('Task due rules apply to local tasks only; leave the account filter empty.');
+    const ruleId = input.id ?? newId();
+    const trigger = clone(input.trigger);
+    const quietHours = input.quietHours ? clone(input.quietHours) : undefined;
+    const writeTime = now();
+    return this.mutateIfChanged((state) => {
+      if (state.proactive.integrityError) throw new Error(PROACTIVE_INTEGRITY_ERROR);
+      if (accountIds.some((accountId) => !state.accounts.some((account) => account.id === accountId))) {
+        throw new Error('Rule account filters must reference saved account configurations.');
+      }
+      const prior = state.proactive.rules.find((rule) => rule.id === ruleId);
+      if (input.id) {
+        if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion! < 1) throw new Error('Editing a rule requires its current version.');
+        if (!prior) throw new Error('Proactive rule was not found.');
+        if (prior.version !== input.expectedVersion) throw new Error('This proactive rule changed elsewhere. Reload it before saving.');
+      } else if (input.expectedVersion !== undefined) throw new Error('A new proactive rule cannot include an expected version.');
+      const candidate: SavedProactiveRule = {
+        id: ruleId, revision: prior?.revision ?? 1, version: prior?.version ?? 1, name, enabled: input.enabled, accountIds, trigger,
+        ...(quietHours ? { quietHours } : {}), createdAt: prior?.createdAt ?? writeTime, updatedAt: prior?.updatedAt ?? writeTime,
+      };
+      if (prior) {
+        const eligibilityBefore = proactiveStableValue({ enabled: prior.enabled, accountIds: prior.accountIds, trigger: prior.trigger, quietHours: prior.quietHours ?? null });
+        const eligibilityAfter = proactiveStableValue({ enabled: candidate.enabled, accountIds: candidate.accountIds, trigger: candidate.trigger, quietHours: candidate.quietHours ?? null });
+        const changed = eligibilityBefore !== eligibilityAfter || prior.name !== candidate.name;
+        if (!changed) return { changed: false, result: prior };
+        candidate.revision = prior.revision + Number(eligibilityBefore !== eligibilityAfter);
+        candidate.version = prior.version + 1;
+        candidate.updatedAt = writeTime;
+      }
+      evaluateProactive({ nowUtc: new Date().toISOString(), timeZone: state.settings.timezone, rules: [candidate], sources: [] });
+      if (prior) {
+        const priorIndex = state.proactive.rules.findIndex((rule) => rule.id === prior.id);
+        state.proactive.rules[priorIndex] = candidate;
+      } else {
+        if (state.proactive.rules.length >= 64) throw new Error('A maximum of 64 proactive rules can be saved.');
+        state.proactive.rules.push(candidate);
+      }
+      return { changed: true, result: candidate };
+    });
+  }
+
+  async deleteProactiveRule(id: string, expectedVersion: number): Promise<void> {
+    if (this.proactiveQuarantine) throw new Error(PROACTIVE_INTEGRITY_ERROR);
+    if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 1) throw new Error('Deleting a rule requires its current version.');
+    await this.mutateIfChanged((state) => {
+      if (state.proactive.integrityError) throw new Error(PROACTIVE_INTEGRITY_ERROR);
+      const index = state.proactive.rules.findIndex((rule) => rule.id === id);
+      if (index < 0) throw new Error('Proactive rule was not found.');
+      if (state.proactive.rules[index].version !== expectedVersion) throw new Error('This proactive rule changed elsewhere. Reload it before deleting.');
+      state.proactive.rules.splice(index, 1);
+      return { changed: true, result: undefined };
+    });
+  }
+
+  async evaluateLocalCandidates(): Promise<ProactiveState> {
+    await this.load();
+    return this.mutateIfChanged(async (state) => {
+      if (this.proactiveQuarantine || state.proactive.integrityError) return { changed: false, result: state.proactive };
+      const changed = await this.evaluateProactiveDraft(state);
+      return { changed, result: state.proactive };
+    });
+  }
+
+  async dismissProactiveCandidate(candidateId: string): Promise<ProactiveCandidateEntry> {
+    if (this.proactiveQuarantine) throw new Error(PROACTIVE_INTEGRITY_ERROR);
+    return this.mutateIfChanged(async (state) => {
+      if (state.proactive.integrityError) throw new Error(PROACTIVE_INTEGRITY_ERROR);
+      await this.evaluateProactiveDraft(state);
+      const entry = state.proactive.candidates.find((candidate) => candidate.candidate.id === candidateId);
+      if (!entry) throw new Error('This proactive candidate is no longer retained. Refresh the local list.');
+      const candidate = entry.candidate;
+      if (!state.proactive.dismissals.some((item) => item.candidateId === candidate.id)) {
+        if (state.proactive.dismissals.length >= 2000) throw new Error('Dismissal history is full. Remove old rules before dismissing another candidate.');
+        state.proactive.dismissals.push({
+          candidateId: candidate.id, ruleId: candidate.ruleId, ruleRevision: candidate.ruleRevision,
+          sourceId: candidate.sourceId, sourceVersion: candidate.sourceVersion, dismissedAt: now(),
+        });
+      }
+      return { changed: true, result: entry };
+    });
+  }
+
+  async snoozeProactiveCandidate(candidateId: string, until: string): Promise<ProactiveCandidateEntry> {
+    if (this.proactiveQuarantine) throw new Error(PROACTIVE_INTEGRITY_ERROR);
+    const requestedAt = Date.now();
+    const parsedUntil = new Date(until);
+    if (!Number.isFinite(parsedUntil.getTime()) || parsedUntil.toISOString() !== until || parsedUntil.getTime() <= requestedAt || parsedUntil.getTime() > requestedAt + 7 * 86_400_000) {
+      throw new Error('Snooze must end at a future time within the next seven days.');
+    }
+    return this.mutateIfChanged(async (state) => {
+      if (state.proactive.integrityError) throw new Error(PROACTIVE_INTEGRITY_ERROR);
+      await this.evaluateProactiveDraft(state);
+      const entry = state.proactive.candidates.find((candidate) => candidate.candidate.id === candidateId);
+      if (!entry) throw new Error('This proactive candidate is no longer retained. Refresh the local list.');
+      const candidate = entry.candidate;
+      const snoozedAt = now();
+      const createdAtMs = Date.parse(snoozedAt);
+      const untilMs = Date.parse(until);
+      if (!Number.isFinite(untilMs) || untilMs <= createdAtMs || untilMs - createdAtMs > 7 * 86_400_000) {
+        throw new Error('Snooze must end at a future time within the next seven days.');
+      }
+      const prior = state.proactive.snoozes.find((item) => item.suppressionKey === candidate.suppressionKey);
+      if (!prior && state.proactive.snoozes.length >= 2000) throw new Error('Snooze history is full. Wait for an existing snooze to expire.');
+      if (prior) { prior.until = until; prior.snoozedAt = snoozedAt; }
+      else state.proactive.snoozes.push({ suppressionKey: candidate.suppressionKey, ruleId: candidate.ruleId, sourceId: candidate.sourceId, until, snoozedAt });
+      return { changed: true, result: entry };
+    });
+  }
+
+  async getProactiveCandidateSource(candidateId: string): Promise<ProactiveCandidateSourceResult> {
+    await this.load();
+    const boundSnapshot = this.snapshot;
+    const entry = boundSnapshot.proactive.candidates.find((candidate) => candidate.candidate.id === candidateId);
+    if (!entry) return { status: 'missing' };
+    if (this.proactiveQuarantine || boundSnapshot.proactive.integrityError) return { status: 'stale', candidate: entry.candidate };
+    const builtSources = await buildProactiveSources(
+      boundSnapshot,
+      boundSnapshot.proactive.candidates.map((candidate) => candidate.candidate),
+      Date.now(), this.proactiveSourceHashMemo,
+      (value) => Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, value, { encoding: Crypto.CryptoEncoding.HEX }),
+    );
+    if (this.snapshot !== boundSnapshot) return { status: 'stale', candidate: entry.candidate };
+    const current = builtSources.sources.find((source) => source.sourceId === entry.candidate.sourceId);
+    if (!current && builtSources.omittedSourceCount > 0) return { status: 'stale', candidate: entry.candidate };
+    if (!current) return { status: 'missing', candidate: entry.candidate };
+    if (current.availability === 'unavailable') return { status: 'unavailable', candidate: entry.candidate };
+    if (current.freshness !== 'fresh' || current.sourceVersion !== entry.candidate.sourceVersion) return { status: 'stale', candidate: entry.candidate };
+    return { status: 'current', candidate: entry.candidate, source: current };
   }
 
   async saveDocument(path: string, content: string): Promise<ContextDocument> {

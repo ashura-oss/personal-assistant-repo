@@ -29,6 +29,8 @@ import type {
   AccountCapability,
   LocalTask,
   MailboxSnapshotMessage,
+  SavedProactiveRule,
+  ProactiveState,
 } from "./src/core";
 import { controller as productionController } from "./src/services/controller";
 import { createDispatchHistoryScenario } from "./src/dev/receiptScenario";
@@ -45,6 +47,9 @@ import * as Sharing from "expo-sharing";
 import { loadAudioForUpload } from "./src/audio/readAudio";
 import { ConnectionsSection } from "./src/ui/ConnectionsSection";
 import { MailboxSection } from "./src/ui/MailboxSection";
+import { ProactiveCandidatesSection } from "./src/ui/ProactiveCandidatesSection";
+import { ProactiveRulesSection } from "./src/ui/ProactiveRulesSection";
+import { useProactiveClock } from "./src/ui/useProactiveClock";
 import { ReviewSheet } from "./src/ui/ReviewSheet";
 import { NoteDetail as NoteDetailView } from "./src/ui/NoteDetail";
 import { TasksSection } from "./src/ui/TasksSection";
@@ -239,6 +244,11 @@ export default function App() {
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
+  useProactiveClock(
+    controller,
+    loading,
+    state.proactive.lastEvaluation?.nextCheckAt,
+  );
   const foregroundMailBusy = useRef(false);
   const audio = useAudioCapture();
   const [inboxFilter, setInboxFilter] = useState<"pending" | "done">(
@@ -1017,10 +1027,30 @@ export default function App() {
                 proposals={proposals}
                 accounts={state.accounts}
                 mailbox={state.mailbox}
+                proactive={state.proactive}
                 filter={inboxFilter}
                 setFilter={setInboxFilter}
                 mode={state.settings.mode}
                 onOpen={(proposal) => void openProposal(proposal)}
+                busy={busy}
+                onDismissCandidate={(candidateId) =>
+                  void run(async () => {
+                    await controller.dismissProactiveCandidate(candidateId);
+                    setNotice("Attention item dismissed.");
+                  })
+                }
+                onSnoozeCandidate={(candidateId, until) =>
+                  void run(async () => {
+                    await controller.snoozeProactiveCandidate(
+                      candidateId,
+                      until,
+                    );
+                    setNotice("Attention item snoozed.");
+                  })
+                }
+                onGetCandidateSource={(candidateId) =>
+                  controller.getProactiveCandidateSource(candidateId)
+                }
               />
             ) : (
               <LibraryScreen
@@ -1127,6 +1157,20 @@ export default function App() {
               onSync={syncAccount}
               onRefreshMail={refreshMailHead}
               onContinueMail={continueMailBackfill}
+              onSaveProactiveRule={(input) =>
+                run(async () => {
+                  const rule = await controller.saveProactiveRule(input);
+                  setNotice("Attention rule saved.");
+                  return rule;
+                })
+              }
+              onDeleteProactiveRule={(id, expectedVersion) =>
+                run(async () => {
+                  await controller.deleteProactiveRule(id, expectedVersion);
+                  setNotice("Attention rule deleted.");
+                  return true;
+                })
+              }
               demoMode={isIsolatedDemo}
             />
           </SafeAreaView>
@@ -1543,18 +1587,28 @@ function InboxScreen({
   proposals,
   accounts,
   mailbox,
+  proactive,
   filter,
   setFilter,
   mode,
   onOpen,
+  busy,
+  onDismissCandidate,
+  onSnoozeCandidate,
+  onGetCandidateSource,
 }: {
   proposals: Proposal[];
   accounts: ReturnType<typeof productionController.getSnapshot>["accounts"];
   mailbox: MailboxSnapshotMessage[];
+  proactive: ProactiveState;
   filter: "pending" | "done";
   setFilter: (v: "pending" | "done") => void;
   mode: AppSettings["mode"];
   onOpen: (p: Proposal) => void;
+  busy: boolean;
+  onDismissCandidate: (candidateId: string) => void;
+  onSnoozeCandidate: (candidateId: string, until: string) => void;
+  onGetCandidateSource: AppController["getProactiveCandidateSource"];
 }) {
   return (
     <ScrollView
@@ -1624,6 +1678,14 @@ function InboxScreen({
           </Text>
         </View>
       )}
+      <ProactiveCandidatesSection
+        proactive={proactive}
+        accounts={accounts}
+        busy={busy}
+        onDismiss={onDismissCandidate}
+        onSnooze={onSnoozeCandidate}
+        onGetSource={onGetCandidateSource}
+      />
       <MailboxSection messages={mailbox} accounts={accounts} />
     </ScrollView>
   );
@@ -1775,6 +1837,8 @@ function SettingsScreen({
   onSync,
   onRefreshMail,
   onContinueMail,
+  onSaveProactiveRule,
+  onDeleteProactiveRule,
 }: {
   state: ReturnType<typeof productionController.getSnapshot>;
   onClose: () => void;
@@ -1789,6 +1853,13 @@ function SettingsScreen({
   onSync: (accountId: string, continueSync: boolean) => Promise<void>;
   onRefreshMail: (accountId: string) => void;
   onContinueMail: (accountId: string) => void;
+  onSaveProactiveRule: (
+    input: Parameters<AppController["saveProactiveRule"]>[0],
+  ) => Promise<SavedProactiveRule | undefined>;
+  onDeleteProactiveRule: (
+    id: string,
+    expectedVersion: number,
+  ) => Promise<boolean | undefined>;
   onSave: (p: Partial<AppSettings>) => Promise<unknown>;
   onSaveAccount: (c: {
     provider: "google" | "microsoft" | "local";
@@ -2179,6 +2250,14 @@ function SettingsScreen({
           label="Save limits & retention"
           tone="quiet"
           onPress={() => void saveSettings()}
+        />
+        <ProactiveRulesSection
+          rules={state.proactive.rules}
+          accounts={state.accounts}
+          timezone={state.settings.timezone}
+          busy={busy}
+          onSave={onSaveProactiveRule}
+          onDelete={onDeleteProactiveRule}
         />
         <Text style={s.sectionTitle}>Accounts</Text>
         {state.accounts.length ? (

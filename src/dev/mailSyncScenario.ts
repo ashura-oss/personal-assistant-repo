@@ -122,7 +122,7 @@ function makeFixtureFetcher(): typeof fetch {
         id: messageId,
         threadId: `thread-${messageId}`,
         snippet:
-          "Fictional message content for local mailbox sync review. No real mailbox was contacted.",
+          "Project planning message for a fictional local mailbox preview. No real mailbox was contacted.",
         internalDate: String(receivedAt),
         labelIds: unread ? ["INBOX", "UNREAD"] : ["INBOX"],
         payload: {
@@ -286,5 +286,24 @@ export async function createMailSyncScenario() {
       "The sample mail fixture did not preserve its first-page cursor.",
     );
   }
+  await controller.saveProactiveRule({
+    name: "Morgan's unread notes",
+    enabled: true,
+    accountIds: [],
+    trigger: {
+      type: "unread_from",
+      addresses: ["morgan@sample.invalid"],
+    },
+  });
+  await controller.saveProactiveRule({
+    name: "Project mentions",
+    enabled: true,
+    accountIds: [],
+    trigger: {
+      type: "keyword",
+      keywords: ["project"],
+      unreadOnly: false,
+    },
+  });
   return controller;
 }

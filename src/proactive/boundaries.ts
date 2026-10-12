@@ -1,4 +1,4 @@
-import { evaluateProactive } from './index';
+import { evaluateProactive } from './evaluator';
 import type { ProactiveRule, ProactiveSnooze, ProactiveSource } from './types';
 
 const MAX_INPUT = 10_000;
