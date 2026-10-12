@@ -516,8 +516,8 @@ export interface SelectedMailTextSnapshot {
   text?: string;
   textDigest?: string;
   bytes: number;
-  extractionVersion: 'mail-text-v1';
-  representation: 'plain' | 'snippet' | 'none';
+  extractionVersion: 'mail-text-v1' | 'mail-text-v2';
+  representation: 'plain' | 'converted_html' | 'snippet' | 'none';
   completeness: 'complete_text' | 'excerpt' | 'unavailable';
   omissionReasons: string[];
 }
@@ -555,7 +555,7 @@ export interface MailReplyTextGenerationResult {
   generatedAt?: string;
   fromCache: boolean;
   submittedContext?: {
-    bytes: number; representation: 'plain' | 'snippet' | 'none'; completeness: 'complete_text' | 'excerpt' | 'unavailable';
+    bytes: number; representation: 'plain' | 'converted_html' | 'snippet' | 'none'; completeness: 'complete_text' | 'excerpt' | 'unavailable';
     omissionReasons: string[]; requestBytes: number; briefBytes: number; policyDocuments: string[];
   };
 }

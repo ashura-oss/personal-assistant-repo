@@ -152,7 +152,7 @@ export interface ReplyGenerationUsage { inputTokens: number; outputTokens: numbe
 export interface ReplyGenerationResult extends ReplyGenerationUsage { text: string; requestBytes: number; }
 export interface ReplyGenerationInput {
   sourceText: string;
-  sourceRepresentation: 'plain' | 'snippet' | 'none';
+  sourceRepresentation: 'plain' | 'converted_html' | 'snippet' | 'none';
   sourceCompleteness: 'complete_text' | 'excerpt' | 'unavailable';
   subject: string;
   to: string[];

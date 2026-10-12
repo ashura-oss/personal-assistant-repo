@@ -147,11 +147,9 @@ export function MailReplyComposer({
         ) {
           setBodySnapshot(cached.snapshot);
           setShowFullBody(false);
-          setUseSavedExcerpt(cached.snapshot.completeness === "complete_text");
+          setUseSavedExcerpt(cached.snapshot.completeness === "complete_text" && cached.snapshot.representation !== "converted_html");
           setBodyStatus(
-            cached.snapshot.completeness === "complete_text"
-              ? "Previously loaded message text is ready to use."
-              : "A saved excerpt is available. Choose it explicitly before generating.",
+            bodyTextStatus(cached.snapshot, true),
           );
         } else {
           setBodySnapshot(null);
@@ -243,14 +241,10 @@ export function MailReplyComposer({
       }
       setBodySnapshot(result.snapshot);
       setShowFullBody(false);
-      const complete = result.snapshot.completeness === "complete_text";
+      const complete = result.snapshot.completeness === "complete_text" && result.snapshot.representation !== "converted_html";
       setUseSavedExcerpt(complete);
       setBodyStatus(
-        complete
-          ? "Message text loaded. Review the exact text below before generating."
-          : result.snapshot.completeness === "excerpt"
-            ? "Only an excerpt is available. Choose it explicitly before generating."
-            : "No usable message text was returned. You can still write a reply manually.",
+        bodyTextStatus(result.snapshot, false),
       );
     } catch (cause) {
       if (sequence === bodyLoadSequence.current && visibleRef.current && activeMessageId.current === requestedMessageId) {
@@ -395,10 +389,11 @@ export function MailReplyComposer({
               <Text style={styles.limitText}>Selected text is capped at 16 KB</Text>
             </View>
             <Button label={loadingText ? "Loading message text…" : "Load message text"} disabled={!source || checking || loadingText || busy || generating} tone="quiet" onPress={() => void loadMessageText()} />
-            {bodySnapshot ? <Text style={styles.contextMeta}>{bodySnapshot.representation === "plain" ? "Plain message text" : bodySnapshot.representation === "snippet" ? "Saved excerpt" : "Unavailable"} · {bodySnapshot.completeness.replaceAll("_", " ")} · {bodySnapshot.bytes.toLocaleString()} bytes · checked {new Date(bodySnapshot.checkedAt).toLocaleString()}</Text> : null}
+            {bodySnapshot ? <Text style={styles.contextMeta}>{bodyTextLabel(bodySnapshot.representation)} · {bodySnapshot.completeness.replaceAll("_", " ")} · {bodySnapshot.bytes.toLocaleString()} bytes · checked {new Date(bodySnapshot.checkedAt).toLocaleString()}</Text> : null}
             {bodySnapshot?.text ? <Text selectable numberOfLines={showFullBody ? undefined : 8} style={styles.contextText}>{bodySnapshot.text}</Text> : null}
+            {bodySnapshot?.representation === "converted_html" ? <Text style={styles.disclaimer}>Layout and hidden-content rules may differ from the original email.</Text> : null}
             {bodySnapshot?.text && bodySnapshot.bytes > 1200 ? <Button label={showFullBody ? "Show less selected text" : "Show full selected text"} tone="quiet" onPress={() => setShowFullBody((current) => !current)} /> : null}
-            {bodySnapshot?.omissionReasons.length ? <Text style={styles.disclaimer}>Not included: {bodySnapshot.omissionReasons.join(", ")}</Text> : null}
+            {bodySnapshot?.omissionReasons.length ? <View style={styles.omissions}>{friendlyOmissionReasons(bodySnapshot.omissionReasons).map(({ label, prefix }) => <Text key={`${prefix}-${label}`} style={styles.disclaimer}>{prefix}: {label}</Text>)}</View> : null}
             {bodySnapshot?.completeness === "excerpt" && !useSavedExcerpt ? <Button label="Use this excerpt" tone="quiet" disabled={busy || generating} onPress={() => { invalidatePendingGeneration(); setUseSavedExcerpt(true); setBodyStatus("Excerpt selected. Review it before generating."); }} /> : null}
             {bodyStatus ? <Text style={styles.disclaimer}>{bodyStatus}</Text> : null}
 
@@ -473,6 +468,65 @@ function messageOf(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback;
 }
 
+function bodyTextLabel(representation: SelectedMailTextSnapshot["representation"]) {
+  if (representation === "plain") return "Plain message text";
+  if (representation === "converted_html") return "Converted HTML text";
+  if (representation === "snippet") return "Saved excerpt";
+  return "Unavailable";
+}
+
+function bodyTextStatus(snapshot: SelectedMailTextSnapshot, cached: boolean) {
+  if (snapshot.representation === "converted_html") {
+    return cached
+      ? "Converted HTML text is ready for review. Choose it explicitly before generating."
+      : "Converted HTML text needs review. Choose this excerpt explicitly before generating.";
+  }
+  if (snapshot.completeness === "complete_text") {
+    return cached
+      ? "Previously loaded message text is ready to use."
+      : "Message text loaded. Review the exact text below before generating.";
+  }
+  if (snapshot.completeness === "excerpt") {
+    return cached
+      ? "A saved excerpt is available. Choose it explicitly before generating."
+      : "Only an excerpt is available. Choose it explicitly before generating.";
+  }
+  return "No usable message text was returned. You can still write a reply manually.";
+}
+
+function friendlyOmissionReasons(reasons: string[]) {
+  const friendly = new Map<string, { label: string; prefix: string }>();
+  for (const reason of reasons) {
+    const code = reason.toLowerCase();
+    let label: string | undefined;
+    let prefix = "Not included";
+    if (code === "html_non_rendering_conversion") {
+      label = "HTML was converted to plain text without rendering.";
+      prefix = "Text handling";
+    } else if (code.includes("active_content")) label = "Active or non-message markup was omitted.";
+    else if (code.includes("script") || code.includes("style") || code.includes("head")) label = "Script or style content was omitted.";
+    else if (code.includes("hidden")) label = "Content marked hidden was omitted.";
+    else if (code === "html_css_visibility_not_computed") {
+      label = "Hidden-content rules may differ from the original layout.";
+      prefix = "Text handling";
+    }
+    else if (code.includes("link") || code.includes("destination")) label = "Link destinations were omitted; visible link text may remain.";
+    else if (code.includes("code")) label = "Code-like content was omitted.";
+    else if (code.includes("byte") || code.includes("size") || code.includes("attribute")) label = "Some text or markup exceeded a size limit.";
+    else if (code.includes("depth")) label = "Nested markup exceeded the conversion limit.";
+    else if (code === "html_unclosed_tags") {
+      label = "Markup had implied or missing closing tags; review the converted text.";
+      prefix = "Text handling";
+    }
+    else if (code === "html_parse_error") label = "Some markup could not be parsed.";
+    else if (code.includes("tag") || code.includes("element") || code.includes("callback") || code.includes("parse") || code.includes("unclosed")) label = "Some content was omitted because markup exceeded conversion limits.";
+    else if (code.includes("html")) label = "Some HTML content could not be included in the text conversion.";
+    else label = "Some message content was omitted during text extraction.";
+    friendly.set(`${prefix}:${label}`, { label, prefix });
+  }
+  return [...friendly.values()];
+}
+
 const styles = {
   safe: { flex: 1, backgroundColor: C.bg },
   safeArea: { flex: 1, backgroundColor: C.bg },
@@ -495,6 +549,7 @@ const styles = {
   sectionHeading: { gap: 3 },
   limitText: { color: C.muted, fontSize: 10, lineHeight: 15 },
   contextMeta: { color: C.sage, fontSize: 11, lineHeight: 17 },
+  omissions: { gap: 3 },
   contextText: { color: C.text, fontSize: 12, lineHeight: 18, backgroundColor: C.card, borderRadius: 12, padding: 12, borderColor: C.border, borderWidth: 1 },
   contextCard: { gap: 8, padding: 12, backgroundColor: C.card, borderRadius: 12, borderColor: C.border, borderWidth: 1 },
   guidanceItem: { gap: 6 },

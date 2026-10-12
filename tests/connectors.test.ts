@@ -230,7 +230,7 @@ describe('provider connector clients', () => {
     const fetcher = vi.fn(async (input: RequestInfo | URL) => { const url = new URL(String(input)); requested.push(url); return response(gmailSelectedMessage()); }) as typeof fetch;
     const { client } = fixture({ fetcher });
     const result = await client.readSelectedMessageText(account, 'gmail-selected', { sizeEstimate: 1234, sizeCheckedAt: new Date(Date.now() - 1000).toISOString() });
-    expect(result).toMatchObject({ status: 'available', text: 'Selected message body', bytes: 21, representation: 'plain', completeness: 'complete_text', extractionVersion: 'mail-text-v1' });
+    expect(result).toMatchObject({ status: 'available', text: 'Selected message body', bytes: 21, representation: 'plain', completeness: 'complete_text', extractionVersion: 'mail-text-v2' });
     expect(result.message).toMatchObject({ id: 'gmail-selected', idFormat: 'gmail', threadId: 'thread-selected', providerVersion: 'history-7', sizeEstimate: 1234, replyMetadataComplete: true });
     expect(requested).toHaveLength(1);
     expect(requested[0].searchParams.get('format')).toBe('full');
@@ -309,7 +309,7 @@ describe('provider connector clients', () => {
     ]);
   });
 
-  it('labels HTML and attachment-only Gmail content as snippets and never fetches attachment IDs', async () => {
+  it('converts HTML Gmail content and never fetches attachment IDs', async () => {
     const requested: string[] = [];
     const fetcher = vi.fn(async (input: RequestInfo | URL) => {
       requested.push(String(input));
@@ -322,8 +322,8 @@ describe('provider connector clients', () => {
     }) as typeof fetch;
     const { client } = fixture({ fetcher });
     const result = await client.readSelectedMessageText(account, 'gmail-selected', { sizeEstimate: 1234, sizeCheckedAt: new Date().toISOString() });
-    expect(result).toMatchObject({ status: 'available', text: 'Selected snippet', representation: 'snippet', completeness: 'excerpt' });
-    expect(result.reasons).toEqual(expect.arrayContaining(['html_conversion_unavailable', 'attachment_body_unavailable']));
+    expect(result).toMatchObject({ status: 'available', text: 'html body', representation: 'converted_html', completeness: 'excerpt', extractionVersion: 'mail-text-v2' });
+    expect(result.reasons).toEqual(expect.arrayContaining(['html_non_rendering_conversion', 'attachment_body_unavailable']));
     expect(requested).toHaveLength(1);
     expect(requested.some((url) => url.includes('attachments'))).toBe(false);
   });
@@ -347,7 +347,7 @@ describe('provider connector clients', () => {
     const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => { requestedUrl = String(input); prefer = new Headers(init?.headers).get('prefer') ?? ''; return response(graphSelectedMessage()); }) as typeof fetch;
     const { client } = fixture({ fetcher, token: token({ identity: microsoftIdentity }) });
     const result = await client.readSelectedMessageText(microsoftAccount, 'AAMk-selected==');
-    expect(result).toMatchObject({ status: 'available', text: 'Selected Graph body', representation: 'plain', completeness: 'complete_text' });
+    expect(result).toMatchObject({ status: 'available', text: 'Selected Graph body', representation: 'plain', completeness: 'complete_text', extractionVersion: 'mail-text-v2' });
     expect(result.message).toMatchObject({ id: 'AAMk-selected==', idFormat: 'graph-immutable', providerVersion: 'change-7', replyMetadataComplete: true });
     expect(requestedUrl).toContain('/me/messages/AAMk-selected%3D%3D?');
     expect(new URL(requestedUrl).searchParams.get('$select')).toBe('id,conversationId,changeKey,subject,body,bodyPreview,from,replyTo,toRecipients,ccRecipients,internetMessageId,internetMessageHeaders,isRead,receivedDateTime');
@@ -356,7 +356,10 @@ describe('provider connector clients', () => {
     expect(fetcher).toHaveBeenCalledTimes(1);
 
     const htmlClient = fixture({ fetcher: vi.fn(async () => response(graphSelectedMessage('AAMk-selected==', '', { body: { contentType: 'html', content: '<p>body</p>' } }))) as typeof fetch, token: token({ identity: microsoftIdentity }) }).client;
-    await expect(htmlClient.readSelectedMessageText(microsoftAccount, 'AAMk-selected==')).resolves.toMatchObject({ text: 'Graph snippet', representation: 'snippet', completeness: 'excerpt', reasons: expect.arrayContaining(['html_conversion_unavailable']) });
+    await expect(htmlClient.readSelectedMessageText(microsoftAccount, 'AAMk-selected==')).resolves.toMatchObject({ text: 'body', representation: 'converted_html', completeness: 'excerpt', extractionVersion: 'mail-text-v2', reasons: expect.arrayContaining(['html_non_rendering_conversion']) });
+
+    const blankHtmlClient = fixture({ fetcher: vi.fn(async () => response(graphSelectedMessage('AAMk-selected==', '', { body: { contentType: 'html', content: '<p> &nbsp; </p>' } }))) as typeof fetch, token: token({ identity: microsoftIdentity }) }).client;
+    await expect(blankHtmlClient.readSelectedMessageText(microsoftAccount, 'AAMk-selected==')).resolves.toMatchObject({ text: 'Graph snippet', representation: 'snippet', completeness: 'excerpt', extractionVersion: 'mail-text-v2', reasons: expect.arrayContaining(['html_non_rendering_conversion', 'snippet_fallback']) });
   });
 
   it('refuses Graph Basic-only body reads and mismatched immutable IDs before extra requests', async () => {

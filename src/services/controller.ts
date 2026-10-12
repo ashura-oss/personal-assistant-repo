@@ -2433,13 +2433,16 @@ export class AppControllerImpl implements AppController {
 
   private selectedMailTextUnavailable(
     message: MailboxSnapshotMessage, account: Account, sourceDigest: string, reason: string, checkedAt = now(),
+    extractionVersion: SelectedMailTextSnapshot['extractionVersion'] = 'mail-text-v2',
+    reasons?: string[],
   ): SelectedMailTextSnapshot {
+    const boundedReasons = (reasons ?? [reason]).filter((item) => typeof item === 'string' && item.trim().length > 0 && item.length <= 240).slice(0, 16);
     return {
       version: 1, messageId: message.id, accountId: account.id, identityKey: identityKey(account),
       identity: clone(account.identity!), connectionGeneration: account.connectionGeneration ?? 0,
       providerMessageId: message.providerMessageId, idFormat: message.idFormat!, sourceDigest,
       ...(message.providerVersion ? { providerVersion: message.providerVersion } : {}), checkedAt,
-      bytes: 0, extractionVersion: 'mail-text-v1', representation: 'none', completeness: 'unavailable', omissionReasons: [reason],
+      bytes: 0, extractionVersion, representation: 'none', completeness: 'unavailable', omissionReasons: boundedReasons.length ? boundedReasons : [reason],
     };
   }
 
@@ -2536,20 +2539,36 @@ export class AppControllerImpl implements AppController {
     let bytes = 0;
     let representation: SelectedMailTextSnapshot['representation'] = 'none';
     let completeness: SelectedMailTextSnapshot['completeness'] = 'unavailable';
-    const omissionReasons = [...(result.reasons ?? [])].filter((reason) => typeof reason === 'string').slice(0, 16);
-    if (updatedMessage && updatedSource && typeof result.text === 'string' && ['plain', 'snippet'].includes(result.representation) && ['complete_text', 'excerpt'].includes(result.completeness)) {
+    let extractionVersion: SelectedMailTextSnapshot['extractionVersion'] = 'mail-text-v2';
+    const omissionReasons = [...(result.reasons ?? [])].filter((reason) => typeof reason === 'string' && reason.trim().length > 0 && reason.length <= 240).slice(0, 16);
+    const receivedVersion: unknown = result.extractionVersion;
+    const receivedRepresentation: unknown = result.representation;
+    const receivedCompleteness: unknown = result.completeness;
+    const recognizedExtractionVersion = receivedVersion === 'mail-text-v1' || receivedVersion === 'mail-text-v2';
+    const allowedRepresentation = receivedVersion === 'mail-text-v1'
+      ? ['plain', 'snippet', 'none'].includes(receivedRepresentation as string)
+      : recognizedExtractionVersion && ['plain', 'converted_html', 'snippet', 'none'].includes(receivedRepresentation as string);
+    const validExtractionPair = allowedRepresentation && ['complete_text', 'excerpt'].includes(receivedCompleteness as string) &&
+      (receivedCompleteness !== 'complete_text' || receivedRepresentation === 'plain') &&
+      (receivedRepresentation !== 'converted_html' || (receivedVersion === 'mail-text-v2' && receivedCompleteness === 'excerpt'));
+    const validUnavailablePair = allowedRepresentation && receivedRepresentation === 'none' && receivedCompleteness === 'unavailable' &&
+      result.status === 'unavailable' && result.bytes === 0 && result.text === undefined;
+    if (result.status === 'available' && updatedMessage && updatedSource && recognizedExtractionVersion && validExtractionPair && typeof result.text === 'string' && receivedRepresentation !== 'none') {
       const rawBytes = utf8Bytes(result.text);
       const normalized = normalizeMailText(result.text);
       bytes = utf8Bytes(normalized);
       if (rawBytes === result.bytes && rawBytes <= MAX_SELECTED_MAIL_TEXT_BYTES && bytes <= MAX_SELECTED_MAIL_TEXT_BYTES) {
         text = normalized;
         textDigest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, normalized);
-        representation = result.representation;
-        completeness = result.completeness;
+        representation = receivedRepresentation as SelectedMailTextSnapshot['representation'];
+        completeness = receivedCompleteness as SelectedMailTextSnapshot['completeness'];
+        extractionVersion = receivedVersion as SelectedMailTextSnapshot['extractionVersion'];
       } else {
         omissionReasons.push('text_byte_limit_or_length_mismatch');
       }
-    }
+    } else if (validUnavailablePair && recognizedExtractionVersion) {
+      extractionVersion = receivedVersion as SelectedMailTextSnapshot['extractionVersion'];
+    } else if (!recognizedExtractionVersion || !validExtractionPair) omissionReasons.push('invalid_extraction_result');
     if (this.selectedMailFence(this.snapshot, input.messageId) !== expectedFence) return { status: 'stale' };
     const sourceForCache = updatedSource ?? before.source;
     const baseMessage = updatedMessage ?? original;
@@ -2557,8 +2576,9 @@ export class AppControllerImpl implements AppController {
       version: 1, messageId: original.id, accountId: account.id, identityKey: identityKey(account), identity: clone(account.identity),
       connectionGeneration: account.connectionGeneration ?? 0, providerMessageId: original.providerMessageId, idFormat: original.idFormat,
       sourceDigest: sourceForCache.sourceDigest, ...(baseMessage.providerVersion ? { providerVersion: baseMessage.providerVersion } : {}),
-      checkedAt, text, textDigest, bytes, extractionVersion: 'mail-text-v1', representation, completeness, omissionReasons,
-    } : this.selectedMailTextUnavailable(baseMessage, account, sourceForCache.sourceDigest, omissionReasons[0] ?? 'text_unavailable', checkedAt);
+      checkedAt, text, textDigest, bytes, extractionVersion, representation, completeness, omissionReasons,
+    } : this.selectedMailTextUnavailable(baseMessage, account, sourceForCache.sourceDigest, omissionReasons[0] ?? 'text_unavailable', checkedAt,
+      validUnavailablePair ? extractionVersion : 'mail-text-v2', validUnavailablePair ? omissionReasons : undefined);
     await this.mutate((state) => {
       if (this.selectedMailFence(state, input.messageId) !== expectedFence) throw new Error('Selected message changed while text was being saved.');
       const messageIndex = state.mailbox.findIndex((item) => item.id === input.messageId);
@@ -2604,7 +2624,7 @@ export class AppControllerImpl implements AppController {
       .map((doc) => ({ path: doc.path, revision: doc.revision, content: doc.content }));
     return stableJson({
       fence: this.selectedMailFence(state, messageId), metadata: canonicalMailboxContent(message), observedAt: message.observedAt,
-      body: { sourceDigest: body.sourceDigest, textDigest: body.textDigest, text: body.text, checkedAt: body.checkedAt, bytes: body.bytes, representation: body.representation, completeness: body.completeness },
+      body: { sourceDigest: body.sourceDigest, textDigest: body.textDigest, text: body.text, checkedAt: body.checkedAt, bytes: body.bytes, extractionVersion: body.extractionVersion, representation: body.representation, completeness: body.completeness, omissionReasons: body.omissionReasons },
       account: { identity: account.identity, generation: account.connectionGeneration ?? 0, tokenRef: account.tokenRef, capabilities: account.capabilities, grantedScopes: account.grantedScopes },
       settings: state.settings, policy, note: note ? { id: note.id, revision: note.revision, transcript: note.transcript, capturedAt: note.capturedAt ?? note.createdAt, captureTimeZone: note.captureTimeZone ?? state.settings.timezone } : null,
     });
@@ -2657,6 +2677,8 @@ export class AppControllerImpl implements AppController {
     const requestAsOf = new Date().toISOString();
     const sourceAndText = {
       sourceDigest: input.sourceDigest, textDigest: input.textDigest, mode: input.mode, to: input.to, cc: input.cc, subject: source.source.subject,
+      extractionVersion: cachedBody.snapshot.extractionVersion, representation: cachedBody.snapshot.representation,
+      completeness: cachedBody.snapshot.completeness, omissionReasons: cachedBody.snapshot.omissionReasons,
       brief, noteId: input.noteId ?? null, noteRevision: input.noteRevision ?? null,
       noteDigest: noteContext === undefined ? null : await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, noteContext),
       noteCapture: noteCapture ?? null, accountIdentity: source.source.identity, connectionGeneration: source.source.connectionGeneration,

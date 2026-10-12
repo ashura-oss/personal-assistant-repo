@@ -16,6 +16,8 @@ const PREVIEW_SCOPE = "https://www.googleapis.com/auth/gmail.readonly";
 const MOCK_OPENAI_KEY = "still-mail-preview-openai-key-not-a-credential";
 const MOCK_OPENAI_ORIGIN = "https://still-preview.openai.azure.com";
 const MOCK_OPENAI_DEPLOYMENT = "gpt-6-luna";
+const HTML_SAMPLE_MESSAGE = '<p>Project discussion: Could you send the revised timeline by Friday?</p><p>Owners &amp; next steps:</p><ul><li>Confirm release owner</li><li>Share updated dates</li></ul><p>Image: <img alt="Roadmap preview" src="https://assets.invalid/roadmap.png"></p><p><a href="https://secret.example/path">Open project plan</a></p><p hidden>Hidden details must not appear.</p><script>window.secret = true;</script><style>.private{display:none}</style><pre><code>token=do-not-include</code></pre>';
+const HTML_SAMPLE_EXPECTED_TEXT = "Project discussion: Could you send the revised timeline by Friday?\nOwners & next steps:\n• Confirm release owner\n• Share updated dates\nImage: [Image: Roadmap preview]\nOpen project plan";
 
 class MemoryStateStore implements StateStore {
   private value?: AppState;
@@ -119,6 +121,10 @@ function makeFixtureFetcher(mockGeneration: boolean): typeof fetch {
       const inputText = Array.isArray(input)
         ? input.flatMap((item: any) => Array.isArray(item?.content) ? item.content : []).map((item: any) => item?.text).filter((value: unknown) => typeof value === "string")
         : [];
+      const selectedMessageMarker = "SELECTED MESSAGE (converted_html; excerpt):\n";
+      const selectedMessageText = typeof inputText[1] === "string" && inputText[1].includes(selectedMessageMarker)
+        ? inputText[1].slice(inputText[1].lastIndexOf(selectedMessageMarker) + selectedMessageMarker.length)
+        : "";
       const inputBytes = inputText.reduce((total: number, value: string) => total + new TextEncoder().encode(value).length, 0);
       const allowedBodyKeys = ["input", "max_output_tokens", "model", "reasoning", "store", "text", "tools"];
       if (
@@ -130,7 +136,9 @@ function makeFixtureFetcher(mockGeneration: boolean): typeof fetch {
         stableFixtureJson(schema) !== stableFixtureJson(expectedSchema) ||
         JSON.stringify(roleNames) !== JSON.stringify(["developer", "user"]) ||
         !messageShapeIsTextOnly || inputText.length !== 2 || inputBytes > 23_744 ||
-        !inputText[1].includes("Project discussion: Could you send the revised timeline by Friday?")
+        selectedMessageText !== HTML_SAMPLE_EXPECTED_TEXT ||
+        selectedMessageText.includes("Hidden details must not appear") || selectedMessageText.includes("window.secret") ||
+        selectedMessageText.includes("secret.example") || selectedMessageText.includes("token=do-not-include")
       ) {
         throw new Error("The sample reply fixture rejected a request outside the text-only reply contract.");
       }
@@ -206,10 +214,12 @@ function makeFixtureFetcher(mockGeneration: boolean): typeof fetch {
         internalDate: String(receivedAt),
         labelIds: unread ? ["INBOX", "UNREAD"] : ["INBOX"],
         payload: {
-          mimeType: format === "full" ? "text/plain" : "multipart/alternative",
+          mimeType: format === "full" && messageId === "sample-unread-first-page" ? "text/html" : format === "full" ? "text/plain" : "multipart/alternative",
           headers,
           ...(format === "full"
-            ? { body: { size: 66, data: "UHJvamVjdCBkaXNjdXNzaW9uOiBDb3VsZCB5b3Ugc2VuZCB0aGUgcmV2aXNlZCB0aW1lbGluZSBieSBGcmlkYXk_" } }
+            ? { body: messageId === "sample-unread-first-page"
+                ? { size: HTML_SAMPLE_MESSAGE.length, data: base64UrlAscii(HTML_SAMPLE_MESSAGE) }
+                : { size: 66, data: "UHJvamVjdCBkaXNjdXNzaW9uOiBDb3VsZCB5b3Ugc2VuZCB0aGUgcmV2aXNlZCB0aW1lbGluZSBieSBGcmlkYXk_" } }
             : {}),
         },
       });
@@ -272,6 +282,10 @@ function stableFixtureJson(value: unknown): string {
     return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableFixtureJson(record[key])}`).join(",")}}`;
   }
   return JSON.stringify(value);
+}
+
+function base64UrlAscii(value: string): string {
+  return btoa(value).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
 function equalIdentity(

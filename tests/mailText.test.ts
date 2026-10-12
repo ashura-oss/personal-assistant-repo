@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { boundGraphText, extractGmailMessageText } from '../src/connectors/mailText';
+import { convertHtmlToText } from '../src/connectors/htmlText';
 
 const encoded = (value: string) => {
   const bytes = new TextEncoder().encode(value);
@@ -37,18 +38,69 @@ describe('selected mail text extraction', () => {
     expect(result.reasons).not.toContain('html_conversion_unavailable');
   });
 
-  it('marks an unsupported mixed HTML fragment as incomplete beside plain text', () => {
+  it('selects plain text and records an omitted mixed HTML branch', () => {
     const result = extractGmailMessageText({ mimeType: 'multipart/mixed', parts: [
       textPart('Plain fragment'), { mimeType: 'text/html', body: { data: encoded('<p>other body fragment</p>') } },
     ] });
     expect(result).toMatchObject({ text: 'Plain fragment', completeness: 'excerpt' });
-    expect(result.reasons).toContain('html_conversion_unavailable');
+    expect(result.reasons).toContain('additional_text_part_omitted');
   });
 
-  it('uses a labeled snippet for HTML-only and never strips or renders HTML', () => {
+  it('converts HTML-only Gmail bodies without rendering markup', () => {
     const result = extractGmailMessageText({ mimeType: 'text/html', body: { data: encoded('<script>bad()</script><p>body</p>') } }, 'Provider excerpt');
-    expect(result).toMatchObject({ text: 'Provider excerpt', representation: 'snippet', completeness: 'excerpt' });
-    expect(result.reasons).toContain('html_conversion_unavailable');
+    expect(result).toMatchObject({ text: 'body', representation: 'converted_html', completeness: 'excerpt' });
+    expect(result.reasons).toContain('html_non_rendering_conversion');
+    expect(result.text).not.toContain('bad()');
+  });
+
+  it('uses plain content in multipart/alternative and does not include converted HTML', () => {
+    const result = extractGmailMessageText({ mimeType: 'multipart/alternative', parts: [
+      { mimeType: 'text/html', body: { data: encoded('<p>rich version</p>') } }, textPart('plain version'),
+    ] });
+    expect(result).toMatchObject({ text: 'plain version', representation: 'plain', completeness: 'complete_text' });
+    expect(result.reasons).not.toContain('html_non_rendering_conversion');
+  });
+
+  it('prefers readable HTML over a whitespace-only plain alternative', () => {
+    const result = extractGmailMessageText({ mimeType: 'multipart/alternative', parts: [
+      textPart('  \r\n  '), { mimeType: 'text/html', body: { data: encoded('<p>Readable rich body</p>') } },
+    ] });
+    expect(result).toMatchObject({ text: 'Readable rich body', representation: 'converted_html', completeness: 'excerpt' });
+    expect(result.reasons).toContain('html_non_rendering_conversion');
+  });
+
+  it('keeps nested related HTML reasons local when an outer alternative has usable plain text', () => {
+    const result = extractGmailMessageText({ mimeType: 'multipart/alternative', parts: [
+      { mimeType: 'multipart/related', parts: [{ mimeType: 'text/html', body: { data: encoded('<p>rich body</p>') } }] },
+      textPart('Complete plain body'),
+    ] });
+    expect(result).toMatchObject({ text: 'Complete plain body', representation: 'plain', completeness: 'complete_text' });
+    expect(result.reasons).not.toContain('html_non_rendering_conversion');
+    expect(result.reasons).not.toContain('html_css_visibility_not_computed');
+  });
+
+  it('ignores a broken HTML alternative when usable plain text is selected', () => {
+    const result = extractGmailMessageText({ mimeType: 'multipart/alternative', parts: [
+      { mimeType: 'text/html', body: {} }, textPart('Complete plain body'),
+    ] });
+    expect(result).toMatchObject({ text: 'Complete plain body', representation: 'plain', completeness: 'complete_text' });
+    expect(result.reasons).not.toContain('html_data_missing');
+  });
+
+  it('uses the provider snippet when blank plain and malformed HTML alternatives are unreadable', () => {
+    const result = extractGmailMessageText({ mimeType: 'multipart/alternative', parts: [
+      textPart('  '), { mimeType: 'text/html', body: { data: '%%%bad%%%' } },
+    ] }, 'Saved provider excerpt');
+    expect(result).toMatchObject({ text: 'Saved provider excerpt', representation: 'snippet', completeness: 'excerpt' });
+    expect(result.reasons).toEqual(expect.arrayContaining(['malformed_base64', 'snippet_fallback']));
+  });
+
+  it('selects readable HTML over a blank plain body in multipart/mixed', () => {
+    const result = extractGmailMessageText({ mimeType: 'multipart/mixed', parts: [
+      textPart('  '), { mimeType: 'text/html', body: { data: encoded('<p>Readable mixed body</p>') } },
+    ] });
+    expect(result).toMatchObject({ text: 'Readable mixed body', representation: 'converted_html', completeness: 'excerpt' });
+    expect(result.reasons).toEqual(expect.arrayContaining(['additional_text_part_omitted', 'html_non_rendering_conversion']));
   });
 
   it('omits attachment, external attachment body, and embedded-message text', () => {
@@ -108,6 +160,10 @@ describe('selected mail text extraction', () => {
     expect(partsResult.text).toBe('first');
     expect(partsResult.reasons).toContain('mime_part_limit');
     expect(partsResult.completeness).toBe('excerpt');
+
+    const hostileParts = extractGmailMessageText({ mimeType: 'multipart/mixed', parts: [...Array(128).fill(null), textPart('too late')] }, 'Safe excerpt');
+    expect(hostileParts).toMatchObject({ text: 'Safe excerpt', representation: 'snippet', completeness: 'excerpt' });
+    expect(hostileParts.reasons).toContain('mime_part_limit');
   });
 
   it('bounds Graph text with the same UTF-8 policy', () => {
@@ -115,5 +171,76 @@ describe('selected mail text extraction', () => {
     expect(result.bytes).toBe(16_383);
     expect(result.text).toHaveLength(16_383);
     expect(result.completeness).toBe('excerpt');
+  });
+});
+
+describe('non-rendering HTML conversion', () => {
+  it('decodes entities, keeps useful spacing and image alt, and excludes link destinations', () => {
+    const result = convertHtmlToText('<h2>Trip &amp; costs</h2><p>Hello <strong>there</strong><br>friend <img alt="map"></p><p><a href="https://secret.example">Open</a></p>');
+    expect(result.text).toBe('Trip & costs\nHello there\nfriend [Image: map]\nOpen');
+    expect(result.text).not.toContain('secret.example');
+    expect(result.reasons).toContain('html_non_rendering_conversion');
+    expect(result.reasons).toContain('html_css_visibility_not_computed');
+    expect(result.reasons).toContain('html_link_destination_omitted');
+  });
+
+  it('omits hidden and active content, while retaining preformatted newlines and reporting omitted code', () => {
+    const result = convertHtmlToText('<p>shown</p><div hidden>hidden</div><div aria-hidden="TRUE">hidden</div><div style="display:none">hidden</div><div style="visibility: hidden">hidden</div><style>.x{}</style><script>bad()</script><code>secret code</code><pre>row one\nrow two</pre>');
+    expect(result.text).toBe('shown\nrow one\nrow two');
+    expect(result.reasons).toContain('html_code_omitted');
+    expect(result.reasons).toContain('html_hidden_content_omitted');
+    expect(result.reasons).toContain('html_active_content_omitted');
+    expect(result.text).not.toMatch(/hidden|bad|secret/);
+  });
+
+  it('marks list items with bullets and table cells with separators', () => {
+    const result = convertHtmlToText('<ul><li>First</li><li>Second</li></ul><table><tr><td>A</td><td>B</td></tr><tr><td>C</td><td>D</td></tr></table>');
+    expect(result.text).toBe('• First\n• Second\nA | B\nC | D');
+  });
+
+  it('separates image alt from adjacent inline text and records blocked embeds', () => {
+    const result = convertHtmlToText('<p>Before<img alt="map">After</p><embed src="https://secret.example">');
+    expect(result.text).toBe('Before [Image: map] After');
+    expect(result.reasons).toContain('html_active_content_omitted');
+    expect(result.text).not.toContain('secret.example');
+  });
+
+  it('produces the stable selected-message excerpt used by the demo fixture', () => {
+    const html = '<p>Project discussion: Could you send the revised timeline by Friday?</p><p>Owners &amp; next steps:</p><ul><li>Confirm release owner</li><li>Share updated dates</li></ul><p>Image: <img alt="Roadmap preview" src="https://assets.invalid/roadmap.png"></p><p><a href="https://secret.example/path">Open project plan</a></p><p hidden>Hidden details must not appear.</p><script>window.secret = true;</script><style>.private{display:none}</style><pre><code>token=do-not-include</code></pre>';
+    const result = convertHtmlToText(html);
+    expect(result.text).toBe('Project discussion: Could you send the revised timeline by Friday?\nOwners & next steps:\n• Confirm release owner\n• Share updated dates\nImage: [Image: Roadmap preview]\nOpen project plan');
+    expect(result.reasons).toEqual(expect.arrayContaining(['html_hidden_content_omitted', 'html_active_content_omitted', 'html_link_destination_omitted', 'html_code_omitted']));
+  });
+
+  it('handles malformed and unclosed markup as a bounded excerpt', () => {
+    const result = convertHtmlToText('<div><p>Readable &amp; safe');
+    expect(result.text).toBe('Readable & safe');
+    expect(result.reasons).toContain('html_unclosed_tags');
+  });
+
+  it('normalizes astral text on a UTF-8 boundary and enforces input and output caps', () => {
+    const astral = convertHtmlToText(`<p>${'x'.repeat(16_380)}🙂tail</p>`);
+    expect(new TextEncoder().encode(astral.text).byteLength).toBeLessThanOrEqual(16 * 1024);
+    expect(astral.reasons).toContain('html_output_byte_limit');
+    expect(astral.text).not.toContain('\uFFFD');
+
+    const inputLimited = convertHtmlToText(`<p>${'a'.repeat(270 * 1024)}</p>`);
+    expect(inputLimited.text).toBe('');
+    expect(inputLimited.reasons).toContain('html_input_byte_limit');
+  });
+
+  it('enforces nesting, tag, attribute, and callback limits', () => {
+    expect(convertHtmlToText(`${'<div>'.repeat(66)}x`).reasons).toContain('html_depth_limit');
+    expect(convertHtmlToText('<i></i>'.repeat(4100)).reasons).toContain('html_tag_limit');
+    const oversizedAlt = convertHtmlToText(`<img alt="${'a'.repeat(2049)}">`);
+    expect(oversizedAlt.text).toBe('');
+    expect(oversizedAlt.reasons).toContain('html_attribute_limit');
+    expect(convertHtmlToText(`<div ${'a '.repeat(33_000)}>`).reasons).toContain('html_callback_limit');
+  });
+
+  it('does not create readable text from whitespace-only HTML', () => {
+    expect(convertHtmlToText('<p> &nbsp; </p>').text).toBe('');
+    const result = extractGmailMessageText({ mimeType: 'text/html', body: { data: encoded('<p> &nbsp; </p>') } }, 'Provider snippet');
+    expect(result).toMatchObject({ text: 'Provider snippet', representation: 'snippet', completeness: 'excerpt' });
   });
 });

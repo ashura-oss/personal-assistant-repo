@@ -1,4 +1,6 @@
-export type MailTextRepresentation = 'plain' | 'snippet' | 'none';
+import { convertHtmlToText } from './htmlText';
+
+export type MailTextRepresentation = 'plain' | 'converted_html' | 'snippet' | 'none';
 export type MailTextCompleteness = 'complete_text' | 'excerpt' | 'unavailable';
 
 export interface MailTextExtraction {
@@ -74,79 +76,127 @@ function disposition(part: Record<string, unknown>): string {
   return record(header) && typeof header.value === 'string' ? header.value.toLowerCase() : '';
 }
 
-interface Candidate { text?: string; reason?: string; html: boolean; }
+interface Candidate { text?: string; representation: 'plain' | 'converted_html'; htmlData?: string; htmlCharset?: string; }
+interface VisitResult { candidate?: Candidate; reasons: Set<string>; incomplete: boolean; }
 
-/** Extracts only a selected message's plain-text body. Attachments and HTML are never fetched or rendered. */
+/** Extracts bounded selected-message text with deferred HTML conversion; attachments are never fetched and HTML is never rendered. */
 export function extractGmailMessageText(payload: unknown, snippet?: string): MailTextExtraction {
-  const reasons = new Set<string>();
+  const limitReasons = new Set<string>();
   let visited = 0;
   let limitHit = false;
-  let textIncomplete = false;
 
-  const visit = (value: unknown, depth: number): Candidate | undefined => {
-    if (!record(value)) { reasons.add('malformed_mime_part'); textIncomplete = true; return undefined; }
-    if (depth > MAX_MIME_DEPTH) { reasons.add('mime_depth_limit'); limitHit = true; return undefined; }
+  const emptyResult = (): VisitResult => ({ reasons: new Set(), incomplete: false });
+  const convertHtmlCandidate = (candidate: Candidate): VisitResult => {
+    if (candidate.htmlData === undefined) return { candidate, reasons: new Set(), incomplete: false };
+    try {
+      const html = decodeText(decodeBase64Url(candidate.htmlData), candidate.htmlCharset);
+      const converted = convertHtmlToText(html);
+      return { candidate: converted.text.trim() ? { text: converted.text, representation: 'converted_html' } : undefined,
+        reasons: new Set(converted.reasons), incomplete: true };
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : 'malformed_text';
+      return { reasons: new Set([reason]), incomplete: true };
+    }
+  };
+
+  const visit = (value: unknown, depth: number): VisitResult => {
+    if (depth > MAX_MIME_DEPTH) { limitReasons.add('mime_depth_limit'); limitHit = true; return emptyResult(); }
     visited++;
-    if (visited > MAX_MIME_PARTS) { reasons.add('mime_part_limit'); limitHit = true; return undefined; }
+    if (visited > MAX_MIME_PARTS) { limitReasons.add('mime_part_limit'); limitHit = true; return emptyResult(); }
+    if (!record(value)) return { reasons: new Set(['malformed_mime_part']), incomplete: true };
     const part = value;
     const mimeType = typeof part.mimeType === 'string' ? part.mimeType.toLowerCase() : '';
     const filename = typeof part.filename === 'string' ? part.filename : '';
     const body = record(part.body) ? part.body : {};
-    if (mimeType === 'message/rfc822') { reasons.add('embedded_message_omitted'); return undefined; }
+    if (mimeType === 'message/rfc822') return { reasons: new Set(['embedded_message_omitted']), incomplete: false };
     const contentDisposition = disposition(part);
     if (filename || /(?:^|;)\s*attachment(?:;|$)/i.test(contentDisposition) || /(?:^|;)\s*filename\*?\s*=/i.test(contentDisposition)) {
-      reasons.add('attachment_omitted'); return undefined;
+      return { reasons: new Set(['attachment_omitted']), incomplete: false };
     }
     if (typeof body.attachmentId === 'string' && body.attachmentId) {
-      reasons.add('attachment_body_unavailable');
-      if (mimeType === 'text/plain' || mimeType === 'text/html') textIncomplete = true;
-      return undefined;
+      return { reasons: new Set(['attachment_body_unavailable']), incomplete: mimeType === 'text/plain' || mimeType === 'text/html' };
     }
 
     if (mimeType.startsWith('multipart/')) {
-      if (!Array.isArray(part.parts)) { reasons.add('malformed_mime_parts'); textIncomplete = true; return undefined; }
-      let firstPlain: Candidate | undefined;
-      let sawHtml = false;
+      if (!Array.isArray(part.parts)) return { reasons: new Set(['malformed_mime_parts']), incomplete: true };
+      const results: VisitResult[] = [];
       for (const child of part.parts) {
-        const candidate = visit(child, depth + 1);
-        if (!candidate) continue;
-        if (candidate.html) { sawHtml = true; continue; }
-        if (candidate.text !== undefined) {
-          if (!firstPlain) firstPlain = candidate;
-          else { reasons.add('additional_text_part_omitted'); textIncomplete = true; }
-        }
-        if (candidate.reason) reasons.add(candidate.reason);
+        if (limitHit) break;
+        results.push(visit(child, depth + 1));
       }
-      if (firstPlain) {
-        if (sawHtml && mimeType !== 'multipart/alternative') {
-          reasons.add('html_conversion_unavailable');
-          textIncomplete = true;
+      const candidates = results.map((result, index) => ({ result, index })).filter(({ result }) => result.candidate !== undefined);
+      const plain = candidates.filter(({ result }) => result.candidate?.representation === 'plain');
+      const nonblankPlain = plain.find(({ result }) => Boolean(result.candidate?.text?.trim()));
+      const html = candidates.find(({ result }) => result.candidate?.representation === 'converted_html');
+      const mergeReasons = (selected: VisitResult, includeSiblings: boolean): VisitResult => {
+        const merged = new Set(selected.reasons);
+        let incomplete = selected.incomplete;
+        if (includeSiblings) {
+          for (const result of results) {
+            if (result === selected) continue;
+            for (const reason of result.reasons) merged.add(reason);
+            incomplete ||= result.incomplete;
+          }
         }
-        return firstPlain;
+        return { ...selected, reasons: merged, incomplete };
+      };
+      if (mimeType === 'multipart/alternative') {
+        if (nonblankPlain) {
+          const selected = mergeReasons(nonblankPlain.result, false);
+          if (plain.some((branch) => branch !== nonblankPlain)) { selected.reasons.add('additional_text_part_omitted'); selected.incomplete = true; }
+          return selected;
+        }
+        if (html) {
+          const selected = mergeReasons(html.result, false);
+          if (plain.length) { selected.reasons.add('additional_text_part_omitted'); selected.incomplete = true; }
+          return selected;
+        }
+        const firstPlain = plain[0];
+        if (firstPlain) {
+          const selected = mergeReasons(firstPlain.result, false);
+          if (plain.length > 1) { selected.reasons.add('additional_text_part_omitted'); selected.incomplete = true; }
+          return selected;
+        }
+        const failed = emptyResult();
+        for (const result of results) { for (const reason of result.reasons) failed.reasons.add(reason); failed.incomplete ||= result.incomplete; }
+        return failed;
       }
-      if (sawHtml) { reasons.add('html_conversion_unavailable'); return { html: true }; }
-      return undefined;
+      const selected = nonblankPlain ?? html ?? plain[0];
+      if (selected) {
+        const merged = mergeReasons(selected.result, true);
+        if (candidates.length > 1) { merged.reasons.add('additional_text_part_omitted'); merged.incomplete = true; }
+        return merged;
+      }
+      const failed = emptyResult();
+      for (const result of results) { for (const reason of result.reasons) failed.reasons.add(reason); failed.incomplete ||= result.incomplete; }
+      return failed;
     }
-    if (mimeType === 'text/html') return { html: true };
-    if (mimeType !== 'text/plain') return undefined;
-    if (typeof body.data !== 'string') { reasons.add('plain_text_data_missing'); textIncomplete = true; return { reason: 'plain_text_data_missing', html: false }; }
+    if (mimeType === 'text/html') {
+      if (typeof body.data !== 'string') return { reasons: new Set(['html_data_missing']), incomplete: true };
+      return { candidate: { representation: 'converted_html', htmlData: body.data, htmlCharset: charsetFor(part) }, reasons: new Set(), incomplete: false };
+    }
+    if (mimeType !== 'text/plain') return emptyResult();
+    if (typeof body.data !== 'string') return { reasons: new Set(['plain_text_data_missing']), incomplete: true };
     try {
       const decoded = decodeText(decodeBase64Url(body.data), charsetFor(part));
-      return { text: decoded, html: false };
+      return { candidate: { text: decoded, representation: 'plain' }, reasons: new Set(), incomplete: false };
     } catch (error) {
       const reason = error instanceof Error ? error.message : 'malformed_text';
-      reasons.add(reason);
-      textIncomplete = true;
-      return { reason, html: false };
+      return { reasons: new Set([reason]), incomplete: true };
     }
   };
 
-  const candidate = visit(payload, 0);
+  let result = visit(payload, 0);
+  if (result.candidate?.representation === 'converted_html') {
+    const converted = convertHtmlCandidate(result.candidate);
+    result = { candidate: converted.candidate, reasons: new Set([...result.reasons, ...converted.reasons]), incomplete: result.incomplete || converted.incomplete };
+  }
+  const reasons = new Set([...limitReasons, ...result.reasons]);
+  const candidate = result.candidate;
   let text = candidate?.text;
-  let representation: MailTextRepresentation = 'plain';
-  let completeness: MailTextCompleteness = 'complete_text';
-  if (text === undefined) {
-    if (candidate?.html) reasons.add('html_conversion_unavailable');
+  let representation: MailTextRepresentation = candidate?.representation ?? 'plain';
+  let completeness: MailTextCompleteness = candidate?.representation === 'converted_html' ? 'excerpt' : 'complete_text';
+  if (text === undefined || (!text.trim() && typeof snippet === 'string' && snippet.trim())) {
     if (typeof snippet === 'string' && snippet.trim()) {
       const bounded = boundedText(snippet);
       text = bounded.text;
@@ -161,8 +211,7 @@ export function extractGmailMessageText(payload: unknown, snippet?: string): Mai
     const bounded = boundedText(text);
     text = bounded.text;
     if (bounded.truncated) { completeness = 'excerpt'; reasons.add('text_byte_limit'); }
-    if (limitHit || textIncomplete) completeness = 'excerpt';
-    if (candidate?.reason) completeness = 'excerpt';
+    if (limitHit || result.incomplete) completeness = 'excerpt';
   }
   const bytes = utf8Bytes(text);
   return { text, bytes, representation, completeness, reasons: [...reasons].slice(0, 16) };
@@ -172,4 +221,13 @@ export function boundGraphText(text: string): MailTextExtraction {
   const bounded = boundedText(text);
   return { text: bounded.text, bytes: utf8Bytes(bounded.text), representation: 'plain',
     completeness: bounded.truncated ? 'excerpt' : 'complete_text', reasons: bounded.truncated ? ['text_byte_limit'] : [] };
+}
+
+export function extractGraphHtmlText(html: string): MailTextExtraction {
+  const converted = convertHtmlToText(html);
+  if (!converted.text.trim()) return { bytes: 0, representation: 'none', completeness: 'unavailable', reasons: converted.reasons };
+  const bounded = boundedText(converted.text);
+  const reasons = [...converted.reasons];
+  if (bounded.truncated) reasons.push('text_byte_limit');
+  return { text: bounded.text, bytes: utf8Bytes(bounded.text), representation: 'converted_html', completeness: 'excerpt', reasons: reasons.slice(0, 16) };
 }

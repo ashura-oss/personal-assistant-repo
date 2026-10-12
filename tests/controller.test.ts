@@ -272,6 +272,7 @@ describe('application state controller', () => {
     const text = 'Thanks, I will review the notes.\r\nI prefer concise replies. e\u0301';
     const observedAt = new Date().toISOString();
     let providerCalls = 0;
+    const submittedRepresentations: string[] = [];
     let blockKey = false;
     let keyStarted!: () => void;
     let releaseKey!: () => void;
@@ -280,6 +281,8 @@ describe('application state controller', () => {
       providerCalls += 1;
       const body = JSON.parse(String(init?.body));
       const userText = body.input[1].content[0].text as string;
+      const representation = userText.match(/SELECTED MESSAGE \(([^;]+);/)?.[1];
+      if (representation) submittedRepresentations.push(representation);
       if (userText.includes('SELECTED NOTE CONTEXT')) expect(userText).toContain('I prefer concise replies.');
       return new Response(JSON.stringify({ status: 'completed', output: [{ content: [{ type: 'output_text', text: reply }] }], usage: { input_tokens: 40, output_tokens: 12 } }), { status: 200 });
     }, async () => {
@@ -289,18 +292,24 @@ describe('application state controller', () => {
       await new Promise<void>((resolve) => { releaseKey = resolve; });
       return 'fixture-openai-key';
     });
+    let extractionVersion: 'mail-text-v1' | 'mail-text-v2' = 'mail-text-v1';
+    let extractionRepresentation: 'plain' | 'converted_html' | 'none' = 'plain';
+    let extractionCompleteness: 'complete_text' | 'excerpt' | 'unavailable' = 'complete_text';
     const connector = {
       async verifyOAuthIdentity() { return true; },
       async readSelectedMessageText(_account: unknown, providerMessageId: string) {
         return {
-          status: 'available', message: {
+          status: extractionRepresentation === 'none' ? 'unavailable' : 'available', message: {
             id: providerMessageId, idFormat: 'gmail' as const, threadId: 'text-thread', subject: 'Review notes',
             from: 'Sam <sam@example.test>', senderEmail: 'sam@example.test', receivedAt: observedAt,
             snippet: 'Please review.', replyMetadataComplete: true, internetMessageId: '<text-1@example.test>',
             providerVersion: 'history-1', sizeEstimate: new TextEncoder().encode(text).length, sizeCheckedAt: observedAt,
             replyTo: ['sam@example.test'], to: ['me@example.test'], cc: [],
-          }, text, bytes: new TextEncoder().encode(text).length, representation: 'plain' as const,
-          completeness: 'complete_text' as const, reasons: [], checkedAt: observedAt, extractionVersion: 'mail-text-v1' as const,
+          }, ...(extractionRepresentation === 'none' ? {} : { text }), bytes: extractionRepresentation === 'none' ? 0 : new TextEncoder().encode(text).length, representation: extractionRepresentation,
+          completeness: extractionCompleteness, reasons: extractionRepresentation === 'none'
+            ? ['html_non_rendering_conversion', 'html_css_visibility_not_computed', 'html_input_byte_limit']
+            : extractionVersion === 'mail-text-v2' ? ['html_non_rendering_conversion'] : [],
+          checkedAt: observedAt, extractionVersion,
         };
       },
     };
@@ -336,9 +345,15 @@ describe('application state controller', () => {
     store.failNext = true;
     await expect(app.loadMailReplyText({ messageId: message.id, sourceDigest: loaded.snapshot!.sourceDigest })).rejects.toThrow(/disk full/i);
     expect(app.getSnapshot().selectedMailTexts[0].text).toBe(loaded.snapshot!.text);
+    extractionVersion = 'mail-text-v2';
+    extractionRepresentation = 'converted_html';
+    extractionCompleteness = 'excerpt';
+    const htmlLoaded = await app.loadMailReplyText({ messageId: message.id, sourceDigest: loaded.snapshot!.sourceDigest });
+    expect(htmlLoaded).toMatchObject({ status: 'current', snapshot: { extractionVersion: 'mail-text-v2', representation: 'converted_html', completeness: 'excerpt', omissionReasons: ['html_non_rendering_conversion'] } });
+    expect(htmlLoaded.snapshot?.bytes).toBe(new TextEncoder().encode(htmlLoaded.snapshot?.text).length);
     const note = await app.saveNote({ transcript: 'I prefer concise replies.' });
     const input = {
-      messageId: message.id, sourceDigest: loaded.snapshot!.sourceDigest, textDigest: loaded.snapshot!.textDigest!, mode: 'reply' as const,
+      messageId: message.id, sourceDigest: htmlLoaded.snapshot!.sourceDigest, textDigest: htmlLoaded.snapshot!.textDigest!, mode: 'reply' as const,
       to: ['sam@example.test'], cc: [], brief: 'Say that I will check.', composerRevision: 1, noteId: note.id, noteRevision: note.revision,
     };
     const originalDigest = Crypto.digestStringAsync.bind(Crypto);
@@ -372,6 +387,7 @@ describe('application state controller', () => {
     const cached = await app.generateMailReplyText({ ...input, composerRevision: 2 });
     expect(first).toMatchObject({ status: 'current', composerRevision: 1, fromCache: false });
     expect(cached).toMatchObject({ status: 'current', composerRevision: 2, fromCache: true });
+    expect(submittedRepresentations).toEqual(['converted_html']);
     expect(providerCalls).toBe(1);
     expect(app.getSnapshot().proposals).toEqual([]);
     expect(app.getSnapshot().dispatchRecords).toEqual([]);
@@ -386,6 +402,57 @@ describe('application state controller', () => {
     expect(providerCalls).toBe(1);
     expect(app.getSnapshot().usage.attemptsToday).toBe(1);
     expect(app.getSnapshot().usage.unknownCharges).toBe(1);
+    const bodyVersionMutation = app as unknown as { mutate: (operation: (draft: AppState) => void) => Promise<void> };
+    await bodyVersionMutation.mutate((draft) => {
+      const body = draft.selectedMailTexts.find((item) => item.messageId === message.id)!;
+      body.extractionVersion = 'mail-text-v1';
+      body.representation = 'plain';
+      body.completeness = 'excerpt';
+    });
+    const changedSemantics = await app.generateMailReplyText({ ...input, composerRevision: 4 });
+    expect(changedSemantics).toMatchObject({ status: 'current', fromCache: false });
+    expect(providerCalls).toBe(2);
+    expect(submittedRepresentations).toEqual(['converted_html', 'plain']);
+    await bodyVersionMutation.mutate((draft) => {
+      const body = draft.selectedMailTexts.find((item) => item.messageId === message.id)!;
+      body.representation = 'snippet';
+      body.completeness = 'excerpt';
+      body.omissionReasons = ['snippet_fallback'];
+    });
+    const changedRepresentation = await app.generateMailReplyText({ ...input, composerRevision: 6 });
+    expect(changedRepresentation).toMatchObject({ status: 'current', fromCache: false });
+    expect(providerCalls).toBe(3);
+    expect(submittedRepresentations).toEqual(['converted_html', 'plain', 'snippet']);
+    blockKey = true;
+    const extractionKeyStarted = new Promise<void>((resolve) => { keyStarted = resolve; });
+    const pendingExtractionChange = app.generateMailReplyText({ ...input, composerRevision: 7, brief: 'Use a friendly tone.', forceRefresh: true });
+    await extractionKeyStarted;
+    await bodyVersionMutation.mutate((draft) => {
+      const body = draft.selectedMailTexts.find((item) => item.messageId === message.id)!;
+      body.omissionReasons = ['snippet_fallback', 'metadata_unavailable'];
+    });
+    releaseKey();
+    await expect(pendingExtractionChange).resolves.toMatchObject({ status: 'stale', composerRevision: 7 });
+    expect(providerCalls).toBe(3);
+    extractionVersion = 'mail-text-v1';
+    extractionRepresentation = 'converted_html';
+    extractionCompleteness = 'excerpt';
+    const invalidLegacyHtml = await app.loadMailReplyText({ messageId: message.id, sourceDigest: input.sourceDigest });
+    expect(invalidLegacyHtml).toMatchObject({ status: 'unavailable', snapshot: { representation: 'none', completeness: 'unavailable' } });
+    expect(invalidLegacyHtml.snapshot?.text).toBeUndefined();
+    extractionVersion = 'mail-text-v2';
+    extractionCompleteness = 'complete_text';
+    const invalidCompleteHtml = await app.loadMailReplyText({ messageId: message.id, sourceDigest: input.sourceDigest });
+    expect(invalidCompleteHtml).toMatchObject({ status: 'unavailable', snapshot: { representation: 'none', completeness: 'unavailable' } });
+    expect(invalidCompleteHtml.snapshot?.text).toBeUndefined();
+    extractionVersion = 'mail-text-v2';
+    extractionRepresentation = 'none';
+    extractionCompleteness = 'unavailable';
+    const legitimateUnavailable = await app.loadMailReplyText({ messageId: message.id, sourceDigest: input.sourceDigest });
+    expect(legitimateUnavailable).toMatchObject({ status: 'unavailable', snapshot: {
+      extractionVersion: 'mail-text-v2', representation: 'none', completeness: 'unavailable',
+      omissionReasons: ['html_non_rendering_conversion', 'html_css_visibility_not_computed', 'html_input_byte_limit'],
+    } });
   });
 
   it('invalidates approval after an edit and keeps source revisions tied to the original note', async () => {

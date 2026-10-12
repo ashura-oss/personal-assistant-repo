@@ -1,6 +1,6 @@
 import type { Account, AccountCapability, EmailProposalPayload, EventProposalPayload } from '../core';
 import { canonicalMailReplySource, replyReferences as frozenReplyReferences, validateReplyBinding, type MailReplyProvenance } from '../mailReply';
-import { boundGraphText, extractGmailMessageText, type MailTextCompleteness, type MailTextRepresentation } from './mailText';
+import { boundGraphText, extractGmailMessageText, extractGraphHtmlText, type MailTextCompleteness, type MailTextRepresentation } from './mailText';
 import { scopeGrantsCapability } from './oauth';
 
 const GOOGLE_API = 'https://gmail.googleapis.com/gmail/v1/users/me';
@@ -133,7 +133,7 @@ export interface SelectedMessageTextResult {
   completeness: MailTextCompleteness;
   reasons: string[];
   checkedAt: string;
-  extractionVersion: 'mail-text-v1';
+  extractionVersion: 'mail-text-v1' | 'mail-text-v2';
 }
 
 export interface MessageWindow {
@@ -850,7 +850,7 @@ export class ConnectorClient {
     let providerVersion: string | undefined;
     let checkedAt = new Date(this.now()).toISOString();
     const unavailable = (reasons: string[], message?: MessageSummary): SelectedMessageTextResult => ({ status: 'unavailable', ...(message ? { message } : {}),
-      bytes: 0, representation: 'none', completeness: 'unavailable', reasons: reasons.slice(0, 16), checkedAt, extractionVersion: 'mail-text-v1' });
+      bytes: 0, representation: 'none', completeness: 'unavailable', reasons: reasons.slice(0, 16), checkedAt, extractionVersion: 'mail-text-v2' });
 
     if (account.provider === 'google') {
       const suppliedEstimate = safeSizeEstimate(options.sizeEstimate);
@@ -902,7 +902,7 @@ export class ConnectorClient {
       if (!selected.message.replyMetadataComplete) reasons.push('reply_metadata_incomplete');
       return { status: selected.message.replyMetadataComplete && extracted.text !== undefined ? 'available' : 'unavailable', message: selected.message,
         ...(extracted.text !== undefined ? { text: extracted.text } : {}), bytes: extracted.bytes, representation: extracted.representation,
-        completeness: extracted.completeness, reasons: reasons.slice(0, 16), checkedAt, extractionVersion: 'mail-text-v1' };
+        completeness: extracted.completeness, reasons: reasons.slice(0, 16), checkedAt, extractionVersion: 'mail-text-v2' };
     }
 
     const graphUrl = new URL(`${GRAPH_API}/me/messages/${encodeURIComponent(providerMessageId)}`);
@@ -925,15 +925,21 @@ export class ConnectorClient {
     const contentType = typeof selected.body?.contentType === 'string' ? selected.body.contentType.toLowerCase() : '';
     let extracted;
     if (contentType === 'text' && typeof selected.body?.content === 'string') extracted = boundGraphText(selected.body.content);
-    else {
+    else if (contentType === 'html' && typeof selected.body?.content === 'string') {
+      extracted = extractGraphHtmlText(selected.body.content);
+      if (extracted.text === undefined) {
+        const fallback = extractGmailMessageText(undefined, selected.snippet);
+        extracted = { ...fallback, reasons: [...extracted.reasons, ...fallback.reasons].slice(0, 16) };
+      }
+    } else {
       extracted = extractGmailMessageText(undefined, selected.snippet);
-      extracted.reasons = [...extracted.reasons, contentType === 'html' ? 'html_conversion_unavailable' : 'plain_body_unavailable'].slice(0, 16);
+      extracted.reasons = [...extracted.reasons, 'plain_body_unavailable'].slice(0, 16);
     }
     const reasons = [...extracted.reasons];
     if (!selected.message.replyMetadataComplete) reasons.push('reply_metadata_incomplete');
     return { status: selected.message.replyMetadataComplete && extracted.text !== undefined ? 'available' : 'unavailable', message: selected.message,
       ...(extracted.text !== undefined ? { text: extracted.text } : {}), bytes: extracted.bytes, representation: extracted.representation,
-      completeness: extracted.completeness, reasons: reasons.slice(0, 16), checkedAt, extractionVersion: 'mail-text-v1' };
+      completeness: extracted.completeness, reasons: reasons.slice(0, 16), checkedAt, extractionVersion: 'mail-text-v2' };
   }
 
   private async writeJson(account: Account, url: string, kind: 'mail' | 'calendar', init: RequestInit, beforeDispatch: () => void): Promise<MutationReceipt> {
