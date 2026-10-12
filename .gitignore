@@ -1,0 +1,17 @@
+node_modules/
+.expo/
+dist/
+coverage/
+*.log
+.env
+.env.*
+!.env.example
+*.mobileprovision
+*.p12
+*.p8
+*.pem
+*.key
+*.crt
+*.keystore
+*.jks
+credentials/

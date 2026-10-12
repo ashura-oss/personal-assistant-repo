@@ -1,0 +1,52 @@
+{
+  "expo": {
+    "name": "Still",
+    "slug": "still-voice-assistant",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "scheme": "still",
+    "userInterfaceStyle": "dark",
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.still.voiceassistant",
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "Still records voice notes only when you tap Record.",
+        "UIBackgroundModes": []
+      }
+    },
+    "android": {
+      "package": "com.still.voiceassistant",
+      "permissions": [
+        "android.permission.RECORD_AUDIO"
+      ]
+    },
+    "plugins": [
+      [
+        "expo-audio",
+        {
+          "microphonePermission": "Allow Still to record voice notes when you choose.",
+          "recordAudioAndroid": true,
+          "enableBackgroundPlayback": false,
+          "enableBackgroundRecording": false
+        }
+      ],
+      "expo-sqlite",
+      "expo-secure-store",
+      [
+        "expo-notifications",
+        {
+          "color": "#969A9F",
+          "defaultChannel": "reminders"
+        }
+      ],
+      "expo-sharing",
+      "expo-font",
+      "expo-asset",
+      "expo-web-browser"
+    ],
+    "web": {
+      "bundler": "metro",
+      "output": "single"
+    }
+  }
+}
