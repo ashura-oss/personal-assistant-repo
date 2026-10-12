@@ -133,6 +133,7 @@ export function BackupImportSheet({
               <Text style={styles.cardTitle}>{complete.restored ? "Missing content restored" : "Backup added"}</Text>
               <Text style={styles.body}>{complete.restored ? "Restored" : "Added"} {complete.notes} note{complete.notes === 1 ? "" : "s"} and {complete.tasks} task{complete.tasks === 1 ? "" : "s"}. Existing notes, tasks, documents, archives, and settings were kept. Imported history remains read-only.</Text>
               {complete.taskLinksRepaired ? <Text style={styles.body}>{complete.taskLinksRepaired} imported task source link{complete.taskLinksRepaired === 1 ? " was" : "s were"} repaired.</Text> : null}
+              {(complete.archive.archivedKnowledge?.length ?? 0) > 0 ? <Text style={styles.body}>{complete.archive.archivedKnowledge!.length} knowledge cohort{complete.archive.archivedKnowledge!.length === 1 ? " remains" : "s remain"} archived. Review in Library → Memory to activate separate copies.</Text> : null}
               {!complete.restored && complete.archive.documents.length ? <Text style={styles.body}>{complete.archive.documents.length} document{complete.archive.documents.length === 1 ? "" : "s"} are archived. Review each before using it as assistant context.</Text> : null}
               <Button label="Done" onPress={close} />
             </View>
@@ -152,12 +153,15 @@ export function BackupImportSheet({
               {fileName ? <Text style={styles.caption}>Selected file · {fileName}</Text> : null}
               {preview ? (
                 <View style={styles.card}>
-                  <Text style={styles.cardTitle}>{preview.sourceFormat === "voice-assistant-export-v1" ? "Legacy backup" : "Still backup v2"}</Text>
+                  <Text style={styles.cardTitle}>{preview.sourceFormat === "voice-assistant-export-v1" ? "Legacy export · v1" : preview.sourceFormat === "still-backup-v2" ? "Still backup · v2" : preview.sourceFormat === "still-backup-v3" ? "Still backup · v3" : "Unknown backup version"}</Text>
                   <Text style={styles.caption}>Exported {new Date(preview.exportedAt).toLocaleString()}</Text>
                   <View style={styles.counts}>
                     <Text style={styles.count}>{preview.noteCount} notes</Text>
                     <Text style={styles.count}>{preview.taskCount} tasks</Text>
                     <Text style={styles.count}>{preview.documentCount} documents</Text>
+                    <Text style={styles.count}>{preview.personCount} people</Text>
+                    <Text style={styles.count}>{preview.projectCount} projects</Text>
+                    <Text style={styles.count}>{preview.knowledgeCohortCount} knowledge cohorts</Text>
                     <Text style={styles.count}>{preview.historyCount} history records</Text>
                   </View>
                   {preview.missingAudioCount ? <Text style={styles.warning}>{preview.missingAudioCount} recording{preview.missingAudioCount === 1 ? " is" : "s are"} not included. Imported notes will show audio missing; no local audio path will be opened.</Text> : <Text style={styles.caption}>Audio is not included in this backup.</Text>}
@@ -177,7 +181,8 @@ export function BackupImportSheet({
                       {preview.taskLinkRepairCount ? <Text style={styles.caption}>{preview.taskLinkRepairCount} task source link{preview.taskLinkRepairCount === 1 ? "" : "s"} can be repaired{preview.taskLinkRepairLabels.length ? ` · ${preview.taskLinkRepairLabels.join(", ")}` : ""}</Text> : null}
                     </View>
                   ) : preview.alreadyImported ? <Text style={styles.warning}>This backup has already been imported and nothing is missing.</Text> : null}
-                  <Text style={styles.disclaimer}>Imported analyses and action history are historical claims. Documents stay inactive until you review and choose to use them as context.</Text>
+                  <Text style={styles.disclaimer}>Imported analyses and action history are historical claims. People and Projects remain in an archived knowledge cohort; nothing is activated or merged automatically. Review it in Library → Memory, where you can add a separate copy.</Text>
+                  <Text style={styles.disclaimer}>Documents stay inactive until you review and choose to use them as context.</Text>
                   <Button label={applying ? preview.alreadyImported ? "Restoring missing items…" : "Adding backup…" : preview.alreadyImported ? preview.missingNoteCount + preview.missingTaskCount > 0 ? "Restore missing items" : "Already imported" : "Import this backup"} disabled={applying || busy || (preview.alreadyImported && preview.missingNoteCount + preview.missingTaskCount === 0)} onPress={() => void apply()} />
                 </View>
               ) : null}

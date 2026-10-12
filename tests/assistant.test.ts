@@ -135,6 +135,7 @@ describe('local assistant context and response validation', () => {
       decisions: [{ text: 'call Mina tomorrow', sourceId: 'transcript', revision: 3, sourceVersion: catalog.byId.get('transcript')!.version, quote: 'I decided to call Mina tomorrow.' }],
       citations: [{ sourceId: 'transcript', revision: 3, sourceVersion: catalog.byId.get('transcript')!.version, quote: 'The draft is ready.' }],
       clarifications: [], proposals: [{ kind: 'task', title: 'Call Mina', body: 'Call Mina tomorrow.', recipients: [], dueAt: null, evidence: ['I decided to call Mina tomorrow.'] }],
+      memorySuggestions: [],
     };
     expect(validateAssistantResponse(good, catalog, selection).citations[0].source).toBe('Current transcript');
     expect(() => validateAssistantResponse({ ...good, citations: [{ ...good.citations[0], revision: 2 }] }, catalog, selection)).toThrow(/stale source revision/i);
@@ -149,7 +150,7 @@ describe('local assistant context and response validation', () => {
     const catalog = await createSourceCatalog([transcript, rules, long], fakeSha256);
     const selection = selectContext(catalog, { byteBudget: 500, buildBody: (context) => JSON.stringify({ context }) });
     expect(selection.omittedSourceIds).toContain(long.id);
-    const bad = { summary: '', answer: '', decisions: [], citations: [{ sourceId: long.id, revision: 1, sourceVersion: catalog.byId.get(long.id)!.version, quote: 'Private context' }], clarifications: [], proposals: [] };
+    const bad = { summary: '', answer: '', decisions: [], citations: [{ sourceId: long.id, revision: 1, sourceVersion: catalog.byId.get(long.id)!.version, quote: 'Private context' }], clarifications: [], proposals: [], memorySuggestions: [] };
     expect(() => validateAssistantResponse(bad, catalog, selection)).toThrow(/exact quote/i);
   });
 
@@ -163,7 +164,7 @@ describe('local assistant context and response validation', () => {
   });
 
   it('emits strict one-response schema and safe deterministic offline answers', () => {
-    expect(assistantResponseSchema.required).toEqual(['summary', 'answer', 'decisions', 'citations', 'clarifications', 'proposals']);
+    expect(assistantResponseSchema.required).toEqual(['summary', 'answer', 'decisions', 'citations', 'clarifications', 'proposals', 'memorySuggestions']);
     const empty = buildOfflinePreview({ intent: 'assist', transcript: '', timeZone: 'Asia/Singapore', now: '2026-10-12T00:00:00Z' });
     expect(empty.summary).toContain('No transcript text');
     expect(empty.answer).toContain('AI is not connected');

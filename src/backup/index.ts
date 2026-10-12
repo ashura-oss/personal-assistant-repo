@@ -1,7 +1,11 @@
 import type { AppState, NoteAssistResult, Proposal } from '../core';
+import { emptyKnowledgeState, renderKnowledgeMarkdown, validateKnowledgeState, type KnowledgeState } from '../knowledge';
 
-export const PORTABLE_BACKUP_FORMAT = 'still-backup-v2' as const;
-export const PORTABLE_BACKUP_SCHEMA_VERSION = 2 as const;
+export const PORTABLE_BACKUP_FORMAT = 'still-backup-v3' as const;
+export const PORTABLE_BACKUP_SCHEMA_VERSION = 3 as const;
+const V2_FORMAT = 'still-backup-v2' as const;
+const V2_SCHEMA_VERSION = 2 as const;
+type PortableSourceFormat = typeof PORTABLE_BACKUP_FORMAT | typeof V2_FORMAT | 'voice-assistant-export-v1';
 
 export const BACKUP_LIMITS = Object.freeze({
   maxBytes: 32 * 1024 * 1024,
@@ -17,6 +21,8 @@ export const BACKUP_LIMITS = Object.freeze({
   idChars: 256,
   titleChars: 512,
   pathChars: 240,
+  knowledgeCohorts: 50,
+  knowledgeSourceIdChars: 1_200,
 });
 
 export interface PortableNote {
@@ -69,8 +75,8 @@ export interface PortableHistoryEntry {
 }
 
 export interface PortableBackupV2 {
-  format: typeof PORTABLE_BACKUP_FORMAT;
-  schemaVersion: typeof PORTABLE_BACKUP_SCHEMA_VERSION;
+  format: typeof V2_FORMAT;
+  schemaVersion: typeof V2_SCHEMA_VERSION;
   exportId: string;
   exportedAt: string;
   audioIncluded: false;
@@ -81,21 +87,41 @@ export interface PortableBackupV2 {
   history: PortableHistoryEntry[];
 }
 
+export interface PortableKnowledgeNarrative {
+  entityKind: 'person' | 'project'; entityId: string; content: string; revision: number; updatedAt: string;
+}
+export interface PortableKnowledge { state: KnowledgeState; narratives: PortableKnowledgeNarrative[] }
+export interface PortableKnowledgeCohort { sourceId: string; knowledge: PortableKnowledge }
+
+export interface PortableBackupV3 extends Omit<PortableBackupV2, 'format' | 'schemaVersion'> {
+  format: typeof PORTABLE_BACKUP_FORMAT;
+  schemaVersion: typeof PORTABLE_BACKUP_SCHEMA_VERSION;
+  knowledge: PortableKnowledge;
+  archivedKnowledge: PortableKnowledgeCohort[];
+}
+
+export interface KnowledgeActivationLink {
+  entityKind: 'person' | 'project'; sourceEntityId: string; entityId: string; sourceDigest: string; activatedAt: string;
+}
+export interface ImportedArchivedKnowledgeCohort extends PortableKnowledgeCohort { id: string; activationLinks?: KnowledgeActivationLink[] }
+
 export interface ImportedBackupArchive {
   id: string;
   contentHash: string;
   fileHash: string;
-  sourceFormat: typeof PORTABLE_BACKUP_FORMAT | 'voice-assistant-export-v1';
+  sourceFormat: PortableSourceFormat;
   exportedAt: string;
   importedAt: string;
   noteLinks: { sourceId: string; noteId: string }[];
   taskLinks: { sourceId: string; taskId: string }[];
   documents: (PortableDocument & { id: string; activatedPath?: string; activatedAt?: string })[];
   history: (PortableHistoryEntry & { id: string; localNoteId?: string })[];
+  archivedKnowledge?: ImportedArchivedKnowledgeCohort[];
 }
 
 export interface PortableBackupParseResult {
-  backup: PortableBackupV2;
+  backup: PortableBackupV3;
+  sourceFormat: PortableSourceFormat;
   warnings: string[];
   ignoredFieldCount: number;
   migratedFromV1: boolean;
@@ -202,14 +228,25 @@ export function validatePortableDocumentPath(value: unknown): string {
   return value;
 }
 
+function baseRestoredTextBytes(backup: Pick<PortableBackupV2, 'notes' | 'tasks' | 'documents' | 'archivedDocuments' | 'history'>): number {
+  let total = 0;
+  const add = (value: string) => { total += utf8Length(value); };
+  for (const note of backup.notes) { add(note.title); add(note.transcript); }
+  for (const task of backup.tasks) { add(task.title); add(task.body); }
+  for (const document of backup.documents) add(document.content);
+  for (const document of backup.archivedDocuments) add(document.content);
+  for (const entry of backup.history) { add(entry.title); add(entry.content); add(entry.status); }
+  return total;
+}
+
 function normalizeV2(value: unknown): PortableBackupV2 {
   if (!isRecord(value)) fail('Backup must be a JSON object.');
   ownKeys(value, ['format', 'schemaVersion', 'exportId', 'exportedAt', 'audioIncluded', 'notes', 'tasks', 'documents', 'archivedDocuments', 'history'], 'Backup');
-  if (value.format !== PORTABLE_BACKUP_FORMAT || value.schemaVersion !== PORTABLE_BACKUP_SCHEMA_VERSION) fail('Backup format or schema version is not supported.');
+  if (value.format !== V2_FORMAT || value.schemaVersion !== V2_SCHEMA_VERSION) fail('Backup format or schema version is not supported.');
   if (value.audioIncluded !== false) fail('Backup audioIncluded must be false for this format.');
   const backup: PortableBackupV2 = {
-    format: PORTABLE_BACKUP_FORMAT,
-    schemaVersion: PORTABLE_BACKUP_SCHEMA_VERSION,
+    format: V2_FORMAT,
+    schemaVersion: V2_SCHEMA_VERSION,
     exportId: validateId(value.exportId, 'Backup export ID'),
     exportedAt: validateDate(value.exportedAt, 'Backup export time'),
     audioIncluded: false,
@@ -302,14 +339,135 @@ function normalizeV2(value: unknown): PortableBackupV2 {
     };
   });
   duplicateIds(backup.history, 'History');
-  let totalText = 0;
-  const add = (text: string) => { totalText += utf8Length(text); if (totalText > BACKUP_LIMITS.maxRestoredTextBytes) fail('Backup text exceeds the total restore limit.'); };
-  for (const note of backup.notes) { add(note.title); add(note.transcript); }
-  for (const task of backup.tasks) { add(task.title); add(task.body); }
-  for (const document of backup.documents) add(document.content);
-  for (const document of backup.archivedDocuments) add(document.content);
-  for (const entry of backup.history) { add(entry.title); add(entry.content); add(entry.status); }
+  if (baseRestoredTextBytes(backup) > BACKUP_LIMITS.maxRestoredTextBytes) fail('Backup text exceeds the total restore limit.');
   return backup;
+}
+
+function redactEvidence(value: KnowledgeState['people'][number]['facts'][number]['evidence']): typeof value {
+  return value?.map((item) => {
+    const kind = item.sourceId.startsWith('mail:') ? 'mail' : /^calendar(?:[:\-]|$)/.test(item.sourceId) ? 'calendar' : undefined;
+    return { ...item, ...(kind ? { sourceId: `historical:${kind}:${item.sourceVersion}` } : {}) };
+  });
+}
+function redactReference(reference: KnowledgeState['people'][number]['sourceLinks'][number]['reference'], safeLabel: string) {
+  return reference.kind === 'mail' || reference.kind === 'calendar'
+    ? { kind: 'historical' as const, label: safeLabel, originalKind: reference.kind }
+    : reference;
+}
+function historicalReference(reference: KnowledgeState['people'][number]['sourceLinks'][number]['reference'], safeLabel: string) {
+  return reference.kind === 'historical' ? reference : { kind: 'historical' as const, label: safeLabel, originalKind: reference.kind };
+}
+function portableChange(change: KnowledgeState['suggestions'][number]['change'], referencesUnavailable: boolean) {
+  if (change.type !== 'add_source_link') return change;
+  const reference = referencesUnavailable ? historicalReference(change.reference, change.label) : redactReference(change.reference, change.label);
+  if (reference.kind === 'historical' && 'referenceRevision' in change) {
+    const { referenceRevision: _referenceRevision, ...portable } = change;
+    return { ...portable, reference };
+  }
+  return { ...change, reference };
+}
+
+/** Projects live knowledge into inert backup content with provider identities removed. */
+export function createPortableKnowledge(
+  input: KnowledgeState,
+  narrativeDocuments: readonly Pick<PortableDocument, 'path' | 'content' | 'revision' | 'updatedAt'>[] = [],
+  referencesUnavailable = false,
+): PortableKnowledge {
+  const state = validateKnowledgeState(input);
+  const projected: KnowledgeState = {
+    schemaVersion: 1,
+    people: state.people.map((person) => { const { importOrigin: _origin, ...portablePerson } = person; return { ...portablePerson,
+      facts: person.facts.map((fact) => ({ ...fact, ...(fact.evidence ? { evidence: redactEvidence(fact.evidence) } : {}) })),
+      contacts: person.contacts.map((contact) => ({ ...contact, ...(contact.evidence ? { evidence: redactEvidence(contact.evidence) } : {}) })),
+      sourceLinks: person.sourceLinks.map((link) => ({ ...link, reference: referencesUnavailable ? historicalReference(link.reference, link.label) : redactReference(link.reference, link.label), ...(link.evidence ? { evidence: redactEvidence(link.evidence) } : {}) })),
+    }; }),
+    projects: state.projects.map((project) => { const { importOrigin: _origin, ...portableProject } = project; return { ...portableProject,
+      facts: project.facts.map((fact) => ({ ...fact, ...(fact.evidence ? { evidence: redactEvidence(fact.evidence) } : {}) })),
+      members: project.members.map((member) => ({ ...member, ...(member.evidence ? { evidence: redactEvidence(member.evidence) } : {}) })),
+      sourceLinks: project.sourceLinks.map((link) => ({ ...link, reference: referencesUnavailable ? historicalReference(link.reference, link.label) : redactReference(link.reference, link.label), ...(link.evidence ? { evidence: redactEvidence(link.evidence) } : {}) })),
+    }; }),
+    suggestions: state.suggestions.map((suggestion) => ({ ...suggestion, change: portableChange(suggestion.change, referencesUnavailable),
+      ...(suggestion.evidence ? { evidence: redactEvidence(suggestion.evidence) } : {}),
+      ...(suggestion.originalChange ? { originalChange: portableChange(suggestion.originalChange, referencesUnavailable) } : {}),
+      ...(suggestion.originalEvidence ? { originalEvidence: redactEvidence(suggestion.originalEvidence) } : {}) })),
+  };
+  const narrativeFor = (entity: KnowledgeState['people'][number] | KnowledgeState['projects'][number], entityKind: 'person' | 'project'): PortableKnowledgeNarrative => {
+    const document = narrativeDocuments.find((candidate) => candidate.path === entity.narrativePath);
+    return { entityKind, entityId: entity.id, content: document?.content ?? renderKnowledgeMarkdown(projected, entityKind, entity.id),
+      revision: document?.revision ?? entity.revision, updatedAt: document?.updatedAt ?? entity.updatedAt };
+  };
+  const narratives: PortableKnowledgeNarrative[] = [
+    ...projected.people.map((entity) => narrativeFor(entity, 'person')),
+    ...projected.projects.map((entity) => narrativeFor(entity, 'project')),
+  ];
+  return normalizePortableKnowledge({ state: projected, narratives });
+}
+
+function normalizePortableKnowledge(value: unknown): PortableKnowledge {
+  if (!isRecord(value)) fail('Portable knowledge must be an object.');
+  ownKeys(value, ['state', 'narratives'], 'Portable knowledge');
+  if (!isRecord(value.state) || !Array.isArray(value.state.people) || !Array.isArray(value.state.projects)
+    || [...value.state.people, ...value.state.projects].some((entity) => isRecord(entity) && Object.prototype.hasOwnProperty.call(entity, 'importOrigin'))) fail('Portable knowledge cannot contain runtime import authority.');
+  const state = validateKnowledgeState(value.state);
+  const rows = arrayField(value.narratives, BACKUP_LIMITS.knowledgeCohorts * 20, 'Knowledge narratives');
+  const expected = new Map<string, { revision: number; updatedAt: string }>();
+  for (const person of state.people) expected.set(`person:${person.id}`, person);
+  for (const project of state.projects) expected.set(`project:${project.id}`, project);
+  if (rows.length !== expected.size) fail('Portable knowledge must include one narrative for each entity.');
+  const seen = new Set<string>();
+  const narratives = rows.map((row) => {
+    if (!isRecord(row)) fail('Knowledge narrative must be an object.');
+    ownKeys(row, ['entityKind', 'entityId', 'content', 'revision', 'updatedAt'], 'Knowledge narrative');
+    if (row.entityKind !== 'person' && row.entityKind !== 'project') fail('Knowledge narrative entity kind is invalid.');
+    const entityId = validateKnowledgeEntityId(row.entityId);
+    const key = `${row.entityKind}:${entityId}`;
+    const entity = expected.get(key);
+    if (!entity || seen.has(key)) fail('Knowledge narrative entity is missing or duplicated.');
+    seen.add(key);
+    if (!Number.isSafeInteger(row.revision) || (row.revision as number) < 1) fail('Knowledge narrative revision is invalid.');
+    return { entityKind: row.entityKind as 'person' | 'project', entityId, content: boundedString(row.content, 'Knowledge narrative', 16 * 1024), revision: row.revision as number, updatedAt: validateDate(row.updatedAt, 'Knowledge narrative update time') };
+  });
+  return { state, narratives };
+}
+function validateKnowledgeEntityId(value: unknown): string {
+  if (typeof value !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)) fail('Knowledge entity ID must be a canonical UUID.');
+  return value;
+}
+
+function normalizeKnowledgeCohorts(value: unknown, label: string): PortableKnowledgeCohort[] {
+  const rows = arrayField(value, BACKUP_LIMITS.knowledgeCohorts, label);
+  const cohorts = rows.map((row) => {
+    if (!isRecord(row)) fail(`${label} cohort must be an object.`);
+    ownKeys(row, ['sourceId', 'knowledge'], `${label} cohort`);
+    const sourceId = validateHistoryId(row.sourceId);
+    if (sourceId.length > BACKUP_LIMITS.knowledgeSourceIdChars) fail(`${label} source ID is too long.`);
+    return { sourceId, knowledge: normalizePortableKnowledge(row.knowledge) };
+  });
+  if (new Set(cohorts.map(({ sourceId }) => sourceId)).size !== cohorts.length) fail(`${label} contains duplicate source IDs.`);
+  return cohorts;
+}
+
+function emptyPortableKnowledge(): PortableKnowledge { return { state: emptyKnowledgeState(), narratives: [] }; }
+function hasKnowledge(value: PortableKnowledge): boolean {
+  const { state } = value;
+  return Boolean(state.people.length || state.projects.length || state.suggestions.length);
+}
+function normalizeV3(value: unknown): PortableBackupV3 {
+  if (!isRecord(value)) fail('Backup must be a JSON object.');
+  ownKeys(value, ['format', 'schemaVersion', 'exportId', 'exportedAt', 'audioIncluded', 'notes', 'tasks', 'documents', 'archivedDocuments', 'history', 'knowledge', 'archivedKnowledge'], 'Backup');
+  if (value.format !== PORTABLE_BACKUP_FORMAT || value.schemaVersion !== PORTABLE_BACKUP_SCHEMA_VERSION) fail('Backup format or schema version is not supported.');
+  const base = normalizeV2({ format: V2_FORMAT, schemaVersion: V2_SCHEMA_VERSION, exportId: value.exportId, exportedAt: value.exportedAt, audioIncluded: value.audioIncluded,
+    notes: value.notes, tasks: value.tasks, documents: value.documents, archivedDocuments: value.archivedDocuments, history: value.history });
+  const knowledge = normalizePortableKnowledge(value.knowledge);
+  const archivedKnowledge = normalizeKnowledgeCohorts(value.archivedKnowledge, 'Archived knowledge');
+  if (archivedKnowledge.length + (hasKnowledge(knowledge) ? 1 : 0) > BACKUP_LIMITS.knowledgeCohorts) fail('Knowledge cohorts exceed the allowed item count.');
+  const totalText = baseRestoredTextBytes(base) + utf8Length(JSON.stringify(knowledge)) + archivedKnowledge.reduce((total, cohort) => total + utf8Length(JSON.stringify(cohort.knowledge)), 0);
+  if (totalText > BACKUP_LIMITS.maxRestoredTextBytes) fail('Backup text exceeds the total restore limit.');
+  return { ...base, format: PORTABLE_BACKUP_FORMAT, schemaVersion: PORTABLE_BACKUP_SCHEMA_VERSION, knowledge, archivedKnowledge };
+}
+function upgradeV2(backup: PortableBackupV2): PortableBackupV3 {
+  return normalizeV3({ ...backup, format: PORTABLE_BACKUP_FORMAT, schemaVersion: PORTABLE_BACKUP_SCHEMA_VERSION,
+    knowledge: emptyPortableKnowledge(), archivedKnowledge: [] });
 }
 
 function scanDepth(text: string): void {
@@ -378,7 +536,7 @@ function migrateV1(raw: Record<string, unknown>): { backup: PortableBackupV2; ig
   if (typeof raw.exportedAt !== 'string') fail('Legacy backup export time is missing.');
   const exportedAt = legacyDate(raw.exportedAt, new Date(0).toISOString(), 'Backup export time');
   const ignoredFieldCount = Object.keys(raw).filter((key) => !V1_TOP_LEVEL.has(key)).length;
-  const backup: PortableBackupV2 = { format: PORTABLE_BACKUP_FORMAT, schemaVersion: PORTABLE_BACKUP_SCHEMA_VERSION,
+  const backup: PortableBackupV2 = { format: V2_FORMAT, schemaVersion: V2_SCHEMA_VERSION,
     exportId: 'migrated-v1', exportedAt, audioIncluded: false, notes: [], tasks: [], documents: [], archivedDocuments: [], history: [] };
   for (const item of legacyArray(raw, 'notes', BACKUP_LIMITS.notes)) {
     if (!isRecord(item) || typeof item.id !== 'string' || typeof item.title !== 'string' || typeof item.transcript !== 'string' || typeof item.createdAt !== 'string') fail('Legacy backup contains an invalid note entry.');
@@ -465,7 +623,7 @@ function migrateV1(raw: Record<string, unknown>): { backup: PortableBackupV2; ig
   return { backup: normalizeV2(backup), ignoredFieldCount };
 }
 
-/** Parse and strictly validate a v2 portable backup or adapt the exact legacy export marker. */
+/** Parse a v1/v2 legacy input through a strict adapter, or validate the current v3 format. */
 export function parsePortableBackup(input: string | Uint8Array): PortableBackupParseResult {
   let text: string;
   if (typeof input === 'string' && input.length > BACKUP_LIMITS.maxBytes) fail('Backup file exceeds the allowed size.');
@@ -482,25 +640,30 @@ export function parsePortableBackup(input: string | Uint8Array): PortableBackupP
     const migrated = migrateV1(raw);
     const warnings = [AUTHORITY_WARNING, AUDIO_WARNING];
     if (migrated.ignoredFieldCount) warnings.push(UNKNOWN_WARNING);
-    return { ...migrated, warnings, migratedFromV1: true };
+    return { backup: upgradeV2(migrated.backup), sourceFormat: 'voice-assistant-export-v1', ignoredFieldCount: migrated.ignoredFieldCount, warnings, migratedFromV1: true };
+  }
+  if (raw.format === V2_FORMAT) {
+    const backup = upgradeV2(normalizeV2(raw));
+    return { backup, sourceFormat: V2_FORMAT, warnings: [AUTHORITY_WARNING, AUDIO_WARNING], ignoredFieldCount: 0, migratedFromV1: false };
   }
   if (raw.format !== PORTABLE_BACKUP_FORMAT) fail('Backup format or schema version is not supported.');
-  const backup = normalizeV2(raw);
-  return { backup, warnings: [AUTHORITY_WARNING, AUDIO_WARNING], ignoredFieldCount: 0, migratedFromV1: false };
+  const backup = normalizeV3(raw);
+  return { backup, sourceFormat: PORTABLE_BACKUP_FORMAT, warnings: [AUTHORITY_WARNING, AUDIO_WARNING], ignoredFieldCount: 0, migratedFromV1: false };
 }
 
 /** Fail-closed validator for the inert archive persisted by the controller. */
 export function validateImportedBackupArchive(value: unknown): ImportedBackupArchive | undefined {
   try {
     if (!isRecord(value)) return undefined;
-    ownKeys(value, ['id', 'contentHash', 'fileHash', 'sourceFormat', 'exportedAt', 'importedAt', 'noteLinks', 'taskLinks', 'documents', 'history'], 'Imported archive');
+    ownKeys(value, ['id', 'contentHash', 'fileHash', 'sourceFormat', 'exportedAt', 'importedAt', 'noteLinks', 'taskLinks', 'documents', 'history', 'archivedKnowledge'], 'Imported archive');
     const id = validateId(value.id, 'Imported archive ID');
     for (const key of ['contentHash', 'fileHash'] as const) if (typeof value[key] !== 'string' || !/^[a-f\d]{64}$/i.test(value[key] as string)) return undefined;
-    if (value.sourceFormat !== PORTABLE_BACKUP_FORMAT && value.sourceFormat !== 'voice-assistant-export-v1') return undefined;
+    if (value.sourceFormat !== PORTABLE_BACKUP_FORMAT && value.sourceFormat !== V2_FORMAT && value.sourceFormat !== 'voice-assistant-export-v1') return undefined;
     const noteLinksRaw = arrayField(value.noteLinks, BACKUP_LIMITS.notes, 'Archive note links');
     const taskLinksRaw = arrayField(value.taskLinks, BACKUP_LIMITS.tasks, 'Archive task links');
     const docsRaw = arrayField(value.documents, BACKUP_LIMITS.documents, 'Archive documents');
     const historyRaw = arrayField(value.history, BACKUP_LIMITS.history, 'Archive history');
+    const archivedKnowledgeRaw = value.archivedKnowledge === undefined ? [] : arrayField(value.archivedKnowledge, BACKUP_LIMITS.knowledgeCohorts, 'Archive knowledge cohorts');
     const noteLinks = noteLinksRaw.map((row) => {
       if (!isRecord(row)) fail('Archive note link is invalid.');
       ownKeys(row, ['sourceId', 'noteId'], 'Archive note link');
@@ -528,7 +691,7 @@ export function validateImportedBackupArchive(value: unknown): ImportedBackupArc
     const history = historyRaw.map((row) => {
       if (!isRecord(row)) fail('Archive history entry is invalid.');
       ownKeys(row, ['id', 'kind', 'sourceId', 'sourceNoteId', 'localNoteId', 'title', 'content', 'status', 'occurredAt', 'provider', 'reference'], 'Archive history entry');
-      const entry = normalizeV2({ format: PORTABLE_BACKUP_FORMAT, schemaVersion: 2, exportId: id, exportedAt: value.exportedAt,
+      const entry = normalizeV2({ format: V2_FORMAT, schemaVersion: V2_SCHEMA_VERSION, exportId: id, exportedAt: value.exportedAt,
         audioIncluded: false, notes: [], tasks: [], documents: [], archivedDocuments: [], history: [{
           kind: row.kind, sourceId: row.sourceId, ...(row.sourceNoteId !== undefined ? { sourceNoteId: row.sourceNoteId } : {}),
           title: row.title, content: row.content, status: row.status, ...(row.occurredAt !== undefined ? { occurredAt: row.occurredAt } : {}),
@@ -538,13 +701,32 @@ export function validateImportedBackupArchive(value: unknown): ImportedBackupArc
     });
     duplicateIds(history, 'Archive history');
     if (new Set(history.map((entry) => entry.id)).size !== history.length) fail('Archive history contains duplicate local IDs.');
+    const archivedKnowledge = archivedKnowledgeRaw.map((row) => {
+      if (!isRecord(row)) fail('Archive knowledge cohort is invalid.');
+      ownKeys(row, ['id', 'sourceId', 'knowledge', 'activationLinks'], 'Archive knowledge cohort');
+      const sourceId = validateHistoryId(row.sourceId);
+      if (sourceId.length > BACKUP_LIMITS.knowledgeSourceIdChars) fail('Archive knowledge source ID is too long.');
+      const activationLinks = row.activationLinks === undefined ? undefined : arrayField(row.activationLinks, 1_000, 'Knowledge activation links').map((item) => {
+        if (!isRecord(item)) fail('Knowledge activation link is invalid.');
+        ownKeys(item, ['entityKind', 'sourceEntityId', 'entityId', 'sourceDigest', 'activatedAt'], 'Knowledge activation link');
+        if (item.entityKind !== 'person' && item.entityKind !== 'project') fail('Knowledge activation entity kind is invalid.');
+        if (typeof item.sourceDigest !== 'string' || !/^[a-f0-9]{64}$/.test(item.sourceDigest)) fail('Knowledge activation digest is invalid.');
+        return { entityKind: item.entityKind as 'person' | 'project', sourceEntityId: validateKnowledgeEntityId(item.sourceEntityId), entityId: validateKnowledgeEntityId(item.entityId), sourceDigest: item.sourceDigest,
+          activatedAt: validateDate(item.activatedAt, 'Knowledge activation time') };
+      });
+      if (activationLinks && (new Set(activationLinks.map(({ entityKind, sourceEntityId }) => `${entityKind}:${sourceEntityId}`)).size !== activationLinks.length
+        || new Set(activationLinks.map(({ entityId }) => entityId)).size !== activationLinks.length)) fail('Knowledge activation links contain duplicate IDs.');
+      return { id: validateId(row.id, 'Archive knowledge cohort ID'), sourceId, knowledge: normalizePortableKnowledge(row.knowledge), ...(activationLinks ? { activationLinks } : {}) };
+    });
+    if (new Set(archivedKnowledge.map(({ id: cohortId }) => cohortId)).size !== archivedKnowledge.length || new Set(archivedKnowledge.map(({ sourceId }) => sourceId)).size !== archivedKnowledge.length) fail('Archive knowledge cohorts contain duplicate IDs.');
     let restoredTextBytes = 0;
     for (const document of documents) restoredTextBytes += utf8Length(document.content);
     for (const entry of history) restoredTextBytes += utf8Length(entry.title) + utf8Length(entry.content) + utf8Length(entry.status);
+    for (const cohort of archivedKnowledge) restoredTextBytes += utf8Length(JSON.stringify(cohort.knowledge));
     if (restoredTextBytes > BACKUP_LIMITS.maxRestoredTextBytes) return undefined;
     return { id, contentHash: value.contentHash as string, fileHash: value.fileHash as string,
       sourceFormat: value.sourceFormat, exportedAt: validateDate(value.exportedAt, 'Archive export time'), importedAt: validateDate(value.importedAt, 'Archive import time'),
-      noteLinks, taskLinks, documents, history };
+      noteLinks, taskLinks, documents, history, archivedKnowledge };
   } catch { return undefined; }
 }
 
@@ -578,10 +760,12 @@ function analysisHistory(note: AppState['notes'][number]): PortableHistoryEntry[
 }
 
 /** Build an allowlisted DTO. Runtime-only fields and authority are deliberately not projected. */
-export function createPortableBackup(state: AppState, metadata: PortableBackupMetadata): PortableBackupV2 {
+export function createPortableBackup(state: AppState, metadata: PortableBackupMetadata): PortableBackupV3 {
   const history: PortableHistoryEntry[] = [];
   const currentNoteIds = new Set(state.notes.map((note) => note.id));
-  const backup: PortableBackupV2 = {
+  const stateKnowledge = (state as AppState & { knowledge?: KnowledgeState }).knowledge ?? emptyKnowledgeState();
+  const stateDocuments = (state as AppState & { documents: PortableDocument[] }).documents;
+  const backup: PortableBackupV3 = {
     format: PORTABLE_BACKUP_FORMAT, schemaVersion: PORTABLE_BACKUP_SCHEMA_VERSION,
     exportId: validateId(metadata.exportId, 'Backup export ID'), exportedAt: validateDate(metadata.exportedAt, 'Backup export time'), audioIncluded: false,
     notes: state.notes.map((note) => {
@@ -602,7 +786,7 @@ export function createPortableBackup(state: AppState, metadata: PortableBackupMe
         ...(sourceNoteId ? { sourceNoteId } : {}), ...(unresolvedSourceNoteId ? { unresolvedSourceNoteId } : {}) };
     }),
     documents: state.documents.map(({ path, content, revision, updatedAt }) => ({ path, content, revision, updatedAt })),
-    archivedDocuments: [],
+    archivedDocuments: [], knowledge: createPortableKnowledge(stateKnowledge, stateDocuments), archivedKnowledge: [],
     history,
   };
   for (const note of state.notes) history.push(...analysisHistory(note));
@@ -642,14 +826,33 @@ export function createPortableBackup(state: AppState, metadata: PortableBackupMe
       ...((item.localNoteId ?? item.sourceNoteId) ? { sourceNoteId: item.localNoteId ?? item.sourceNoteId } : {}), title: item.title, content: item.content, status: item.status,
       ...(item.occurredAt ? { occurredAt: item.occurredAt } : {}),
       ...(item.provider ? { provider: item.provider } : {}), ...(item.reference ? { reference: item.reference } : {}) });
+    for (const cohort of archive.archivedKnowledge ?? []) backup.archivedKnowledge.push({ sourceId: `archive:${archive.id}:knowledge:${cohort.id}`,
+      knowledge: createPortableKnowledge(cohort.knowledge.state, cohort.knowledge.narratives.map((narrative) => {
+        const entity = narrative.entityKind === 'person' ? cohort.knowledge.state.people.find((person) => person.id === narrative.entityId) : cohort.knowledge.state.projects.find((project) => project.id === narrative.entityId);
+        return { path: entity?.narrativePath ?? '', content: narrative.content, revision: narrative.revision, updatedAt: narrative.updatedAt };
+      }), true) });
   }
-  return normalizeV2(backup);
+  return normalizeV3(backup);
 }
 
 /** Canonical content string for an idempotency digest; excludes export identity and time. */
-export function canonicalPortableContent(backup: PortableBackupV2): string {
-  const normalized = normalizeV2(backup);
+export function canonicalPortableContent(backup: PortableBackupV3): string {
+  const normalized = normalizeV3(backup);
   return JSON.stringify({ format: normalized.format, schemaVersion: normalized.schemaVersion, audioIncluded: false,
+    notes: [...normalized.notes].sort((a, b) => a.sourceId.localeCompare(b.sourceId)),
+    tasks: [...normalized.tasks].sort((a, b) => a.sourceId.localeCompare(b.sourceId)),
+    documents: [...normalized.documents].sort((a, b) => a.path.localeCompare(b.path)),
+    archivedDocuments: [...normalized.archivedDocuments].sort((a, b) => a.sourceId.localeCompare(b.sourceId)),
+    history: [...normalized.history].sort((a, b) => a.sourceId.localeCompare(b.sourceId)),
+    knowledge: normalized.knowledge,
+    archivedKnowledge: [...normalized.archivedKnowledge].sort((a, b) => a.sourceId.localeCompare(b.sourceId)) });
+}
+
+/** Legacy canonical bytes used only to recover content hashes written by v2 archives. */
+export function legacyCanonicalPortableContentV2(backup: PortableBackupV3): string | undefined {
+  const normalized = normalizeV3(backup);
+  if (hasKnowledge(normalized.knowledge) || normalized.archivedKnowledge.length > 0) return undefined;
+  return JSON.stringify({ format: V2_FORMAT, schemaVersion: V2_SCHEMA_VERSION, audioIncluded: false,
     notes: [...normalized.notes].sort((a, b) => a.sourceId.localeCompare(b.sourceId)),
     tasks: [...normalized.tasks].sort((a, b) => a.sourceId.localeCompare(b.sourceId)),
     documents: [...normalized.documents].sort((a, b) => a.path.localeCompare(b.path)),
@@ -659,17 +862,22 @@ export function canonicalPortableContent(backup: PortableBackupV2): string {
 
 export interface PortableBackupPreview {
   noteCount: number; taskCount: number; documentCount: number; archivedDocumentCount: number; historyCount: number;
+  personCount: number; projectCount: number; knowledgeCohortCount: number;
   missingAudioCount: number; documentConflicts: { path: string; identical: boolean }[];
 }
 
 /** Content-only preview. Current documents are read-only inputs and are never changed here. */
-export function summarizePortableBackup(backup: PortableBackupV2, currentDocuments: readonly Pick<PortableDocument, 'path' | 'content'>[] = []): PortableBackupPreview {
+export function summarizePortableBackup(backup: PortableBackupV3, currentDocuments: readonly Pick<PortableDocument, 'path' | 'content'>[] = []): PortableBackupPreview {
+  const normalized = normalizeV3(backup);
   const current = new Map(currentDocuments.map((document) => [document.path.normalize('NFC').toLocaleLowerCase('en-US'), document]));
-  const documentConflicts = backup.documents.flatMap((document) => {
+  const documentConflicts = normalized.documents.flatMap((document) => {
     const existing = current.get(document.path.normalize('NFC').toLocaleLowerCase('en-US'));
     return existing ? [{ path: document.path, identical: existing.path === document.path && existing.content === document.content }] : [];
   });
-  return { noteCount: backup.notes.length, taskCount: backup.tasks.length, documentCount: backup.documents.length + backup.archivedDocuments.length,
-    archivedDocumentCount: backup.archivedDocuments.length, historyCount: backup.history.length,
-    missingAudioCount: backup.notes.filter((note) => note.audioMissing).length, documentConflicts };
+  return { noteCount: normalized.notes.length, taskCount: normalized.tasks.length, documentCount: normalized.documents.length + normalized.archivedDocuments.length,
+    archivedDocumentCount: normalized.archivedDocuments.length, historyCount: normalized.history.length,
+    personCount: normalized.knowledge.state.people.length + normalized.archivedKnowledge.reduce((total, cohort) => total + cohort.knowledge.state.people.length, 0),
+    projectCount: normalized.knowledge.state.projects.length + normalized.archivedKnowledge.reduce((total, cohort) => total + cohort.knowledge.state.projects.length, 0),
+    knowledgeCohortCount: normalized.archivedKnowledge.length + (hasKnowledge(normalized.knowledge) ? 1 : 0),
+    missingAudioCount: normalized.notes.filter((note) => note.audioMissing).length, documentConflicts };
 }

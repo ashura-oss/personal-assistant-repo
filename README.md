@@ -4,6 +4,8 @@ Still is a native-first voice assistant for capturing a thought, reviewing what 
 
 This repository contains the current uncredentialed build and the full product roadmap in [docs/PLAN.md](docs/PLAN.md). The roadmap labels each capability as implemented, configured, mock, unverified, or not yet implemented so setup gaps remain visible.
 
+People, Projects, and Memory provide local structured personal context. Suggestions retain their evidence and require explicit review; imported knowledge remains archived until the user chooses to add a separate copy. See [the iteration log](docs/ITERATIONS.md) for current scope and verification boundaries.
+
 ## Current setup
 
 Requirements: Node.js 22.13 or later, npm, and the Expo SDK 57 toolchain. Use a current iPhone development build for microphone, Keychain, OAuth redirects, and native notification checks. The web preview runs locally and can exercise browser capture and IndexedDB workflows; it does not certify native behavior.
@@ -17,7 +19,7 @@ Use the Expo CLI to open the web preview or a development build. `npm run typech
 
 ## Private data and provider setup
 
-Audio recordings, notes, proposal drafts, and Markdown documents are stored locally. Native audio uses the app documents directory; browser audio Blobs use IndexedDB. Browser API credentials exist in memory only. Native API credentials use the platform secure store. The local database and documents are not described as encrypted by default, and app-private files may be included in device backups. JSON export is an explicit user action; protect exported files as sensitive data.
+Audio recordings, notes, proposal drafts, and Markdown documents are stored locally. Native audio uses the app documents directory; browser audio Blobs use IndexedDB. Browser API credentials exist in memory only. Native API credentials use the platform secure store. The local database and documents are not described as encrypted by default, and app-private files may be included in device backups. JSON backup export is an explicit user action and includes notes, tasks, Markdown, People/Projects, inert imported-knowledge archives, and read-only history; it excludes settings, recordings, and provider credentials/state. Protect exported files as sensitive data.
 
 Azure Speech and Azure OpenAI require a user's endpoint, deployment, and key. These are intentionally not preconfigured. A connection or account label stays “configured” until authentication is actually verified. Browser CORS and the selected Azure resource's model availability need credentialed tests. No live provider, OAuth, external send, or production deployment has been verified in this build.
 
@@ -27,7 +29,7 @@ Provider authorization uses a system-browser authorization-code + PKCE handoff. 
 
 1. Confirm the Apple Developer membership, bundle identifier, App Store Connect app record, and signing credentials.
 2. Configure platform-specific OAuth client registrations and exact redirect URIs for each provider; set only public client IDs in local build environment, keep client secrets out of the app, and rebuild native apps after callback-scheme changes.
-3. Configure a user-owned Azure Speech resource and GPT-6 Luna deployment, then test actual audio format, latency, response schema, and limits.
+3. Select an Azure OpenAI deployment actually available in the user's resource, plus Azure Speech; verify model availability, API compatibility, pricing, audio formats, latency, response schema, and limits before provider use. “GPT-6 Luna” is a requested label, not proof of a public Azure deployment.
 4. Run `npx expo install --check`, `npx expo-doctor`, typecheck, core tests, web export, and the iOS JavaScript export.
 5. Build a signed iOS development build with EAS and validate capture, interruptions, offline persistence, Keychain lifecycle, OAuth, local notification delivery, and privacy/export on a physical iPhone.
 6. Run a reviewed test action with an explicitly approved payload and test recipient before enabling any real send path. Uploading through EAS Submit is not publication; TestFlight and App Store review remain separate steps.

@@ -181,7 +181,7 @@ export function ImportedBackupsSection({
           <View key={archive.id} style={styles.archiveCard}>
             <Pressable accessibilityRole="button" accessibilityLabel={`${isOpen ? "Hide" : "Show"} imported backup from ${new Date(archive.exportedAt).toLocaleDateString()}`} accessibilityState={{ expanded: isOpen }} onPress={toggle} style={styles.archiveHeader}>
               <View style={styles.archiveCopy}>
-                <Text style={styles.archiveTitle}>Imported backup · {archive.sourceFormat === "voice-assistant-export-v1" ? "Legacy v1" : "Still v2"}</Text>
+                <Text style={styles.archiveTitle}>Imported backup · {archive.sourceFormat === "voice-assistant-export-v1" ? "Legacy v1" : archive.sourceFormat === "still-backup-v2" ? "Still v2" : archive.sourceFormat === "still-backup-v3" ? "Still v3" : "Unknown backup version"}</Text>
                 <Text style={styles.caption}>Exported {new Date(archive.exportedAt).toLocaleDateString()} · added {new Date(archive.importedAt).toLocaleDateString()}</Text>
                 <Text style={styles.caption}>{archive.noteLinks.length} notes · {archive.taskLinks.length} tasks · {archive.documents.length} archived documents · {archive.history.length} historical records</Text>
               </View>

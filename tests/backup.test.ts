@@ -1,10 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import type { AppState } from '../src/core';
 import {
-  BACKUP_LIMITS, PORTABLE_BACKUP_FORMAT, canonicalPortableContent, createPortableBackup,
-  parsePortableBackup, summarizePortableBackup, validateImportedBackupArchive,
-  validatePortableDocumentPath, type PortableBackupV2,
+  BACKUP_LIMITS, PORTABLE_BACKUP_FORMAT, canonicalPortableContent, createPortableBackup, createPortableKnowledge,
+  parsePortableBackup, summarizePortableBackup, validateImportedBackupArchive, legacyCanonicalPortableContentV2,
+  validatePortableDocumentPath, type PortableBackupV3,
 } from '../src/backup';
+import { emptyKnowledgeState } from '../src/knowledge';
 
 const at = '2026-10-12T10:00:00.000Z';
 
@@ -15,17 +16,32 @@ function emptyState(): AppState {
     syncStates: {}, pendingCredentialCleanup: [], dispatchRecords: [], dispatchRecordQuarantine: [], mailboxSchemaVersion: 2,
     proactive: { schemaVersion: 1, rules: [], candidates: [], dismissals: [], snoozes: [] },
     importedBackups: [],
+    knowledge: emptyKnowledgeState(),
   };
 }
 
-function sampleBackup(): PortableBackupV2 {
+function sampleBackup(): PortableBackupV3 {
   return {
-    format: PORTABLE_BACKUP_FORMAT, schemaVersion: 2, exportId: 'export-1', exportedAt: at, audioIncluded: false,
+    format: PORTABLE_BACKUP_FORMAT, schemaVersion: 3, exportId: 'export-1', exportedAt: at, audioIncluded: false,
     notes: [{ sourceId: 'note-1', title: 'Walk', transcript: 'Remember the route', durationSeconds: 8, createdAt: at, audioMissing: true }],
     tasks: [{ sourceId: 'task-1', title: 'Call', body: 'Call the clinic', status: 'open', createdAt: at, sourceNoteId: 'note-1' }],
     documents: [{ path: 'memory/profile.md', content: 'Preference', revision: 2, updatedAt: at }],
     archivedDocuments: [{ sourceId: 'archived-1', path: 'memory/profile.md', content: 'Older preference', revision: 1, updatedAt: at }],
     history: [{ kind: 'dispatch', sourceId: 'dispatch:ref-' + 'x'.repeat(300), title: 'Action — imported history', content: 'Sent a message', status: 'accepted (unverified imported history)', occurredAt: at, provider: 'google', reference: 'provider-id' }],
+    knowledge: { state: emptyKnowledgeState(), narratives: [] }, archivedKnowledge: [],
+  };
+}
+
+const personUuid = '123e4567-e89b-42d3-a456-426614174000';
+function knowledgeWithProviderReference() {
+  return {
+    schemaVersion: 1 as const,
+    people: [{ id: personUuid, revision: 1, name: 'Ada', aliases: [], narrativePath: `people/${personUuid}.md`, createdAt: at, updatedAt: at, facts: [
+      { id: '123e4567-e89b-42d3-a456-426614174001', provenance: 'accepted_inference' as const, createdAt: at,
+        evidence: [{ sourceId: 'mail:private-account-key:private-message-id', sourceVersion: `0:${'c'.repeat(64)}`, revision: 0, quote: 'Exact\nclaim' }], statement: 'Works with Ada' },
+    ], contacts: [], sourceLinks: [{ id: '123e4567-e89b-42d3-a456-426614174002', provenance: 'user_authored' as const, createdAt: at,
+      reference: { kind: 'mail' as const, id: 'private-message-id', identityKey: 'private-account-key', connectionGeneration: 4 }, label: 'Planning message' }] }],
+    projects: [], suggestions: [],
   };
 }
 
@@ -37,7 +53,7 @@ describe('portable backup schema', () => {
       processingFingerprint: 'secret-fingerprint', importOrigin: { kind: 'backup_import', archiveId: 'archive-1', sourceNoteId: 'old-note', audioMissing: true, originalTimeZoneUnknown: true } });
     state.notes[0]!.analysis = { noteId: 'n1', sourceRevision: 4, intent: 'assist', fingerprint: 'analysis-fingerprint', analyzedAt: '', capturedAt: at,
       captureTimeZone: 'UTC', summary: 'Short summary', answer: 'Short answer', decisions: [], citations: [], clarifications: ['Confirm the location'], proposalIds: [],
-      source: 'offline_preview', includedSourceIds: [], includedSources: [], omittedSourceIds: [], omittedSourceCount: 0, sourceVersions: {} };
+      source: 'offline_preview', includedSourceIds: [], includedSources: [], omittedSourceIds: [], omittedSourceCount: 0, sourceVersions: {}, knowledgeSelection: [] };
     state.accounts.push({ id: 'a1', provider: 'google', displayName: 'Me', email: 'me@example.com', connected: true, authStatus: 'connected',
       tokenRef: 'opaque-token-ref', identity: { providerNamespace: 'google', clientId: 'private-client', subject: 'private-subject' }, grantedScopes: ['mail.send'] });
     state.proposals.push({ id: 'p1', noteId: 'n1', kind: 'email', title: 'Email', body: 'Draft body', status: 'approved', revision: 2,
@@ -88,9 +104,59 @@ describe('portable backup schema', () => {
     expect(JSON.stringify(parsed)).not.toContain('opaque-secret');
     expect(JSON.stringify(parsed)).not.toContain('secret-digest');
     expect(parsed.warnings).toContain('Account connections, credentials, and executable approvals are not restored.');
+    expect(parsed.sourceFormat).toBe('voice-assistant-export-v1');
+    expect(parsed.backup.format).toBe(PORTABLE_BACKUP_FORMAT);
+    expect(parsed.backup.knowledge.state).toEqual(emptyKnowledgeState());
   });
 
-  it('rejects unknown v2 fields and unsupported formats while allowing archived path duplicates', () => {
+  it('adapts strict v2 input to v3 with empty knowledge and records the actual source marker', () => {
+    const { knowledge: _knowledge, archivedKnowledge: _archivedKnowledge, format: _format, schemaVersion: _version, ...fields } = sampleBackup();
+    const v2 = { ...fields, format: 'still-backup-v2', schemaVersion: 2 };
+    const parsed = parsePortableBackup(JSON.stringify(v2));
+    expect(parsed.sourceFormat).toBe('still-backup-v2');
+    expect(parsed.backup.format).toBe(PORTABLE_BACKUP_FORMAT);
+    expect(parsed.backup.schemaVersion).toBe(3);
+    expect(parsed.backup.knowledge.state).toEqual(emptyKnowledgeState());
+    expect(parsed.backup.archivedKnowledge).toEqual([]);
+    expect(legacyCanonicalPortableContentV2(parsed.backup)).toContain('"format":"still-backup-v2","schemaVersion":2');
+    expect(legacyCanonicalPortableContentV2({ ...parsed.backup, knowledge: createPortableKnowledge(knowledgeWithProviderReference()) })).toBeUndefined();
+    const emptyV2 = parsePortableBackup(JSON.stringify({ format: 'still-backup-v2', schemaVersion: 2, exportId: 'legacy', exportedAt: at, audioIncluded: false,
+      notes: [], tasks: [], documents: [], archivedDocuments: [], history: [] })).backup;
+    expect(legacyCanonicalPortableContentV2(emptyV2)).toBe(JSON.stringify({ format: 'still-backup-v2', schemaVersion: 2, audioIncluded: false,
+      notes: [], tasks: [], documents: [], archivedDocuments: [], history: [] }));
+  });
+
+  it('keeps the combined active and archived knowledge cohort count within 50', () => {
+    const knowledge = createPortableKnowledge(knowledgeWithProviderReference());
+    const backup = { ...sampleBackup(), knowledge, archivedKnowledge: Array.from({ length: 49 }, (_, index) => ({ sourceId: `prior-${index}`, knowledge: { state: emptyKnowledgeState(), narratives: [] } })) };
+    expect(parsePortableBackup(JSON.stringify(backup)).backup.archivedKnowledge).toHaveLength(49);
+    expect(() => parsePortableBackup(JSON.stringify({ ...backup, archivedKnowledge: [...backup.archivedKnowledge, { sourceId: 'prior-50', knowledge: { state: emptyKnowledgeState(), narratives: [] } }] }))).toThrow(/cohorts/i);
+  });
+
+  it('counts knowledge text in the same total restore budget as notes and documents', () => {
+    const people = Array.from({ length: 100 }, (_, index) => {
+      const id = `123e4567-e89b-42d3-a456-${String(index + 1000).padStart(12, '0')}`;
+      return { id, revision: 1, name: `Person ${index}`, aliases: [], narrativePath: `people/${id}.md`, createdAt: at, updatedAt: at, facts: [], contacts: [], sourceLinks: [] };
+    });
+    const knowledge = { state: { schemaVersion: 1, people, projects: [], suggestions: [] },
+      narratives: people.map((person) => ({ entityKind: 'person' as const, entityId: person.id, content: 'x'.repeat(16 * 1024), revision: 1, updatedAt: at })) };
+    const documents = Array.from({ length: 90 }, (_, index) => ({ path: `memory/profile-${index}.md`, content: 'x'.repeat(BACKUP_LIMITS.textBytes), revision: 1, updatedAt: at }));
+    expect(() => parsePortableBackup(JSON.stringify({ ...sampleBackup(), documents, archivedDocuments: [], knowledge }))).toThrow(/total restore limit/i);
+  });
+
+  it('redacts provider identity from active knowledge and retains explicit narrative snapshots', () => {
+    const portable = createPortableKnowledge(knowledgeWithProviderReference(), [{ path: `people/${personUuid}.md`, content: 'Canonical narrative', revision: 7, updatedAt: at }]);
+    const encoded = JSON.stringify(portable);
+    expect(portable.narratives).toEqual([{ entityKind: 'person', entityId: personUuid, content: 'Canonical narrative', revision: 7, updatedAt: at }]);
+    expect(encoded).not.toContain('private-account-key');
+    expect(encoded).not.toContain('private-message-id');
+    expect(encoded).toContain(`historical:mail:0:${'c'.repeat(64)}`);
+    expect(portable.state.people[0]?.sourceLinks[0]?.reference).toEqual({ kind: 'historical', label: 'Planning message', originalKind: 'mail' });
+    const withRuntimeAuthority = { ...sampleBackup(), knowledge: { ...portable, state: { ...portable.state, people: [{ ...portable.state.people[0], importOrigin: { kind: 'backup_knowledge' } }] } } };
+    expect(() => parsePortableBackup(JSON.stringify(withRuntimeAuthority))).toThrow(/runtime import authority/i);
+  });
+
+  it('rejects unknown v3 fields and unsupported formats while allowing archived path duplicates', () => {
     const backup = sampleBackup();
     expect(parsePortableBackup(JSON.stringify(backup)).backup.archivedDocuments).toHaveLength(1);
     expect(() => parsePortableBackup(JSON.stringify({ ...backup, runtimeState: {} }))).toThrow(/unsupported field/i);
@@ -114,7 +180,7 @@ describe('portable backup schema', () => {
     expect(() => parsePortableBackup(new Uint8Array([0xc3, 0x28]))).toThrow(/UTF-8/i);
     expect(() => parsePortableBackup(' '.repeat(BACKUP_LIMITS.maxBytes + 1))).toThrow(/size/i);
     expect(() => parsePortableBackup('['.repeat(BACKUP_LIMITS.maxDepth + 1) + '0' + ']'.repeat(BACKUP_LIMITS.maxDepth + 1))).toThrow(/nesting/i);
-    const dangerous = '{"format":"still-backup-v2","schemaVersion":2,"exportId":"x","exportedAt":"2026-10-12T10:00:00.000Z","audioIncluded":false,"notes":[],"tasks":[],"documents":[],"archivedDocuments":[],"history":[],"__proto__":{}}';
+    const dangerous = '{"format":"still-backup-v3","schemaVersion":3,"exportId":"x","exportedAt":"2026-10-12T10:00:00.000Z","audioIncluded":false,"notes":[],"tasks":[],"documents":[],"archivedDocuments":[],"history":[],"knowledge":{"state":{"schemaVersion":1,"people":[],"projects":[],"suggestions":[]},"narratives":[]},"archivedKnowledge":[],"__proto__":{}}';
     expect(() => parsePortableBackup(dangerous)).toThrow(/forbidden object key/i);
     const malformedScalar = JSON.stringify({ ...sampleBackup(), notes: [{ ...sampleBackup().notes[0], title: '\ud800' }] });
     expect(() => parsePortableBackup(malformedScalar)).toThrow(/invalid Unicode|title is invalid/i);
@@ -146,15 +212,26 @@ describe('portable backup schema', () => {
   });
 
   it('validates persistent inert archive rows and rejects malformed or unknown fields', () => {
+    const portableKnowledge = createPortableKnowledge(knowledgeWithProviderReference());
     const archive = {
       id: 'archive-1', contentHash: 'a'.repeat(64), fileHash: 'b'.repeat(64), sourceFormat: PORTABLE_BACKUP_FORMAT,
       exportedAt: at, importedAt: at, noteLinks: [{ sourceId: 'n1', noteId: 'local-n1' }], taskLinks: [],
       documents: [{ id: 'doc1', path: 'memory/profile.md', content: 'Older content', revision: 1, updatedAt: at }],
       history: [{ id: 'h1', kind: 'dispatch', sourceId: 'dispatch:provider-' + 'x'.repeat(300), title: 'Claim', content: 'Unverified', status: 'unknown' }],
+      archivedKnowledge: [{ id: 'cohort-1', sourceId: 'active-knowledge', knowledge: portableKnowledge,
+        activationLinks: [{ entityKind: 'person', sourceEntityId: personUuid, entityId: '123e4567-e89b-42d3-a456-426614174009', sourceDigest: 'd'.repeat(64), activatedAt: at }] }],
     };
-    expect(validateImportedBackupArchive(archive)).toMatchObject({ id: 'archive-1', history: [{ kind: 'dispatch' }] });
+    expect(validateImportedBackupArchive(archive)).toMatchObject({ id: 'archive-1', history: [{ kind: 'dispatch' }], archivedKnowledge: [{ sourceId: 'active-knowledge', activationLinks: [{ entityKind: 'person' }] }] });
     expect(validateImportedBackupArchive({ ...archive, history: [...archive.history, { ...archive.history[0], sourceId: 'dispatch:different-source' }] })).toBeUndefined();
     expect(validateImportedBackupArchive({ ...archive, credentials: { token: 'secret' } })).toBeUndefined();
     expect(validateImportedBackupArchive({ ...archive, documents: [{ ...archive.documents[0], activatedPath: 'memory/../x.md' }] })).toBeUndefined();
+    expect(validateImportedBackupArchive({ ...archive, archivedKnowledge: [{ ...archive.archivedKnowledge[0], activationLinks: [{ ...archive.archivedKnowledge[0].activationLinks[0], sourceDigest: 'bad' }] }] })).toBeUndefined();
+
+    const state = emptyState();
+    state.importedBackups.push(validateImportedBackupArchive(archive)!);
+    const exportedAgain = createPortableBackup(state, { exportId: 'portable-archive', exportedAt: at });
+    expect(exportedAgain.archivedKnowledge).toHaveLength(1);
+    expect(exportedAgain.archivedKnowledge[0]?.knowledge.state.people[0]?.sourceLinks[0]?.reference).toEqual({ kind: 'historical', label: 'Planning message', originalKind: 'mail' });
+    expect(JSON.stringify(exportedAgain)).not.toContain('private-account-key');
   });
 });

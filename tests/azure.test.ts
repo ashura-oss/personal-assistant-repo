@@ -29,7 +29,7 @@ describe('Azure endpoint and Responses request', () => {
       expect(body.text.format.strict).toBe(true);
       expect(body.input.map((message: { role: string }) => message.role)).toEqual(['developer', 'user']);
       return new Response(JSON.stringify({
-        output: [{ content: [{ type: 'output_text', text: JSON.stringify({ summary: 'Call Alex tomorrow.', answer: '', decisions: [], citations: [{ sourceId: 'transcript', revision: 1, sourceVersion, quote: 'I need to call Alex tomorrow.' }], clarifications: [], proposals: [{ kind: 'task', title: 'Call Alex', body: 'Call Alex tomorrow', recipients: [], dueAt: null, evidence: ['I need to call Alex tomorrow.'] }] }) }] }],
+        output: [{ content: [{ type: 'output_text', text: JSON.stringify({ summary: 'Call Alex tomorrow.', answer: '', decisions: [], citations: [{ sourceId: 'transcript', revision: 1, sourceVersion, quote: 'I need to call Alex tomorrow.' }], clarifications: [], proposals: [{ kind: 'task', title: 'Call Alex', body: 'Call Alex tomorrow', recipients: [], dueAt: null, evidence: ['I need to call Alex tomorrow.'] }], memorySuggestions: [] }) }] }],
         usage: { input_tokens: 123456, output_tokens: 65432 },
       }), { status: 200, headers: { 'content-type': 'application/json' } });
     });
@@ -70,7 +70,7 @@ describe('Azure endpoint and Responses request', () => {
     const fetcher = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
       requestBody = String(init?.body);
       return new Response(JSON.stringify({
-        output: [{ content: [{ type: 'output_text', text: JSON.stringify({ summary: '', answer: '', decisions: [], citations: [], clarifications: [], proposals: [] }) }] }],
+        output: [{ content: [{ type: 'output_text', text: JSON.stringify({ summary: '', answer: '', decisions: [], citations: [], clarifications: [], proposals: [], memorySuggestions: [] }) }] }],
         usage: { input_tokens: null, output_tokens: -1 },
       }), { status: 200, headers: { 'content-type': 'application/json' } });
     });

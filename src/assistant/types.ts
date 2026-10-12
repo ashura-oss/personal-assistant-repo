@@ -1,5 +1,5 @@
 export type AssistantIntent = 'assist' | 'summarize' | 'answer' | 'extract';
-export type AssistantSourceKind = 'note' | 'document' | 'task' | 'calendar' | 'mail';
+export type AssistantSourceKind = 'note' | 'document' | 'task' | 'calendar' | 'mail' | 'knowledge';
 
 /** Content is the captured local snapshot; source IDs must not contain mutable display names. */
 export interface AssistantSourceInput {
@@ -12,17 +12,21 @@ export interface AssistantSourceInput {
   kind?: AssistantSourceKind;
   title?: string;
   updatedAt?: string;
+  /** Local deterministic selection hint; it is never included in provider context. */
+  selectionPriority?: 0 | 1 | 2;
 }
 
 export interface LocalContextSnapshotInput {
   transcript: { revision: number; text: string };
   query?: string;
   intent?: AssistantIntent;
-  documents?: Array<{ path: string; revision: number; content: string; updatedAt?: string }>;
-  tasks?: Array<{ id: string; title: string; body: string; status: string; dueAt?: string; updatedAt?: string }>;
+  documents?: Array<{ path: string; revision: number; content: string; updatedAt?: string; selectionPriority?: 0 | 1 | 2 }>;
+  knowledge?: AssistantSourceInput[];
+  notes?: { id: string; title: string; revision: number; transcript: string; updatedAt?: string; selectionPriority?: 0 | 1 | 2 }[];
+  tasks?: Array<{ id: string; title: string; body: string; status: string; dueAt?: string; updatedAt?: string; selectionPriority?: 0 | 1 | 2 }>;
   calendars?: Array<{ id: string; accountId: string; identityKey?: string; providerId?: string; name: string; writable: boolean; connected: boolean }>;
-  calendarEvents?: Array<{ id: string; accountId: string; calendarId: string; providerEventId: string; identityKey?: string; subject?: string; start?: string; end?: string; timeZone?: string }>;
-  mailbox?: Array<{ id: string; accountId: string; providerMessageId: string; identityKey: string; subject?: string; from?: string; receivedAt?: string; snippet?: string }>;
+  calendarEvents?: Array<{ id: string; accountId: string; calendarId: string; providerEventId: string; identityKey?: string; subject?: string; start?: string; end?: string; timeZone?: string; selectionPriority?: 0 | 1 | 2 }>;
+  mailbox?: Array<{ id: string; accountId: string; providerMessageId: string; identityKey: string; subject?: string; from?: string; receivedAt?: string; snippet?: string; selectionPriority?: 0 | 1 | 2 }>;
   calendarSnapshot?: {
     identityKey: string;
     timeMin: string;
@@ -69,6 +73,18 @@ export interface AssistantProposal {
   evidence: string[];
 }
 
+export interface AssistantMemorySuggestion {
+  targetSourceId: string;
+  targetRevision: number;
+  type: 'add_fact' | 'add_contact' | 'add_source_link' | 'add_member';
+  statement: string | null;
+  address: string | null;
+  label: string | null;
+  relatedSourceId: string | null;
+  role: string | null;
+  evidence: AssistantCitation[];
+}
+
 export interface AssistantResponse {
   summary: string;
   answer: string;
@@ -76,6 +92,7 @@ export interface AssistantResponse {
   citations: AssistantCitation[];
   clarifications: string[];
   proposals: AssistantProposal[];
+  memorySuggestions: AssistantMemorySuggestion[];
 }
 
 export interface ContextSelection {

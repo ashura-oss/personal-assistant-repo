@@ -3,7 +3,8 @@ import * as Crypto from 'expo-crypto';
 import type { AppState } from '../src/core';
 import { AppControllerImpl } from '../src/services/controller';
 import type { StateStore } from '../src/storage/contracts';
-import { BACKUP_LIMITS, PORTABLE_BACKUP_FORMAT, PORTABLE_BACKUP_SCHEMA_VERSION, parsePortableBackup, type PortableBackupV2 } from '../src/backup';
+import { BACKUP_LIMITS, PORTABLE_BACKUP_FORMAT, PORTABLE_BACKUP_SCHEMA_VERSION, legacyCanonicalPortableContentV2, parsePortableBackup, type PortableBackupV3 } from '../src/backup';
+import { emptyKnowledgeState } from '../src/knowledge';
 
 class MemoryStore implements StateStore {
   value?: AppState;
@@ -20,7 +21,7 @@ class MemoryStore implements StateStore {
 }
 
 const stamp = '2026-10-12T10:00:00.000Z';
-function fixture(): PortableBackupV2 {
+function fixture(): PortableBackupV3 {
   return {
     format: PORTABLE_BACKUP_FORMAT, schemaVersion: PORTABLE_BACKUP_SCHEMA_VERSION, exportId: 'portable-1',
     exportedAt: stamp, audioIncluded: false,
@@ -32,6 +33,7 @@ function fixture(): PortableBackupV2 {
     documents: [{ path: 'memory/RULES.md', content: '# Imported rules\n\nDo not call venues without asking.', revision: 3, updatedAt: stamp }],
     archivedDocuments: [],
     history: [{ kind: 'analysis', sourceId: 'analysis:same-note-id', sourceNoteId: 'same-note-id', title: 'Old analysis', content: 'Historical only.', status: 'Unverified historical result', occurredAt: stamp }],
+    knowledge: { state: emptyKnowledgeState(), narratives: [] }, archivedKnowledge: [],
   };
 }
 
@@ -49,7 +51,7 @@ describe('controller portable backup workflow', () => {
     expect(digestSpy).not.toHaveBeenCalled();
   });
 
-  it('exports an allowlisted v2 backup without connected-account authority or credentials', async () => {
+  it('exports an allowlisted v3 backup without connected-account authority or credentials', async () => {
     const store = new MemoryStore();
     const app = new AppControllerImpl(store);
     await app.load();
@@ -63,7 +65,7 @@ describe('controller portable backup workflow', () => {
     const restored = new AppControllerImpl(store);
     await restored.load();
     const backup = JSON.parse(await restored.exportData());
-    expect(backup).toMatchObject({ format: PORTABLE_BACKUP_FORMAT, schemaVersion: 2, audioIncluded: false });
+    expect(backup).toMatchObject({ format: PORTABLE_BACKUP_FORMAT, schemaVersion: 3, audioIncluded: false });
     expect(JSON.stringify(backup)).not.toContain('secret-token-ref');
     expect(backup).not.toHaveProperty('accounts');
     expect(backup).not.toHaveProperty('settings');
@@ -232,6 +234,37 @@ describe('controller portable backup workflow', () => {
     expect(app.getSnapshot().notes.some((item) => item.importOrigin?.archiveId === archive.id && item.importOrigin.sourceNoteId === 'same-note-id')).toBe(true);
     const duplicate = await app.prepareBackupImport(newInput);
     expect(duplicate).toMatchObject({ alreadyImported: true, missingNoteCount: 0, missingTaskCount: 0 });
+  });
+
+  it('matches a pre-v3 archive by legacy v2 content hash and preserves its identity during recovery', async () => {
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store);
+    await app.load();
+    const v2 = { ...fixture(), format: 'still-backup-v2', schemaVersion: 2 } as Record<string, unknown>;
+    delete v2.knowledge;
+    delete v2.archivedKnowledge;
+    const originalInput = JSON.stringify(v2);
+    const firstPreview = await app.prepareBackupImport(originalInput);
+    const archive = await app.applyBackupImport({ sessionId: firstPreview.sessionId, planHash: firstPreview.planHash });
+    const originalContentHash = await sha(legacyCanonicalPortableContentV2(parsePortableBackup(originalInput).backup)!);
+    const originalFileHash = await sha(originalInput);
+    const oldImportedAt = archive.importedAt;
+    const legacyState = structuredClone(app.getSnapshot());
+    Object.assign(legacyState.importedBackups.find((item) => item.id === archive.id)!, {
+      contentHash: originalContentHash, fileHash: originalFileHash, sourceFormat: 'still-backup-v2',
+    });
+    store.value = legacyState;
+    const legacyController = new AppControllerImpl(store);
+    await legacyController.load();
+    await legacyController.deleteNote(archive.noteLinks[0]!.noteId);
+
+    const reloaded = new AppControllerImpl(store);
+    await reloaded.load();
+    const regeneratedInput = JSON.stringify({ ...v2, exportId: 'regenerated-v2', exportedAt: '2026-10-13T08:00:00.000Z' });
+    const preview = await reloaded.prepareBackupImport(regeneratedInput);
+    expect(preview).toMatchObject({ alreadyImported: true, missingNoteCount: 1, missingTaskCount: 0 });
+    const restored = await reloaded.applyBackupImport({ sessionId: preview.sessionId, planHash: preview.planHash });
+    expect(restored).toMatchObject({ id: archive.id, contentHash: originalContentHash, fileHash: originalFileHash, importedAt: oldImportedAt });
   });
 
   it('imports and recovers special source IDs such as __proto__ and constructor as ordinary values', async () => {

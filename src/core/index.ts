@@ -1,6 +1,7 @@
 /** Stable application contracts shared by the UI, services, and storage. */
 import type { AssistantCitation, AssistantDecision } from '../assistant';
 import type { AudioRecoveryMetadata } from '../audio/recovery.types';
+import type { KnowledgeState, KnowledgeEntityKind, KnowledgeFact, ContactClaim, KnowledgeSourceLink, ProjectMember, KnowledgeSuggestion, KnowledgeChange, KnowledgeEvidence } from '../knowledge/types';
 
 export type NoteStatus = 'recorded' | 'processed' | 'error';
 export type ProposalKind = 'task' | 'reminder' | 'email' | 'event' | 'memory';
@@ -25,12 +26,14 @@ export interface NoteAssistResult {
   citations: AssistCitation[];
   clarifications: string[];
   proposalIds: string[];
+  memorySuggestionIds?: string[];
   source: 'provider' | 'offline_preview';
   includedSourceIds: string[];
   includedSources: { id: string; title: string; excerpt?: string }[];
   omittedSourceIds: string[];
   omittedSourceCount: number;
   sourceVersions: Record<string, string>;
+  knowledgeSelection?: { kind: KnowledgeEntityKind; id: string }[];
   answeredAsOf?: string;
   answerTimeZone?: string;
   stale?: boolean;
@@ -103,6 +106,7 @@ export interface NoteProposalProvenance {
   captureTimeZone: string;
   intent: AssistIntent;
   question?: string;
+  knowledgeSelection?: { kind: KnowledgeEntityKind; id: string }[];
   sources: ProposalSourceProvenance[];
   policySources: ProposalSourceProvenance[];
   settingsFingerprint: string;
@@ -406,6 +410,7 @@ export interface ContextDocument {
   content: string;
   revision: number;
   updatedAt: string;
+  selectionPriority?: 0 | 1 | 2;
 }
 
 export interface ActivityItem {
@@ -602,6 +607,9 @@ export interface AppState {
   /** Imported material is inert archive data; it is never assistant context or live authority. */
   importedBackups: import('../backup').ImportedBackupArchive[];
   backupRecoveryStatus?: { quarantinedArchiveCount: number; message: 'Some imported backup archive data could not be validated and is held privately.' };
+  /** Current, explicitly reviewed structured knowledge; imported archives remain inert. */
+  knowledge: KnowledgeState;
+  knowledgeRecoveryStatus?: { message: 'Some saved knowledge could not be validated and is held privately.' };
 }
 
 export interface BackupImportPreview {
@@ -615,6 +623,9 @@ export interface BackupImportPreview {
   taskCount: number;
   documentCount: number;
   historyCount: number;
+  personCount: number;
+  projectCount: number;
+  knowledgeCohortCount: number;
   missingAudioCount: number;
   /** Items absent from their verified local links and eligible for restoration from this archive. */
   missingNoteCount: number;
@@ -629,6 +640,30 @@ export interface BackupImportPreview {
   ignoredFieldCount: number;
   alreadyImported: boolean;
 }
+
+export interface ImportedKnowledgeActivationPreview {
+  sessionId: string;
+  planHash: string;
+  expiresAt: string;
+  archiveId: string;
+  cohortId: string;
+  kind: KnowledgeEntityKind;
+  sourceEntityId: string;
+  sourceName: string;
+  sourceEntity: import('../knowledge/types').Person | import('../knowledge/types').Project;
+  alreadyActivated: boolean;
+  targetId: string;
+  narrativePath: string;
+  narrativeContent: string;
+  factCount: number;
+  contactCount: number;
+  sourceLinkCount: number;
+  memberCount: number;
+  unavailableProviderReferenceCount: number;
+  unresolvedMemberCount: number;
+}
+
+export type KnowledgeSelection = { kind: KnowledgeEntityKind; id: string }[];
 
 /** Safe UI disclosure for a staged file; deliberately excludes the private staged URI. */
 export type RecordingAttachmentPreview = AudioRecoveryMetadata & {
@@ -669,6 +704,50 @@ export interface CalendarConfig {
 
 export type SettingsPatch = Partial<AppSettings>;
 
+export interface SavePersonInput {
+  id?: string;
+  expectedRevision?: number;
+  expectedDocumentRevision?: number;
+  name: string;
+  aliases: string[];
+  narrative: string;
+}
+
+export interface SaveProjectInput extends SavePersonInput {
+  status: import('../knowledge/types').Project['status'];
+  goal: string;
+  startsOn?: string;
+  targetOn?: string;
+  dateTimeZone?: string;
+}
+
+export interface KnowledgeItemCommand {
+  entityKind: KnowledgeEntityKind;
+  entityId: string;
+  expectedEntityRevision: number;
+  itemId?: string;
+}
+
+export interface KnowledgeSuggestionInput { targetKind: KnowledgeEntityKind; targetId: string; change: KnowledgeChange; evidence: KnowledgeEvidence[] }
+
+export interface SaveKnowledgeFactInput extends KnowledgeItemCommand { statement: string }
+export interface SaveKnowledgeContactInput extends Omit<KnowledgeItemCommand, 'entityKind'> { entityKind: 'person'; address: string; label: string }
+export interface SaveKnowledgeSourceLinkInput extends KnowledgeItemCommand { reference: import('../knowledge/types').KnowledgeReference; label: string }
+export interface SaveKnowledgeMemberInput extends Omit<KnowledgeItemCommand, 'entityKind'> { entityKind: 'project'; personId: string; personRevision: number; role: string }
+
+export interface ReviewKnowledgeSuggestionInput {
+  expectedRevision: number;
+  decision: 'accept' | 'dismiss';
+  targetRevision?: number;
+  memberPersonRevision?: number;
+}
+
+export interface EditKnowledgeSuggestionInput {
+  expectedRevision: number;
+  change: KnowledgeChange;
+  evidence: KnowledgeEvidence[];
+}
+
 export interface AppController {
   getSnapshot(): AppState;
   subscribe(listener: (state: AppState) => void): () => void;
@@ -680,7 +759,7 @@ export interface AppController {
   cancelRecordingAttachment(sessionId: string): Promise<void>;
   updateTranscript(id: string, text: string): Promise<Note>;
   processNote(id: string): Promise<Proposal[]>;
-  assistNote(id: string, options?: { intent?: AssistIntent; question?: string; forceRefresh?: boolean }): Promise<NoteAssistResult>;
+  assistNote(id: string, options?: { intent?: AssistIntent; question?: string; forceRefresh?: boolean; knowledgeSelection?: KnowledgeSelection }): Promise<NoteAssistResult>;
   refreshAnalysisStatus(noteId: string): Promise<NoteAssistResult | undefined>;
   checkProposalFreshness(id: string): Promise<{ current: boolean; reason?: string }>;
   reconcileDispatch(recordId: string, input: { disposition: import('../dispatch').DispatchReconciliation; note: string; remoteId?: string }): Promise<import('../dispatch').DispatchRecord>;
@@ -691,7 +770,23 @@ export interface AppController {
   dismissProposal(id: string): Promise<Proposal>;
   completeTask(id: string): Promise<LocalTask>;
   reopenTask(id: string): Promise<LocalTask>;
-  saveDocument(path: string, content: string): Promise<ContextDocument>;
+  savePerson(input: SavePersonInput): Promise<import('../knowledge/types').Person>;
+  saveProject(input: SaveProjectInput): Promise<import('../knowledge/types').Project>;
+  setKnowledgeEntityArchived(input: { kind: KnowledgeEntityKind; id: string; expectedRevision: number; archived: boolean }): Promise<import('../knowledge/types').Person | import('../knowledge/types').Project>;
+  saveKnowledgeFact(input: SaveKnowledgeFactInput): Promise<KnowledgeFact>;
+  removeKnowledgeFact(input: KnowledgeItemCommand): Promise<void>;
+  saveKnowledgeContact(input: SaveKnowledgeContactInput): Promise<ContactClaim>;
+  removeKnowledgeContact(input: KnowledgeItemCommand & { entityKind: 'person' }): Promise<void>;
+  saveKnowledgeSourceLink(input: SaveKnowledgeSourceLinkInput): Promise<KnowledgeSourceLink>;
+  removeKnowledgeSourceLink(input: KnowledgeItemCommand): Promise<void>;
+  saveKnowledgeMember(input: SaveKnowledgeMemberInput): Promise<ProjectMember>;
+  removeKnowledgeMember(input: KnowledgeItemCommand & { entityKind: 'project' }): Promise<void>;
+  createKnowledgeSuggestionFromNote(input: { noteId: string; sourceId: string; quote: string; targetKind: KnowledgeEntityKind; targetId: string; change: import('../knowledge/types').KnowledgeChange }): Promise<KnowledgeSuggestion>;
+  editKnowledgeSuggestion(id: string, input: EditKnowledgeSuggestionInput): Promise<KnowledgeSuggestion>;
+  reviewKnowledgeSuggestion(id: string, input: ReviewKnowledgeSuggestionInput): Promise<KnowledgeSuggestion>;
+  saveDocument(path: string, content: string, options?: { expectedRevision?: number; expectedEntityRevision?: number }): Promise<ContextDocument>;
+  prepareImportedKnowledgeActivation(input: { archiveId: string; cohortId: string; kind: KnowledgeEntityKind; entityId: string }): Promise<ImportedKnowledgeActivationPreview>;
+  activateImportedKnowledgeEntity(input: { sessionId: string; planHash: string; expectedDocumentRevision?: number }): Promise<{ entity: import('../knowledge/types').Person | import('../knowledge/types').Project; document: ContextDocument }>;
   saveSettings(patch: SettingsPatch): Promise<AppSettings>;
   saveAccount(config: AccountConfig): Promise<Account>;
   installVerifiedAccount(config: AccountConfig, result: OAuthInstallResult): Promise<Account>;

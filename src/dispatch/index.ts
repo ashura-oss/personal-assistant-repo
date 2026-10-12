@@ -86,6 +86,20 @@ function sourceList(value: unknown, label: string): NoteProposalProvenance['sour
   return result;
 }
 
+function knowledgeSelection(value: unknown): NonNullable<NoteProposalProvenance['knowledgeSelection']> {
+  if (!Array.isArray(value) || value.length > 5) fail('Provenance knowledge selection is invalid.');
+  const result = value.map((raw) => {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) fail('Provenance knowledge selection is invalid.');
+    const item = raw as Record<string, unknown>;
+    onlyKeys(item, ['kind', 'id'], 'Provenance knowledge selection');
+    if ((item.kind !== 'person' && item.kind !== 'project') || typeof item.id !== 'string' || !UUID.test(item.id)) fail('Provenance knowledge selection is invalid.');
+    return { kind: item.kind, id: item.id } as { kind: 'person' | 'project'; id: string };
+  });
+  const keys = result.map(({ kind, id }) => `${kind}:${id}`);
+  if (new Set(keys).size !== keys.length) fail('Provenance knowledge selection must be unique.');
+  return result;
+}
+
 function snapshotProvenance(value: AnyProposalProvenance | undefined): AnyProposalProvenance {
   if (!value) return fail('Dispatch source provenance is missing or unsupported.');
   if (value.version === 2 && value.kind === 'mail_reply') {
@@ -101,7 +115,7 @@ function snapshotProvenance(value: AnyProposalProvenance | undefined): AnyPropos
     return structuredClone(value);
   }
   if (value.version !== 1) return fail('Dispatch source provenance is missing or unsupported.');
-  onlyKeys(value, ['version', 'assistContractVersion', 'analysisFingerprint', 'noteId', 'noteRevision', 'capturedAt', 'captureTimeZone', 'intent', 'question', 'sources', 'policySources', 'settingsFingerprint', 'answeredAsOf', 'expiresAt'], 'Dispatch provenance');
+  onlyKeys(value, ['version', 'assistContractVersion', 'analysisFingerprint', 'noteId', 'noteRevision', 'capturedAt', 'captureTimeZone', 'intent', 'question', 'knowledgeSelection', 'sources', 'policySources', 'settingsFingerprint', 'answeredAsOf', 'expiresAt'], 'Dispatch provenance');
   assertRevision(value.noteRevision, 'Provenance note revision');
   const intent = value.intent;
   if (!['assist', 'summarize', 'answer', 'extract'].includes(intent)) fail('Provenance intent is invalid.');
@@ -117,6 +131,7 @@ function snapshotProvenance(value: AnyProposalProvenance | undefined): AnyPropos
     captureTimeZone: validTimeZone(value.captureTimeZone, 'Provenance time zone'),
     intent,
     ...(value.question !== undefined ? { question: contentString(value.question, 'Provenance question', 16 * 1024, true) } : {}),
+    ...(value.knowledgeSelection !== undefined ? { knowledgeSelection: knowledgeSelection(value.knowledgeSelection) } : {}),
     sources,
     policySources,
     settingsFingerprint: cleanString(value.settingsFingerprint, 'Settings fingerprint', 16 * 1024),

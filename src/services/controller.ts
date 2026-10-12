@@ -8,6 +8,8 @@ import type {
   SelectedMailTextSnapshot, MailReplyTextLoadResult, MailReplyTextCacheResult, MailReplyTextGenerationInput, MailReplyTextGenerationResult,
   ProactiveCandidateEntry, ProactiveCandidateSourceResult,
   ProactiveState, SavedProactiveRule, RecordingAttachmentPreview,
+  SavePersonInput, SaveProjectInput, KnowledgeItemCommand, SaveKnowledgeFactInput, SaveKnowledgeContactInput,
+  SaveKnowledgeSourceLinkInput, SaveKnowledgeMemberInput, ReviewKnowledgeSuggestionInput, EditKnowledgeSuggestionInput, KnowledgeSelection,
 } from '../core';
 import { stateStore } from '../storage/platformStorage';
 import type { StateStore } from '../storage/contracts';
@@ -34,11 +36,13 @@ import { computeProactiveNextCheckAt } from '../proactive/boundaries';
 import { buildProactiveSources, proactiveStableValue, type ProactiveSourceHashMemo } from '../proactive/adapters';
 import { emptyProactiveState, normalizeProactiveData, PROACTIVE_INTEGRITY_ERROR, uncertainOnLoad, type ProactiveQuarantine } from '../proactive/state';
 import { canonicalMailReplySource, createMailReplySource, defaultReplyRecipients, replyReferences, validateMailReplySource, validateReplyBinding } from '../mailReply';
-import { BACKUP_LIMITS, canonicalPortableContent, createPortableBackup, parsePortableBackup, summarizePortableBackup, validatePortableDocumentPath, validateImportedBackupArchive } from '../backup';
-import type { ImportedBackupArchive, PortableBackupV2 } from '../backup';
+import { emptyKnowledgeState, getKnowledgeEntity, knowledgeContextSources, validateKnowledgeState, validateKnowledgeSuggestion } from '../knowledge';
+import type { ContactClaim, KnowledgeChange, KnowledgeEntityKind, KnowledgeEvidence, KnowledgeFact, KnowledgeReference, KnowledgeSourceLink, KnowledgeSuggestion, Person, Project, ProjectMember } from '../knowledge';
+import { BACKUP_LIMITS, canonicalPortableContent, legacyCanonicalPortableContentV2, createPortableBackup, parsePortableBackup, summarizePortableBackup, validatePortableDocumentPath, validateImportedBackupArchive } from '../backup';
+import type { ImportedBackupArchive, PortableBackupV3, PortableKnowledgeCohort } from '../backup';
 
 const now = () => new Date().toISOString();
-const ASSIST_CONTRACT_VERSION = 'assist-v2';
+const ASSIST_CONTRACT_VERSION = 'assist-v3';
 let fallbackUuidCounter = 0;
 const newId = () => Crypto.randomUUID?.() ?? globalThis.crypto?.randomUUID?.() ??
   `00000000-0000-4000-8000-${String(++fallbackUuidCounter).padStart(12, '0')}`;
@@ -72,6 +76,15 @@ function stateEntityIds(state: AppState): Set<string> {
       item.id, ...item.noteLinks.map((link) => link.noteId), ...item.taskLinks.map((link) => link.taskId),
       ...item.documents.map((document) => document.id), ...item.history.map((entry) => entry.id),
     ]),
+    ...state.knowledge.people.flatMap((item) => [item.id, ...item.facts.map((row) => row.id), ...item.contacts.map((row) => row.id), ...item.sourceLinks.map((row) => row.id)]),
+    ...state.knowledge.projects.flatMap((item) => [item.id, ...item.facts.map((row) => row.id), ...item.members.map((row) => row.id), ...item.sourceLinks.map((row) => row.id)]),
+    ...state.knowledge.suggestions.map((item) => item.id),
+    ...state.importedBackups.flatMap((archive) => (archive.archivedKnowledge ?? []).flatMap((cohort) => [
+      cohort.id, ...(cohort.activationLinks ?? []).map((link) => link.entityId),
+      ...cohort.knowledge.state.people.flatMap((item) => [item.id, ...item.facts.map((row) => row.id), ...item.contacts.map((row) => row.id), ...item.sourceLinks.map((row) => row.id)]),
+      ...cohort.knowledge.state.projects.flatMap((item) => [item.id, ...item.facts.map((row) => row.id), ...item.members.map((row) => row.id), ...item.sourceLinks.map((row) => row.id)]),
+      ...cohort.knowledge.state.suggestions.map((item) => item.id),
+    ])),
   ]);
 }
 function allocateFreshId(usedIds: Set<string>): string {
@@ -148,7 +161,7 @@ function initialState(): AppState {
     settings: { ...DEFAULT_SETTINGS },
     usage: { month: day.slice(0, 7), day, requests: 0, attemptsToday: 0, inputTokens: 0, outputTokens: 0, transcriptionSeconds: 0, attempts: 0, unknownCharges: 0, reservedUsd: 0, priceKnown: false, estimatedCostUsd: 0 },
     mailbox: [], selectedMailTexts: [], calendarEvents: [], syncStates: {}, pendingCredentialCleanup: [], dispatchRecords: [], dispatchRecordQuarantine: [], mailboxSchemaVersion: 2,
-    proactive: emptyProactiveState(), importedBackups: [],
+    proactive: emptyProactiveState(), importedBackups: [], knowledge: emptyKnowledgeState(),
   };
 }
 
@@ -342,6 +355,18 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value));
 }
 
+function normalizeKnowledgeSelection(value: unknown): KnowledgeSelection {
+  if (!Array.isArray(value) || value.length > 5) throw new Error('Select no more than five people or projects for this Assist request.');
+  const result: KnowledgeSelection = [];
+  const seen = new Set<string>();
+  for (const row of value) {
+    if (!isRecord(row) || (row.kind !== 'person' && row.kind !== 'project') || typeof row.id !== 'string' || !row.id) throw new Error('The selected knowledge source is invalid.');
+    const key = `${row.kind}:${row.id}`;
+    if (!seen.has(key)) { result.push({ kind: row.kind, id: row.id }); seen.add(key); }
+  }
+  return result;
+}
+
 function validMailboxCacheRow(value: unknown): value is MailboxSnapshotMessage {
   if (!isRecord(value)) return false;
   return typeof value.accountId === 'string' && value.accountId.length > 0 && value.accountId.length <= 256 &&
@@ -355,15 +380,62 @@ function validCalendarCacheRow(value: unknown): value is CalendarEventSnapshot {
     typeof value.providerEventId === 'string' && value.providerEventId.length > 0 && value.providerEventId.length <= 1024;
 }
 
-function assistContext(state: AppState, note: Note, intent: AssistIntent, question?: string): { documents: ContextDocument[]; additionalSources: AssistantSourceInput[]; omittedSourceCount: number; omittedSourceIds: string[] } {
-  const allDocuments = state.documents.filter(({ path }) => !path.startsWith('logs/') && path !== 'memory/INFERENCES.md' && path !== 'memory/DECISIONS.md');
+function assistContext(state: AppState, note: Note, intent: AssistIntent, question?: string, knowledgeSelection: KnowledgeSelection = []): { documents: ContextDocument[]; additionalSources: AssistantSourceInput[]; omittedSourceCount: number; omittedSourceIds: string[] } {
+  const entityNarrativePaths = new Set([
+    ...state.knowledge.people.map((entity) => entity.narrativePath),
+    ...state.knowledge.projects.map((entity) => entity.narrativePath),
+  ]);
+  const allDocuments = state.documents.filter(({ path }) => !path.startsWith('logs/') && path !== 'memory/INFERENCES.md' && path !== 'memory/DECISIONS.md' &&
+    !entityNarrativePaths.has(path));
   const taskQuery = intent === 'answer' && /\b(task|tasks|task count|how many|todo|to-do|action item)\b/i.test(question ?? '');
+  const selectedKnowledge = new Set(knowledgeSelection.map((item) => `${item.kind}:${item.id}`));
+  const acceptedKnowledge = [
+    ...state.knowledge.people.map((entity) => ({ kind: 'person' as const, entity })),
+    ...state.knowledge.projects.map((entity) => ({ kind: 'project' as const, entity })),
+  ].filter(({ entity }) => !entity.archivedAt && entity.sourceLinks.some((link) =>
+    link.reference.kind === 'note' && 'id' in link.reference && link.reference.id === note.id));
+  const anchorKnowledgeKeys = new Set([
+    ...acceptedKnowledge.map(({ kind, entity }) => `${kind}:${entity.id}`),
+    ...knowledgeSelection.map(({ kind, id }) => `${kind}:${id}`),
+  ]);
+  const anchorEntities = [
+    ...state.knowledge.people.map((entity) => ({ kind: 'person' as const, entity })),
+    ...state.knowledge.projects.map((entity) => ({ kind: 'project' as const, entity })),
+  ].filter(({ kind, entity }) => anchorKnowledgeKeys.has(`${kind}:${entity.id}`));
+  const linkedEntityKeys = new Set<string>(), linkedTaskIds = new Set<string>(), linkedNoteIds = new Set<string>(), linkedDocumentPaths = new Set<string>();
+  const linkedMailKeys = new Set<string>(), linkedCalendarKeys = new Set<string>();
+  for (const { entity } of anchorEntities) {
+    for (const { reference } of entity.sourceLinks) {
+      if (reference.kind === 'person' || reference.kind === 'project') linkedEntityKeys.add(`${reference.kind}:${reference.id}`);
+      else if (reference.kind === 'task') linkedTaskIds.add(reference.id);
+      else if (reference.kind === 'note') linkedNoteIds.add(reference.id);
+      else if (reference.kind === 'document') linkedDocumentPaths.add(reference.id);
+      else if (reference.kind === 'mail') linkedMailKeys.add(`${reference.identityKey}:${reference.id}`);
+      else if (reference.kind === 'calendar') linkedCalendarKeys.add(`${reference.identityKey}:${reference.calendarId}:${reference.id}`);
+    }
+    if ('members' in entity) for (const member of entity.members) if ('personId' in member) linkedEntityKeys.add(`person:${member.personId}`);
+  }
+  const relatedKnowledgeKeys = new Set([...anchorKnowledgeKeys, ...[...linkedEntityKeys].filter((key) => {
+    const [kind, id] = key.split(':') as [KnowledgeEntityKind, string];
+    const entity = getKnowledgeEntity(state.knowledge, kind, id);
+    return Boolean(entity && (!entity.archivedAt || knowledgeSelection.some((selected) => selected.kind === kind && selected.id === id)));
+  })]);
+  const knowledgeSources = knowledgeContextSources(state.knowledge,
+    state.documents.map((document) => ({ path: document.path, content: document.content })),
+    knowledgeSelection.map(({ kind, id }) => ({ kind, id }))).map((source) => ({
+      ...source,
+      selectionPriority: (selectedKnowledge.has(source.id.replace(/^knowledge:/, '')) ? 2
+        : relatedKnowledgeKeys.has(source.id.replace(/^knowledge:/, '')) ? 1 : 0) as 0 | 1 | 2,
+    }));
+  const linkedTaskSourceIds = new Set([...linkedTaskIds].map((id) => `task:${encodeURIComponent(id)}`));
   const built = buildLocalSourceSet({
     transcript: { revision: note.revision, text: note.transcript },
     query: `${question ?? ''}\n${note.transcript}`,
     intent,
-    documents: allDocuments.map((doc) => ({ path: doc.path, revision: doc.revision, content: doc.content, updatedAt: doc.updatedAt })),
-    tasks: taskQuery ? state.tasks.map((task) => ({ id: task.id, title: task.title, body: task.body, status: task.status, dueAt: task.dueAt, updatedAt: task.completedAt ?? task.createdAt })) : [],
+    documents: allDocuments.map((doc) => ({ path: doc.path, revision: doc.revision, content: doc.content, updatedAt: doc.updatedAt, selectionPriority: linkedDocumentPaths.has(doc.path) ? 1 as const : 0 as const })),
+    notes: state.notes.filter((item) => linkedNoteIds.has(item.id) && item.id !== note.id).map((item) => ({ id: item.id, title: item.title, revision: item.revision, transcript: item.transcript, updatedAt: item.capturedAt ?? item.createdAt, selectionPriority: 1 as const })),
+    knowledge: knowledgeSources,
+    tasks: taskQuery || linkedTaskIds.size ? state.tasks.filter((task) => taskQuery || linkedTaskIds.has(task.id)).map((task) => ({ id: task.id, title: task.title, body: task.body, status: task.status, dueAt: task.dueAt, updatedAt: task.completedAt ?? task.createdAt, selectionPriority: (linkedTaskIds.has(task.id) ? 1 : 0) as 0 | 1 })) : [],
     calendars: state.calendars.flatMap((calendar) => {
       const account = state.accounts.find((item) => item.id === calendar.accountId);
       return account?.connected && account.authStatus === 'connected'
@@ -372,15 +444,19 @@ function assistContext(state: AppState, note: Note, intent: AssistIntent, questi
     }),
     calendarEvents: state.calendarEvents.flatMap((event) => {
       const account = state.accounts.find((item) => item.id === event.accountId);
-      return account?.connected && account.authStatus === 'connected' ? [{ ...event, identityKey: identityKey(account) }] : [];
+      const identity = account && identityKey(account);
+      const calendar = state.calendars.find((item) => item.id === event.calendarId && item.accountId === event.accountId && item.connected);
+      if (!identity || !calendar || !account?.connected || account.authStatus !== 'connected' || event.verifiedIdentityKey !== identity ||
+        (event.connectionGeneration ?? 0) !== (account.connectionGeneration ?? 0)) return [];
+      return [{ ...event, identityKey: identity, selectionPriority: linkedCalendarKeys.has(`${identity}:${calendar.providerId ?? calendar.id}:${event.providerEventId}`) ? 1 as const : 0 as const }];
     }),
     mailbox: state.mailbox.flatMap((message) => {
       const account = state.accounts.find((item) => item.id === message.accountId);
       if (!account?.connected || account.authStatus !== 'connected' || !message.providerMessageId || message.providerDeletedAt || message.replyMetadataComplete !== true) return [];
       const accountIdentity = identityKey(account);
       return message.identityKey === `${accountIdentity}:${message.providerMessageId}` &&
-        (!message.verifiedIdentityKey || message.verifiedIdentityKey === accountIdentity)
-        ? [{ ...message, identityKey: accountIdentity }]
+        message.verifiedIdentityKey === accountIdentity && (message.connectionGeneration ?? 0) === (account.connectionGeneration ?? 0)
+        ? [{ ...message, identityKey: accountIdentity, selectionPriority: linkedMailKeys.has(`${accountIdentity}:${message.providerMessageId}`) ? 1 as const : 0 as const }]
         : [];
     }),
   });
@@ -388,9 +464,12 @@ function assistContext(state: AppState, note: Note, intent: AssistIntent, questi
   return {
     documents: built.sources.filter((source) => source.id.startsWith('doc:')).flatMap((source) => {
       const document = documentByPath.get(source.id.slice('doc:'.length));
-      return document ? [document] : [];
+      return document ? [{ ...document, selectionPriority: source.selectionPriority }] : [];
     }),
-    additionalSources: built.sources.filter((source) => source.id !== 'transcript' && !source.id.startsWith('doc:') && (taskQuery || !source.id.startsWith('task:'))),
+    additionalSources: [
+      ...built.sources.filter((source) => source.id !== 'transcript' && !source.id.startsWith('doc:') &&
+        (!source.id.startsWith('task:') || taskQuery || linkedTaskSourceIds.has(source.id))),
+    ],
     omittedSourceCount: built.omittedSourceCount,
     omittedSourceIds: built.omittedSourceIds,
   };
@@ -496,7 +575,7 @@ function sourceActionKey(note: Note, kind: Proposal['kind'], evidence: Proposal[
 
 function createProposalProvenance(input: {
   analysisFingerprint: string; note: Note; intent: AssistIntent; question?: string;
-  sourceVersions: Record<string, string>; policySources: ProposalProvenance['policySources']; settings: AppSettings; answeredAsOf?: string;
+  sourceVersions: Record<string, string>; policySources: ProposalProvenance['policySources']; settings: AppSettings; answeredAsOf?: string; knowledgeSelection?: KnowledgeSelection;
 }): ProposalProvenance | undefined {
   const sources = Object.entries(input.sourceVersions).map(([sourceId, sourceVersion]) => {
     const match = /^(\d+):([a-f0-9]{64})$/i.exec(sourceVersion);
@@ -512,13 +591,14 @@ function createProposalProvenance(input: {
     noteId: input.note.id, noteRevision: input.note.revision, capturedAt: input.note.capturedAt ?? input.note.createdAt,
     captureTimeZone: input.note.captureTimeZone || input.settings.timezone,
     intent: input.intent, ...(input.question ? { question: input.question } : {}),
+    knowledgeSelection: clone(input.knowledgeSelection ?? []),
     sources: sources as NonNullable<typeof sources[number]>[], policySources: input.policySources,
     settingsFingerprint: JSON.stringify(input.settings),
     ...(input.answeredAsOf ? { answeredAsOf: input.answeredAsOf, expiresAt } : {}),
   };
 }
 
-function normalizeLoadedState(value: unknown): AppState & { backupImportQuarantine?: unknown[] } {
+function normalizeLoadedState(value: unknown): AppState & { backupImportQuarantine?: unknown[]; knowledgeQuarantine?: unknown[] } {
   const defaults = initialState();
   if (!value || typeof value !== 'object') throw new Error('Saved app data is not a valid state snapshot. It was preserved for recovery.');
   const raw = value as Partial<AppState>;
@@ -541,6 +621,15 @@ function normalizeLoadedState(value: unknown): AppState & { backupImportQuaranti
       if (validated) importedBackups.push(validated); else backupImportQuarantine.push(candidate);
     }
   } else if (rawArchives !== undefined) backupImportQuarantine.push(rawArchives);
+  const knowledgeQuarantine: unknown[] = [];
+  const retainedKnowledgeQuarantine = (value as { knowledgeQuarantine?: unknown }).knowledgeQuarantine;
+  if (Array.isArray(retainedKnowledgeQuarantine)) knowledgeQuarantine.push(...retainedKnowledgeQuarantine);
+  else if (retainedKnowledgeQuarantine !== undefined) knowledgeQuarantine.push(retainedKnowledgeQuarantine);
+  let knowledge = emptyKnowledgeState();
+  if (raw.knowledge !== undefined) {
+    try { knowledge = validateKnowledgeState(raw.knowledge); }
+    catch { knowledgeQuarantine.push(raw.knowledge); }
+  }
   const notes = raw.notes.map((note) => {
     const analysis = note.analysis ? {
       ...note.analysis,
@@ -675,6 +764,11 @@ function normalizeLoadedState(value: unknown): AppState & { backupImportQuaranti
   }
   return {
     ...defaults, ...raw, notes, proposals, tasks, importedBackups,
+    knowledge,
+    ...(knowledgeQuarantine.length ? { knowledgeQuarantine } : {}),
+    knowledgeRecoveryStatus: knowledgeQuarantine.length
+      ? { message: 'Some saved knowledge could not be validated and is held privately.' as const }
+      : undefined,
     ...(backupImportQuarantine.length ? { backupImportQuarantine } : {}),
     backupRecoveryStatus: backupImportQuarantine.length
       ? { quarantinedArchiveCount: backupImportQuarantine.length, message: 'Some imported backup archive data could not be validated and is held privately.' as const }
@@ -746,6 +840,7 @@ function normalizeLoadedState(value: unknown): AppState & { backupImportQuaranti
 }
 
 export interface ControllerIntegrationDependencies {
+  writeDocument?: (path: string, content: string) => Promise<void>;
   tokenStore?: OAuthTokenStore;
   deleteToken?: (tokenRef: string) => Promise<void>;
   verifyOAuthResult?: (result: OAuthBridgeResult, stored: StoredOAuthToken) => Promise<boolean>;
@@ -759,7 +854,7 @@ export interface ControllerIntegrationDependencies {
 
 interface BackupImportSession {
   preview: BackupImportPreview;
-  backup: PortableBackupV2;
+  backup: PortableBackupV3;
   capturedState: AppState;
   capturedStateJson: string;
   preparedAtMs: number;
@@ -772,7 +867,21 @@ interface BackupImportSession {
   missingTaskSourceIds: string[];
   documentIds: Record<string, string>;
   historyIds: Record<string, string>;
+  knowledgeCohortIds: Record<string, string>;
+  knowledgeCohorts: PortableKnowledgeCohort[];
   appliedArchiveId?: string;
+}
+
+interface KnowledgeActivationSession {
+  preview: import('../core').ImportedKnowledgeActivationPreview;
+  stateJson: string;
+  preparedAtMs: number;
+  entity: Person | Project;
+  narrativeContent: string;
+  archiveId: string;
+  cohortId: string;
+  sourceDigest: string;
+  targetId: string;
 }
 
 interface RecordingAttachmentSession {
@@ -815,14 +924,17 @@ export class AppControllerImpl implements AppController {
   private installingTokenRefs = new Set<string>();
   private proactiveQuarantine?: ProactiveQuarantine;
   private backupImportQuarantine: unknown[] = [];
+  private knowledgeQuarantine: unknown[] = [];
   private proactiveSourceHashMemo: ProactiveSourceHashMemo = new Map();
   private mailReplyGenerations = new Map<string, { messageId: string; promise: Promise<MailReplyTextGenerationResult> }>();
   private mailReplyGenerationCache = new Map<string, MailReplyTextGenerationResult>();
   private backupImportSessions = new Map<string, BackupImportSession>();
+  private knowledgeActivationSessions = new Map<string, KnowledgeActivationSession>();
   private recordingAttachmentSessions = new Map<string, RecordingAttachmentSession>();
   private recordingAttachmentJobs = new Map<string, Promise<Note>>();
   private recordingAttachmentReceipts = new Map<string, RecordingAttachmentReceipt>();
   private recordingRecoveryPromise?: Promise<RecordingRecoveryService>;
+  private draftAllocatedIds = new WeakMap<AppState, Set<string>>();
 
   constructor(
     private readonly store: StateStore = stateStore,
@@ -855,16 +967,18 @@ export class AppControllerImpl implements AppController {
   }
 
   private persistedState(state: AppState): AppState {
-    const result = { ...state } as AppState & { proactiveQuarantine?: unknown; backupImportQuarantine?: unknown[] };
+    const result = { ...state } as AppState & { proactiveQuarantine?: unknown; backupImportQuarantine?: unknown[]; knowledgeQuarantine?: unknown[] };
     if (this.proactiveQuarantine) result.proactiveQuarantine = clone(this.proactiveQuarantine);
     if (this.backupImportQuarantine.length) result.backupImportQuarantine = clone(this.backupImportQuarantine);
+    if (this.knowledgeQuarantine.length) result.knowledgeQuarantine = clone(this.knowledgeQuarantine);
     return result;
   }
 
   private publicState(state: AppState): AppState {
-    const result = clone(state) as AppState & { proactiveQuarantine?: unknown; backupImportQuarantine?: unknown };
+    const result = clone(state) as AppState & { proactiveQuarantine?: unknown; backupImportQuarantine?: unknown; knowledgeQuarantine?: unknown };
     delete result.proactiveQuarantine;
     delete result.backupImportQuarantine;
+    delete result.knowledgeQuarantine;
     return result;
   }
 
@@ -1109,7 +1223,8 @@ export class AppControllerImpl implements AppController {
     if (provenance.settingsFingerprint !== JSON.stringify(state.settings)) throw new Error('Assistant settings changed. Run Assist again before approving or continuing this action.');
     if (provenance.answeredAsOf && !Number.isFinite(Date.parse(provenance.answeredAsOf))) throw new Error('This suggestion has an invalid question-time anchor. Run Assist again before approving it.');
     if (provenance.expiresAt && (!Number.isFinite(Date.parse(provenance.expiresAt)) || Date.now() >= Date.parse(provenance.expiresAt))) throw new Error('This answer-based suggestion expired at the next question-time window. Run Assist again before approving or continuing it.');
-    const { documents, additionalSources } = assistContext(state, note, provenance.intent, provenance.question);
+    if (!Array.isArray(provenance.knowledgeSelection)) throw new Error('This suggestion has no saved knowledge selection. Run Assist again before approving it.');
+    const { documents, additionalSources } = assistContext(state, note, provenance.intent, provenance.question, provenance.knowledgeSelection);
     const inputs: AssistantSourceInput[] = [
       { id: 'transcript', revision: note.revision, text: note.transcript, required: true, kind: 'note', title: 'Recorded transcript' },
       ...documents.map((document) => ({ id: `doc:${document.path}`, revision: document.revision, text: document.content, required: true, kind: 'document' as const, title: document.path, updatedAt: document.updatedAt })),
@@ -1135,7 +1250,7 @@ export class AppControllerImpl implements AppController {
       return JSON.stringify({
         contractVersion: ASSIST_CONTRACT_VERSION, analysisFingerprint: provenance.analysisFingerprint,
         note: { id: note.id, revision: note.revision, capturedAt: note.capturedAt ?? note.createdAt, captureTimeZone: note.captureTimeZone },
-        settings: state.settings, answeredAsOf: provenance.answeredAsOf ?? null,
+        settings: state.settings, answeredAsOf: provenance.answeredAsOf ?? null, knowledgeSelection: provenance.knowledgeSelection ?? [],
         sources: inputs.map((source) => ({ id: source.id, revision: source.revision, text: source.text,
           versionMaterial: source.versionMaterial ?? null, required: source.required, kind: source.kind ?? null, title: source.title ?? null, updatedAt: source.updatedAt ?? null })),
         policySources: policyInputs.map((source) => ({ id: source.id, revision: source.revision, text: source.text, updatedAt: source.updatedAt ?? null })),
@@ -1307,6 +1422,8 @@ export class AppControllerImpl implements AppController {
     const normalized = loaded ? normalizeLoadedState(loaded) : initialState();
     this.backupImportQuarantine = clone((normalized as AppState & { backupImportQuarantine?: unknown[] }).backupImportQuarantine ?? []);
     delete (normalized as AppState & { backupImportQuarantine?: unknown[] }).backupImportQuarantine;
+    this.knowledgeQuarantine = clone((normalized as AppState & { knowledgeQuarantine?: unknown[] }).knowledgeQuarantine ?? []);
+    delete (normalized as AppState & { knowledgeQuarantine?: unknown[] }).knowledgeQuarantine;
     this.state = normalized;
     const persisted = loaded as (AppState & { proactiveQuarantine?: unknown }) | undefined;
     const proactive = normalizeProactiveData(persisted?.proactive, persisted?.proactiveQuarantine);
@@ -1377,7 +1494,7 @@ export class AppControllerImpl implements AppController {
   async saveNote(input: SaveNoteInput): Promise<Note> {
     const transcript = input.transcript.trim();
     if (!transcript && !input.audioUri) throw new Error('Add a transcript or an audio recording first.');
-    const result = await this.mutate((state) => {
+    const result = await this.mutate(async (state) => {
       const capturedDate = input.capturedAt ? new Date(input.capturedAt) : new Date();
       if (!Number.isFinite(capturedDate.getTime())) throw new Error('Recording start time is invalid.');
       const note: Note = {
@@ -1618,6 +1735,83 @@ export class AppControllerImpl implements AppController {
     return job;
   }
 
+  private sourceReference(state: AppState, sourceId: string, note: Note): KnowledgeReference | undefined {
+    if (sourceId === 'transcript') return { kind: 'note', id: note.id };
+    if (sourceId.startsWith('note:')) {
+      try { const id = decodeURIComponent(sourceId.slice(5)); return state.notes.some((item) => item.id === id) ? { kind: 'note', id } : undefined; }
+      catch { return undefined; }
+    }
+    const knowledgeMatch = /^knowledge:(person|project):([0-9a-f-]+)$/.exec(sourceId);
+    if (knowledgeMatch) {
+      const kind = knowledgeMatch[1] as KnowledgeEntityKind, entityId = knowledgeMatch[2];
+      const entity = getKnowledgeEntity(state.knowledge, kind, entityId);
+      return entity && !entity.archivedAt ? { kind, id: entity.id } : undefined;
+    }
+    if (sourceId.startsWith('doc:')) { const id = sourceId.slice(4); return state.documents.some((item) => item.path === id) ? { kind: 'document', id } : undefined; }
+    if (sourceId.startsWith('task:')) { try { const id = decodeURIComponent(sourceId.slice(5)); return state.tasks.some((item) => item.id === id) ? { kind: 'task', id } : undefined; } catch { return undefined; } }
+    if (sourceId.startsWith('mail:')) {
+      const parts = sourceId.slice(5).split(':'); if (parts.length !== 2) return undefined;
+      try {
+        const identity = decodeURIComponent(parts[0]), providerId = decodeURIComponent(parts[1]);
+        const matches = state.mailbox.filter((item) => item.providerMessageId === providerId && item.verifiedIdentityKey === identity && item.identityKey === `${identity}:${providerId}` && !item.providerDeletedAt);
+        if (matches.length !== 1) return undefined;
+        const message = matches[0];
+        const account = state.accounts.find((item) => item.id === message.accountId && item.connected && item.authStatus === 'connected' && identityKey(item) === identity && (item.connectionGeneration ?? 0) === (message.connectionGeneration ?? 0) && (item.capabilities ?? []).includes('mail.read'));
+        return account ? { kind: 'mail', id: providerId, identityKey: identity, connectionGeneration: account.connectionGeneration ?? 0 } : undefined;
+      } catch { return undefined; }
+    }
+    if (sourceId.startsWith('calendar-event:')) {
+      const parts = sourceId.slice('calendar-event:'.length).split(':'); if (parts.length !== 3) return undefined;
+      try {
+        const identity = decodeURIComponent(parts[0]), calendarProviderId = decodeURIComponent(parts[1]), providerId = decodeURIComponent(parts[2]);
+        const matches = state.calendarEvents.filter((item) => item.providerEventId === providerId && item.verifiedIdentityKey === identity && !item.providerDeletedAt &&
+          state.calendars.some((calendar) => calendar.id === item.calendarId && (calendar.providerId ?? calendar.id) === calendarProviderId && calendar.accountId === item.accountId && calendar.connected));
+        if (matches.length !== 1) return undefined;
+        const event = matches[0];
+        const account = state.accounts.find((item) => item.id === event.accountId && item.connected && item.authStatus === 'connected' && identityKey(item) === identity &&
+          (item.connectionGeneration ?? 0) === (event.connectionGeneration ?? 0) && (item.capabilities ?? []).includes('calendar.read'));
+        return account ? { kind: 'calendar', id: providerId, calendarId: calendarProviderId, identityKey: identity, connectionGeneration: account.connectionGeneration ?? 0 } : undefined;
+      } catch { return undefined; }
+    }
+    return undefined;
+  }
+
+  private materializeAssistantMemorySuggestions(state: AppState, rows: DraftAnalysis['memorySuggestions'], note: Note, fingerprint: string): string[] {
+    if (this.knowledgeQuarantine.length || !rows.length) return [];
+    const ids: string[] = [];
+    for (const row of rows.slice(0, 4)) {
+      const match = /^knowledge:(person|project):([0-9a-f-]+)$/.exec(row.targetSourceId);
+      if (!match) continue;
+      const entityKind = match[1] as KnowledgeEntityKind, entityId = match[2];
+      const target = getKnowledgeEntity(state.knowledge, entityKind, entityId);
+      if (!target || target.archivedAt || target.revision !== row.targetRevision) continue;
+      const evidence = row.evidence.map(({ sourceId, revision, sourceVersion, quote }) => ({
+        sourceId: sourceId === 'transcript' ? `note:${note.id}` : sourceId, revision, sourceVersion, quote,
+      }));
+      let change: KnowledgeChange;
+      if (row.type === 'add_fact' && row.statement) change = { type: 'add_fact', entityKind, entityId, statement: row.statement };
+      else if (row.type === 'add_contact' && entityKind === 'person' && row.address && row.label !== null) change = { type: 'add_contact', entityKind: 'person', entityId, address: row.address, label: row.label };
+      else if (row.type === 'add_source_link' && row.relatedSourceId && row.label !== null) {
+        const reference = this.sourceReference(state, row.relatedSourceId, note); if (!reference) continue;
+        try { this.assertKnowledgeReferenceExists(state, reference); } catch { continue; }
+        change = { type: 'add_source_link', entityKind, entityId, reference,
+          ...((reference.kind === 'person' || reference.kind === 'project') ? { referenceRevision: getKnowledgeEntity(state.knowledge, reference.kind, reference.id)!.revision } : {}), label: row.label };
+      } else if (row.type === 'add_member' && entityKind === 'project' && row.relatedSourceId && row.role) {
+        const personMatch = /^knowledge:person:([0-9a-f-]+)$/.exec(row.relatedSourceId);
+        const person = personMatch && state.knowledge.people.find((item) => item.id === personMatch[1]);
+        if (!person || person.archivedAt) continue;
+        change = { type: 'add_member', entityKind: 'project', entityId, personId: person.id, personRevision: person.revision, role: row.role };
+      } else continue;
+      if (state.knowledge.suggestions.some((item) => ['pending', 'accepted'].includes(item.status) && stableJson(item.change) === stableJson(change))) continue;
+      if (state.knowledge.suggestions.filter((item) => item.status === 'pending').length >= 200) break;
+      const suggestion = validateKnowledgeSuggestion({ id: this.freshStateId(state), revision: 1, change, targetRevision: target.revision, evidence, status: 'pending', createdAt: now(), updatedAt: now(), sourceNoteId: note.id, sourceAnalysisFingerprint: fingerprint });
+      state.knowledge.suggestions.push(suggestion); ids.push(suggestion.id);
+      this.journalKnowledgeReview(state, 'created', suggestion, target.name);
+    }
+    state.knowledge = validateKnowledgeState(state.knowledge);
+    return ids;
+  }
+
   async refreshAnalysisStatus(noteId: string): Promise<NoteAssistResult | undefined> {
     await this.load();
     return this.mutateIfChanged(async (state) => {
@@ -1626,7 +1820,7 @@ export class AppControllerImpl implements AppController {
       const analysis = note.analysis;
       const boundFingerprint = analysis.fingerprint;
       const boundSourceRevision = analysis.sourceRevision;
-      const { documents, additionalSources, omittedSourceCount, omittedSourceIds } = assistContext(state, note, analysis.intent, analysis.question);
+      const { documents, additionalSources, omittedSourceCount, omittedSourceIds } = assistContext(state, note, analysis.intent, analysis.question, analysis.knowledgeSelection ?? []);
       const request = {
         intent: analysis.intent, question: analysis.question,
         ...(analysis.answeredAsOf ? { queryTimeAnchor: analysis.answeredAsOf, queryTimeZone: analysis.answerTimeZone ?? state.settings.timezone } : {}),
@@ -1666,20 +1860,21 @@ export class AppControllerImpl implements AppController {
     });
   }
 
-  async assistNote(id: string, options: { intent?: AssistIntent; question?: string; forceRefresh?: boolean } = {}): Promise<NoteAssistResult> {
+  async assistNote(id: string, options: { intent?: AssistIntent; question?: string; forceRefresh?: boolean; knowledgeSelection?: KnowledgeSelection } = {}): Promise<NoteAssistResult> {
     const intent = options.intent ?? 'assist';
     const question = options.question?.trim() || undefined;
     const requestedAt = new Date();
     const queryBucket = intent === 'answer' && question ? Math.floor(requestedAt.getTime() / 900_000) : '';
-    const key = JSON.stringify([id, intent, question, queryBucket, Boolean(options.forceRefresh)]);
+    const knowledgeSelection = normalizeKnowledgeSelection(options.knowledgeSelection ?? []);
+    const key = JSON.stringify([id, intent, question, queryBucket, knowledgeSelection, Boolean(options.forceRefresh)]);
     const existing = this.assistJobs.get(key);
     if (existing) return existing;
-    const job = this.runAssistNote(id, { ...options, intent, question }, requestedAt).finally(() => this.assistJobs.delete(key));
+    const job = this.runAssistNote(id, { ...options, intent, question, knowledgeSelection }, requestedAt).finally(() => this.assistJobs.delete(key));
     this.assistJobs.set(key, job);
     return job;
   }
 
-  private async runAssistNote(id: string, options: { intent?: AssistIntent; question?: string; forceRefresh?: boolean } = {}, requestedAt = new Date()): Promise<NoteAssistResult> {
+  private async runAssistNote(id: string, options: { intent?: AssistIntent; question?: string; forceRefresh?: boolean; knowledgeSelection?: KnowledgeSelection } = {}, requestedAt = new Date()): Promise<NoteAssistResult> {
     const intent = options.intent ?? 'assist';
     const question = options.question?.trim() || undefined;
     if (!['assist', 'summarize', 'answer', 'extract'].includes(intent)) throw new Error('Choose a supported assist action.');
@@ -1689,8 +1884,10 @@ export class AppControllerImpl implements AppController {
     if (!note) throw new Error('Note was not found.');
     this.requireConfirmedCaptureTimeZone(note);
     if (!note.transcript.trim()) throw new Error('This audio note has no transcript. Enter text or connect the speech provider before processing.');
+    const knowledgeSelection = normalizeKnowledgeSelection(options.knowledgeSelection ?? []);
+    for (const selected of knowledgeSelection) if (!getKnowledgeEntity(state.knowledge, selected.kind, selected.id)) throw new Error('One of the selected people or projects no longer exists. Refresh the selection and try again.');
     const sourceRevision = note.revision;
-    const { documents: contextDocs, additionalSources: localSources, omittedSourceCount, omittedSourceIds } = assistContext(state, note, intent, question);
+    const { documents: contextDocs, additionalSources: localSources, omittedSourceCount, omittedSourceIds } = assistContext(state, note, intent, question, knowledgeSelection);
     const capturedAt = note.capturedAt ?? note.createdAt;
     const answeredAsOf = intent === 'answer' && question ? requestedAt.toISOString() : undefined;
     const queryBucket = answeredAsOf ? Math.floor(requestedAt.getTime() / 900_000) : undefined;
@@ -1711,7 +1908,7 @@ export class AppControllerImpl implements AppController {
     const offlineCatalog = state.settings.mode === 'preview' ? await createSourceCatalog(offlineInputs,
       async (bytes) => Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, new TextDecoder().decode(bytes))) : undefined;
     const sourceVersions = prepared?.sourceVersions ?? Object.fromEntries(offlineCatalog?.sources.map((source) => [source.id, source.version]) ?? [['transcript', transcriptVersion]]);
-    const processingFingerprint = JSON.stringify({ contractVersion: ASSIST_CONTRACT_VERSION, transcript: note.transcript, sourceRevision, sources: sourceVersions, settings: state.settings, intent, question,
+    const processingFingerprint = JSON.stringify({ contractVersion: ASSIST_CONTRACT_VERSION, transcript: note.transcript, sourceRevision, sources: sourceVersions, settings: state.settings, intent, question, knowledgeSelection,
       capturedAt, captureTimeZone: note.captureTimeZone || state.settings.timezone,
       ...(answeredAsOf ? { queryBucket, queryTimeZone: state.settings.timezone } : {}),
     });
@@ -1733,6 +1930,7 @@ export class AppControllerImpl implements AppController {
       generated = {
         summary: preview.summary, answer: preview.answer, decisions: preview.decisions, citations: preview.citations,
         clarifications: preview.clarifications, proposals: proposals.map(({ kind, title, body, recipients, dueAt, evidence }) => ({ kind, title, body, recipients, dueAt, evidence })),
+        memorySuggestions: [],
         includedSourceIds: offlineIncludedIds,
         includedSources: offlineIncludedIds.map((sourceId) => {
           const input = sourceId === 'transcript' ? { title: 'Recorded transcript', text: note.transcript } : localSources.find((source) => source.id === sourceId)!;
@@ -1748,11 +1946,12 @@ export class AppControllerImpl implements AppController {
     const policyCatalog = await createSourceCatalog(policyInputs, async (bytes) =>
       Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, new TextDecoder().decode(bytes)));
     const policySources = policyCatalog.sources.map((source) => ({ sourceId: source.id, revision: source.revision, sourceVersion: source.version }));
+    const memorySuggestionFingerprint = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, processingFingerprint, { encoding: Crypto.CryptoEncoding.HEX });
     const created: Proposal[] = generated.proposals.map((draft) => ({
       id: newId(), noteId: note.id, ...draft, status: 'draft', revision: 1,
       recipients: [...draft.recipients], sourceRevision: note.revision, evidence: draft.evidence.map((item) => ({ ...item })),
       sourceActionKey: sourceActionKey(note, draft.kind, draft.evidence),
-      provenance: createProposalProvenance({ analysisFingerprint: processingFingerprint, note, intent, question, sourceVersions: generated.sourceVersions, policySources, settings: state.settings, answeredAsOf }),
+      provenance: createProposalProvenance({ analysisFingerprint: processingFingerprint, note, intent, question, knowledgeSelection, sourceVersions: generated.sourceVersions, policySources, settings: state.settings, answeredAsOf }),
       requiresRebuild: false,
     }));
 
@@ -1761,7 +1960,7 @@ export class AppControllerImpl implements AppController {
       if (current.revision !== sourceRevision) throw new Error('The transcript changed during processing. Process the updated note again.');
       let stale = JSON.stringify(draft.settings) !== JSON.stringify(state.settings);
       try {
-        const currentContext = assistContext(draft, current, intent, question);
+        const currentContext = assistContext(draft, current, intent, question, knowledgeSelection);
         let currentVersions: Record<string, string>;
         if (draft.settings.mode === 'provider') {
           const currentRequest = { intent, question, ...(answeredAsOf ? { queryTimeAnchor: answeredAsOf, queryTimeZone: state.settings.timezone } : {}), additionalSources: currentContext.additionalSources, preselection: { omittedSourceCount: currentContext.omittedSourceCount, omittedSourceIds: currentContext.omittedSourceIds } };
@@ -1789,7 +1988,7 @@ export class AppControllerImpl implements AppController {
           clarifications: [...generated.clarifications, 'Local context changed while this response was being prepared. Refresh the analysis to use the current sources.'],
           proposalIds: [], source: state.settings.mode === 'provider' ? 'provider' : 'offline_preview',
           includedSourceIds: generated.includedSourceIds, includedSources: generated.includedSources, omittedSourceIds: generated.omittedSourceIds, omittedSourceCount: generated.omittedSourceCount,
-          sourceVersions: generated.sourceVersions, stale: true,
+          sourceVersions: generated.sourceVersions, knowledgeSelection, stale: true,
         };
         current.status = 'processed'; current.processingFingerprint = processingFingerprint; current.analysis = analysis;
         addActivity(draft, 'error', 'Assist response retained as stale because local context changed during processing. No proposals were created.', { noteId: id });
@@ -1817,23 +2016,27 @@ export class AppControllerImpl implements AppController {
       ];
       current.status = 'processed';
       current.processingFingerprint = processingFingerprint;
+      const memorySuggestionIds = this.materializeAssistantMemorySuggestions(draft, generated.memorySuggestions, current, memorySuggestionFingerprint);
+      if (memorySuggestionIds.length) this.validateKnowledgeAndBackup(draft);
       const analysis: NoteAssistResult = {
         noteId: id, sourceRevision, intent, ...(question ? { question } : {}), fingerprint: processingFingerprint,
         analyzedAt: now(), capturedAt: note.capturedAt ?? note.createdAt, captureTimeZone: note.captureTimeZone || state.settings.timezone, ...(answeredAsOf ? { answeredAsOf, answerTimeZone: state.settings.timezone } : {}),
         summary: generated.summary, answer: generated.answer, decisions: generated.decisions, citations: generated.citations,
-        clarifications: generated.clarifications, proposalIds: selected.map((proposal) => proposal.id),
+        clarifications: generated.clarifications, proposalIds: selected.map((proposal) => proposal.id), memorySuggestionIds,
         source: state.settings.mode === 'provider' ? 'provider' : 'offline_preview',
-        includedSourceIds: generated.includedSourceIds, includedSources: generated.includedSources, omittedSourceIds: generated.omittedSourceIds, omittedSourceCount: generated.omittedSourceCount, sourceVersions: generated.sourceVersions,
+        includedSourceIds: generated.includedSourceIds, includedSources: generated.includedSources, omittedSourceIds: generated.omittedSourceIds, omittedSourceCount: generated.omittedSourceCount, sourceVersions: generated.sourceVersions, knowledgeSelection,
       };
       current.analysis = analysis;
       const docs = [
         ...recordJournal(draft, `processed:${id}:r${sourceRevision}`, `Processed note ${current.title}; ${created.length} review suggestion(s) created.`),
         ...created.filter((proposal) => !existingByAction.has(proposal.sourceActionKey!)).map((proposal) => appendInference(draft, proposal, state.settings.mode)),
+        ...memorySuggestionIds.flatMap(() => draft.documents.filter((document) => document.path === 'memory/INFERENCES.md')),
       ];
       addActivity(draft, 'proposal_created', state.settings.mode === 'provider'
         ? `Azure OpenAI assisted with this recorded note and drafted ${created.length} review suggestion${created.length === 1 ? '' : 's'}.`
         : `Preview mode extracted ${created.length} suggestion${created.length === 1 ? '' : 's'} from your transcript. No provider was contacted.`, { noteId: id });
-      return { proposals: selected, analysis, docs };
+      if (memorySuggestionIds.length) this.validateKnowledgeAndBackup(draft);
+      return { proposals: selected, analysis, docs: [...new Map(docs.map((document) => [document.path, document])).values()] };
     });
     await Promise.all(result.docs.map((document) => this.mirrorDocument(document)));
     return result.analysis;
@@ -2480,16 +2683,471 @@ export class AppControllerImpl implements AppController {
     return { status: 'current', candidate: entry.candidate, source: current };
   }
 
-  async saveDocument(path: string, content: string): Promise<ContextDocument> {
+  private assertKnowledgeWritable(): void {
+    if (this.knowledgeQuarantine.length) throw new Error('Saved knowledge is held for recovery. Export other data or repair the saved knowledge before editing it.');
+  }
+
+  private findKnowledgeEntity(state: AppState, kind: KnowledgeEntityKind, id: string): Person | Project {
+    const entity = getKnowledgeEntity(state.knowledge, kind, id);
+    if (!entity) throw new Error('Person or project was not found.');
+    return entity;
+  }
+
+  private freshStateId(state: AppState): string {
+    let used = this.draftAllocatedIds.get(state);
+    if (!used) { used = stateEntityIds(state); this.draftAllocatedIds.set(state, used); }
+    return allocateFreshId(used);
+  }
+
+  private assertKnowledgeReferenceExists(state: AppState, reference: KnowledgeReference): void {
+    if (reference.kind === 'note' && !state.notes.some((item) => item.id === reference.id)) throw new Error('Choose a note that still exists in this library.');
+    if (reference.kind === 'task' && !state.tasks.some((item) => item.id === reference.id)) throw new Error('Choose a task that still exists in this library.');
+    if (reference.kind === 'document' && !state.documents.some((item) => item.path === reference.id)) throw new Error('Choose a document that still exists in this library.');
+    if (reference.kind === 'person' || reference.kind === 'project') {
+      const related = getKnowledgeEntity(state.knowledge, reference.kind, reference.id);
+      if (!related || related.archivedAt) throw new Error('Choose a current, active person or project.');
+      return;
+    }
+    if (reference.kind === 'mail') {
+      const accounts = state.accounts.filter((item) => item.connected && item.authStatus === 'connected' && identityKey(item) === reference.identityKey &&
+        (item.connectionGeneration ?? 0) === reference.connectionGeneration && (item.capabilities ?? []).includes('mail.read'));
+      const account = accounts.length === 1 ? accounts[0] : undefined;
+      const messages = account && state.mailbox.filter((item) => item.accountId === account.id && item.providerMessageId === reference.id &&
+        item.identityKey === `${reference.identityKey}:${reference.id}` && item.verifiedIdentityKey === reference.identityKey &&
+        (item.connectionGeneration ?? 0) === reference.connectionGeneration && !item.providerDeletedAt);
+      const message = messages?.length === 1 ? messages[0] : undefined;
+      if (!account || !message) throw new Error('The referenced mailbox message is no longer available from this verified account.');
+      return;
+    }
+    if (reference.kind === 'calendar') {
+      const events = state.calendarEvents.filter((item) => item.providerEventId === reference.id && item.verifiedIdentityKey === reference.identityKey &&
+        (item.connectionGeneration ?? 0) === reference.connectionGeneration && !item.providerDeletedAt &&
+        state.calendars.some((calendar) => calendar.id === item.calendarId && calendar.accountId === item.accountId && calendar.connected &&
+          (calendar.providerId ?? calendar.id) === reference.calendarId));
+      const event = events.length === 1 ? events[0] : undefined;
+      const account = event && state.accounts.find((item) => item.id === event.accountId && item.connected && item.authStatus === 'connected' &&
+        identityKey(item) === reference.identityKey && (item.connectionGeneration ?? 0) === reference.connectionGeneration && (item.capabilities ?? []).includes('calendar.read'));
+      if (!event || !account) throw new Error('The referenced calendar event is no longer available from this verified account.');
+    }
+  }
+
+  private journalKnowledgeReview(state: AppState, action: 'created' | 'edited' | 'accepted' | 'dismissed', suggestion: KnowledgeSuggestion, targetName: string): void {
+    const marker = `knowledge-suggestion:${suggestion.id}:r${suggestion.revision}:${action}`;
+    const inference = state.documents.find((item) => item.path === 'memory/INFERENCES.md');
+    const inferenceText = `${inference?.content?.trim() || '# Inferences'}\n<!-- ${marker} -->\n- ${action === 'accepted' ? 'Accepted inference' : action === 'dismissed' ? 'Dismissed suggestion' : action === 'edited' ? 'Edited suggestion' : 'Pending suggestion'} for ${targetName}: ${suggestion.change.type}.\n`;
+    upsertDocument(state, 'memory/INFERENCES.md', inferenceText);
+    if (action === 'accepted') {
+      const decisions = state.documents.find((item) => item.path === 'memory/DECISIONS.md');
+      upsertDocument(state, 'memory/DECISIONS.md', `${decisions?.content?.trim() || '# Decisions'}\n<!-- ${marker} -->\n- User accepted a reviewed ${suggestion.change.type} for ${targetName}. It remains an unverified inference.\n`);
+    }
+  }
+
+  private async mirrorKnowledgeJournals(): Promise<void> {
+    for (const path of ['memory/INFERENCES.md', 'memory/DECISIONS.md']) {
+      const document = this.snapshot.documents.find((item) => item.path === path);
+      if (document) await this.mirrorDocument(document);
+    }
+  }
+
+  private validateKnowledgeAndBackup(state: AppState): void {
+    state.knowledge = validateKnowledgeState(state.knowledge);
+    assertPortableBackupFits(state);
+  }
+
+  private async saveKnowledgeEntity(kind: KnowledgeEntityKind, input: SavePersonInput | SaveProjectInput): Promise<Person | Project> {
+    this.assertKnowledgeWritable();
+    if (new TextEncoder().encode(input.narrative).length > 16 * 1024) throw new Error('Knowledge narrative is limited to 16 KiB.');
+    const saved = await this.mutate((state) => {
+      this.assertKnowledgeWritable();
+      const id = input.id ?? this.freshStateId(state);
+      const path = `${kind === 'person' ? 'people' : 'projects'}/${id}.md`;
+      const collection = kind === 'person' ? state.knowledge.people : state.knowledge.projects;
+      const existing = collection.find((item) => item.id === id);
+      if (existing && input.expectedRevision !== existing.revision) throw new Error('This knowledge entry changed. Refresh it before saving.');
+      if (!existing && input.id) throw new Error('Person or project was not found.');
+      if (!existing && stateEntityIds(state).has(id)) throw new Error('The requested person or project ID is already in use.');
+      const document = state.documents.find((item) => item.path === path);
+      if (document && input.expectedDocumentRevision !== document.revision) throw new Error('This narrative changed. Refresh it before saving.');
+      if (!document && input.expectedDocumentRevision !== undefined) throw new Error('This narrative was removed. Refresh it before saving.');
+      const timestamp = now();
+      const base = {
+        id, revision: (existing?.revision ?? 0) + 1, name: input.name.trim(), aliases: [...input.aliases], narrativePath: path,
+        createdAt: existing?.createdAt ?? timestamp, updatedAt: timestamp, facts: existing?.facts ?? [], sourceLinks: existing?.sourceLinks ?? [],
+        ...(existing?.archivedAt ? { archivedAt: existing.archivedAt } : {}), ...(existing?.importOrigin ? { importOrigin: existing.importOrigin } : {}),
+      };
+      const entity: Person | Project = kind === 'person'
+        ? { ...base, contacts: (existing as Person | undefined)?.contacts ?? [] }
+        : { ...base, status: (input as SaveProjectInput).status, goal: (input as SaveProjectInput).goal, startsOn: (input as SaveProjectInput).startsOn,
+          targetOn: (input as SaveProjectInput).targetOn, dateTimeZone: (input as SaveProjectInput).dateTimeZone, members: (existing as Project | undefined)?.members ?? [] };
+      const candidate = kind === 'person'
+        ? { ...state.knowledge, people: [...state.knowledge.people.filter((item) => item.id !== id), entity as Person] }
+        : { ...state.knowledge, projects: [...state.knowledge.projects.filter((item) => item.id !== id), entity as Project] };
+      state.knowledge = validateKnowledgeState(candidate);
+      const content = input.narrative;
+      const nextDocument: ContextDocument = { path, content, revision: (document?.revision ?? 0) + 1, updatedAt: timestamp };
+      if (document) Object.assign(document, nextDocument); else state.documents.unshift(nextDocument);
+      markAnalysesStale(state, [`knowledge:${kind}:${id}`, `doc:${path}`]);
+      this.validateKnowledgeAndBackup(state);
+      const savedEntity = getKnowledgeEntity(state.knowledge, kind, id)!;
+      return { entity: savedEntity as Person | Project, document: nextDocument };
+    });
+    await this.mirrorDocument(saved.document);
+    await this.mirrorKnowledgeJournals();
+    return saved.entity;
+  }
+
+  async savePerson(input: SavePersonInput): Promise<Person> { return await this.saveKnowledgeEntity('person', input) as Person; }
+  async saveProject(input: SaveProjectInput): Promise<Project> { return await this.saveKnowledgeEntity('project', input) as Project; }
+
+  async setKnowledgeEntityArchived(input: { kind: KnowledgeEntityKind; id: string; expectedRevision: number; archived: boolean }): Promise<Person | Project> {
+    this.assertKnowledgeWritable();
+    return this.mutate((state) => {
+      this.assertKnowledgeWritable();
+      const entity = this.findKnowledgeEntity(state, input.kind, input.id);
+      if (entity.revision !== input.expectedRevision) throw new Error('This knowledge entry changed. Refresh it before saving.');
+      const timestamp = now();
+      if (input.archived === Boolean(entity.archivedAt)) return entity;
+      if (input.kind === 'person') {
+        const item = state.knowledge.people.find((row) => row.id === input.id)!;
+        item.revision += 1; item.updatedAt = timestamp; if (input.archived) item.archivedAt = timestamp; else delete item.archivedAt;
+      } else {
+        const item = state.knowledge.projects.find((row) => row.id === input.id)!;
+        item.revision += 1; item.updatedAt = timestamp; if (input.archived) item.archivedAt = timestamp; else delete item.archivedAt;
+      }
+      markAnalysesStale(state, [`knowledge:${input.kind}:${input.id}`]);
+      this.validateKnowledgeAndBackup(state);
+      return this.findKnowledgeEntity(state, input.kind, input.id);
+    });
+  }
+
+  private updateKnowledgeItem<T>(command: KnowledgeItemCommand, update: (entity: Person | Project, state: AppState) => T): Promise<T> {
+    this.assertKnowledgeWritable();
+    return this.mutate((state) => {
+      this.assertKnowledgeWritable();
+      const entity = this.findKnowledgeEntity(state, command.entityKind, command.entityId);
+      if (entity.revision !== command.expectedEntityRevision) throw new Error('This knowledge entry changed. Refresh it before saving.');
+      const result = update(entity, state);
+      entity.revision += 1; entity.updatedAt = now();
+      markAnalysesStale(state, [`knowledge:${command.entityKind}:${command.entityId}`]);
+      this.validateKnowledgeAndBackup(state);
+      return result;
+    });
+  }
+
+  async saveKnowledgeFact(input: SaveKnowledgeFactInput): Promise<KnowledgeFact> {
+    return this.updateKnowledgeItem(input, (entity, state) => {
+      const rows = entity.facts; const found = input.itemId ? rows.find((item) => item.id === input.itemId) : undefined;
+      if (input.itemId && !found) throw new Error('Fact was not found.');
+      const item: KnowledgeFact = { id: found?.id ?? this.freshStateId(state), provenance: 'user_authored', createdAt: found?.createdAt ?? now(), statement: input.statement.trim() };
+      const index = found ? rows.indexOf(found) : -1; if (index >= 0) rows[index] = item; else rows.push(item); return item;
+    });
+  }
+  async removeKnowledgeFact(input: KnowledgeItemCommand): Promise<void> {
+    await this.updateKnowledgeItem(input, (entity) => { const index = entity.facts.findIndex((item) => item.id === input.itemId); if (index < 0) throw new Error('Fact was not found.'); entity.facts.splice(index, 1); });
+  }
+  async saveKnowledgeContact(input: SaveKnowledgeContactInput): Promise<ContactClaim> {
+    return this.updateKnowledgeItem(input, (entity, state) => {
+      if (!('contacts' in entity)) throw new Error('Contacts can only be added to a person.');
+      const found = input.itemId ? entity.contacts.find((item) => item.id === input.itemId) : undefined;
+      if (input.itemId && !found) throw new Error('Contact was not found.');
+      const item: ContactClaim = { id: found?.id ?? this.freshStateId(state), provenance: 'user_authored', createdAt: found?.createdAt ?? now(), address: input.address.trim(), label: input.label.trim() };
+      const index = found ? entity.contacts.indexOf(found) : -1; if (index >= 0) entity.contacts[index] = item; else entity.contacts.push(item); return item;
+    });
+  }
+  async removeKnowledgeContact(input: KnowledgeItemCommand & { entityKind: 'person' }): Promise<void> {
+    await this.updateKnowledgeItem(input, (entity) => { if (!('contacts' in entity)) throw new Error('Person was not found.'); const index = entity.contacts.findIndex((item) => item.id === input.itemId); if (index < 0) throw new Error('Contact was not found.'); entity.contacts.splice(index, 1); });
+  }
+  async saveKnowledgeSourceLink(input: SaveKnowledgeSourceLinkInput): Promise<KnowledgeSourceLink> {
+    return this.updateKnowledgeItem(input, (entity, state) => {
+      this.assertKnowledgeReferenceExists(state, input.reference);
+      const found = input.itemId ? entity.sourceLinks.find((item) => item.id === input.itemId) : undefined;
+      if (input.itemId && !found) throw new Error('Source link was not found.');
+      const item: KnowledgeSourceLink = { id: found?.id ?? this.freshStateId(state), provenance: 'user_authored', createdAt: found?.createdAt ?? now(), reference: clone(input.reference), label: input.label.trim() };
+      const index = found ? entity.sourceLinks.indexOf(found) : -1; if (index >= 0) entity.sourceLinks[index] = item; else entity.sourceLinks.push(item); return item;
+    });
+  }
+  async removeKnowledgeSourceLink(input: KnowledgeItemCommand): Promise<void> {
+    await this.updateKnowledgeItem(input, (entity) => { const index = entity.sourceLinks.findIndex((item) => item.id === input.itemId); if (index < 0) throw new Error('Source link was not found.'); entity.sourceLinks.splice(index, 1); });
+  }
+  async saveKnowledgeMember(input: SaveKnowledgeMemberInput): Promise<ProjectMember> {
+    return this.updateKnowledgeItem(input, (entity, state) => {
+      if (!('members' in entity)) throw new Error('Members can only be added to a project.');
+      const person = state.knowledge.people.find((row) => row.id === input.personId);
+      if (!person || person.revision !== input.personRevision || person.archivedAt) throw new Error('Choose a current, active person before adding a project member.');
+      const found = input.itemId ? entity.members.find((item) => item.id === input.itemId) : undefined;
+      if (input.itemId && !found) throw new Error('Project member was not found.');
+      const item: ProjectMember = { id: found?.id ?? this.freshStateId(state), provenance: 'user_authored', createdAt: found?.createdAt ?? now(), personId: input.personId, role: input.role.trim() };
+      const index = found ? entity.members.indexOf(found) : -1; if (index >= 0) entity.members[index] = item; else entity.members.push(item); return item;
+    });
+  }
+  async removeKnowledgeMember(input: KnowledgeItemCommand & { entityKind: 'project' }): Promise<void> {
+    await this.updateKnowledgeItem(input, (entity) => { if (!('members' in entity)) throw new Error('Project was not found.'); const index = entity.members.findIndex((item) => item.id === input.itemId); if (index < 0) throw new Error('Project member was not found.'); entity.members.splice(index, 1); });
+  }
+
+  async createKnowledgeSuggestionFromNote(input: { noteId: string; sourceId: string; quote: string; targetKind: KnowledgeEntityKind; targetId: string; change: KnowledgeChange }): Promise<KnowledgeSuggestion> {
+    this.assertKnowledgeWritable();
+    const result = await this.mutate(async (state) => {
+      this.assertKnowledgeWritable();
+      const note = this.note(state, input.noteId);
+      const quote = input.quote.trim();
+      if (!quote || !note.transcript.includes(quote)) throw new Error('Evidence must be an exact quote from the saved note transcript.');
+      if (input.sourceId !== 'transcript' && input.sourceId !== note.id) throw new Error('Manual note evidence must come from the selected note transcript.');
+      const target = this.findKnowledgeEntity(state, input.targetKind, input.targetId);
+      if (target.archivedAt) throw new Error('Unarchive the person or project before creating a suggestion.');
+      const transcriptSource = { id: `note:${note.id}`, revision: note.revision, text: note.transcript, required: true, kind: 'note' as const };
+      const catalog = await createSourceCatalog([transcriptSource], async (bytes) => Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, new TextDecoder().decode(bytes)));
+      const source = catalog.byId.get(`note:${note.id}`)!;
+      let change = { ...clone(input.change), entityKind: input.targetKind, entityId: input.targetId } as KnowledgeChange;
+      if (change.type === 'add_source_link') {
+        this.assertKnowledgeReferenceExists(state, change.reference);
+        if (change.reference.kind === 'person' || change.reference.kind === 'project') {
+          const related = this.findKnowledgeEntity(state, change.reference.kind, change.reference.id);
+          if (change.referenceRevision !== undefined && change.referenceRevision !== related.revision) throw new Error('The related person or project changed. Refresh before creating this suggestion.');
+          change = { ...change, referenceRevision: related.revision };
+        }
+      }
+      if (change.type === 'add_member') {
+        const person = state.knowledge.people.find((item) => item.id === change.personId);
+        if (!person || person.archivedAt || person.revision !== change.personRevision) throw new Error('Choose a current, active person before creating this member suggestion.');
+      }
+      if (state.knowledge.suggestions.some((item) => ['pending', 'accepted'].includes(item.status) && stableJson(item.change) === stableJson(change))) {
+        throw new Error('An equivalent pending or accepted suggestion already exists.');
+      }
+      const suggestion = validateKnowledgeSuggestion({
+        id: this.freshStateId(state), revision: 1, change, targetRevision: target.revision,
+        evidence: [{ sourceId: `note:${note.id}`, revision: source.revision, sourceVersion: source.version, quote }],
+        status: 'pending', createdAt: now(), updatedAt: now(), sourceNoteId: note.id,
+      });
+      state.knowledge.suggestions.push(suggestion);
+      this.journalKnowledgeReview(state, 'created', suggestion, target.name);
+      addActivity(state, 'local_action', `A memory suggestion was saved for ${target.name}.`, { noteId: note.id });
+      this.validateKnowledgeAndBackup(state);
+      return suggestion;
+    });
+    await this.mirrorKnowledgeJournals();
+    return result;
+  }
+
+  async editKnowledgeSuggestion(id: string, input: EditKnowledgeSuggestionInput): Promise<KnowledgeSuggestion> {
+    this.assertKnowledgeWritable();
+    const result = await this.mutate((state) => {
+      this.assertKnowledgeWritable();
+      const suggestion = state.knowledge.suggestions.find((item) => item.id === id);
+      if (!suggestion) throw new Error('Memory suggestion was not found.');
+      if (suggestion.revision !== input.expectedRevision || suggestion.status !== 'pending') throw new Error('This memory suggestion changed or is no longer pending.');
+      let editedChange = input.change;
+      const target = this.findKnowledgeEntity(state, editedChange.entityKind, editedChange.entityId);
+      if (target.archivedAt) throw new Error('Unarchive the person or project before editing its suggestion.');
+      if (editedChange.type === 'add_source_link') {
+        this.assertKnowledgeReferenceExists(state, editedChange.reference);
+        if (editedChange.reference.kind === 'person' || editedChange.reference.kind === 'project') {
+          const related = this.findKnowledgeEntity(state, editedChange.reference.kind, editedChange.reference.id);
+          if (editedChange.referenceRevision !== undefined && editedChange.referenceRevision !== related.revision) throw new Error('The related person or project changed. Refresh before editing this suggestion.');
+          editedChange = { ...editedChange, referenceRevision: related.revision };
+        }
+      }
+      if (editedChange.type === 'add_member') {
+        const person = state.knowledge.people.find((item) => item.id === editedChange.personId);
+        if (!person || person.archivedAt || person.revision !== editedChange.personRevision) throw new Error('Choose a current, active person before editing this member suggestion.');
+      }
+      if (state.knowledge.suggestions.some((item) => item.id !== id && ['pending', 'accepted'].includes(item.status) && stableJson(item.change) === stableJson(editedChange))) {
+        throw new Error('An equivalent pending or accepted suggestion already exists.');
+      }
+      const next = validateKnowledgeSuggestion({
+        ...suggestion, revision: suggestion.revision + 1, targetRevision: target.revision,
+        originalChange: suggestion.originalChange ?? suggestion.change,
+        originalEvidence: suggestion.originalEvidence ?? suggestion.evidence,
+        change: clone(editedChange), evidence: clone(input.evidence), updatedAt: now(), reviewedAt: undefined, status: 'pending',
+      });
+      Object.assign(suggestion, next);
+      this.journalKnowledgeReview(state, 'edited', suggestion, target.name);
+      this.validateKnowledgeAndBackup(state);
+      return suggestion;
+    });
+    await this.mirrorKnowledgeJournals();
+    return result;
+  }
+
+  private async currentKnowledgeSourceVersions(state: AppState, suggestion: KnowledgeSuggestion): Promise<Map<string, { revision: number; version: string; text: string }>> {
+    const requiredIds = new Set(suggestion.evidence.map((item) => item.sourceId === 'transcript' && suggestion.sourceNoteId
+      ? `note:${suggestion.sourceNoteId}` : item.sourceId));
+    const sources: AssistantSourceInput[] = [];
+    const noteId = suggestion.sourceNoteId;
+    const note = noteId ? state.notes.find((item) => item.id === noteId) : undefined;
+    for (const sourceId of requiredIds) {
+      if (sourceId.startsWith('note:')) {
+        let citedNoteId: string;
+        try { citedNoteId = decodeURIComponent(sourceId.slice(5)); } catch { continue; }
+        const citedNote = state.notes.find((item) => item.id === citedNoteId);
+        if (!citedNote) continue;
+        if (noteId && citedNote.id === noteId) sources.push({ id: sourceId, revision: citedNote.revision, text: citedNote.transcript, required: true, kind: 'note', title: citedNote.title, updatedAt: citedNote.capturedAt ?? citedNote.createdAt });
+        else {
+          const built = buildLocalSourceSet({ transcript: { revision: 0, text: '' }, notes: [{ id: citedNote.id, title: citedNote.title, revision: citedNote.revision, transcript: citedNote.transcript,
+            updatedAt: citedNote.capturedAt ?? citedNote.createdAt, selectionPriority: 1 }] });
+          sources.push(...built.sources.filter((item) => item.id === sourceId));
+        }
+        continue;
+      }
+      if (sourceId.startsWith('doc:')) {
+        const path = sourceId.slice(4), document = state.documents.find((item) => item.path === path);
+        if (document) sources.push({ id: sourceId, revision: document.revision, text: document.content, required: false, kind: 'document' });
+        continue;
+      }
+      if (sourceId.startsWith('task:')) {
+        let taskId: string;
+        try { taskId = decodeURIComponent(sourceId.slice(5)); } catch { continue; }
+        const task = state.tasks.find((item) => item.id === taskId);
+        if (task) {
+          const built = buildLocalSourceSet({ transcript: { revision: 0, text: '' }, tasks: [{ id: task.id, title: task.title, body: task.body, status: task.status, dueAt: task.dueAt, updatedAt: task.completedAt ?? task.createdAt, selectionPriority: 1 }] });
+          sources.push(...built.sources.filter((item) => item.id === sourceId));
+        }
+        continue;
+      }
+      const knowledgeMatch = /^knowledge:(person|project):([0-9a-f-]+)$/.exec(sourceId);
+      if (knowledgeMatch) {
+        const entityKind = knowledgeMatch[1] as KnowledgeEntityKind, entityId = knowledgeMatch[2];
+        const entity = getKnowledgeEntity(state.knowledge, entityKind, entityId);
+        if (entity) sources.push(...knowledgeContextSources(state.knowledge,
+          state.documents.map((item) => ({ path: item.path, content: item.content })), [{ kind: entityKind, id: entityId }]).filter((item) => item.id === sourceId));
+        continue;
+      }
+      if (sourceId.startsWith('mail:')) {
+        const parts = sourceId.slice(5).split(':');
+        if (parts.length !== 2) continue;
+        try {
+          const identity = decodeURIComponent(parts[0]), providerMessageId = decodeURIComponent(parts[1]);
+          const message = state.mailbox.find((item) => item.providerMessageId === providerMessageId && item.identityKey === `${identity}:${providerMessageId}` && item.verifiedIdentityKey === identity && !item.providerDeletedAt);
+          const account = message && state.accounts.find((item) => item.id === message.accountId && item.connected && item.authStatus === 'connected' && identityKey(item) === identity &&
+            (item.connectionGeneration ?? 0) === (message.connectionGeneration ?? 0) && item.capabilities?.includes('mail.read'));
+          if (message && account) {
+            const built = buildLocalSourceSet({ transcript: { revision: 0, text: '' }, mailbox: [{ id: message.id, accountId: account.id, providerMessageId, identityKey: identity, subject: message.subject, from: message.from, receivedAt: message.receivedAt, snippet: message.snippet }] });
+            sources.push(...built.sources.filter((item) => item.id === sourceId));
+          }
+        } catch { /* malformed provider source IDs fail closed */ }
+        continue;
+      }
+      if (sourceId.startsWith('calendar-event:')) {
+        const parts = sourceId.slice('calendar-event:'.length).split(':');
+        if (parts.length !== 3) continue;
+        try {
+          const identity = decodeURIComponent(parts[0]), providerCalendarId = decodeURIComponent(parts[1]), providerEventId = decodeURIComponent(parts[2]);
+          const matches = state.calendarEvents.flatMap((item) => {
+            if (item.providerEventId !== providerEventId || item.verifiedIdentityKey !== identity || item.providerDeletedAt) return [];
+            const calendar = state.calendars.find((candidate) => candidate.id === item.calendarId && candidate.accountId === item.accountId && candidate.connected && (candidate.providerId ?? candidate.id) === providerCalendarId);
+            const account = calendar && state.accounts.find((candidate) => candidate.id === calendar.accountId && candidate.connected && candidate.authStatus === 'connected' && identityKey(candidate) === identity &&
+              (candidate.connectionGeneration ?? 0) === (item.connectionGeneration ?? 0) && candidate.capabilities?.includes('calendar.read'));
+            return calendar && account ? [{ event: item, calendar, account }] : [];
+          });
+          const { event, calendar, account } = matches.length === 1 ? matches[0] : {} as { event: CalendarEventSnapshot; calendar: Calendar; account: Account };
+          if (event && calendar && account) {
+            const built = buildLocalSourceSet({ transcript: { revision: 0, text: '' }, calendars: [{ id: calendar.id, accountId: account.id, identityKey: identity, providerId: calendar.providerId, name: calendar.name, writable: calendar.writable, connected: true }],
+              calendarEvents: [{ ...event, identityKey: identity }] });
+            sources.push(...built.sources.filter((item) => item.id === sourceId));
+          }
+        } catch { /* malformed provider source IDs fail closed */ }
+      }
+    }
+    const catalog = await createSourceCatalog([...new Map(sources.map((source) => [source.id, source])).values()],
+      async (bytes) => Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, new TextDecoder().decode(bytes)));
+    const versions = new Map(catalog.sources.map((source) => [source.id, { revision: source.revision, version: source.version, text: source.text }]));
+    if (note && suggestion.evidence.some((item) => item.sourceId === 'transcript')) {
+      const transcript = versions.get(`note:${note.id}`);
+      if (transcript) versions.set('transcript', transcript);
+    }
+    return versions;
+  }
+
+  async reviewKnowledgeSuggestion(id: string, input: ReviewKnowledgeSuggestionInput): Promise<KnowledgeSuggestion> {
+    this.assertKnowledgeWritable();
+    const result = await this.mutate(async (state) => {
+      this.assertKnowledgeWritable();
+      const suggestion = state.knowledge.suggestions.find((item) => item.id === id);
+      if (!suggestion) throw new Error('Memory suggestion was not found.');
+      if (suggestion.status !== 'pending' || suggestion.revision !== input.expectedRevision) throw new Error('This memory suggestion changed or is no longer pending.');
+      if (input.decision === 'dismiss') {
+        suggestion.status = 'dismissed'; suggestion.reviewedAt = now(); suggestion.updatedAt = suggestion.reviewedAt; suggestion.revision += 1;
+        const target = this.findKnowledgeEntity(state, suggestion.change.entityKind, suggestion.change.entityId);
+        this.journalKnowledgeReview(state, 'dismissed', suggestion, target.name);
+        addActivity(state, 'local_action', 'A memory suggestion was dismissed.', { noteId: suggestion.sourceNoteId });
+        this.validateKnowledgeAndBackup(state);
+        return suggestion;
+      }
+      const target = this.findKnowledgeEntity(state, suggestion.change.entityKind, suggestion.change.entityId);
+      if (target.archivedAt || target.revision !== suggestion.targetRevision || (input.targetRevision !== undefined && input.targetRevision !== target.revision)) throw new Error('The target person or project changed. Refresh the suggestion before accepting it.');
+      if (suggestion.change.type === 'add_source_link') {
+        this.assertKnowledgeReferenceExists(state, suggestion.change.reference);
+        if (suggestion.change.reference.kind === 'person' || suggestion.change.reference.kind === 'project') {
+          const related = this.findKnowledgeEntity(state, suggestion.change.reference.kind, suggestion.change.reference.id);
+          if (related.archivedAt || related.revision !== suggestion.change.referenceRevision) throw new Error('The related person or project changed. Refresh the suggestion before accepting it.');
+        }
+      }
+      const versions = await this.currentKnowledgeSourceVersions(state, suggestion);
+      for (const evidence of suggestion.evidence) {
+        const current = versions.get(evidence.sourceId);
+        if (!current || current.revision !== evidence.revision || current.version !== evidence.sourceVersion || !current.text.includes(evidence.quote)) throw new Error('The cited source changed or is no longer available. Review the evidence and create a fresh suggestion.');
+      }
+      if (suggestion.change.type === 'add_member') {
+        const memberChange = suggestion.change;
+        const person = state.knowledge.people.find((item) => item.id === memberChange.personId);
+        if (!person || person.archivedAt || person.revision !== memberChange.personRevision || (input.memberPersonRevision !== undefined && input.memberPersonRevision !== person.revision)) throw new Error('The selected project member changed. Refresh the suggestion before accepting it.');
+      }
+      const evidence = clone(suggestion.evidence);
+      const itemBase = { id: this.freshStateId(state), provenance: 'accepted_inference' as const, createdAt: now(), evidence, suggestionId: suggestion.id };
+      const change = suggestion.change;
+      if (change.type === 'add_fact') target.facts.push({ ...itemBase, statement: change.statement });
+      else if (change.type === 'add_contact') {
+        if (!('contacts' in target)) throw new Error('A contact suggestion must target a person.');
+        target.contacts.push({ ...itemBase, address: change.address, label: change.label });
+      } else if (change.type === 'add_source_link') {
+        this.assertKnowledgeReferenceExists(state, change.reference);
+        target.sourceLinks.push({ ...itemBase, reference: clone(change.reference), label: change.label });
+      }
+      else {
+        if (!('members' in target)) throw new Error('A member suggestion must target a project.');
+        target.members.push({ ...itemBase, personId: change.personId, role: change.role });
+      }
+      target.revision += 1; target.updatedAt = now();
+      suggestion.status = 'accepted'; suggestion.reviewedAt = now(); suggestion.updatedAt = suggestion.reviewedAt; suggestion.revision += 1;
+      this.journalKnowledgeReview(state, 'accepted', suggestion, target.name);
+      markAnalysesStale(state, [`knowledge:${change.entityKind}:${change.entityId}`]);
+      addActivity(state, 'local_action', `A reviewed memory suggestion was added to ${target.name}.`, { noteId: suggestion.sourceNoteId });
+      this.validateKnowledgeAndBackup(state);
+      return suggestion;
+    });
+    await this.mirrorKnowledgeJournals();
+    return result;
+  }
+
+  async saveDocument(path: string, content: string, options: { expectedRevision?: number; expectedEntityRevision?: number } = {}): Promise<ContextDocument> {
     const cleanPath = path.replace(/\\/g, '/').replace(/^\/+/, '');
     if (!cleanPath || cleanPath.split('/').some((part) => part === '.' || part === '..')) throw new Error('Document path must stay inside the app documents folder.');
+    const entityPath = /^people\/[0-9a-f-]+\.md$/.test(cleanPath) || /^projects\/[0-9a-f-]+\.md$/.test(cleanPath);
+    if (entityPath) this.assertKnowledgeWritable();
+    if (entityPath && new TextEncoder().encode(content).length > 16 * 1024) throw new Error('Knowledge narrative is limited to 16 KiB.');
     const document = await this.mutate((state) => {
+      if (entityPath) this.assertKnowledgeWritable();
       const existing = state.documents.find((item) => item.path === cleanPath);
+      if (existing && options.expectedRevision !== existing.revision) throw new Error('This document changed. Refresh it before saving.');
+      if (!existing && options.expectedRevision !== undefined) throw new Error('This document was removed. Refresh it before saving.');
+      const entityMatch = /^people\/([0-9a-f-]+)\.md$/.exec(cleanPath) ?? /^projects\/([0-9a-f-]+)\.md$/.exec(cleanPath);
+      if (entityMatch) {
+        const kind: KnowledgeEntityKind = cleanPath.startsWith('people/') ? 'person' : 'project';
+        const entity = state.knowledge[kind === 'person' ? 'people' : 'projects'].find((item) => item.id === entityMatch[1]);
+        if (entity && options.expectedEntityRevision !== entity.revision) throw new Error('This person or project changed. Refresh it before saving its narrative.');
+        if (!entity && options.expectedEntityRevision !== undefined) throw new Error('This person or project was removed.');
+        if (!entity) throw new Error('Create the person or project before saving its canonical narrative.');
+      }
       if (existing?.content === content) return existing;
       const changed = existing?.content !== content;
       const next: ContextDocument = { path: cleanPath, content, revision: (existing?.revision ?? 0) + 1, updatedAt: now() };
       if (existing) Object.assign(existing, next); else state.documents.unshift(next);
+      if (entityMatch) {
+        const kind: KnowledgeEntityKind = cleanPath.startsWith('people/') ? 'person' : 'project';
+        const entity = state.knowledge[kind === 'person' ? 'people' : 'projects'].find((item) => item.id === entityMatch[1]);
+        if (entity) { entity.revision += 1; entity.updatedAt = next.updatedAt; markAnalysesStale(state, [`knowledge:${kind}:${entity.id}`]); }
+      }
       if (changed) markAnalysesStale(state, [`doc:${cleanPath}`]);
+      if (entityMatch) this.validateKnowledgeAndBackup(state);
       return next;
     });
     await this.mirrorDocument(document);
@@ -2497,7 +3155,7 @@ export class AppControllerImpl implements AppController {
   }
 
   private async mirrorDocument(document: ContextDocument): Promise<void> {
-    try { await writePrivateDocument(document.path, document.content); this.mirrorDirty.delete(document.path); }
+    try { await (this.integration.writeDocument ?? writePrivateDocument)(document.path, document.content); this.mirrorDirty.delete(document.path); }
     catch (error) {
       this.mirrorDirty.add(document.path);
       await this.mutate((state) => addActivity(state, 'error', `Local document mirror for ${document.path} will retry on next launch: ${error instanceof Error ? error.message : 'write failed'}.`));
@@ -2508,7 +3166,7 @@ export class AppControllerImpl implements AppController {
     for (const path of [...this.mirrorDirty]) {
       const document = this.snapshot.documents.find((item) => item.path === path);
       if (!document) { this.mirrorDirty.delete(path); continue; }
-      try { await writePrivateDocument(document.path, document.content); this.mirrorDirty.delete(path); }
+      try { await (this.integration.writeDocument ?? writePrivateDocument)(document.path, document.content); this.mirrorDirty.delete(path); }
       catch { /* canonical SQLite/IndexedDB document remains available and will retry next launch */ }
     }
   }
@@ -3623,6 +4281,156 @@ export class AppControllerImpl implements AppController {
     });
   }
 
+  async prepareImportedKnowledgeActivation(input: { archiveId: string; cohortId: string; kind: KnowledgeEntityKind; entityId: string }): Promise<import('../core').ImportedKnowledgeActivationPreview> {
+    await this.load();
+    this.assertKnowledgeWritable();
+    const snapshot = this.snapshot;
+    const snapshotJson = stableJson(snapshot);
+    const archive = snapshot.importedBackups.find((item) => item.id === input.archiveId);
+    const cohort = archive?.archivedKnowledge?.find((item) => item.id === input.cohortId);
+    if (!archive || !cohort) throw new Error('Imported knowledge archive was not found.');
+    const entity = getKnowledgeEntity(cohort.knowledge.state, input.kind, input.entityId);
+    if (!entity) throw new Error('Imported person or project was not found.');
+    const narrative = cohort.knowledge.narratives.find((item) => item.entityKind === input.kind && item.entityId === input.entityId);
+    const narrativeContent = narrative?.content ?? '';
+    const sourceDigest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, stableJson({ kind: input.kind, entity, narrativeContent }), { encoding: Crypto.CryptoEncoding.HEX });
+    if (this.snapshot !== snapshot || stableJson(this.snapshot) !== snapshotJson) throw new Error('App data changed while this activation preview was being prepared. Open a fresh preview.');
+    const link = cohort.activationLinks?.find((item) => item.entityKind === input.kind && item.sourceEntityId === input.entityId);
+    const linkedEntity = link && getKnowledgeEntity(snapshot.knowledge, input.kind, link.entityId);
+    const alreadyActivated = Boolean(link && linkedEntity?.importOrigin?.kind === 'backup_knowledge' &&
+      linkedEntity.importOrigin.archiveId === archive.id && linkedEntity.importOrigin.cohortId === cohort.id &&
+      linkedEntity.importOrigin.sourceEntityId === input.entityId && linkedEntity.importOrigin.sourceDigest === sourceDigest &&
+      link.sourceDigest === sourceDigest && snapshot.documents.some((document) => document.path === linkedEntity.narrativePath));
+    if (link && !alreadyActivated) throw new Error('The saved activation mapping cannot be verified. It is kept for recovery and will not be reused.');
+    const targetId = alreadyActivated ? link!.entityId : allocateFreshId(stateEntityIds(snapshot));
+    const sessionId = newId(), createdAt = Date.now(), expiresAt = new Date(createdAt + 15 * 60_000).toISOString();
+    const project = entity as Project;
+    const projectMembers = input.kind === 'project' ? project.members : [];
+    const unresolvedMemberCount = projectMembers.filter((member) => {
+      const sourcePersonId = 'sourcePersonId' in member ? member.sourcePersonId : member.personId;
+      const activated = cohort.activationLinks?.find((item) => item.entityKind === 'person' && item.sourceEntityId === sourcePersonId);
+      const active = activated && snapshot.knowledge.people.find((person) => person.id === activated.entityId);
+      return !active || active.importOrigin?.kind !== 'backup_knowledge' || active.importOrigin.archiveId !== archive.id || active.importOrigin.cohortId !== cohort.id || active.importOrigin.sourceEntityId !== sourcePersonId || active.importOrigin.sourceDigest !== activated.sourceDigest;
+    }).length;
+    const preview = {
+      sessionId, planHash: await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, stableJson({ snapshotJson, archiveId: archive.id, cohortId: cohort.id, kind: input.kind, entityId: input.entityId, sourceDigest, targetId }), { encoding: Crypto.CryptoEncoding.HEX }),
+      expiresAt, archiveId: archive.id, cohortId: cohort.id, kind: input.kind, sourceEntityId: input.entityId, sourceName: entity.name, sourceEntity: clone(entity), alreadyActivated, targetId,
+      narrativePath: `${input.kind === 'person' ? 'people' : 'projects'}/${targetId}.md`, narrativeContent,
+      factCount: entity.facts.length, contactCount: input.kind === 'person' ? (entity as Person).contacts.length : 0,
+      sourceLinkCount: entity.sourceLinks.length, memberCount: projectMembers.length,
+      unavailableProviderReferenceCount: entity.sourceLinks.filter((item) => item.reference.kind === 'historical' || item.reference.kind === 'mail' || item.reference.kind === 'calendar').length,
+      unresolvedMemberCount,
+    };
+    for (const [id, session] of this.knowledgeActivationSessions) if (createdAt < session.preparedAtMs || createdAt - session.preparedAtMs > 15 * 60_000) this.knowledgeActivationSessions.delete(id);
+    while (this.knowledgeActivationSessions.size >= 2) this.knowledgeActivationSessions.delete(this.knowledgeActivationSessions.keys().next().value!);
+    this.knowledgeActivationSessions.set(sessionId, { preview, stateJson: snapshotJson, preparedAtMs: createdAt, entity: clone(entity), narrativeContent, archiveId: archive.id, cohortId: cohort.id, sourceDigest, targetId });
+    return clone(preview);
+  }
+
+  async activateImportedKnowledgeEntity(input: { sessionId: string; planHash: string; expectedDocumentRevision?: number }): Promise<{ entity: Person | Project; document: ContextDocument }> {
+    this.assertKnowledgeWritable();
+    const session = this.knowledgeActivationSessions.get(input.sessionId);
+    if (!session || session.preview.planHash !== input.planHash) throw new Error('This activation preview is missing or changed. Prepare it again.');
+    const age = Date.now() - session.preparedAtMs;
+    if (age < 0 || age > 15 * 60_000) { this.knowledgeActivationSessions.delete(input.sessionId); throw new Error('This activation preview expired. Prepare it again.'); }
+    const result = await this.mutate(async (state) => {
+      this.assertKnowledgeWritable();
+      const queuedAge = Date.now() - session.preparedAtMs;
+      if (queuedAge < 0 || queuedAge > 15 * 60_000) throw new Error('This activation preview expired while waiting to save. Prepare it again.');
+      if (stableJson(state) !== session.stateJson) throw new Error('App data changed after this preview. Prepare a fresh activation preview.');
+      const archive = state.importedBackups.find((item) => item.id === session.archiveId);
+      const cohort = archive?.archivedKnowledge?.find((item) => item.id === session.cohortId);
+      if (!archive || !cohort) throw new Error('Imported knowledge archive is no longer available.');
+      const currentSource = getKnowledgeEntity(cohort.knowledge.state, session.preview.kind, session.preview.sourceEntityId);
+      if (!currentSource) throw new Error('Imported source entity is no longer available.');
+      const sourceNarrative = cohort.knowledge.narratives.find((item) => item.entityKind === session.preview.kind && item.entityId === session.preview.sourceEntityId)?.content ?? '';
+      const currentDigest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, stableJson({ kind: session.preview.kind, entity: currentSource, narrativeContent: sourceNarrative }), { encoding: Crypto.CryptoEncoding.HEX });
+      const verifiedAge = Date.now() - session.preparedAtMs;
+      if (verifiedAge < 0 || verifiedAge > 15 * 60_000) throw new Error('This activation preview expired while its source was being checked. Prepare it again.');
+      if (currentDigest !== session.sourceDigest) throw new Error('Imported source changed after this preview. Prepare a fresh activation preview.');
+      const existingLink = cohort.activationLinks?.find((item) => item.entityKind === session.preview.kind && item.sourceEntityId === session.preview.sourceEntityId);
+      if (existingLink) {
+        const active = getKnowledgeEntity(state.knowledge, session.preview.kind, existingLink.entityId);
+        if (!active || active.importOrigin?.kind !== 'backup_knowledge' || active.importOrigin.archiveId !== archive.id || active.importOrigin.cohortId !== cohort.id || active.importOrigin.sourceEntityId !== session.preview.sourceEntityId || active.importOrigin.sourceDigest !== existingLink.sourceDigest) throw new Error('The saved activation link cannot be verified. No data was changed.');
+        const document = state.documents.find((item) => item.path === active.narrativePath);
+        if (!document) throw new Error('The activated narrative document is missing.');
+        return { entity: active, document };
+      }
+      const id = session.targetId;
+      if (state.knowledge.people.some((item) => item.id === id) || state.knowledge.projects.some((item) => item.id === id)) throw new Error('The planned person or project ID is already in use. Prepare a fresh preview.');
+      const path = session.preview.narrativePath;
+      const oldDoc = state.documents.find((item) => item.path === path);
+      if (oldDoc || session.preview.narrativePath !== `${session.preview.kind === 'person' ? 'people' : 'projects'}/${id}.md` || session.preview.targetId !== id) throw new Error('The planned narrative destination is no longer available.');
+      if (input.expectedDocumentRevision !== undefined) throw new Error('This narrative destination was expected to be new. Refresh the preview.');
+      const timestamp = now();
+      const origin = { kind: 'backup_knowledge' as const, archiveId: archive.id, cohortId: cohort.id, sourceEntityId: currentSource.id, sourceDigest: session.sourceDigest };
+      const cleanEvidence = (evidence?: KnowledgeEvidence[]) => evidence?.map((entry) => {
+        const sourceKind = /^(knowledge|note|doc|task|mail|calendar-event|calendar):/.exec(entry.sourceId)?.[1] ?? 'source';
+        return { ...entry, sourceId: `historical:imported:${entry.sourceVersion}:${sourceKind}` };
+      });
+      const facts = currentSource.facts.map((item) => ({ id: this.freshStateId(state), provenance: item.provenance, createdAt: item.createdAt, ...(cleanEvidence(item.evidence) ? { evidence: cleanEvidence(item.evidence) } : {}), statement: item.statement }));
+      const sourceLinks: KnowledgeSourceLink[] = currentSource.sourceLinks.map((item) => {
+        let reference: KnowledgeReference = clone(item.reference);
+        if (reference.kind === 'mail' || reference.kind === 'calendar') reference = { kind: 'historical', label: item.label || reference.kind, originalKind: reference.kind };
+        else if (reference.kind === 'note') {
+          const sourceId = reference.id; const mapped = archive.noteLinks.find((link) => link.sourceId === sourceId);
+          const note = mapped && state.notes.find((candidate) => candidate.id === mapped.noteId);
+          const verified = Boolean(mapped && note?.importOrigin?.kind === 'backup_import' && note.importOrigin.archiveId === archive.id && note.importOrigin.sourceNoteId === sourceId);
+          reference = verified && mapped ? { kind: 'note', id: mapped.noteId } : { kind: 'historical', label: item.label, originalKind: 'note' };
+        } else if (reference.kind === 'task') {
+          const sourceId = reference.id; const mapped = archive.taskLinks.find((link) => link.sourceId === sourceId);
+          const task = mapped && state.tasks.find((candidate) => candidate.id === mapped.taskId);
+          const verified = Boolean(mapped && task?.importOrigin?.kind === 'backup_import' && task.importOrigin.archiveId === archive.id && task.importOrigin.sourceTaskId === sourceId);
+          reference = verified && mapped ? { kind: 'task', id: mapped.taskId } : { kind: 'historical', label: item.label, originalKind: 'task' };
+        } else if (reference.kind === 'document') {
+          const sourceId = reference.id; const mapped = archive.documents.find((doc) => doc.path === sourceId && doc.activatedPath);
+          const active = mapped && state.documents.find((doc) => doc.path === mapped.activatedPath);
+          reference = mapped && active ? { kind: 'document', id: active.path } : { kind: 'historical', label: item.label, originalKind: 'document' };
+        } else if (reference.kind === 'person' || reference.kind === 'project') {
+          const mapped = cohort.activationLinks?.find((entry) => entry.entityKind === reference.kind && entry.sourceEntityId === reference.id);
+          const active = mapped && getKnowledgeEntity(state.knowledge, reference.kind, mapped.entityId);
+          const verified = Boolean(mapped && active?.importOrigin?.kind === 'backup_knowledge' && active.importOrigin.archiveId === archive.id &&
+            active.importOrigin.cohortId === cohort.id && active.importOrigin.sourceEntityId === reference.id && active.importOrigin.sourceDigest === mapped.sourceDigest);
+          reference = verified && mapped ? { kind: reference.kind, id: mapped.entityId } : { kind: 'historical', label: item.label, originalKind: reference.kind };
+        }
+        return { id: this.freshStateId(state), provenance: item.provenance, createdAt: item.createdAt, ...(cleanEvidence(item.evidence) ? { evidence: cleanEvidence(item.evidence) } : {}), reference, label: item.label };
+      });
+      let entity: Person | Project;
+      if (session.preview.kind === 'person') {
+        const source = currentSource as Person;
+        entity = { id, revision: 1, name: source.name, aliases: [...source.aliases], narrativePath: path, createdAt: timestamp, updatedAt: timestamp, facts, sourceLinks,
+          contacts: source.contacts.map((item) => ({ id: this.freshStateId(state), provenance: item.provenance, createdAt: item.createdAt, ...(cleanEvidence(item.evidence) ? { evidence: cleanEvidence(item.evidence) } : {}), address: item.address, label: item.label })), importOrigin: origin };
+        state.knowledge.people.push(entity);
+      } else {
+        const source = currentSource as Project;
+        const members: ProjectMember[] = source.members.map((member) => {
+          const sourcePersonId = ('sourcePersonId' in member ? member.sourcePersonId : member.personId) ?? '';
+          const activated = cohort.activationLinks?.find((link) => link.entityKind === 'person' && link.sourceEntityId === sourcePersonId);
+          const activePerson = activated && state.knowledge.people.find((person) => person.id === activated.entityId);
+          const verified = Boolean(activePerson && activePerson.importOrigin?.kind === 'backup_knowledge' && activePerson.importOrigin.archiveId === archive.id && activePerson.importOrigin.cohortId === cohort.id && activePerson.importOrigin.sourceEntityId === sourcePersonId && activePerson.importOrigin.sourceDigest === activated?.sourceDigest);
+          const base = { id: this.freshStateId(state), provenance: member.provenance, createdAt: member.createdAt, ...(cleanEvidence(member.evidence) ? { evidence: cleanEvidence(member.evidence) } : {}), role: member.role };
+          return verified && activePerson ? { ...base, personId: activePerson.id } : { ...base, sourcePersonId, label: 'Unavailable imported person' };
+        });
+        entity = { id, revision: 1, name: source.name, aliases: [...source.aliases], narrativePath: path, createdAt: timestamp, updatedAt: timestamp, facts, sourceLinks, status: source.status, goal: source.goal, startsOn: source.startsOn, targetOn: source.targetOn, dateTimeZone: source.dateTimeZone, members, importOrigin: origin };
+        state.knowledge.projects.push(entity);
+      }
+      state.knowledge = validateKnowledgeState(state.knowledge);
+      const document: ContextDocument = { path, content: session.narrativeContent, revision: 1, updatedAt: timestamp };
+      state.documents.unshift(document);
+      cohort.activationLinks ??= [];
+      cohort.activationLinks.push({ entityKind: session.preview.kind, sourceEntityId: currentSource.id, entityId: id, sourceDigest: session.sourceDigest, activatedAt: timestamp });
+      const verifiedArchive = validateImportedBackupArchive(archive);
+      if (!verifiedArchive) throw new Error('Imported activation metadata did not validate. No data was changed.');
+      state.importedBackups[state.importedBackups.findIndex((item) => item.id === archive.id)] = verifiedArchive;
+      addActivity(state, 'local_action', `Imported ${session.preview.kind} “${entity.name}” was activated as a new local entry.`, {});
+      this.validateKnowledgeAndBackup(state);
+      return { entity: getKnowledgeEntity(state.knowledge, session.preview.kind, id)!, document };
+    });
+    this.knowledgeActivationSessions.delete(input.sessionId);
+    await this.mirrorDocument(result.document);
+    return result;
+  }
+
   async exportData(): Promise<string> {
     const backup = createPortableBackup(this.snapshot, { exportId: newId(), exportedAt: now() });
     const serialized = JSON.stringify(backup);
@@ -3647,9 +4455,20 @@ export class AppControllerImpl implements AppController {
     const hash = async (value: string) => Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, value, { encoding: Crypto.CryptoEncoding.HEX });
     const fileHash = await hash(fileText);
     const contentHash = await hash(canonicalPortableContent(backup));
+    const activeKnowledgePresent = backup.knowledge.state.people.length || backup.knowledge.state.projects.length || backup.knowledge.state.suggestions.length;
+    const activeSourceHash = activeKnowledgePresent ? await hash(stableJson(backup.knowledge)) : undefined;
+    let activeSourceId = activeSourceHash ? `active:${activeSourceHash}` : undefined;
+    const archivedSourceIds = new Set(backup.archivedKnowledge.map((cohort) => cohort.sourceId));
+    while (activeSourceId && archivedSourceIds.has(activeSourceId)) activeSourceId += ':active';
+    const knowledgeCohorts: PortableKnowledgeCohort[] = [
+      ...(activeSourceId ? [{ sourceId: activeSourceId, knowledge: backup.knowledge }] : []),
+      ...backup.archivedKnowledge,
+    ];
+    const legacyV2Content = legacyCanonicalPortableContentV2(backup);
+    const legacyV2Hash = legacyV2Content ? await hash(legacyV2Content) : undefined;
     const usedIds = stateEntityIds(capturedSnapshot);
     const allocateId = () => allocateFreshId(usedIds);
-    const existingArchive = capturedSnapshot.importedBackups.find((item) => item.contentHash === contentHash);
+    const existingArchive = capturedSnapshot.importedBackups.find((item) => item.contentHash === contentHash || (legacyV2Hash && item.contentHash === legacyV2Hash));
     const noteIds = Object.create(null) as Record<string, string>;
     const missingNotes = backup.notes.filter((item) => {
       const link = existingArchive?.noteLinks.find((candidate) => candidate.sourceId === item.sourceId);
@@ -3691,10 +4510,15 @@ export class AppControllerImpl implements AppController {
     ]);
     const historyIds = Object.create(null) as Record<string, string>;
     if (!existingArchive) for (const item of backup.history) historyIds[item.sourceId] = allocateId();
+    const knowledgeCohortIds = Object.create(null) as Record<string, string>;
+    for (const cohort of knowledgeCohorts) {
+      const existing = existingArchive?.archivedKnowledge?.find((item) => item.sourceId === cohort.sourceId);
+      knowledgeCohortIds[cohort.sourceId] = existing?.id ?? allocateId();
+    }
     const sessionId = allocateId();
     const planFields = {
-      fileHash, contentHash, sourceFormat: parsed.migratedFromV1 ? 'voice-assistant-export-v1' : backup.format,
-      archiveId, existingArchiveId: existingArchive?.id, noteIds, taskIds, taskLinkRepairs, documentIds, historyIds, capturedStateJson,
+      fileHash, contentHash, sourceFormat: parsed.sourceFormat,
+      archiveId, existingArchiveId: existingArchive?.id, noteIds, taskIds, taskLinkRepairs, documentIds, historyIds, knowledgeCohortIds, capturedStateJson,
       missingNoteSourceIds: missingNotes.map((item) => item.sourceId), missingTaskSourceIds: missingTasks.map((item) => item.sourceId),
       documentConflicts: summary.documentConflicts,
     };
@@ -3713,7 +4537,7 @@ export class AppControllerImpl implements AppController {
     }
     const preview: BackupImportPreview = {
       sessionId, fileHash, contentHash, planHash,
-      sourceFormat: parsed.migratedFromV1 ? 'voice-assistant-export-v1' : backup.format,
+      sourceFormat: parsed.sourceFormat,
       exportedAt: backup.exportedAt, ...summary, warnings: [...parsed.warnings], ignoredFieldCount: parsed.ignoredFieldCount,
       missingNoteCount: missingNotes.length, missingTaskCount: missingTasks.length,
       missingNoteLabels: missingNotes.map((item) => item.title || 'Untitled note'),
@@ -3726,6 +4550,7 @@ export class AppControllerImpl implements AppController {
       existingArchiveId: existingArchive?.id, noteIds, taskIds, taskLinkRepairs,
       missingNoteSourceIds: missingNotes.map((item) => item.sourceId), missingTaskSourceIds: missingTasks.map((item) => item.sourceId),
       documentIds, historyIds,
+      knowledgeCohortIds, knowledgeCohorts,
     });
     return clone(preview);
   }
@@ -3740,7 +4565,7 @@ export class AppControllerImpl implements AppController {
     const archive = await this.mutateIfChanged((state) => {
       const applyTime = Date.now();
       if (applyTime < session.preparedAtMs || applyTime - session.preparedAtMs >= 15 * 60_000) throw new Error('Backup preview expired. Prepare a new preview.');
-      const alreadyImported = state.importedBackups.find((item) => item.contentHash === session.preview.contentHash);
+      const alreadyImported = (session.existingArchiveId ? state.importedBackups.find((item) => item.id === session.existingArchiveId) : undefined) ?? state.importedBackups.find((item) => item.contentHash === session.preview.contentHash);
       // A second click on the same plan (or an equivalent preview) is an idempotent no-op
       // once every linked item is again present with its matching import origin.
       const complete = Boolean(alreadyImported && session.backup.notes.every((item) => {
@@ -3751,7 +4576,7 @@ export class AppControllerImpl implements AppController {
         const link = alreadyImported.taskLinks.find((candidate) => candidate.sourceId === item.sourceId);
         const task = link && state.tasks.find((candidate) => candidate.id === link.taskId);
         return Boolean(task && task.importOrigin?.kind === 'backup_import' && task.importOrigin.archiveId === alreadyImported.id && task.importOrigin.sourceTaskId === item.sourceId);
-      }));
+      }) && session.knowledgeCohorts.every((cohort) => alreadyImported.archivedKnowledge?.some((item) => item.sourceId === cohort.sourceId)));
       if (complete) return { changed: false, result: alreadyImported! };
       if (stableJson(this.publicState(state)) !== session.capturedStateJson) throw new Error('App data changed after the backup preview. Prepare a new preview before restoring.');
       if (this.snapshot !== session.capturedState) throw new Error('App data changed after the backup preview. Prepare a new preview before restoring.');
@@ -3808,6 +4633,10 @@ export class AppControllerImpl implements AppController {
         created.documents = documents;
         created.history = history;
       }
+      created.archivedKnowledge ??= [];
+      for (const cohort of session.knowledgeCohorts) if (!created.archivedKnowledge.some((item) => item.sourceId === cohort.sourceId)) {
+        created.archivedKnowledge.push({ id: session.knowledgeCohortIds[cohort.sourceId], sourceId: cohort.sourceId, knowledge: clone(cohort.knowledge) });
+      }
       const restoredNoteIds = new Set(notes.map((note) => note.id));
       for (const [sourceTaskId, repair] of Object.entries(session.taskLinkRepairs)) {
         const item = backup.tasks.find((candidate) => candidate.sourceId === sourceTaskId);
@@ -3822,8 +4651,8 @@ export class AppControllerImpl implements AppController {
       state.notes.unshift(...notes);
       state.tasks.unshift(...tasks);
       if (!currentArchive) state.importedBackups.push(created);
-      if (notes.length || tasks.length || Object.keys(session.taskLinkRepairs).length) {
-        addActivity(state, 'local_action', `Restored ${notes.length} note${notes.length === 1 ? '' : 's'} and ${tasks.length} task${tasks.length === 1 ? '' : 's'} from an imported backup.`);
+      if (notes.length || tasks.length || Object.keys(session.taskLinkRepairs).length || session.knowledgeCohorts.length) {
+        addActivity(state, 'local_action', `Restored ${notes.length} note${notes.length === 1 ? '' : 's'} and ${tasks.length} task${tasks.length === 1 ? '' : 's'} from an imported backup; knowledge entries remain in the inert archive until activated.`);
       }
       assertPortableBackupFits(state);
       return { changed: true, result: created };

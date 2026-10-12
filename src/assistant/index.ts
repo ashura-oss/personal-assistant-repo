@@ -1,8 +1,8 @@
 import type {
-  AssistantCitation, AssistantDecision, AssistantIntent, AssistantProposal, AssistantResponse,
+  AssistantCitation, AssistantDecision, AssistantProposal, AssistantMemorySuggestion, AssistantResponse,
   AssistantSource, AssistantSourceInput, BoundedLocalSourceSet, ContextSelection, LocalContextSnapshotInput, OfflinePreviewInput, SourceCatalog,
 } from './types';
-export type { AssistantCitation, AssistantDecision, AssistantIntent, AssistantProposal, AssistantResponse,
+export type { AssistantCitation, AssistantDecision, AssistantIntent, AssistantProposal, AssistantMemorySuggestion, AssistantResponse,
   AssistantSource, AssistantSourceInput, AssistantSourceKind, BoundedLocalSourceSet, ContextSelection, LocalContextSnapshotInput, OfflinePreviewInput, SourceCatalog } from './types';
 
 const MAX_SOURCES = 200;
@@ -66,14 +66,22 @@ export function buildLocalSourceSet(input: LocalContextSnapshotInput): BoundedLo
   for (const document of [...docScan, ...requiredDocs]) {
     const id = `doc:${document.path}`;
     if (candidates.some((candidate) => candidate.id === id)) continue;
-    addCandidate({ id, revision: document.revision, text: document.content, required: isRequiredDocument(document.path), kind: 'document', title: safeSourceLabel(document.path), updatedAt: document.updatedAt });
+    addCandidate({ id, revision: document.revision, text: document.content, required: isRequiredDocument(document.path), kind: 'document', title: safeSourceLabel(document.path), updatedAt: document.updatedAt, selectionPriority: document.selectionPriority });
   }
   for (const document of docs.slice(MAX_SCAN_PER_KIND)) if (!isRequiredDocument(document.path)) omit(`doc:${document.path}`);
+
+  const notes = input.notes ?? [];
+  for (const note of notes.slice(0, MAX_SCAN_PER_KIND)) {
+    addCandidate({ id: `note:${encodeURIComponent(note.id)}`, revision: note.revision,
+      text: `Note: ${safeSourceLabel(note.title)}\n${note.transcript}`, required: false, kind: 'note', title: safeSourceLabel(note.title),
+      updatedAt: note.updatedAt, selectionPriority: note.selectionPriority });
+  }
+  for (const note of notes.slice(MAX_SCAN_PER_KIND)) omit(`note:${encodeURIComponent(note.id)}`);
 
   const tasks = input.tasks ?? [];
   const taskScan = tasks.slice(0, MAX_SCAN_PER_KIND);
   for (const task of taskScan) {
-    addCandidate({ id: `task:${encodeURIComponent(task.id)}`, revision: 0, text: [`Task: ${safeSourceLabel(task.title)}`, `Status: ${safeSourceLabel(task.status)}`, task.dueAt ? `Due: ${safeSourceLabel(task.dueAt)}` : '', safeSourceLabel(task.body.slice(0, 4_000))].filter(Boolean).join('\n'), required: false, kind: 'task', title: safeSourceLabel(task.title), updatedAt: task.updatedAt });
+    addCandidate({ id: `task:${encodeURIComponent(task.id)}`, revision: 0, text: [`Task: ${safeSourceLabel(task.title)}`, `Status: ${safeSourceLabel(task.status)}`, task.dueAt ? `Due: ${safeSourceLabel(task.dueAt)}` : '', safeSourceLabel(task.body.slice(0, 4_000))].filter(Boolean).join('\n'), required: false, kind: 'task', title: safeSourceLabel(task.title), updatedAt: task.updatedAt, selectionPriority: task.selectionPriority });
   }
   for (const task of tasks.slice(MAX_SCAN_PER_KIND)) omit(`task:${encodeURIComponent(task.id)}`);
   if (taskQuery) {
@@ -106,7 +114,7 @@ export function buildLocalSourceSet(input: LocalContextSnapshotInput): BoundedLo
     const calendar = connectedCalendar.get(`${event.accountId}\n${event.calendarId}`);
     if (!calendar || requireStableIdentity(calendar.identityKey) !== identityKey) continue;
     addCandidate({ id: `calendar-event:${encodeURIComponent(identityKey)}:${encodeURIComponent(calendar.providerId ?? calendar.id)}:${encodeURIComponent(event.providerEventId)}`, revision: 0,
-      text: [`Event: ${safeSourceLabel(event.subject ?? '(untitled)')}`, `Start: ${safeSourceLabel(event.start ?? '(not available)')}`, `End: ${safeSourceLabel(event.end ?? '(not available)')}`, `Time zone: ${safeSourceLabel(event.timeZone ?? '(not available)')}`].join('\n'), required: false, kind: 'calendar', title: safeSourceLabel(event.subject ?? 'Calendar event') });
+      text: [`Event: ${safeSourceLabel(event.subject ?? '(untitled)')}`, `Start: ${safeSourceLabel(event.start ?? '(not available)')}`, `End: ${safeSourceLabel(event.end ?? '(not available)')}`, `Time zone: ${safeSourceLabel(event.timeZone ?? '(not available)')}`].join('\n'), required: false, kind: 'calendar', title: safeSourceLabel(event.subject ?? 'Calendar event'), selectionPriority: event.selectionPriority });
   }
   for (const event of events.slice(MAX_SCAN_PER_KIND)) omit(`calendar-event:${encodeURIComponent(event.identityKey ?? 'unbound')}:${encodeURIComponent(event.providerEventId)}`);
   if (calendarQuery && input.calendarSnapshot && requireStableIdentity(input.calendarSnapshot.identityKey)
@@ -136,16 +144,19 @@ export function buildLocalSourceSet(input: LocalContextSnapshotInput): BoundedLo
     if (count >= MAX_MAIL_PER_ACCOUNT) { omit(`mail:${encodeURIComponent(identityKey)}:${encodeURIComponent(message.providerMessageId)}`); continue; }
     perIdentityCount.set(identityKey, count + 1);
     addCandidate({ id: `mail:${encodeURIComponent(identityKey)}:${encodeURIComponent(message.providerMessageId)}`, revision: 0,
-      text: [`Subject: ${safeSourceLabel(message.subject ?? '(no subject)')}`, `From: ${safeSourceLabel(message.from ?? '(unknown sender)')}`, `Received: ${safeSourceLabel(message.receivedAt ?? '(unknown time)')}`, `Preview: ${safeSourceLabel(message.snippet ?? '').slice(0, 2_000)}`].join('\n'), required: false, kind: 'mail', title: safeSourceLabel(message.subject ?? 'Email message'), updatedAt: message.receivedAt });
+      text: [`Subject: ${safeSourceLabel(message.subject ?? '(no subject)')}`, `From: ${safeSourceLabel(message.from ?? '(unknown sender)')}`, `Received: ${safeSourceLabel(message.receivedAt ?? '(unknown time)')}`, `Preview: ${safeSourceLabel(message.snippet ?? '').slice(0, 2_000)}`].join('\n'), required: false, kind: 'mail', title: safeSourceLabel(message.subject ?? 'Email message'), updatedAt: message.receivedAt, selectionPriority: message.selectionPriority });
   }
   for (const message of mailbox.slice(MAX_SCAN_PER_KIND)) omit(`mail:${encodeURIComponent(message.identityKey)}:${encodeURIComponent(message.providerMessageId)}`);
+
+  for (const source of (input.knowledge ?? []).slice(0, MAX_SCAN_PER_KIND)) addCandidate(source);
+  for (const source of (input.knowledge ?? []).slice(MAX_SCAN_PER_KIND)) omit(source.id);
 
   const required = candidates.filter((source) => source.required || source.id === 'transcript' || (source.kind === 'document' && isRequiredDocument(source.id)));
   const requiredIds = new Set(required.map((source) => source.id));
   const queryTerms = terms(query).slice(0, 256);
   const transcriptTerms = terms(input.transcript.text).slice(0, 256);
   const ids = explicitIds(query);
-  const scored = candidates.filter((source) => !requiredIds.has(source.id)).map((source, index) => ({ source, index, score: scoreSource(source, queryTerms, transcriptTerms, ids) }));
+  const scored = candidates.filter((source) => !requiredIds.has(source.id)).map((source, index) => ({ source, index, score: Math.max(scoreSource(source, queryTerms, transcriptTerms, ids), (source.selectionPriority ?? 0) * 10_000) }));
   scored.sort((a, b) => b.score - a.score || (b.source.updatedAt ?? '').localeCompare(a.source.updatedAt ?? '') || a.index - b.index);
   const room = Math.max(0, MAX_SOURCES - required.length);
   const selected = scored.filter(({ score }) => score > 0).slice(0, room).map(({ source }) => source);
@@ -174,7 +185,7 @@ export async function createSourceCatalog(inputs: readonly AssistantSourceInput[
   for (const input of inputs) {
     if (!input.id || input.id.length > 512 || /[\u0000-\u001f\u007f]/.test(input.id) || seen.has(input.id)) throw new Error('Context source IDs must be unique, stable, and bounded.');
     if (!validRevision(input.revision)) throw new Error(`Context source ${input.id} has an invalid revision.`);
-    if (typeof input.required !== 'boolean' || (input.kind !== undefined && !['note', 'document', 'task', 'calendar', 'mail'].includes(input.kind)) || (input.title !== undefined && (typeof input.title !== 'string' || input.title.length > 1000))) throw new Error(`Context source ${input.id} has invalid metadata.`);
+    if (typeof input.required !== 'boolean' || (input.kind !== undefined && !['note', 'document', 'task', 'calendar', 'mail', 'knowledge'].includes(input.kind)) || (input.title !== undefined && (typeof input.title !== 'string' || input.title.length > 1000))) throw new Error(`Context source ${input.id} has invalid metadata.`);
     if (typeof input.text !== 'string' || byteLength(input.text) > MAX_SOURCE_BYTES || (input.versionMaterial !== undefined && (typeof input.versionMaterial !== 'string' || byteLength(input.versionMaterial) > MAX_VERSION_BYTES))) throw new Error(`Context source ${input.id} is too large to validate safely.`);
     if (input.updatedAt !== undefined && !Number.isFinite(Date.parse(input.updatedAt))) throw new Error(`Context source ${input.id} has an invalid update time.`);
     const contentHash = (await sha256(encoder.encode(normalizeSourceText(input.versionMaterial ?? input.text)))).toLowerCase();
@@ -283,7 +294,7 @@ export function selectContext(catalog: SourceCatalog, options: SelectContextOpti
   const transcriptTerms = terms(options.transcript ?? transcript.text).slice(0, 256);
   const ids = explicitIds(query);
   const candidates = catalog.sources.filter((source) => !alreadyIncluded.has(source.id))
-    .map((source, index) => ({ source, index, score: scoreSource(source, relevantTerms, transcriptTerms, ids) }))
+    .map((source, index) => ({ source, index, score: Math.max(scoreSource(source, relevantTerms, transcriptTerms, ids), (source.selectionPriority ?? 0) * 10_000) }))
     .sort((a, b) => b.score - a.score || (b.source.updatedAt ?? '').localeCompare(a.source.updatedAt ?? '') || a.index - b.index)
     .filter(({ source, score }) => score > 0 || (source.kind === 'document' && /(?:^|\/)profile\.md$/i.test(source.id)));
   const requestedSupplemental = options.maxSupplementalSources ?? MAX_SUPPLEMENTAL;
@@ -309,7 +320,7 @@ export function selectContext(catalog: SourceCatalog, options: SelectContextOpti
 
 export const assistantResponseSchema = {
   type: 'object', additionalProperties: false,
-  required: ['summary', 'answer', 'decisions', 'citations', 'clarifications', 'proposals'],
+  required: ['summary', 'answer', 'decisions', 'citations', 'clarifications', 'proposals', 'memorySuggestions'],
   properties: {
     summary: { type: 'string', maxLength: 3000 }, answer: { type: 'string', maxLength: 6000 },
     decisions: { type: 'array', maxItems: 20, items: { type: 'object', additionalProperties: false, required: ['text', 'sourceId', 'revision', 'sourceVersion', 'quote'], properties: { text: { type: 'string', maxLength: 1000 }, sourceId: { type: 'string', maxLength: 512 }, revision: { type: 'integer', minimum: 0 }, sourceVersion: { type: 'string', maxLength: 320 }, quote: { type: 'string', maxLength: 1000 } } } },
@@ -319,6 +330,17 @@ export const assistantResponseSchema = {
       kind: { type: 'string', enum: ['task', 'reminder', 'email', 'event', 'memory'] }, title: { type: 'string', maxLength: 140 }, body: { type: 'string', maxLength: 2000 },
       recipients: { type: 'array', maxItems: 10, items: { type: 'string', maxLength: 320 } }, dueAt: { type: ['string', 'null'], maxLength: 80 }, evidence: { type: 'array', maxItems: 5, items: { type: 'string', maxLength: 1000 } },
     } } },
+    memorySuggestions: { type: 'array', maxItems: 4, items: { type: 'object', additionalProperties: false,
+      required: ['targetSourceId', 'targetRevision', 'type', 'statement', 'address', 'label', 'relatedSourceId', 'role', 'evidence'], properties: {
+        targetSourceId: { type: 'string', maxLength: 512 }, targetRevision: { type: 'integer', minimum: 1 },
+        type: { type: 'string', enum: ['add_fact', 'add_contact', 'add_source_link', 'add_member'] },
+        statement: { type: ['string', 'null'], maxLength: 1024 }, address: { type: ['string', 'null'], maxLength: 512 },
+        label: { type: ['string', 'null'], maxLength: 120 }, relatedSourceId: { type: ['string', 'null'], maxLength: 512 }, role: { type: ['string', 'null'], maxLength: 120 },
+        evidence: { type: 'array', minItems: 1, maxItems: 4, items: { type: 'object', additionalProperties: false, required: ['sourceId', 'revision', 'sourceVersion', 'quote'], properties: {
+          sourceId: { type: 'string', maxLength: 512 }, revision: { type: 'integer', minimum: 0 }, sourceVersion: { type: 'string', maxLength: 320 }, quote: { type: 'string', maxLength: 1000 },
+        } } },
+      },
+    } },
   },
 } as const;
 
@@ -346,11 +368,11 @@ function validateCitation(value: unknown, catalog: SourceCatalog, selection?: Co
 export function validateAssistantResponse(value: unknown, catalog: SourceCatalog, selection?: ContextSelection, transcriptSourceId = 'transcript'): AssistantResponse {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Assistant response must be an object.');
   const raw = value as Record<string, unknown>;
-  const allowed = ['summary', 'answer', 'decisions', 'citations', 'clarifications', 'proposals'];
+  const allowed = ['summary', 'answer', 'decisions', 'citations', 'clarifications', 'proposals', 'memorySuggestions'];
   if (Object.keys(raw).some((key) => !allowed.includes(key)) || allowed.some((key) => !(key in raw))) throw new Error('Assistant response does not match the required schema.');
   const summary = requireString(raw.summary, 'summary', 3000);
   const answer = requireString(raw.answer, 'answer', 6000);
-  if (!Array.isArray(raw.citations) || raw.citations.length > 30 || !Array.isArray(raw.decisions) || raw.decisions.length > 20 || !Array.isArray(raw.clarifications) || raw.clarifications.length > 10 || !Array.isArray(raw.proposals) || raw.proposals.length > 20) throw new Error('Assistant response contains too many structured items.');
+  if (!Array.isArray(raw.citations) || raw.citations.length > 30 || !Array.isArray(raw.decisions) || raw.decisions.length > 20 || !Array.isArray(raw.clarifications) || raw.clarifications.length > 10 || !Array.isArray(raw.proposals) || raw.proposals.length > 20 || !Array.isArray(raw.memorySuggestions) || raw.memorySuggestions.length > 4) throw new Error('Assistant response contains too many structured items.');
   const citations = raw.citations.map((citation) => validateCitation(citation, catalog, selection));
   const decisions: AssistantDecision[] = raw.decisions.map((decision) => {
     if (!decision || typeof decision !== 'object') throw new Error('Assistant returned an invalid decision.');
@@ -371,7 +393,37 @@ export function validateAssistantResponse(value: unknown, catalog: SourceCatalog
     if (!Array.isArray(record.evidence) || record.evidence.length < 1 || record.evidence.length > 5 || record.evidence.some((item) => typeof item !== 'string' || !item || item.length > 1000 || !transcript?.text.includes(item) || (selection && !selection.excerpts[transcriptSourceId]?.includes(item)))) throw new Error('Assistant proposal evidence is not an exact transcript quote.');
     return { kind: record.kind as AssistantProposal['kind'], title: requireString(record.title, 'proposal title', 140, false), body: requireString(record.body, 'proposal body', 2000), recipients: [...record.recipients] as string[], dueAt: record.dueAt as string | null, evidence: [...record.evidence] as string[] };
   });
-  return { summary, answer, decisions, citations, clarifications, proposals };
+  const memorySuggestions: AssistantMemorySuggestion[] = raw.memorySuggestions.map((candidate) => {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) throw new Error('Assistant memory suggestion is invalid.');
+    const item = candidate as Record<string, unknown>;
+    if (Object.keys(item).sort().join(',') !== 'address,evidence,label,relatedSourceId,role,statement,targetRevision,targetSourceId,type' || !Array.isArray(item.evidence) || item.evidence.length < 1 || item.evidence.length > 4) throw new Error('Assistant memory suggestion contains unsupported fields.');
+    const targetSourceId = requireString(item.targetSourceId, 'memory target source ID', 512, false);
+    const target = catalog.byId.get(targetSourceId);
+    if (!target || target.kind !== 'knowledge' || target.revision !== item.targetRevision || !Number.isSafeInteger(item.targetRevision)) throw new Error('Assistant memory suggestion refers to an unknown or stale knowledge target.');
+    if (selection && !selection.excerpts[targetSourceId]) throw new Error('Assistant memory suggestion target was not included in request context.');
+    const type = item.type;
+    if (typeof type !== 'string' || !['add_fact', 'add_contact', 'add_source_link', 'add_member'].includes(type)) throw new Error('Assistant memory change type is invalid.');
+    const nullable = (key: string, max: number): string | null => item[key] === null ? null : requireString(item[key], key, max, false);
+    const statement = nullable('statement', 1024), address = nullable('address', 512), label = nullable('label', 120), relatedSourceId = nullable('relatedSourceId', 512), role = nullable('role', 120);
+    const expected: Record<string, string[]> = {
+      add_fact: ['statement'], add_contact: ['address', 'label'], add_source_link: ['relatedSourceId', 'label'], add_member: ['relatedSourceId', 'role'],
+    };
+    const values: Record<string, unknown> = { statement, address, label, relatedSourceId, role };
+    for (const key of ['statement', 'address', 'label', 'relatedSourceId', 'role']) {
+      if (expected[type].includes(key) ? values[key] === null : values[key] !== null) throw new Error('Assistant memory suggestion fields do not match its change type.');
+    }
+    if (type === 'add_contact' && !targetSourceId.startsWith('knowledge:person:')) throw new Error('Only a person can receive a contact claim.');
+    if (type === 'add_member' && !targetSourceId.startsWith('knowledge:project:')) throw new Error('Only a project can receive a member.');
+    if (type === 'add_member' || type === 'add_source_link') {
+      const personId = requireString(relatedSourceId, 'related source ID', 512, false);
+      const person = catalog.byId.get(personId);
+      if (!person || (selection && !selection.excerpts[personId])) throw new Error('Assistant memory suggestion refers to an unknown or omitted source.');
+      if (type === 'add_member' && (person.kind !== 'knowledge' || !personId.startsWith('knowledge:person:'))) throw new Error('A project member must reference an included person source.');
+    }
+    const evidence = item.evidence.map((entry) => validateCitation(entry, catalog, selection));
+    return { targetSourceId, targetRevision: item.targetRevision as number, type: type as AssistantMemorySuggestion['type'], statement, address, label, relatedSourceId, role, evidence };
+  });
+  return { summary, answer, decisions, citations, clarifications, proposals, memorySuggestions };
 }
 
 function firstSentence(transcript: string): string {
@@ -467,5 +519,5 @@ export function buildOfflinePreview(input: OfflinePreviewInput): AssistantRespon
   const decisions = decisionQuote && decisionText && Number.isSafeInteger(revision) && revision! >= 0 && typeof sourceVersion === 'string' && sourceVersion.length <= 320
     ? [{ text: decisionText, sourceId: 'transcript', revision: revision!, sourceVersion, quote: decisionQuote, source: 'Transcript' }]
     : [];
-  return { summary, answer, decisions, citations: decisions.map(({ sourceId, revision, sourceVersion, quote, source }) => ({ sourceId, revision, sourceVersion, quote, source })), clarifications, proposals: [] };
+  return { summary, answer, decisions, citations: decisions.map(({ sourceId, revision, sourceVersion, quote, source }) => ({ sourceId, revision, sourceVersion, quote, source })), clarifications, proposals: [], memorySuggestions: [] };
 }

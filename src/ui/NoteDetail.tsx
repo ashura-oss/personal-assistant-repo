@@ -8,6 +8,7 @@ import {
   View,
 } from "react-native";
 import type { AssistIntent, Note, NoteAssistResult, Proposal } from "../core";
+import type { KnowledgeChange, KnowledgeEntityKind, Person, Project } from "../knowledge/types";
 import { Button, Field, IconButton } from "./primitives";
 import { C, s } from "./theme";
 
@@ -31,6 +32,8 @@ type Props = {
   providerReady: boolean;
   analysisStatusError?: string;
   analysisStatusChecking?: boolean;
+  people?: Person[];
+  projects?: Project[];
   onRetryStatus: () => void;
   onClose: () => void;
   onUpdate: (text: string) => void;
@@ -39,7 +42,9 @@ type Props = {
     intent: AssistIntent;
     question?: string;
     forceRefresh?: boolean;
+    knowledgeSelection?: { kind: KnowledgeEntityKind; id: string }[];
   }) => void;
+  onCreateMemorySuggestion: (input: { noteId: string; sourceId: string; quote: string; targetKind: KnowledgeEntityKind; targetId: string; change: KnowledgeChange }) => Promise<unknown>;
   onOpenProposals: () => void;
   onTranscribe: () => void;
   onAttachRecording: () => void;
@@ -66,11 +71,14 @@ export function NoteDetail({
   providerReady,
   analysisStatusError,
   analysisStatusChecking,
+  people = [],
+  projects = [],
   onRetryStatus,
   onClose,
   onUpdate,
   onConfirmImportedTimeZone,
   onAssist,
+  onCreateMemorySuggestion,
   onOpenProposals,
   onTranscribe,
   onAttachRecording,
@@ -89,6 +97,17 @@ export function NoteDetail({
   const [advanced, setAdvanced] = useState(false);
   const [showCitations, setShowCitations] = useState(false);
   const [showContext, setShowContext] = useState(false);
+  const [knowledgeSelection, setKnowledgeSelection] = useState<{ kind: KnowledgeEntityKind; id: string }[]>(analysis?.knowledgeSelection ?? []);
+  const [suggestionOpen, setSuggestionOpen] = useState(false);
+  const [suggestionTargetKind, setSuggestionTargetKind] = useState<KnowledgeEntityKind>('person');
+  const [suggestionTargetId, setSuggestionTargetId] = useState('');
+  const [suggestionOperation, setSuggestionOperation] = useState<'add_fact' | 'add_contact' | 'add_source_link' | 'add_member'>('add_fact');
+  const [suggestionQuote, setSuggestionQuote] = useState('');
+  const [suggestionValue, setSuggestionValue] = useState('');
+  const [suggestionLabel, setSuggestionLabel] = useState('');
+  const [suggestionPersonId, setSuggestionPersonId] = useState('');
+  const [suggestionRole, setSuggestionRole] = useState('');
+  const [suggestionMessage, setSuggestionMessage] = useState('');
   const dirty = text !== note.transcript;
   const timeZoneUnconfirmed = note.importOrigin?.originalTimeZoneUnknown === true;
   const effectiveIntent: AssistIntent = question.trim() ? "answer" : intent;
@@ -110,6 +129,14 @@ export function NoteDetail({
     !busy &&
       !timeZoneUnconfirmed &&
     !(effectiveIntent === "answer" && !question.trim());
+  const availableEntities = [
+    ...people.map((item) => ({ kind: 'person' as const, id: item.id, name: item.name, archived: Boolean(item.archivedAt), importedCopy: item.importOrigin?.kind === 'backup_knowledge' })),
+    ...projects.map((item) => ({ kind: 'project' as const, id: item.id, name: item.name, archived: Boolean(item.archivedAt), importedCopy: item.importOrigin?.kind === 'backup_knowledge' })),
+  ];
+  const selectedSuggestionTarget = suggestionTargetKind === 'person'
+    ? people.find((item) => item.id === suggestionTargetId)
+    : projects.find((item) => item.id === suggestionTargetId);
+  const exactQuote = Boolean(suggestionQuote.trim()) && note.transcript.includes(suggestionQuote.trim());
   const reviewableProposalCount = analysisIsStale
     ? 0
     : proposals.filter(
@@ -337,6 +364,14 @@ export function NoteDetail({
                     multiline
                   />
                 ) : null}
+                <Text style={s.label}>Optional context · up to 5</Text>
+                <Text style={s.knowledgeFootnote}>Still uses active people and projects by default. Select an item to include it explicitly; archived context is marked.</Text>
+                {availableEntities.map((entity) => {
+                  const chosen = knowledgeSelection.some((item) => item.kind === entity.kind && item.id === entity.id);
+                  return <Pressable key={`${entity.kind}:${entity.id}`} accessibilityRole="checkbox" accessibilityState={{ checked: chosen }} disabled={!chosen && knowledgeSelection.length >= 5} onPress={() => setKnowledgeSelection((current) => chosen ? current.filter((item) => !(item.kind === entity.kind && item.id === entity.id)) : [...current, { kind: entity.kind, id: entity.id }])} style={s.knowledgeCard}>
+                    <Text style={[s.knowledgeMeta, { flex: 1 }]}>{chosen ? '✓ ' : ''}{entity.name} · {entity.kind}{entity.importedCopy ? ' · Imported copy' : ''}{entity.archived ? ' · archived' : ''}</Text>
+                  </Pressable>;
+                })}
               </>
             ) : null}
             {analysisStatusError ? (
@@ -377,9 +412,44 @@ export function NoteDetail({
                   intent: effectiveIntent,
                   ...(question.trim() ? { question: question.trim() } : {}),
                   ...(analysisIsStale ? { forceRefresh: true } : {}),
+                  ...(knowledgeSelection.length ? { knowledgeSelection } : {}),
                 })
               }
             />
+            <Button label="Suggest a memory connection" tone="quiet" icon="git-branch-outline" disabled={busy || dirty || !note.transcript.trim()} onPress={() => { setSuggestionQuote(''); setSuggestionValue(''); setSuggestionMessage(''); setSuggestionOpen(true); }} />
+            {suggestionOpen ? <View style={s.setupCard}>
+              <View style={s.sectionHeader}><Text style={s.setupTitle}>Ground it in this note</Text><IconButton name="close" label="Close memory suggestion form" onPress={() => setSuggestionOpen(false)} /></View>
+              <Text style={s.knowledgeFootnote}>This saves a suggestion for review. It does not make another model request.</Text>
+              <View style={s.knowledgeStatusRow}>{(['person', 'project'] as const).map((kind) => <Pressable key={kind} accessibilityRole="radio" accessibilityState={{ selected: suggestionTargetKind === kind }} onPress={() => { setSuggestionTargetKind(kind); setSuggestionTargetId(''); }} style={[s.knowledgeStatusChoice, suggestionTargetKind === kind && s.knowledgeStatusSelected]}><Text style={s.knowledgeMeta}>{kind === 'person' ? 'Person' : 'Project'}</Text></Pressable>)}</View>
+              {(suggestionTargetKind === 'person' ? people : projects).map((entity) => <Pressable key={entity.id} accessibilityRole="radio" accessibilityState={{ selected: suggestionTargetId === entity.id }} onPress={() => setSuggestionTargetId(entity.id)} style={[s.knowledgeStatusChoice, suggestionTargetId === entity.id && s.knowledgeStatusSelected]}><Text style={s.knowledgeMeta}>{entity.name}{entity.importOrigin?.kind === 'backup_knowledge' ? ' · Imported copy' : ''}{entity.archivedAt ? ' · archived' : ''}</Text></Pressable>)}
+              <Text style={s.label}>Suggested change</Text>
+              {(['add_fact', ...(suggestionTargetKind === 'person' ? ['add_contact'] : []), 'add_source_link', ...(suggestionTargetKind === 'project' ? ['add_member'] : [])] as (typeof suggestionOperation)[]).map((operation) => <Pressable key={operation} accessibilityRole="radio" accessibilityState={{ selected: suggestionOperation === operation }} onPress={() => { setSuggestionOperation(operation); setSuggestionValue(''); }} style={[s.knowledgeStatusChoice, suggestionOperation === operation && s.knowledgeStatusSelected]}><Text style={s.knowledgeMeta}>{operation === 'add_fact' ? 'Add fact' : operation === 'add_contact' ? 'Add contact claim' : operation === 'add_source_link' ? 'Link this note' : 'Add project member'}</Text></Pressable>)}
+              {suggestionOperation === 'add_fact' ? <Field label="Proposed fact" value={suggestionValue} onChangeText={setSuggestionValue} multiline /> : null}
+              {suggestionOperation === 'add_contact' ? <><Field label="Contact address claim · not verified" value={suggestionValue} onChangeText={setSuggestionValue} keyboardType="email-address" /><Field label="Label" value={suggestionLabel} onChangeText={setSuggestionLabel} placeholder="Email" /></> : null}
+              {suggestionOperation === 'add_source_link' ? <Field label="Why this note belongs here" value={suggestionValue} onChangeText={setSuggestionValue} /> : null}
+              {suggestionOperation === 'add_member' ? <><Text style={s.label}>Choose a person</Text>{people.filter((person) => !person.archivedAt).map((person) => <Pressable key={person.id} accessibilityRole="radio" accessibilityState={{ selected: suggestionPersonId === person.id }} onPress={() => setSuggestionPersonId(person.id)} style={[s.knowledgeStatusChoice, suggestionPersonId === person.id && s.knowledgeStatusSelected]}><Text style={s.knowledgeMeta}>{person.name}{person.importOrigin?.kind === 'backup_knowledge' ? ' · Imported copy' : ''}</Text></Pressable>)}<Field label="Role" value={suggestionRole} onChangeText={setSuggestionRole} /></> : null}
+              <Field label="Exact quote from this saved note" value={suggestionQuote} onChangeText={setSuggestionQuote} multiline placeholder="Copy an exact sentence from the transcript" />
+              {!exactQuote && suggestionQuote.trim() ? <Text style={s.knowledgeError}>The quote must appear exactly in this saved transcript.</Text> : null}
+              {suggestionMessage ? <Text accessibilityRole="alert" style={s.knowledgeError}>{suggestionMessage}</Text> : null}
+              <Button label="Save for memory review" disabled={busy || !selectedSuggestionTarget || !exactQuote || (suggestionOperation === 'add_fact' && !suggestionValue.trim()) || (suggestionOperation === 'add_contact' && !suggestionValue.trim()) || (suggestionOperation === 'add_source_link' && !suggestionValue.trim()) || (suggestionOperation === 'add_member' && !suggestionPersonId)} onPress={() => {
+                if (!selectedSuggestionTarget || !exactQuote) return;
+                const entityKind = suggestionTargetKind;
+                const entityId = suggestionTargetId;
+                let change: KnowledgeChange;
+                if (suggestionOperation === 'add_fact') change = { type: 'add_fact', entityKind, entityId, statement: suggestionValue.trim() };
+                else if (suggestionOperation === 'add_contact' && entityKind === 'person') change = { type: 'add_contact', entityKind, entityId, address: suggestionValue.trim(), label: suggestionLabel.trim() || 'Contact' };
+                else if (suggestionOperation === 'add_source_link') change = { type: 'add_source_link', entityKind, entityId, reference: { kind: 'note', id: note.id }, label: suggestionValue.trim() };
+                else if (suggestionOperation === 'add_member' && entityKind === 'project') {
+                  const member = people.find((person) => person.id === suggestionPersonId);
+                  if (!member) return;
+                  change = { type: 'add_member', entityKind, entityId, personId: member.id, personRevision: member.revision, role: suggestionRole.trim() };
+                } else return;
+                void onCreateMemorySuggestion({ noteId: note.id, sourceId: 'transcript', quote: suggestionQuote.trim(), targetKind: entityKind, targetId: entityId, change }).then((result) => {
+                  if (result) { setSuggestionOpen(false); setSuggestionMessage(''); }
+                  else setSuggestionMessage('The suggestion could not be saved. Check the notice and try again.');
+                }).catch((error) => setSuggestionMessage(error instanceof Error ? error.message : 'The source changed. Reopen this note and try again.'));
+              }} />
+            </View> : null}
             {dirty ? (
               <Text style={s.disclaimer}>
                 Save transcript edits before asking about this note.

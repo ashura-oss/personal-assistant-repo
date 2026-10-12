@@ -32,11 +32,22 @@ import type {
   MailboxSnapshotMessage,
   SavedProactiveRule,
   ProactiveState,
+  SavePersonInput,
+  SaveProjectInput,
+  SaveKnowledgeFactInput,
+  SaveKnowledgeContactInput,
+  SaveKnowledgeSourceLinkInput,
+  SaveKnowledgeMemberInput,
+  KnowledgeItemCommand,
+  ReviewKnowledgeSuggestionInput,
+  EditKnowledgeSuggestionInput,
 } from "./src/core";
+import type { KnowledgeEntityKind, KnowledgeReference, KnowledgeSuggestion } from "./src/knowledge/types";
 import { controller as productionController } from "./src/services/controller";
 import { createDispatchHistoryScenario } from "./src/dev/receiptScenario";
 import { createMailSyncScenario } from "./src/dev/mailSyncScenario";
 import { createBackupScenario } from "./src/dev/backupScenario";
+import { createKnowledgeScenario } from "./src/dev/knowledgeScenario";
 import { useAudioCapture } from "./src/audio/useAudioCapture";
 import type { AudioCapture } from "./src/audio/types";
 import {
@@ -58,6 +69,10 @@ import { NoteDetail as NoteDetailView } from "./src/ui/NoteDetail";
 import { BackupImportSheet } from "./src/ui/BackupImportSheet";
 import { ImportedBackupsSection } from "./src/ui/ImportedBackupsSection";
 import { RecordingAttachmentSheet } from "./src/ui/RecordingAttachmentSheet";
+import { KnowledgeSection } from "./src/ui/KnowledgeSection";
+import { KnowledgeEntitySheet } from "./src/ui/KnowledgeEntitySheet";
+import { KnowledgeSuggestionSheet } from "./src/ui/KnowledgeSuggestionSheet";
+import { ImportedKnowledgeReview } from "./src/ui/ImportedKnowledgeReview";
 import { TasksSection } from "./src/ui/TasksSection";
 import { IconButton, Button, Field } from "./src/ui/primitives";
 import { C, s } from "./src/ui/theme";
@@ -77,7 +92,8 @@ const previewScenario =
 const isDispatchHistoryDemo = previewScenario === "dispatch-history";
 const isMailSyncDemo = previewScenario === "mail-sync";
 const isBackupImportDemo = previewScenario === "backup-import";
-const isIsolatedDemo = isDispatchHistoryDemo || isMailSyncDemo || isBackupImportDemo;
+const isKnowledgeDemo = previewScenario === "knowledge";
+const isIsolatedDemo = isDispatchHistoryDemo || isMailSyncDemo || isBackupImportDemo || isKnowledgeDemo;
 
 function useAppState(appController: AppController) {
   return useSyncExternalStore(
@@ -129,6 +145,93 @@ function freshnessAccountState(
       }))
       .sort((left, right) => left.accountId.localeCompare(right.accountId)),
   };
+}
+
+function knowledgeAccountIdentityKey(account: ReturnType<typeof productionController.getSnapshot>['accounts'][number]) {
+  const identity = account.identity;
+  if (!account.connected || account.authStatus !== 'connected' || account.provider === 'local' ||
+      !identity?.providerNamespace || identity.providerNamespace !== account.provider ||
+      !identity.clientId || !identity.subject ||
+      (account.provider === 'microsoft' && !identity.resourceUserId)) return undefined;
+  return [identity.providerNamespace, identity.clientId, identity.subject, identity.resourceUserId ?? ''].join(':');
+}
+
+function knowledgeReferenceOptions(state: ReturnType<typeof productionController.getSnapshot>) {
+  const structuredNarrativePaths = new Set([
+    ...state.knowledge.people.map((entity) => entity.narrativePath),
+    ...state.knowledge.projects.map((entity) => entity.narrativePath),
+  ]);
+  const references: { reference: KnowledgeReference; label: string }[] = [
+    ...state.notes.map((note) => ({ reference: { kind: 'note' as const, id: note.id }, label: `Note · ${(note.transcript || 'Untitled note').slice(0, 70)}` })),
+    ...state.tasks.map((task) => ({ reference: { kind: 'task' as const, id: task.id }, label: `Task · ${task.title}` })),
+    ...state.documents.filter((document) => !structuredNarrativePaths.has(document.path)).map((document) => ({ reference: { kind: 'document' as const, id: document.path }, label: `Document · ${friendlyDocumentName(document.path)}` })),
+    ...state.knowledge.people.filter((person) => !person.archivedAt).map((person) => ({ reference: { kind: 'person' as const, id: person.id }, label: `Person · ${person.name}${person.importOrigin?.kind === 'backup_knowledge' ? ' · Imported copy' : ''}` })),
+    ...state.knowledge.projects.filter((project) => !project.archivedAt).map((project) => ({ reference: { kind: 'project' as const, id: project.id }, label: `Project · ${project.name}${project.importOrigin?.kind === 'backup_knowledge' ? ' · Imported copy' : ''}` })),
+  ];
+  for (const message of state.mailbox) {
+    const account = state.accounts.find((item) => item.id === message.accountId);
+    const identityKey = account && knowledgeAccountIdentityKey(account);
+    if (!account || !identityKey || !account.capabilities?.includes('mail.read') ||
+        typeof message.connectionGeneration !== 'number' || message.providerDeletedAt ||
+        message.verifiedIdentityKey !== identityKey || message.identityKey !== `${identityKey}:${message.providerMessageId}` ||
+        message.connectionGeneration !== account.connectionGeneration) continue;
+    references.push({ reference: { kind: 'mail', id: message.providerMessageId, identityKey, connectionGeneration: message.connectionGeneration }, label: `Saved mail · ${message.subject || message.from || 'No subject'}` });
+  }
+  for (const event of state.calendarEvents) {
+    const account = state.accounts.find((item) => item.id === event.accountId);
+    const identityKey = account && knowledgeAccountIdentityKey(account);
+    if (!account || !identityKey || !account.capabilities?.includes('calendar.read') ||
+        typeof event.connectionGeneration !== 'number' || event.providerDeletedAt ||
+        event.verifiedIdentityKey !== identityKey || event.connectionGeneration !== account.connectionGeneration) continue;
+    const calendar = state.calendars.find((item) => item.id === event.calendarId && item.accountId === event.accountId && item.connected);
+    if (!calendar) continue;
+    references.push({ reference: { kind: 'calendar', id: event.providerEventId, calendarId: calendar.providerId ?? calendar.id, identityKey, connectionGeneration: event.connectionGeneration }, label: `Saved calendar item · ${event.subject || 'Untitled event'}` });
+  }
+  return references;
+}
+
+function knowledgeEvidenceLabels(state: ReturnType<typeof productionController.getSnapshot>) {
+  const labels: Record<string, string> = Object.create(null) as Record<string, string>;
+  labels.transcript = 'Saved note transcript';
+  for (const note of state.notes) {
+    const label = `Note · ${(note.transcript || 'Untitled note').slice(0, 70)}`;
+    labels[note.id] = label;
+    labels[`note:${note.id}`] = label;
+  }
+  for (const task of state.tasks) {
+    labels[`task:${encodeURIComponent(task.id)}`] = `Task · ${task.title}`;
+  }
+  labels['task:index'] = 'Saved task list snapshot';
+  for (const document of state.documents) {
+    labels[`doc:${document.path}`] = `Document · ${friendlyDocumentName(document.path)}`;
+    labels[document.path] = `Document · ${friendlyDocumentName(document.path)}`;
+  }
+  for (const message of state.mailbox) {
+    const account = state.accounts.find((item) => item.id === message.accountId);
+    const identityKey = account && knowledgeAccountIdentityKey(account);
+    if (!account || !identityKey || !account.capabilities?.includes('mail.read') || message.providerDeletedAt ||
+        message.verifiedIdentityKey !== identityKey || message.identityKey !== `${identityKey}:${message.providerMessageId}` ||
+        typeof message.connectionGeneration !== 'number' || message.connectionGeneration !== account.connectionGeneration) continue;
+    const sourceId = `mail:${encodeURIComponent(identityKey)}:${encodeURIComponent(message.providerMessageId)}`;
+    labels[sourceId] = `Saved mail · ${message.subject || message.from || 'No subject'}`;
+  }
+  for (const event of state.calendarEvents) {
+    const account = state.accounts.find((item) => item.id === event.accountId);
+    const identityKey = account && knowledgeAccountIdentityKey(account);
+    if (!account || !identityKey || !account.capabilities?.includes('calendar.read') || event.providerDeletedAt ||
+        event.verifiedIdentityKey !== identityKey || typeof event.connectionGeneration !== 'number' || event.connectionGeneration !== account.connectionGeneration) continue;
+    const calendar = state.calendars.find((item) => item.id === event.calendarId && item.accountId === event.accountId);
+    const providerCalendarId = calendar?.providerId ?? event.calendarId;
+    const sourceId = `calendar-event:${encodeURIComponent(identityKey)}:${encodeURIComponent(providerCalendarId)}:${encodeURIComponent(event.providerEventId)}`;
+    labels[sourceId] = `Saved calendar item · ${event.subject || 'Untitled event'}`;
+  }
+  for (const person of state.knowledge.people) {
+    if (!person.archivedAt) labels[`knowledge:person:${person.id}`] = `Person · ${person.name}`;
+  }
+  for (const project of state.knowledge.projects) {
+    if (!project.archivedAt) labels[`knowledge:project:${project.id}`] = `Project · ${project.name}`;
+  }
+  return labels;
 }
 
 function NoteCard({ note, onPress }: { note: Note; onPress: () => void }) {
@@ -258,18 +361,19 @@ export default function App() {
   const [controller, setController] =
     useState<AppController>(productionController);
   const state = useAppState(controller);
-  const [tab, setTab] = useState<Tab>(isBackupImportDemo ? "library" : isIsolatedDemo ? "inbox" : "record");
+  const [tab, setTab] = useState<Tab>(isBackupImportDemo || isKnowledgeDemo ? "library" : isIsolatedDemo ? "inbox" : "record");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [detail, setDetail] = useState<Note | null>(null);
   const [recordingAttachmentNoteId, setRecordingAttachmentNoteId] = useState<string | null>(null);
   const [review, setReview] = useState<Proposal | null>(null);
   const [replyMessageId, setReplyMessageId] = useState<string | null>(null);
   const [notice, setNotice] = useState("");
+  const [isolatedPreviewFailed, setIsolatedPreviewFailed] = useState(false);
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
   useProactiveClock(
     controller,
-    loading,
+    loading || isIsolatedDemo,
     state.proactive.lastEvaluation?.nextCheckAt,
   );
   const foregroundMailBusy = useRef(false);
@@ -316,12 +420,17 @@ export default function App() {
             ? await createMailSyncScenario({ mockGeneration: true })
             : isBackupImportDemo
               ? await createBackupScenario()
+              : isKnowledgeDemo
+                ? await createKnowledgeScenario()
             : productionController;
         if (!mounted) return;
         setController(selected);
         await selected.load();
       } catch (e) {
-        if (mounted) setNotice(messageOf(e));
+        if (mounted) {
+          setNotice(messageOf(e));
+          if (isIsolatedDemo) setIsolatedPreviewFailed(true);
+        }
       } finally {
         if (mounted) setLoading(false);
       }
@@ -779,6 +888,7 @@ export default function App() {
     },
     [run, controller],
   );
+
   const disconnectAccount = useCallback(
     async (accountId: string) => {
       await run(async () => {
@@ -837,6 +947,23 @@ export default function App() {
     [controller, run],
   );
 
+  if (isIsolatedDemo && isolatedPreviewFailed) {
+    return (
+      <SafeAreaProvider>
+        <SafeAreaView style={s.safe}>
+          <View style={s.viewport}>
+            <Text style={s.kicker}>ISOLATED PREVIEW</Text>
+            <Text style={s.h1}>Sample preview could not load.</Text>
+            <Text accessibilityRole="alert" style={s.analysisText}>{notice || "The sample data was not started."}</Text>
+            <Button label="Reload preview" onPress={() => {
+              if (Platform.OS === "web" && typeof window !== "undefined") window.location.reload();
+            }} />
+          </View>
+        </SafeAreaView>
+      </SafeAreaProvider>
+    );
+  }
+
   return (
     <SafeAreaProvider>
       <SafeAreaView style={s.safe}>
@@ -859,7 +986,9 @@ export default function App() {
                   ? "Sample history · no external actions"
                   : isMailSyncDemo
                     ? "Sample mail · no external actions"
-                    : "Sample backup · in-memory only · no external access"}
+                    : isBackupImportDemo
+                      ? "Sample backup · in-memory only · no external access"
+                      : "Sample knowledge · in-memory only · no external actions"}
               </Text>
             </View>
           ) : null}
@@ -977,6 +1106,8 @@ export default function App() {
                   activeAnalysis &&
                   analysisStatusCheckedKey !== analysisFreshnessKey,
                 )}
+                people={state.knowledge.people}
+                projects={state.knowledge.projects}
                 onRetryStatus={() => {
                   checkedAnalysisKey.current = "";
                   setAnalysisStatusError(null);
@@ -1024,6 +1155,11 @@ export default function App() {
                     );
                   });
                 }}
+                onCreateMemorySuggestion={(input) => run(async () => {
+                  const suggestion = await controller.createKnowledgeSuggestionFromNote(input);
+                  setNotice("Memory suggestion saved for review.");
+                  return suggestion;
+                })}
                 onOpenProposals={() => {
                   setInboxFilter("pending");
                   setTab("inbox");
@@ -1134,8 +1270,13 @@ export default function App() {
                 busy={busy}
                 controller={controller}
                 importedBackups={state.importedBackups}
+                knowledge={state.knowledge}
+                knowledgeRecoveryStatus={state.knowledgeRecoveryStatus}
+                references={knowledgeReferenceOptions(state)}
+                evidenceLabels={knowledgeEvidenceLabels(state)}
                 previewMode={isIsolatedDemo}
                 sampleBackupMode={isBackupImportDemo}
+                knowledgeDemoMode={isKnowledgeDemo}
                 onComplete={(id) =>
                   run(async () => {
                     await controller.completeTask(id);
@@ -1149,6 +1290,20 @@ export default function App() {
                   })
                 }
                 onOpenNote={openNote}
+                onSavePerson={(input) => run(() => controller.savePerson(input))}
+                onSaveProject={(input) => run(() => controller.saveProject(input))}
+                onSetKnowledgeArchived={(input) => run(() => controller.setKnowledgeEntityArchived(input))}
+                onSaveKnowledgeFact={(input) => run(() => controller.saveKnowledgeFact(input))}
+                onRemoveKnowledgeFact={(input) => run(async () => { await controller.removeKnowledgeFact(input); return true; })}
+                onSaveKnowledgeContact={(input) => run(() => controller.saveKnowledgeContact(input))}
+                onRemoveKnowledgeContact={(input) => run(async () => { await controller.removeKnowledgeContact(input); return true; })}
+                onSaveKnowledgeSourceLink={(input) => run(() => controller.saveKnowledgeSourceLink(input))}
+                onRemoveKnowledgeSourceLink={(input) => run(async () => { await controller.removeKnowledgeSourceLink(input); return true; })}
+                onSaveKnowledgeMember={(input) => run(() => controller.saveKnowledgeMember(input))}
+                onRemoveKnowledgeMember={(input) => run(async () => { await controller.removeKnowledgeMember(input); return true; })}
+                onReviewKnowledgeSuggestion={(id, input) => run(() => controller.reviewKnowledgeSuggestion(id, input))}
+                onEditKnowledgeSuggestion={(id, input) => run(() => controller.editKnowledgeSuggestion(id, input))}
+                onRun={(action) => run(action)}
                 onOpenDoc={(d) => {
                   const existing = state.documents.find(
                     (x) => x.path === d.path,
@@ -1813,13 +1968,32 @@ function LibraryScreen({
   busy,
   controller,
   importedBackups,
+  knowledge,
+  knowledgeRecoveryStatus,
+  references,
+  evidenceLabels,
   previewMode,
   sampleBackupMode,
+  knowledgeDemoMode,
   onComplete,
   onReopen,
   onOpenNote,
   onOpenDoc,
   onExport,
+  onSavePerson,
+  onSaveProject,
+  onSetKnowledgeArchived,
+  onSaveKnowledgeFact,
+  onRemoveKnowledgeFact,
+  onSaveKnowledgeContact,
+  onRemoveKnowledgeContact,
+  onSaveKnowledgeSourceLink,
+  onRemoveKnowledgeSourceLink,
+  onSaveKnowledgeMember,
+  onRemoveKnowledgeMember,
+  onReviewKnowledgeSuggestion,
+  onEditKnowledgeSuggestion,
+  onRun,
 }: {
   notes: Note[];
   query: string;
@@ -1829,15 +2003,47 @@ function LibraryScreen({
   busy: boolean;
   controller: AppController;
   importedBackups: ReturnType<typeof productionController.getSnapshot>["importedBackups"];
+  knowledge: ReturnType<typeof productionController.getSnapshot>["knowledge"];
+  knowledgeRecoveryStatus?: ReturnType<typeof productionController.getSnapshot>["knowledgeRecoveryStatus"];
+  references: { reference: KnowledgeReference; label: string }[];
+  evidenceLabels: Record<string, string>;
   previewMode: boolean;
   sampleBackupMode: boolean;
+  knowledgeDemoMode: boolean;
   onComplete: (id: string) => void;
   onReopen: (id: string) => void;
   onOpenNote: (n: Note) => void;
   onOpenDoc: (d: { path: string; content: string }) => void;
   onExport: () => void;
+  onSavePerson: (input: SavePersonInput) => Promise<unknown>;
+  onSaveProject: (input: SaveProjectInput) => Promise<unknown>;
+  onSetKnowledgeArchived: (input: { kind: KnowledgeEntityKind; id: string; expectedRevision: number; archived: boolean }) => Promise<unknown>;
+  onSaveKnowledgeFact: (input: SaveKnowledgeFactInput) => Promise<unknown>;
+  onRemoveKnowledgeFact: (input: KnowledgeItemCommand) => Promise<unknown>;
+  onSaveKnowledgeContact: (input: SaveKnowledgeContactInput) => Promise<unknown>;
+  onRemoveKnowledgeContact: (input: KnowledgeItemCommand & { entityKind: 'person' }) => Promise<unknown>;
+  onSaveKnowledgeSourceLink: (input: SaveKnowledgeSourceLinkInput) => Promise<unknown>;
+  onRemoveKnowledgeSourceLink: (input: KnowledgeItemCommand) => Promise<unknown>;
+  onSaveKnowledgeMember: (input: SaveKnowledgeMemberInput) => Promise<unknown>;
+  onRemoveKnowledgeMember: (input: KnowledgeItemCommand & { entityKind: 'project' }) => Promise<unknown>;
+  onReviewKnowledgeSuggestion: (id: string, input: ReviewKnowledgeSuggestionInput) => Promise<unknown>;
+  onEditKnowledgeSuggestion: (id: string, input: EditKnowledgeSuggestionInput) => Promise<KnowledgeSuggestion | undefined>;
+  onRun: <T>(action: () => Promise<T>) => Promise<T | undefined>;
 }) {
   const [importOpen, setImportOpen] = useState(false);
+  const [section, setSection] = useState<'notes' | 'people' | 'projects' | 'memory'>(knowledgeDemoMode ? 'memory' : 'notes');
+  const [entityKind, setEntityKind] = useState<'person' | 'project'>('person');
+  const [editingEntityId, setEditingEntityId] = useState<string | null>(null);
+  const [editorInstance, setEditorInstance] = useState(0);
+  const [entitySheetOpen, setEntitySheetOpen] = useState(false);
+  const structuredNarrativePaths = new Set([
+    ...knowledge.people.map((entity) => entity.narrativePath),
+    ...knowledge.projects.map((entity) => entity.narrativePath),
+  ]);
+  const libraryDocuments = docs.filter((document) => !structuredNarrativePaths.has(document.path));
+  const editingEntity = entityKind === 'person'
+    ? knowledge.people.find((entity) => entity.id === editingEntityId)
+    : knowledge.projects.find((entity) => entity.id === editingEntityId);
   return (
     <ScrollView
       contentContainerStyle={s.scroll}
@@ -1864,6 +2070,14 @@ function LibraryScreen({
           accessibilityLabel="Search library"
         />
       </View>
+      <View style={s.librarySegments} accessibilityRole="tablist">
+        {([['notes', 'Notes'], ['people', 'People'], ['projects', 'Projects'], ['memory', 'Memory']] as const).map(([key, label]) => (
+          <Pressable key={key} accessibilityRole="tab" accessibilityLabel={`${label} library section`} accessibilityState={{ selected: section === key }} onPress={() => setSection(key)} style={[s.librarySegment, section === key && s.librarySegmentActive]}>
+            <Text style={[s.librarySegmentText, section === key && s.librarySegmentTextActive]}>{label}</Text>
+          </Pressable>
+        ))}
+      </View>
+      {section === 'notes' ? <>
       <TasksSection
         tasks={tasks}
         busy={busy}
@@ -1888,8 +2102,8 @@ function LibraryScreen({
           }
         />
       </View>
-      {docs.length ? (
-        docs.map((d) => {
+      {libraryDocuments.length ? (
+        libraryDocuments.map((d) => {
           const title = friendlyDocumentName(d.path);
           return (
             <Pressable
@@ -1918,8 +2132,8 @@ function LibraryScreen({
           );
         })
       ) : (
-        <Text style={s.emptyText}>
-          No documents yet. Add personal notes or rules here.
+          <Text style={s.emptyText}>
+          No personal documents yet. Add notes or rules here.
         </Text>
       )}
       <View style={{ height: 10 }} />
@@ -1946,21 +2160,72 @@ function LibraryScreen({
         onPress={onExport}
       />
       <Text style={s.disclaimer}>
-        JSON exports include notes, tasks, Markdown documents, and read-only
-        action history. Accounts, credentials, active approvals, and recordings
-        are not included. Protect exported files as private data.
+        JSON exports include notes, tasks, Markdown documents, People and
+        Projects, imported knowledge archives, and read-only action history.
+        Accounts, credentials, active approvals, and recordings are not included.
+        Imported knowledge stays archived until you activate a separate copy.
+        Protect exported files as private data.
       </Text>
       {sampleBackupMode ? (
         <Text style={s.disclaimer}>
           Sample preview uses in-memory data. OAuth, provider keys, microphone capture, and external requests are disabled.
         </Text>
       ) : null}
+      </> : section === 'people' || section === 'projects' ? (
+        <KnowledgeSection
+          kind={section === 'people' ? 'person' : 'project'}
+          people={knowledge.people}
+          projects={knowledge.projects}
+          query={query}
+          busy={busy}
+          onCreate={() => { setEntityKind(section === 'people' ? 'person' : 'project'); setEditingEntityId(null); setEditorInstance((value) => value + 1); setEntitySheetOpen(true); }}
+          onOpen={(entity) => { setEntityKind(section === 'people' ? 'person' : 'project'); setEditingEntityId(entity.id); setEditorInstance((value) => value + 1); setEntitySheetOpen(true); }}
+          onArchive={(kind, id, revision, archived) => {
+            void onSetKnowledgeArchived({ kind, id, expectedRevision: revision, archived });
+          }}
+        />
+      ) : (
+        <>
+          {knowledgeRecoveryStatus ? <View style={s.analysisStale}><Text style={s.analysisText}>{knowledgeRecoveryStatus.message}</Text></View> : null}
+          <KnowledgeSuggestionSheet
+            suggestions={knowledge.suggestions}
+            people={knowledge.people}
+            projects={knowledge.projects}
+            sourceLabels={evidenceLabels}
+            busy={busy}
+            onReview={onReviewKnowledgeSuggestion}
+            onEdit={onEditKnowledgeSuggestion}
+          />
+          <ImportedKnowledgeReview archives={importedBackups} busy={busy} controller={controller} onRun={onRun} />
+        </>
+      )}
       <BackupImportSheet
         visible={importOpen}
         controller={controller}
         busy={busy}
         sampleMode={sampleBackupMode}
         onClose={() => setImportOpen(false)}
+      />
+      <KnowledgeEntitySheet
+        key={editorInstance}
+        visible={entitySheetOpen}
+        kind={entityKind}
+        entity={editingEntity}
+        people={knowledge.people}
+        documents={docs}
+        references={references}
+        busy={busy}
+        onClose={() => { setEntitySheetOpen(false); setEditingEntityId(null); }}
+        onSavePerson={onSavePerson}
+        onSaveProject={onSaveProject}
+        onSaveFact={onSaveKnowledgeFact}
+        onRemoveFact={onRemoveKnowledgeFact}
+        onSaveContact={onSaveKnowledgeContact}
+        onRemoveContact={onRemoveKnowledgeContact}
+        onSaveSourceLink={onSaveKnowledgeSourceLink}
+        onRemoveSourceLink={onRemoveKnowledgeSourceLink}
+        onSaveMember={onSaveKnowledgeMember}
+        onRemoveMember={onRemoveKnowledgeMember}
       />
     </ScrollView>
   );

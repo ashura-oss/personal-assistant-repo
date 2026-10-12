@@ -20,6 +20,11 @@ class MemoryStore implements StateStore {
   async clear() { this.value = undefined; }
 }
 
+async function saveDocumentCurrent(app: AppControllerImpl, path: string, content: string) {
+  const revision = app.getSnapshot().documents.find((item) => item.path === path)?.revision;
+  return app.saveDocument(path, content, { expectedRevision: revision });
+}
+
 describe('application state controller', () => {
   it('creates a mail-origin reply from a fresh verified mailbox snapshot without a synthetic note', async () => {
     const store = new MemoryStore();
@@ -412,7 +417,7 @@ describe('application state controller', () => {
     const started = new Promise<void>((resolve) => { keyStarted = resolve; });
     const staleGeneration = app.generateMailReplyText({ ...input, composerRevision: 3, brief: 'A different explicit brief.' });
     await started;
-    await app.saveDocument('memory/RULES.md', 'Use a formal tone.');
+    await saveDocumentCurrent(app, 'memory/RULES.md', 'Use a formal tone.');
     releaseKey();
     await expect(staleGeneration).resolves.toMatchObject({ status: 'stale', composerRevision: 3 });
     expect(providerCalls).toBe(1);
@@ -495,7 +500,7 @@ describe('application state controller', () => {
     const note = await app.saveNote({ transcript: 'I need to buy groceries tomorrow.' });
     const [proposal] = await app.processNote(note.id);
     await app.approveProposal(proposal.id);
-    await app.saveDocument('memory/RULES.md', 'Never create reminders without a time.');
+    await saveDocumentCurrent(app, 'memory/RULES.md', 'Never create reminders without a time.');
     const stale = await app.checkProposalFreshness(proposal.id);
     expect(stale).toMatchObject({ current: false });
     expect(app.getSnapshot().proposals.find((item) => item.id === proposal.id)).toMatchObject({
@@ -894,11 +899,11 @@ describe('application state controller', () => {
     Object.assign(persisted.accounts[0], { connected: true, authStatus: 'connected', identity, tokenRef: 'mail-token', capabilities: ['mail.read'], capabilityLimits: ['mail.read'] });
     const accountIdentity = 'google:google-client:mail-subject:';
     persisted.mailbox = [
-      { id: 'valid-row', accountId: account.id, providerMessageId: 'provider-message', identityKey: `${accountIdentity}:provider-message`, subject: 'Shipment update', from: 'store@example.com', receivedAt: '2026-10-12T01:00:00Z', snippet: 'Your package is arriving today.', replyMetadataComplete: true },
+      { id: 'valid-row', accountId: account.id, providerMessageId: 'provider-message', identityKey: `${accountIdentity}:provider-message`, verifiedIdentityKey: accountIdentity, connectionGeneration: account.connectionGeneration ?? 0, subject: 'Shipment update', from: 'store@example.com', receivedAt: '2026-10-12T01:00:00Z', snippet: 'Your package is arriving today.', replyMetadataComplete: true },
       { id: 'wrong-row', accountId: account.id, providerMessageId: 'other-message', identityKey: 'different-account:other-message', subject: 'Private', snippet: 'Must not be included.' },
     ];
     const fetcher = async () => new Response(JSON.stringify({ output: [{ content: [{ type: 'output_text', text: JSON.stringify({
-      summary: 'The shipment update says the package is arriving today.', answer: 'It is arriving today.', decisions: [], citations: [], clarifications: [], proposals: [],
+      summary: 'The shipment update says the package is arriving today.', answer: 'It is arriving today.', decisions: [], citations: [], clarifications: [], proposals: [], memorySuggestions: [],
     }) }] }] }), { status: 200, headers: { 'content-type': 'application/json' } });
     const app = new AppControllerImpl(store, { openAi: new AzureOpenAIClient(fetcher as typeof fetch, async () => 'test-key') }, {
       tokenStore: { async get(ref) { return ref === 'mail-token' ? structuredClone(token) : null; }, async set() {} },
@@ -910,6 +915,35 @@ describe('application state controller', () => {
     const analysis = await app.assistNote(note.id, { intent: 'answer', question: 'What does the shipment update email say?' });
     expect(Object.keys(analysis.sourceVersions)).toContain(`mail:${encodeURIComponent(accountIdentity)}:${encodeURIComponent('provider-message')}`);
     expect(Object.keys(analysis.sourceVersions).some((sourceId) => sourceId.includes('wrong-row') || sourceId.includes('other-message'))).toBe(false);
+  });
+
+  it('binds knowledge calendar references to both provider calendar and event IDs', async () => {
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store);
+    await app.load();
+    const account = await app.saveAccount({ provider: 'google', displayName: 'Calendar', email: 'calendar@example.test' });
+    const person = await app.savePerson({ name: 'Maya', aliases: [], narrative: '' });
+    const identity = { providerNamespace: 'google' as const, clientId: 'google-client', subject: 'calendar-subject' };
+    const identityValue = 'google:google-client:calendar-subject:';
+    const internal = app as unknown as { mutate(operation: (state: AppState) => void): Promise<void> };
+    await internal.mutate((state) => {
+      const storedAccount = state.accounts.find((item) => item.id === account.id)!;
+      Object.assign(storedAccount, { connected: true, authStatus: 'connected', identity, connectionGeneration: 4, capabilities: ['calendar.read'] });
+      state.calendars.push(
+        { id: 'local-cal-a', accountId: account.id, name: 'First', writable: false, connected: true, providerId: 'provider-cal-a' },
+        { id: 'local-cal-b', accountId: account.id, name: 'Second', writable: false, connected: true, providerId: 'provider-cal-b' },
+      );
+      state.calendarEvents.push(
+        { id: 'event-row-a', accountId: account.id, calendarId: 'local-cal-a', providerEventId: 'same-event', subject: 'First calendar event', observedAt: new Date().toISOString(), verifiedIdentityKey: identityValue, connectionGeneration: 4 },
+        { id: 'event-row-b', accountId: account.id, calendarId: 'local-cal-b', providerEventId: 'same-event', subject: 'Second calendar event', observedAt: new Date().toISOString(), verifiedIdentityKey: identityValue, connectionGeneration: 4 },
+      );
+    });
+    const linked = await app.saveKnowledgeSourceLink({ entityKind: 'person', entityId: person.id, expectedEntityRevision: person.revision,
+      reference: { kind: 'calendar', id: 'same-event', calendarId: 'provider-cal-b', identityKey: identityValue, connectionGeneration: 4 }, label: 'Second calendar' });
+    expect(linked.reference).toMatchObject({ kind: 'calendar', id: 'same-event', calendarId: 'provider-cal-b' });
+    await expect(app.saveKnowledgeSourceLink({ entityKind: 'person', entityId: person.id, expectedEntityRevision: person.revision + 1,
+      reference: { kind: 'calendar', id: 'same-event', calendarId: 'provider-cal-mismatch', identityKey: identityValue, connectionGeneration: 4 }, label: 'Wrong calendar' }))
+      .rejects.toThrow(/no longer available/i);
   });
 
   it('reuses a configured same-provider account entry when installing its verified identity', async () => {
@@ -993,6 +1027,7 @@ describe('application state controller', () => {
     let externalWrites = 0;
     let rejectNextWrite = false;
     let pauseWrite = false;
+    let providerBody = '';
     let releaseWrite: (() => void) | undefined;
     let writeStarted: (() => void) | undefined;
     const connector = {
@@ -1015,20 +1050,27 @@ describe('application state controller', () => {
     };
     const transcript = 'Email Alex about the meeting.';
     const sourceVersion = `1:${await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, transcript.normalize('NFC'))}`;
-    const fetcher = async () => new Response(JSON.stringify({ output: [{ content: [{ type: 'output_text', text: JSON.stringify({
+    const fetcher = async (_input: RequestInfo | URL, init?: RequestInit) => {
+      providerBody = String(init?.body ?? '');
+      return new Response(JSON.stringify({ output: [{ content: [{ type: 'output_text', text: JSON.stringify({
       summary: 'Email Alex about the meeting.', answer: '', decisions: [],
       citations: [{ sourceId: 'transcript', revision: 1, sourceVersion, quote: transcript }], clarifications: [],
-      proposals: [{ kind: 'email', title: 'Meeting', body: 'Let us meet tomorrow.', recipients: ['alex@example.com'], dueAt: null, evidence: [transcript] }],
-    }) }] }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+      proposals: [{ kind: 'email', title: 'Meeting', body: 'Let us meet tomorrow.', recipients: ['alex@example.com'], dueAt: null, evidence: [transcript] }], memorySuggestions: [],
+      }) }] }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    };
     const app = new AppControllerImpl(store, { openAi: new AzureOpenAIClient(fetcher as typeof fetch, async () => 'test-key') }, {
       tokenStore, deleteToken: async () => undefined, clientIds: { google: 'google-client' },
-      verifyOAuthResult: async () => true, connectorFactory: () => connector as never,
+      verifyOAuthResult: async () => true, connectorFactory: () => connector as never, writeDocument: async () => undefined,
     });
     await app.load();
     const account = await app.installVerifiedAccount({ provider: 'google', displayName: '', email: '' }, result);
     await app.saveSettings({ mode: 'provider', openAiEndpoint: 'https://example.openai.azure.com', openAiDeployment: 'gpt-6-luna' });
+    const person = await app.savePerson({ name: 'Alex', aliases: [], narrative: 'Project contact.' });
     const note = await app.saveNote({ transcript });
-    const [draft] = await app.processNote(note.id);
+    const analysis = await app.assistNote(note.id, { intent: 'assist', knowledgeSelection: [{ kind: 'person', id: person.id }] });
+    const draft = app.getSnapshot().proposals.find((proposal) => proposal.id === analysis.proposalIds[0])!;
+    expect(providerBody).toContain(`knowledge:person:${person.id}`);
+    expect(draft.provenance?.version === 1 && draft.provenance.knowledgeSelection).toEqual([{ kind: 'person', id: person.id }]);
     await app.editProposal(draft.id, { accountId: account.id, email: {
       operation: 'send', to: ['alex@example.com'], cc: [], bcc: [], subject: 'Meeting', text: 'Let us meet tomorrow.', attachments: [],
     } });
@@ -1041,6 +1083,7 @@ describe('application state controller', () => {
       proposalId: draft.id, operation: 'send', outcome: 'accepted', remoteId: 'provider-reference',
       account: { displayName: 'Verified', email: 'user@example.com' },
       payload: { kind: 'email', email: { to: ['alex@example.com'], subject: 'Meeting', text: 'Let us meet tomorrow.' } },
+      sourceProvenance: { version: 1, knowledgeSelection: [{ kind: 'person', id: person.id }] },
     });
     expect(executed.lastError).toBeUndefined();
     expect(app.getSnapshot().activity.some((item) => /Completion or delivery is not confirmed/.test(item.message))).toBe(true);
@@ -1107,7 +1150,7 @@ describe('application state controller', () => {
     const writeBegan = new Promise<void>((resolve) => { writeStarted = resolve; });
     const pendingExecution = app.executeProposal(secondDraft.id);
     await writeBegan;
-    await app.saveDocument('memory/RULES.md', '# Rules\n\nDo not send meeting emails.\n');
+    await saveDocumentCurrent(app, 'memory/RULES.md', '# Rules\n\nDo not send meeting emails.\n');
     releaseWrite?.();
     const blocked = await pendingExecution;
     expect(blocked).toMatchObject({ status: 'failed', lastError: expect.stringMatching(/changed before provider dispatch/i) });
@@ -1156,7 +1199,7 @@ describe('application state controller', () => {
     const sourceVersion = `1:${await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, transcript.normalize('NFC'))}`;
     const fetcher = async () => new Response(JSON.stringify({ output: [{ content: [{ type: 'output_text', text: JSON.stringify({
       summary: 'Send Jordan the final notes.', answer: '', decisions: [], citations: [{ sourceId: 'transcript', revision: 1, sourceVersion, quote: transcript }],
-      clarifications: [], proposals: [{ kind: 'email', title: 'Final notes', body: 'Here are the final notes.', recipients: ['jordan@example.com'], dueAt: null, evidence: [transcript] }],
+      clarifications: [], proposals: [{ kind: 'email', title: 'Final notes', body: 'Here are the final notes.', recipients: ['jordan@example.com'], dueAt: null, evidence: [transcript] }], memorySuggestions: [],
     }) }] }] }), { status: 200, headers: { 'content-type': 'application/json' } });
     const integration = { tokenStore, deleteToken: async () => undefined, clientIds: { google: 'google-client' }, verifyOAuthResult: async () => true, connectorFactory: () => connector as never };
     const app = new AppControllerImpl(store, { openAi: new AzureOpenAIClient(fetcher as typeof fetch, async () => 'test-key') }, integration);
@@ -1367,7 +1410,7 @@ describe('application state controller', () => {
           output: [{ content: [{ type: 'output_text', text: JSON.stringify({
             summary: 'A review call is planned.', answer: 'Tomorrow at ten in the recording timezone.',
             decisions: [], citations: [{ sourceId: 'transcript', revision: 1, sourceVersion, quote: 'tomorrow at ten' }],
-            clarifications: [], proposals: [],
+            clarifications: [], proposals: [], memorySuggestions: [],
           }) }] }], usage: { input_tokens: 10, output_tokens: 5 },
         }), { status: 200, headers: { 'content-type': 'application/json' } });
       };
@@ -1419,7 +1462,7 @@ describe('application state controller', () => {
 
     const refreshed = await reloaded.assistNote(note.id, { intent: 'summarize' });
     expect(refreshed.fingerprint).not.toBe(JSON.stringify(oldFingerprint));
-    expect((JSON.parse(refreshed.fingerprint) as { contractVersion: string }).contractVersion).toBe('assist-v2');
+    expect((JSON.parse(refreshed.fingerprint) as { contractVersion: string }).contractVersion).toBe('assist-v3');
   });
 
   it('retains uncertain prior retry charges and actual estimates after a later provider success', async () => {
@@ -1428,7 +1471,7 @@ describe('application state controller', () => {
       if (fail) return new Response('unauthorized', { status: 401 });
       const sourceVersion = `1:${await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, 'I need to call Sam tomorrow.')}`;
       return new Response(JSON.stringify({
-        output: [{ content: [{ type: 'output_text', text: JSON.stringify({ summary: 'Call Sam tomorrow.', answer: '', decisions: [], citations: [{ sourceId: 'transcript', revision: 1, sourceVersion, quote: 'I need to call Sam tomorrow.' }], clarifications: [], proposals: [{ kind: 'task', title: 'Call Sam', body: 'Call Sam tomorrow', recipients: [], dueAt: null, evidence: ['I need to call Sam tomorrow.'] }] }) }] }],
+        output: [{ content: [{ type: 'output_text', text: JSON.stringify({ summary: 'Call Sam tomorrow.', answer: '', decisions: [], citations: [{ sourceId: 'transcript', revision: 1, sourceVersion, quote: 'I need to call Sam tomorrow.' }], clarifications: [], proposals: [{ kind: 'task', title: 'Call Sam', body: 'Call Sam tomorrow', recipients: [], dueAt: null, evidence: ['I need to call Sam tomorrow.'] }], memorySuggestions: [] }) }] }],
         usage: { input_tokens: 10, output_tokens: 5 },
       }), { status: 200, headers: { 'content-type': 'application/json' } });
     };
@@ -1451,7 +1494,7 @@ describe('application state controller', () => {
       calls += 1;
       const sourceVersion = `1:${await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, 'I need to call Sam tomorrow.')}`;
       return new Response(JSON.stringify({
-        output: [{ content: [{ type: 'output_text', text: JSON.stringify({ summary: 'Call Sam tomorrow.', answer: '', decisions: [], citations: [{ sourceId: 'transcript', revision: 1, sourceVersion, quote: 'I need to call Sam tomorrow.' }], clarifications: [], proposals: [{ kind: 'task', title: 'Call Sam', body: 'Call Sam tomorrow', recipients: [], dueAt: null, evidence: ['I need to call Sam tomorrow.'] }] }) }] }],
+        output: [{ content: [{ type: 'output_text', text: JSON.stringify({ summary: 'Call Sam tomorrow.', answer: '', decisions: [], citations: [{ sourceId: 'transcript', revision: 1, sourceVersion, quote: 'I need to call Sam tomorrow.' }], clarifications: [], proposals: [{ kind: 'task', title: 'Call Sam', body: 'Call Sam tomorrow', recipients: [], dueAt: null, evidence: ['I need to call Sam tomorrow.'] }], memorySuggestions: [] }) }] }],
         usage: { input_tokens: 10, output_tokens: 5 },
       }), { status: 200, headers: { 'content-type': 'application/json' } });
     };
@@ -1471,7 +1514,7 @@ describe('application state controller', () => {
     const afterReload = await reloaded.processNote(note.id);
     expect(calls).toBe(1);
     expect(afterReload.map((proposal) => proposal.id)).toEqual(initial.map((proposal) => proposal.id));
-    await reloaded.saveDocument('memory/PROFILE.md', '# Profile\n\nSam prefers email.\n');
+    await saveDocumentCurrent(reloaded, 'memory/PROFILE.md', '# Profile\n\nSam prefers email.\n');
     await reloaded.processNote(note.id);
     expect(calls).toBe(2);
   });
@@ -1481,7 +1524,7 @@ describe('application state controller', () => {
     const fetcher = async () => {
       calls += 1;
       return new Response(JSON.stringify({
-        output: [{ content: [{ type: 'output_text', text: JSON.stringify({ summary: 'No actions.', answer: '', decisions: [], citations: [], clarifications: [], proposals: [] }) }] }],
+        output: [{ content: [{ type: 'output_text', text: JSON.stringify({ summary: 'No actions.', answer: '', decisions: [], citations: [], clarifications: [], proposals: [], memorySuggestions: [] }) }] }],
         usage: { input_tokens: 10, output_tokens: 5 },
       }), { status: 200, headers: { 'content-type': 'application/json' } });
     };
@@ -1510,7 +1553,7 @@ describe('application state controller', () => {
     await app.approveProposal(groceries!.id);
     await app.executeProposal(groceries!.id);
 
-    await app.saveDocument('memory/PROFILE.md', '# Profile\n\nI prefer detailed planning.\n');
+    await saveDocumentCurrent(app, 'memory/PROFILE.md', '# Profile\n\nI prefer detailed planning.\n');
     const refreshed = await app.processNote(note.id);
     expect(refreshed.some((proposal) => proposal.id === groceries!.id)).toBe(false);
     expect(app.getSnapshot().proposals.filter((proposal) => proposal.kind === 'task' && proposal.sourceRevision === note.revision && /groceries/i.test(proposal.title)).map(({ id, title, status, sourceActionKey }) => ({ id, title, status, sourceActionKey }))).toHaveLength(1);
@@ -1532,7 +1575,7 @@ describe('application state controller', () => {
       return new Response(JSON.stringify({ output: [{ content: [{ type: 'output_text', text: JSON.stringify({
         summary: 'Call Alex.', answer: '', decisions: [],
         citations: [{ sourceId: 'transcript', revision: 1, sourceVersion, quote: text }], clarifications: [],
-        proposals: [{ kind: 'task', title: 'Call Alex', body: 'Call Alex tomorrow.', recipients: [], dueAt: null, evidence: [text] }],
+        proposals: [{ kind: 'task', title: 'Call Alex', body: 'Call Alex tomorrow.', recipients: [], dueAt: null, evidence: [text] }], memorySuggestions: [],
       }) }] }] }), { status: 200, headers: { 'content-type': 'application/json' } });
     });
     const store = new MemoryStore();
@@ -1542,7 +1585,7 @@ describe('application state controller', () => {
     const note = await app.saveNote({ transcript: text });
     const assist = app.assistNote(note.id);
     await started;
-    await app.saveDocument('memory/PROFILE.md', '# Profile\n\nChanged while the response was pending.\n');
+    await saveDocumentCurrent(app, 'memory/PROFILE.md', '# Profile\n\nChanged while the response was pending.\n');
     release();
     const result = await assist;
     expect(result.stale).toBe(true);
