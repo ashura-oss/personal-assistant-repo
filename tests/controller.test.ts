@@ -4,8 +4,7 @@ import { AppControllerImpl } from '../src/services/controller';
 import type { StateStore } from '../src/storage/contracts';
 import { AzureOpenAIClient } from '../src/services/azure';
 import { cancelReminderNotification, reminderNotificationId, requestReminderNotification } from '../src/services/notifications';
-import type { OAuthBridgeResult, StoredOAuthToken } from '../src/connectors';
-import { withCredentialLock } from '../src/connectors';
+import { ProviderWriteRejectedError, withCredentialLock, type OAuthBridgeResult, type StoredOAuthToken } from '../src/connectors';
 import * as Crypto from 'expo-crypto';
 
 class MemoryStore implements StateStore {
@@ -67,6 +66,21 @@ describe('application state controller', () => {
     const second = new AppControllerImpl(store);
     await second.load();
     expect(second.getSnapshot().notes[0]).toMatchObject({ id: note.id, transcript: 'Remember to call Sam.' });
+  });
+
+  it('quarantines invalid dispatch receipts privately and omits them from portable exports', async () => {
+    const store = new MemoryStore();
+    const first = new AppControllerImpl(store);
+    await first.load();
+    await first.saveNote({ transcript: 'Keep the appointment notes.' });
+    store.value!.dispatchRecords = [{ id: 'invalid-receipt', secret: 'private-corrupt-data' }] as never;
+    const recovered = new AppControllerImpl(store);
+    await recovered.load();
+    expect(recovered.getSnapshot().dispatchRecords).toEqual([]);
+    expect(recovered.getSnapshot().dispatchRecordQuarantine).toMatchObject([{ reason: 'invalid_persisted_receipt', raw: { id: 'invalid-receipt' } }]);
+    const exported = await recovered.exportData();
+    expect(exported).not.toContain('dispatchRecordQuarantine');
+    expect(exported).not.toContain('private-corrupt-data');
   });
 
   it('installs only verifier-approved OAuth identity and resumes sync from persisted page cursors', async () => {
@@ -292,6 +306,7 @@ describe('application state controller', () => {
     };
     let verifiedEnvelope = false;
     let externalWrites = 0;
+    let rejectNextWrite = false;
     let pauseWrite = false;
     let releaseWrite: (() => void) | undefined;
     let writeStarted: (() => void) | undefined;
@@ -306,6 +321,10 @@ describe('application state controller', () => {
         }
         if (!verifier.verifyBeforeDispatch(envelope as never)) throw new Error('Approved action changed before provider dispatch.');
         externalWrites++;
+        if (rejectNextWrite) {
+          rejectNextWrite = false;
+          throw new ProviderWriteRejectedError(400);
+        }
         return { status: 'accepted' as const, id: 'provider-reference' };
       },
     };
@@ -332,11 +351,69 @@ describe('application state controller', () => {
     const executed = await app.executeProposal(draft.id);
     expect(verifiedEnvelope).toBe(true);
     expect(executed).toMatchObject({ status: 'accepted', remoteOperation: 'send', remoteId: 'provider-reference', simulated: false });
+    expect(executed.dispatchRecordId).toBeTruthy();
+    expect(app.getSnapshot().dispatchRecords[0]).toMatchObject({
+      proposalId: draft.id, operation: 'send', outcome: 'accepted', remoteId: 'provider-reference',
+      account: { displayName: 'Verified', email: 'user@example.com' },
+      payload: { kind: 'email', email: { to: ['alex@example.com'], subject: 'Meeting', text: 'Let us meet tomorrow.' } },
+    });
     expect(executed.lastError).toBeUndefined();
     expect(app.getSnapshot().activity.some((item) => /Completion or delivery is not confirmed/.test(item.message))).toBe(true);
 
+    // A reconnect must not erase the source-action duplicate guard. Rehydrate a
+    // second candidate for the already accepted source action while its context is current.
+    const accepted = app.getSnapshot().proposals.find((item) => item.status === 'accepted')!;
+    const duplicate = structuredClone(accepted);
+    duplicate.id = 'reconnected-duplicate-candidate';
+    duplicate.status = 'draft';
+    delete duplicate.approvedRevision;
+    delete duplicate.approvedPayloadDigest;
+    delete duplicate.dispatchRecordId;
+    delete duplicate.remoteId;
+    delete duplicate.remoteOperation;
+    delete duplicate.remoteAcceptedAt;
+    const persisted = structuredClone(store.value!);
+    persisted.proposals.unshift(duplicate);
+    const savedAccount = persisted.accounts.find((item) => item.id === account.id)!;
+    savedAccount.connected = false;
+    savedAccount.authStatus = 'configured';
+    savedAccount.tokenRef = undefined;
+    savedAccount.capabilities = [];
+    savedAccount.connectionGeneration = (savedAccount.connectionGeneration ?? 0) + 1;
+    store.value = persisted;
+    const reconnected = new AppControllerImpl(store, {}, {
+      tokenStore, deleteToken: async () => undefined, clientIds: { google: 'google-client' },
+      verifyOAuthResult: async () => true, connectorFactory: () => connector as never,
+    });
+    await reconnected.load();
+    await reconnected.installVerifiedAccount({ id: account.id, provider: 'google', displayName: '', email: '' }, result);
+    const duplicateApproved = await reconnected.approveProposal(duplicate.id);
+    expect(duplicateApproved.status).toBe('approved');
+    const recordCountBeforeDuplicate = reconnected.getSnapshot().dispatchRecords.length;
+    await expect(reconnected.executeProposal(duplicate.id)).rejects.toThrow(/already has a pending, accepted, or unknown/i);
+    expect(reconnected.getSnapshot().dispatchRecords).toHaveLength(recordCountBeforeDuplicate);
+    await reconnected.saveAccount({ id: account.id, provider: 'google', displayName: 'Renamed account', email: 'receipt@example.com' });
+    expect(reconnected.getSnapshot().accounts.find((item) => item.id === account.id)?.displayName).toBe('Renamed account');
+    expect(reconnected.getSnapshot().dispatchRecords[0].account.displayName).toBe('Verified');
+
+    // Old terminal remote proposals without a frozen receipt remain readable,
+    // but are explicitly marked as incomplete history after migration.
+    const legacyStore = new MemoryStore();
+    legacyStore.value = structuredClone(reconnected.getSnapshot());
+    legacyStore.value.dispatchRecords = [];
+    const legacyAccepted = legacyStore.value.proposals.find((item) => item.status === 'accepted')!;
+    delete legacyAccepted.dispatchRecordId;
+    const legacy = new AppControllerImpl(legacyStore, {});
+    await legacy.load();
+    expect(legacy.getSnapshot().proposals.find((item) => item.id === legacyAccepted.id)).toMatchObject({
+      status: 'accepted', dispatchHistoryIncomplete: true,
+    });
+    expect(legacy.getSnapshot().dispatchRecords).toEqual([]);
+
     const secondNote = await app.saveNote({ transcript });
     const [secondDraft] = await app.processNote(secondNote.id);
+    expect(app.getSnapshot().dispatchRecords).toHaveLength(1);
+    expect(app.getSnapshot().dispatchRecords[0].sourceActionKey).not.toBe(secondDraft.sourceActionKey);
     await app.editProposal(secondDraft.id, { accountId: account.id, email: {
       operation: 'send', to: ['alex@example.com'], cc: [], bcc: [], subject: 'Meeting', text: 'Let us meet tomorrow.', attachments: [],
     } });
@@ -350,6 +427,86 @@ describe('application state controller', () => {
     const blocked = await pendingExecution;
     expect(blocked).toMatchObject({ status: 'failed', lastError: expect.stringMatching(/changed before provider dispatch/i) });
     expect(externalWrites).toBe(1);
+    expect(app.getSnapshot().dispatchRecords).toHaveLength(2);
+    expect(app.getSnapshot().dispatchRecords[0]).toMatchObject({ outcome: 'rejected', rejectionCode: 'precondition_failed' });
+    expect(app.getSnapshot().dispatchRecords[1]).toMatchObject({ outcome: 'accepted' });
+
+    const rejectedNote = await app.saveNote({ transcript });
+    const [rejectedDraft] = await app.processNote(rejectedNote.id);
+    await app.editProposal(rejectedDraft.id, { accountId: account.id, email: {
+      operation: 'send', to: ['jamie@example.com'], cc: [], bcc: [], subject: 'Updated agenda', text: 'Here is the revised agenda.', attachments: [],
+    } });
+    await app.approveProposal(rejectedDraft.id);
+    rejectNextWrite = true;
+    const providerRejected = await app.executeProposal(rejectedDraft.id);
+    expect(providerRejected.status).toBe('failed');
+    expect(app.getSnapshot().dispatchRecords[0]).toMatchObject({ outcome: 'rejected', rejectionCode: 'provider_rejected' });
+
+  });
+
+  it('keeps dispatch receipts independent of disconnect and turns an interrupted record unknown on reload', async () => {
+    const store = new MemoryStore();
+    const identity = { providerNamespace: 'google' as const, clientId: 'google-client', subject: 'receipt-subject' };
+    const token: StoredOAuthToken = { accessToken: 'test-access', expiresAt: Date.now() + 600_000, identity };
+    const tokenStore = { async get() { return structuredClone(token); }, async set() {} };
+    const oauth: OAuthBridgeResult = {
+      provider: 'google', accessToken: token.accessToken, expiresAt: token.expiresAt,
+      grantedScopes: ['openid', 'https://www.googleapis.com/auth/gmail.send'], requestedCapabilities: ['mail.send'],
+      capabilities: ['mail.send'], identity, displayName: 'Receipt Account', email: 'receipt@example.com',
+    };
+    let writeStarted!: () => void;
+    let releaseWrite!: () => void;
+    const started = new Promise<void>((resolve) => { writeStarted = resolve; });
+    const writeGate = new Promise<void>((resolve) => { releaseWrite = resolve; });
+    const connector = {
+      async verifyOAuthIdentity() { return true; },
+      async sendEmail(_account: unknown, envelope: unknown, verifier: { verify(value: never): Promise<boolean>; verifyBeforeDispatch(value: never): boolean }) {
+        if (!await verifier.verify(envelope as never) || !verifier.verifyBeforeDispatch(envelope as never)) throw new Error('Final fence denied dispatch.');
+        writeStarted();
+        await writeGate;
+        return { status: 'accepted' as const, id: 'late-provider-id' };
+      },
+    };
+    const transcript = 'Send Jordan the final notes.';
+    const sourceVersion = `1:${await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, transcript.normalize('NFC'))}`;
+    const fetcher = async () => new Response(JSON.stringify({ output: [{ content: [{ type: 'output_text', text: JSON.stringify({
+      summary: 'Send Jordan the final notes.', answer: '', decisions: [], citations: [{ sourceId: 'transcript', revision: 1, sourceVersion, quote: transcript }],
+      clarifications: [], proposals: [{ kind: 'email', title: 'Final notes', body: 'Here are the final notes.', recipients: ['jordan@example.com'], dueAt: null, evidence: [transcript] }],
+    }) }] }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    const integration = { tokenStore, deleteToken: async () => undefined, clientIds: { google: 'google-client' }, verifyOAuthResult: async () => true, connectorFactory: () => connector as never };
+    const app = new AppControllerImpl(store, { openAi: new AzureOpenAIClient(fetcher as typeof fetch, async () => 'test-key') }, integration);
+    await app.load();
+    const account = await app.installVerifiedAccount({ provider: 'google', displayName: '', email: '' }, oauth);
+    await app.saveSettings({ mode: 'provider', openAiEndpoint: 'https://example.openai.azure.com', openAiDeployment: 'gpt-6-luna' });
+    const note = await app.saveNote({ transcript });
+    const [draft] = await app.processNote(note.id);
+    await app.editProposal(draft.id, { accountId: account.id, email: { operation: 'send', to: ['jordan@example.com'], cc: [], bcc: [], subject: 'Final notes', text: 'Here are the final notes.', attachments: [] } });
+    await app.approveProposal(draft.id);
+    const executing = app.executeProposal(draft.id);
+    await started;
+    const pendingRecord = app.getSnapshot().dispatchRecords[0];
+    expect(pendingRecord).toMatchObject({ outcome: 'pending', account: { displayName: 'Receipt Account' } });
+
+    const crashStore = new MemoryStore();
+    crashStore.value = structuredClone(store.value!);
+    const restarted = new AppControllerImpl(crashStore, {}, {
+      tokenStore: { async get() { return null; }, async set() {} }, deleteToken: async () => undefined,
+    });
+    await restarted.load();
+    expect(restarted.getSnapshot().dispatchRecords[0]).toMatchObject({ id: pendingRecord.id, outcome: 'unknown' });
+    expect(crashStore.value?.dispatchRecords[0]).toMatchObject({ id: pendingRecord.id, outcome: 'unknown' });
+    expect(restarted.getSnapshot().proposals.find((item) => item.id === draft.id)).toMatchObject({ status: 'unknown', dispatchRecordId: pendingRecord.id });
+    await restarted.reconcileDispatch(pendingRecord.id, { disposition: 'not_found', note: 'Checked the destination manually.' });
+    expect(restarted.getSnapshot().dispatchRecords[0]).toMatchObject({ outcome: 'unknown', reconciliations: [{ disposition: 'not_found' }] });
+    await restarted.disconnectAccount(account.id);
+    await expect(restarted.executeProposal(draft.id)).rejects.toThrow(/approve this exact version/i);
+
+    await app.disconnectAccount(account.id);
+    releaseWrite();
+    const late = await executing;
+    expect(late).toMatchObject({ status: 'accepted', remoteId: 'late-provider-id' });
+    expect(app.getSnapshot().accounts[0]).toMatchObject({ connected: false, tokenRef: undefined });
+    expect(app.getSnapshot().dispatchRecords[0]).toMatchObject({ id: pendingRecord.id, outcome: 'accepted', remoteId: 'late-provider-id' });
   });
 
   it('marks volatile or missing credentials for reauthentication after reload and clears approvals before disconnect', async () => {

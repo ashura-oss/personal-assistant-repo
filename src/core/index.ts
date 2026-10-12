@@ -118,6 +118,9 @@ export interface Proposal {
   requiresRebuild?: boolean;
   /** Synchronous canonical dependency snapshot rechecked after connector preparation and before fetch. */
   dispatchDependencyProjection?: string;
+  dispatchRecordId?: string;
+  /** Legacy terminal external action lacks an exact credential-free frozen receipt. */
+  dispatchHistoryIncomplete?: boolean;
   accountId?: string;
   recipients: string[];
   calendarId?: string;
@@ -326,6 +329,13 @@ export interface AppState {
   syncStates: Record<string, AccountSyncState>;
   /** Opaque refs only; internal cleanup bookkeeping excluded from user export. */
   pendingCredentialCleanup: { tokenRef: string; reason: 'replaced' | 'disconnected' | 'orphan'; createdAt: string; lastError?: string }[];
+  /** Immutable credential-free audit records for external writes. */
+  dispatchRecords: import('../dispatch').DispatchRecord[];
+  /**
+   * Private recovery data. Never display `raw` or include it in portable export/model context.
+   * Any entry blocks new external writes until receipt history is repaired.
+   */
+  dispatchRecordQuarantine: { reason: 'invalid_persisted_receipt'; quarantinedAt: string; raw: unknown }[];
 }
 
 export interface SaveNoteInput {
@@ -369,6 +379,7 @@ export interface AppController {
   assistNote(id: string, options?: { intent?: AssistIntent; question?: string; forceRefresh?: boolean }): Promise<NoteAssistResult>;
   refreshAnalysisStatus(noteId: string): Promise<NoteAssistResult | undefined>;
   checkProposalFreshness(id: string): Promise<{ current: boolean; reason?: string }>;
+  reconcileDispatch(recordId: string, input: { disposition: import('../dispatch').DispatchReconciliation; note: string; remoteId?: string }): Promise<import('../dispatch').DispatchRecord>;
   transcribeNote(id: string): Promise<Note>;
   editProposal(id: string, patch: ProposalPatch): Promise<Proposal>;
   approveProposal(id: string): Promise<Proposal>;

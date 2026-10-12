@@ -14,11 +14,13 @@ import type {
   ApprovedDispatch, DispatchVerifier, OAuthBridgeResult, StoredOAuthToken, OAuthTokenStore,
   MessageSummary, CalendarSummary, SyncPage, MutationReceipt,
 } from '../connectors';
-import { ConnectorClient, withCredentialLock } from '../connectors';
+import { ConnectorClient, ProviderWriteRejectedError, withCredentialLock } from '../connectors';
 import { scopeGrantsCapability } from '../connectors/oauth';
 import { oauthTokenStore, deleteOAuthToken } from '../auth/tokenStore';
 import { Platform } from 'react-native';
 import { buildLocalSourceSet, buildOfflinePreview, createSourceCatalog, type AssistantSourceInput } from '../assistant';
+import { appendDispatchReconciliation, createDispatchRecord, recordDispatchOutcome, validateDispatchRecord } from '../dispatch';
+import type { DispatchOutcome, DispatchRecord, DispatchReconciliation } from '../dispatch';
 
 const now = () => new Date().toISOString();
 const ASSIST_CONTRACT_VERSION = 'assist-v2';
@@ -45,6 +47,11 @@ function isoWeek(date: string): string {
   return `${weekYear}-W${String(week).padStart(2, '0')}`;
 }
 const clone = <T,>(value: T): T => structuredClone(value);
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map((item) => stableJson(item)).join(',')}]`;
+  if (value && typeof value === 'object') return `{${Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`).join(',')}}`;
+  return JSON.stringify(value) ?? 'null';
+}
 function deepFreeze<T>(value: T): T {
   if (value && typeof value === 'object' && !Object.isFrozen(value)) {
     Object.freeze(value);
@@ -64,7 +71,7 @@ function initialState(): AppState {
     notes: [], proposals: [], tasks: [], accounts: [], calendars: [], documents: [], activity: [],
     settings: { ...DEFAULT_SETTINGS },
     usage: { month: day.slice(0, 7), day, requests: 0, attemptsToday: 0, inputTokens: 0, outputTokens: 0, transcriptionSeconds: 0, attempts: 0, unknownCharges: 0, reservedUsd: 0, priceKnown: false, estimatedCostUsd: 0 },
-    mailbox: [], calendarEvents: [], syncStates: {}, pendingCredentialCleanup: [],
+    mailbox: [], calendarEvents: [], syncStates: {}, pendingCredentialCleanup: [], dispatchRecords: [], dispatchRecordQuarantine: [],
   };
 }
 
@@ -173,6 +180,45 @@ function validEmail(value: string): boolean {
 function sameAccountIdentity(a: Account['identity'], b: Account['identity']): boolean {
   return Boolean(a && b && a.providerNamespace === b.providerNamespace && a.clientId === b.clientId &&
     a.subject === b.subject && a.resourceUserId === b.resourceUserId && a.issuer === b.issuer && a.tenantId === b.tenantId);
+}
+
+function dispatchIdentityMatches(record: DispatchRecord, account: Account): boolean {
+  const identity = account.identity;
+  return Boolean(identity && record.account.identity.providerNamespace === identity.providerNamespace &&
+    record.account.identity.clientId === identity.clientId && record.account.identity.subject === identity.subject &&
+    (record.account.identity.resourceUserId ?? '') === (identity.resourceUserId ?? ''));
+}
+
+function assertNoDuplicateDispatch(state: AppState, candidate: DispatchRecord): void {
+  const sameSourceIdentity = (record: DispatchRecord) => record.sourceActionKey === candidate.sourceActionKey &&
+    record.account.identity.providerNamespace === candidate.account.identity.providerNamespace &&
+    record.account.identity.clientId === candidate.account.identity.clientId &&
+    record.account.identity.subject === candidate.account.identity.subject &&
+    (record.account.identity.resourceUserId ?? '') === (candidate.account.identity.resourceUserId ?? '');
+  const candidateMail = candidate.operation === 'draft' || candidate.operation === 'send';
+  const recordDuplicate = state.dispatchRecords.some((record) => {
+    if (!['pending', 'accepted', 'unknown'].includes(record.outcome)) return false;
+    if (record.duplicateKey === candidate.duplicateKey) return true;
+    return record.outcome === 'unknown' && candidateMail && (record.operation === 'draft' || record.operation === 'send') && sameSourceIdentity(record);
+  });
+  if (recordDuplicate) throw new Error('This source action already has a pending, accepted, or unknown provider attempt. Review its dispatch history; it will not be sent again.');
+
+  const recordedProposalIds = new Set(state.dispatchRecords.map((record) => record.proposalId));
+  const legacyDuplicate = state.proposals.some((proposal) => {
+    if (proposal.id === candidate.proposalId || recordedProposalIds.has(proposal.id) || !['accepted', 'unknown', 'dispatching'].includes(proposal.status) || proposal.simulated) return false;
+    const operation = proposal.remoteOperation ?? (proposal.kind === 'email' ? proposal.email?.operation : proposal.kind === 'event' ? 'event' : undefined);
+    const proposalMail = proposal.kind === 'email';
+    const identity = proposal.accountId ? state.accounts.find((account) => account.id === proposal.accountId) : undefined;
+    const sameAccount = proposal.accountId === candidate.accountId || Boolean(identity && dispatchIdentityMatches(candidate, identity));
+    const sameSource = proposal.sourceActionKey
+      ? proposal.sourceActionKey === candidate.sourceActionKey
+      : proposal.noteId === candidate.sourceProvenance.noteId && proposal.sourceRevision === candidate.sourceRevision && proposal.kind === (candidate.operation === 'event' ? 'event' : 'email');
+    if (!sameAccount || !sameSource) return false;
+    if (proposalMail && candidateMail && !operation) return true;
+    if (proposal.status === 'unknown' && proposalMail && candidateMail) return true;
+    return operation === candidate.operation;
+  });
+  if (legacyDuplicate) throw new Error('A legacy provider action for this source already exists. Its historical payload was not captured, so this action is blocked from duplicate dispatch.');
 }
 
 function identityKey(account: Account): string {
@@ -407,8 +453,28 @@ function normalizeLoadedState(value: unknown): AppState {
   const savedTasks: LocalTask[] = Array.isArray(raw.tasks) ? raw.tasks : [];
   const tasks = [...savedTasks, ...migratedTasks.filter((task) => !savedTasks.some((saved) => saved.id === task.id))];
   const settings = { ...DEFAULT_SETTINGS, ...rawSettings, timezone: validTimezone(rawSettings.timezone), maxRequestBytes };
+  const dispatchRecords: DispatchRecord[] = [];
+  const dispatchRecordQuarantine: AppState['dispatchRecordQuarantine'] = Array.isArray(raw.dispatchRecordQuarantine)
+    ? raw.dispatchRecordQuarantine.map((item) => item && typeof item === 'object' && 'raw' in item && 'quarantinedAt' in item
+      ? { reason: 'invalid_persisted_receipt' as const, quarantinedAt: typeof item.quarantinedAt === 'string' ? item.quarantinedAt : now(), raw: item.raw }
+      : { reason: 'invalid_persisted_receipt' as const, quarantinedAt: now(), raw: item })
+    : [];
+  if (Array.isArray(raw.dispatchRecords)) {
+    for (const value of raw.dispatchRecords) {
+      try { dispatchRecords.push(validateDispatchRecord(value)); }
+      catch { dispatchRecordQuarantine.push({ reason: 'invalid_persisted_receipt', quarantinedAt: now(), raw: value }); }
+    }
+  }
+  const recordIds = new Set(dispatchRecords.map((record) => record.id));
+  for (const proposal of proposals) {
+    if (proposal.dispatchRecordId && !recordIds.has(proposal.dispatchRecordId)) proposal.dispatchRecordId = undefined;
+    if ((proposal.kind === 'email' || proposal.kind === 'event') && ['accepted', 'unknown'].includes(proposal.status) && !proposal.dispatchRecordId) {
+      proposal.dispatchHistoryIncomplete = true;
+    }
+  }
   return {
     ...defaults, ...raw, notes, proposals, tasks,
+    dispatchRecords, dispatchRecordQuarantine,
     pendingCredentialCleanup: Array.isArray(raw.pendingCredentialCleanup) ? raw.pendingCredentialCleanup.filter((item) =>
       item && typeof item.tokenRef === 'string' && item.tokenRef.length > 0 && ['replaced', 'disconnected', 'orphan'].includes(item.reason) && typeof item.createdAt === 'string') : [],
     // Account configuration is not authentication and cannot restore an OAuth connection.
@@ -752,13 +818,32 @@ export class AppControllerImpl implements AppController {
         addActivity(this.state, 'error', `${account.displayName || account.email} needs to reconnect before account actions can continue.`);
       }
     }
+    for (const record of this.state.dispatchRecords) {
+      if (record.outcome === 'pending') {
+        try {
+          const unknownAt = new Date(Math.max(Date.now(), Date.parse(record.dispatchStartedAt))).toISOString();
+          const unknown = recordDispatchOutcome(record, { outcome: 'unknown', at: unknownAt });
+          this.state.dispatchRecords[this.state.dispatchRecords.findIndex((item) => item.id === record.id)] = unknown;
+        } catch { /* Keep malformed history read-only; never infer an accepted result. */ }
+      }
+    }
     for (const proposal of this.state.proposals) {
-      if (proposal.status === 'dispatching') {
+      if (proposal.dispatchRecordId) {
+        const record = this.state.dispatchRecords.find((item) => item.id === proposal.dispatchRecordId);
+        if (record && proposal.status === 'dispatching') {
+          proposal.status = record.outcome === 'accepted' ? 'accepted' : record.outcome === 'rejected' ? 'failed' : 'unknown';
+          proposal.remoteOperation = record.operation;
+          proposal.remoteId = record.remoteId;
+          if (record.outcome === 'accepted') proposal.remoteAcceptedAt = record.outcomeAt;
+          proposal.lastError = record.outcome === 'unknown' ? 'App closed while this external action was in progress. Check the destination manually; this action will not be retried.' : undefined;
+        }
+      } else if (proposal.status === 'dispatching') {
         const remote = proposal.kind === 'email' || proposal.kind === 'event';
         proposal.status = remote ? 'unknown' : 'failed';
+        proposal.dispatchHistoryIncomplete = remote;
         proposal.approvedPayloadDigest = undefined;
         proposal.lastError = remote
-          ? 'App closed while this external action was in progress. Check the destination manually; this action will not be retried.'
+          ? 'App closed while this legacy external action was in progress. Its exact provider payload was not captured; do not retry automatically.'
           : 'App closed before this local action was confirmed. Review before trying again.';
       }
     }
@@ -1234,12 +1319,27 @@ export class AppControllerImpl implements AppController {
       }
       if (await approvedDigest(proposal, state) !== proposal.approvedPayloadDigest) throw new Error('The approved content or destination changed. Review and approve it again.');
       if (proposal.kind === 'event' && !proposal.eventTransactionId) proposal.eventTransactionId = newId();
+      const operation = proposal.kind === 'email' ? proposal.email?.operation : proposal.kind === 'event' ? 'event' : undefined;
+      const account = proposal.accountId ? state.accounts.find((item) => item.id === proposal.accountId) : undefined;
+      const capability = operation === 'draft' ? 'mail.draft' : operation === 'send' ? 'mail.send' : operation === 'event' ? 'calendar.write' : undefined;
+      const calendar = proposal.kind === 'event' ? state.calendars.find((item) => item.id === proposal.calendarId) : undefined;
+      const canDispatch = (proposal.kind === 'email' || proposal.kind === 'event') && state.settings.mode === 'provider' && Boolean(this.connector && account && account.connected && account.authStatus === 'connected' && capability && account.capabilities?.includes(capability)) &&
+        (proposal.kind !== 'event' || Boolean(calendar && calendar.accountId === account?.id && calendar.connected && calendar.writable && calendar.providerId));
       proposal.status = 'dispatching';
-      return { proposal, dependencyProjection };
+      let dispatchRecord: DispatchRecord | undefined;
+      if (canDispatch && account) {
+        if (state.dispatchRecordQuarantine.length) throw new Error('Dispatch history failed integrity validation. External writes are disabled until the receipt history is repaired.');
+        dispatchRecord = createDispatchRecord({ id: newId(), dispatchStartedAt: now(), proposal, account, calendar });
+        assertNoDuplicateDispatch(state, dispatchRecord);
+        state.dispatchRecords.unshift(dispatchRecord);
+        proposal.dispatchRecordId = dispatchRecord.id;
+      }
+      return { proposal, dependencyProjection, dispatchRecord, capturedAccount: canDispatch && account ? account : undefined };
     });
     if ('invalidated' in claim) throw new Error(claim.invalidated);
     const claimed = claim.proposal;
     const approvedDependencyProjection = claim.dependencyProjection;
+    const frozenRecord = claim.dispatchRecord;
 
     let result: ProposalStatusOutcome;
     if (claimed.kind === 'reminder') {
@@ -1272,82 +1372,123 @@ export class AppControllerImpl implements AppController {
         result = { status: 'failed', message: error instanceof Error ? error.message : 'Could not write the local memory.' };
       }
     } else {
-      const account = this.snapshot.accounts.find((item) => item.id === claimed.accountId);
-      const operation = claimed.kind === 'email' ? claimed.email?.operation : claimed.kind === 'event' ? 'event' : undefined;
-      const capability = operation === 'draft' ? 'mail.draft' : operation === 'send' ? 'mail.send' : operation === 'event' ? 'calendar.write' : undefined;
-      const calendar = claimed.kind === 'event' ? this.snapshot.calendars.find((item) => item.id === claimed.calendarId) : undefined;
-      if (this.snapshot.settings.mode !== 'provider' || !this.connector || !account || account.authStatus !== 'connected' || !account.connected || !capability || !account.capabilities?.includes(capability) ||
-          (claimed.kind === 'event' && (!calendar || calendar.accountId !== account.id || !calendar.connected || !calendar.writable || !calendar.providerId))) {
+      if (!frozenRecord || !this.connector || !claim.capturedAccount) {
         result = { status: 'simulated', message: `Simulation only: this ${claimed.kind === 'email' ? 'email' : 'calendar event'} was not sent or created in an external account because provider mode, verified identity, and the selected permission are required.` };
       } else {
+        const account = claim.capturedAccount;
+        const record = frozenRecord;
+        const operation = record.operation;
         const envelope: ApprovedDispatch = {
-          proposalId: claimed.id, revision: claimed.revision, sourceRevision: claimed.sourceRevision, operation: operation!,
-          accountId: account.id, identity: clone(account.identity!), payloadDigest: claimed.approvedPayloadDigest!,
-          title: claimed.title, body: claimed.body, calendarId: claimed.kind === 'event'
-            ? this.snapshot.calendars.find((calendar) => calendar.id === claimed.calendarId)?.providerId
-            : claimed.calendarId,
-          payload: claimed.kind === 'email'
-            ? clone(claimed.email!)
-            : { ...clone(claimed.event!), title: claimed.event!.title ?? claimed.title, description: claimed.event!.description ?? claimed.body },
+          proposalId: record.proposalId, revision: record.approvedRevision, sourceRevision: record.sourceRevision, operation,
+          accountId: record.accountId, identity: clone(record.account.identity), payloadDigest: record.payloadDigest,
+          title: record.title, body: record.body, calendarId: record.calendar?.providerId,
+          payload: record.payload.kind === 'email'
+            ? { ...clone(record.payload.email), operation: record.operation === 'draft' || record.operation === 'send' ? record.operation : undefined }
+            : clone(record.payload.event),
+        };
+        const matchesFrozenPayload = (proposal: Proposal) => stableJson(proposal.kind === 'email'
+          ? proposal.email
+          : proposal.kind === 'event'
+            ? { ...proposal.event, title: proposal.event?.title ?? proposal.title, description: proposal.event?.description ?? proposal.body }
+            : null) === stableJson(envelope.payload);
+        const recordIsCurrent = (state: AppState, proposal: Proposal) => {
+          const persisted = state.dispatchRecords.find((item) => item.id === record.id);
+          return persisted?.outcome === 'pending' && proposal.dispatchRecordId === record.id && persisted.payloadDigest === record.payloadDigest;
         };
         const verifier: DispatchVerifier = { verify: async (candidate) => {
           const currentState = this.snapshot;
           const current = currentState.proposals.find((item) => item.id === id);
-          const currentAccount = currentState.accounts.find((item) => item.id === candidate.accountId);
-          if (!current || !currentAccount || current.status !== 'dispatching' || current.revision !== candidate.revision ||
-              current.approvedRevision !== candidate.revision || current.approvedPayloadDigest !== candidate.payloadDigest ||
-              current.sourceRevision !== candidate.sourceRevision || current.accountId !== candidate.accountId ||
-              !sameAccountIdentity(currentAccount.identity, candidate.identity) ||
-              (current.kind === 'event'
-                ? currentState.calendars.find((calendar) => calendar.id === current.calendarId)?.providerId !== candidate.calendarId
-                : current.calendarId !== candidate.calendarId) ||
-              await approvedDigest(current, currentState) !== candidate.payloadDigest) return false;
+          const currentAccount = currentState.accounts.find((item) => item.id === record.accountId);
+          if (!current || !currentAccount || !recordIsCurrent(currentState, current) || current.status !== 'dispatching' ||
+              current.revision !== record.approvedRevision || current.approvedRevision !== record.approvedRevision ||
+              current.approvedPayloadDigest !== record.payloadDigest || current.sourceRevision !== record.sourceRevision ||
+              current.accountId !== record.accountId || !sameAccountIdentity(currentAccount.identity, record.account.identity) ||
+              await approvedDigest(current, currentState) !== record.payloadDigest || !matchesFrozenPayload(current)) return false;
           if (await this.validateProposalProvenance(currentState, current) !== approvedDependencyProjection) return false;
-          return JSON.stringify(candidate.payload) === JSON.stringify(current.kind === 'email'
-            ? current.email
-            : { ...current.event, title: current.event?.title ?? current.title, description: current.event?.description ?? current.body });
+          return stableJson(candidate) === stableJson(envelope);
         }, verifyBeforeDispatch: (candidate) => {
           const currentState = this.snapshot;
           const current = currentState.proposals.find((item) => item.id === id);
           const currentNote = current && currentState.notes.find((item) => item.id === current.noteId);
-          const currentAccount = currentState.accounts.find((item) => item.id === candidate.accountId);
-          const expectedCapability = candidate.operation === 'draft' ? 'mail.draft' : candidate.operation === 'send' ? 'mail.send' : 'calendar.write';
-          if (!current || !currentNote || !currentAccount || currentState.settings.mode !== 'provider' ||
-              current.status !== 'dispatching' || current.approvedRevision !== candidate.revision ||
-              current.revision !== candidate.revision || current.approvedPayloadDigest !== candidate.payloadDigest ||
-              current.sourceRevision !== currentNote.revision || current.sourceRevision !== candidate.sourceRevision ||
-              current.accountId !== currentAccount.id || currentAccount.authStatus !== 'connected' || !currentAccount.connected ||
+          const currentAccount = currentState.accounts.find((item) => item.id === record.accountId);
+          const expectedCapability = operation === 'draft' ? 'mail.draft' : operation === 'send' ? 'mail.send' : 'calendar.write';
+          if (!current || !currentNote || !currentAccount || currentState.settings.mode !== 'provider' || !recordIsCurrent(currentState, current) ||
+              current.status !== 'dispatching' || current.approvedRevision !== record.approvedRevision || current.revision !== record.approvedRevision ||
+              current.approvedPayloadDigest !== record.payloadDigest || current.sourceRevision !== currentNote.revision || current.sourceRevision !== record.sourceRevision ||
+              current.accountId !== record.accountId || currentAccount.authStatus !== 'connected' || !currentAccount.connected ||
               currentAccount.connectionGeneration !== account.connectionGeneration || !currentAccount.capabilities?.includes(expectedCapability) ||
-              !sameAccountIdentity(currentAccount.identity, candidate.identity) ||
-              this.proposalDependencyProjection(currentState, current) !== approvedDependencyProjection) return false;
-          if (candidate.operation === 'event') {
+              !sameAccountIdentity(currentAccount.identity, record.account.identity) || !matchesFrozenPayload(current) ||
+              this.proposalDependencyProjection(currentState, current) !== approvedDependencyProjection ||
+              stableJson(candidate) !== stableJson(envelope)) return false;
+          if (operation === 'event') {
             const target = currentState.calendars.find((item) => item.id === current.calendarId);
-            if (!target || !target.connected || !target.writable || target.accountId !== currentAccount.id || target.providerId !== candidate.calendarId) return false;
+            if (!target || !target.connected || !target.writable || target.accountId !== currentAccount.id || target.providerId !== record.calendar?.providerId) return false;
           }
-          if (candidate.operation === 'draft' || candidate.operation === 'send') return current.email?.operation === candidate.operation;
-          return current.kind === 'event';
+          return true;
         } };
         try {
           const receipt: MutationReceipt = operation === 'draft'
             ? await this.connector.createDraft(account, envelope, verifier)
             : operation === 'send'
               ? await this.connector.sendEmail(account, envelope, verifier)
-              : await this.connector.createEvent(account, this.snapshot.calendars.find((calendar) => calendar.id === claimed.calendarId)?.providerId ?? '', envelope, verifier, claimed.eventTransactionId!);
+              : await this.connector.createEvent(account, record.calendar!.providerId, envelope, verifier, record.providerIdempotencyKey!);
           result = receipt.status === 'unknown'
-            ? { status: 'unknown', operation, message: 'The provider outcome is unknown. Check the destination manually; this action will not be retried.' }
-            : { status: 'accepted', operation, remoteId: receipt.id, message: `The provider accepted the ${operation} request${receipt.id ? ` (reference ${receipt.id})` : ''}. Completion or delivery is not confirmed.` };
+            ? { status: 'unknown', operation, dispatchOutcome: 'unknown', message: 'The provider outcome is unknown. Check the destination manually; this action will not be retried.' }
+            : { status: 'accepted', operation, dispatchOutcome: 'accepted', remoteId: receipt.id, message: `The provider accepted the ${operation} request${receipt.id ? ` (reference ${receipt.id})` : ''}. Completion or delivery is not confirmed.` };
         } catch (error) {
-          result = { status: 'failed', message: error instanceof Error ? error.message : 'The provider rejected the approved action.' };
+          const providerRejected = error instanceof ProviderWriteRejectedError;
+          result = {
+            status: 'failed', dispatchOutcome: 'rejected',
+            rejectionCode: providerRejected ? 'provider_rejected' : 'precondition_failed',
+            message: providerRejected
+              ? `The provider rejected the ${operation} request (HTTP ${error.status}). Review the destination and approve a fresh attempt if needed.`
+              : error instanceof Error ? error.message : 'The approved action was rejected before transmission.',
+          };
         }
       }
     }
 
     let cancelReminder = false;
-    let committed: Proposal;
+    let committed: Proposal | undefined;
     try {
       committed = await this.mutate((state) => {
-        const proposal = this.proposal(state, id);
-        if (proposal.status !== 'dispatching') throw new Error('Action state changed while execution was in progress.');
+        let persistedRecord: DispatchRecord | undefined;
+        if (frozenRecord) {
+          const recordIndex = state.dispatchRecords.findIndex((item) => item.id === frozenRecord.id);
+          const record = state.dispatchRecords[recordIndex];
+          if (!record) throw new Error('The frozen dispatch receipt disappeared before its result could be saved.');
+          if (record.outcome === 'pending') {
+            const outcome = result.dispatchOutcome ?? (result.status === 'accepted' ? 'accepted' : result.status === 'unknown' ? 'unknown' : 'rejected');
+            persistedRecord = recordDispatchOutcome(record, {
+              outcome, at: new Date(Math.max(Date.now(), Date.parse(record.dispatchStartedAt))).toISOString(),
+              ...(result.remoteId ? { remoteId: result.remoteId } : {}),
+              ...(outcome === 'rejected' ? { rejectionCode: result.rejectionCode ?? 'precondition_failed' } : {}),
+            });
+            state.dispatchRecords[recordIndex] = persistedRecord;
+          } else {
+            persistedRecord = record;
+          }
+          result.status = persistedRecord.outcome === 'accepted' ? 'accepted' : persistedRecord.outcome === 'unknown' ? 'unknown' : 'failed';
+          result.dispatchOutcome = persistedRecord.outcome === 'pending' ? undefined : persistedRecord.outcome;
+          result.operation = persistedRecord.operation;
+          result.remoteId = persistedRecord.remoteId;
+          result.rejectionCode = persistedRecord.rejectionCode;
+          if (persistedRecord.outcome === 'unknown') result.message = 'The provider outcome is unknown. Check the destination manually; this action will not be retried.';
+          if (persistedRecord.outcome === 'accepted') result.message = `The provider accepted the ${persistedRecord.operation} request${persistedRecord.remoteId ? ` (reference ${persistedRecord.remoteId})` : ''}. Completion or delivery is not confirmed.`;
+          if (persistedRecord.outcome === 'rejected' && persistedRecord.rejectionCode === 'provider_rejected') result.message = `The provider rejected the ${persistedRecord.operation} request. Review the destination and approve a fresh attempt if needed.`;
+        }
+        const proposal = state.proposals.find((item) => item.id === id);
+        if (!proposal) {
+          if (!persistedRecord) throw new Error('The action was removed before completion.');
+          addActivity(state, result.status === 'failed' || result.status === 'unknown' ? 'error' : 'local_action',
+            `Dispatch receipt saved after the proposal was removed: ${result.message}`, { proposalId: frozenRecord!.proposalId });
+          return undefined;
+        }
+        if (proposal.status !== 'dispatching') {
+          if (!persistedRecord) throw new Error('Action state changed while execution was in progress.');
+          addActivity(state, 'error', `Dispatch receipt saved while preserving the proposal’s newer state: ${result.message}`, { proposalId: frozenRecord!.proposalId, noteId: proposal.noteId });
+          return proposal;
+        }
         if ((proposal.kind === 'task' || proposal.kind === 'reminder') && result.status === 'executed' &&
             this.proposalDependencyProjection(state, proposal) !== approvedDependencyProjection) {
           cancelReminder = proposal.kind === 'reminder';
@@ -1375,6 +1516,17 @@ export class AppControllerImpl implements AppController {
       throw error;
     }
     if (cancelReminder) await cancelReminderNotification(claimed);
+    if (!committed && frozenRecord) {
+      // Preserve a truthful result for the caller even if the local proposal was removed;
+      // the durable dispatch history remains the canonical receipt.
+      return {
+        ...claimed, status: result.status, dispatchRecordId: frozenRecord.id,
+        remoteOperation: frozenRecord.operation, remoteId: result.remoteId,
+        remoteAcceptedAt: result.status === 'accepted' ? frozenRecord.outcomeAt : undefined,
+        lastError: result.status === 'failed' || result.status === 'unknown' ? result.message : undefined,
+      };
+    }
+    if (!committed) throw new Error('The action was removed before completion.');
     return committed;
   }
 
@@ -1387,6 +1539,22 @@ export class AppControllerImpl implements AppController {
       proposal.approvedPayloadDigest = undefined;
       addActivity(state, 'proposal_created', 'Suggestion dismissed.', { proposalId: id, noteId: proposal.noteId });
       return proposal;
+    });
+  }
+
+  async reconcileDispatch(recordId: string, input: { disposition: DispatchReconciliation; note: string; remoteId?: string }): Promise<DispatchRecord> {
+    return this.mutate((state) => {
+      const index = state.dispatchRecords.findIndex((record) => record.id === recordId);
+      if (index < 0) throw new Error('Dispatch history record was not found.');
+      const current = state.dispatchRecords[index];
+      const updated = appendDispatchReconciliation(current, {
+        id: newId(), disposition: input.disposition,
+        at: new Date(Math.max(Date.now(), current.outcomeAt ? Date.parse(current.outcomeAt) : 0)).toISOString(),
+        note: input.note, ...(input.remoteId ? { remoteId: input.remoteId } : {}),
+      });
+      state.dispatchRecords[index] = updated;
+      addActivity(state, 'local_action', 'Added a local reconciliation note. Provider outcome remains unchanged.', { proposalId: current.proposalId });
+      return updated;
     });
   }
 
@@ -1478,10 +1646,15 @@ export class AppControllerImpl implements AppController {
     if (!email.includes('@') || /[\s<>]/.test(email)) throw new Error('Enter a valid account email address.');
     return this.mutate((state) => {
       const id = config.id ?? newId();
-      if (state.proposals.some((item) => item.accountId === id && ['dispatching', 'unknown'].includes(item.status))) throw new Error('This account is part of an action whose result must be checked before changing its identity.');
       const prior = state.accounts.find((item) => item.id === id);
-      const account: Account = { id, provider: config.provider, displayName: config.displayName.trim(), email, connected: false, authStatus: 'configured', grantedScopes: [], capabilities: [], syncStatus: 'idle', connectionGeneration: (prior?.connectionGeneration ?? 0) + 1 };
+      if (prior?.identity && prior.provider !== config.provider) throw new Error('A saved provider identity cannot be moved to a different provider. Create a separate account entry.');
+      if (prior?.identity && state.proposals.some((item) => item.accountId === id && item.status === 'dispatching')) throw new Error('Wait for the current provider operation to finish before editing this account.');
+      const oldTokenRef = prior?.tokenRef;
+      const account: Account = { id, provider: config.provider, displayName: config.displayName.trim(), email, connected: false, authStatus: 'configured', identity: prior?.identity, tokenRef: undefined, grantedScopes: [], capabilities: [], syncStatus: 'idle', connectionGeneration: (prior?.connectionGeneration ?? 0) + 1 };
       if (prior) Object.assign(prior, account); else state.accounts.push(account);
+      if (oldTokenRef && !state.pendingCredentialCleanup.some((item) => item.tokenRef === oldTokenRef)) {
+        state.pendingCredentialCleanup.push({ tokenRef: oldTokenRef, reason: 'disconnected', createdAt: now() });
+      }
       for (const proposal of state.proposals.filter((item) => item.accountId === id && ['draft', 'approved', 'failed'].includes(item.status))) {
         this.invalidate(proposal);
         proposal.status = 'draft';
@@ -1587,7 +1760,6 @@ export class AppControllerImpl implements AppController {
             throw new Error('The account changed while reconnecting. Restart sign-in to protect the active connection.');
           }
         } else if (prior) throw new Error('The account was connected or changed while sign-in was being verified. Restart sign-in.');
-        if (prior && state.proposals.some((item) => item.accountId === prior.id && ['dispatching', 'unknown'].includes(item.status))) throw new Error('Resolve the in-progress or unknown provider action before reconnecting this account.');
         const oldTokenRef = prior?.tokenRef;
         const account: Account = {
           id: prior?.id ?? config.id ?? newId(), provider: result.provider,
@@ -1641,7 +1813,6 @@ export class AppControllerImpl implements AppController {
     const account = await this.mutate((state) => {
       const current = state.accounts.find((item) => item.id === id);
       if (!current) throw new Error('Account was not found.');
-      if (state.proposals.some((item) => item.accountId === id && ['dispatching', 'unknown'].includes(item.status))) throw new Error('Resolve the in-progress or unknown provider action before disconnecting this account.');
       if (current.identity) {
         const priorIdentity = encodeURIComponent(identityKey(current));
         markAnalysesStale(state, [], [`mail:${priorIdentity}:`, `calendar:${priorIdentity}:`, `calendar-event:${priorIdentity}:`]);
@@ -1857,7 +2028,7 @@ export class AppControllerImpl implements AppController {
   }
 
   async exportData(): Promise<string> {
-    const { pendingCredentialCleanup: _cleanup, ...userState } = clone(this.snapshot);
+    const { pendingCredentialCleanup: _cleanup, dispatchRecordQuarantine: _quarantine, ...userState } = clone(this.snapshot);
     return JSON.stringify({ format: 'voice-assistant-export-v1', exportedAt: now(), ...userState }, null, 2);
   }
 
@@ -1880,7 +2051,7 @@ export class AppControllerImpl implements AppController {
   }
 }
 
-type ProposalStatusOutcome = { status: 'executed' | 'simulated' | 'failed' | 'accepted' | 'unknown'; message: string; notificationId?: string; operation?: ApprovedDispatch['operation']; remoteId?: string };
+type ProposalStatusOutcome = { status: 'executed' | 'simulated' | 'failed' | 'accepted' | 'unknown'; message: string; notificationId?: string; operation?: ApprovedDispatch['operation']; remoteId?: string; dispatchOutcome?: Exclude<DispatchOutcome, 'pending'>; rejectionCode?: 'provider_rejected' | 'precondition_failed' };
 
 const googleClientId = (Platform.OS === 'web' ? process.env.EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID : process.env.EXPO_PUBLIC_GOOGLE_NATIVE_CLIENT_ID)?.trim() ?? '';
 const microsoftClientId = (Platform.OS === 'web' ? process.env.EXPO_PUBLIC_MICROSOFT_WEB_CLIENT_ID : process.env.EXPO_PUBLIC_MICROSOFT_NATIVE_CLIENT_ID)?.trim() ?? '';

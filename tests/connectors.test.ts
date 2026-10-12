@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { ConnectorClient, type ApprovedDispatch, type OAuthTokenStore, type StoredOAuthToken } from '../src/connectors';
+import { ConnectorClient, describeMessageWindowQuery, messageWindowQueryFingerprint, ProviderHttpError, ProviderWriteRejectedError, type ApprovedDispatch, type OAuthTokenStore, type StoredOAuthToken } from '../src/connectors';
 import { exchangeAuthorizationCode } from '../src/connectors/oauth';
 import type { Account, EmailProposalPayload } from '../src/core';
 
@@ -30,6 +30,21 @@ const response = (body: unknown, status = 200) => new Response(body === undefine
 
 describe('provider connector clients', () => {
   beforeEach(() => { vi.clearAllMocks(); });
+
+  it('uses a canonical account, window, and page-size fingerprint for message-window cursors', async () => {
+    const base = { timeMin: '2026-10-01T00:00:00Z', timeMax: '2026-10-02T00:00:00Z', pageSize: 3 };
+    const descriptor = describeMessageWindowQuery(account, base);
+    expect(descriptor).toEqual(describeMessageWindowQuery(account, { timeMin: '2026-10-01T08:00:00+08:00', timeMax: '2026-10-02T08:00:00+08:00', pageSize: 3.9 }));
+    expect(messageWindowQueryFingerprint(account, base)).toBe(descriptor.queryFingerprint);
+    expect(messageWindowQueryFingerprint({ ...account, identity: { ...tokenIdentity, subject: 'different-subject' } }, base)).not.toBe(descriptor.queryFingerprint);
+    expect(messageWindowQueryFingerprint(account, { ...base, timeMax: '2026-10-03T00:00:00Z' })).not.toBe(descriptor.queryFingerprint);
+    expect(messageWindowQueryFingerprint(account, { ...base, pageSize: 4 })).not.toBe(descriptor.queryFingerprint);
+
+    const { client } = fixture({ fetcher: vi.fn(async () => response({ messages: [] })) as typeof fetch });
+    const result = await client.syncMessageWindow(account, base);
+    expect(result.queryFingerprint).toBe(descriptor.queryFingerprint);
+    expect(result.window).toEqual(descriptor.window);
+  });
 
   it('refreshes once for concurrent calls and preserves an omitted refresh token', async () => {
     let refreshCount = 0;
@@ -122,6 +137,167 @@ describe('provider connector clients', () => {
     expect(guardCalls).toBe(6);
     expect(persistedPages).toHaveLength(3);
     expect(persistedPages[2].cursor).toContain('pageToken=three');
+  });
+
+  it('hydrates exactly one Gmail inbox window page, filters half-open boundaries, and reports only explicit 404 gaps', async () => {
+    const seen: string[] = [];
+    const start = Date.parse('2026-10-01T00:00:00.250Z');
+    const end = Date.parse('2026-10-02T00:00:00.250Z');
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      seen.push(url.toString());
+      if (url.pathname.endsWith('/messages') && !url.pathname.includes('/messages/')) {
+        expect(url.searchParams.get('q')).toContain(`after:${Math.floor(start / 1000) - 1}`);
+        expect(url.searchParams.get('q')).toContain(`before:${Math.ceil(end / 1000) + 1}`);
+        expect(url.searchParams.get('q')).toContain('in:inbox');
+        return response({ messages: [{ id: 'in-window' }, { id: 'outside-window' }, { id: 'deleted' }], nextPageToken: 'next-token' });
+      }
+      if (url.pathname.endsWith('/deleted')) return response({}, 404);
+      const id = url.pathname.split('/').pop();
+      const timestamp = id === 'outside-window' ? end : start;
+      return response({ id, threadId: 'thread-1', internalDate: String(timestamp), labelIds: ['INBOX'], snippet: 'short preview', payload: { headers: [
+        { name: 'Subject', value: 'Agenda' }, { name: 'From', value: 'Alex <alex@example.test>' },
+        { name: 'To', value: 'me@example.test' }, { name: 'Message-ID', value: '<message-1>' },
+      ] } });
+    }) as typeof fetch;
+    const { client } = fixture({ fetcher });
+    const pages: Array<{ items: unknown[]; cursor?: string; count: number; metadata: { unavailableIds: string[]; window: { from: string; to: string }; queryFingerprint: string } }> = [];
+    const result = await client.syncMessageWindow(account, { timeMin: new Date(start).toISOString(), timeMax: new Date(end).toISOString(), pageSize: 3, onPage: (items, cursor, count, metadata) => { pages.push({ items, cursor, count, metadata }); } });
+    expect(result.items).toHaveLength(1);
+    expect(result.items[0]).toMatchObject({ id: 'in-window', idFormat: 'gmail', senderEmail: 'alex@example.test', replyMetadataComplete: true });
+    expect(result.unavailableIds).toEqual(['deleted']);
+    expect(result.partial).toBe(true);
+    expect(result.nextCursor).toContain('q=after%3A');
+    expect(result.queryFingerprint).toContain('google-client');
+    expect(pages).toHaveLength(1);
+    expect(pages[0]).toMatchObject({ count: 1 });
+    expect(pages[0].metadata).toMatchObject({ unavailableIds: ['deleted'], window: result.window, queryFingerprint: result.queryFingerprint });
+    expect(seen).toHaveLength(4);
+    expect(seen.slice(1).every((url) => url.includes('format=metadata'))).toBe(true);
+  });
+
+  it('does not commit a Gmail page with an invalid message date and validates window cursor query binding', async () => {
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith('/messages') && !url.pathname.includes('/messages/')) return response({ messages: [{ id: 'bad-date' }] });
+      return response({ id: 'bad-date', internalDate: 'not-a-date', payload: { headers: [] } });
+    }) as typeof fetch;
+    const { client } = fixture({ fetcher });
+    const onPage = vi.fn();
+    await expect(client.syncMessageWindow(account, { timeMin: '2026-10-01T00:00:00.000Z', timeMax: '2026-10-02T00:00:00.000Z', onPage })).rejects.toThrow(/valid internal date/i);
+    expect(onPage).not.toHaveBeenCalled();
+    await expect(client.syncMessageWindow(account, { timeMin: '2026-10-01T00:00:00.000Z', timeMax: '2026-10-02T00:00:00.000Z', cursor: 'https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=5&q=wrong&pageToken=x' })).rejects.toThrow(/exact mailbox window/i);
+  });
+
+  it('reads Microsoft inbox pages with half-open filter, immutable IDs, bounded headers, and safe continuation paths', async () => {
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      expect(url.pathname).toBe('/v1.0/me/mailFolders/inbox/messages');
+      expect(url.searchParams.get('$filter')).toContain('receivedDateTime ge 2026-10-01T00:00:00.000Z and receivedDateTime lt 2026-10-02T00:00:00.000Z');
+      expect(url.searchParams.get('$select')).toContain('internetMessageHeaders');
+      expect(new Headers(init?.headers).get('prefer')).toContain('IdType="ImmutableId"');
+      return response({ value: [{ id: 'AAMk...==', conversationId: 'thread', changeKey: 'v9', isRead: false, receivedDateTime: '2026-10-01T00:00:00Z', from: { emailAddress: { name: 'Alex', address: 'alex@example.test' } }, replyTo: [{ emailAddress: { address: 'reply@example.test' } }], toRecipients: [], ccRecipients: [], internetMessageId: '<graph-message>', internetMessageHeaders: [{ name: 'From', value: 'Alex <alex@example.test>' }] }], '@odata.nextLink': 'https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?$skiptoken=opaque' });
+    }) as typeof fetch;
+    const { client } = fixture({ token: token({ identity: microsoftIdentity }), fetcher });
+    const result = await client.syncMessageWindow(microsoftAccount, { timeMin: '2026-10-01T00:00:00.000Z', timeMax: '2026-10-02T00:00:00.000Z' });
+    expect(result.items[0]).toMatchObject({ id: 'AAMk...==', idFormat: 'graph-immutable', isRead: false, senderEmail: 'alex@example.test', internetMessageId: '<graph-message>', providerVersion: 'v9', replyTo: ['reply@example.test'], to: [], cc: [], replyMetadataComplete: true });
+    expect(result.nextCursor).toContain('$skiptoken=opaque');
+    expect(result.partial).toBe(true);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    await expect(client.syncMessageWindow(microsoftAccount, { timeMin: '2026-10-01T00:00:00.000Z', timeMax: '2026-10-02T00:00:00.000Z', cursor: 'https://graph.microsoft.com/v1.0/me/drive/root/children' })).rejects.toThrow(/outside the allowed API/i);
+  });
+
+  it('atomically reports Gmail messages moved out of INBOX and rejects mismatched hydrated IDs', async () => {
+    const pageStore: Array<{ ids: string[]; unavailable: string[] }> = [];
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith('/messages') && !url.pathname.includes('/messages/')) return response({ messages: [{ id: 'moved' }, { id: 'unknown-labels' }] });
+      if (url.pathname.endsWith('/moved')) return response({ id: 'moved', internalDate: String(Date.parse('2026-10-01T12:00:00Z')), labelIds: ['SPAM'], payload: { headers: [] } });
+      return response({ id: 'unknown-labels', internalDate: String(Date.parse('2026-10-01T13:00:00Z')), payload: { headers: [{ name: 'From', value: 'alex@example.test' }] } });
+    }) as typeof fetch;
+    const { client } = fixture({ fetcher });
+    const result = await client.syncMessageWindow(account, {
+      timeMin: '2026-10-01T00:00:00Z', timeMax: '2026-10-02T00:00:00Z',
+      onPage: (items, _cursor, _count, metadata) => { pageStore.push({ ids: items.map(({ id }) => id), unavailable: metadata.unavailableIds }); },
+    });
+    expect(result.items.map(({ id }) => id)).toEqual(['unknown-labels']);
+    expect(result.items[0]).toMatchObject({ isRead: undefined, replyMetadataComplete: false });
+    expect(result.unavailableIds).toEqual(['moved']);
+    expect(pageStore).toEqual([{ ids: ['unknown-labels'], unavailable: ['moved'] }]);
+
+    const mismatchFetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      return url.pathname.endsWith('/messages') && !url.pathname.includes('/messages/')
+        ? response({ messages: [{ id: 'listed-id' }] })
+        : response({ id: 'different-id', internalDate: String(Date.parse('2026-10-01T12:00:00Z')) });
+    }) as typeof fetch;
+    const mismatchClient = fixture({ fetcher: mismatchFetcher }).client;
+    const commit = vi.fn();
+    await expect(mismatchClient.syncMessageWindow(account, { timeMin: '2026-10-01T00:00:00Z', timeMax: '2026-10-02T00:00:00Z', onPage: commit })).rejects.toThrow(/does not match/i);
+    expect(commit).not.toHaveBeenCalled();
+  });
+
+  it('marks Microsoft reply metadata incomplete when structured recipient arrays are absent or malformed', async () => {
+    const fetcher = vi.fn(async () => response({ value: [{ id: 'opaque', changeKey: 'v1', internetMessageId: '<id>', receivedDateTime: '2026-10-01T10:00:00Z', from: { emailAddress: { address: 'alex@example.test' } }, internetMessageHeaders: [{ name: 'X-Unsupported', value: 'x' }] }] })) as typeof fetch;
+    const { client } = fixture({ token: token({ identity: microsoftIdentity }), fetcher });
+    const result = await client.syncMessageWindow(microsoftAccount, { timeMin: '2026-10-01T00:00:00Z', timeMax: '2026-10-02T00:00:00Z' });
+    expect(result.items[0]).toMatchObject({ replyMetadataComplete: false, internetMessageId: '<id>', providerVersion: 'v1' });
+    expect(result.items[0].to).toBeUndefined();
+    expect(result.items[0].headers).toEqual([]);
+  });
+
+  it('fails closed on malformed successful JSON, missing Graph values, and oversized pages without committing cursors', async () => {
+    const onPage = vi.fn();
+    const malformed = fixture({ fetcher: (async () => new Response('{invalid-json', { status: 200 })) as typeof fetch }).client;
+    await expect(malformed.syncMessageWindow(account, { timeMin: '2026-10-01T00:00:00Z', timeMax: '2026-10-02T00:00:00Z', onPage })).rejects.toThrow(/invalid JSON/i);
+    expect(onPage).not.toHaveBeenCalled();
+
+    const missingGraphValue = fixture({
+      token: token({ identity: microsoftIdentity }), fetcher: (async () => response({ '@odata.nextLink': 'https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?$skip=1' })) as typeof fetch,
+    }).client;
+    await expect(missingGraphValue.syncMessageWindow(microsoftAccount, { timeMin: '2026-10-01T00:00:00Z', timeMax: '2026-10-02T00:00:00Z', onPage })).rejects.toThrow(/invalid message page/i);
+    expect(onPage).not.toHaveBeenCalled();
+
+    const oversized = fixture({
+      fetcher: (async () => response({ messages: Array.from({ length: 11 }, (_, index) => ({ id: `id-${index}` })) })) as typeof fetch,
+    }).client;
+    await expect(oversized.syncMessageWindow(account, { timeMin: '2026-10-01T00:00:00Z', timeMax: '2026-10-02T00:00:00Z', pageSize: 10, onPage })).rejects.toThrow(/more messages than the requested page size/i);
+    expect(onPage).not.toHaveBeenCalled();
+  });
+
+  it('classifies a malformed Gmail detail 404 as unavailable without losing the status', async () => {
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      return url.pathname.endsWith('/messages') && !url.pathname.includes('/messages/')
+        ? response({ messages: [{ id: 'deleted' }] })
+        : new Response('not-json', { status: 404 });
+    }) as typeof fetch;
+    const { client } = fixture({ fetcher });
+    const onPage = vi.fn();
+    const result = await client.syncMessageWindow(account, { timeMin: '2026-10-01T00:00:00Z', timeMax: '2026-10-02T00:00:00Z', onPage });
+    expect(result.unavailableIds).toEqual(['deleted']);
+    expect(onPage).toHaveBeenCalledWith([], undefined, 1, expect.objectContaining({ unavailableIds: ['deleted'] }));
+  });
+
+  it('distinguishes definite provider write rejection from ambiguous failures and exposes read HTTP status', async () => {
+    const rejected = fixture({ fetcher: (async () => response({ error: 'bad request' }, 400)) as typeof fetch });
+    await expect(rejected.client.sendEmail(account, envelope, verifier)).rejects.toBeInstanceOf(ProviderWriteRejectedError);
+    try { await rejected.client.sendEmail(account, envelope, verifier); } catch (error) {
+      expect(error).toMatchObject({ status: 400, code: 'provider_rejected', dispatched: true });
+    }
+    const unavailable = fixture({ fetcher: (async () => response({}, 404)) as typeof fetch });
+    await expect(unavailable.client.listCalendars(account)).rejects.toBeInstanceOf(ProviderHttpError);
+    await expect(unavailable.client.listCalendars(account)).rejects.toMatchObject({ status: 404 });
+  });
+
+  it('classifies Graph send 400 and 403 responses as definite provider rejections after one request', async () => {
+    for (const status of [400, 403]) {
+      const fetcher = vi.fn(async () => response({ error: 'rejected' }, status)) as typeof fetch;
+      const { client } = fixture({ token: token({ identity: microsoftIdentity }), fetcher });
+      await expect(client.sendEmail(microsoftAccount, { ...envelope, accountId: microsoftAccount.id, identity: microsoftIdentity }, verifier))
+        .rejects.toMatchObject({ status, code: 'provider_rejected', dispatched: true });
+      expect(fetcher).toHaveBeenCalledTimes(1);
+    }
   });
 
   it('rejects external cursors before making a request', async () => {

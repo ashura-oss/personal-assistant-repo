@@ -24,10 +24,12 @@ import type {
   Note,
   Proposal,
   AppSettings,
+  AppController,
   AccountCapability,
   LocalTask,
 } from "./src/core";
-import { controller } from "./src/services/controller";
+import { controller as productionController } from "./src/services/controller";
+import { createDispatchHistoryScenario } from "./src/dev/receiptScenario";
 import { useAudioCapture } from "./src/audio/useAudioCapture";
 import type { AudioCapture } from "./src/audio/types";
 import {
@@ -53,16 +55,21 @@ import { exchangeAuthorizationCode } from "./src/connectors/oauth";
 
 type Tab = "inbox" | "record" | "library";
 
-const subscribe = (
-  listener: (state: ReturnType<typeof controller.getSnapshot>) => void,
-) => controller.subscribe(listener);
-const getSnapshot = () => controller.getSnapshot();
-function useAppState() {
-  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+const isDispatchHistoryDemo =
+  typeof __DEV__ !== "undefined" &&
+  __DEV__ &&
+  process.env.EXPO_PUBLIC_PREVIEW_SCENARIO === "dispatch-history";
+
+function useAppState(appController: AppController) {
+  return useSyncExternalStore(
+    (listener) => appController.subscribe(listener),
+    () => appController.getSnapshot(),
+    () => appController.getSnapshot(),
+  );
 }
 
 function freshnessAccountState(
-  state: ReturnType<typeof controller.getSnapshot>,
+  state: ReturnType<typeof productionController.getSnapshot>,
 ) {
   return {
     accounts: state.accounts.map((account) => ({
@@ -166,7 +173,7 @@ function ProposalCard({
   onPress,
 }: {
   proposal: Proposal;
-  accounts: ReturnType<typeof controller.getSnapshot>["accounts"];
+  accounts: ReturnType<typeof productionController.getSnapshot>["accounts"];
   onPress: () => void;
 }) {
   const provider = accounts.find(
@@ -176,7 +183,7 @@ function ProposalCard({
     proposal.status === "dispatching"
       ? "In progress"
       : proposal.status === "unknown"
-        ? "Check provider before retry"
+        ? "Outcome unknown"
         : proposal.status === "failed"
           ? "Needs attention"
           : proposal.status === "simulated"
@@ -215,8 +222,12 @@ function ProposalCard({
 }
 
 export default function App() {
-  const state = useAppState();
-  const [tab, setTab] = useState<Tab>("record");
+  const [controller, setController] =
+    useState<AppController>(productionController);
+  const state = useAppState(controller);
+  const [tab, setTab] = useState<Tab>(
+    isDispatchHistoryDemo ? "inbox" : "record",
+  );
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [detail, setDetail] = useState<Note | null>(null);
   const [review, setReview] = useState<Proposal | null>(null);
@@ -224,7 +235,9 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
   const audio = useAudioCapture();
-  const [inboxFilter, setInboxFilter] = useState<"pending" | "done">("pending");
+  const [inboxFilter, setInboxFilter] = useState<"pending" | "done">(
+    isDispatchHistoryDemo ? "done" : "pending",
+  );
   const [query, setQuery] = useState("");
   const [doc, setDoc] = useState<{ path: string; content: string } | null>(
     null,
@@ -255,10 +268,24 @@ export default function App() {
   const checkedReviewFreshnessKey = useRef("");
 
   useEffect(() => {
-    controller
-      .load()
-      .catch((e: unknown) => setNotice(messageOf(e)))
-      .finally(() => setLoading(false));
+    let mounted = true;
+    void (async () => {
+      try {
+        const selected = isDispatchHistoryDemo
+          ? await createDispatchHistoryScenario()
+          : productionController;
+        if (!mounted) return;
+        setController(selected);
+        await selected.load();
+      } catch (e) {
+        if (mounted) setNotice(messageOf(e));
+      } finally {
+        if (mounted) setLoading(false);
+      }
+    })();
+    return () => {
+      mounted = false;
+    };
   }, []);
 
   const notes = [...state.notes].sort((a, b) =>
@@ -418,6 +445,7 @@ export default function App() {
     activeDetailNoteId,
     analysisFreshnessKey,
     analysisStatusRetry,
+    controller,
   ]);
 
   useEffect(() => {
@@ -474,6 +502,7 @@ export default function App() {
     reviewProposalRequiresRebuild,
     reviewProposalStatus,
     reviewFreshnessRetry,
+    controller,
   ]);
 
   useEffect(() => {
@@ -549,7 +578,7 @@ export default function App() {
     setNotice(
       "Recording saved on this device. Add a transcript to create a reviewable proposal.",
     );
-  }, [audio]);
+  }, [audio, controller]);
   useEffect(() => {
     if (
       audio.status === "recording" &&
@@ -586,6 +615,10 @@ export default function App() {
       capabilities: AccountCapability[],
       accountId?: string,
     ) => {
+      if (isDispatchHistoryDemo) {
+        setNotice("Account connections are disabled in sample history mode.");
+        return;
+      }
       await run(async () => {
         const config = configuredProviderAuth(provider);
         const handoff = await authorizeWithBrowser(config, capabilities);
@@ -628,7 +661,7 @@ export default function App() {
         );
       });
     },
-    [run],
+    [run, controller],
   );
   const disconnectAccount = useCallback(
     async (accountId: string) => {
@@ -637,7 +670,7 @@ export default function App() {
         setNotice("Account disconnected and pending approvals cleared.");
       });
     },
-    [run],
+    [run, controller],
   );
   const syncAccount = useCallback(
     async (accountId: string, continueSync: boolean) => {
@@ -655,7 +688,7 @@ export default function App() {
         );
       });
     },
-    [run],
+    [run, controller],
   );
 
   return (
@@ -673,6 +706,13 @@ export default function App() {
               onPress={() => setSettingsOpen(true)}
             />
           </View>
+          {isDispatchHistoryDemo ? (
+            <View style={s.notice}>
+              <Text style={s.noticeText}>
+                Sample history · no external actions
+              </Text>
+            </View>
+          ) : null}
           {notice || audio.error || state.pendingCredentialCleanup.length ? (
             <View style={s.notice}>
               <Ionicons
@@ -867,11 +907,18 @@ export default function App() {
               <RecordScreen
                 audio={audio}
                 busy={busy}
+                demoMode={isDispatchHistoryDemo}
                 recent={notes.slice(0, 3)}
                 onOpen={openNote}
                 onSeeAll={() => setTab("library")}
                 onWrite={() => setManualOpen(true)}
-                onStart={() => run(() => audio.start())}
+                onStart={() =>
+                  isDispatchHistoryDemo
+                    ? setNotice(
+                        "Microphone recording is disabled in sample history mode.",
+                      )
+                    : run(() => audio.start())
+                }
                 onPause={() => run(() => audio.pause())}
                 onResume={() => run(() => audio.resume())}
                 onStop={() => run(saveRecording)}
@@ -987,6 +1034,7 @@ export default function App() {
               onConnect={connectAccount}
               onDisconnect={disconnectAccount}
               onSync={syncAccount}
+              demoMode={isDispatchHistoryDemo}
             />
           </SafeAreaView>
         </Modal>
@@ -1002,6 +1050,20 @@ export default function App() {
               <ReviewSheet
                 state={state}
                 proposal={currentReviewProposal}
+                dispatchRecords={state.dispatchRecords}
+                busy={busy}
+                onReconcile={(recordId, input) =>
+                  run(async () => {
+                    const saved = await controller.reconcileDispatch(
+                      recordId,
+                      input,
+                    );
+                    setNotice(
+                      "Check recorded. The provider outcome remains unknown; nothing was resent.",
+                    );
+                    return saved;
+                  })
+                }
                 sourceStale={Boolean(
                   currentReviewProposal &&
                   ![
@@ -1137,6 +1199,7 @@ export default function App() {
 function RecordScreen({
   audio,
   busy,
+  demoMode,
   recent,
   onOpen,
   onSeeAll,
@@ -1149,6 +1212,7 @@ function RecordScreen({
 }: {
   audio: AudioCapture;
   busy: boolean;
+  demoMode: boolean;
   recent: Note[];
   onOpen: (n: Note) => void;
   onSeeAll: () => void;
@@ -1171,7 +1235,39 @@ function RecordScreen({
         Capture it first. Decide what to do with it later.
       </Text>
       <View style={s.recorder}>
-        {recording ? (
+        {demoMode ? (
+          <>
+            <View style={[s.micOuter, { opacity: 0.45 }]}>
+              <View style={s.micInner}>
+                <Ionicons
+                  accessible={false}
+                  name="mic-off-outline"
+                  size={28}
+                  color={C.bg}
+                />
+              </View>
+            </View>
+            <Text style={s.micTitle}>Recording disabled</Text>
+            <Text style={s.micSub}>
+              Sample history mode never requests microphone access.
+            </Text>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Write a note instead"
+              onPress={onWrite}
+              disabled={busy}
+              style={s.writeInstead}
+            >
+              <Ionicons
+                accessible={false}
+                name="create-outline"
+                size={16}
+                color={C.text}
+              />
+              <Text style={s.writeText}>Write a note instead</Text>
+            </Pressable>
+          </>
+        ) : recording ? (
           <>
             <View style={s.liveRow}>
               <View
@@ -1359,7 +1455,7 @@ function InboxScreen({
   onOpen,
 }: {
   proposals: Proposal[];
-  accounts: ReturnType<typeof controller.getSnapshot>["accounts"];
+  accounts: ReturnType<typeof productionController.getSnapshot>["accounts"];
   filter: "pending" | "done";
   setFilter: (v: "pending" | "done") => void;
   mode: AppSettings["mode"];
@@ -1565,6 +1661,7 @@ function LibraryScreen({
 function SettingsScreen({
   state,
   busy,
+  demoMode,
   onClose,
   onSave,
   onSaveAccount,
@@ -1576,9 +1673,10 @@ function SettingsScreen({
   onDisconnect,
   onSync,
 }: {
-  state: ReturnType<typeof controller.getSnapshot>;
+  state: ReturnType<typeof productionController.getSnapshot>;
   onClose: () => void;
   busy: boolean;
+  demoMode: boolean;
   onConnect: (
     provider: OAuthProvider,
     capabilities: AccountCapability[],
@@ -1649,10 +1747,11 @@ function SettingsScreen({
     state.accounts[0]?.id ?? "",
   );
   useEffect(() => {
+    if (demoMode) return;
     getCredentials()
       .then(setCredentialStatus)
       .catch((e) => onNotice(messageOf(e)));
-  }, [onNotice]);
+  }, [demoMode, onNotice]);
   const saveSettings = async () => {
     const requestKb = Number(maxRequestKb);
     if (!Number.isFinite(requestKb) || requestKb < 4 || requestKb > 96) {
@@ -1757,6 +1856,21 @@ function SettingsScreen({
         <Text style={s.intro}>
           Private by design. Provider setup is optional and can wait.
         </Text>
+        {demoMode ? (
+          <View style={s.analysisStale}>
+            <Text style={s.analysisText}>
+              Sample history mode is in-memory. OAuth, provider keys, and
+              provider requests are disabled.
+            </Text>
+          </View>
+        ) : null}
+        {state.dispatchRecordQuarantine.length ? (
+          <View style={s.analysisStale}>
+            <Text style={s.analysisText}>
+              Action history needs recovery before sending.
+            </Text>
+          </View>
+        ) : null}
         <View style={s.providerToggle}>
           <View style={{ flex: 1 }}>
             <Text style={s.accountName}>Enable Azure analysis</Text>
@@ -1769,6 +1883,7 @@ function SettingsScreen({
             accessibilityLabel="Enable Azure analysis"
             value={providerEnabled}
             onValueChange={setProviderEnabled}
+            disabled={demoMode}
             trackColor={{ false: C.border, true: C.sage }}
             thumbColor={C.text}
           />
@@ -1814,66 +1929,70 @@ function SettingsScreen({
             </Pressable>
           ))}
         </View>
-        <Field
-          label="Speech subscription key"
-          secureTextEntry
-          value={speechKey}
-          onChangeText={setSpeechKey}
-          placeholder={
-            credentialStatus.speechConfigured
-              ? Platform.OS === "web"
-                ? "Saved in this session · enter to replace"
-                : "Saved securely · enter to replace"
-              : "Not configured"
-          }
-        />
-        <Field
-          label="OpenAI API key"
-          secureTextEntry
-          value={openAiKey}
-          onChangeText={setOpenAiKey}
-          placeholder={
-            credentialStatus.openAiConfigured
-              ? Platform.OS === "web"
-                ? "Saved in this session · enter to replace"
-                : "Saved securely · enter to replace"
-              : "Not configured"
-          }
-        />
-        <Text style={s.disclaimer}>
-          Native credentials use platform secure storage. Browser preview keeps
-          credentials in memory only. Azure access, browser CORS, and real
-          transcription remain unverified.
-        </Text>
         <Button
           label="Save provider settings"
           onPress={() => void saveSettings()}
         />
-        <Button
-          label={
-            Platform.OS === "web"
-              ? "Save keys for this session"
-              : "Save entered keys securely"
-          }
-          tone="quiet"
-          disabled={!speechKey && !openAiKey}
-          onPress={() => void saveKeys()}
-        />
-        {credentialStatus.speechConfigured ||
-        credentialStatus.openAiConfigured ? (
-          <Button
-            label="Remove all provider keys"
-            tone="danger"
-            onPress={() => {
-              void onDeleteCredentials().then((result) => {
-                if (result) {
-                  setCredentialStatus(result as typeof credentialStatus);
-                  onNotice("Provider keys removed.");
-                }
-              });
-            }}
-          />
-        ) : null}
+        {demoMode ? null : (
+          <>
+            <Field
+              label="Speech subscription key"
+              secureTextEntry
+              value={speechKey}
+              onChangeText={setSpeechKey}
+              placeholder={
+                credentialStatus.speechConfigured
+                  ? Platform.OS === "web"
+                    ? "Saved in this session · enter to replace"
+                    : "Saved securely · enter to replace"
+                  : "Not configured"
+              }
+            />
+            <Field
+              label="OpenAI API key"
+              secureTextEntry
+              value={openAiKey}
+              onChangeText={setOpenAiKey}
+              placeholder={
+                credentialStatus.openAiConfigured
+                  ? Platform.OS === "web"
+                    ? "Saved in this session · enter to replace"
+                    : "Saved securely · enter to replace"
+                  : "Not configured"
+              }
+            />
+            <Text style={s.disclaimer}>
+              Native credentials use platform secure storage. Browser preview
+              keeps credentials in memory only. Azure access, browser CORS, and
+              real transcription remain unverified.
+            </Text>
+            <Button
+              label={
+                Platform.OS === "web"
+                  ? "Save keys for this session"
+                  : "Save entered keys securely"
+              }
+              tone="quiet"
+              disabled={!speechKey && !openAiKey}
+              onPress={() => void saveKeys()}
+            />
+            {credentialStatus.speechConfigured ||
+            credentialStatus.openAiConfigured ? (
+              <Button
+                label="Remove all provider keys"
+                tone="danger"
+                onPress={() => {
+                  void onDeleteCredentials().then((result) => {
+                    if (result) {
+                      setCredentialStatus(result as typeof credentialStatus);
+                      onNotice("Provider keys removed.");
+                    }
+                  });
+                }}
+              />
+            ) : null}
+          </>
+        )}
         <Text style={s.sectionTitle}>Limits & retention</Text>
         <Field
           label="Maximum request size · KB"

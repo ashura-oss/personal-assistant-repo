@@ -73,14 +73,96 @@ export interface DispatchVerifier {
 
 export type MutationReceipt = { status: 'accepted'; id?: string } | { status: 'unknown' };
 
+/** Provider returned a definite non-success HTTP response. */
+export class ProviderHttpError extends Error {
+  constructor(readonly status: number, message = `Provider request failed (${status}).`) {
+    super(message);
+    this.name = 'ProviderHttpError';
+  }
+}
+
+/** A write reached the provider and received a definitive client-error rejection. */
+export class ProviderWriteRejectedError extends ProviderHttpError {
+  readonly code = 'provider_rejected' as const;
+  readonly dispatched = true as const;
+  constructor(status: number) {
+    super(status, `Provider rejected the write (${status}).`);
+    this.name = 'ProviderWriteRejectedError';
+  }
+}
+
 export interface MessageSummary {
   id: string;
+  idFormat?: 'gmail' | 'graph-immutable';
   threadId?: string;
   subject?: string;
   from?: string;
+  senderEmail?: string;
+  isRead?: boolean;
   receivedAt?: string;
   snippet?: string;
+  replyMetadataComplete?: boolean;
+  internetMessageId?: string;
+  providerVersion?: string;
+  replyTo?: string[];
+  to?: string[];
+  cc?: string[];
+  references?: string;
+  inReplyTo?: string;
+  headers?: Array<{ name: string; value: string }>;
 }
+
+export interface MessageWindow {
+  from: string;
+  to: string;
+}
+
+export interface MessageWindowQueryInput {
+  timeMin: string;
+  timeMax: string;
+  pageSize?: number;
+}
+
+export interface MessageWindowQueryDescriptor {
+  window: MessageWindow;
+  pageSize: number;
+  queryFingerprint: string;
+}
+
+/** Canonical provider/account/window/page-size binding used for continuation cursors. */
+export function describeMessageWindowQuery(account: Account, input: MessageWindowQueryInput): MessageWindowQueryDescriptor {
+  const fromMs = Date.parse(input.timeMin);
+  const toMs = Date.parse(input.timeMax);
+  if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || toMs <= fromMs || toMs - fromMs > 366 * 86_400_000) {
+    throw new Error('Mail sync window must be a valid range of at most one year.');
+  }
+  const window = { from: new Date(fromMs).toISOString(), to: new Date(toMs).toISOString() };
+  const requestedSize = Math.floor(input.pageSize ?? 5);
+  const pageSize = Number.isFinite(requestedSize) ? Math.max(1, Math.min(10, requestedSize)) : 5;
+  const identity = accountIdentity(account);
+  const queryFingerprint = JSON.stringify(['mail-window-v1', account.provider, identity.providerNamespace, identity.clientId, identity.subject, identity.resourceUserId ?? '', window.from, window.to, pageSize]);
+  return { window, pageSize, queryFingerprint };
+}
+
+export function messageWindowQueryFingerprint(account: Account, input: MessageWindowQueryInput): string {
+  return describeMessageWindowQuery(account, input).queryFingerprint;
+}
+
+export interface MessageWindowSyncResult {
+  items: MessageSummary[];
+  nextCursor?: string;
+  partial: boolean;
+  window: MessageWindow;
+  queryFingerprint: string;
+  unavailableIds: string[];
+}
+
+export interface MessageWindowPageMetadata {
+  unavailableIds: string[];
+  window: MessageWindow;
+  queryFingerprint: string;
+}
+export type MessageWindowPageCallback = (items: MessageSummary[], nextCursor: string | undefined, pagesRead: number, metadata: MessageWindowPageMetadata) => void | Promise<void>;
 
 export interface SyncPage<T> {
   items: T[];
@@ -182,6 +264,73 @@ function emailList(values: string[], label: string): string[] {
 function calendarKey(value: string): string {
   if (!value || value.length > 1024 || /^[.]\.?$/.test(value) || /[\u0000-\u001f\u007f]/.test(value)) throw new Error('Invalid calendar identifier.');
   return encodeURIComponent(value);
+}
+
+function graphImmutableHeaders(init: RequestInit): Headers {
+  const headers = new Headers(init.headers);
+  const prefer = headers.get('prefer');
+  if (!prefer?.toLowerCase().includes('idtype="immutableid"')) {
+    headers.set('prefer', prefer ? `${prefer}, IdType="ImmutableId"` : 'IdType="ImmutableId"');
+  }
+  return headers;
+}
+
+function boundedHeaders(input: unknown): Array<{ name: string; value: string }> {
+  if (!Array.isArray(input)) return [];
+  const allowed = new Set(['subject', 'from', 'reply-to', 'to', 'cc', 'message-id', 'references', 'in-reply-to']);
+  return input.flatMap((item) => {
+    if (!item || typeof item !== 'object') return [];
+    const raw = item as { name?: unknown; value?: unknown };
+    if (typeof raw.name !== 'string' || typeof raw.value !== 'string') return [];
+    const name = raw.name.trim().toLowerCase();
+    if (!allowed.has(name) || /[\r\n\0]/.test(raw.value)) return [];
+    return [{ name, value: raw.value.slice(0, 2000) }];
+  }).slice(0, 8);
+}
+
+function headersAreComplete(input: unknown): boolean {
+  if (!Array.isArray(input) || input.length > 8) return false;
+  const allowed = new Set(['subject', 'from', 'reply-to', 'to', 'cc', 'message-id', 'references', 'in-reply-to']);
+  return input.every((item) => {
+    if (!item || typeof item !== 'object') return false;
+    const header = item as { name?: unknown; value?: unknown };
+    return typeof header.name === 'string' && typeof header.value === 'string' && header.value.length <= 2000 &&
+      !/[\r\n\0]/.test(header.value) && allowed.has(header.name.trim().toLowerCase());
+  });
+}
+
+function narrowEmail(value: unknown): string | undefined {
+  if (typeof value !== 'string' || value.length > 1000 || /[\r\n\0]/.test(value)) return undefined;
+  const angle = /<([^<>\s]+@[^<>\s]+)>/.exec(value);
+  const candidate = angle?.[1] ?? (value.trim().includes(' ') ? '' : value.trim());
+  return candidate.length <= 320 && /^[^\s<>@,;]+@[^\s<>@,;]+\.[^\s<>@,;]+$/.test(candidate) ? candidate : undefined;
+}
+
+function validAddressHeader(value: string): boolean {
+  const parts = value.split(',').map((part) => part.trim()).filter(Boolean);
+  return parts.length > 0 && parts.every((part) => Boolean(narrowEmail(part)));
+}
+
+function parseAddressHeader(value: string | undefined): string[] | undefined {
+  if (value === undefined) return undefined;
+  const parts = value.split(',').map((part) => part.trim()).filter(Boolean);
+  const addresses = parts.map((part) => narrowEmail(part));
+  return parts.length > 0 && addresses.every((address): address is string => Boolean(address)) ? addresses : undefined;
+}
+
+function graphAddressList(value: unknown): { addresses?: string[]; complete: boolean } {
+  if (!Array.isArray(value)) return { complete: false };
+  const addresses: string[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== 'object') return { complete: false };
+    const emailAddress = (item as { emailAddress?: unknown }).emailAddress;
+    if (!emailAddress || typeof emailAddress !== 'object') return { complete: false };
+    const address = (emailAddress as { address?: unknown }).address;
+    const normalized = narrowEmail(address);
+    if (!normalized) return { complete: false };
+    addresses.push(normalized);
+  }
+  return { addresses, complete: true };
 }
 
 export class ConnectorClient {
@@ -300,7 +449,9 @@ export class ConnectorClient {
     const token = await this.token(account, guard, signal);
     this.assertConnectionCurrent(account);
     let response: Response;
-    try { response = await this.boundedFetch(url.toString(), { ...init, redirect: 'error', headers: { ...Object.fromEntries(new Headers(init.headers).entries()), authorization: `Bearer ${token.accessToken}` } }, guard, onDispatched, beforeDispatch, signal); }
+    const requestHeaders = account.provider === 'microsoft' && kind === 'mail' ? graphImmutableHeaders(init) : new Headers(init.headers);
+    requestHeaders.set('authorization', `Bearer ${token.accessToken}`);
+    try { response = await this.boundedFetch(url.toString(), { ...init, redirect: 'error', headers: requestHeaders }, guard, onDispatched, beforeDispatch, signal); }
     catch (error) { throw error; }
     if (response.status !== 401 || !retryAuth) return response;
     // A non-idempotent request is never repeated after an ambiguous response.
@@ -310,7 +461,7 @@ export class ConnectorClient {
     }
     if (!token.refreshToken) return this.reauth(account, 'reauth_required', 'Provider rejected the access token.');
     const refreshed = await this.refreshSingleflight(account, token, guard, true, signal);
-    return this.requestWithToken(url, refreshed, init, guard, signal);
+    return this.requestWithToken(url, refreshed, init, guard, signal, account.provider === 'microsoft' && kind === 'mail');
   }
 
   private async refreshSingleflight(account: Account, token: StoredOAuthToken, guard?: RequestGuard, force = false, signal?: AbortSignal): Promise<StoredOAuthToken> {
@@ -333,15 +484,139 @@ export class ConnectorClient {
     finally { if (locks.get(lockKey) === operation) locks.delete(lockKey); }
   }
 
-  private async requestWithToken(url: URL, token: StoredOAuthToken, init: RequestInit, guard?: RequestGuard, signal?: AbortSignal): Promise<Response> {
-    return this.boundedFetch(url.toString(), { ...init, redirect: 'error', headers: { ...Object.fromEntries(new Headers(init.headers).entries()), authorization: `Bearer ${token.accessToken}` } }, guard, undefined, undefined, signal);
+  private async requestWithToken(url: URL, token: StoredOAuthToken, init: RequestInit, guard?: RequestGuard, signal?: AbortSignal, immutableMailId = false): Promise<Response> {
+    const headers = new Headers(init.headers);
+    if (immutableMailId && url.origin === GRAPH_API) {
+      const immutable = graphImmutableHeaders({ ...init, headers });
+      immutable.set('authorization', `Bearer ${token.accessToken}`);
+      return this.boundedFetch(url.toString(), { ...init, redirect: 'error', headers: immutable }, guard, undefined, undefined, signal);
+    }
+    headers.set('authorization', `Bearer ${token.accessToken}`);
+    return this.boundedFetch(url.toString(), { ...init, redirect: 'error', headers }, guard, undefined, undefined, signal);
   }
 
   private async json<T>(account: Account, url: string, kind: 'mail' | 'calendar', init?: RequestInit, guard?: RequestGuard, signal?: AbortSignal): Promise<T> {
     const response = await this.request(account, url, kind, init, true, guard, undefined, signal);
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(`Provider request failed (${response.status}).`);
-    return data as T;
+    if (!response.ok) throw new ProviderHttpError(response.status);
+    try { return await response.json() as T; }
+    catch { throw new Error('Provider returned an invalid JSON response.'); }
+  }
+
+  /** Reads exactly one hydrated INBOX page for a fixed half-open time window. */
+  async syncMessageWindow(account: Account, options: {
+    timeMin: string; timeMax: string; cursor?: string; pageSize?: number;
+    guard?: RequestGuard; signal?: AbortSignal; onPage?: MessageWindowPageCallback;
+  }): Promise<MessageWindowSyncResult> {
+    capability(account, 'mail.read');
+    const query = describeMessageWindowQuery(account, options);
+    const { window, pageSize: size, queryFingerprint } = query;
+    const fromMs = Date.parse(window.from);
+    const toMs = Date.parse(window.to);
+    const items: MessageSummary[] = [];
+    const unavailableIds: string[] = [];
+    const gmailQuery = `after:${Math.floor(fromMs / 1000) - 1} before:${Math.ceil(toMs / 1000) + 1} in:inbox`;
+    let url: URL;
+    if (options.cursor) {
+      const expectedPath = account.provider === 'google' ? `${GOOGLE_API}/messages` : `${GRAPH_API}/me/mailFolders/inbox/messages`;
+      url = safeUrl(options.cursor, account.provider, 'mail', expectedPath);
+      if (account.provider === 'google') {
+        const params = [...url.searchParams.keys()];
+        if (params.some((key) => !['maxResults', 'q', 'pageToken'].includes(key)) || new Set(params).size !== params.length || url.searchParams.get('maxResults') !== String(size) || url.searchParams.get('q') !== gmailQuery || !url.searchParams.get('pageToken')) {
+          throw new Error('Gmail cursor does not match this exact mailbox window.');
+        }
+      }
+    } else if (account.provider === 'google') {
+      url = new URL(`${GOOGLE_API}/messages`);
+      url.searchParams.set('maxResults', String(size));
+      url.searchParams.set('q', gmailQuery);
+    } else {
+      url = new URL(`${GRAPH_API}/me/mailFolders/inbox/messages`);
+      url.searchParams.set('$top', String(size));
+      url.searchParams.set('$orderby', 'receivedDateTime desc');
+      url.searchParams.set('$filter', `receivedDateTime ge ${window.from} and receivedDateTime lt ${window.to}`);
+      url.searchParams.set('$select', 'id,conversationId,changeKey,subject,isRead,from,receivedDateTime,bodyPreview,replyTo,toRecipients,ccRecipients,internetMessageId,internetMessageHeaders');
+    }
+
+    let nextCursor: string | undefined;
+    let pageItems: MessageSummary[];
+    if (account.provider === 'google') {
+      const page = await this.json<{ messages?: Array<{ id?: string; threadId?: string }>; nextPageToken?: string }>(account, url.toString(), 'mail', undefined, options.guard, options.signal);
+      if (page.messages !== undefined && !Array.isArray(page.messages)) throw new Error('Gmail returned an invalid message page.');
+      if ((page.messages?.length ?? 0) > size) throw new Error('Gmail returned more messages than the requested page size; page was not committed.');
+      nextCursor = page.nextPageToken
+        ? `${GOOGLE_API}/messages?maxResults=${size}&q=${encodeURIComponent(gmailQuery)}&pageToken=${encodeURIComponent(page.nextPageToken)}`
+        : undefined;
+      pageItems = [];
+      const ids = page.messages ?? [];
+      for (const listed of ids) {
+        if (typeof listed.id !== 'string' || !listed.id) throw new Error('Gmail returned a message without an ID.');
+        let detail: { id?: string; threadId?: string; snippet?: string; internalDate?: string; labelIds?: string[]; payload?: { headers?: Array<{ name?: string; value?: string }> } };
+        try {
+          detail = await this.json(account, `${GOOGLE_API}/messages/${encodeURIComponent(listed.id)}?format=metadata&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=Reply-To&metadataHeaders=To&metadataHeaders=Cc&metadataHeaders=Message-ID&metadataHeaders=References&metadataHeaders=In-Reply-To`, 'mail', undefined, options.guard, options.signal);
+        } catch (error) {
+          if (error instanceof ProviderHttpError && error.status === 404) { unavailableIds.push(listed.id); continue; }
+          throw error;
+        }
+        const timestamp = typeof detail.internalDate === 'string' && /^\d{1,16}$/.test(detail.internalDate) ? Number(detail.internalDate) : NaN;
+        if (!Number.isFinite(timestamp) || !Number.isFinite(new Date(timestamp).getTime())) throw new Error('Gmail metadata has no valid internal date; page was not committed.');
+        if (detail.id !== undefined && detail.id !== listed.id) throw new Error('Gmail metadata ID does not match the listed message; page was not committed.');
+        if (Array.isArray(detail.labelIds) && !detail.labelIds.includes('INBOX')) { unavailableIds.push(listed.id); continue; }
+        if (timestamp < fromMs || timestamp >= toMs) continue;
+        const headers = boundedHeaders(detail.payload?.headers);
+        const get = (name: string) => headers.find((header) => header.name === name)?.value;
+        const from = get('from');
+        const senderEmail = narrowEmail(from);
+        const addressHeaderValues = headers.filter((header) => ['from', 'reply-to', 'to', 'cc'].includes(header.name));
+        const replyTo = parseAddressHeader(get('reply-to'));
+        const to = parseAddressHeader(get('to'));
+        const cc = parseAddressHeader(get('cc'));
+        const labelsKnown = Array.isArray(detail.labelIds);
+        const replyMetadataComplete = Boolean(labelsKnown && senderEmail && get('message-id') && headersAreComplete(detail.payload?.headers) &&
+          addressHeaderValues.every((header) => validAddressHeader(header.value)) &&
+          (get('reply-to') === undefined || replyTo !== undefined) && (get('to') === undefined || to !== undefined) && (get('cc') === undefined || cc !== undefined));
+        pageItems.push({ id: detail.id ?? listed.id, idFormat: 'gmail', threadId: detail.threadId ?? listed.threadId,
+          subject: get('subject'), from: from?.slice(0, 1000), senderEmail, receivedAt: new Date(timestamp).toISOString(),
+          snippet: detail.snippet?.slice(0, 500), isRead: labelsKnown ? !detail.labelIds!.includes('UNREAD') : undefined,
+          replyMetadataComplete, to, cc, replyTo, internetMessageId: get('message-id')?.slice(0, 1000),
+          references: get('references')?.slice(0, 2000), inReplyTo: get('in-reply-to')?.slice(0, 1000), headers });
+      }
+    } else {
+      const page = await this.json<{ value?: Array<{
+        id?: string; conversationId?: string; changeKey?: string; subject?: string; isRead?: boolean;
+        from?: { emailAddress?: { name?: string; address?: string } }; receivedDateTime?: string; bodyPreview?: string;
+        replyTo?: Array<{ emailAddress?: { address?: string } }>; toRecipients?: Array<{ emailAddress?: { address?: string } }>;
+        ccRecipients?: Array<{ emailAddress?: { address?: string } }>; internetMessageId?: string;
+        internetMessageHeaders?: Array<{ name?: string; value?: string }>;
+      }>; '@odata.nextLink'?: string }>(account, url.toString(), 'mail', undefined, options.guard, options.signal);
+      if (!Array.isArray(page.value)) throw new Error('Microsoft returned an invalid message page.');
+      if (page.value.length > size) throw new Error('Microsoft returned more messages than the requested page size; page was not committed.');
+      nextCursor = page['@odata.nextLink'];
+      if (nextCursor) safeUrl(nextCursor, account.provider, 'mail', `${GRAPH_API}/me/mailFolders/inbox/messages`);
+      pageItems = page.value.flatMap((message) => {
+        if (!message.id || typeof message.receivedDateTime !== 'string' || !Number.isFinite(Date.parse(message.receivedDateTime))) throw new Error('Microsoft metadata has no valid message ID or received date; page was not committed.');
+        const timestamp = Date.parse(message.receivedDateTime);
+        if (timestamp < fromMs || timestamp >= toMs) return [];
+        const from = message.from?.emailAddress?.address;
+        const senderEmail = narrowEmail(from);
+        const headers = boundedHeaders(message.internetMessageHeaders);
+        const replyTo = graphAddressList(message.replyTo);
+        const to = graphAddressList(message.toRecipients);
+        const cc = graphAddressList(message.ccRecipients);
+        const rawHeaders = message.internetMessageHeaders;
+        const headerMap = new Map(headers.map(({ name, value }) => [name, value]));
+        const replyMetadataComplete = Boolean(senderEmail && message.internetMessageId && message.changeKey && rawHeaders && headersAreComplete(rawHeaders) &&
+          replyTo.complete && to.complete && cc.complete);
+        return [{ id: message.id, idFormat: 'graph-immutable' as const, threadId: message.conversationId,
+          subject: message.subject?.slice(0, 1000), from: from?.slice(0, 1000), senderEmail, isRead: typeof message.isRead === 'boolean' ? message.isRead : undefined,
+          receivedAt: new Date(timestamp).toISOString(), snippet: message.bodyPreview?.slice(0, 500), replyMetadataComplete,
+          internetMessageId: message.internetMessageId?.slice(0, 1000), providerVersion: message.changeKey?.slice(0, 1000),
+          replyTo: replyTo.addresses, to: to.addresses, cc: cc.addresses,
+          references: headerMap.get('references')?.slice(0, 2000), inReplyTo: headerMap.get('in-reply-to')?.slice(0, 1000), headers }];
+      });
+    }
+    items.push(...pageItems);
+    await options.onPage?.(pageItems, nextCursor, 1, { unavailableIds: [...unavailableIds], window, queryFingerprint });
+    return { items, nextCursor, partial: Boolean(nextCursor), window, queryFingerprint, unavailableIds };
   }
 
   private async writeJson(account: Account, url: string, kind: 'mail' | 'calendar', init: RequestInit, beforeDispatch: () => void): Promise<MutationReceipt> {
@@ -350,6 +625,7 @@ export class ConnectorClient {
     try { response = await this.request(account, url, kind, init, true, undefined, () => { dispatched = true; }, undefined, beforeDispatch); }
     catch (error) { if (!dispatched) throw error; return { status: 'unknown' }; }
     if (response.status >= 500) return { status: 'unknown' };
+    if (response.status >= 400 && response.status < 500) throw new ProviderWriteRejectedError(response.status);
     if (!response.ok) throw new Error(`Provider request failed (${response.status}).`);
     const data = await response.json().catch(() => ({})) as { id?: unknown };
     return typeof data.id === 'string' && data.id ? { status: 'accepted', id: data.id } : { status: 'unknown' };
@@ -501,6 +777,7 @@ export class ConnectorClient {
     catch (error) { if (dispatched) return { status: 'unknown' }; throw error; }
     if (response.status === 202 || response.ok) return { status: 'accepted' };
     if (response.status >= 500) return { status: 'unknown' };
+    if (response.status >= 400 && response.status < 500) throw new ProviderWriteRejectedError(response.status);
     throw new Error(`Provider send failed (${response.status}).`);
   }
 

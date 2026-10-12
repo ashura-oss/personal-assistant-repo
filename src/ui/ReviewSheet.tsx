@@ -1,13 +1,17 @@
 import React, { useState } from "react";
 import { Pressable, ScrollView, Text, View } from "react-native";
 import type { Proposal } from "../core";
+import type { DispatchRecord, DispatchReconciliation } from "../dispatch";
 import { controller } from "../services/controller";
+import { DispatchHistory } from "./DispatchHistory";
 import { Button, Field, IconButton } from "./primitives";
 import { s } from "./theme";
 
 type ReviewSheetProps = {
   state: ReturnType<typeof controller.getSnapshot>;
   proposal: Proposal | null;
+  dispatchRecords: DispatchRecord[];
+  busy?: boolean;
   onClose: () => void;
   onEdit: (
     p: Partial<
@@ -27,6 +31,14 @@ type ReviewSheetProps = {
   onApprove: () => void;
   onExecute: () => void;
   onDismiss: () => void;
+  onReconcile?: (
+    recordId: string,
+    input: {
+      disposition: DispatchReconciliation;
+      note: string;
+      remoteId?: string;
+    },
+  ) => Promise<unknown>;
   sourceStale?: boolean;
   sourceChecking?: boolean;
   sourceCheckError?: string;
@@ -48,11 +60,14 @@ export function ReviewSheet(props: ReviewSheetProps) {
 function ReviewSheetContent({
   state,
   proposal,
+  dispatchRecords,
+  busy = false,
   onClose,
   onEdit,
   onApprove,
   onExecute,
   onDismiss,
+  onReconcile,
   sourceStale = false,
   sourceChecking = false,
   sourceCheckError,
@@ -203,17 +218,27 @@ function ReviewSheetContent({
         !eventEnd ||
         Date.parse(eventEnd) <= Date.parse(eventStart) ||
         !eventTimeZone.trim()));
+  const proposalDispatches = dispatchRecords.filter(
+    (record) => record.proposalId === proposal.id,
+  );
+  const receiptRecord = proposal.dispatchRecordId
+    ? dispatchRecords.find((record) => record.id === proposal.dispatchRecordId)
+    : proposalDispatches.find((record) => record.outcome !== "pending");
+  const isExternalHistory =
+    (proposal.kind === "email" || proposal.kind === "event") &&
+    !proposal.simulated;
+  const historyIncomplete =
+    isExternalHistory &&
+    !receiptRecord &&
+    (proposal.dispatchHistoryIncomplete ||
+      ["accepted", "unknown", "executed"].includes(proposal.status) ||
+      (proposal.status === "failed" && Boolean(proposal.remoteOperation)));
   if (
     ["accepted", "executed", "simulated", "dismissed", "unknown"].includes(
       proposal.status,
     )
   ) {
-    const receiptAccount = state.accounts.find(
-      (account) => account.id === proposal.accountId,
-    );
-    const receiptCalendar = state.calendars.find(
-      (calendar) => calendar.id === proposal.calendarId,
-    );
+    const receiptStatus = receiptRecord?.outcome ?? proposal.status;
     return (
       <ScrollView
         style={s.sheetBody}
@@ -228,22 +253,31 @@ function ReviewSheetContent({
           </Text>
           <IconButton name="close" label="Close review" onPress={onClose} />
         </View>
-        <Text style={s.h1Small}>{proposal.title}</Text>
+        <Text style={s.h1Small}>
+          {receiptRecord?.title ??
+            (historyIncomplete ? "Saved external action" : proposal.title)}
+        </Text>
         <Text style={s.label}>
           {proposal.status === "simulated"
             ? "LOCAL PREVIEW"
-            : proposal.status === "accepted"
-              ? `ACCEPTED BY ${receiptAccount?.provider === "google" ? "GMAIL" : receiptAccount?.provider === "microsoft" ? "MICROSOFT" : "PROVIDER"}`
-              : proposal.status === "unknown"
-                ? "OUTCOME UNKNOWN"
-                : proposal.status.toUpperCase()}
+            : historyIncomplete
+              ? "HISTORY INCOMPLETE"
+              : receiptStatus === "accepted"
+                ? `ACCEPTED BY ${receiptRecord?.account.provider === "google" ? "GMAIL" : receiptRecord?.account.provider === "microsoft" ? "MICROSOFT" : "PROVIDER"}`
+                : receiptStatus === "unknown"
+                  ? "OUTCOME UNKNOWN"
+                  : receiptStatus.toUpperCase()}
         </Text>
-        {receiptAccount ? (
-          <Text style={s.analysisSource}>
-            Account · {receiptAccount.displayName || receiptAccount.email}
-          </Text>
+        {isExternalHistory ? (
+          <DispatchHistory
+            records={proposalDispatches}
+            incomplete={historyIncomplete}
+            busy={busy}
+            onReconcile={onReconcile}
+            title="Approved details"
+          />
         ) : null}
-        {proposal.email ? (
+        {!isExternalHistory && proposal.email ? (
           <View style={s.analysisBlock}>
             <Text style={s.analysisSource}>
               {proposal.email.operation === "send"
@@ -268,11 +302,8 @@ function ReviewSheetContent({
             </Text>
           </View>
         ) : null}
-        {proposal.event ? (
+        {!isExternalHistory && proposal.event ? (
           <View style={s.analysisBlock}>
-            <Text style={s.analysisSource}>
-              Calendar · {receiptCalendar?.name ?? "Unavailable"}
-            </Text>
             <Text style={s.analysisSource}>
               {new Date(proposal.event.start).toLocaleString(undefined, {
                 timeZone: proposal.event.timeZone,
@@ -296,13 +327,15 @@ function ReviewSheetContent({
             </Text>
           </View>
         ) : null}
-        {proposal.dueAt ? (
+        {!isExternalHistory && proposal.dueAt ? (
           <Text style={s.analysisSource}>
             Scheduled · {new Date(proposal.dueAt).toLocaleString()}
           </Text>
         ) : null}
-        <Text style={s.proposalBody}>{proposal.body}</Text>
-        {proposal.remoteId ? (
+        {!isExternalHistory ? (
+          <Text style={s.proposalBody}>{proposal.body}</Text>
+        ) : null}
+        {!isExternalHistory && proposal.remoteId ? (
           <Text style={s.analysisSource}>
             Provider reference · {proposal.remoteId}
           </Text>
@@ -312,25 +345,26 @@ function ReviewSheetContent({
             Local notification reference · {proposal.notificationId}
           </Text>
         ) : null}
-        {proposal.remoteAcceptedAt ? (
+        {!isExternalHistory && proposal.remoteAcceptedAt ? (
           <Text style={s.analysisSource}>
             Accepted at · {new Date(proposal.remoteAcceptedAt).toLocaleString()}
           </Text>
         ) : null}
-        {proposal.status === "unknown" ? (
+        {proposal.status === "unknown" && !receiptRecord ? (
           <Text style={s.errorText}>
-            Check the selected provider before retrying. This action may already
-            have been accepted.
+            This action may already have been accepted. Check its status before
+            taking any further action.
           </Text>
         ) : null}
-        {proposal.lastError ? (
+        {!isExternalHistory && proposal.lastError ? (
           <Text style={s.errorText}>{proposal.lastError}</Text>
         ) : null}
-        {proposal.evidence.map((e, i) => (
-          <Text key={i} style={s.evidenceQuote}>
-            “{e.quote}”
-          </Text>
-        ))}
+        {!isExternalHistory &&
+          proposal.evidence.map((e, i) => (
+            <Text key={i} style={s.evidenceQuote}>
+              “{e.quote}”
+            </Text>
+          ))}
         <Button label="Close review" tone="quiet" onPress={onClose} />
       </ScrollView>
     );
@@ -587,6 +621,24 @@ function ReviewSheetContent({
       {proposal.lastError ? (
         <Text style={s.errorText}>{proposal.lastError}</Text>
       ) : null}
+      {proposal.status === "failed" && proposalDispatches.length ? (
+        <DispatchHistory
+          records={proposalDispatches}
+          busy={busy}
+          onReconcile={onReconcile}
+          title="Provider attempt history"
+        />
+      ) : null}
+      {proposal.status === "failed" &&
+      isExternalHistory &&
+      !proposalDispatches.length ? (
+        <DispatchHistory
+          records={[]}
+          incomplete
+          busy={busy}
+          title="Provider attempt history"
+        />
+      ) : null}
       {sourceChecking || sourceStale || sourceCheckError ? (
         <View style={s.analysisStale}>
           <Text style={s.analysisText}>
@@ -696,11 +748,7 @@ function ReviewSheetContent({
           ) : null}
         </>
       ) : null}
-      <Button
-        label="Dismiss"
-        tone="quiet"
-        onPress={onDismiss}
-      />
+      <Button label="Dismiss" tone="quiet" onPress={onDismiss} />
     </ScrollView>
   );
 }
