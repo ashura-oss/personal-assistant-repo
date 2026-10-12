@@ -1,0 +1,119 @@
+{
+  "format": "voice-assistant-export-v1",
+  "exportedAt": "2026-10-12T18:30:00.000Z",
+  "notes": [
+    {
+      "id": "sample-note-afternoon",
+      "title": "Afternoon project notes",
+      "transcript": "Morgan asked me to send the revised timeline by Friday.",
+      "audioUri": "file:///SAMPLE-ONLY/not-a-real-recording.m4a",
+      "durationSeconds": 42,
+      "createdAt": "2026-10-12T17:00:00.000Z",
+      "capturedAt": "2026-10-12T16:59:15.000Z",
+      "captureTimeZone": "Asia/Singapore"
+    },
+    {
+      "id": "sample-note-unknown-zone",
+      "title": "Old note with unknown time zone",
+      "transcript": "Remind me to call Morgan tomorrow.",
+      "durationSeconds": 0,
+      "createdAt": "2026-10-10T13:00:00.000Z",
+      "capturedAt": "2026-10-10T12:55:00.000Z"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "sample-task-send-timeline",
+      "title": "Send revised timeline",
+      "body": "Share the schedule with Morgan.",
+      "status": "open",
+      "createdAt": "2026-10-12T17:05:00.000Z",
+      "dueAt": "2026-10-16T09:00:00.000Z",
+      "sourceNoteId": "sample-note-afternoon"
+    },
+    {
+      "id": "sample-task-orphan-done",
+      "title": "Confirm room booking",
+      "body": "The source note is not in this sample backup.",
+      "status": "completed",
+      "createdAt": "2026-10-10T02:00:00.000Z",
+      "completedAt": "2026-10-10T02:30:00.000Z",
+      "sourceNoteId": "missing-source-note"
+    }
+  ],
+  "documents": [
+    {
+      "path": "memory/RULES.md",
+      "content": "# Imported sample rules\n\nUse concise project updates.\n",
+      "revision": 5,
+      "updatedAt": "2026-10-12T17:10:00.000Z"
+    },
+    {
+      "path": "notes/recovered.md",
+      "content": "# Recovered project context\n\nThis imported document stays archived until explicitly reviewed.\n",
+      "revision": 2,
+      "updatedAt": "2026-10-12T17:12:00.000Z"
+    }
+  ],
+  "proposals": [
+    {
+      "id": "sample-approved-email",
+      "kind": "email",
+      "status": "approved",
+      "title": "Email Morgan",
+      "body": "An old approved suggestion is historical only.",
+      "noteId": "sample-note-afternoon",
+      "accountId": "sample-old-account",
+      "recipients": ["morgan@sample.invalid"],
+      "email": {
+        "operation": "send",
+        "to": ["morgan@sample.invalid"],
+        "cc": [],
+        "bcc": [],
+        "subject": "Timeline",
+        "text": "Please see the schedule."
+      },
+      "createdAt": "2026-10-12T17:20:00.000Z",
+      "approvedAt": "2026-10-12T17:22:00.000Z"
+    }
+  ],
+  "dispatchRecords": [
+    {
+      "id": "sample-unknown-action",
+      "outcome": "unknown",
+      "title": "Old calendar change",
+      "body": "A historical action outcome that has not been independently verified.",
+      "dispatchStartedAt": "2026-10-12T17:30:00.000Z",
+      "remoteId": "sample-provider-reference",
+      "payload": {
+        "kind": "email",
+        "email": { "text": "Historical sample body only." }
+      }
+    }
+  ],
+  "accounts": [
+    {
+      "id": "sample-old-account",
+      "provider": "google",
+      "email": "old-reader@sample.invalid",
+      "displayName": "Old sample identity",
+      "connected": true,
+      "tokenRef": "SAMPLE-ONLY-NOT-A-TOKEN",
+      "identity": {
+        "providerNamespace": "google",
+        "clientId": "sample-client.invalid",
+        "subject": "sample-subject-never-verified"
+      }
+    }
+  ],
+  "calendars": [],
+  "settings": {
+    "mode": "provider",
+    "speechKey": "SAMPLE-ONLY-NOT-A-SECRET",
+    "openAiApiKey": "SAMPLE-ONLY-NOT-A-SECRET"
+  },
+  "usage": {
+    "attempts": 999,
+    "estimatedCostUsd": 999
+  }
+}

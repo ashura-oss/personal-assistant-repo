@@ -2,7 +2,7 @@ import * as Crypto from 'expo-crypto';
 import type {
   Account, AccountConfig, AccountSyncState, AccountCapability, ActivityItem, AppController, AppSettings, AppState,
   ForegroundMailRefreshResult, MailCoverageInterval, MailLaneResult, MailSyncWindow,
-  Calendar, CalendarConfig, ContextDocument, Note, NoteAssistResult, AssistIntent, LocalTask, Proposal, ProposalPatch,
+  BackupImportPreview, Calendar, CalendarConfig, ContextDocument, Note, NoteAssistResult, AssistIntent, LocalTask, Proposal, ProposalPatch,
   ProposalProvenance, SaveNoteInput, SettingsPatch, MailboxSnapshotMessage, CalendarEventSnapshot, OAuthInstallResult,
   NoteProposalProvenance, MailReplyProvenance, MailReplySourceSnapshot, MailReplySourceResult,
   SelectedMailTextSnapshot, MailReplyTextLoadResult, MailReplyTextCacheResult, MailReplyTextGenerationInput, MailReplyTextGenerationResult,
@@ -32,6 +32,8 @@ import { computeProactiveNextCheckAt } from '../proactive/boundaries';
 import { buildProactiveSources, proactiveStableValue, type ProactiveSourceHashMemo } from '../proactive/adapters';
 import { emptyProactiveState, normalizeProactiveData, PROACTIVE_INTEGRITY_ERROR, uncertainOnLoad, type ProactiveQuarantine } from '../proactive/state';
 import { canonicalMailReplySource, createMailReplySource, defaultReplyRecipients, replyReferences, validateMailReplySource, validateReplyBinding } from '../mailReply';
+import { BACKUP_LIMITS, canonicalPortableContent, createPortableBackup, parsePortableBackup, summarizePortableBackup, validatePortableDocumentPath, validateImportedBackupArchive } from '../backup';
+import type { ImportedBackupArchive, PortableBackupV2 } from '../backup';
 
 const now = () => new Date().toISOString();
 const ASSIST_CONTRACT_VERSION = 'assist-v2';
@@ -58,6 +60,31 @@ function isoWeek(date: string): string {
   return `${weekYear}-W${String(week).padStart(2, '0')}`;
 }
 const clone = <T,>(value: T): T => structuredClone(value);
+function stateEntityIds(state: AppState): Set<string> {
+  return new Set([
+    ...state.notes.map((item) => item.id), ...state.tasks.map((item) => item.id),
+    ...state.proposals.map((item) => item.id), ...state.activity.map((item) => item.id),
+    ...state.accounts.map((item) => item.id), ...state.calendars.map((item) => item.id),
+    ...state.mailbox.map((item) => item.id), ...state.calendarEvents.map((item) => item.id),
+    ...state.dispatchRecords.map((item) => item.id), ...state.importedBackups.flatMap((item) => [
+      item.id, ...item.noteLinks.map((link) => link.noteId), ...item.taskLinks.map((link) => link.taskId),
+      ...item.documents.map((document) => document.id), ...item.history.map((entry) => entry.id),
+    ]),
+  ]);
+}
+function allocateFreshId(usedIds: Set<string>): string {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const id = newId();
+    if (!usedIds.has(id)) { usedIds.add(id); return id; }
+  }
+  throw new Error('Could not allocate a fresh local ID for this backup operation. Try again.');
+}
+function assertPortableBackupFits(state: AppState): void {
+  const backup = createPortableBackup(state, { exportId: newId(), exportedAt: now() });
+  if (new TextEncoder().encode(JSON.stringify(backup)).length > BACKUP_LIMITS.maxBytes) {
+    throw new Error('The resulting backup would exceed the portable backup size limit. No imported data was saved.');
+  }
+}
 function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map((item) => stableJson(item)).join(',')}]`;
   if (value && typeof value === 'object') return `{${Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`).join(',')}}`;
@@ -83,7 +110,7 @@ function initialState(): AppState {
     settings: { ...DEFAULT_SETTINGS },
     usage: { month: day.slice(0, 7), day, requests: 0, attemptsToday: 0, inputTokens: 0, outputTokens: 0, transcriptionSeconds: 0, attempts: 0, unknownCharges: 0, reservedUsd: 0, priceKnown: false, estimatedCostUsd: 0 },
     mailbox: [], selectedMailTexts: [], calendarEvents: [], syncStates: {}, pendingCredentialCleanup: [], dispatchRecords: [], dispatchRecordQuarantine: [], mailboxSchemaVersion: 2,
-    proactive: emptyProactiveState(),
+    proactive: emptyProactiveState(), importedBackups: [],
   };
 }
 
@@ -453,7 +480,7 @@ function createProposalProvenance(input: {
   };
 }
 
-function normalizeLoadedState(value: unknown): AppState {
+function normalizeLoadedState(value: unknown): AppState & { backupImportQuarantine?: unknown[] } {
   const defaults = initialState();
   if (!value || typeof value !== 'object') throw new Error('Saved app data is not a valid state snapshot. It was preserved for recovery.');
   const raw = value as Partial<AppState>;
@@ -463,13 +490,27 @@ function normalizeLoadedState(value: unknown): AppState {
   }
   const rawSettings: Partial<AppSettings> = raw.settings && typeof raw.settings === 'object' ? raw.settings : {};
   const maxRequestBytes = Number.isFinite(rawSettings.maxRequestBytes) ? Math.max(4000, Math.min(96000, Math.floor(rawSettings.maxRequestBytes!))) : DEFAULT_SETTINGS.maxRequestBytes;
+  const rawArchives = (raw as Partial<AppState> & { importedBackups?: unknown }).importedBackups;
+  const backupImportQuarantine: unknown[] = [];
+  const retainedBackupQuarantine = (value as { backupImportQuarantine?: unknown }).backupImportQuarantine;
+  if (Array.isArray(retainedBackupQuarantine)) backupImportQuarantine.push(...retainedBackupQuarantine);
+  else if (retainedBackupQuarantine !== undefined) backupImportQuarantine.push(retainedBackupQuarantine);
+  const importedBackups: ImportedBackupArchive[] = [];
+  if (Array.isArray(rawArchives)) {
+    if (rawArchives.length > 50) backupImportQuarantine.push(...rawArchives);
+    else for (const candidate of rawArchives) {
+      const validated = validateImportedBackupArchive(candidate);
+      if (validated) importedBackups.push(validated); else backupImportQuarantine.push(candidate);
+    }
+  } else if (rawArchives !== undefined) backupImportQuarantine.push(rawArchives);
   const notes = raw.notes.map((note) => {
     const analysis = note.analysis ? {
       ...note.analysis,
       includedSources: Array.isArray(note.analysis.includedSources) ? note.analysis.includedSources : (note.analysis.includedSourceIds ?? []).map((id) => ({ id, title: id })),
       omittedSourceCount: Number.isFinite(note.analysis.omittedSourceCount) ? note.analysis.omittedSourceCount : (note.analysis.omittedSourceIds ?? []).length,
     } : undefined;
-    return { ...note, revision: Number.isFinite(note.revision) ? note.revision : 1, capturedAt: note.capturedAt ?? note.createdAt, captureTimeZone: validTimezone(note.captureTimeZone ?? rawSettings.timezone), analysis };
+    return { ...note, revision: Number.isFinite(note.revision) ? note.revision : 1, capturedAt: note.capturedAt ?? note.createdAt,
+      captureTimeZone: note.importOrigin?.originalTimeZoneUnknown === true ? 'UTC' : validTimezone(note.captureTimeZone ?? rawSettings.timezone), analysis };
   });
   if (raw.mailboxSchemaVersion !== 2) {
     const hasLegacyMicrosoftMailbox = raw.accounts!.some((account) => account.provider === 'microsoft');
@@ -528,7 +569,42 @@ function normalizeLoadedState(value: unknown): AppState {
   });
   const migratedTasks: LocalTask[] = proposals.filter((proposal) => proposal.kind === 'task' && ['executed', 'accepted'].includes(proposal.status) && Boolean(proposal.noteId) && Number.isSafeInteger(proposal.sourceRevision))
     .map((proposal) => ({ id: proposal.id, title: proposal.title, body: proposal.body, status: 'open', createdAt: proposal.remoteAcceptedAt ?? now(), dueAt: proposal.dueAt, sourceNoteId: proposal.noteId!, sourceRevision: proposal.sourceRevision!, proposalId: proposal.id }));
-  const savedTasks: LocalTask[] = Array.isArray(raw.tasks) ? raw.tasks : [];
+  for (const note of notes) {
+    const origin: unknown = note.importOrigin;
+    if (origin === undefined) continue;
+    if (!isRecord(origin) || origin.kind !== 'backup_import' || typeof origin.archiveId !== 'string' || typeof origin.sourceNoteId !== 'string' || typeof origin.audioMissing !== 'boolean' ||
+        (origin.originalTimeZoneUnknown !== undefined && origin.originalTimeZoneUnknown !== true) || (origin.originUnverified !== undefined && origin.originUnverified !== true)) { delete note.importOrigin; continue; }
+    const archive = importedBackups.find((item) => item.id === origin.archiveId);
+    const linked = Boolean(archive?.noteLinks.some((link) => link.noteId === note.id && link.sourceId === origin.sourceNoteId));
+    const timeZoneConfirmedAt = origin.originalTimeZoneUnknown !== true && typeof origin.timeZoneConfirmedAt === 'string' && Number.isFinite(Date.parse(origin.timeZoneConfirmedAt)) && new Date(Date.parse(origin.timeZoneConfirmedAt)).toISOString() === origin.timeZoneConfirmedAt
+      ? origin.timeZoneConfirmedAt : undefined;
+    note.importOrigin = { kind: 'backup_import', archiveId: origin.archiveId, sourceNoteId: origin.sourceNoteId, audioMissing: origin.audioMissing,
+      ...(origin.originalTimeZoneUnknown === true && !timeZoneConfirmedAt ? { originalTimeZoneUnknown: true } : {}),
+      ...(timeZoneConfirmedAt ? { timeZoneConfirmedAt } : {}), ...(!linked || origin.originUnverified === true ? { originUnverified: true } : {}) };
+  }
+  const savedTasks: LocalTask[] = [];
+  for (const candidate of (Array.isArray(raw.tasks) ? raw.tasks : []) as unknown[]) {
+    if (!isRecord(candidate) || typeof candidate.id !== 'string' || typeof candidate.title !== 'string' || typeof candidate.body !== 'string' || !['open', 'completed'].includes(String(candidate.status)) || typeof candidate.createdAt !== 'string') continue;
+    const origin = candidate.importOrigin;
+    if (isRecord(origin) && origin.kind === 'backup_import') {
+      const archive = importedBackups.find((item) => item.id === origin.archiveId);
+      if (typeof origin.archiveId !== 'string' || typeof origin.sourceTaskId !== 'string') continue;
+      const linkedTask = Boolean(archive?.taskLinks.some((link) => link.sourceId === origin.sourceTaskId && link.taskId === candidate.id));
+      const noteSource = typeof origin.originalSourceNoteId === 'string' ? origin.originalSourceNoteId : undefined;
+      const linkedNote = noteSource ? archive?.noteLinks.find((link) => link.sourceId === noteSource) : undefined;
+      if (typeof candidate.sourceNoteId === 'string' && (!linkedNote || linkedNote.noteId !== candidate.sourceNoteId)) delete candidate.sourceNoteId;
+      savedTasks.push({ id: candidate.id, title: candidate.title, body: candidate.body, status: candidate.status as 'open' | 'completed', createdAt: candidate.createdAt,
+        ...(typeof candidate.completedAt === 'string' ? { completedAt: candidate.completedAt } : {}), ...(typeof candidate.dueAt === 'string' ? { dueAt: candidate.dueAt } : {}),
+        ...(typeof candidate.sourceNoteId === 'string' ? { sourceNoteId: candidate.sourceNoteId } : {}),
+        importOrigin: { kind: 'backup_import', archiveId: origin.archiveId, sourceTaskId: origin.sourceTaskId,
+          ...(noteSource ? { originalSourceNoteId: noteSource } : {}), ...(!linkedTask || origin.originUnverified === true ? { originUnverified: true as const } : {}) } });
+      continue;
+    }
+    if (typeof candidate.sourceNoteId !== 'string' || !Number.isSafeInteger(candidate.sourceRevision) || typeof candidate.proposalId !== 'string') continue;
+    savedTasks.push({ id: candidate.id, title: candidate.title, body: candidate.body, status: candidate.status as 'open' | 'completed', createdAt: candidate.createdAt,
+      ...(typeof candidate.completedAt === 'string' ? { completedAt: candidate.completedAt } : {}), ...(typeof candidate.dueAt === 'string' ? { dueAt: candidate.dueAt } : {}),
+      sourceNoteId: candidate.sourceNoteId, sourceRevision: candidate.sourceRevision as number, proposalId: candidate.proposalId });
+  }
   const tasks = [...savedTasks, ...migratedTasks.filter((task) => !savedTasks.some((saved) => saved.id === task.id))];
   const settings = { ...DEFAULT_SETTINGS, ...rawSettings, timezone: validTimezone(rawSettings.timezone), maxRequestBytes };
   const dispatchRecords: DispatchRecord[] = [];
@@ -551,7 +627,11 @@ function normalizeLoadedState(value: unknown): AppState {
     }
   }
   return {
-    ...defaults, ...raw, notes, proposals, tasks,
+    ...defaults, ...raw, notes, proposals, tasks, importedBackups,
+    ...(backupImportQuarantine.length ? { backupImportQuarantine } : {}),
+    backupRecoveryStatus: backupImportQuarantine.length
+      ? { quarantinedArchiveCount: backupImportQuarantine.length, message: 'Some imported backup archive data could not be validated and is held privately.' as const }
+      : undefined,
     selectedMailTexts: Array.isArray(raw.selectedMailTexts)
       ? raw.selectedMailTexts.filter(validSelectedMailTextSnapshot).slice(0, 20)
       : [],
@@ -629,6 +709,24 @@ export interface ControllerIntegrationDependencies {
   ) => ConnectorClient;
 }
 
+interface BackupImportSession {
+  preview: BackupImportPreview;
+  backup: PortableBackupV2;
+  capturedState: AppState;
+  capturedStateJson: string;
+  preparedAtMs: number;
+  archiveId: string;
+  existingArchiveId?: string;
+  noteIds: Record<string, string>;
+  taskIds: Record<string, string>;
+  taskLinkRepairs: Record<string, { sourceNoteId: string; oldNoteId?: string }>;
+  missingNoteSourceIds: string[];
+  missingTaskSourceIds: string[];
+  documentIds: Record<string, string>;
+  historyIds: Record<string, string>;
+  appliedArchiveId?: string;
+}
+
 export class AppControllerImpl implements AppController {
   private state = initialState();
   private snapshot = deepFreeze(clone(this.state));
@@ -654,9 +752,11 @@ export class AppControllerImpl implements AppController {
   private credentialCleanupJob?: Promise<void>;
   private installingTokenRefs = new Set<string>();
   private proactiveQuarantine?: ProactiveQuarantine;
+  private backupImportQuarantine: unknown[] = [];
   private proactiveSourceHashMemo: ProactiveSourceHashMemo = new Map();
   private mailReplyGenerations = new Map<string, { messageId: string; promise: Promise<MailReplyTextGenerationResult> }>();
   private mailReplyGenerationCache = new Map<string, MailReplyTextGenerationResult>();
+  private backupImportSessions = new Map<string, BackupImportSession>();
 
   constructor(
     private readonly store: StateStore = stateStore,
@@ -678,13 +778,16 @@ export class AppControllerImpl implements AppController {
   private emit(): void { for (const listener of this.listeners) listener(this.snapshot); }
 
   private persistedState(state: AppState): AppState {
-    if (!this.proactiveQuarantine) return state;
-    return { ...state, proactiveQuarantine: clone(this.proactiveQuarantine) } as AppState;
+    const result = { ...state } as AppState & { proactiveQuarantine?: unknown; backupImportQuarantine?: unknown[] };
+    if (this.proactiveQuarantine) result.proactiveQuarantine = clone(this.proactiveQuarantine);
+    if (this.backupImportQuarantine.length) result.backupImportQuarantine = clone(this.backupImportQuarantine);
+    return result;
   }
 
   private publicState(state: AppState): AppState {
-    const result = clone(state) as AppState & { proactiveQuarantine?: unknown };
+    const result = clone(state) as AppState & { proactiveQuarantine?: unknown; backupImportQuarantine?: unknown };
     delete result.proactiveQuarantine;
+    delete result.backupImportQuarantine;
     return result;
   }
 
@@ -1124,7 +1227,10 @@ export class AppControllerImpl implements AppController {
 
   private async loadInternal(): Promise<void> {
     const loaded = await this.store.load();
-    this.state = loaded ? normalizeLoadedState(loaded) : initialState();
+    const normalized = loaded ? normalizeLoadedState(loaded) : initialState();
+    this.backupImportQuarantine = clone((normalized as AppState & { backupImportQuarantine?: unknown[] }).backupImportQuarantine ?? []);
+    delete (normalized as AppState & { backupImportQuarantine?: unknown[] }).backupImportQuarantine;
+    this.state = normalized;
     const persisted = loaded as (AppState & { proactiveQuarantine?: unknown }) | undefined;
     const proactive = normalizeProactiveData(persisted?.proactive, persisted?.proactiveQuarantine);
     this.proactiveQuarantine = proactive.quarantine;
@@ -1232,7 +1338,42 @@ export class AppControllerImpl implements AppController {
     return result;
   }
 
+  async confirmImportedNoteTimeZone(noteId: string, input: { timeZone: string; expectedRevision: number }): Promise<Note> {
+    await this.load();
+    if (!input || typeof input.timeZone !== 'string' || input.timeZone.length > 128 || !Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 1) {
+      throw new Error('Time zone confirmation is invalid. Choose a valid IANA time zone and the current note revision.');
+    }
+    const timeZone = input.timeZone.trim();
+    if (!timeZone || timeZone !== input.timeZone) throw new Error('Enter a canonical IANA time zone name.');
+    try { new Intl.DateTimeFormat('en-US', { timeZone }).format(new Date(0)); }
+    catch { throw new Error('Enter a valid IANA time zone, such as Asia/Singapore or America/Los_Angeles.'); }
+    return this.mutate((state) => {
+      const note = state.notes.find((item) => item.id === noteId);
+      if (!note) throw new Error('Note was not found.');
+      if (note.revision !== input.expectedRevision) throw new Error('The note changed before time zone confirmation. Review its current revision and try again.');
+      if (note.importOrigin?.kind !== 'backup_import' || note.importOrigin.originalTimeZoneUnknown !== true) {
+        throw new Error('This note does not need an original time zone confirmation.');
+      }
+      note.captureTimeZone = timeZone;
+      note.revision += 1;
+      note.processingFingerprint = undefined;
+      const { originalTimeZoneUnknown: _unknownZone, ...confirmedOrigin } = note.importOrigin;
+      note.importOrigin = { ...confirmedOrigin, timeZoneConfirmedAt: now() };
+      if (note.analysis) note.analysis.stale = true;
+      for (const proposal of state.proposals.filter((item) => item.noteId === note.id && ['draft', 'approved', 'failed'].includes(item.status))) {
+        this.invalidate(proposal);
+        proposal.status = 'draft';
+      }
+      addActivity(state, 'local_action', `Confirmed the capture time zone for imported note “${note.title}”.`, { noteId: note.id });
+      return note;
+    });
+  }
+
   async processNote(id: string): Promise<Proposal[]> {
+    await this.load();
+    const note = this.snapshot.notes.find((item) => item.id === id);
+    if (!note) throw new Error('Note was not found.');
+    this.requireConfirmedCaptureTimeZone(note);
     const existing = this.processJobs.get(id);
     if (existing) return existing;
     const job = this.assistNote(id, { intent: 'assist' }).then((analysis) => {
@@ -1313,6 +1454,7 @@ export class AppControllerImpl implements AppController {
     const state = this.snapshot;
     const note = state.notes.find((item) => item.id === id);
     if (!note) throw new Error('Note was not found.');
+    this.requireConfirmedCaptureTimeZone(note);
     if (!note.transcript.trim()) throw new Error('This audio note has no transcript. Enter text or connect the speech provider before processing.');
     const sourceRevision = note.revision;
     const { documents: contextDocs, additionalSources: localSources, omittedSourceCount, omittedSourceIds } = assistContext(state, note, intent, question);
@@ -2368,6 +2510,12 @@ export class AppControllerImpl implements AppController {
     return job;
   }
 
+  private requireConfirmedCaptureTimeZone(note: Note): void {
+    if (note.importOrigin?.originalTimeZoneUnknown === true) {
+      throw new Error('Confirm this imported note’s original time zone before running Assist or using it as reply context. The displayed UTC value is only a fallback.');
+    }
+  }
+
   async getMailReplySource(messageId: string): Promise<MailReplySourceResult> {
     await this.load();
     const captured = this.snapshot;
@@ -2662,6 +2810,7 @@ export class AppControllerImpl implements AppController {
     if (input.noteId) {
       const selectedNote = state.notes.find((item) => item.id === input.noteId);
       if (!selectedNote || selectedNote.revision !== input.noteRevision || !selectedNote.transcript.trim()) throw new Error('The selected note changed or has no transcript. Reopen the picker and select it again.');
+      this.requireConfirmedCaptureTimeZone(selectedNote);
       noteContext = selectedNote.transcript;
       noteCapture = { capturedAt: selectedNote.capturedAt ?? selectedNote.createdAt, timeZone: selectedNote.captureTimeZone ?? state.settings.timezone };
     } else if (input.noteRevision !== undefined) throw new Error('A note revision was supplied without a selected note.');
@@ -3227,8 +3376,267 @@ export class AppControllerImpl implements AppController {
   }
 
   async exportData(): Promise<string> {
-    const { pendingCredentialCleanup: _cleanup, dispatchRecordQuarantine: _quarantine, ...userState } = clone(this.snapshot);
-    return JSON.stringify({ format: 'voice-assistant-export-v1', exportedAt: now(), ...userState }, null, 2);
+    const backup = createPortableBackup(this.snapshot, { exportId: newId(), exportedAt: now() });
+    const serialized = JSON.stringify(backup);
+    if (new TextEncoder().encode(serialized).length > BACKUP_LIMITS.maxBytes) throw new Error('The portable backup exceeds the supported file size. No data was exported.');
+    return serialized;
+  }
+
+  async prepareBackupImport(input: string | Uint8Array): Promise<BackupImportPreview> {
+    if (typeof input !== 'string' && !(input instanceof Uint8Array)) throw new Error('Choose a supported backup file.');
+    if ((typeof input === 'string' && input.length > BACKUP_LIMITS.maxBytes) ||
+        (input instanceof Uint8Array && input.byteLength > BACKUP_LIMITS.maxBytes)) {
+      throw new Error('Backup file exceeds the allowed size.');
+    }
+    const frozenInput: string | Uint8Array = typeof input === 'string' ? input : new Uint8Array(input);
+    const parsed = parsePortableBackup(frozenInput);
+    const fileText = typeof frozenInput === 'string' ? frozenInput : new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(frozenInput);
+    await this.load();
+    const capturedSnapshot = this.snapshot;
+    const capturedStateJson = stableJson(capturedSnapshot);
+    const backup = parsed.backup;
+    const summary = summarizePortableBackup(backup, capturedSnapshot.documents);
+    const hash = async (value: string) => Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, value, { encoding: Crypto.CryptoEncoding.HEX });
+    const fileHash = await hash(fileText);
+    const contentHash = await hash(canonicalPortableContent(backup));
+    const usedIds = stateEntityIds(capturedSnapshot);
+    const allocateId = () => allocateFreshId(usedIds);
+    const existingArchive = capturedSnapshot.importedBackups.find((item) => item.contentHash === contentHash);
+    const noteIds = Object.create(null) as Record<string, string>;
+    const missingNotes = backup.notes.filter((item) => {
+      const link = existingArchive?.noteLinks.find((candidate) => candidate.sourceId === item.sourceId);
+      const note = link && capturedSnapshot.notes.find((candidate) => candidate.id === link.noteId);
+      const present = Boolean(note && note.importOrigin?.kind === 'backup_import' &&
+        note.importOrigin.archiveId === existingArchive?.id && note.importOrigin.sourceNoteId === item.sourceId);
+      if (present) noteIds[item.sourceId] = link!.noteId;
+      else noteIds[item.sourceId] = allocateId();
+      return !present;
+    });
+    const missingNoteSourceIds = new Set(missingNotes.map((item) => item.sourceId));
+    const taskIds = Object.create(null) as Record<string, string>;
+    const missingTasks = backup.tasks.filter((item) => {
+      const link = existingArchive?.taskLinks.find((candidate) => candidate.sourceId === item.sourceId);
+      const task = link && capturedSnapshot.tasks.find((candidate) => candidate.id === link.taskId);
+      const present = Boolean(task && task.importOrigin?.kind === 'backup_import' &&
+        task.importOrigin.archiveId === existingArchive?.id && task.importOrigin.sourceTaskId === item.sourceId);
+      if (present) taskIds[item.sourceId] = link!.taskId;
+      else taskIds[item.sourceId] = allocateId();
+      return !present;
+    });
+    const taskLinkRepairs = Object.create(null) as Record<string, { sourceNoteId: string; oldNoteId?: string }>;
+    const taskLinkRepairLabels: string[] = [];
+    if (existingArchive) for (const item of backup.tasks) {
+      if (!item.sourceNoteId || !missingNoteSourceIds.has(item.sourceNoteId) || taskIds[item.sourceId] !== existingArchive.taskLinks.find((link) => link.sourceId === item.sourceId)?.taskId) continue;
+      const task = capturedSnapshot.tasks.find((candidate) => candidate.id === taskIds[item.sourceId]);
+      if (!task || task.importOrigin?.kind !== 'backup_import' || task.importOrigin.archiveId !== existingArchive.id || task.importOrigin.sourceTaskId !== item.sourceId) continue;
+      const oldNoteLink = existingArchive.noteLinks.find((link) => link.sourceId === item.sourceNoteId);
+      const oldNoteStillExists = oldNoteLink && capturedSnapshot.notes.some((note) => note.id === oldNoteLink.noteId);
+      if (task.sourceNoteId === undefined || (oldNoteLink && task.sourceNoteId === oldNoteLink.noteId && !oldNoteStillExists)) {
+        taskLinkRepairs[item.sourceId] = { sourceNoteId: item.sourceNoteId, ...(oldNoteLink ? { oldNoteId: oldNoteLink.noteId } : {}) };
+        taskLinkRepairLabels.push(item.title);
+      }
+    }
+    const archiveId = existingArchive?.id ?? allocateId();
+    const documentIds = existingArchive ? {} : Object.fromEntries([
+      ...backup.documents.map((item) => [`document:${item.path}`, allocateId()] as const),
+      ...backup.archivedDocuments.map((item) => [`archived:${item.sourceId}`, allocateId()] as const),
+    ]);
+    const historyIds = Object.create(null) as Record<string, string>;
+    if (!existingArchive) for (const item of backup.history) historyIds[item.sourceId] = allocateId();
+    const sessionId = allocateId();
+    const planFields = {
+      fileHash, contentHash, sourceFormat: parsed.migratedFromV1 ? 'voice-assistant-export-v1' : backup.format,
+      archiveId, existingArchiveId: existingArchive?.id, noteIds, taskIds, taskLinkRepairs, documentIds, historyIds, capturedStateJson,
+      missingNoteSourceIds: missingNotes.map((item) => item.sourceId), missingTaskSourceIds: missingTasks.map((item) => item.sourceId),
+      documentConflicts: summary.documentConflicts,
+    };
+    const planHash = await hash(stableJson(planFields));
+    if (this.snapshot !== capturedSnapshot || stableJson(this.snapshot) !== capturedStateJson) {
+      throw new Error('App data changed while the backup preview was being prepared. Open a fresh preview.');
+    }
+    const preparedAtMs = Date.now();
+    for (const [id, session] of this.backupImportSessions) {
+      if (preparedAtMs < session.preparedAtMs || preparedAtMs - session.preparedAtMs > 15 * 60_000) this.backupImportSessions.delete(id);
+    }
+    while (this.backupImportSessions.size >= 2) {
+      const oldest = this.backupImportSessions.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.backupImportSessions.delete(oldest);
+    }
+    const preview: BackupImportPreview = {
+      sessionId, fileHash, contentHash, planHash,
+      sourceFormat: parsed.migratedFromV1 ? 'voice-assistant-export-v1' : backup.format,
+      exportedAt: backup.exportedAt, ...summary, warnings: [...parsed.warnings], ignoredFieldCount: parsed.ignoredFieldCount,
+      missingNoteCount: missingNotes.length, missingTaskCount: missingTasks.length,
+      missingNoteLabels: missingNotes.map((item) => item.title || 'Untitled note'),
+      missingTaskLabels: missingTasks.map((item) => item.title || 'Untitled task'),
+      taskLinkRepairCount: taskLinkRepairLabels.length, taskLinkRepairLabels,
+      alreadyImported: Boolean(existingArchive),
+    };
+    this.backupImportSessions.set(sessionId, {
+      preview, backup, capturedState: capturedSnapshot, capturedStateJson, preparedAtMs, archiveId,
+      existingArchiveId: existingArchive?.id, noteIds, taskIds, taskLinkRepairs,
+      missingNoteSourceIds: missingNotes.map((item) => item.sourceId), missingTaskSourceIds: missingTasks.map((item) => item.sourceId),
+      documentIds, historyIds,
+    });
+    return clone(preview);
+  }
+
+  async applyBackupImport(input: { sessionId: string; planHash: string }): Promise<ImportedBackupArchive> {
+    await this.load();
+    if (!input || typeof input.sessionId !== 'string' || !/^[a-f\d]{64}$/i.test(input.planHash)) throw new Error('Backup preview confirmation is invalid.');
+    const session = this.backupImportSessions.get(input.sessionId);
+    if (!session || session.preview.planHash !== input.planHash) throw new Error('Backup preview is missing or no longer matches. Prepare a new preview.');
+    const time = Date.now();
+    if (time < session.preparedAtMs || time - session.preparedAtMs >= 15 * 60_000) throw new Error('Backup preview expired. Prepare a new preview.');
+    const archive = await this.mutateIfChanged((state) => {
+      const applyTime = Date.now();
+      if (applyTime < session.preparedAtMs || applyTime - session.preparedAtMs >= 15 * 60_000) throw new Error('Backup preview expired. Prepare a new preview.');
+      const alreadyImported = state.importedBackups.find((item) => item.contentHash === session.preview.contentHash);
+      // A second click on the same plan (or an equivalent preview) is an idempotent no-op
+      // once every linked item is again present with its matching import origin.
+      const complete = Boolean(alreadyImported && session.backup.notes.every((item) => {
+        const link = alreadyImported.noteLinks.find((candidate) => candidate.sourceId === item.sourceId);
+        const note = link && state.notes.find((candidate) => candidate.id === link.noteId);
+        return Boolean(note && note.importOrigin?.kind === 'backup_import' && note.importOrigin.archiveId === alreadyImported.id && note.importOrigin.sourceNoteId === item.sourceId);
+      }) && session.backup.tasks.every((item) => {
+        const link = alreadyImported.taskLinks.find((candidate) => candidate.sourceId === item.sourceId);
+        const task = link && state.tasks.find((candidate) => candidate.id === link.taskId);
+        return Boolean(task && task.importOrigin?.kind === 'backup_import' && task.importOrigin.archiveId === alreadyImported.id && task.importOrigin.sourceTaskId === item.sourceId);
+      }));
+      if (complete) return { changed: false, result: alreadyImported! };
+      if (stableJson(this.publicState(state)) !== session.capturedStateJson) throw new Error('App data changed after the backup preview. Prepare a new preview before restoring.');
+      if (this.snapshot !== session.capturedState) throw new Error('App data changed after the backup preview. Prepare a new preview before restoring.');
+      if (!alreadyImported && state.importedBackups.length + this.backupImportQuarantine.length >= 50) throw new Error('The imported archive limit is 50. Export your existing backups or resolve the backup recovery issue before importing another.');
+      const backup = session.backup;
+      const currentArchive = alreadyImported;
+      const noteLinks = currentArchive ? [...currentArchive.noteLinks] : [];
+      for (const item of backup.notes) if (!noteLinks.some((link) => link.sourceId === item.sourceId)) noteLinks.push({ sourceId: item.sourceId, noteId: session.noteIds[item.sourceId] });
+      for (const item of backup.notes) {
+        const existingLink = noteLinks.find((link) => link.sourceId === item.sourceId)!;
+        if (session.missingNoteSourceIds.includes(item.sourceId)) existingLink.noteId = session.noteIds[item.sourceId];
+      }
+      const noteIdMap = new Map(noteLinks.map((link) => [link.sourceId, link.noteId]));
+      const notes: Note[] = backup.notes.filter((item) => session.missingNoteSourceIds.includes(item.sourceId)).map((item) => {
+        const originalTimeZoneUnknown = item.originalTimeZoneUnknown === true || !item.captureTimeZone;
+        return {
+          id: session.noteIds[item.sourceId], title: item.title, transcript: item.transcript, durationSeconds: item.durationSeconds,
+          createdAt: item.createdAt, capturedAt: item.capturedAt ?? item.createdAt,
+          captureTimeZone: item.captureTimeZone ?? 'UTC', status: 'recorded', revision: 1,
+          importOrigin: { kind: 'backup_import', archiveId: session.archiveId, sourceNoteId: item.sourceId,
+            audioMissing: item.audioMissing === true, ...(originalTimeZoneUnknown ? { originalTimeZoneUnknown: true as const } : {}) },
+        };
+      });
+      const taskLinks = currentArchive ? [...currentArchive.taskLinks] : [];
+      for (const item of backup.tasks) if (!taskLinks.some((link) => link.sourceId === item.sourceId)) taskLinks.push({ sourceId: item.sourceId, taskId: session.taskIds[item.sourceId] });
+      for (const item of backup.tasks) if (session.missingTaskSourceIds.includes(item.sourceId)) {
+        taskLinks.find((link) => link.sourceId === item.sourceId)!.taskId = session.taskIds[item.sourceId];
+      }
+      const tasks: LocalTask[] = backup.tasks.filter((item) => session.missingTaskSourceIds.includes(item.sourceId)).map((item) => ({
+        id: session.taskIds[item.sourceId], title: item.title, body: item.body, status: item.status, createdAt: item.createdAt,
+        ...(item.completedAt ? { completedAt: item.completedAt } : {}), ...(item.dueAt ? { dueAt: item.dueAt } : {}),
+          ...(item.sourceNoteId && noteIdMap.has(item.sourceNoteId) ? { sourceNoteId: noteIdMap.get(item.sourceNoteId)! } : {}),
+        importOrigin: { kind: 'backup_import', archiveId: session.archiveId, sourceTaskId: item.sourceId,
+          ...(item.unresolvedSourceNoteId || item.sourceNoteId ? { originalSourceNoteId: item.unresolvedSourceNoteId ?? item.sourceNoteId } : {}) },
+      }));
+      const documents = [
+        ...backup.documents.map((item) => ({ ...item, id: session.documentIds[`document:${item.path}`] })),
+        ...backup.archivedDocuments.map((item) => ({ path: item.path, content: item.content, revision: item.revision, updatedAt: item.updatedAt, id: session.documentIds[`archived:${item.sourceId}`] })),
+      ];
+      const history: ImportedBackupArchive['history'] = backup.history.map((item) => ({
+        ...item, id: session.historyIds[item.sourceId], ...(item.sourceNoteId && noteIdMap.has(item.sourceNoteId) ? { localNoteId: noteIdMap.get(item.sourceNoteId)! } : {}),
+      }));
+      const created: ImportedBackupArchive = currentArchive ?? {
+        id: session.archiveId, contentHash: session.preview.contentHash, fileHash: session.preview.fileHash,
+        sourceFormat: session.preview.sourceFormat, exportedAt: backup.exportedAt, importedAt: now(),
+        noteLinks: [], taskLinks: [], documents: [], history: [],
+      };
+      if (currentArchive) {
+        currentArchive.noteLinks = noteLinks;
+        currentArchive.taskLinks = taskLinks;
+      } else {
+        created.noteLinks = noteLinks;
+        created.taskLinks = taskLinks;
+        created.documents = documents;
+        created.history = history;
+      }
+      const restoredNoteIds = new Set(notes.map((note) => note.id));
+      for (const [sourceTaskId, repair] of Object.entries(session.taskLinkRepairs)) {
+        const item = backup.tasks.find((candidate) => candidate.sourceId === sourceTaskId);
+        const taskLink = taskLinks.find((candidate) => candidate.sourceId === sourceTaskId);
+        const task = taskLink && state.tasks.find((candidate) => candidate.id === taskLink.taskId);
+        const restoredNoteId = noteIdMap.get(repair.sourceNoteId);
+        if (!item || item.sourceNoteId !== repair.sourceNoteId || !task || task.importOrigin?.kind !== 'backup_import' ||
+            task.importOrigin.archiveId !== created.id || task.importOrigin.sourceTaskId !== sourceTaskId || !restoredNoteId || !restoredNoteIds.has(restoredNoteId)) continue;
+        const repairStillSafe = task.sourceNoteId === undefined || (repair.oldNoteId === task.sourceNoteId && !state.notes.some((note) => note.id === repair.oldNoteId));
+        if (repairStillSafe) task.sourceNoteId = restoredNoteId;
+      }
+      state.notes.unshift(...notes);
+      state.tasks.unshift(...tasks);
+      if (!currentArchive) state.importedBackups.push(created);
+      if (notes.length || tasks.length || Object.keys(session.taskLinkRepairs).length) {
+        addActivity(state, 'local_action', `Restored ${notes.length} note${notes.length === 1 ? '' : 's'} and ${tasks.length} task${tasks.length === 1 ? '' : 's'} from an imported backup.`);
+      }
+      assertPortableBackupFits(state);
+      return { changed: true, result: created };
+    });
+    session.appliedArchiveId = archive.id;
+    return archive;
+  }
+
+  async activateImportedDocument(input: {
+    archiveId: string; documentId: string; destinationPath: string; contentDigest: string;
+    expectedCurrentRevision?: number; replaceConfirmed: boolean;
+  }): Promise<{ status: 'activated' | 'unchanged'; document: ContextDocument; mirrorPending: boolean }> {
+    await this.load();
+    if (!input || typeof input.archiveId !== 'string' || typeof input.documentId !== 'string' ||
+        typeof input.replaceConfirmed !== 'boolean' || !/^[a-f\d]{64}$/i.test(input.contentDigest) ||
+        (input.expectedCurrentRevision !== undefined && (!Number.isSafeInteger(input.expectedCurrentRevision) || input.expectedCurrentRevision < 1))) {
+      throw new Error('Document activation confirmation is invalid.');
+    }
+    const destinationPath = validatePortableDocumentPath(input.destinationPath);
+    const captured = this.snapshot;
+    const archive = captured.importedBackups.find((item) => item.id === input.archiveId);
+    const archived = archive?.documents.find((item) => item.id === input.documentId);
+    if (!archive || !archived) throw new Error('The archived document is no longer available.');
+    const contentDigest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, archived.content, { encoding: Crypto.CryptoEncoding.HEX });
+    if (contentDigest.toLowerCase() !== input.contentDigest.toLowerCase()) throw new Error('The archived document content changed. Reopen the preview before activating it.');
+    if (captured !== this.snapshot) throw new Error('App data changed during document verification. Reopen the archive and try again.');
+    const result = await this.mutate((state) => {
+      if (this.snapshot !== captured || stableJson(this.publicState(state)) !== stableJson(captured)) throw new Error('App data changed before document activation. Reopen the archive and try again.');
+      const currentArchive = state.importedBackups.find((item) => item.id === input.archiveId);
+      const current = currentArchive?.documents.find((item) => item.id === input.documentId);
+      if (!currentArchive || !current || current.content !== archived.content || current.path !== archived.path) throw new Error('The archived document changed before activation.');
+      const existing = state.documents.find((item) => item.path.toLocaleLowerCase('en-US') === destinationPath.toLocaleLowerCase('en-US'));
+      if (existing && existing.path !== destinationPath) throw new Error('A case-colliding document path already exists. Choose its exact path or a different destination.');
+      if (existing?.content === current.content) {
+        if (input.expectedCurrentRevision !== undefined && input.expectedCurrentRevision !== existing.revision) {
+          throw new Error('The destination document changed since the preview. Reopen the archive and try again.');
+        }
+        if (input.expectedCurrentRevision === undefined && current.activatedPath !== destinationPath) {
+          throw new Error('Review the existing destination revision before confirming activation.');
+        }
+        current.activatedPath = destinationPath;
+        current.activatedAt ??= now();
+        return { status: 'unchanged' as const, document: existing };
+      }
+      if (existing) {
+        if (!input.replaceConfirmed || input.expectedCurrentRevision !== existing.revision) throw new Error('This document changed or needs explicit replacement confirmation. Review the current content and try again.');
+        if (currentArchive.documents.length >= 1000) throw new Error('The archive has reached its document preservation limit. Export it before replacing this document.');
+        currentArchive.documents.push({ id: allocateFreshId(stateEntityIds(state)), path: existing.path, content: existing.content, revision: existing.revision, updatedAt: existing.updatedAt });
+      } else if (input.expectedCurrentRevision !== undefined) {
+        throw new Error('The destination document no longer exists at the revision shown. Reopen the archive and try again.');
+      }
+      const document: ContextDocument = { path: destinationPath, content: current.content, revision: (existing?.revision ?? 0) + 1, updatedAt: now() };
+      if (existing) Object.assign(existing, document); else state.documents.unshift(document);
+      current.activatedPath = destinationPath;
+      current.activatedAt = now();
+      markAnalysesStale(state, [`doc:${destinationPath}`]);
+      assertPortableBackupFits(state);
+      return { status: 'activated' as const, document };
+    });
+    await this.mirrorDocument(result.document);
+    return { ...result, mirrorPending: this.mirrorDirty.has(result.document.path) };
   }
 
   async deleteNote(id: string): Promise<void> {

@@ -45,11 +45,14 @@ export function TasksSection({ tasks, busy, onComplete, onReopen }: Props) {
         visible.map((task) => (
           <View key={task.id} style={s.taskCard}>
             <View style={s.taskCopy}>
-              <Text style={s.taskTitle}>{task.title}</Text>
+              <Text style={s.taskTitle}>
+                {task.importOrigin?.kind === "backup_import" ? `Imported · ${task.title}` : task.title}
+              </Text>
               {task.body ? <Text style={s.taskBody}>{task.body}</Text> : null}
               <Text style={s.analysisSource}>
-                From a saved note ·{" "}
-                {new Date(task.createdAt).toLocaleDateString()}
+                {task.importOrigin?.kind === "backup_import"
+                  ? `Imported task · ${new Date(task.createdAt).toLocaleDateString()}`
+                  : `From a saved note · ${new Date(task.createdAt).toLocaleDateString()}`}
               </Text>
               {task.dueAt ? (
                 <Text style={s.analysisSource}>

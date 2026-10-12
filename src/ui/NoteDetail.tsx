@@ -11,8 +11,18 @@ import type { AssistIntent, Note, NoteAssistResult, Proposal } from "../core";
 import { Button, Field, IconButton } from "./primitives";
 import { C, s } from "./theme";
 
+function validTimeZone(value: string) {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: value.trim() }).format();
+    return Boolean(value.trim());
+  } catch {
+    return false;
+  }
+}
+
 type Props = {
   note: Note;
+  importedAudioMissing?: boolean;
   analysis?: NoteAssistResult;
   proposals: Proposal[];
   busy: boolean;
@@ -23,6 +33,7 @@ type Props = {
   onRetryStatus: () => void;
   onClose: () => void;
   onUpdate: (text: string) => void;
+  onConfirmImportedTimeZone: (timeZone: string) => void;
   onAssist: (options: {
     intent: AssistIntent;
     question?: string;
@@ -44,6 +55,7 @@ const intents: { key: AssistIntent; label: string }[] = [
 
 export function NoteDetail({
   note,
+  importedAudioMissing = false,
   analysis,
   proposals,
   busy,
@@ -54,6 +66,7 @@ export function NoteDetail({
   onRetryStatus,
   onClose,
   onUpdate,
+  onConfirmImportedTimeZone,
   onAssist,
   onOpenProposals,
   onTranscribe,
@@ -62,6 +75,9 @@ export function NoteDetail({
   onDelete,
 }: Props) {
   const [text, setText] = useState(note.transcript);
+  const [importedTimeZone, setImportedTimeZone] = useState(
+    Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
+  );
   const [intent, setIntent] = useState<AssistIntent>(
     analysis?.intent ?? "assist",
   );
@@ -70,6 +86,7 @@ export function NoteDetail({
   const [showCitations, setShowCitations] = useState(false);
   const [showContext, setShowContext] = useState(false);
   const dirty = text !== note.transcript;
+  const timeZoneUnconfirmed = note.importOrigin?.originalTimeZoneUnknown === true;
   const effectiveIntent: AssistIntent = question.trim() ? "answer" : intent;
   const includedContext =
     analysis?.includedSources.filter((source) => source.id !== "transcript") ??
@@ -87,6 +104,7 @@ export function NoteDetail({
     Boolean(text.trim()) &&
     !dirty &&
     !busy &&
+      !timeZoneUnconfirmed &&
     !(effectiveIntent === "answer" && !question.trim());
   const reviewableProposalCount = analysisIsStale
     ? 0
@@ -122,16 +140,39 @@ export function NoteDetail({
         </View>
         <Text style={s.kicker}>SAVED LOCALLY</Text>
         <Text style={s.analysisSource}>
-          Captured{" "}
-          {new Date(note.capturedAt ?? note.createdAt).toLocaleString(
-            undefined,
-            note.captureTimeZone
-              ? { timeZone: note.captureTimeZone }
-              : undefined,
-          )}
-          {note.captureTimeZone ? ` · ${note.captureTimeZone}` : ""}
+          {note.importOrigin?.originalTimeZoneUnknown
+            ? `Imported timestamp ${note.capturedAt ?? note.createdAt} · original time zone unavailable`
+            : `Captured ${new Date(note.capturedAt ?? note.createdAt).toLocaleString(
+                undefined,
+                note.captureTimeZone
+                  ? { timeZone: note.captureTimeZone }
+                  : undefined,
+              )}${note.captureTimeZone ? ` · ${note.captureTimeZone}` : ""}`}
         </Text>
         <Text style={s.h1Small}>A thought, kept.</Text>
+        {importedAudioMissing ? (
+          <Text style={s.disclaimer}>
+            Imported note · its original recording was not included in the backup.
+          </Text>
+        ) : null}
+        {timeZoneUnconfirmed ? (
+          <View style={s.analysisStale}>
+            <Text style={s.analysisText}>
+              The original capture time zone was not included. Confirm the IANA time zone before Still uses this note for date-sensitive assistance.
+            </Text>
+            <Field
+              label="IANA capture time zone"
+              value={importedTimeZone}
+              onChangeText={setImportedTimeZone}
+              placeholder="Asia/Singapore"
+            />
+            <Button
+              label="Confirm capture time zone"
+              disabled={busy || !validTimeZone(importedTimeZone)}
+              onPress={() => onConfirmImportedTimeZone(importedTimeZone.trim())}
+            />
+          </View>
+        ) : null}
         {note.audioUri ? (
           <>
             <Button

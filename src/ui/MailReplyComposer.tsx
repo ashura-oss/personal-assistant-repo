@@ -348,6 +348,9 @@ export function MailReplyComposer({
       bodySnapshot.bytes <= TEXT_LIMIT &&
       (bodySnapshot.completeness === "complete_text" || useSavedExcerpt),
   );
+  const selectedNoteTimeZoneUnconfirmed = Boolean(
+    selectedNote?.importOrigin?.originalTimeZoneUnknown,
+  );
 
   return (
     <Modal visible={visible} animationType="slide" onRequestClose={onClose} presentationStyle="fullScreen">
@@ -408,7 +411,8 @@ export function MailReplyComposer({
             <Text style={styles.disclaimer}>Before Generate, the request uses the checked text shown above, recipients, this brief, the note you selected, and the saved guidance shown here. The brief and selected note together are limited to 4 KB; message text is limited to 16 KB, within the app&apos;s request byte limit.</Text>
 
             {demoMode ? <Text style={styles.demoBadge}>SAMPLE AI REPLY · NO API USED</Text> : null}
-            <Button label={generating ? "Generating reply…" : "Generate reply"} disabled={busy || checking || loadingText || generating || !selectedTextUsable || !source || !parsedTo.length || combinedBriefBytes > BRIEF_LIMIT || (!demoMode && !aiReady)} onPress={() => void generate()} />
+            {selectedNoteTimeZoneUnconfirmed ? <Text style={styles.warning}>Confirm the imported note’s capture time zone before using it as reply context.</Text> : null}
+            <Button label={generating ? "Generating reply…" : "Generate reply"} disabled={busy || checking || loadingText || generating || selectedNoteTimeZoneUnconfirmed || !selectedTextUsable || !source || !parsedTo.length || combinedBriefBytes > BRIEF_LIMIT || (!demoMode && !aiReady)} onPress={() => void generate()} />
             {!demoMode && !aiReady ? <Text style={styles.disclaimer}>Set provider mode, an Azure OpenAI endpoint, and a deployment in Settings to enable generation.</Text> : null}
             {!selectedTextUsable && !demoMode ? <Text style={styles.disclaimer}>Load checked message text and select any excerpt explicitly before generating.</Text> : null}
             {generatedAt ? <Text style={styles.contextMeta}>Generated · {new Date(generatedAt).toLocaleString()}</Text> : null}
@@ -445,9 +449,16 @@ function NotePicker({ visible, notes, selectedId, onClose, onChoose }: { visible
           <Text style={styles.pickerTitle}>Choose one saved note</Text>
           <Text style={styles.disclaimer}>Only the selected current transcript is included with a later Generate request.</Text>
           <ScrollView showsVerticalScrollIndicator={false}>
-            {eligible.length ? eligible.map((note) => <Pressable key={note.id} accessibilityRole="button" accessibilityLabel={`Choose note ${note.title}`} accessibilityState={{ selected: selectedId === note.id }} onPress={() => onChoose(note)} style={styles.noteOption}>
-              <Text style={styles.noteTitle}>{note.title}</Text><Text style={styles.noteExcerpt} numberOfLines={3}>{note.transcript}</Text>
-            </Pressable>) : <Text style={styles.disclaimer}>No saved transcript under 4 KB is available.</Text>}
+            {eligible.length ? eligible.map((note) => {
+              const timezoneUnconfirmed = note.importOrigin?.originalTimeZoneUnknown === true;
+              return (
+                <Pressable key={note.id} accessibilityRole="button" accessibilityLabel={timezoneUnconfirmed ? `${note.title}. Confirm its capture time zone before using it as context.` : `Choose note ${note.title}`} accessibilityState={{ selected: selectedId === note.id, disabled: timezoneUnconfirmed }} disabled={timezoneUnconfirmed} onPress={() => onChoose(note)} style={[styles.noteOption, timezoneUnconfirmed && styles.disabledNote]}>
+                  <Text style={styles.noteTitle}>{note.title}{timezoneUnconfirmed ? " · Confirm time zone first" : ""}</Text>
+                  <Text style={styles.noteExcerpt} numberOfLines={3}>{note.transcript}</Text>
+                  {timezoneUnconfirmed ? <Text style={styles.disclaimer}>Imported capture time zone is unavailable. Confirm it in the note before selecting this context.</Text> : null}
+                </Pressable>
+              );
+            }) : <Text style={styles.disclaimer}>No saved transcript under 4 KB is available.</Text>}
           </ScrollView>
           <Button label="Cancel" tone="quiet" onPress={onClose} />
         </View>
@@ -558,6 +569,7 @@ const styles = {
   pickerCard: { backgroundColor: C.bg, borderTopLeftRadius: 20, borderTopRightRadius: 20, borderColor: C.border, borderWidth: 1, padding: 20, gap: 12, maxHeight: "80%" as const },
   pickerTitle: { color: C.text, fontSize: 20, lineHeight: 26, fontWeight: "600" as const },
   noteOption: { minHeight: 64, justifyContent: "center" as const, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: C.border, gap: 4 },
+  disabledNote: { opacity: 0.62 },
   noteTitle: { color: C.text, fontSize: 14, fontWeight: "600" as const },
   noteExcerpt: { color: C.muted, fontSize: 12, lineHeight: 18 },
 };

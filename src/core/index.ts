@@ -35,7 +35,15 @@ export interface NoteAssistResult {
   stale?: boolean;
 }
 
-export interface LocalTask {
+export interface ImportedTaskOrigin {
+  kind: 'backup_import';
+  archiveId: string;
+  sourceTaskId: string;
+  originalSourceNoteId?: string;
+  originUnverified?: true;
+}
+
+interface LocalTaskFields {
   id: string;
   title: string;
   body: string;
@@ -43,10 +51,12 @@ export interface LocalTask {
   createdAt: string;
   completedAt?: string;
   dueAt?: string;
-  sourceNoteId: string;
-  sourceRevision: number;
-  proposalId: string;
 }
+
+export type LocalTask = LocalTaskFields & (
+  { importOrigin?: undefined; sourceNoteId: string; sourceRevision: number; proposalId: string } |
+  { importOrigin: ImportedTaskOrigin; sourceNoteId?: string; sourceRevision?: never; proposalId?: never }
+);
 
 export interface Note {
   id: string;
@@ -63,6 +73,7 @@ export interface Note {
   processingFingerprint?: string;
   captureTimeZone?: string;
   analysis?: NoteAssistResult;
+  importOrigin?: { kind: 'backup_import'; archiveId: string; sourceNoteId: string; audioMissing: boolean; originalTimeZoneUnknown?: true; timeZoneConfirmedAt?: string; originUnverified?: true };
 }
 
 export interface ProposalEvidence {
@@ -586,6 +597,35 @@ export interface AppState {
   /** Versioned current mailbox metadata cache; this is independent of immutable dispatch history. */
   mailboxSchemaVersion: 2;
   proactive: ProactiveState;
+  /** Imported material is inert archive data; it is never assistant context or live authority. */
+  importedBackups: import('../backup').ImportedBackupArchive[];
+  backupRecoveryStatus?: { quarantinedArchiveCount: number; message: 'Some imported backup archive data could not be validated and is held privately.' };
+}
+
+export interface BackupImportPreview {
+  sessionId: string;
+  fileHash: string;
+  contentHash: string;
+  planHash: string;
+  sourceFormat: import('../backup').ImportedBackupArchive['sourceFormat'];
+  exportedAt: string;
+  noteCount: number;
+  taskCount: number;
+  documentCount: number;
+  historyCount: number;
+  missingAudioCount: number;
+  /** Items absent from their verified local links and eligible for restoration from this archive. */
+  missingNoteCount: number;
+  missingTaskCount: number;
+  missingNoteLabels: string[];
+  missingTaskLabels: string[];
+  /** Existing imported tasks whose source link can be safely repaired to a note restored by this plan. */
+  taskLinkRepairCount: number;
+  taskLinkRepairLabels: string[];
+  documentConflicts: import('../backup').PortableBackupPreview['documentConflicts'];
+  warnings: string[];
+  ignoredFieldCount: number;
+  alreadyImported: boolean;
 }
 
 export interface SaveNoteInput {
@@ -624,6 +664,7 @@ export interface AppController {
   subscribe(listener: (state: AppState) => void): () => void;
   load(): Promise<void>;
   saveNote(input: SaveNoteInput): Promise<Note>;
+  confirmImportedNoteTimeZone(noteId: string, input: { timeZone: string; expectedRevision: number }): Promise<Note>;
   updateTranscript(id: string, text: string): Promise<Note>;
   processNote(id: string): Promise<Proposal[]>;
   assistNote(id: string, options?: { intent?: AssistIntent; question?: string; forceRefresh?: boolean }): Promise<NoteAssistResult>;
@@ -658,6 +699,12 @@ export interface AppController {
   snoozeProactiveCandidate(candidateId: string, until: string): Promise<ProactiveCandidateEntry>;
   getProactiveCandidateSource(candidateId: string): Promise<ProactiveCandidateSourceResult>;
   exportData(): Promise<string>;
+  prepareBackupImport(input: string | Uint8Array): Promise<BackupImportPreview>;
+  applyBackupImport(input: { sessionId: string; planHash: string }): Promise<import('../backup').ImportedBackupArchive>;
+  activateImportedDocument(input: {
+    archiveId: string; documentId: string; destinationPath: string; contentDigest: string;
+    expectedCurrentRevision?: number; replaceConfirmed: boolean;
+  }): Promise<{ status: 'activated' | 'unchanged'; document: ContextDocument; mirrorPending: boolean }>;
   deleteNote(id: string): Promise<void>;
   getMailReplySource(messageId: string): Promise<MailReplySourceResult>;
   createMailReplyProposal(input: { messageId: string; mode: 'reply' | 'reply_all'; sourceDigest: string; text: string; to?: string[]; cc?: string[] }): Promise<Proposal>;

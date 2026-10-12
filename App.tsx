@@ -26,6 +26,7 @@ import type {
   Proposal,
   AppSettings,
   AppController,
+  ContextDocument,
   AccountCapability,
   LocalTask,
   MailboxSnapshotMessage,
@@ -35,6 +36,7 @@ import type {
 import { controller as productionController } from "./src/services/controller";
 import { createDispatchHistoryScenario } from "./src/dev/receiptScenario";
 import { createMailSyncScenario } from "./src/dev/mailSyncScenario";
+import { createBackupScenario } from "./src/dev/backupScenario";
 import { useAudioCapture } from "./src/audio/useAudioCapture";
 import type { AudioCapture } from "./src/audio/types";
 import {
@@ -53,6 +55,8 @@ import { ProactiveRulesSection } from "./src/ui/ProactiveRulesSection";
 import { useProactiveClock } from "./src/ui/useProactiveClock";
 import { ReviewSheet } from "./src/ui/ReviewSheet";
 import { NoteDetail as NoteDetailView } from "./src/ui/NoteDetail";
+import { BackupImportSheet } from "./src/ui/BackupImportSheet";
+import { ImportedBackupsSection } from "./src/ui/ImportedBackupsSection";
 import { TasksSection } from "./src/ui/TasksSection";
 import { IconButton, Button, Field } from "./src/ui/primitives";
 import { C, s } from "./src/ui/theme";
@@ -71,7 +75,8 @@ const previewScenario =
     : undefined;
 const isDispatchHistoryDemo = previewScenario === "dispatch-history";
 const isMailSyncDemo = previewScenario === "mail-sync";
-const isIsolatedDemo = isDispatchHistoryDemo || isMailSyncDemo;
+const isBackupImportDemo = previewScenario === "backup-import";
+const isIsolatedDemo = isDispatchHistoryDemo || isMailSyncDemo || isBackupImportDemo;
 
 function useAppState(appController: AppController) {
   return useSyncExternalStore(
@@ -168,7 +173,13 @@ function NoteCard({ note, onPress }: { note: Note; onPress: () => void }) {
         {title}
       </Text>
       <Text style={s.noteSub}>
-        {note.status === "processed"
+        {note.importOrigin?.kind === "backup_import" ? (
+          [
+            "Imported",
+            note.importOrigin.audioMissing ? "recording not included" : "unverified source",
+            note.importOrigin.originalTimeZoneUnknown ? "time zone unknown" : "",
+          ].filter(Boolean).join(" · ")
+        ) : note.status === "processed"
           ? "Reviewed"
           : note.status === "error"
             ? "Needs attention"
@@ -244,7 +255,7 @@ export default function App() {
   const [controller, setController] =
     useState<AppController>(productionController);
   const state = useAppState(controller);
-  const [tab, setTab] = useState<Tab>(isIsolatedDemo ? "inbox" : "record");
+  const [tab, setTab] = useState<Tab>(isBackupImportDemo ? "library" : isIsolatedDemo ? "inbox" : "record");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [detail, setDetail] = useState<Note | null>(null);
   const [review, setReview] = useState<Proposal | null>(null);
@@ -299,6 +310,8 @@ export default function App() {
           ? await createDispatchHistoryScenario()
           : isMailSyncDemo
             ? await createMailSyncScenario({ mockGeneration: true })
+            : isBackupImportDemo
+              ? await createBackupScenario()
             : productionController;
         if (!mounted) return;
         setController(selected);
@@ -837,7 +850,9 @@ export default function App() {
               <Text style={s.noticeText}>
                 {isDispatchHistoryDemo
                   ? "Sample history · no external actions"
-                  : "Sample mail · no external actions"}
+                  : isMailSyncDemo
+                    ? "Sample mail · no external actions"
+                    : "Sample backup · in-memory only · no external access"}
               </Text>
             </View>
           ) : null}
@@ -938,6 +953,7 @@ export default function App() {
               <NoteDetailView
                 key={`${detail.id}:${detail.revision}`}
                 note={state.notes.find((n) => n.id === detail.id) ?? detail}
+                importedAudioMissing={Boolean(detail.importOrigin?.audioMissing)}
                 analysis={state.notes.find((n) => n.id === detail.id)?.analysis}
                 proposals={state.proposals.filter(
                   (p) => p.noteId === detail.id,
@@ -969,6 +985,20 @@ export default function App() {
                     setDetail(updated);
                   })
                 }
+                onConfirmImportedTimeZone={(timeZone) => {
+                  const currentNote = controller
+                    .getSnapshot()
+                    .notes.find((note) => note.id === detail.id);
+                  if (!currentNote) return;
+                  void run(async () => {
+                    const updated = await controller.confirmImportedNoteTimeZone(
+                      detail.id,
+                      { timeZone, expectedRevision: currentNote.revision },
+                    );
+                    setDetail(updated);
+                    setNotice("Capture time zone confirmed for this imported note.");
+                  });
+                }}
                 onAssist={(options) => {
                   void run(async () => {
                     const result = await controller.assistNote(
@@ -1091,7 +1121,10 @@ export default function App() {
                 docs={state.documents}
                 tasks={state.tasks}
                 busy={busy}
-                demoMode={isIsolatedDemo}
+                controller={controller}
+                importedBackups={state.importedBackups}
+                previewMode={isIsolatedDemo}
+                sampleBackupMode={isBackupImportDemo}
                 onComplete={(id) =>
                   run(async () => {
                     await controller.completeTask(id);
@@ -1113,7 +1146,7 @@ export default function App() {
                   setDocDraft(existing?.content ?? d.content);
                 }}
                 onExport={() => {
-                  if (isIsolatedDemo) return;
+                  if (isIsolatedDemo && !isBackupImportDemo) return;
                   void run(async () => {
                     const data = await controller.exportData();
                     if (Platform.OS === "web")
@@ -1747,7 +1780,10 @@ function LibraryScreen({
   docs,
   tasks,
   busy,
-  demoMode,
+  controller,
+  importedBackups,
+  previewMode,
+  sampleBackupMode,
   onComplete,
   onReopen,
   onOpenNote,
@@ -1757,16 +1793,20 @@ function LibraryScreen({
   notes: Note[];
   query: string;
   setQuery: (v: string) => void;
-  docs: { path: string; content: string }[];
+  docs: ContextDocument[];
   tasks: LocalTask[];
   busy: boolean;
-  demoMode: boolean;
+  controller: AppController;
+  importedBackups: ReturnType<typeof productionController.getSnapshot>["importedBackups"];
+  previewMode: boolean;
+  sampleBackupMode: boolean;
   onComplete: (id: string) => void;
   onReopen: (id: string) => void;
   onOpenNote: (n: Note) => void;
   onOpenDoc: (d: { path: string; content: string }) => void;
   onExport: () => void;
 }) {
+  const [importOpen, setImportOpen] = useState(false);
   return (
     <ScrollView
       contentContainerStyle={s.scroll}
@@ -1853,19 +1893,44 @@ function LibraryScreen({
       )}
       <View style={{ height: 10 }} />
       <Button
-        label={
-          demoMode ? "Export unavailable in sample mode" : "Export local data"
-        }
+        label="Import a backup"
+        tone="quiet"
+        icon="cloud-download-outline"
+        disabled={busy}
+        onPress={() => setImportOpen(true)}
+      />
+      <ImportedBackupsSection
+        archives={importedBackups}
+        currentDocuments={docs}
+        controller={controller}
+        busy={busy}
+        query={query}
+      />
+      <View style={{ height: 10 }} />
+      <Button
+        label={sampleBackupMode ? "Export sample backup" : previewMode ? "Export unavailable in sample mode" : "Export local data"}
         tone="quiet"
         icon="download-outline"
-        disabled={demoMode}
+        disabled={previewMode && !sampleBackupMode || busy}
         onPress={onExport}
       />
       <Text style={s.disclaimer}>
-        JSON exports include notes, documents, tasks, cached mail and message
-        text, calendars, and action history. Export recordings separately.
-        Protect exported files as private data.
+        JSON exports include notes, tasks, Markdown documents, and read-only
+        action history. Accounts, credentials, active approvals, and recordings
+        are not included. Protect exported files as private data.
       </Text>
+      {sampleBackupMode ? (
+        <Text style={s.disclaimer}>
+          Sample preview uses in-memory data. OAuth, provider keys, microphone capture, and external requests are disabled.
+        </Text>
+      ) : null}
+      <BackupImportSheet
+        visible={importOpen}
+        controller={controller}
+        busy={busy}
+        sampleMode={sampleBackupMode}
+        onClose={() => setImportOpen(false)}
+      />
     </ScrollView>
   );
 }
@@ -2156,6 +2221,7 @@ function SettingsScreen({
         </View>
         <Button
           label="Save provider settings"
+          disabled={demoMode || busy}
           onPress={() => void saveSettings()}
         />
         {demoMode ? null : (

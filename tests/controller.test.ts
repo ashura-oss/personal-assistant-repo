@@ -356,6 +356,22 @@ describe('application state controller', () => {
       messageId: message.id, sourceDigest: htmlLoaded.snapshot!.sourceDigest, textDigest: htmlLoaded.snapshot!.textDigest!, mode: 'reply' as const,
       to: ['sam@example.test'], cc: [], brief: 'Say that I will check.', composerRevision: 1, noteId: note.id, noteRevision: note.revision,
     };
+    const importedUnknownZone = app as unknown as { mutate: (operation: (draft: AppState) => void) => Promise<void>; openAiClient: AzureOpenAIClient };
+    await importedUnknownZone.mutate((draft) => {
+      const selected = draft.notes.find((item) => item.id === note.id)!;
+      selected.importOrigin = { kind: 'backup_import', archiveId: 'archived', sourceNoteId: 'source', audioMissing: true, originalTimeZoneUnknown: true };
+    });
+    const prepareSpy = vi.spyOn(importedUnknownZone.openAiClient, 'prepare');
+    const attemptsBeforeUnknownTimeZone = app.getSnapshot().usage.attemptsToday;
+    await expect(app.generateMailReplyText(input)).rejects.toThrow(/confirm this imported note/i);
+    expect(prepareSpy).not.toHaveBeenCalled();
+    expect(providerCalls).toBe(0);
+    expect(app.getSnapshot().usage.attemptsToday).toBe(attemptsBeforeUnknownTimeZone);
+    await importedUnknownZone.mutate((draft) => {
+      const selected = draft.notes.find((item) => item.id === note.id)!;
+      delete selected.importOrigin;
+    });
+    prepareSpy.mockRestore();
     const originalDigest = Crypto.digestStringAsync.bind(Crypto);
     let releaseSourceHash!: () => void;
     let sourceHashStarted!: () => void;
