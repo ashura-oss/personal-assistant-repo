@@ -1,0 +1,51 @@
+name: Unsigned iOS ARM64 device package
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-unsigned-device-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-unsigned-iphone:
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      EXPO_NO_DOTENV: "1"
+      EXPO_NO_GIT_STATUS: "1"
+    steps:
+      - name: Check out the selected commit
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Select and verify supported Apple toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "arm64"
+          if [ -d /Applications/Xcode_26.4.app/Contents/Developer ]; then
+            sudo xcode-select -s /Applications/Xcode_26.4.app/Contents/Developer
+          fi
+          xcodebuild -version
+          node --version
+          pod --version
+
+      - name: Build and package an unsigned iPhone app
+        run: bash scripts/build-unsigned-ios.sh "$RUNNER_TEMP/StillBuild"
+
+      - name: Upload the unsigned package for manual local signing
+        uses: actions/upload-artifact@v4
+        with:
+          name: still-unsigned-iphone-arm64-${{ github.sha }}
+          path: ${{ runner.temp }}/StillBuild/
+          if-no-files-found: error
+          retention-days: 5

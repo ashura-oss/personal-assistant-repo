@@ -1,6 +1,22 @@
 # iOS build handoff
 
-**Status:** The local static iOS configuration gate passed nine checks. No Expo account/project association, Apple signing setup, device registration, EAS build, TestFlight submission, or native installation has been performed. The repository is being edited on Windows; do not treat a JavaScript export as a native build.
+**Status:** The latest local static iOS configuration gate passed ten checks. No native build or installation has been performed. The proposed AltStore sideload path is blocked pending bundle-identity compatibility; do not treat a JavaScript export as a native build.
+
+## Unsigned ARM64 build workflow
+
+The repository includes a manually dispatched GitHub Actions workflow at `.github/workflows/ios-unsigned-device.yml`. It runs on an Apple Silicon `macos-26` runner and calls the same `scripts/build-unsigned-ios.sh` used for a local Mac build. The script verifies Xcode 26.4+ and Node 22.13+ (SDK 57 minimums [in Expo's SDK reference](https://docs.expo.dev/versions/latest/)), installs the npm lockfile and checked-in patch, runs project checks, generates the iOS project, verifies Expo autolinking, installs CocoaPods, and builds an arm64 Release `iphoneos` app with signing disabled. It refuses to clean an existing `ios/` directory, so each build needs a fresh checkout. It checks the expected build bundle ID, executable architecture, and bundled JavaScript, then packages the full app directory inside `Payload/` for a five-day Actions artifact. The build-log match for `StillPrivacyModule.swift` records a source-build entry only; it does not prove the module is linked into the final executable or works at runtime. For a friend-owned Mac, see [the Mac build handoff](MAC_FRIEND_BUILD.md).
+
+This output is **unsigned** and cannot launch until signed. The AltStore Classic/AltServer route is currently blocked for validating Still's privacy runtime. The official AltStore provisioning code constructs a new app identifier by appending the team identifier to the parent bundle ID when registering an app [in its provisioning-profile flow](https://github.com/altstoreio/AltStore/blob/develop/AltStore/Operations/FetchProvisioningProfilesOperation.swift); Still currently accepts only `com.still.voiceassistant`. The exact Windows direct-sideload result has not been tested, so preserve the blocker until identity compatibility is implemented and verified. Do not widen the privacy runtime's identity allowlist to make signing work. AltServer documents direct IPA sideloading and seven-day reinstallation for those apps [in its release notes](https://github.com/altstoreio/FAQ/blob/main/release-notes/altserver.md); this does not establish compatibility with Still's runtime.
+
+The app's runtime identity is deliberately strict. A signing flow that changes the bundle ID cannot validate this build; the compatibility work and device check are still required. Even a successful compile or IPA package would not prove the module is linked, the re-signed app launches, or device features work. The [iOS validation matrix](IOS_VALIDATION.md) remains the record for those checks.
+
+GitHub-hosted builds require this source tree in a GitHub repository; the artifact is stored by Actions. This workspace has no configured remote. No repository was created, source uploaded, workflow dispatched, or build artifact produced. The workflow has not been build-verified. If the source must stay off GitHub, a trusted Mac or another authorized build host is needed.
+
+The workflow sets `EXPO_NO_DOTENV=1`; it does not read `.env`, provider keys, or signing credentials. OAuth callbacks depend on public native client ID/redirect values not supplied to the workflow. No private key is included in the artifact.
+
+## OpenRouter Batch foundation (separate from iOS validation)
+
+One fictional OpenRouter Batch request was submitted with one POST, then checked through read-only status and ownership diagnostics. The exact request, strict `READY` result, outer canonical Luna model, and inline base model were verified. OpenRouter reported 75 prompt tokens, 14 completion tokens, and US$0.00000725 for that request. It contained no personal audio or user content. The original local submission journal remains `submission_unknown`; the separately verified diagnostic receipt was not adopted into it, and the utility will not resubmit automatically. This proves only that this synthetic Batch request completed with the validated response and usage; it does not prove in-app queued chat, general model availability, future pricing, or any iOS behavior. The OpenRouter key is stored outside the repository and is not used by this workflow.
 
 ## Local checks on Windows
 
@@ -52,9 +68,23 @@ From Windows, an EAS cloud build can use Expo's macOS build workers if the user 
 
 ## References
 
+- [Apple: code signatures and iOS launch requirements](https://developer.apple.com/documentation/xcode/using-the-latest-code-signature-format?changes=__8_8%2C__8_8)
+- [GitHub: macOS hosted runner architectures](https://docs.github.com/en/actions/how-tos/write-workflows/choose-where-workflows-run/choose-the-runner-for-a-job)
+- [GitHub: workflow artifacts](https://docs.github.com/en/actions/concepts/workflows-and-actions/workflow-artifacts)
+- [Expo: local module setup](https://docs.expo.dev/modules/get-started/)
+- [Expo: native module autolinking](https://docs.expo.dev/modules/autolinking/)
+- [Expo: SDK and toolchain requirements](https://docs.expo.dev/versions/latest/)
+- [AltStore Classic: Windows install guide](https://faq.altstore.io/altstore-classic/how-to-install-altstore-windows)
+- [AltServer: direct IPA sideloading and renewal notes](https://faq.altstore.io/release-notes/altserver)
 - [Expo: iOS development build for devices](https://docs.expo.dev/tutorial/eas/ios-development-build-for-devices/)
 - [Expo: internal distribution](https://docs.expo.dev/build/internal-distribution/)
 - [Expo: local EAS builds](https://docs.expo.dev/build-reference/local-builds/)
 - [Expo: iOS Developer Mode](https://docs.expo.dev/guides/ios-developer-mode/)
 - [Expo CLI](https://docs.expo.dev/more/expo-cli/)
 - [CocoaPods podspec `homepage` field](https://guides.cocoapods.org/syntax/podspec.html#homepage)
+
+## Phase 31 project checkpoint
+
+Root's 2026-10-13 22:52:05 SGT checkpoint passed a clean `npm ci`, 890 tests across 80 files, TypeScript, full lint with zero errors and 40 existing warnings, and ten static iOS configuration checks. The unsigned iOS JavaScript export passed with 929 modules and a 4.6 MB Hermes bundle (`index-45f04d6414343a0f4becca488133c9d5.hbc`). The web export passed with 634 modules across 12 bundles (1.1 MB entry and 681 KB controller). These are source and JavaScript-export checks, not native compilation, signing, or device validation.
+
+The OpenRouter profile uses Batch only. The user-facing profile identifies Luna Batch; durable in-app job submission, retrieval, history, and result application remain pending. The Batch API may take up to 24 hours, and OpenRouter retains submitted inputs/results for up to 30 days or until deletion. The one synthetic smoke request above is the only real provider call recorded here.
