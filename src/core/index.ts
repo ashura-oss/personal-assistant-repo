@@ -171,6 +171,9 @@ export interface Proposal {
   reminderId?: string;
   /** Stable idempotency key for provider event creation, persisted before dispatch. */
   eventTransactionId?: string;
+  eventDestination?: EventProposalDestination;
+  deviceCalendarApproval?: DeviceCalendarEventApproval;
+  deviceEventDispatchRecordId?: string;
   /** Stable same-source action identity used to prevent reprocessing from resurrecting consumed suggestions. */
   sourceActionKey?: string;
   provenance?: AnyProposalProvenance;
@@ -227,6 +230,27 @@ export interface EventProposalPayload {
   attendees: string[];
   invitePolicy: 'send' | 'none';
 }
+
+export type EventProposalDestination =
+  | { kind: 'remote_calendar'; accountId: string; calendarId: string }
+  | { kind: 'device_calendar'; calendarId: string };
+
+/** Controller-created local permission/source snapshot used only for native event approval. */
+export interface DeviceCalendarEventApproval {
+  version: 1;
+  installationId: string;
+  generation: number;
+  selectionRevision: number;
+  calendarId: string;
+  nativeCalendarId: string;
+  calendarFingerprint: string;
+  payloadDigest: string;
+  dependencyProjection: string;
+  approvedAt: string;
+}
+
+export type DeviceCalendarAccessStatus = 'needs_check' | 'full_access' | 'write_only' | 'denied' | 'undetermined' | 'unavailable';
+export interface DeviceCalendarAccessState { status: DeviceCalendarAccessStatus; checkedAt?: string }
 
 export type AccountAuthStatus = 'configured' | 'connected' | 'reauth_required' | 'revoked';
 export type AccountCapability = 'mail.read' | 'mail.draft' | 'mail.send' | 'calendar.read' | 'calendar.write';
@@ -594,6 +618,10 @@ export interface AppState {
   mailbox: MailboxSnapshotMessage[];
   selectedMailTexts: SelectedMailTextSnapshot[];
   calendarEvents: CalendarEventSnapshot[];
+  /** Native calendars are installation-scoped; persisted permission is never trusted on load. */
+  deviceCalendars: import('../deviceCalendars/types').DeviceCalendarState;
+  deviceCalendarAccess: DeviceCalendarAccessState;
+  deviceCalendarRecoveryStatus?: { quarantined: true; message: 'Some device calendar history could not be validated and is held privately. New device calendar writes are disabled until recovery.' };
   syncStates: Record<string, AccountSyncState>;
   /** Opaque refs only; internal cleanup bookkeeping excluded from user export. */
   pendingCredentialCleanup: { tokenRef: string; reason: 'replaced' | 'disconnected' | 'orphan'; createdAt: string; lastError?: string }[];
@@ -693,7 +721,7 @@ export interface SaveNoteInput {
 }
 
 export type ProposalPatch = Partial<Pick<Proposal,
-  'title' | 'body' | 'accountId' | 'recipients' | 'calendarId' | 'dueAt' | 'email' | 'event'
+  'title' | 'body' | 'accountId' | 'recipients' | 'calendarId' | 'eventDestination' | 'dueAt' | 'email' | 'event'
 >>;
 
 export interface AccountConfig {
@@ -774,9 +802,16 @@ export interface AppController {
   checkProposalFreshness(id: string): Promise<{ current: boolean; reason?: string }>;
   reconcileDispatch(recordId: string, input: { disposition: import('../dispatch').DispatchReconciliation; note: string; remoteId?: string }): Promise<import('../dispatch').DispatchRecord>;
   transcribeNote(id: string): Promise<Note>;
-  editProposal(id: string, patch: ProposalPatch): Promise<Proposal>;
-  approveProposal(id: string): Promise<Proposal>;
-  executeProposal(id: string): Promise<Proposal>;
+  editProposal(id: string, patch: ProposalPatch, options?: { expectedRevision: number }): Promise<Proposal>;
+  approveProposal(id: string, options?: { expectedRevision: number }): Promise<Proposal>;
+  executeProposal(id: string, options?: { expectedRevision: number }): Promise<Proposal>;
+  connectDeviceCalendars(input: { expectedGeneration: number }): Promise<DeviceCalendarAccessState>;
+  disconnectDeviceCalendars(input: { expectedGeneration: number }): Promise<import('../deviceCalendars/types').DeviceCalendarState>;
+  checkDeviceCalendarAccess(): Promise<DeviceCalendarAccessState>;
+  setDeviceCalendarSelection(input: { expectedGeneration: number; expectedSelectionRevision: number; calendarIds: string[] }): Promise<import('../deviceCalendars/types').DeviceCalendarState>;
+  refreshDeviceCalendars(input: { expectedGeneration: number; expectedSelectionRevision: number; continueRunId?: string }): Promise<import('../deviceCalendars/types').DeviceCalendarState>;
+  inspectDeviceEventDispatch(recordId: string): Promise<{ record: import('../deviceCalendars/types').DeviceEventDispatchRecord; lookup: import('../deviceCalendars/types').DeviceEventLookupResult }>;
+  reconcileDeviceEventDispatch(recordId: string, input: { disposition: import('../deviceCalendars/types').DeviceEventReconciliation; note: string; nativeEventId?: string }): Promise<import('../deviceCalendars/types').DeviceEventDispatchRecord>;
   dismissProposal(id: string): Promise<Proposal>;
   completeTask(id: string): Promise<LocalTask>;
   reopenTask(id: string): Promise<LocalTask>;

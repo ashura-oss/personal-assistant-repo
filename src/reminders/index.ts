@@ -80,12 +80,12 @@ export function validateReminderPayload(value: unknown): ReminderPayload {
 }
 
 function validateProactiveOrigin(value: Record<string, unknown>): ProactiveReminderOrigin {
-  keys(value, ['kind', 'candidate', 'rule', 'source', 'binding', 'capturedAt', 'expiresAt'], 'Proactive reminder origin');
+  keys(value, ['kind', 'candidate', 'rule', 'source', 'binding', 'deviceBinding', 'capturedAt', 'expiresAt'], 'Proactive reminder origin');
   const source = object(value.source, 'Proactive source');
   const sourceKeys = source.kind === 'mail'
     ? ['kind', 'sourceId', 'namespace', 'accountId', 'providerId', 'sourceVersion', 'availability', 'freshness', 'senderEmail', 'isRead', 'subject', 'snippet', 'receivedAt', 'receivedAtUtcCertified']
     : source.kind === 'meeting'
-      ? ['kind', 'sourceId', 'namespace', 'accountId', 'providerId', 'sourceVersion', 'availability', 'freshness', 'subject', 'startAt', 'startAtUtcCertified']
+      ? ['kind', 'sourceId', 'namespace', 'accountId', 'providerId', 'sourceVersion', 'availability', 'freshness', 'subject', 'startAt', 'startAtUtcCertified', 'deviceBinding']
       : ['kind', 'sourceId', 'namespace', 'accountId', 'providerId', 'sourceVersion', 'availability', 'freshness', 'title', 'status', 'dueAt', 'dueAtUtcCertified'];
   keys(source, sourceKeys, 'Proactive source');
   const validatedSource = source as unknown as ProactiveSource;
@@ -124,10 +124,28 @@ function validateProactiveOrigin(value: Record<string, unknown>): ProactiveRemin
   if (ruleVersion < ruleRevision || ruleId !== candidateRuleId || ruleRevision !== candidateRuleRevision) fail('Proactive candidate does not match its saved rule snapshot.');
 
   const local = validatedSource.namespace.toLowerCase() === 'local';
+  const nativeCalendar = validatedSource.namespace === 'device_calendar';
   let binding: ProactiveReminderOrigin['binding'];
-  if (local) {
+  let deviceBinding: ProactiveReminderOrigin['deviceBinding'];
+  if (nativeCalendar && validatedSource.kind === 'meeting') {
+    if (value.binding !== undefined || !validatedSource.deviceBinding) fail('Native calendar reminders cannot contain an account binding.');
+    const raw = object(value.deviceBinding, 'Device calendar reminder binding');
+    keys(raw, ['installationId', 'generation', 'calendarId', 'nativeEventId', 'occurrenceStart'], 'Device calendar reminder binding');
+    deviceBinding = {
+      installationId: text(raw.installationId, 'Device installation ID', { maxChars: 64, maxBytes: 64, empty: false }),
+      generation: positiveInt(raw.generation, 'Device generation'),
+      calendarId: text(raw.calendarId, 'Device calendar ID', { maxChars: 64, maxBytes: 64, empty: false }),
+      nativeEventId: text(raw.nativeEventId, 'Native event ID', { maxChars: 1024, maxBytes: 1024, empty: false }),
+      occurrenceStart: timestamp(raw.occurrenceStart, 'Device event occurrence start'),
+    };
+    if (JSON.stringify(deviceBinding) !== JSON.stringify(validatedSource.deviceBinding)) fail('Device reminder binding does not match its source snapshot.');
+  } else if (nativeCalendar) {
+    fail('Native calendar reminder source must be a meeting.');
+  } else if (local) {
     if (value.binding !== undefined) fail('Local proactive reminders cannot contain an account binding.');
+    if (value.deviceBinding !== undefined) fail('Local proactive reminders cannot contain a device calendar binding.');
   } else {
+    if (value.deviceBinding !== undefined) fail('Remote proactive reminders cannot contain a device calendar binding.');
     const raw = object(value.binding, 'Proactive account binding');
     keys(raw, ['accountId', 'namespace', 'identityKey', 'connectionGeneration'], 'Proactive account binding');
     binding = {
@@ -143,7 +161,7 @@ function validateProactiveOrigin(value: Record<string, unknown>): ProactiveRemin
   if (Date.parse(expiresAt) <= Date.parse(capturedAt)) fail('Proactive source expiry must follow its capture time.');
   return { kind: 'proactive', candidate: candidate as unknown as ProactiveReminderOrigin['candidate'],
     rule: { id: ruleId, revision: ruleRevision, version: ruleVersion, name: ruleName }, source: source as unknown as ProactiveReminderOrigin['source'],
-    ...(binding ? { binding } : {}), capturedAt, expiresAt };
+    ...(binding ? { binding } : {}), ...(deviceBinding ? { deviceBinding } : {}), capturedAt, expiresAt };
 }
 
 function validateOrigin(value: unknown): ReminderRecord['origin'] {

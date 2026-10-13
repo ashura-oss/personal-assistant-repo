@@ -484,11 +484,14 @@ describe('application state controller', () => {
     const [draft] = await app.processNote(note.id);
     const approved = await app.approveProposal(draft.id);
     expect(approved.status).toBe('approved');
-    await app.editProposal(draft.id, { title: 'Send the revised report' });
+    const edited = await app.editProposal(draft.id, { title: 'Send the revised report' }, { expectedRevision: draft.revision });
     expect(app.getSnapshot().proposals[0].status).toBe('draft');
-    await expect(app.executeProposal(draft.id)).rejects.toThrow(/Approve this exact version/);
+    await expect(app.approveProposal(draft.id, { expectedRevision: draft.revision })).rejects.toThrow(/changed/i);
+    await expect(app.executeProposal(draft.id, { expectedRevision: draft.revision })).rejects.toThrow(/changed/i);
+    await app.approveProposal(draft.id, { expectedRevision: edited.revision });
     await app.updateTranscript(note.id, 'I need to finish the revised report today.');
-    await expect(app.approveProposal(draft.id)).rejects.toThrow(/source transcript changed/i);
+    const sourceInvalidated = app.getSnapshot().proposals.find((item) => item.id === draft.id)!;
+    await expect(app.approveProposal(draft.id, { expectedRevision: sourceInvalidated.revision })).rejects.toThrow(/source transcript changed/i);
     const [fresh] = await app.processNote(note.id);
     expect(fresh.sourceRevision).toBe(app.getSnapshot().notes[0].revision);
   });

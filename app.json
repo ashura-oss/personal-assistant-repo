@@ -16,6 +16,10 @@
     },
     "android": {
       "package": "com.still.voiceassistant",
+      "blockedPermissions": [
+        "android.permission.READ_CALENDAR",
+        "android.permission.WRITE_CALENDAR"
+      ],
       "permissions": [
         "android.permission.RECORD_AUDIO"
       ]
@@ -32,6 +36,15 @@
       ],
       "expo-sqlite",
       "expo-secure-store",
+      [
+        "expo-calendar",
+        {
+          "calendarPermission": "Allow Still to read the calendars you select and save events you approve.",
+          "writeOnlyCalendarPermission": false,
+          "remindersPermission": false,
+          "writeOnlyAccess": false
+        }
+      ],
       [
         "expo-notifications",
         {

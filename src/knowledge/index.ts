@@ -117,6 +117,16 @@ function normalizeReference(value: unknown): KnowledgeReference {
     }
     return { kind: 'mail', id: refId, identityKey, connectionGeneration: value.connectionGeneration as number };
   }
+  if (value.kind === 'device_calendar_event') {
+    ownKeys(value, ['kind', 'installationId', 'generation', 'calendarId', 'eventId', 'occurrenceStart'], 'Device calendar reference');
+    if (!Number.isSafeInteger(value.generation) || (value.generation as number) < 1) fail('Device calendar reference generation is invalid.');
+    const installationId = id(value.installationId, 'Device installation ID');
+    const calendarId = id(value.calendarId, 'Device calendar ID');
+    const eventId = string(value.eventId, 'Native event ID', KNOWLEDGE_LIMITS.sourceIdChars, KNOWLEDGE_LIMITS.sourceIdChars);
+    const occurrenceStart = timestamp(value.occurrenceStart, 'Event occurrence start');
+    if (!eventId) fail('Native event ID is invalid.');
+    return { kind: 'device_calendar_event', installationId, generation: value.generation as number, calendarId, eventId, occurrenceStart };
+  }
   if (value.kind === 'historical') {
     ownKeys(value, ['kind', 'label', 'originalKind'], 'Knowledge reference');
     return { kind: 'historical', label: string(value.label, 'Historical reference label', KNOWLEDGE_LIMITS.labelChars), originalKind: string(value.originalKind, 'Historical reference kind', 64, 64) };

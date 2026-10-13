@@ -12,6 +12,7 @@ export type KnowledgeReference =
   | { kind: 'person' | 'project'; id: string }
   | { kind: 'mail'; id: string; identityKey: string; connectionGeneration: number }
   | { kind: 'calendar'; id: string; calendarId: string; identityKey: string; connectionGeneration: number }
+  | { kind: 'device_calendar_event'; installationId: string; generation: number; calendarId: string; eventId: string; occurrenceStart: string }
   | { kind: 'historical'; label: string; originalKind: string };
 
 export interface KnowledgeSourceLink {

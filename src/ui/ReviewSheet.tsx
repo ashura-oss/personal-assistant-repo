@@ -1,9 +1,12 @@
 import React, { useState } from "react";
 import { Pressable, ScrollView, Text, View } from "react-native";
-import type { Proposal } from "../core";
+import type { AppController, EventProposalDestination, Proposal } from "../core";
 import type { DispatchRecord, DispatchReconciliation } from "../dispatch";
+import type { DeviceEventDispatchRecord, DeviceEventReconciliation } from "../deviceCalendars/types";
+import { resolveReminderLocalDateTime } from "../reminders/time";
 import { controller } from "../services/controller";
 import { DispatchHistory } from "./DispatchHistory";
+import { DeviceEventDispatchHistory } from "./DeviceEventDispatchHistory";
 import { Button, Field, IconButton } from "./primitives";
 import { s } from "./theme";
 
@@ -11,6 +14,7 @@ type ReviewSheetProps = {
   state: ReturnType<typeof controller.getSnapshot>;
   proposal: Proposal | null;
   dispatchRecords: DispatchRecord[];
+  deviceEventDispatchRecords?: DeviceEventDispatchRecord[];
   busy?: boolean;
   demoMode?: boolean;
   onClose: () => void;
@@ -23,6 +27,7 @@ type ReviewSheetProps = {
         | "accountId"
         | "recipients"
         | "calendarId"
+        | "eventDestination"
         | "dueAt"
         | "email"
         | "event"
@@ -40,6 +45,8 @@ type ReviewSheetProps = {
       remoteId?: string;
     },
   ) => Promise<unknown>;
+  onInspectDeviceEvent?: (recordId: string) => Promise<Awaited<ReturnType<AppController["inspectDeviceEventDispatch"]>>>;
+  onReconcileDeviceEvent?: (recordId: string, input: { disposition: DeviceEventReconciliation; note: string; nativeEventId?: string }) => Promise<unknown>;
   sourceStale?: boolean;
   sourceChecking?: boolean;
   sourceCheckError?: string;
@@ -62,6 +69,7 @@ function ReviewSheetContent({
   state,
   proposal,
   dispatchRecords,
+  deviceEventDispatchRecords = [],
   busy = false,
   demoMode = false,
   onClose,
@@ -70,6 +78,8 @@ function ReviewSheetContent({
   onExecute,
   onDismiss,
   onReconcile,
+  onInspectDeviceEvent,
+  onReconcileDeviceEvent,
   sourceStale = false,
   sourceChecking = false,
   sourceCheckError,
@@ -101,22 +111,24 @@ function ReviewSheetContent({
   const [emailOperation, setEmailOperation] = useState<"draft" | "send">(
     proposal.email?.operation ?? "draft",
   );
-  const initialEventTime = localDateTime(
-    proposal.event?.start ?? proposal.dueAt,
-  );
-  const initialEventEnd = localDateTime(
-    proposal.event?.end ??
-      (proposal.dueAt
-        ? new Date(Date.parse(proposal.dueAt) + 3600000).toISOString()
-        : undefined),
-  );
+  const initialEventTimeZone = proposal.event?.timeZone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const initialEventTime = proposal.event
+    ? localDateTimeInZone(proposal.event.start, initialEventTimeZone)
+    : localDateTime(proposal.dueAt);
+  const initialEventEnd = proposal.event
+    ? localDateTimeInZone(proposal.event.end, initialEventTimeZone)
+    : localDateTime(proposal.dueAt ? new Date(Date.parse(proposal.dueAt) + 3600000).toISOString() : undefined);
   const [eventStartDate, setEventStartDate] = useState(initialEventTime.date);
   const [eventStartTime, setEventStartTime] = useState(initialEventTime.time);
   const [eventEndDate, setEventEndDate] = useState(initialEventEnd.date);
   const [eventEndTime, setEventEndTime] = useState(initialEventEnd.time);
-  const eventTimeZone =
-    proposal.event?.timeZone ??
-    Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const [eventTimeZone, setEventTimeZone] = useState(initialEventTimeZone);
+  const [startFoldChoice, setStartFoldChoice] = useState<0 | 1 | undefined>();
+  const [endFoldChoice, setEndFoldChoice] = useState<0 | 1 | undefined>();
+  const initialDestination = proposal.eventDestination ?? (proposal.accountId && proposal.calendarId
+    ? { kind: "remote_calendar" as const, accountId: proposal.accountId, calendarId: proposal.calendarId }
+    : undefined);
+  const [eventDestination, setEventDestination] = useState<EventProposalDestination | undefined>(initialDestination);
   const [eventAttendees, setEventAttendees] = useState(
     proposal.event?.attendees.join(", ") ?? "",
   );
@@ -149,8 +161,26 @@ function ReviewSheetContent({
     attachments: proposal.email?.attachments ?? [],
     ...(proposal.email?.reply ? { reply: proposal.email.reply } : {}),
   };
-  const eventStart = localIso(eventStartDate, eventStartTime, eventTimeZone);
-  const eventEnd = localIso(eventEndDate, eventEndTime, eventTimeZone);
+  const startResolutions = resolveReminderLocalDateTime(`${eventStartDate}T${eventStartTime}`, eventTimeZone);
+  const endResolutions = resolveReminderLocalDateTime(`${eventEndDate}T${eventEndTime}`, eventTimeZone);
+  const eventStartChanged = !proposal.event || (
+    eventStartDate !== localDateTimeInZone(proposal.event!.start, proposal.event!.timeZone).date ||
+    eventStartTime !== localDateTimeInZone(proposal.event!.start, proposal.event!.timeZone).time ||
+    eventTimeZone !== proposal.event!.timeZone
+  );
+  const eventEndChanged = !proposal.event || (
+    eventEndDate !== localDateTimeInZone(proposal.event!.end, proposal.event!.timeZone).date ||
+    eventEndTime !== localDateTimeInZone(proposal.event!.end, proposal.event!.timeZone).time ||
+    eventTimeZone !== proposal.event!.timeZone
+  );
+  const eventStart = !eventStartChanged
+    ? proposal.event?.start ?? ""
+    : startResolutions.length === 1 ? startResolutions[0]
+      : startResolutions.length === 2 && startFoldChoice !== undefined ? startResolutions[startFoldChoice] : undefined;
+  const eventEnd = !eventEndChanged
+    ? proposal.event?.end ?? ""
+    : endResolutions.length === 1 ? endResolutions[0]
+      : endResolutions.length === 2 && endFoldChoice !== undefined ? endResolutions[endFoldChoice] : undefined;
   const eventPayload = {
     start: eventStart ?? "",
     end: eventEnd ?? "",
@@ -183,7 +213,7 @@ function ReviewSheetContent({
           },
         )) ||
     (proposal.kind === "event" &&
-      JSON.stringify(eventPayload) !== JSON.stringify(proposal.event ?? {}));
+      (JSON.stringify(eventPayload) !== JSON.stringify(proposal.event ?? {}) || JSON.stringify(eventDestination) !== JSON.stringify(initialDestination)));
   const chosenAccount = state.accounts.find((a) => a.id === accountId);
   const calendars = state.calendars.filter(
     (c) => !accountId || c.accountId === accountId,
@@ -204,14 +234,26 @@ function ReviewSheetContent({
       : proposal.kind === "reminder"
         ? "Schedule reminder"
         : proposal.kind === "event"
-          ? previewMode
-            ? "Preview calendar action"
-            : "Create approved event"
+          ? eventDestination?.kind === "device_calendar"
+            ? demoMode ? "Simulate device event save" : "Create approved device event"
+            : previewMode
+              ? "Preview calendar action"
+              : "Create approved event"
           : proposal.kind === "memory"
             ? "Save memory"
             : "Save task";
   const chosenCalendar = state.calendars.find(
     (calendar) => calendar.id === calendarId,
+  );
+  const chosenDeviceCalendar = state.deviceCalendars.calendars.find(
+    (calendar) => calendar.localId === eventDestination?.calendarId,
+  );
+  const deviceCalendarWritable = Boolean(
+    eventDestination?.kind === "device_calendar" &&
+    state.deviceCalendars.enabled &&
+    state.deviceCalendarAccess.status === "full_access" &&
+    state.deviceCalendars.selectedCalendarIds.includes(eventDestination.calendarId) &&
+    chosenDeviceCalendar?.allowsModifications,
   );
   const replyAccount = frozenReplySource
     ? state.accounts.find(
@@ -226,7 +268,7 @@ function ReviewSheetContent({
       )
     : undefined;
   const blocked =
-    !previewMode &&
+    (!previewMode || (proposal.kind === "event" && eventDestination?.kind === "device_calendar")) &&
     (proposal.kind === "email"
       ? mailReply
         ? !replyAccount?.capabilities?.includes("mail.draft")
@@ -235,10 +277,13 @@ function ReviewSheetContent({
             effectiveEmailOperation === "draft" ? "mail.draft" : "mail.send",
           )
       : proposal.kind === "event"
-        ? !chosenAccount?.connected ||
-          !chosenCalendar?.connected ||
-          !chosenCalendar.writable ||
-          !chosenAccount.capabilities?.includes("calendar.write")
+        ? eventDestination?.kind === "device_calendar"
+          ? !deviceCalendarWritable || parseCsv(eventAttendees).length > 0 || invitePolicy !== "none"
+          : eventDestination?.kind !== "remote_calendar" ||
+            !chosenAccount?.connected ||
+            !chosenCalendar?.connected ||
+            !chosenCalendar.writable ||
+            !chosenAccount.capabilities?.includes("calendar.write")
         : false);
   const invalidPayload =
     scheduleInputInvalid ||
@@ -247,7 +292,12 @@ function ReviewSheetContent({
       (!eventStart ||
         !eventEnd ||
         Date.parse(eventEnd) <= Date.parse(eventStart) ||
-        !eventTimeZone.trim()));
+        !eventDestination ||
+        (eventDestination.kind === "device_calendar" && !eventDestination.calendarId) ||
+        !eventTimeZone.trim() ||
+        (eventDestination?.kind === "device_calendar" && (parseCsv(eventAttendees).length > 0 || invitePolicy !== "none")) ||
+        (eventStartChanged && startResolutions.length !== 1 && !(startResolutions.length === 2 && startFoldChoice !== undefined)) ||
+        (eventEndChanged && endResolutions.length !== 1 && !(endResolutions.length === 2 && endFoldChoice !== undefined))));
   const proposalDispatches = dispatchRecords.filter(
     (record) => record.proposalId === proposal.id,
   );
@@ -256,7 +306,13 @@ function ReviewSheetContent({
     : proposalDispatches.find((record) => record.outcome !== "pending");
   const isExternalHistory =
     (proposal.kind === "email" || proposal.kind === "event") &&
-    !proposal.simulated;
+    !proposal.simulated && proposal.eventDestination?.kind !== "device_calendar";
+  const deviceEventRecord = proposal.deviceEventDispatchRecordId
+    ? deviceEventDispatchRecords.find((record) => record.id === proposal.deviceEventDispatchRecordId)
+    : deviceEventDispatchRecords.find((record) => record.proposalId === proposal.id);
+  const isDeviceEventHistory = proposal.kind === "event" && (
+    proposal.eventDestination?.kind === "device_calendar" || Boolean(deviceEventRecord)
+  );
   const historyIncomplete =
     isExternalHistory &&
     !receiptRecord &&
@@ -268,7 +324,7 @@ function ReviewSheetContent({
       proposal.status,
     )
   ) {
-    const receiptStatus = receiptRecord?.outcome ?? proposal.status;
+    const receiptStatus = deviceEventRecord?.outcome ?? receiptRecord?.outcome ?? proposal.status;
     return (
       <ScrollView
         style={s.sheetBody}
@@ -284,11 +340,15 @@ function ReviewSheetContent({
           <IconButton name="close" label="Close review" onPress={onClose} />
         </View>
         <Text style={s.h1Small}>
-          {receiptRecord?.title ??
-            (historyIncomplete ? "Saved external action" : proposal.title)}
+          {isDeviceEventHistory
+            ? deviceEventRecord?.payload.title ?? "Device event history unavailable"
+            : receiptRecord?.title ??
+              (historyIncomplete ? "Saved external action" : proposal.title)}
         </Text>
         <Text style={s.label}>
-          {proposal.status === "simulated"
+          {isDeviceEventHistory
+            ? deviceEventRecord ? "DEVICE EVENT RECORD" : "DEVICE HISTORY INCOMPLETE"
+            : proposal.status === "simulated"
             ? "LOCAL PREVIEW"
             : historyIncomplete
               ? "HISTORY INCOMPLETE"
@@ -298,7 +358,16 @@ function ReviewSheetContent({
                   ? "OUTCOME UNKNOWN"
                   : receiptStatus.toUpperCase()}
         </Text>
-        {isExternalHistory ? (
+        {isDeviceEventHistory && deviceEventRecord && onInspectDeviceEvent && onReconcileDeviceEvent ? (
+          <DeviceEventDispatchHistory
+            record={deviceEventRecord}
+            busy={busy}
+            demoMode={demoMode}
+            onInspect={onInspectDeviceEvent}
+            onReconcile={onReconcileDeviceEvent}
+          />
+        ) : null}
+        {isExternalHistory && !isDeviceEventHistory ? (
           <DispatchHistory
             records={proposalDispatches}
             incomplete={historyIncomplete}
@@ -307,7 +376,7 @@ function ReviewSheetContent({
             title="Approved details"
           />
         ) : null}
-        {!isExternalHistory && proposal.email ? (
+        {!isExternalHistory && !isDeviceEventHistory && proposal.email ? (
           <View style={s.analysisBlock}>
             <Text style={s.analysisSource}>
               {proposal.email.operation === "send"
@@ -332,7 +401,7 @@ function ReviewSheetContent({
             </Text>
           </View>
         ) : null}
-        {!isExternalHistory && proposal.event ? (
+        {!isExternalHistory && !isDeviceEventHistory && proposal.event ? (
           <View style={s.analysisBlock}>
             <Text style={s.analysisSource}>
               {new Date(proposal.event.start).toLocaleString(undefined, {
@@ -357,36 +426,36 @@ function ReviewSheetContent({
             </Text>
           </View>
         ) : null}
-        {!isExternalHistory && proposal.dueAt ? (
+        {!isExternalHistory && !isDeviceEventHistory && proposal.dueAt ? (
           <Text style={s.analysisSource}>
             Scheduled · {new Date(proposal.dueAt).toLocaleString()}
           </Text>
         ) : null}
-        {!isExternalHistory ? (
+        {!isExternalHistory && !isDeviceEventHistory ? (
           <Text style={s.proposalBody}>{proposal.body}</Text>
         ) : null}
-        {!isExternalHistory && proposal.remoteId ? (
+        {!isExternalHistory && !isDeviceEventHistory && proposal.remoteId ? (
           <Text style={s.analysisSource}>
             Provider reference · {proposal.remoteId}
           </Text>
         ) : null}
-        {proposal.notificationId ? (
+        {!isDeviceEventHistory && proposal.notificationId ? (
           <Text style={s.analysisSource}>
             Local notification reference · {proposal.notificationId}
           </Text>
         ) : null}
-        {!isExternalHistory && proposal.remoteAcceptedAt ? (
+        {!isExternalHistory && !isDeviceEventHistory && proposal.remoteAcceptedAt ? (
           <Text style={s.analysisSource}>
             Accepted at · {new Date(proposal.remoteAcceptedAt).toLocaleString()}
           </Text>
         ) : null}
-        {proposal.status === "unknown" && !receiptRecord ? (
+        {proposal.status === "unknown" && !receiptRecord && !isDeviceEventHistory ? (
           <Text style={s.errorText}>
             This action may already have been accepted. Check its status before
             taking any further action.
           </Text>
         ) : null}
-        {!isExternalHistory && proposal.lastError ? (
+        {!isExternalHistory && !isDeviceEventHistory && proposal.lastError ? (
           <Text style={s.errorText}>{proposal.lastError}</Text>
         ) : null}
         {!isExternalHistory &&
@@ -544,8 +613,37 @@ function ReviewSheetContent({
       ) : null}
       {proposal.kind === "event" ? (
         <>
-          <Text style={s.label}>Calendar</Text>
-          {calendars.map((c) => (
+          <Text style={s.label}>Where to save</Text>
+          <View style={s.pills}>
+            {(["remote_calendar", "device_calendar"] as const).map((kind) => (
+              <Pressable
+                key={kind}
+                accessibilityRole="radio"
+                accessibilityLabel={kind === "remote_calendar" ? "Online calendar" : "On this iPhone"}
+                accessibilityState={{ selected: eventDestination?.kind === kind }}
+                onPress={() => {
+                  if (kind === "remote_calendar") {
+                    const fallback = state.calendars.find((item) => item.id === calendarId && item.accountId === accountId) ?? calendars[0];
+                    if (fallback) {
+                      setAccountId(fallback.accountId);
+                      setCalendarId(fallback.id);
+                    }
+                    setEventDestination(fallback ? { kind: "remote_calendar", accountId: fallback.accountId, calendarId: fallback.id } : undefined);
+                  } else {
+                    setAccountId("");
+                    setCalendarId("");
+                    const selectedLocalId = state.deviceCalendars.selectedCalendarIds.find((id) => state.deviceCalendars.calendars.some((calendar) => calendar.localId === id && calendar.allowsModifications));
+                    const writableId = selectedLocalId ?? state.deviceCalendars.calendars.find((calendar) => calendar.allowsModifications)?.localId;
+                    setEventDestination({ kind: "device_calendar", calendarId: writableId ?? "" });
+                  }
+                }}
+                style={[s.pill, eventDestination?.kind === kind && s.pillActive]}
+              >
+                <Text style={[s.pillText, eventDestination?.kind === kind && s.pillTextActive]}>{kind === "remote_calendar" ? "Online calendar" : "On this iPhone"}</Text>
+              </Pressable>
+            ))}
+          </View>
+          {eventDestination?.kind === "remote_calendar" ? calendars.map((c) => (
             <Pressable
               key={c.id}
               accessibilityRole="radio"
@@ -554,6 +652,7 @@ function ReviewSheetContent({
               onPress={() => {
                 setCalendarId(c.id);
                 setAccountId(c.accountId);
+                setEventDestination({ kind: "remote_calendar", accountId: c.accountId, calendarId: c.id });
               }}
               style={[
                 s.accountChoice,
@@ -570,13 +669,35 @@ function ReviewSheetContent({
                   : "Not connected for changes"}
               </Text>
             </Pressable>
-          ))}
+          )) : null}
+          {eventDestination?.kind === "device_calendar" ? (
+            <>
+              {state.deviceCalendars.calendars.filter((calendar) =>
+                state.deviceCalendars.selectedCalendarIds.includes(calendar.localId) && calendar.allowsModifications,
+              ).map((calendar) => (
+                <Pressable
+                  key={calendar.localId}
+                  accessibilityRole="radio"
+                  accessibilityLabel={`Save on this iPhone to ${calendar.title}`}
+                  accessibilityState={{ selected: eventDestination.calendarId === calendar.localId }}
+                  onPress={() => setEventDestination({ kind: "device_calendar", calendarId: calendar.localId })}
+                  style={[s.accountChoice, eventDestination.calendarId === calendar.localId && s.accountChoiceSelected]}
+                >
+                  <Text style={s.accountName}>{calendar.title}</Text>
+                  <Text style={s.accountSub}>{calendar.sourceName || "On this iPhone"} · Writable</Text>
+                </Pressable>
+              ))}
+              {state.deviceCalendarAccess.status !== "full_access" ? <Text style={s.disclaimer}>Full Calendar access is required to create an event on this iPhone.</Text> : null}
+              {!state.deviceCalendars.selectedCalendarIds.some((id) => state.deviceCalendars.calendars.some((calendar) => calendar.localId === id && calendar.allowsModifications)) ? <Text style={s.disclaimer}>Choose a selected writable calendar in Settings first.</Text> : null}
+              <Text style={s.disclaimer}>No invitations are sent. Calendar may sync the event according to its account settings.</Text>
+            </>
+          ) : null}
           <View style={s.inlineFields}>
             <View style={{ flex: 1 }}>
               <Field
                 label="Starts · date"
                 value={eventStartDate}
-                onChangeText={setEventStartDate}
+                onChangeText={(value) => { setEventStartDate(value); setStartFoldChoice(undefined); }}
                 placeholder="YYYY-MM-DD"
               />
             </View>
@@ -584,7 +705,7 @@ function ReviewSheetContent({
               <Field
                 label="Local time"
                 value={eventStartTime}
-                onChangeText={setEventStartTime}
+                onChangeText={(value) => { setEventStartTime(value); setStartFoldChoice(undefined); }}
                 placeholder="HH:MM"
               />
             </View>
@@ -594,7 +715,7 @@ function ReviewSheetContent({
               <Field
                 label="Ends · date"
                 value={eventEndDate}
-                onChangeText={setEventEndDate}
+                onChangeText={(value) => { setEventEndDate(value); setEndFoldChoice(undefined); }}
                 placeholder="YYYY-MM-DD"
               />
             </View>
@@ -602,14 +723,19 @@ function ReviewSheetContent({
               <Field
                 label="Local time"
                 value={eventEndTime}
-                onChangeText={setEventEndTime}
+                onChangeText={(value) => { setEventEndTime(value); setEndFoldChoice(undefined); }}
                 placeholder="HH:MM"
               />
             </View>
           </View>
-          <Text style={s.disclaimer}>
-            Times use your device&apos;s local time zone: {eventTimeZone}.
-          </Text>
+          <Field label="Time zone · IANA name" value={eventTimeZone} onChangeText={(value) => { setEventTimeZone(value); setStartFoldChoice(undefined); setEndFoldChoice(undefined); }} placeholder="Asia/Singapore" />
+          <Text style={s.disclaimer}>Times use the selected time zone: {eventTimeZone || "choose an IANA time zone"}.</Text>
+          {eventStart ? <Text style={s.disclaimer}>Resolved start · {formatZonedInstant(eventStart, eventTimeZone)}</Text> : null}
+          {eventEnd ? <Text style={s.disclaimer}>Resolved end · {formatZonedInstant(eventEnd, eventTimeZone)}</Text> : null}
+          {eventStartChanged && startResolutions.length === 0 ? <Text style={s.errorText}>Enter a valid start date, time, and time zone. This local time may not exist when clocks move forward.</Text> : null}
+          {eventStartChanged && startResolutions.length === 2 ? <View style={s.evidence}><Text style={s.label}>START TIME OCCURS TWICE</Text>{startResolutions.map((instant, index) => <Button key={instant} label={`${index === 0 ? "First" : "Second"} · ${formatZonedInstant(instant, eventTimeZone)}`} tone={startFoldChoice === index ? "light" : "quiet"} onPress={() => setStartFoldChoice(index as 0 | 1)} />)}</View> : null}
+          {eventEndChanged && endResolutions.length === 0 ? <Text style={s.errorText}>Enter a valid end date, time, and time zone. This local time may not exist when clocks move forward.</Text> : null}
+          {eventEndChanged && endResolutions.length === 2 ? <View style={s.evidence}><Text style={s.label}>END TIME OCCURS TWICE</Text>{endResolutions.map((instant, index) => <Button key={instant} label={`${index === 0 ? "First" : "Second"} · ${formatZonedInstant(instant, eventTimeZone)}`} tone={endFoldChoice === index ? "light" : "quiet"} onPress={() => setEndFoldChoice(index as 0 | 1)} />)}</View> : null}
           <Field
             label="Attendees"
             value={eventAttendees}
@@ -617,6 +743,7 @@ function ReviewSheetContent({
             placeholder="name@example.com, ..."
             keyboardType="email-address"
           />
+          {eventDestination?.kind === "device_calendar" ? <Text style={s.disclaimer}>To create on this iPhone, remove every attendee and choose “Do not invite.” No invitations will be sent.</Text> : null}
           <Text style={s.label}>Invitation policy</Text>
           <View style={s.pills}>
             {(["send", "none"] as const).map((value) => (
@@ -752,7 +879,11 @@ function ReviewSheetContent({
       {previewMode &&
       (proposal.kind === "email" || proposal.kind === "event") ? (
         <Text style={s.disclaimer}>
-          {demoMode
+          {proposal.kind === "event" && eventDestination?.kind === "device_calendar"
+            ? demoMode
+              ? "Sample only. This uses a closed mock calendar and does not change an iPhone calendar."
+              : "Approval creates an event in the selected on-device calendar. No invitations are sent; Calendar may sync it according to its account settings."
+            : demoMode
             ? "Sample preview only. No mailbox draft, email, or calendar change will be created."
             : "Preview mode simulates this action. No email will be sent and no external calendar will change."}
         </Text>
@@ -787,6 +918,7 @@ function ReviewSheetContent({
                   ? frozenReplySource.accountId
                   : accountId || undefined,
               calendarId: calendarId || undefined,
+              eventDestination: proposal.kind === "event" ? eventDestination : undefined,
               dueAt:
                 proposal.kind === "event"
                   ? eventStart
@@ -827,8 +959,13 @@ function ReviewSheetContent({
           />
           {blocked ? (
             <Text style={s.disclaimer}>
-              Connect and verify this exact account before this action is
-              available.
+              {proposal.kind === "event" && eventDestination?.kind === "device_calendar"
+                ? !state.deviceCalendars.enabled || state.deviceCalendarAccess.status !== "full_access"
+                  ? "Connect device calendars and allow full access before creating this event."
+                  : parseCsv(eventAttendees).length > 0 || invitePolicy !== "none"
+                    ? "Remove attendees and choose “Do not invite” to create this event on this iPhone."
+                    : "Choose a selected writable calendar in Settings before creating this event."
+                : "Connect and verify this exact account before this action is available."}
             </Text>
           ) : null}
         </>
@@ -847,6 +984,47 @@ function localDateTime(iso?: string) {
     date: `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`,
     time: `${pad(date.getHours())}:${pad(date.getMinutes())}`,
   };
+}
+
+function localDateTimeInZone(iso: string, timeZone: string) {
+  const date = new Date(iso);
+  if (!Number.isFinite(date.getTime())) return { date: "", time: "" };
+  try {
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+    }).formatToParts(date);
+    const value = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+    return {
+      date: `${value.year}-${value.month}-${value.day}`,
+      time: `${value.hour}:${value.minute}`,
+    };
+  } catch {
+    return { date: "", time: "" };
+  }
+}
+
+function formatZonedInstant(iso: string, timeZone: string) {
+  try {
+    const showSeconds = new Date(iso).getSeconds() !== 0;
+    return new Intl.DateTimeFormat(undefined, {
+      timeZone,
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+      ...(showSeconds ? { second: "2-digit" as const } : {}),
+      timeZoneName: "shortOffset",
+    }).format(new Date(iso)) + ` (${new Date(iso).toISOString()})`;
+  } catch {
+    return `${iso} · ${timeZone}`;
+  }
 }
 
 function parseCsv(value: string): string[] {
@@ -869,70 +1047,4 @@ function sameIdentity(
       current.tenantId === frozen.tenantId &&
       current.resourceUserId === frozen.resourceUserId,
   );
-}
-
-function localIso(
-  date: string,
-  time: string,
-  timeZone: string,
-): string | undefined {
-  const dateMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date);
-  const timeMatch = /^(\d{2}):(\d{2})$/.exec(time);
-  if (!dateMatch || !timeMatch || !timeZone.trim()) return undefined;
-  const target = [
-    Number(dateMatch[1]),
-    Number(dateMatch[2]),
-    Number(dateMatch[3]),
-    Number(timeMatch[1]),
-    Number(timeMatch[2]),
-  ];
-  const nominal = Date.UTC(
-    target[0],
-    target[1] - 1,
-    target[2],
-    target[3],
-    target[4],
-  );
-  if (
-    new Date(nominal).getUTCFullYear() !== target[0] ||
-    new Date(nominal).getUTCMonth() + 1 !== target[1] ||
-    new Date(nominal).getUTCDate() !== target[2] ||
-    target[3] > 23 ||
-    target[4] > 59
-  )
-    return undefined;
-  try {
-    let instant = nominal;
-    const formatter = new Intl.DateTimeFormat("en-GB", {
-      timeZone,
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-      hourCycle: "h23",
-    });
-    for (let i = 0; i < 4; i++) {
-      const values = formatter
-        .formatToParts(instant)
-        .reduce<Record<string, number>>((result, item) => {
-          if (["year", "month", "day", "hour", "minute"].includes(item.type))
-            result[item.type] = Number(item.value);
-          return result;
-        }, {});
-      const represented = Date.UTC(
-        values.year,
-        values.month - 1,
-        values.day,
-        values.hour,
-        values.minute,
-      );
-      const correction = nominal - represented;
-      if (correction === 0) return new Date(instant).toISOString();
-      instant += correction;
-    }
-  } catch {
-    return undefined;
-  }
-  return undefined;
 }

@@ -8,6 +8,7 @@ import type {
   SelectedMailTextSnapshot, MailReplyTextLoadResult, MailReplyTextCacheResult, MailReplyTextGenerationInput, MailReplyTextGenerationResult,
   ProactiveCandidateEntry, ProactiveCandidateSourceResult,
   ProactiveState, SavedProactiveRule, RecordingAttachmentPreview,
+  DeviceCalendarAccessState,
   SavePersonInput, SaveProjectInput, KnowledgeItemCommand, SaveKnowledgeFactInput, SaveKnowledgeContactInput,
   SaveKnowledgeSourceLinkInput, SaveKnowledgeMemberInput, ReviewKnowledgeSuggestionInput, EditKnowledgeSuggestionInput, KnowledgeSelection,
 } from '../core';
@@ -24,6 +25,14 @@ import {
 } from '../reminders';
 import type { LegacyReminderCancellation, ReminderIntent, ReminderPayload, ReminderRecord, ReminderState } from '../reminders';
 import type { NotificationBackend, PendingNotificationRequest } from './notificationBackend';
+import type { DeviceCalendarState } from '../deviceCalendars/types';
+import {
+  appendDeviceEventReconciliation, createDeviceEventDispatchRecord, getDeviceCalendarBackend,
+  validateDeviceCalendarReadWindow,
+  recordDeviceEventOutcome, validateDeviceCalendarState,
+} from '../deviceCalendars';
+import type { DeviceCalendarBackend, DeviceEventDispatchRecord, DeviceCalendarRow } from '../deviceCalendars';
+import { DeviceCalendarBackendError } from './deviceCalendarBackend';
 import { removeAudio } from '../audio/readAudio';
 import type { AudioRecoveryMetadata, RecordingRecoveryService, StagedRecording } from '../audio/recovery.types';
 import { MAX_DURATION_SECONDS, MAX_RECOVERY_BYTES, RECOVERY_FORMATS, safeAudioFileName } from '../audio/formats';
@@ -185,8 +194,13 @@ function initialState(): AppState {
     settings: { ...DEFAULT_SETTINGS },
     usage: { month: day.slice(0, 7), day, requests: 0, attemptsToday: 0, inputTokens: 0, outputTokens: 0, transcriptionSeconds: 0, attempts: 0, unknownCharges: 0, reservedUsd: 0, priceKnown: false, estimatedCostUsd: 0 },
     mailbox: [], selectedMailTexts: [], calendarEvents: [], syncStates: {}, pendingCredentialCleanup: [], dispatchRecords: [], dispatchRecordQuarantine: [], mailboxSchemaVersion: 2,
+    deviceCalendars: emptyDeviceCalendarState(), deviceCalendarAccess: { status: 'needs_check' },
     proactive: emptyProactiveState(), importedBackups: [], knowledge: emptyKnowledgeState(), reminders: emptyReminderState(newId()),
   };
+}
+
+function emptyDeviceCalendarState(installationId = newId()): DeviceCalendarState {
+  return { schemaVersion: 1, installationId, generation: 1, selectionRevision: 1, enabled: false, selectedCalendarIds: [], calendars: [], events: [], dispatchRecords: [] };
 }
 
 function emptySyncState(accountId: string): AccountSyncState {
@@ -404,6 +418,47 @@ function validCalendarCacheRow(value: unknown): value is CalendarEventSnapshot {
     typeof value.providerEventId === 'string' && value.providerEventId.length > 0 && value.providerEventId.length <= 1024;
 }
 
+function currentDeviceCalendarSnapshotAvailable(state: AppState, at = Date.now()): boolean {
+  const device = state.deviceCalendars, run = device.readRun;
+  if (state.deviceCalendarAccess.status !== 'full_access' || !device.enabled || !device.selectedCalendarIds.length || !run ||
+      run.generation !== device.generation || run.selectionRevision !== device.selectionRevision ||
+      stableJson(run.selectedCalendarIds) !== stableJson(device.selectedCalendarIds)) return false;
+  const age = at - Date.parse(run.startedAt);
+  if (!Number.isFinite(age) || age < 0 || age >= 15 * 60_000 || run.partial || run.completedCalendarIds.length !== run.selectedCalendarIds.length) return false;
+  const inWindow = device.events.filter((event) => event.generation === device.generation && device.selectedCalendarIds.includes(event.calendarId) &&
+    Date.parse(event.end) > Date.parse(run.window.timeMin) && Date.parse(event.start) < Date.parse(run.window.timeMax));
+  return inWindow.every((event) => {
+    if (event.cancelled) return true;
+    const observedAt = Date.parse(event.observedAt);
+    const eventAge = at - observedAt;
+    return Number.isFinite(eventAge) && eventAge >= 0 && eventAge < 15 * 60_000;
+  });
+}
+
+function usableDeviceCalendarSnapshot(state: AppState, at = Date.now()): boolean {
+  const device = state.deviceCalendars, run = device.readRun;
+  if (state.deviceCalendarAccess.status !== 'full_access' || !device.enabled || !device.selectedCalendarIds.length || !run ||
+      run.generation !== device.generation || run.selectionRevision !== device.selectionRevision ||
+      stableJson(run.selectedCalendarIds) !== stableJson(device.selectedCalendarIds)) return false;
+  const age = at - Date.parse(run.startedAt);
+  return Number.isFinite(age) && age >= 0 && age < 15 * 60_000;
+}
+
+function deviceReminderSourceProjection(state: AppState, binding: NonNullable<Extract<ReminderRecord['origin'], { kind: 'proactive' }>['deviceBinding']>): string | undefined {
+  const device = state.deviceCalendars;
+  const calendar = device.calendars.find((item) => item.localId === binding.calendarId);
+  const event = device.events.find((item) => item.calendarId === binding.calendarId && item.nativeEventId === binding.nativeEventId &&
+    item.occurrenceStart === binding.occurrenceStart && item.generation === binding.generation && !item.cancelled);
+  if (!calendar || !event || state.deviceCalendarAccess.status !== 'full_access' || !device.enabled || device.installationId !== binding.installationId ||
+      device.generation !== binding.generation || !device.selectedCalendarIds.includes(binding.calendarId)) return undefined;
+  const age = Date.now() - Date.parse(event.observedAt);
+  if (!Number.isFinite(age) || age < 0 || age >= 15 * 60_000) return undefined;
+  return stableJson({ installationId: device.installationId, generation: device.generation, selectionRevision: device.selectionRevision,
+    calendarId: calendar.localId, nativeCalendarId: calendar.nativeId, calendarFingerprint: calendar.fingerprint,
+    event: { nativeEventId: event.nativeEventId, occurrenceStart: event.occurrenceStart, title: event.title, notes: event.notes,
+      notesTruncated: event.notesTruncated, start: event.start, end: event.end, timeZone: event.timeZone ?? null, allDay: event.allDay, cancelled: event.cancelled } });
+}
+
 function assistContext(state: AppState, note: Note, intent: AssistIntent, question?: string, knowledgeSelection: KnowledgeSelection = []): { documents: ContextDocument[]; additionalSources: AssistantSourceInput[]; omittedSourceCount: number; omittedSourceIds: string[] } {
   const entityNarrativePaths = new Set([
     ...state.knowledge.people.map((entity) => entity.narrativePath),
@@ -427,7 +482,7 @@ function assistContext(state: AppState, note: Note, intent: AssistIntent, questi
     ...state.knowledge.projects.map((entity) => ({ kind: 'project' as const, entity })),
   ].filter(({ kind, entity }) => anchorKnowledgeKeys.has(`${kind}:${entity.id}`));
   const linkedEntityKeys = new Set<string>(), linkedTaskIds = new Set<string>(), linkedNoteIds = new Set<string>(), linkedDocumentPaths = new Set<string>();
-  const linkedMailKeys = new Set<string>(), linkedCalendarKeys = new Set<string>();
+  const linkedMailKeys = new Set<string>(), linkedCalendarKeys = new Set<string>(), linkedDeviceEventKeys = new Set<string>();
   for (const { entity } of anchorEntities) {
     for (const { reference } of entity.sourceLinks) {
       if (reference.kind === 'person' || reference.kind === 'project') linkedEntityKeys.add(`${reference.kind}:${reference.id}`);
@@ -436,6 +491,7 @@ function assistContext(state: AppState, note: Note, intent: AssistIntent, questi
       else if (reference.kind === 'document') linkedDocumentPaths.add(reference.id);
       else if (reference.kind === 'mail') linkedMailKeys.add(`${reference.identityKey}:${reference.id}`);
       else if (reference.kind === 'calendar') linkedCalendarKeys.add(`${reference.identityKey}:${reference.calendarId}:${reference.id}`);
+      else if (reference.kind === 'device_calendar_event') linkedDeviceEventKeys.add(`device_calendar_event:${encodeURIComponent(reference.installationId)}:${encodeURIComponent(reference.calendarId)}:${encodeURIComponent(reference.eventId)}:${encodeURIComponent(reference.occurrenceStart)}`);
     }
     if ('members' in entity) for (const member of entity.members) if ('personId' in member) linkedEntityKeys.add(`person:${member.personId}`);
   }
@@ -483,6 +539,33 @@ function assistContext(state: AppState, note: Note, intent: AssistIntent, questi
         ? [{ ...message, identityKey: accountIdentity, selectionPriority: linkedMailKeys.has(`${accountIdentity}:${message.providerMessageId}`) ? 1 as const : 0 as const }]
         : [];
     }),
+    deviceCalendarSnapshot: (() => {
+      const device = state.deviceCalendars;
+      const run = device.readRun;
+      if (state.deviceCalendarAccess.status !== 'full_access' || !device.enabled || !device.selectedCalendarIds.length || !run ||
+          run.generation !== device.generation || run.selectionRevision !== device.selectionRevision ||
+          stableJson(run.selectedCalendarIds) !== stableJson(device.selectedCalendarIds)) return undefined;
+      const inWindow = device.events.filter((event) => event.generation === device.generation && device.selectedCalendarIds.includes(event.calendarId) &&
+        !event.cancelled && Date.parse(event.end) > Date.parse(run.window.timeMin) && Date.parse(event.start) < Date.parse(run.window.timeMax));
+      const events = device.events.filter((event) => event.generation === device.generation && device.selectedCalendarIds.includes(event.calendarId) &&
+        !event.cancelled && Number.isFinite(Date.parse(event.observedAt)) && Date.now() - Date.parse(event.observedAt) >= 0 &&
+        Date.now() - Date.parse(event.observedAt) < 15 * 60_000 && Date.parse(event.end) > Date.parse(run.window.timeMin) &&
+        Date.parse(event.start) < Date.parse(run.window.timeMax));
+      const freshAsOf = events.reduce<string | undefined>((latest, event) => !latest || Date.parse(event.observedAt) > Date.parse(latest) ? event.observedAt : latest, undefined);
+      const runAge = Date.now() - Date.parse(run.startedAt);
+      const staleCount = inWindow.length - events.length;
+      return {
+        installationId: device.installationId, generation: device.generation, selectionRevision: device.selectionRevision,
+        selectedCalendarIds: [...device.selectedCalendarIds], timeMin: run.window.timeMin, timeMax: run.window.timeMax,
+        asOf: freshAsOf ?? run.startedAt,
+        partial: run.partial || run.completedCalendarIds.length !== run.selectedCalendarIds.length || staleCount > 0 || !Number.isFinite(runAge) || runAge < 0 || runAge >= 15 * 60_000,
+        omittedEvents: run.truncatedEvents + staleCount, events: events.map((event) => ({ calendarId: event.calendarId,
+          nativeEventId: event.nativeEventId, occurrenceStart: event.occurrenceStart, title: event.title, notes: event.notes,
+          notesTruncated: event.notesTruncated, start: event.start, end: event.end, timeZone: event.timeZone,
+          allDay: event.allDay, cancelled: event.cancelled,
+          selectionPriority: linkedDeviceEventKeys.has(`device_calendar_event:${encodeURIComponent(device.installationId)}:${encodeURIComponent(event.calendarId)}:${encodeURIComponent(event.nativeEventId)}:${encodeURIComponent(event.occurrenceStart)}`) ? 1 as const : 0 as const })),
+      };
+    })(),
   });
   const documentByPath = new Map(allDocuments.map((document) => [document.path, document]));
   return {
@@ -510,7 +593,7 @@ function offlineAssistInputs(note: Note, intent: AssistIntent, question: string 
   const calendarQuestion = intent === 'answer' && /\b(calendar|meeting|event|upcoming|tomorrow|today|next)\b/i.test(question ?? '') && calendarAvailable;
   return [
     { id: 'transcript', revision: note.revision, text: note.transcript, required: true, kind: 'note' },
-    ...additionalSources.filter((source) => taskQuestion && source.id.startsWith('task:') || calendarQuestion && source.id.startsWith('calendar')),
+    ...additionalSources.filter((source) => taskQuestion && source.id.startsWith('task:') || calendarQuestion && (source.id.startsWith('calendar') || source.id.startsWith('device_calendar'))),
   ];
 }
 
@@ -541,7 +624,7 @@ function intersectCapabilities(...groups: AccountCapability[][]): AccountCapabil
 
 async function approvedDigest(proposal: Proposal, state: AppState): Promise<string> {
   const account = state.accounts.find((item) => item.id === proposal.accountId);
-  const calendar = state.calendars.find((item) => item.id === proposal.calendarId);
+  const calendar = proposal.eventDestination?.kind === 'remote_calendar' ? state.calendars.find((item) => item.id === proposal.eventDestination?.calendarId) : undefined;
   const payload = JSON.stringify({
     id: proposal.id, revision: proposal.revision, noteId: proposal.noteId, sourceRevision: proposal.sourceRevision,
     provenance: proposal.provenance ?? null, requiresRebuild: proposal.requiresRebuild ?? false,
@@ -556,6 +639,7 @@ async function approvedDigest(proposal: Proposal, state: AppState): Promise<stri
       scopes: account.grantedScopes ?? [], capabilities: account.capabilities ?? [], capabilityLimits: account.capabilityLimits ?? [],
     } : null,
     recipients: [...proposal.recipients], calendarId: proposal.calendarId ?? null,
+    eventDestination: proposal.eventDestination ?? null, deviceCalendarApproval: proposal.deviceCalendarApproval ?? null,
     calendarDestination: calendar ? { accountId: calendar.accountId, providerId: calendar.providerId ?? null, name: calendar.name, writable: calendar.writable, connected: calendar.connected } : null,
     dueAt: proposal.dueAt ?? null, email: proposal.email ?? null, event: proposal.event ?? null, evidence: proposal.evidence,
   });
@@ -622,7 +706,7 @@ function createProposalProvenance(input: {
   };
 }
 
-function normalizeLoadedState(value: unknown): AppState & { backupImportQuarantine?: unknown[]; knowledgeQuarantine?: unknown[]; reminderQuarantine?: unknown[] } {
+function normalizeLoadedState(value: unknown): AppState & { backupImportQuarantine?: unknown[]; knowledgeQuarantine?: unknown[]; reminderQuarantine?: unknown[]; deviceCalendarQuarantine?: unknown[] } {
   const defaults = initialState();
   if (!value || typeof value !== 'object') throw new Error('Saved app data is not a valid state snapshot. It was preserved for recovery.');
   const raw = value as Partial<AppState>;
@@ -775,6 +859,15 @@ function normalizeLoadedState(value: unknown): AppState & { backupImportQuaranti
     try { reminders = validateReminderState(raw.reminders); }
     catch { reminders = emptyReminderState(newId()); reminderQuarantine.push(raw.reminders); }
   }
+  const retainedDeviceCalendarQuarantine = (value as { deviceCalendarQuarantine?: unknown }).deviceCalendarQuarantine;
+  const deviceCalendarQuarantine: unknown[] = Array.isArray(retainedDeviceCalendarQuarantine)
+    ? clone(retainedDeviceCalendarQuarantine) : retainedDeviceCalendarQuarantine === undefined ? [] : [retainedDeviceCalendarQuarantine];
+  let deviceCalendars: DeviceCalendarState;
+  if (raw.deviceCalendars === undefined) deviceCalendars = defaults.deviceCalendars;
+  else {
+    try { deviceCalendars = clone(validateDeviceCalendarState(raw.deviceCalendars)); }
+    catch { deviceCalendars = defaults.deviceCalendars; deviceCalendarQuarantine.push(raw.deviceCalendars); }
+  }
   const dispatchRecords: DispatchRecord[] = [];
   const dispatchRecordQuarantine: AppState['dispatchRecordQuarantine'] = Array.isArray(raw.dispatchRecordQuarantine)
     ? raw.dispatchRecordQuarantine.map((item) => item && typeof item === 'object' && 'raw' in item && 'quarantinedAt' in item
@@ -805,6 +898,13 @@ function normalizeLoadedState(value: unknown): AppState & { backupImportQuaranti
     ...(reminderQuarantine.length ? { reminderQuarantine } : {}),
     reminderRecoveryStatus: reminderQuarantine.length
       ? { quarantined: true as const, message: 'Some reminder data could not be validated and is held privately. New reminders are disabled until recovery.' as const }
+      : undefined,
+    deviceCalendars,
+    // Permission state in persisted JSON is informational only. The OS is checked on explicit action/foreground.
+    deviceCalendarAccess: { status: 'needs_check' },
+    ...(deviceCalendarQuarantine.length ? { deviceCalendarQuarantine } : {}),
+    deviceCalendarRecoveryStatus: deviceCalendarQuarantine.length
+      ? { quarantined: true as const, message: 'Some device calendar history could not be validated and is held privately. New device calendar writes are disabled until recovery.' as const }
       : undefined,
     ...(backupImportQuarantine.length ? { backupImportQuarantine } : {}),
     backupRecoveryStatus: backupImportQuarantine.length
@@ -888,6 +988,7 @@ export interface ControllerIntegrationDependencies {
   ) => ConnectorClient;
   recordingRecovery?: RecordingRecoveryService;
   reminderBackend?: NotificationBackend;
+  deviceCalendarBackend?: DeviceCalendarBackend;
 }
 
 interface BackupImportSession {
@@ -980,6 +1081,13 @@ export class AppControllerImpl implements AppController {
   private reminderJobs = new Map<string, Promise<ReminderRecord>>();
   private reminderLegacyJobs = new Map<string, Promise<void>>();
   private draftAllocatedIds = new WeakMap<AppState, Set<string>>();
+  private deviceEventQuarantine: unknown[] = [];
+  private verifiedDeviceCalendarGeneration?: number;
+  private deviceCalendarJob?: Promise<DeviceCalendarState>;
+  private deviceEventJobs = new Map<string, Promise<Proposal>>();
+  private deviceEventCreateTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private deviceEventLateResults = new Map<string, Promise<void>>();
+  private readonly deviceCalendarBackend: DeviceCalendarBackend;
 
   constructor(
     private readonly store: StateStore = stateStore,
@@ -992,6 +1100,7 @@ export class AppControllerImpl implements AppController {
       ? integration.connectorFactory(integration.tokenStore, (accountId, status) => this.handleConnectorAuthStatus(accountId, status))
       : undefined;
     this.reminderBackend = integration.reminderBackend ?? createNotificationBackend();
+    this.deviceCalendarBackend = integration.deviceCalendarBackend ?? getDeviceCalendarBackend();
   }
 
   private async getRecordingRecoveryService(): Promise<RecordingRecoveryService> {
@@ -1013,20 +1122,22 @@ export class AppControllerImpl implements AppController {
   }
 
   private persistedState(state: AppState): AppState {
-    const result = { ...state } as AppState & { proactiveQuarantine?: unknown; backupImportQuarantine?: unknown[]; knowledgeQuarantine?: unknown[]; reminderQuarantine?: unknown[] };
+    const result = { ...state } as AppState & { proactiveQuarantine?: unknown; backupImportQuarantine?: unknown[]; knowledgeQuarantine?: unknown[]; reminderQuarantine?: unknown[]; deviceCalendarQuarantine?: unknown[] };
     if (this.proactiveQuarantine) result.proactiveQuarantine = clone(this.proactiveQuarantine);
     if (this.backupImportQuarantine.length) result.backupImportQuarantine = clone(this.backupImportQuarantine);
     if (this.knowledgeQuarantine.length) result.knowledgeQuarantine = clone(this.knowledgeQuarantine);
     if (this.reminderQuarantine.length) result.reminderQuarantine = clone(this.reminderQuarantine);
+    if (this.deviceEventQuarantine.length) result.deviceCalendarQuarantine = clone(this.deviceEventQuarantine);
     return result;
   }
 
   private publicState(state: AppState): AppState {
-    const result = clone(state) as AppState & { proactiveQuarantine?: unknown; backupImportQuarantine?: unknown; knowledgeQuarantine?: unknown; reminderQuarantine?: unknown };
+    const result = clone(state) as AppState & { proactiveQuarantine?: unknown; backupImportQuarantine?: unknown; knowledgeQuarantine?: unknown; reminderQuarantine?: unknown; deviceCalendarQuarantine?: unknown };
     delete result.proactiveQuarantine;
     delete result.backupImportQuarantine;
     delete result.knowledgeQuarantine;
     delete result.reminderQuarantine;
+    delete result.deviceCalendarQuarantine;
     return result;
   }
 
@@ -1413,6 +1524,7 @@ export class AppControllerImpl implements AppController {
     proposal.revision += 1;
     proposal.approvedRevision = undefined;
     proposal.approvedPayloadDigest = undefined;
+    proposal.deviceCalendarApproval = undefined;
     proposal.lastError = undefined;
     if (proposal.status === 'approved' || proposal.status === 'failed') proposal.status = 'draft';
   }
@@ -1469,6 +1581,7 @@ export class AppControllerImpl implements AppController {
 
   private async loadInternal(): Promise<void> {
     this.verifiedReminderForeground.clear();
+    this.verifiedDeviceCalendarGeneration = undefined;
     const loaded = await this.store.load();
     const normalized = loaded ? normalizeLoadedState(loaded) : initialState();
     this.backupImportQuarantine = clone((normalized as AppState & { backupImportQuarantine?: unknown[] }).backupImportQuarantine ?? []);
@@ -1477,6 +1590,8 @@ export class AppControllerImpl implements AppController {
     delete (normalized as AppState & { knowledgeQuarantine?: unknown[] }).knowledgeQuarantine;
     this.reminderQuarantine = clone((normalized as AppState & { reminderQuarantine?: unknown[] }).reminderQuarantine ?? []);
     delete (normalized as AppState & { reminderQuarantine?: unknown[] }).reminderQuarantine;
+    this.deviceEventQuarantine = clone((normalized as AppState & { deviceCalendarQuarantine?: unknown[] }).deviceCalendarQuarantine ?? []);
+    delete (normalized as AppState & { deviceCalendarQuarantine?: unknown[] }).deviceCalendarQuarantine;
     this.state = normalized;
     const persisted = loaded as (AppState & { proactiveQuarantine?: unknown }) | undefined;
     const proactive = normalizeProactiveData(persisted?.proactive, persisted?.proactiveQuarantine);
@@ -1512,7 +1627,24 @@ export class AppControllerImpl implements AppController {
         } catch { /* Keep malformed history read-only; never infer an accepted result. */ }
       }
     }
+    for (const record of this.state.deviceCalendars.dispatchRecords) {
+      if (record.outcome !== 'pending') continue;
+      try {
+        const outcomeAt = new Date(Math.max(Date.now(), Date.parse(record.claimAt))).toISOString();
+        const unknown = recordDeviceEventOutcome(record, { outcome: 'unknown', at: outcomeAt, observationSource: 'restart_recovery' });
+        this.state.deviceCalendars.dispatchRecords[this.state.deviceCalendars.dispatchRecords.findIndex((item) => item.id === record.id)] = unknown;
+      } catch { /* Invalid history is retained privately by normalization and never becomes authorization. */ }
+    }
     for (const proposal of this.state.proposals) {
+      if (proposal.deviceEventDispatchRecordId && proposal.status === 'dispatching') {
+        const record = this.state.deviceCalendars.dispatchRecords.find((item) => item.id === proposal.deviceEventDispatchRecordId);
+        proposal.status = record?.outcome === 'saved' ? 'accepted' : record?.outcome === 'rejected' ? 'failed' : 'unknown';
+        proposal.deviceEventDispatchRecordId = record?.id;
+        proposal.remoteId = record?.nativeEventId;
+        proposal.remoteAcceptedAt = record?.outcomeAt;
+        proposal.lastError = record?.outcome === 'unknown' || !record
+          ? 'App closed while this on-device calendar action was in progress. Check the calendar manually; the event will not be created again.' : undefined;
+      }
       if (proposal.dispatchRecordId) {
         const record = this.state.dispatchRecords.find((item) => item.id === proposal.dispatchRecordId);
         if (record && proposal.status === 'dispatching') {
@@ -1826,6 +1958,20 @@ export class AppControllerImpl implements AppController {
         return account ? { kind: 'calendar', id: providerId, calendarId: calendarProviderId, identityKey: identity, connectionGeneration: account.connectionGeneration ?? 0 } : undefined;
       } catch { return undefined; }
     }
+    if (sourceId.startsWith('device_calendar_event:')) {
+      const parts = sourceId.slice('device_calendar_event:'.length).split(':');
+      if (parts.length !== 4) return undefined;
+      try {
+        const [installationId, calendarId, eventId, occurrenceStart] = parts.map((part) => decodeURIComponent(part));
+        const device = state.deviceCalendars;
+        const matches = device.events.filter((event) => event.calendarId === calendarId && event.nativeEventId === eventId && event.occurrenceStart === occurrenceStart && !event.cancelled);
+        if (matches.length !== 1 || matches[0].generation !== device.generation || !device.selectedCalendarIds.includes(calendarId) ||
+            !this.deviceCalendarGenerationIsCurrent(state, device.generation, installationId)) return undefined;
+        const age = Date.now() - Date.parse(matches[0].observedAt);
+        return Number.isFinite(age) && age >= 0 && age < 15 * 60_000
+          ? { kind: 'device_calendar_event', installationId, generation: device.generation, calendarId, eventId, occurrenceStart } : undefined;
+      } catch { return undefined; }
+    }
     return undefined;
   }
 
@@ -1883,7 +2029,7 @@ export class AppControllerImpl implements AppController {
       if (state.settings.mode === 'provider' && analysis.source === 'provider') {
         currentVersions = (await this.openAiClient.prepare(note, documents, state.settings, request)).sourceVersions;
       } else {
-        const calendarAvailable = state.calendars.some((calendar) => {
+        const calendarAvailable = usableDeviceCalendarSnapshot(state) || state.calendars.some((calendar) => {
           const account = state.accounts.find((item) => item.id === calendar.accountId);
           const sync = state.syncStates[calendar.accountId];
           return Boolean(account?.connected && account.authStatus === 'connected' && calendar.connected && sync?.calendarsCompletedAt && sync.eventsCompletedAt[calendar.id]);
@@ -1947,17 +2093,19 @@ export class AppControllerImpl implements AppController {
     const request = { intent, question, ...(answeredAsOf ? { queryTimeAnchor: answeredAsOf, queryTimeZone: state.settings.timezone } : {}), additionalSources: localSources, preselection: { omittedSourceCount, omittedSourceIds } };
     const prepared = state.settings.mode === 'provider' ? await this.openAiClient.prepare(note, contextDocs, state.settings, request) : undefined;
     const transcriptVersion = `${note.revision}:${await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, note.transcript.replace(/\r\n?/g, '\n').normalize('NFC'))}`;
-    const hasCompleteCalendar = state.calendars.some((calendar) => {
+    const hasCompleteRemoteCalendar = state.calendars.some((calendar) => {
       const account = state.accounts.find((item) => item.id === calendar.accountId);
       const sync = state.syncStates[calendar.accountId];
       return Boolean(account?.connected && account.authStatus === 'connected' && calendar.connected && sync?.calendarsCompletedAt && sync.eventsCompletedAt[calendar.id]);
     });
+    const hasCompleteDeviceCalendar = currentDeviceCalendarSnapshotAvailable(state);
+    const hasUsableDeviceCalendar = usableDeviceCalendarSnapshot(state);
     const verifiedEvents = state.calendarEvents.filter((event) => {
       const calendar = state.calendars.find((item) => item.id === event.calendarId);
       const account = state.accounts.find((item) => item.id === event.accountId);
       return Boolean(calendar?.connected && account?.connected && account.authStatus === 'connected' && identityKey(account));
     });
-    const offlineInputs = offlineAssistInputs(note, intent, question, localSources, hasCompleteCalendar);
+    const offlineInputs = offlineAssistInputs(note, intent, question, localSources, hasCompleteRemoteCalendar || hasUsableDeviceCalendar);
     const offlineCatalog = state.settings.mode === 'preview' ? await createSourceCatalog(offlineInputs,
       async (bytes) => Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, new TextDecoder().decode(bytes))) : undefined;
     const sourceVersions = prepared?.sourceVersions ?? Object.fromEntries(offlineCatalog?.sources.map((source) => [source.id, source.version]) ?? [['transcript', transcriptVersion]]);
@@ -1976,8 +2124,17 @@ export class AppControllerImpl implements AppController {
       if (this.snapshot.notes.find((item) => item.id === id)?.revision !== sourceRevision) throw new Error('The transcript changed during processing. The provider result was discarded.');
     } else {
       const proposals = extractPreviewProposals(note);
+      const device = state.deviceCalendars, deviceRun = device.readRun;
+      const deviceEvents = usableDeviceCalendarSnapshot(state) && deviceRun
+        ? device.events.filter((event) => event.generation === device.generation && device.selectedCalendarIds.includes(event.calendarId) && !event.cancelled &&
+          Date.now() - Date.parse(event.observedAt) >= 0 && Date.now() - Date.parse(event.observedAt) < 15 * 60_000 &&
+          Date.parse(event.end) > Date.parse(deviceRun.window.timeMin) && Date.parse(event.start) < Date.parse(deviceRun.window.timeMax))
+          .map(({ title, start, end, timeZone, allDay, notes, notesTruncated }) => ({ subject: title, start, end, timeZone, allDay, notes, notesTruncated })) : [];
       const preview = buildOfflinePreview({ intent, transcript: note.transcript, question, timeZone: answeredAsOf ? state.settings.timezone : note.captureTimeZone || state.settings.timezone, now: answeredAsOf ?? capturedAt, transcriptRevision: note.revision, transcriptSourceVersion: transcriptVersion,
-        ...(intent === 'answer' ? { tasks: state.tasks.map(({ title, status, dueAt }) => ({ title, status, dueAt })), calendarEvents: verifiedEvents.map(({ subject, start, timeZone }) => ({ subject, start, timeZone })), calendarSnapshotAvailable: hasCompleteCalendar } : {}),
+        ...(intent === 'answer' ? { tasks: state.tasks.map(({ title, status, dueAt }) => ({ title, status, dueAt })), calendarEvents: verifiedEvents.map(({ subject, start, timeZone }) => ({ subject, start, timeZone })),
+          deviceCalendarEvents: deviceEvents, deviceCalendarSnapshotAvailable: hasCompleteDeviceCalendar,
+          deviceCalendarSnapshotPartial: hasUsableDeviceCalendar && !hasCompleteDeviceCalendar,
+          calendarSnapshotAvailable: hasCompleteRemoteCalendar } : {}),
       });
       const offlineIncludedIds = offlineInputs.map((source) => source.id);
       generated = {
@@ -2228,9 +2385,228 @@ export class AppControllerImpl implements AppController {
     return updated;
   }
 
-  async editProposal(id: string, patch: ProposalPatch): Promise<Proposal> {
+  private assertDeviceCalendarWritable(state: AppState): void {
+    if (this.deviceEventQuarantine.length || state.deviceCalendarRecoveryStatus?.quarantined) {
+      throw new Error('Device calendar history failed integrity validation. New device calendar actions are disabled until recovery.');
+    }
+  }
+
+  private invalidatePendingDeviceEvents(state: AppState, reason: string): void {
+    for (const proposal of state.proposals.filter((item) => item.eventDestination?.kind === 'device_calendar' && ['draft', 'approved', 'failed'].includes(item.status))) {
+      this.invalidate(proposal);
+      proposal.status = 'draft';
+      proposal.lastError = reason;
+    }
+  }
+
+  private deviceCalendarGenerationIsCurrent(state: AppState, generation: number, installationId = state.deviceCalendars.installationId): boolean {
+    return !this.deviceEventQuarantine.length && state.deviceCalendars.installationId === installationId &&
+      state.deviceCalendars.generation === generation && this.verifiedDeviceCalendarGeneration === generation &&
+      state.deviceCalendarAccess.status === 'full_access';
+  }
+
+  private deviceEventProjection(state: AppState, proposal: Proposal, row?: DeviceCalendarRow): string | undefined {
+    const approval = proposal.deviceCalendarApproval;
+    const destination = proposal.eventDestination;
+    if (proposal.kind !== 'event' || destination?.kind !== 'device_calendar' || !proposal.event || !approval) return undefined;
+    const target = row ?? state.deviceCalendars.calendars.find((item) => item.localId === destination.calendarId);
+    if (!target) return undefined;
+    return JSON.stringify({ installationId: state.deviceCalendars.installationId, generation: state.deviceCalendars.generation,
+      selectionRevision: state.deviceCalendars.selectionRevision, calendarId: target.localId, nativeId: target.nativeId,
+      fingerprint: target.fingerprint, event: { title: proposal.event.title ?? proposal.title, notes: proposal.event.description ?? proposal.body,
+        start: proposal.event.start, end: proposal.event.end, timeZone: proposal.event.timeZone, attendees: proposal.event.attendees, invitePolicy: proposal.event.invitePolicy } });
+  }
+
+  async checkDeviceCalendarAccess(): Promise<DeviceCalendarAccessState> {
+    await this.load();
+    const captured = this.snapshot.deviceCalendars;
+    const permission = await this.deviceCalendarBackend.getPermission();
+    return this.mutate((state) => {
+      if (state.deviceCalendars.installationId !== captured.installationId || state.deviceCalendars.generation !== captured.generation) {
+        throw new Error('Device calendar connection changed while permission was checked. Check access again.');
+      }
+      const next: DeviceCalendarAccessState = { status: permission, checkedAt: now() };
+      if (permission !== 'full_access') {
+        this.verifiedDeviceCalendarGeneration = undefined;
+        state.deviceCalendars = { ...state.deviceCalendars, generation: state.deviceCalendars.generation + 1, enabled: false,
+          selectedCalendarIds: [], events: [], readRun: undefined };
+        this.invalidatePendingDeviceEvents(state, 'Device calendar access changed. Check access and review this event again.');
+      } else this.verifiedDeviceCalendarGeneration = state.deviceCalendars.generation;
+      state.deviceCalendarAccess = next;
+      return next;
+    });
+  }
+
+  async connectDeviceCalendars(input: { expectedGeneration: number }): Promise<DeviceCalendarAccessState> {
+    await this.load();
+    this.assertDeviceCalendarWritable(this.snapshot);
+    const captured = this.snapshot.deviceCalendars;
+    if (captured.generation !== input.expectedGeneration) throw new Error('Device calendar connection changed. Refresh before connecting.');
+    const permission = await this.deviceCalendarBackend.requestFullPermission();
+    if (permission !== 'full_access') {
+      return this.mutate((state) => {
+        if (state.deviceCalendars.generation !== captured.generation || state.deviceCalendars.installationId !== captured.installationId) throw new Error('Device calendar connection changed while permission was requested.');
+        this.verifiedDeviceCalendarGeneration = undefined;
+        state.deviceCalendarAccess = { status: permission, checkedAt: now() };
+        state.deviceCalendars = { ...state.deviceCalendars, generation: state.deviceCalendars.generation + 1, enabled: false, selectedCalendarIds: [], events: [], readRun: undefined };
+        this.invalidatePendingDeviceEvents(state, 'Device calendar access changed. Review this event again after reconnecting.');
+        return state.deviceCalendarAccess;
+      });
+    }
+    const discovery = await this.deviceCalendarBackend.listCalendars(captured.calendars);
+    const result = await this.mutate((state) => {
+      if (state.deviceCalendars.generation !== captured.generation || state.deviceCalendars.installationId !== captured.installationId) throw new Error('Device calendar connection changed while calendars were listed.');
+      const generation = state.deviceCalendars.generation + 1;
+      state.deviceCalendars = { ...state.deviceCalendars, generation, selectionRevision: state.deviceCalendars.selectionRevision + 1,
+        enabled: true, calendars: discovery.calendars.slice(0, 100), selectedCalendarIds: [], events: [], readRun: undefined };
+      state.deviceCalendarAccess = { status: 'full_access', checkedAt: now() };
+      this.verifiedDeviceCalendarGeneration = generation;
+      this.invalidatePendingDeviceEvents(state, 'Device calendar connection changed. Review this event again after selecting a calendar.');
+      return state.deviceCalendarAccess;
+    });
+    return result;
+  }
+
+  async disconnectDeviceCalendars(input: { expectedGeneration: number }): Promise<DeviceCalendarState> {
+    return this.mutate((state) => {
+      this.assertDeviceCalendarWritable(state);
+      const device = state.deviceCalendars;
+      if (device.generation !== input.expectedGeneration) throw new Error('Device calendar connection changed. Refresh before disconnecting.');
+      device.generation += 1;
+      device.selectionRevision += 1;
+      device.enabled = false;
+      device.selectedCalendarIds = [];
+      device.events = [];
+      device.readRun = undefined;
+      this.verifiedDeviceCalendarGeneration = undefined;
+      state.deviceCalendarAccess = { status: 'needs_check' };
+      this.invalidatePendingDeviceEvents(state, 'Device calendar access changed. Review this event again after reconnecting.');
+      return device;
+    });
+  }
+
+  async setDeviceCalendarSelection(input: { expectedGeneration: number; expectedSelectionRevision: number; calendarIds: string[] }): Promise<DeviceCalendarState> {
+    return this.mutate((state) => {
+      this.assertDeviceCalendarWritable(state);
+      const device = state.deviceCalendars;
+      if (!this.deviceCalendarGenerationIsCurrent(state, input.expectedGeneration) || device.selectionRevision !== input.expectedSelectionRevision) throw new Error('Device calendar access or selection changed. Refresh before selecting calendars.');
+      if (!Array.isArray(input.calendarIds) || input.calendarIds.length > 20 || new Set(input.calendarIds).size !== input.calendarIds.length || input.calendarIds.some((id) => !device.calendars.some((row) => row.localId === id))) throw new Error('Choose up to 20 calendars from the current device calendar list.');
+      device.selectedCalendarIds = [...input.calendarIds];
+      device.selectionRevision += 1;
+      device.readRun = undefined;
+      this.invalidatePendingDeviceEvents(state, 'Device calendar selection changed. Review this event again.');
+      return device;
+    });
+  }
+
+  async refreshDeviceCalendars(input: { expectedGeneration: number; expectedSelectionRevision: number; continueRunId?: string }): Promise<DeviceCalendarState> {
+    if (this.deviceCalendarJob) return this.deviceCalendarJob;
+    const job = this.refreshDeviceCalendarsInternal(input);
+    this.deviceCalendarJob = job;
+    try { return await job; } finally { if (this.deviceCalendarJob === job) this.deviceCalendarJob = undefined; }
+  }
+
+  private async refreshDeviceCalendarsInternal(input: { expectedGeneration: number; expectedSelectionRevision: number; continueRunId?: string }): Promise<DeviceCalendarState> {
+    await this.load();
+    this.assertDeviceCalendarWritable(this.snapshot);
+    const captured = clone(this.snapshot.deviceCalendars);
+    if (!this.deviceCalendarGenerationIsCurrent(this.snapshot, input.expectedGeneration) || captured.selectionRevision !== input.expectedSelectionRevision || !captured.enabled) throw new Error('Connect device calendars and choose a current selection before refreshing.');
+    let run = captured.readRun;
+    if (input.continueRunId) {
+      if (!run || run.runId !== input.continueRunId || run.generation !== captured.generation || run.selectionRevision !== captured.selectionRevision) throw new Error('This device calendar refresh continuation is no longer current. Start a fresh refresh.');
+    } else {
+      const at = Date.now();
+      const selected = [...captured.selectedCalendarIds];
+      run = { runId: newId(), generation: captured.generation, selectionRevision: captured.selectionRevision,
+        window: { timeMin: new Date(at - 86_400_000).toISOString(), timeMax: new Date(at + 14 * 86_400_000).toISOString() },
+        selectedCalendarIds: selected, cursor: 0, startedAt: new Date(at).toISOString(), completedCalendarIds: [], partial: false, truncatedCalendars: 0, truncatedEvents: 0 };
+      validateDeviceCalendarReadWindow(run.window, 15);
+      await this.mutate((state) => {
+        if (!this.deviceCalendarGenerationIsCurrent(state, captured.generation, captured.installationId) || state.deviceCalendars.selectionRevision !== captured.selectionRevision) throw new Error('Device calendar access or selection changed before refresh.');
+        state.deviceCalendars.readRun = run;
+      });
+    }
+    const pageRun = clone(run);
+    for (let count = 0; count < 4 && pageRun.cursor < pageRun.selectedCalendarIds.length; count++) {
+      const calendarId = pageRun.selectedCalendarIds[pageRun.cursor];
+      const capturedRow = pageRun && captured.calendars.find((row) => row.localId === calendarId);
+      if (!capturedRow) throw new Error('A selected device calendar is no longer available.');
+      const row = await this.deviceCalendarBackend.getCalendar(capturedRow.nativeId, capturedRow);
+      if (row.fingerprint !== capturedRow.fingerprint) throw new Error('A selected device calendar changed. Refresh the calendar list and select it again.');
+      if (!this.deviceCalendarGenerationIsCurrent(this.snapshot, captured.generation, captured.installationId) ||
+          this.snapshot.deviceCalendars.selectionRevision !== captured.selectionRevision) throw new Error('Device calendar access or selection changed before the event read.');
+      const read = await this.deviceCalendarBackend.readEvents(calendarId, row.nativeId, pageRun.window, now(), captured.generation);
+      const permissionAfterRead = await this.deviceCalendarBackend.getPermission();
+      if (permissionAfterRead !== 'full_access') {
+        await this.mutate((state) => {
+          if (state.deviceCalendars.generation !== captured.generation || state.deviceCalendars.installationId !== captured.installationId) return;
+          this.verifiedDeviceCalendarGeneration = undefined;
+          state.deviceCalendarAccess = { status: permissionAfterRead, checkedAt: now() };
+          state.deviceCalendars = { ...state.deviceCalendars, generation: state.deviceCalendars.generation + 1, selectionRevision: state.deviceCalendars.selectionRevision + 1,
+            enabled: false, selectedCalendarIds: [], events: [], readRun: undefined };
+          this.invalidatePendingDeviceEvents(state, 'Device calendar access changed while events were read. Check access and review this event again.');
+        });
+        throw new Error('Device calendar access changed while events were read. The page was discarded.');
+      }
+      const freshAfterRead = await this.deviceCalendarBackend.getCalendar(row.nativeId, row);
+      if (freshAfterRead.localId !== row.localId || freshAfterRead.nativeId !== row.nativeId || freshAfterRead.fingerprint !== row.fingerprint ||
+          !this.deviceCalendarGenerationIsCurrent(this.snapshot, captured.generation, captured.installationId) ||
+          this.snapshot.deviceCalendars.selectionRevision !== captured.selectionRevision || !this.snapshot.deviceCalendars.selectedCalendarIds.includes(calendarId)) {
+        await this.mutate((state) => {
+          if (state.deviceCalendars.generation !== captured.generation || state.deviceCalendars.installationId !== captured.installationId ||
+              state.deviceCalendars.selectionRevision !== captured.selectionRevision) return;
+          state.deviceCalendars = { ...state.deviceCalendars, selectionRevision: state.deviceCalendars.selectionRevision + 1,
+            enabled: false, selectedCalendarIds: [], events: [], readRun: undefined };
+          this.invalidatePendingDeviceEvents(state, 'A selected device calendar changed while events were read. Refresh and review this event again.');
+        });
+        throw new Error('A selected device calendar changed while events were read. The page was discarded.');
+      }
+      await this.mutate((state) => {
+        if (!this.deviceCalendarGenerationIsCurrent(state, captured.generation, captured.installationId) || state.deviceCalendars.selectionRevision !== captured.selectionRevision || state.deviceCalendars.readRun?.runId !== pageRun.runId) throw new Error('Device calendar access, selection, or refresh changed while events were read. The page was discarded.');
+        const currentRun = state.deviceCalendars.readRun!;
+        if (currentRun.cursor !== pageRun.cursor || currentRun.selectedCalendarIds[currentRun.cursor] !== calendarId) throw new Error('Device calendar refresh page is out of order.');
+        const windowStart = Date.parse(pageRun.window.timeMin), windowEnd = Date.parse(pageRun.window.timeMax);
+        // Backend reads events that overlap the query window, including events
+        // which began before its lower bound. Replace by overlap to keep one
+        // canonical snapshot row when the same spanning event is refreshed.
+        const keep = state.deviceCalendars.events.filter((event) => !(event.calendarId === calendarId &&
+          Date.parse(event.end) > windowStart && Date.parse(event.start) < windowEnd));
+        const room = Math.max(0, 500 - keep.length);
+        const pageEvents = read.events.slice(0, room);
+        state.deviceCalendars.events = [...keep, ...pageEvents];
+        currentRun.cursor += 1;
+        currentRun.completedCalendarIds = [...currentRun.completedCalendarIds, calendarId];
+        currentRun.partial ||= read.partial || read.omitted > 0 || read.scanned > 2000 || pageEvents.length < read.events.length;
+        if (read.partial || read.omitted) currentRun.truncatedCalendars += 1;
+        currentRun.truncatedEvents += Math.max(read.omitted, read.events.length - pageEvents.length);
+      });
+      pageRun.cursor += 1;
+    }
+    return this.snapshot.deviceCalendars;
+  }
+
+  async inspectDeviceEventDispatch(recordId: string): Promise<{ record: DeviceEventDispatchRecord; lookup: import('../deviceCalendars').DeviceEventLookupResult }> {
+    await this.load();
+    const record = this.snapshot.deviceCalendars.dispatchRecords.find((item) => item.id === recordId);
+    if (!record || record.outcome === 'pending') throw new Error('A terminal device event receipt is required before lookup.');
+    const lookup = await this.deviceCalendarBackend.lookupRecord(record);
+    return { record: clone(record), lookup: clone(lookup) };
+  }
+
+  async reconcileDeviceEventDispatch(recordId: string, input: { disposition: import('../deviceCalendars').DeviceEventReconciliation; note: string; nativeEventId?: string }): Promise<DeviceEventDispatchRecord> {
+    return this.mutate((state) => {
+      const index = state.deviceCalendars.dispatchRecords.findIndex((item) => item.id === recordId);
+      if (index < 0) throw new Error('Device event receipt was not found.');
+      const record = appendDeviceEventReconciliation(state.deviceCalendars.dispatchRecords[index], { id: newId(), disposition: input.disposition, at: now(), note: input.note, ...(input.nativeEventId ? { nativeEventId: input.nativeEventId } : {}) });
+      state.deviceCalendars.dispatchRecords[index] = record;
+      return record;
+    });
+  }
+
+  async editProposal(id: string, patch: ProposalPatch, options?: { expectedRevision: number }): Promise<Proposal> {
     const result = await this.mutate(async (state) => {
       const proposal = this.proposal(state, id);
+      if (options && proposal.revision !== options.expectedRevision) throw new Error('This proposal changed. Reopen the current version before editing.');
       if (['executed', 'accepted', 'simulated', 'dispatching', 'unknown', 'dismissed'].includes(proposal.status)) throw new Error('This proposal can no longer be edited.');
       if (proposal.kind === 'reminder') {
         const revision = proposal.notificationRevision ?? proposal.revision;
@@ -2249,6 +2625,20 @@ export class AppControllerImpl implements AppController {
         else if (proposal.email) proposal.email.reply = clone(locked);
         await this.validateProposalProvenance(state, proposal);
       } else Object.assign(proposal, patch);
+      if (patch.eventDestination) {
+        proposal.eventDestination = clone(patch.eventDestination);
+        if (patch.eventDestination.kind === 'device_calendar') {
+          proposal.accountId = undefined;
+          proposal.calendarId = patch.eventDestination.calendarId;
+        } else {
+          proposal.accountId = patch.eventDestination.accountId;
+          proposal.calendarId = patch.eventDestination.calendarId;
+        }
+        proposal.deviceCalendarApproval = undefined;
+      }
+      if (proposal.kind === 'event' && proposal.eventDestination?.kind === 'device_calendar' && proposal.event && (proposal.event.attendees.length || proposal.event.invitePolicy !== 'none')) {
+        throw new Error('On-device events cannot include guests or invitations.');
+      }
       proposal.recipients = [...new Set((proposal.recipients ?? []).map((recipient) => recipient.trim()).filter(Boolean))];
       this.invalidate(proposal);
       proposal.status = 'draft';
@@ -2259,9 +2649,23 @@ export class AppControllerImpl implements AppController {
     return result;
   }
 
-  async approveProposal(id: string): Promise<Proposal> {
+  async approveProposal(id: string, options?: { expectedRevision: number }): Promise<Proposal> {
+    await this.load();
+    const beforeApproval = this.snapshot.proposals.find((item) => item.id === id);
+    if (options && beforeApproval?.revision !== options.expectedRevision) throw new Error('This proposal changed. Reopen the current version before approving.');
+    let deviceApprovalPreflight: { revision: number; generation: number; selectionRevision: number; localId: string; row: DeviceCalendarRow } | undefined;
+    if (beforeApproval?.kind === 'event' && beforeApproval.eventDestination?.kind === 'device_calendar') {
+      const snapshot = this.snapshot;
+      const device = snapshot.deviceCalendars;
+      const row = device.calendars.find((item) => item.localId === beforeApproval.eventDestination!.calendarId);
+      if (!row || !this.deviceCalendarGenerationIsCurrent(snapshot, device.generation) || !device.enabled || !device.selectedCalendarIds.includes(row.localId)) throw new Error('Connect device calendars, select this calendar, and check access before approving.');
+      const fresh = await this.deviceCalendarBackend.getCalendar(row.nativeId, row);
+      if (fresh.localId !== row.localId || fresh.fingerprint !== row.fingerprint || !fresh.allowsModifications) throw new Error('The selected device calendar changed. Refresh calendars and review this event again.');
+      deviceApprovalPreflight = { revision: beforeApproval.revision, generation: device.generation, selectionRevision: device.selectionRevision, localId: row.localId, row: fresh };
+    }
     const result = await this.mutate(async (state) => {
       const proposal = this.proposal(state, id);
+      if (options && proposal.revision !== options.expectedRevision) throw new Error('This proposal changed while approval was checked. Reopen the current version before approving.');
       if (proposal.status !== 'draft' && proposal.status !== 'failed') throw new Error('Only a draft or safely failed proposal can be approved.');
       if (proposal.provenance?.version === 1) {
         if (!proposal.noteId) throw new Error('The source note is missing. Run Assist again before approving.');
@@ -2286,8 +2690,6 @@ export class AppControllerImpl implements AppController {
       }
       if (proposal.kind === 'event') {
         if (!proposal.calendarId) throw new Error('Choose a calendar before approving this event.');
-        const calendar = state.calendars.find((item) => item.id === proposal.calendarId);
-        if (!calendar || calendar.accountId !== proposal.accountId) throw new Error('The selected calendar does not belong to the selected account.');
         if (!proposal.event) throw new Error('Complete the event date, time zone, attendees, and invite policy before approving.');
         if (proposal.event) {
           const start = Date.parse(proposal.event.start);
@@ -2295,10 +2697,42 @@ export class AppControllerImpl implements AppController {
           if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) throw new Error('Event end must be later than its start.');
           try { new Intl.DateTimeFormat('en-US', { timeZone: proposal.event.timeZone }).format(); }
           catch { throw new Error('Choose a valid event time zone.'); }
-          if (!['send', 'none'].includes(proposal.event.invitePolicy) || proposal.event.attendees.some((attendee) => !validEmail(attendee))) throw new Error('Check the event invite policy and attendee addresses.');
           const title = proposal.event.title?.trim() || proposal.title;
           if (!title || /[\r\n]/.test(title)) throw new Error('Event title is required and cannot contain line breaks.');
-          proposal.event = { ...proposal.event, title, description: proposal.event.description ?? proposal.body };
+          if (proposal.eventDestination?.kind === 'device_calendar') {
+            if (proposal.event.invitePolicy !== 'none' || proposal.event.attendees.length !== 0) throw new Error('On-device events cannot include guests or invitations.');
+            this.assertDeviceCalendarWritable(state);
+            const device = state.deviceCalendars;
+            if (!deviceApprovalPreflight || proposal.revision !== deviceApprovalPreflight.revision || device.generation !== deviceApprovalPreflight.generation ||
+                device.selectionRevision !== deviceApprovalPreflight.selectionRevision || !this.deviceCalendarGenerationIsCurrent(state, device.generation) || !device.enabled || !device.selectedCalendarIds.includes(proposal.eventDestination.calendarId)) throw new Error('Device calendar access changed while approval was checked. Review this event again.');
+            const row = device.calendars.find((item) => item.localId === proposal.eventDestination!.calendarId);
+            const fresh = deviceApprovalPreflight.row;
+            if (!row || !row.allowsModifications || row.localId !== fresh.localId || row.fingerprint !== fresh.fingerprint) throw new Error('Choose a writable selected device calendar.');
+            if (fresh.localId !== row.localId || fresh.fingerprint !== row.fingerprint || !fresh.allowsModifications || !this.deviceCalendarGenerationIsCurrent(state, device.generation) || state.deviceCalendars.selectionRevision !== device.selectionRevision) throw new Error('The selected device calendar changed. Refresh calendars and review this event again.');
+            proposal.accountId = undefined;
+            proposal.calendarId = row.localId;
+            proposal.event = { ...proposal.event, title, description: proposal.event.description ?? proposal.body, attendees: [], invitePolicy: 'none' };
+            const dependencyProjection = JSON.stringify({ installationId: device.installationId, generation: device.generation, selectionRevision: device.selectionRevision,
+              calendarId: row.localId, nativeId: row.nativeId, fingerprint: row.fingerprint,
+              event: { title, notes: proposal.event.description ?? proposal.body, start: proposal.event.start, end: proposal.event.end, timeZone: proposal.event.timeZone,
+                attendees: proposal.event.attendees, invitePolicy: proposal.event.invitePolicy } });
+            const payloadDigest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, dependencyProjection);
+            proposal.deviceCalendarApproval = { version: 1, installationId: device.installationId, generation: device.generation, selectionRevision: device.selectionRevision,
+              calendarId: row.localId, nativeCalendarId: row.nativeId, calendarFingerprint: row.fingerprint, payloadDigest, dependencyProjection, approvedAt: now() };
+          } else {
+            const destination = proposal.eventDestination?.kind === 'remote_calendar'
+              ? proposal.eventDestination : proposal.accountId && proposal.calendarId
+                ? { kind: 'remote_calendar' as const, accountId: proposal.accountId, calendarId: proposal.calendarId } : undefined;
+            if (!destination) throw new Error('Choose either a verified account calendar or selected device calendar.');
+            const calendar = state.calendars.find((item) => item.id === destination.calendarId);
+            if (!calendar || calendar.accountId !== destination.accountId) throw new Error('The selected calendar does not belong to the selected account.');
+            if (!['send', 'none'].includes(proposal.event.invitePolicy) || proposal.event.attendees.some((attendee) => !validEmail(attendee))) throw new Error('Check the event invite policy and attendee addresses.');
+            proposal.eventDestination = destination;
+            proposal.accountId = destination.accountId;
+            proposal.calendarId = destination.calendarId;
+            proposal.deviceCalendarApproval = undefined;
+            proposal.event = { ...proposal.event, title, description: proposal.event.description ?? proposal.body };
+          }
         }
       }
       if (proposal.kind === 'reminder' && proposal.dueAt) {
@@ -2318,9 +2752,23 @@ export class AppControllerImpl implements AppController {
     return result.proposal;
   }
 
-  async executeProposal(id: string): Promise<Proposal> {
+  async executeProposal(id: string, options?: { expectedRevision: number }): Promise<Proposal> {
+    await this.load();
+    const beforeExecute = this.snapshot.proposals.find((item) => item.id === id);
+    if (options && beforeExecute?.revision !== options.expectedRevision) throw new Error('This proposal changed. Reopen the current version before continuing.');
+    let deviceEventPreflight: { revision: number; generation: number; selectionRevision: number; row: DeviceCalendarRow } | undefined;
+    if (beforeExecute?.kind === 'event' && beforeExecute.eventDestination?.kind === 'device_calendar') {
+      const snapshot = this.snapshot;
+      const device = snapshot.deviceCalendars;
+      const row = device.calendars.find((item) => item.localId === beforeExecute.eventDestination!.calendarId);
+      if (!row || !this.deviceCalendarGenerationIsCurrent(snapshot, device.generation) || !device.enabled || !device.selectedCalendarIds.includes(row.localId)) throw new Error('Device calendar access or selection is no longer current.');
+      const fresh = await this.deviceCalendarBackend.getCalendar(row.nativeId, row);
+      if (fresh.fingerprint !== row.fingerprint || !fresh.allowsModifications) throw new Error('The selected device calendar changed. Refresh and approve the event again.');
+      deviceEventPreflight = { revision: beforeExecute.revision, generation: device.generation, selectionRevision: device.selectionRevision, row: fresh };
+    }
     const claim = await this.mutate(async (state) => {
       const proposal = this.proposal(state, id);
+      if (options && proposal.revision !== options.expectedRevision) throw new Error('This proposal changed while execution was checked. Reopen the current version before continuing.');
       if (proposal.status !== 'approved' || proposal.approvedRevision !== proposal.revision || !proposal.approvedPayloadDigest) throw new Error('Approve this exact version before continuing.');
       let dependencyProjection: string;
       try { dependencyProjection = await this.validateProposalProvenance(state, proposal); }
@@ -2356,12 +2804,43 @@ export class AppControllerImpl implements AppController {
         proposal.reminderId = reminder.id;
       }
       if (await approvedDigest(proposal, state) !== proposal.approvedPayloadDigest) throw new Error('The approved content or destination changed. Review and approve it again.');
+      let deviceEventRecord: DeviceEventDispatchRecord | undefined;
+      if (proposal.kind === 'event' && proposal.eventDestination?.kind === 'device_calendar') {
+        this.assertDeviceCalendarWritable(state);
+        if (proposal.event?.attendees.length || proposal.event?.invitePolicy !== 'none') throw new Error('On-device events cannot include guests or invitations.');
+        const approval = proposal.deviceCalendarApproval;
+        const device = state.deviceCalendars;
+        const row = device.calendars.find((item) => item.localId === proposal.eventDestination!.calendarId);
+        if (!approval || !row || !device.selectedCalendarIds.includes(row.localId) || !row.allowsModifications ||
+            !this.deviceCalendarGenerationIsCurrent(state, approval.generation, approval.installationId) || approval.calendarId !== row.localId ||
+            approval.nativeCalendarId !== row.nativeId || approval.calendarFingerprint !== row.fingerprint || approval.selectionRevision !== device.selectionRevision ||
+            approval.dependencyProjection !== this.deviceEventProjection(state, proposal, row)) {
+          throw new Error('Device calendar, selection, or approved source changed. Refresh and approve this event again.');
+        }
+        const fresh = deviceEventPreflight?.row;
+        if (!deviceEventPreflight || deviceEventPreflight.revision !== proposal.revision || deviceEventPreflight.generation !== approval.generation ||
+            deviceEventPreflight.selectionRevision !== approval.selectionRevision || !fresh || fresh.fingerprint !== row.fingerprint || !fresh.allowsModifications ||
+            !this.deviceCalendarGenerationIsCurrent(state, approval.generation, approval.installationId)) throw new Error('Device calendar access or details changed. Refresh and approve this event again.');
+        if (device.dispatchRecords.length >= 1000) throw new Error('Device event receipt history is full. Export or reconcile old history before creating another event.');
+        proposal.status = 'dispatching';
+        const sourceActionKey = proposal.sourceActionKey ?? JSON.stringify([proposal.noteId, proposal.sourceRevision, 'event', proposal.evidence.map((item) => item.quote)]);
+        proposal.sourceActionKey = sourceActionKey;
+        deviceEventRecord = createDeviceEventDispatchRecord({ id: newId(), claimAt: now(), proposal,
+          target: { installationId: device.installationId, generation: device.generation, selectionRevision: device.selectionRevision,
+            calendarLocalId: row.localId, nativeId: row.nativeId, fingerprint: row.fingerprint, title: row.title,
+            sourceLabel: row.sourceName ?? row.sourceType ?? 'On-device calendar' } });
+        if (device.dispatchRecords.some((record) => record.duplicateKey === deviceEventRecord!.duplicateKey)) throw new Error('This source action already has a device-calendar receipt. Inspect or reconcile that receipt; it will not be created again.');
+        device.dispatchRecords.unshift(deviceEventRecord);
+        proposal.deviceEventDispatchRecordId = deviceEventRecord.id;
+        return { proposal, dependencyProjection, deviceEventRecord, capturedDeviceGeneration: device.generation };
+      }
       if (proposal.kind === 'event' && !proposal.eventTransactionId) proposal.eventTransactionId = newId();
       const operation = proposal.kind === 'email' ? proposal.email?.operation : proposal.kind === 'event' ? 'event' : undefined;
       const account = proposal.accountId ? state.accounts.find((item) => item.id === proposal.accountId) : undefined;
       const capability = operation === 'draft' ? 'mail.draft' : operation === 'send' ? 'mail.send' : operation === 'event' ? 'calendar.write' : undefined;
       const calendar = proposal.kind === 'event' ? state.calendars.find((item) => item.id === proposal.calendarId) : undefined;
       const canDispatch = (proposal.kind === 'email' || proposal.kind === 'event') && state.settings.mode === 'provider' && Boolean(this.connector && account && account.connected && account.authStatus === 'connected' && capability && account.capabilities?.includes(capability)) &&
+        (proposal.kind !== 'event' || proposal.eventDestination?.kind !== 'device_calendar') &&
         (proposal.kind !== 'event' || Boolean(calendar && calendar.accountId === account?.id && calendar.connected && calendar.writable && calendar.providerId));
       proposal.status = 'dispatching';
       let dispatchRecord: DispatchRecord | undefined;
@@ -2378,6 +2857,7 @@ export class AppControllerImpl implements AppController {
     const claimed = claim.proposal;
     const approvedDependencyProjection = claim.dependencyProjection;
     const frozenRecord = claim.dispatchRecord;
+    const frozenDeviceRecord = 'deviceEventRecord' in claim ? claim.deviceEventRecord : undefined;
 
     let result: ProposalStatusOutcome;
     if (claimed.kind === 'reminder') {
@@ -2412,6 +2892,61 @@ export class AppControllerImpl implements AppController {
         result = { status: 'executed', message: 'Memory saved to the local profile documents.' };
       } catch (error) {
         result = { status: 'failed', message: error instanceof Error ? error.message : 'Could not write the local memory.' };
+      }
+    } else if (frozenDeviceRecord) {
+      const createPromise = this.deviceCalendarBackend.createApprovedEvent(frozenDeviceRecord, () => {
+        const latest = this.snapshot;
+        const current = latest.proposals.find((item) => item.id === frozenDeviceRecord.proposalId);
+        const record = latest.deviceCalendars.dispatchRecords.find((item) => item.id === frozenDeviceRecord.id);
+        const approval = current?.deviceCalendarApproval;
+        const row = latest.deviceCalendars.calendars.find((item) => item.localId === frozenDeviceRecord.target.calendarLocalId);
+        return Boolean(current && row && record?.outcome === 'pending' && current.deviceEventDispatchRecordId === frozenDeviceRecord.id &&
+          current.status === 'dispatching' && current.revision === frozenDeviceRecord.revision && current.approvedRevision === frozenDeviceRecord.revision &&
+          current.approvedPayloadDigest === frozenDeviceRecord.payloadDigest && approval &&
+          approval.installationId === frozenDeviceRecord.target.installationId && approval.generation === frozenDeviceRecord.target.generation &&
+          approval.selectionRevision === frozenDeviceRecord.target.selectionRevision && row.fingerprint === frozenDeviceRecord.target.fingerprint &&
+          row.nativeId === frozenDeviceRecord.target.nativeId && row.allowsModifications && latest.deviceCalendars.selectedCalendarIds.includes(row.localId) &&
+          this.deviceCalendarGenerationIsCurrent(latest, frozenDeviceRecord.target.generation, frozenDeviceRecord.target.installationId) &&
+          this.proposalDependencyProjection(latest, current) === approvedDependencyProjection &&
+          approval.dependencyProjection === this.deviceEventProjection(latest, current, row) &&
+          stableJson(current.event) === stableJson({ ...current.event, title: frozenDeviceRecord.payload.title, description: frozenDeviceRecord.payload.notes }));
+      });
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<{ status: 'timeout' }>((resolve) => { timer = setTimeout(() => resolve({ status: 'timeout' }), 30_000); });
+      const resultPromise = createPromise.then((value) => ({ status: 'result' as const, value }), (error: unknown) => ({ status: 'error' as const, error }));
+      const nativeResult = await Promise.race([resultPromise, timeout]);
+      if (timer !== undefined) clearTimeout(timer);
+      if (nativeResult.status === 'timeout') {
+        result = { status: 'unknown', message: 'The on-device calendar did not confirm whether it saved the event before the wait limit. Check the calendar manually; it will not be created again.' };
+        await this.commitDeviceEventReceipt(frozenDeviceRecord, { outcome: 'unknown', at: now(), observationSource: 'timeout' });
+        let late: Promise<void>;
+        late = resultPromise.then(async (lateResult) => {
+          if (lateResult.status === 'result' && lateResult.value.status === 'saved' && lateResult.value.nativeEventId) {
+            await this.commitDeviceEventReceipt(frozenDeviceRecord, { outcome: 'saved', nativeEventId: lateResult.value.nativeEventId, at: now(), late: true });
+          } else if (lateResult.status === 'result' && lateResult.value.status === 'unknown' && lateResult.value.nativeEventId) {
+            await this.commitDeviceEventReceipt(frozenDeviceRecord, { outcome: 'unknown', nativeEventId: lateResult.value.nativeEventId, at: now(), observationSource: 'native_callback', lateObservation: true });
+          }
+        }).catch(() => undefined).finally(() => {
+          if (this.deviceEventLateResults.get(frozenDeviceRecord.id) === late) this.deviceEventLateResults.delete(frozenDeviceRecord.id);
+        });
+        this.deviceEventLateResults.set(frozenDeviceRecord.id, late);
+      } else if (nativeResult.status === 'result' && nativeResult.value.status === 'saved' && nativeResult.value.nativeEventId) {
+        await this.commitDeviceEventReceipt(frozenDeviceRecord, { outcome: 'saved', nativeEventId: nativeResult.value.nativeEventId, at: now() });
+        result = { status: 'accepted', message: 'The event was saved to this device calendar. This confirms a local save, not cloud synchronization.' };
+      } else if (nativeResult.status === 'result') {
+        await this.commitDeviceEventReceipt(frozenDeviceRecord, { outcome: 'unknown', at: now(), ...(nativeResult.value.nativeEventId ? { nativeEventId: nativeResult.value.nativeEventId } : {}), observationSource: 'native_callback' });
+        result = { status: 'unknown', message: 'The native calendar could not verify whether the event was saved. Check the calendar manually; it will not be created again.' };
+      } else {
+        const error = nativeResult.error;
+        const code = error instanceof DeviceCalendarBackendError ? error.code : 'precondition_failed';
+        if (code === 'create_unknown') result = { status: 'unknown', message: 'The native calendar outcome is unknown. Check the calendar manually; this event will not be retried.' };
+        else {
+          const mapped: import('../deviceCalendars').DeviceEventErrorCode = code === 'permission_denied' ? 'permission_denied' : code === 'permission_unavailable' ? 'permission_unavailable'
+            : code === 'calendar_missing' ? 'calendar_missing' : code === 'calendar_changed' ? 'calendar_changed' : code === 'calendar_readonly' ? 'calendar_readonly'
+              : code === 'unsupported_payload' ? 'unsupported_payload' : code === 'unavailable' ? 'unavailable' : 'precondition_failed';
+          await this.commitDeviceEventReceipt(frozenDeviceRecord, { outcome: 'rejected', errorCode: mapped, at: now() });
+          result = { status: 'failed', message: error instanceof Error ? error.message : 'Device calendar rejected this event before saving.' };
+        }
       }
     } else {
       if (!frozenRecord || !this.connector || !claim.capturedAccount) {
@@ -2494,6 +3029,16 @@ export class AppControllerImpl implements AppController {
       }
     }
 
+    if (frozenDeviceRecord) {
+      if (result.status !== 'accepted' || this.snapshot.deviceCalendars.dispatchRecords.find((item) => item.id === frozenDeviceRecord.id)?.outcome === 'pending') {
+        await this.commitDeviceEventReceipt(frozenDeviceRecord, {
+          outcome: result.status === 'failed' ? 'rejected' : 'unknown', at: now(),
+          ...(result.status === 'failed' ? { errorCode: 'precondition_failed' as const } : {}),
+        });
+      }
+      return this.snapshot.proposals.find((item) => item.id === frozenDeviceRecord.proposalId) ?? claimed;
+    }
+
     let committed: Proposal | undefined;
     try {
       committed = await this.mutate((state) => {
@@ -2569,6 +3114,44 @@ export class AppControllerImpl implements AppController {
     }
     if (!committed) throw new Error('The action was removed before completion.');
     return committed;
+  }
+
+  private async commitDeviceEventReceipt(record: DeviceEventDispatchRecord, input: {
+    outcome: 'saved' | 'unknown' | 'rejected'; at: string; nativeEventId?: string;
+    errorCode?: import('../deviceCalendars').DeviceEventErrorCode; late?: boolean; lateObservation?: boolean; observationSource?: 'timeout' | 'native_callback' | 'restart_recovery';
+  }): Promise<void> {
+    await this.mutate((state) => {
+      const index = state.deviceCalendars.dispatchRecords.findIndex((item) => item.id === record.id);
+      if (index < 0) return;
+      const current = state.deviceCalendars.dispatchRecords[index];
+      if (this.deviceDispatchClaimProjection(current) !== this.deviceDispatchClaimProjection(record)) return;
+      let changed = false;
+      if (current.outcome === 'pending' || current.outcome === 'unknown' && (input.late && input.outcome === 'saved' || input.lateObservation && input.outcome === 'unknown')) {
+        state.deviceCalendars.dispatchRecords[index] = recordDeviceEventOutcome(current, {
+          outcome: input.outcome, at: new Date(Math.max(Date.parse(input.at), Date.parse(current.claimAt), current.outcomeAt ? Date.parse(current.outcomeAt) : 0)).toISOString(),
+          ...(input.nativeEventId ? { nativeEventId: input.nativeEventId } : {}), ...(input.errorCode ? { errorCode: input.errorCode } : {}),
+          ...(input.observationSource ? { observationSource: input.observationSource } : input.late ? { observationSource: 'native_callback' as const } : {}),
+          ...(input.late ? { allowLateNativeCompletion: true as const } : {}),
+          ...(input.lateObservation ? { allowLateNativeObservation: true as const } : {}),
+        });
+        changed = true;
+      }
+      const settled = state.deviceCalendars.dispatchRecords[index];
+      const proposal = state.proposals.find((item) => item.id === settled.proposalId);
+      if (proposal?.deviceEventDispatchRecordId === settled.id) {
+        proposal.status = settled.outcome === 'saved' ? 'accepted' : settled.outcome === 'rejected' ? 'failed' : 'unknown';
+        proposal.remoteId = settled.nativeEventId;
+        proposal.remoteAcceptedAt = settled.outcome === 'saved' ? settled.outcomeAt : undefined;
+        proposal.lastError = settled.outcome === 'unknown' ? 'The device-calendar outcome is unknown. Check the calendar manually; this event will not be created again.' : undefined;
+      }
+      if (changed && settled.outcome === 'saved') addActivity(state, 'local_action', 'Event saved to the selected on-device calendar. Cloud synchronization is not confirmed.', { proposalId: settled.proposalId });
+    });
+  }
+
+  private deviceDispatchClaimProjection(record: DeviceEventDispatchRecord): string {
+    return stableJson({ version: record.version, id: record.id, proposalId: record.proposalId, revision: record.revision,
+      sourceRevision: record.sourceRevision, sourceProvenance: record.sourceProvenance, sourceActionKey: record.sourceActionKey,
+      duplicateKey: record.duplicateKey, payloadDigest: record.payloadDigest, target: record.target, payload: record.payload, claimAt: record.claimAt });
   }
 
   async dismissProposal(id: string): Promise<Proposal> {
@@ -2773,7 +3356,7 @@ export class AppControllerImpl implements AppController {
     return record;
   }
 
-  private assertReminderOriginCurrent(state: AppState, origin: ReminderRecord['origin'], allowSaved = false): void {
+  private assertReminderOriginCurrent(state: AppState, origin: ReminderRecord['origin'], allowSaved = false, expectedDeviceProjection?: string): void {
     if (allowSaved) return;
     if (origin.kind === 'manual') return;
     if (origin.kind === 'note') {
@@ -2799,9 +3382,26 @@ export class AppControllerImpl implements AppController {
         throw new Error('The source account changed. Refresh the reminder source before approving or saving it.');
       }
     }
+    if (origin.deviceBinding && !allowSaved) {
+      const binding = origin.deviceBinding;
+      const device = state.deviceCalendars;
+      const calendar = device.calendars.find((item) => item.localId === binding.calendarId);
+      const event = device.events.find((item) => item.calendarId === binding.calendarId && item.nativeEventId === binding.nativeEventId && item.occurrenceStart === binding.occurrenceStart && item.generation === binding.generation && !item.cancelled);
+      const age = event ? Date.now() - Date.parse(event.observedAt) : Number.POSITIVE_INFINITY;
+      if (!calendar || !event || state.deviceCalendarAccess.status !== 'full_access' || !device.enabled || device.installationId !== binding.installationId ||
+          device.generation !== binding.generation || !device.selectedCalendarIds.includes(binding.calendarId) || !Number.isFinite(age) || age < 0 || age >= 15 * 60_000 ||
+          origin.source.kind !== 'meeting' || origin.source.deviceBinding === undefined || stableJson(origin.source.deviceBinding) !== stableJson(binding) ||
+          (expectedDeviceProjection !== undefined && deviceReminderSourceProjection(state, binding) !== expectedDeviceProjection)) {
+        throw new Error('The on-device calendar source changed. Refresh the reminder source before approving or saving it.');
+      }
+    }
   }
 
-  private async verifyProactiveReminderOrigin(origin: Extract<ReminderRecord['origin'], { kind: 'proactive' }>): Promise<void> {
+  private async verifyProactiveReminderOrigin(origin: Extract<ReminderRecord['origin'], { kind: 'proactive' }>): Promise<string | undefined> {
+    if (origin.deviceBinding) {
+      const access = await this.checkDeviceCalendarAccess();
+      if (access.status !== 'full_access') throw new Error('Check on-device calendar access and refresh this reminder source before approving or saving it.');
+    }
     await this.evaluateLocalCandidates();
     const captured = this.snapshot;
     const entry = captured.proactive.candidates.find((item) => item.candidate.id === origin.candidate.id);
@@ -2812,12 +3412,16 @@ export class AppControllerImpl implements AppController {
     const fresh = await this.getProactiveCandidateSource(origin.candidate.id);
     if (this.snapshot !== captured || fresh.status !== 'current' || fresh.source?.sourceVersion !== origin.candidate.sourceVersion ||
         stableJson(fresh.source) !== stableJson(origin.source)) throw new Error('The proactive source changed. Refresh it before approving or saving.');
+    const deviceProjection = origin.deviceBinding ? deviceReminderSourceProjection(captured, origin.deviceBinding) : undefined;
+    if (origin.deviceBinding && !deviceProjection) throw new Error('The on-device calendar source changed. Refresh it before approving or saving.');
     if (origin.binding) {
       const account = captured.accounts.find((item) => item.id === origin.binding!.accountId);
       if (!account || !account.connected || account.authStatus !== 'connected' || identityKey(account) !== origin.binding.identityKey || (account.connectionGeneration ?? 0) !== origin.binding.connectionGeneration) {
         throw new Error('The source account changed. Refresh the reminder source before approving or saving it.');
       }
     }
+    if (origin.deviceBinding) this.assertReminderOriginCurrent(captured, origin);
+    return deviceProjection;
   }
 
   private async reminderApprovalDigest(record: ReminderRecord): Promise<string> {
@@ -2864,10 +3468,13 @@ export class AppControllerImpl implements AppController {
       candidateOrigin = {
         kind: 'proactive', candidate: clone(source.candidate), rule: { id: rule.id, revision: rule.revision, version: rule.version, name: rule.name },
         source: clone(source.source), ...(account ? { binding: { accountId: account.id, namespace: account.provider, identityKey: identityKey(account), connectionGeneration: account.connectionGeneration ?? 0 } } : {}),
+        ...(source.source.kind === 'meeting' && source.source.deviceBinding ? { deviceBinding: clone(source.source.deviceBinding) } : {}),
         capturedAt: now(), expiresAt: new Date(Date.now() + 15 * 60_000).toISOString(),
       };
     }
     const dueAt = input.dueAt ?? new Date(Math.ceil((Date.now() + 60 * 60_000) / 60_000) * 60_000).toISOString();
+    const capturedDeviceProjection = candidateOrigin.kind === 'proactive' && candidateOrigin.deviceBinding
+      ? deviceReminderSourceProjection(this.snapshot, candidateOrigin.deviceBinding) : undefined;
     const sourceTitle = candidateOrigin.kind === 'proactive'
       ? candidateOrigin.source.kind === 'task' ? candidateOrigin.source.title
         : candidateOrigin.source.subject
@@ -2879,7 +3486,7 @@ export class AppControllerImpl implements AppController {
       if (candidateOrigin.kind === 'proactive') {
         const existing = state.reminders.records.find((item) => item.origin.kind === 'proactive' && item.origin.candidate.id === candidateOrigin.candidate.id && ['draft', 'approved', 'saved'].includes(item.status));
         if (existing) return existing;
-        this.assertReminderOriginCurrent(state, candidateOrigin);
+        this.assertReminderOriginCurrent(state, candidateOrigin, false, capturedDeviceProjection);
       }
       if (state.reminders.records.length >= 500) throw new Error('Reminder storage is full. Export or delete an old reminder first.');
       const time = now();
@@ -2926,12 +3533,14 @@ export class AppControllerImpl implements AppController {
     const account = refreshed.source.accountId ? bound.accounts.find((item) => item.id === refreshed.source!.accountId) : undefined;
     const origin: ReminderRecord['origin'] = { kind: 'proactive', candidate: clone(refreshed.candidate), rule: { id: rule.id, revision: rule.revision, version: rule.version, name: rule.name },
       source: clone(refreshed.source), ...(account ? { binding: { accountId: account.id, namespace: account.provider, identityKey: identityKey(account), connectionGeneration: account.connectionGeneration ?? 0 } } : {}),
+      ...(refreshed.source.kind === 'meeting' && refreshed.source.deviceBinding ? { deviceBinding: clone(refreshed.source.deviceBinding) } : {}),
       capturedAt: now(), expiresAt: new Date(Date.now() + 15 * 60_000).toISOString() };
+    const refreshedDeviceProjection = origin.kind === 'proactive' && origin.deviceBinding ? deviceReminderSourceProjection(bound, origin.deviceBinding) : undefined;
     const result = await this.mutate((state) => {
       this.assertReminderWritable();
       const current = this.reminder(state, id);
       if (current.revision !== input.expectedRevision || current.origin.kind !== 'proactive') throw new Error('This reminder changed while its source was refreshing.');
-      this.assertReminderOriginCurrent(state, origin);
+      this.assertReminderOriginCurrent(state, origin, false, refreshedDeviceProjection);
       const wasSaved = current.status === 'saved';
       if (wasSaved) this.cancellationForCurrentIntent(state, current);
       current.origin = origin; current.revision += 1; current.status = 'draft'; current.updatedAt = now();
@@ -2946,12 +3555,12 @@ export class AppControllerImpl implements AppController {
     await this.load();
     const before = this.reminder(this.snapshot, id);
     if (before.revision !== input.expectedRevision) throw new Error('This reminder changed. Reopen it before approving.');
-    if (before.origin.kind === 'proactive' && !before.firstSavedAt) await this.verifyProactiveReminderOrigin(before.origin);
+    const verifiedDeviceProjection = before.origin.kind === 'proactive' && !before.firstSavedAt ? await this.verifyProactiveReminderOrigin(before.origin) : undefined;
     return this.mutate(async (state) => {
       this.assertReminderWritable();
       const record = this.reminder(state, id);
       if (record.revision !== input.expectedRevision || record.status !== 'draft') throw new Error('Reopen the current reminder draft before approving it.');
-      this.assertReminderOriginCurrent(state, record.origin, Boolean(record.firstSavedAt));
+      this.assertReminderOriginCurrent(state, record.origin, Boolean(record.firstSavedAt), verifiedDeviceProjection);
       this.validateReminderDue(record);
       const approvedPayloadDigest = await this.reminderApprovalDigest(record);
       record.status = 'approved'; record.approvedRevision = record.revision; record.approvedPayloadDigest = approvedPayloadDigest; record.updatedAt = now();
@@ -2977,18 +3586,18 @@ export class AppControllerImpl implements AppController {
     await this.load(); this.assertReminderWritable();
     const before = this.reminder(this.snapshot, id);
     if (before.revision !== expectedRevision || before.status !== 'approved' || before.approvedRevision !== expectedRevision) throw new Error('Approve the current reminder version before saving it.');
-    if (before.origin.kind === 'proactive' && !before.firstSavedAt) await this.verifyProactiveReminderOrigin(before.origin);
+    let verifiedDeviceProjection = before.origin.kind === 'proactive' && !before.firstSavedAt ? await this.verifyProactiveReminderOrigin(before.origin) : undefined;
     const permission = await this.reminderBackend.getPermission();
     const resolved = permission === 'undetermined' ? await this.reminderBackend.requestPermission() : permission;
     // Permission UI can remain open while the source changes. Rebuild the source projection
     // after that await; the serialized mutation below then compares it with the committed rule,
     // candidate, identity, and generation before saving the user's intent.
-    if (before.origin.kind === 'proactive' && !before.firstSavedAt) await this.verifyProactiveReminderOrigin(before.origin);
+    if (before.origin.kind === 'proactive' && !before.firstSavedAt) verifiedDeviceProjection = await this.verifyProactiveReminderOrigin(before.origin);
     const saved = await this.mutate(async (state) => {
       this.assertReminderWritable();
       const record = this.reminder(state, id);
       if (record.revision !== expectedRevision || record.status !== 'approved' || record.approvedRevision !== expectedRevision || !record.approvedPayloadDigest) throw new Error('This reminder changed while notification permission was checked. Review and approve it again.');
-      this.assertReminderOriginCurrent(state, record.origin, Boolean(record.firstSavedAt));
+      this.assertReminderOriginCurrent(state, record.origin, Boolean(record.firstSavedAt), verifiedDeviceProjection);
       if (record.origin.kind === 'proactive' && !record.firstSavedAt && stableJson(record.origin) !== stableJson(before.origin)) throw new Error('The proactive source changed while notification permission was checked.');
       if (record.origin.kind === 'note' && !record.firstSavedAt) {
         const sourceProposalId = record.origin.proposalId;
@@ -3405,6 +4014,18 @@ export class AppControllerImpl implements AppController {
       const account = event && state.accounts.find((item) => item.id === event.accountId && item.connected && item.authStatus === 'connected' &&
         identityKey(item) === reference.identityKey && (item.connectionGeneration ?? 0) === reference.connectionGeneration && (item.capabilities ?? []).includes('calendar.read'));
       if (!event || !account) throw new Error('The referenced calendar event is no longer available from this verified account.');
+      return;
+    }
+    if (reference.kind === 'device_calendar_event') {
+      const device = state.deviceCalendars;
+      const matches = device.events.filter((event) => event.calendarId === reference.calendarId && event.nativeEventId === reference.eventId &&
+        event.occurrenceStart === reference.occurrenceStart && event.generation === reference.generation && !event.cancelled);
+      const event = matches.length === 1 ? matches[0] : undefined;
+      const age = event ? Date.now() - Date.parse(event.observedAt) : Number.POSITIVE_INFINITY;
+      if (!event || !this.deviceCalendarGenerationIsCurrent(state, reference.generation, reference.installationId) ||
+          !device.enabled || !device.selectedCalendarIds.includes(reference.calendarId) || !Number.isFinite(age) || age < 0 || age >= 15 * 60_000) {
+        throw new Error('The referenced on-device event is no longer current in the selected calendar.');
+      }
     }
   }
 
@@ -3722,6 +4343,32 @@ export class AppControllerImpl implements AppController {
             sources.push(...built.sources.filter((item) => item.id === sourceId));
           }
         } catch { /* malformed provider source IDs fail closed */ }
+        continue;
+      }
+      if (sourceId.startsWith('device_calendar_event:')) {
+        const parts = sourceId.slice('device_calendar_event:'.length).split(':');
+        if (parts.length !== 4) continue;
+        try {
+          const [installationId, calendarId, nativeEventId, occurrenceStart] = parts.map((part) => decodeURIComponent(part));
+          const device = state.deviceCalendars;
+          const matches = device.events.filter((item) => item.calendarId === calendarId && item.nativeEventId === nativeEventId &&
+            item.occurrenceStart === occurrenceStart && item.generation === device.generation && !item.cancelled);
+          const event = matches.length === 1 ? matches[0] : undefined;
+          const age = event ? Date.now() - Date.parse(event.observedAt) : Number.POSITIVE_INFINITY;
+          if (!event || !device.enabled || state.deviceCalendarAccess.status !== 'full_access' ||
+              !device.selectedCalendarIds.includes(calendarId) || !this.deviceCalendarGenerationIsCurrent(state, device.generation, installationId) ||
+              !Number.isFinite(age) || age < 0 || age >= 15 * 60_000) continue;
+          const start = Date.parse(event.start);
+          const built = buildLocalSourceSet({ transcript: { revision: 0, text: '' }, deviceCalendarSnapshot: {
+            installationId, generation: device.generation, selectionRevision: device.selectionRevision,
+            selectedCalendarIds: [calendarId], timeMin: new Date(start - 60_000).toISOString(), timeMax: new Date(start + 60_000).toISOString(),
+            asOf: event.observedAt, partial: false, omittedEvents: 0,
+            events: [{ calendarId, nativeEventId, occurrenceStart, title: event.title, notes: event.notes,
+              notesTruncated: event.notesTruncated, start: event.start, end: event.end, timeZone: event.timeZone,
+              allDay: event.allDay, cancelled: event.cancelled }],
+          } });
+          sources.push(...built.sources.filter((item) => item.id === sourceId));
+        } catch { /* malformed or stale on-device source IDs fail closed */ }
       }
     }
     const catalog = await createSourceCatalog([...new Map(sources.map((source) => [source.id, source])).values()],

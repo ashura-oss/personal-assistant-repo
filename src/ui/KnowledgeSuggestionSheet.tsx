@@ -240,6 +240,10 @@ function referenceLabel(reference: KnowledgeReference, people: Person[] = [], pr
     const sourceId = `mail:${encodeURIComponent(reference.identityKey)}:${encodeURIComponent(reference.id)}`;
     return sourceLabels[sourceId] ?? 'Mail · historical source unavailable';
   }
+  if (reference.kind === 'device_calendar_event') {
+    const sourceId = `device_calendar_event:${encodeURIComponent(reference.installationId)}:${encodeURIComponent(reference.calendarId)}:${encodeURIComponent(reference.eventId)}:${encodeURIComponent(reference.occurrenceStart)}`;
+    return sourceLabels[sourceId] ?? 'On this iPhone · historical event unavailable';
+  }
   return `${reference.kind} · ${reference.id}`;
 }
 

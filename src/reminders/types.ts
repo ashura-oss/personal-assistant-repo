@@ -38,6 +38,7 @@ export interface ProactiveReminderOrigin {
   rule: { id: string; revision: number; version: number; name: string };
   source: ProactiveSource;
   binding?: ProactiveReminderBinding;
+  deviceBinding?: import('../proactive').ProactiveMeetingSource['deviceBinding'];
   capturedAt: string;
   expiresAt: string;
 }

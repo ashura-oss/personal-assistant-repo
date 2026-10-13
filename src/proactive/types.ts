@@ -46,6 +46,8 @@ export interface ProactiveMeetingSource extends SourceBase {
   subject?: string;
   startAt?: string;
   startAtUtcCertified?: boolean;
+  /** Installation-scoped native event identity; absent for OAuth calendar rows. */
+  deviceBinding?: { installationId: string; generation: number; calendarId: string; nativeEventId: string; occurrenceStart: string };
 }
 
 export interface ProactiveTaskSource extends SourceBase {

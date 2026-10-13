@@ -107,8 +107,17 @@ function validateSource(source: ProactiveSource): void {
   string(source.namespace, 'Source namespace', 128);
   if (source.accountId !== undefined) string(source.accountId, 'Source account ID', 256);
   string(source.providerId, 'Provider source ID', 1024);
-  if (source.namespace.toLowerCase() === 'local') {
+  if (source.namespace === 'local') {
     if (source.kind !== 'task' || source.accountId !== undefined) fail('Only accountless local tasks are supported as local sources.');
+  } else if (source.namespace === 'device_calendar') {
+    if (source.kind !== 'meeting' || source.accountId !== undefined || !source.deviceBinding) fail('Device calendar sources must be accountless, typed meetings with a binding.');
+    const binding = source.deviceBinding;
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(binding.installationId) ||
+        !Number.isSafeInteger(binding.generation) || binding.generation < 1 || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(binding.calendarId) ||
+        !binding.nativeEventId || binding.nativeEventId.length > 1024 || /[\u0000-\u001f\u007f]/.test(binding.nativeEventId) ||
+        !Number.isFinite(Date.parse(binding.occurrenceStart)) || new Date(binding.occurrenceStart).toISOString() !== binding.occurrenceStart) fail('Device calendar source binding is invalid.');
+    const expectedProviderId = JSON.stringify([binding.installationId, binding.calendarId, binding.nativeEventId, binding.occurrenceStart]);
+    if (source.providerId !== expectedProviderId) fail('Device calendar provider ID does not match its frozen tuple.');
   } else if (!source.accountId) fail('Remote mail, meeting, and task sources must identify their account.');
   if (source.sourceId !== sourceId(source)) fail('Source ID does not match its immutable namespace/account/provider identity.');
   string(source.sourceVersion, 'Source version', 512);
@@ -121,6 +130,7 @@ function validateSource(source: ProactiveSource): void {
     optionalText(source.snippet, 'Mail snippet', 2000);
   } else if (source.kind === 'meeting') {
     optionalText(source.subject, 'Meeting subject', 2000);
+    if (source.namespace !== 'device_calendar' && source.deviceBinding !== undefined) fail('Only native meetings may carry a device binding.');
   }
   else if (source.kind === 'task') {
     optionalText(source.title, 'Task title', 2000);
@@ -241,6 +251,7 @@ function priorSort(a: ProactiveCandidate, b: ProactiveCandidate): number {
   return a.id.localeCompare(b.id);
 }
 function appliesToRule(rule: ProactiveRule, source: ProactiveSource): boolean {
+  if (source.namespace === 'device_calendar') return rule.accountIds.length === 0;
   return rule.accountIds.length === 0 || (source.accountId !== undefined && rule.accountIds.includes(source.accountId));
 }
 

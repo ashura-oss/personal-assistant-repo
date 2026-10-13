@@ -192,4 +192,28 @@ describe('local assistant context and response validation', () => {
     const decision = buildOfflinePreview({ intent: 'extract', transcript: transcript.text, timeZone: 'Asia/Singapore', now: '2026-10-12T00:00:00Z', transcriptRevision: 3, transcriptSourceVersion: `3:${'a'.repeat(64)}` });
     expect(decision.decisions[0]).toMatchObject({ sourceId: 'transcript', revision: 3, quote: 'I decided to call Mina tomorrow.' });
   });
+
+  it('uses typed native-calendar source IDs and discloses when an on-device snapshot is capped', () => {
+    const installationId = '11111111-1111-4111-8111-111111111111';
+    const calendarId = '22222222-2222-4222-8222-222222222222';
+    const makeEvent = (index: number) => {
+      const day = String(13 + Math.floor(index / 20)).padStart(2, '0');
+      return { calendarId, nativeEventId: `native-event-${index}`, occurrenceStart: `2026-10-${day}T10:00:00.000Z`,
+        title: `Meeting ${index}`, notes: '', notesTruncated: false, start: `2026-10-${day}T10:00:00.000Z`,
+        end: `2026-10-${day}T11:00:00.000Z`, timeZone: 'UTC', allDay: false, cancelled: false };
+    };
+    const snapshot = { installationId, generation: 4, selectionRevision: 2, selectedCalendarIds: [calendarId],
+      timeMin: '2026-10-12T00:00:00.000Z', timeMax: '2026-10-27T00:00:00.000Z', asOf: '2026-10-12T12:00:00.000Z',
+      partial: false, omittedEvents: 0, events: Array.from({ length: 51 }, (_, index) => makeEvent(index)) };
+    const built = buildLocalSourceSet({ transcript: { revision: 1, text: 'Calendar review.' }, intent: 'answer', query: 'upcoming calendar meetings', deviceCalendarSnapshot: snapshot });
+    const sourceId = `device_calendar_event:${encodeURIComponent(installationId)}:${encodeURIComponent(calendarId)}:${encodeURIComponent('native-event-0')}:${encodeURIComponent(makeEvent(0).occurrenceStart)}`;
+    expect(built.sources.some((source) => source.id === sourceId)).toBe(true);
+    const index = built.sources.find((source) => source.id === `device_calendar:index:${encodeURIComponent(installationId)}`)!;
+    expect(index.text).toContain('partial=yes; omitted=1; showing 50 of 51 cached events');
+
+    const preview = buildOfflinePreview({ intent: 'answer', question: 'What meetings are upcoming tomorrow?', transcript: '', timeZone: 'UTC',
+      now: '2026-10-12T12:00:00.000Z', deviceCalendarSnapshotAvailable: true, deviceCalendarEvents: [{ ...makeEvent(0), subject: makeEvent(0).title }] });
+    expect(preview.answer).toContain('on-device calendar snapshot');
+    expect(preview.answer).toContain('Meeting 0');
+  });
 });

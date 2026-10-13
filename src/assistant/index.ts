@@ -134,6 +134,51 @@ export function buildLocalSourceSet(input: LocalContextSnapshotInput): BoundedLo
     }
   }
 
+  const deviceSnapshot = input.deviceCalendarSnapshot;
+  if (deviceSnapshot && requireStableIdentity(deviceSnapshot.installationId) &&
+    Number.isSafeInteger(deviceSnapshot.generation) && deviceSnapshot.generation >= 0 &&
+    Number.isSafeInteger(deviceSnapshot.selectionRevision) && deviceSnapshot.selectionRevision >= 0 &&
+    Array.isArray(deviceSnapshot.selectedCalendarIds) && deviceSnapshot.selectedCalendarIds.length <= 20 &&
+    Number.isFinite(Date.parse(deviceSnapshot.timeMin)) && Number.isFinite(Date.parse(deviceSnapshot.timeMax)) &&
+    Date.parse(deviceSnapshot.timeMin) < Date.parse(deviceSnapshot.timeMax) && Number.isFinite(Date.parse(deviceSnapshot.asOf))) {
+    const selected = new Set(deviceSnapshot.selectedCalendarIds);
+    const allSelectedEvents = deviceSnapshot.events.filter((event) => selected.has(event.calendarId));
+    const allEvents = allSelectedEvents.filter((event) => !event.cancelled);
+    const events = allEvents.slice(0, MAX_SCAN_PER_KIND);
+    for (const event of events) {
+      if (!event.calendarId || !event.nativeEventId || !event.occurrenceStart) continue;
+      const sourceId = `device_calendar_event:${encodeURIComponent(deviceSnapshot.installationId)}:${encodeURIComponent(event.calendarId)}:${encodeURIComponent(event.nativeEventId)}:${encodeURIComponent(event.occurrenceStart)}`;
+      const material = JSON.stringify({ generation: deviceSnapshot.generation, selectionRevision: deviceSnapshot.selectionRevision,
+        calendarId: event.calendarId, nativeEventId: event.nativeEventId, occurrenceStart: event.occurrenceStart,
+        title: event.title, notes: event.notes, notesTruncated: event.notesTruncated, start: event.start, end: event.end, timeZone: event.timeZone ?? '', allDay: event.allDay, cancelled: event.cancelled });
+      const text = [`On-device calendar event: ${safeSourceLabel(event.title || '(untitled)')}`,
+        `Start: ${safeSourceLabel(event.start)}`, `End: ${safeSourceLabel(event.end)}`,
+        `Time zone: ${safeSourceLabel(event.timeZone ?? '(not available)')}`,
+        ...(event.notes ? [`Notes${event.notesTruncated ? ' (truncated)' : ''}: ${safeSourceLabel(event.notes)}`] : [])].join('\n');
+      addCandidate({ id: sourceId, revision: deviceSnapshot.generation, text, versionMaterial: material,
+        required: false, kind: 'device_calendar_event', title: safeSourceLabel(event.title || 'On-device event'), selectionPriority: event.selectionPriority ?? (calendarQuery ? 1 : 0) });
+    }
+    if (calendarQuery) {
+      const rows = events.map((event) => [event.calendarId, event.nativeEventId, event.occurrenceStart,
+        event.title, event.notes, event.notesTruncated, event.start, event.end, event.timeZone ?? '', event.allDay ? 'all-day' : 'timed'].join('\t'));
+      const visible = events.slice(0, 50).map((event) =>
+        `${safeSourceLabel(event.title || '(untitled)')} | ${safeSourceLabel(event.start)} | ${safeSourceLabel(event.timeZone ?? '(time zone unavailable)')}`);
+      const omitted = deviceSnapshot.omittedEvents + Math.max(0, allSelectedEvents.length - events.length) + Math.max(0, events.length - visible.length);
+      const partial = deviceSnapshot.partial || omitted > 0;
+      const text = [`On-device calendar snapshot for selected calendars (${deviceSnapshot.selectedCalendarIds.length})`,
+        `Range: ${deviceSnapshot.timeMin} to ${deviceSnapshot.timeMax}; checked ${deviceSnapshot.asOf}; partial=${partial ? 'yes' : 'no'}; omitted=${omitted}; showing ${visible.length} of ${events.length} cached events.`,
+        ...visible].join('\n');
+      if (byteLength(text) <= MAX_SOURCE_BYTES && byteLength(JSON.stringify({ generation: deviceSnapshot.generation,
+        selectionRevision: deviceSnapshot.selectionRevision, selected: deviceSnapshot.selectedCalendarIds, range: [deviceSnapshot.timeMin, deviceSnapshot.timeMax],
+        partial, omitted, events: rows })) <= MAX_VERSION_BYTES) {
+        addCandidate({ id: `device_calendar:index:${encodeURIComponent(deviceSnapshot.installationId)}`, revision: deviceSnapshot.generation,
+          text, versionMaterial: JSON.stringify({ generation: deviceSnapshot.generation, selectionRevision: deviceSnapshot.selectionRevision,
+            selected: deviceSnapshot.selectedCalendarIds, range: [deviceSnapshot.timeMin, deviceSnapshot.timeMax], partial,
+            omitted, events: rows }), required: true, kind: 'device_calendar', title: 'On-device calendar snapshot' });
+      } else omit(`device_calendar:index:${encodeURIComponent(deviceSnapshot.installationId)}`);
+    }
+  }
+
   const mailbox = input.mailbox ?? [];
   const mailScan = mailbox.slice(0, MAX_SCAN_PER_KIND);
   const perIdentityCount = new Map<string, number>();
@@ -185,7 +230,7 @@ export async function createSourceCatalog(inputs: readonly AssistantSourceInput[
   for (const input of inputs) {
     if (!input.id || input.id.length > 512 || /[\u0000-\u001f\u007f]/.test(input.id) || seen.has(input.id)) throw new Error('Context source IDs must be unique, stable, and bounded.');
     if (!validRevision(input.revision)) throw new Error(`Context source ${input.id} has an invalid revision.`);
-    if (typeof input.required !== 'boolean' || (input.kind !== undefined && !['note', 'document', 'task', 'calendar', 'mail', 'knowledge'].includes(input.kind)) || (input.title !== undefined && (typeof input.title !== 'string' || input.title.length > 1000))) throw new Error(`Context source ${input.id} has invalid metadata.`);
+    if (typeof input.required !== 'boolean' || (input.kind !== undefined && !['note', 'document', 'task', 'calendar', 'mail', 'knowledge', 'device_calendar', 'device_calendar_event'].includes(input.kind)) || (input.title !== undefined && (typeof input.title !== 'string' || input.title.length > 1000))) throw new Error(`Context source ${input.id} has invalid metadata.`);
     if (typeof input.text !== 'string' || byteLength(input.text) > MAX_SOURCE_BYTES || (input.versionMaterial !== undefined && (typeof input.versionMaterial !== 'string' || byteLength(input.versionMaterial) > MAX_VERSION_BYTES))) throw new Error(`Context source ${input.id} is too large to validate safely.`);
     if (input.updatedAt !== undefined && !Number.isFinite(Date.parse(input.updatedAt))) throw new Error(`Context source ${input.id} has an invalid update time.`);
     const contentHash = (await sha256(encoder.encode(normalizeSourceText(input.versionMaterial ?? input.text)))).toLowerCase();
@@ -486,7 +531,32 @@ export function buildOfflinePreview(input: OfflinePreviewInput): AssistantRespon
     const now = input.now instanceof Date ? input.now.getTime() : Date.parse(input.now);
     let validZone = true;
     try { new Intl.DateTimeFormat('en', { timeZone: input.timeZone }).format(0); } catch { validZone = false; }
-    if (input.calendarSnapshotAvailable !== true || !input.calendarEvents || !validZone || !Number.isFinite(now)) {
+    if ((input.deviceCalendarSnapshotAvailable === true || input.deviceCalendarSnapshotPartial === true) && input.deviceCalendarEvents && validZone && Number.isFinite(now)) {
+      const today = localDateFor(now, input.timeZone);
+      const targetDate = /\btomorrow\b/i.test(question) ? shiftCalendarDate(today, 1) : /\btoday\b/i.test(question) ? today : undefined;
+      const available = input.deviceCalendarEvents.flatMap((event) => {
+        if (event.allDay) return [];
+        const start = eventEpoch(event.start, event.timeZone);
+        if (start === undefined || start < now || (targetDate && localDateFor(start, input.timeZone) !== targetDate)) return [];
+        return [{ event, start }];
+      }).sort((a, b) => a.start - b.start).slice(0, 3);
+      if (available.length) {
+        const formatter = new Intl.DateTimeFormat('en', { timeZone: input.timeZone, dateStyle: 'medium', timeStyle: 'short' });
+        answer = `From ${input.deviceCalendarSnapshotPartial ? 'a partial ' : 'the '}on-device calendar snapshot: ${available.map(({ event, start }) => `${event.subject || 'Untitled event'} at ${formatter.format(start)}${event.notes ? ` (${event.notes}${event.notesTruncated ? '…' : ''})` : ''}`).join('; ')}.`;
+        if (input.deviceCalendarSnapshotPartial) clarifications = ['This is a partial snapshot; refresh the selected device calendars for a complete answer.'];
+      } else if (input.deviceCalendarEvents.some((event) => event.allDay && !event.timeZone)) {
+        answer = 'I can’t verify an all-day event date because the device calendar did not provide its time zone.';
+        clarifications = ['Check the event’s date and time zone in the device calendar.'];
+      } else if (input.deviceCalendarEvents.some((event) => event.allDay)) {
+        answer = 'The on-device calendar snapshot includes all-day events, but no matching timed event could be verified.';
+        clarifications = ['All-day entries do not have a precise meeting time.'];
+      } else if (input.deviceCalendarSnapshotAvailable === true && input.deviceCalendarEvents.every((event) => eventEpoch(event.start, event.timeZone) !== undefined)) {
+        answer = targetDate ? `No upcoming events were found for ${targetDate} in the on-device calendar snapshot.` : 'No upcoming events were found in the on-device calendar snapshot.';
+      } else {
+        answer = input.deviceCalendarSnapshotPartial ? 'I can’t confirm that there are no matching events because this on-device calendar snapshot is partial.' : 'I can’t verify on-device calendar times because some events lack an explicit time zone.';
+        clarifications = ['Refresh the selected device calendars before asking about their dates.'];
+      }
+    } else if (input.calendarSnapshotAvailable !== true || !input.calendarEvents || !validZone || !Number.isFinite(now)) {
       answer = 'I can’t verify current calendar events from this local snapshot.';
       clarifications = ['Sync a calendar and use a valid time zone before asking about upcoming events.'];
     } else {

@@ -14,6 +14,7 @@ import type {
   ProactiveCandidateSourceResult,
   ProactiveState,
 } from "../core";
+import type { DeviceCalendarAccessStatus, DeviceCalendarState } from "../deviceCalendars/types";
 import type { ProactiveSource } from "../proactive";
 import Ionicons from "@expo/vector-icons/Ionicons";
 import { Button } from "./primitives";
@@ -22,6 +23,8 @@ import { C, s } from "./theme";
 type Props = {
   proactive: ProactiveState;
   accounts: Account[];
+  deviceCalendars: DeviceCalendarState;
+  deviceCalendarAccess: DeviceCalendarAccessStatus;
   busy: boolean;
   onDismiss: (candidateId: string) => void;
   onSnooze: (candidateId: string, until: string) => void;
@@ -89,9 +92,51 @@ function sourceTime(source: ProactiveSource) {
   return timestampInLocalTime(source.dueAt, source.dueAtUtcCertified);
 }
 
+type DeviceSourcePresentation = { calendarTitle: string; timeZone?: string };
+
+function parseDeviceProviderId(value: string) {
+  if (value.length > 1024) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!Array.isArray(parsed) || parsed.length !== 4 || parsed.some((part) => typeof part !== "string" || !part || part.length > 512)) return undefined;
+    const [installationId, calendarId, nativeEventId, occurrenceStart] = parsed as string[];
+    return { installationId, calendarId, nativeEventId, occurrenceStart };
+  } catch { return undefined; }
+}
+
+function resolveDeviceSourcePresentation(
+  binding: { installationId: string; generation: number; calendarId: string; nativeEventId: string; occurrenceStart: string } | undefined,
+  device: DeviceCalendarState,
+  access: DeviceCalendarAccessStatus,
+): DeviceSourcePresentation | undefined {
+  if (!binding || access !== "full_access" || !device.enabled || device.installationId !== binding.installationId || device.generation !== binding.generation || !device.selectedCalendarIds.includes(binding.calendarId)) return undefined;
+  const run = device.readRun;
+  if (!run || run.generation !== device.generation || run.selectionRevision !== device.selectionRevision || !run.selectedCalendarIds.includes(binding.calendarId)) return undefined;
+  const event = device.events.find((item) => item.generation === device.generation && item.calendarId === binding.calendarId && item.nativeEventId === binding.nativeEventId && item.occurrenceStart === binding.occurrenceStart && !item.cancelled);
+  if (!event) return undefined;
+  const observedAt = Date.parse(event.observedAt);
+  const age = Date.now() - observedAt;
+  if (!Number.isFinite(observedAt) || age < 0 || age >= 15 * 60_000) return undefined;
+  const calendar = device.calendars.find((item) => item.localId === binding.calendarId);
+  return calendar ? { calendarTitle: calendar.title || "Calendar", ...(calendar.timeZone ? { timeZone: calendar.timeZone } : {}) } : undefined;
+}
+
+function sourceTimeInDeviceZone(value: string | undefined, utcCertified: boolean | undefined, timeZone?: string) {
+  if (!timeZone || !value || !utcCertified) return timestampInLocalTime(value, utcCertified);
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "Time unavailable";
+  try {
+    return new Intl.DateTimeFormat(undefined, {
+      timeZone, year: "numeric", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "shortOffset",
+    }).format(date);
+  } catch { return timestampInLocalTime(value, utcCertified); }
+}
+
 export function ProactiveCandidatesSection({
   proactive,
   accounts,
+  deviceCalendars,
+  deviceCalendarAccess,
   busy,
   onDismiss,
   onSnooze,
@@ -123,10 +168,16 @@ export function ProactiveCandidatesSection({
       ? account.displayName || account.email
       : "Account unavailable";
   };
-  const entrySourceLabel = (entry: ProactiveCandidateEntry) =>
-    entry.presentation === "uncertain"
-      ? "Saved source · needs recheck"
-      : accountName(entry.candidate.accountId);
+  const entrySourceLabel = (entry: ProactiveCandidateEntry) => {
+    if (entry.presentation === "uncertain") return "Saved source · needs recheck";
+    if (entry.candidate.namespace === "device_calendar") {
+      const tuple = parseDeviceProviderId(entry.candidate.providerId);
+      const binding = tuple ? { ...tuple, generation: deviceCalendars.generation } : undefined;
+      const source = resolveDeviceSourcePresentation(binding, deviceCalendars, deviceCalendarAccess);
+      return source ? `${source.calendarTitle} · On this iPhone` : "On this iPhone · original calendar unavailable";
+    }
+    return accountName(entry.candidate.accountId);
+  };
 
   const openSource = async (entry: ProactiveCandidateEntry) => {
     setOpened(entry);
@@ -389,7 +440,12 @@ export function ProactiveCandidatesSection({
                         </Text>
                       ) : null}
                       {sourceResult.source ? (
-                        <SourceDetails source={sourceResult.source} />
+                        <SourceDetails
+                          source={sourceResult.source}
+                          deviceSourcePresentation={sourceResult.source.kind === "meeting"
+                            ? resolveDeviceSourcePresentation(sourceResult.source.deviceBinding, deviceCalendars, deviceCalendarAccess)
+                            : undefined}
+                        />
                       ) : null}
                     </>
                   ) : null}
@@ -411,10 +467,11 @@ export function ProactiveCandidatesSection({
   );
 }
 
-function SourceDetails({ source }: { source: ProactiveSource }) {
+function SourceDetails({ source, deviceSourcePresentation }: { source: ProactiveSource; deviceSourcePresentation?: DeviceSourcePresentation }) {
   return (
     <View style={styles.sourceDetails}>
       <Text style={s.accountName}>{sourceTitle(source)}</Text>
+      {source.namespace === "device_calendar" ? <Text style={s.accountSub}>{deviceSourcePresentation ? `${deviceSourcePresentation.calendarTitle} · On this iPhone` : "On this iPhone · original calendar unavailable"}</Text> : null}
       {source.kind === "mail" && source.senderEmail ? (
         <Text style={s.accountSub}>From {source.senderEmail}</Text>
       ) : null}
@@ -427,7 +484,9 @@ function SourceDetails({ source }: { source: ProactiveSource }) {
           : source.kind === "meeting"
             ? "Starts"
             : "Due"}{" "}
-        {sourceTime(source)}
+        {source.kind === "meeting" && source.namespace === "device_calendar"
+          ? sourceTimeInDeviceZone(source.startAt, source.startAtUtcCertified, deviceSourcePresentation?.timeZone)
+          : sourceTime(source)}
       </Text>
       {source.kind === "mail" && source.snippet ? (
         <Text style={styles.detailText}>{source.snippet}</Text>

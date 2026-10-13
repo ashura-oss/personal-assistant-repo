@@ -1,5 +1,5 @@
 export type AssistantIntent = 'assist' | 'summarize' | 'answer' | 'extract';
-export type AssistantSourceKind = 'note' | 'document' | 'task' | 'calendar' | 'mail' | 'knowledge';
+export type AssistantSourceKind = 'note' | 'document' | 'task' | 'calendar' | 'mail' | 'knowledge' | 'device_calendar' | 'device_calendar_event';
 
 /** Content is the captured local snapshot; source IDs must not contain mutable display names. */
 export interface AssistantSourceInput {
@@ -34,6 +34,18 @@ export interface LocalContextSnapshotInput {
     asOf: string;
     partial: boolean;
     events: Array<{ providerEventId: string; subject?: string; start?: string; end?: string; timeZone?: string }>;
+  };
+  deviceCalendarSnapshot?: {
+    installationId: string;
+    generation: number;
+    selectionRevision: number;
+    selectedCalendarIds: string[];
+    timeMin: string;
+    timeMax: string;
+    asOf: string;
+    partial: boolean;
+    omittedEvents: number;
+    events: { calendarId: string; nativeEventId: string; occurrenceStart: string; title: string; notes: string; notesTruncated: boolean; start: string; end: string; timeZone?: string; allDay: boolean; cancelled: boolean; selectionPriority?: 0 | 1 | 2 }[];
   };
 }
 
@@ -114,4 +126,7 @@ export interface OfflinePreviewInput {
   tasks?: Array<{ title: string; status: string; dueAt?: string }>;
   calendarEvents?: Array<{ subject?: string; start?: string; timeZone?: string }>;
   calendarSnapshotAvailable?: boolean;
+  deviceCalendarSnapshotAvailable?: boolean;
+  deviceCalendarSnapshotPartial?: boolean;
+  deviceCalendarEvents?: { subject?: string; start?: string; end?: string; timeZone?: string; allDay?: boolean; notes?: string; notesTruncated?: boolean }[];
 }

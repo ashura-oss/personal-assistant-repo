@@ -50,7 +50,11 @@ function originCopy(record: ReminderRecord) {
   if (record.origin.kind === "note") return { heading: "Saved note", quote: record.origin.quote };
   const source = record.origin.source;
   const heading = source.kind === "mail" ? source.subject || "Saved message" : source.kind === "meeting" ? source.subject || "Calendar event" : source.title || "Local task";
-  const sourceName = source.namespace === "local" || source.kind === "task" ? "Local source" : `${source.namespace} account`;
+  const sourceName = source.namespace === "device_calendar"
+    ? "On this iPhone"
+    : source.namespace === "local" || source.kind === "task"
+      ? "Local source"
+      : `${source.namespace} account`;
   const quoteLabel = record.origin.candidate.quoteField.replaceAll("_", " ");
   return { heading: `${record.origin.rule.name} · ${heading}`, quote: record.origin.candidate.quote, sourceName, quoteLabel, capturedAt: record.origin.capturedAt };
 }

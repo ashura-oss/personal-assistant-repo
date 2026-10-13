@@ -345,12 +345,13 @@ function normalizeV2(value: unknown): PortableBackupV2 {
 
 function redactEvidence(value: KnowledgeState['people'][number]['facts'][number]['evidence']): typeof value {
   return value?.map((item) => {
-    const kind = item.sourceId.startsWith('mail:') ? 'mail' : /^calendar(?:[:\-]|$)/.test(item.sourceId) ? 'calendar' : undefined;
+    const kind = item.sourceId.startsWith('mail:') ? 'mail' : /^calendar(?:[:\-]|$)/.test(item.sourceId) ? 'calendar'
+      : item.sourceId.startsWith('device_calendar_event:') ? 'device_calendar' : undefined;
     return { ...item, ...(kind ? { sourceId: `historical:${kind}:${item.sourceVersion}` } : {}) };
   });
 }
 function redactReference(reference: KnowledgeState['people'][number]['sourceLinks'][number]['reference'], safeLabel: string) {
-  return reference.kind === 'mail' || reference.kind === 'calendar'
+  return reference.kind === 'mail' || reference.kind === 'calendar' || reference.kind === 'device_calendar_event'
     ? { kind: 'historical' as const, label: safeLabel, originalKind: reference.kind }
     : reference;
 }
@@ -804,6 +805,13 @@ export function createPortableBackup(state: AppState, metadata: PortableBackupMe
       ...record.reconciliations.map((item) => `Reconciliation (${item.disposition}): ${item.note}`)].filter(Boolean).join('\n\n'),
     status: `${record.outcome} (unverified imported history)`, occurredAt: record.dispatchStartedAt, provider: record.account.provider,
     ...(record.remoteId ? { reference: record.remoteId } : {}) });
+  }
+  for (const record of state.deviceCalendars.dispatchRecords) {
+    history.push({ kind: 'dispatch', sourceId: `device-dispatch:${record.id}`, title: 'On-device calendar action — imported history',
+      content: [`Event: ${record.payload.title}`, `Start: ${record.payload.start}`, `End: ${record.payload.end}`, `Time zone: ${record.payload.timeZone}`,
+        ...(record.payload.notes ? [`Description: ${record.payload.notes}`] : []),
+        ...record.reconciliations.map((item) => `Reconciliation (${item.disposition}): ${item.note}`)].join('\n\n'),
+      status: `${record.outcome} (unverified imported device history)`, occurredAt: record.claimAt, provider: 'on-device calendar' });
   }
   for (const message of state.mailbox) history.push({ kind: 'mail', sourceId: `mail:${message.id}`, title: 'Mail item — imported history',
     content: [`Subject: ${message.subject ?? ''}`, `From: ${message.from ?? ''}`, `Sender: ${message.senderEmail ?? ''}`, `To: ${(message.to ?? []).join(', ')}`, `Cc: ${(message.cc ?? []).join(', ')}`, `Received: ${message.receivedAt ?? ''}`, `Snippet: ${message.snippet ?? ''}`].filter(Boolean).join('\n'), status: `Imported mailbox snapshot; unverified${message.observedAt ? '' : ' — Original time unavailable'}`,

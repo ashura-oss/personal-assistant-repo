@@ -1,5 +1,6 @@
 import type { AppState, CalendarEventSnapshot, MailboxSnapshotMessage } from '../core';
 import { proactiveSourceId, validateProactiveSource, type ProactiveCandidate, type ProactiveSource } from './index';
+import type { DeviceEventSnapshot } from '../deviceCalendars';
 
 export interface ProactiveSourceHashMemoEntry { canonical: string; version: string }
 export type ProactiveSourceHashMemo = Map<string, ProactiveSourceHashMemoEntry>;
@@ -136,6 +137,43 @@ async function meetingSource(
   } catch { return undefined; }
 }
 
+async function deviceMeetingSource(
+  event: DeviceEventSnapshot,
+  state: AppState,
+  now: number,
+  memo: ProactiveSourceHashMemo,
+  digest: (value: string) => Promise<string>,
+): Promise<ProactiveSource | undefined> {
+  const device = state.deviceCalendars;
+  const calendar = device.calendars.find((row) => row.localId === event.calendarId);
+  const run = device.readRun;
+  if (!calendar || !run || event.allDay || state.deviceCalendarAccess.status !== 'full_access' || !device.enabled ||
+      run.generation !== device.generation || run.selectionRevision !== device.selectionRevision ||
+      !device.selectedCalendarIds.includes(event.calendarId) || !run.selectedCalendarIds.includes(event.calendarId) ||
+      event.generation !== device.generation) return undefined;
+  const installationId = device.installationId;
+  const binding = { installationId, generation: device.generation, calendarId: event.calendarId,
+    nativeEventId: event.nativeEventId, occurrenceStart: event.occurrenceStart };
+  const providerId = JSON.stringify([installationId, event.calendarId, event.nativeEventId, event.occurrenceStart]);
+  const namespace = 'device_calendar';
+  const sourceId = proactiveSourceId({ namespace, providerId });
+  const observed = Date.parse(event.observedAt);
+  const freshness = Number.isFinite(observed) && now - observed >= 0 && now - observed < 15 * 60_000 ? 'fresh' : 'stale';
+  const available = !event.cancelled;
+  const consumed = { kind: 'meeting', namespace, providerId, binding, calendarFingerprint: calendar.fingerprint,
+    title: event.title, notes: event.notes, notesTruncated: event.notesTruncated, start: event.start, end: event.end,
+    timeZone: event.timeZone ?? null, allDay: event.allDay, cancelled: event.cancelled };
+  try {
+    const candidate: ProactiveSource = {
+      kind: 'meeting', sourceId, namespace, providerId, sourceVersion: 'pending', availability: available ? 'available' : 'unavailable', freshness,
+      subject: event.title, startAt: event.start, deviceBinding: binding,
+    };
+    validateProactiveSource(candidate);
+    const sourceVersion = await hashedSource(sourceId, consumed, memo, digest);
+    return { ...candidate, sourceVersion };
+  } catch { return undefined; }
+}
+
 async function taskSource(
   task: AppState['tasks'][number], memo: ProactiveSourceHashMemo, digest: (value: string) => Promise<string>,
 ): Promise<ProactiveSource | undefined> {
@@ -189,6 +227,15 @@ export async function buildProactiveSources(
     const providerId = JSON.stringify([calendar.providerId ?? calendar.id, event.providerEventId]);
     const sourceId = proactiveSourceId({ namespace, accountId: account.id, providerId });
     jobs.push({ sourceId, run: () => meetingSource(event, calendar, account, now, memo, digest) });
+  }
+  const deviceEvents = state.deviceCalendars.events
+    .filter((event): event is DeviceEventSnapshot => isRecord(event) && typeof event.calendarId === 'string' && typeof event.nativeEventId === 'string')
+    .sort((a, b) => a.observedAt.localeCompare(b.observedAt) || a.calendarId.localeCompare(b.calendarId) || a.nativeEventId.localeCompare(b.nativeEventId))
+    .slice(0, 500);
+  for (const event of deviceEvents) {
+    const providerId = JSON.stringify([state.deviceCalendars.installationId, event.calendarId, event.nativeEventId, event.occurrenceStart]);
+    const sourceId = proactiveSourceId({ namespace: 'device_calendar', providerId });
+    jobs.push({ sourceId, run: () => deviceMeetingSource(event, state, now, memo, digest) });
   }
   for (const task of state.tasks) {
     if (typeof task.id !== 'string' || !task.id) continue;

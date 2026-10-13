@@ -49,6 +49,7 @@ import { createMailSyncScenario } from "./src/dev/mailSyncScenario";
 import { createBackupScenario } from "./src/dev/backupScenario";
 import { createKnowledgeScenario } from "./src/dev/knowledgeScenario";
 import { createReminderPreview } from "./src/dev/reminderPreview";
+import { createDeviceCalendarPreview } from "./src/dev/deviceCalendarPreview";
 import { useAudioCapture } from "./src/audio/useAudioCapture";
 import type { AudioCapture } from "./src/audio/types";
 import {
@@ -76,6 +77,7 @@ import { KnowledgeSuggestionSheet } from "./src/ui/KnowledgeSuggestionSheet";
 import { ImportedKnowledgeReview } from "./src/ui/ImportedKnowledgeReview";
 import { ReminderReview } from "./src/ui/ReminderReview";
 import { RemindersSection } from "./src/ui/RemindersSection";
+import { DeviceCalendarsSection } from "./src/ui/DeviceCalendarsSection";
 import { TasksSection } from "./src/ui/TasksSection";
 import { IconButton, Button, Field } from "./src/ui/primitives";
 import { C, s } from "./src/ui/theme";
@@ -98,7 +100,8 @@ const isMailSyncDemo = previewScenario === "mail-sync";
 const isBackupImportDemo = previewScenario === "backup-import";
 const isKnowledgeDemo = previewScenario === "knowledge";
 const isReminderDemo = previewScenario === "reminders";
-const isIsolatedDemo = isDispatchHistoryDemo || isMailSyncDemo || isBackupImportDemo || isKnowledgeDemo || isReminderDemo;
+const isDeviceCalendarsDemo = previewScenario === "device-calendars";
+const isIsolatedDemo = isDispatchHistoryDemo || isMailSyncDemo || isBackupImportDemo || isKnowledgeDemo || isReminderDemo || isDeviceCalendarsDemo;
 
 function useAppState(appController: AppController) {
   return useSyncExternalStore(
@@ -192,6 +195,20 @@ function knowledgeReferenceOptions(state: ReturnType<typeof productionController
     if (!calendar) continue;
     references.push({ reference: { kind: 'calendar', id: event.providerEventId, calendarId: calendar.providerId ?? calendar.id, identityKey, connectionGeneration: event.connectionGeneration }, label: `Saved calendar item · ${event.subject || 'Untitled event'}` });
   }
+  if (state.deviceCalendars.enabled && state.deviceCalendarAccess.status === 'full_access') {
+    const now = Date.now();
+    for (const event of state.deviceCalendars.events) {
+      const calendar = state.deviceCalendars.calendars.find((item) => item.localId === event.calendarId);
+      const age = now - Date.parse(event.observedAt);
+      if (!calendar || event.cancelled || event.generation !== state.deviceCalendars.generation ||
+          !state.deviceCalendars.selectedCalendarIds.includes(event.calendarId) || !Number.isFinite(age) || age < 0 || age > 15 * 60_000) continue;
+      references.push({
+        reference: { kind: 'device_calendar_event', installationId: state.deviceCalendars.installationId, generation: event.generation,
+          calendarId: event.calendarId, eventId: event.nativeEventId, occurrenceStart: event.occurrenceStart },
+        label: `On this iPhone · ${calendar.title} · ${event.title || 'Untitled event'}`,
+      });
+    }
+  }
   return references;
 }
 
@@ -229,6 +246,17 @@ function knowledgeEvidenceLabels(state: ReturnType<typeof productionController.g
     const providerCalendarId = calendar?.providerId ?? event.calendarId;
     const sourceId = `calendar-event:${encodeURIComponent(identityKey)}:${encodeURIComponent(providerCalendarId)}:${encodeURIComponent(event.providerEventId)}`;
     labels[sourceId] = `Saved calendar item · ${event.subject || 'Untitled event'}`;
+  }
+  if (state.deviceCalendars.enabled && state.deviceCalendarAccess.status === 'full_access') {
+    const now = Date.now();
+    for (const event of state.deviceCalendars.events) {
+      const calendar = state.deviceCalendars.calendars.find((item) => item.localId === event.calendarId);
+      const age = now - Date.parse(event.observedAt);
+      if (!calendar || event.cancelled || event.generation !== state.deviceCalendars.generation ||
+          !state.deviceCalendars.selectedCalendarIds.includes(event.calendarId) || !Number.isFinite(age) || age < 0 || age > 15 * 60_000) continue;
+      const sourceId = `device_calendar_event:${encodeURIComponent(state.deviceCalendars.installationId)}:${encodeURIComponent(event.calendarId)}:${encodeURIComponent(event.nativeEventId)}:${encodeURIComponent(event.occurrenceStart)}`;
+      labels[sourceId] = `On this iPhone · ${calendar.title} · ${event.title || 'Untitled event'}`;
+    }
   }
   for (const person of state.knowledge.people) {
     if (!person.archivedAt) labels[`knowledge:person:${person.id}`] = `Person · ${person.name}`;
@@ -434,6 +462,8 @@ export default function App() {
                 ? await createKnowledgeScenario()
                 : isReminderDemo
                   ? await createReminderPreview()
+                  : isDeviceCalendarsDemo
+                    ? await createDeviceCalendarPreview()
             : productionController;
         if (!mounted) return;
         setController(selected);
@@ -721,7 +751,16 @@ export default function App() {
     [],
   );
   const openReminder = (record: ReminderRecord) => {
-    if (record.origin.kind === "proactive" && record.origin.binding) {
+    if (record.origin.kind === "proactive" && record.origin.deviceBinding) {
+      const binding = record.origin.deviceBinding;
+      const device = state.deviceCalendars;
+      const calendar = device.installationId === binding.installationId && device.generation === binding.generation
+        ? device.calendars.find((item) => item.localId === binding.calendarId)
+        : undefined;
+      setReminderSourceAccountLabel(calendar
+        ? `On this iPhone · ${calendar.title || "Calendar"}`
+        : "On this iPhone · original calendar unavailable");
+    } else if (record.origin.kind === "proactive" && record.origin.binding) {
       const binding = record.origin.binding;
       const account = state.accounts.find((item) => {
         const identity = item.identity;
@@ -812,6 +851,36 @@ export default function App() {
       removeWebListener?.();
     };
   }, [loading, refreshForegroundMail]);
+  useEffect(() => {
+    if (loading || isIsolatedDemo) return;
+    const checkPermission = () => {
+      if (controller.getSnapshot().deviceCalendars.enabled) {
+        void controller.checkDeviceCalendarAccess().catch(() => undefined);
+      }
+    };
+    const initial = setTimeout(checkPermission, 0);
+    let removeNative: (() => void) | undefined;
+    let removeWeb: (() => void) | undefined;
+    if (Platform.OS === "web" && typeof document !== "undefined") {
+      let visible = document.visibilityState === "visible";
+      const onVisibility = () => {
+        const nextVisible = document.visibilityState === "visible";
+        if (!visible && nextVisible) checkPermission();
+        visible = nextVisible;
+      };
+      document.addEventListener("visibilitychange", onVisibility);
+      removeWeb = () => document.removeEventListener("visibilitychange", onVisibility);
+    } else {
+      let wasActive = NativeAppState.currentState === "active";
+      const native = NativeAppState.addEventListener("change", (next) => {
+        const active = next === "active";
+        if (!wasActive && active) checkPermission();
+        wasActive = active;
+      });
+      removeNative = () => native.remove();
+    }
+    return () => { clearTimeout(initial); removeNative?.(); removeWeb?.(); };
+  }, [controller, loading]);
   const openNote = (note: Note) => {
     setDetail(note);
     setTab("record");
@@ -1046,6 +1115,8 @@ export default function App() {
                       ? "Sample backup · in-memory only · no external access"
                       : isReminderDemo
                         ? "Sample reminders · in-memory only · simulated alerts"
+                    : isDeviceCalendarsDemo
+                      ? "Sample device calendars · in-memory only · simulated native calls"
                         : "Sample knowledge · in-memory only · no external actions"}
               </Text>
             </View>
@@ -1292,6 +1363,8 @@ export default function App() {
                 proposals={proposals}
                 accounts={state.accounts}
                 mailbox={state.mailbox}
+                deviceCalendars={state.deviceCalendars}
+                deviceCalendarAccess={state.deviceCalendarAccess.status}
                 onReplyMessage={(messageId) => setReplyMessageId(messageId)}
                 proactive={state.proactive}
                 filter={inboxFilter}
@@ -1470,6 +1543,33 @@ export default function App() {
                   return true;
                 })
               }
+              onConnectDeviceCalendars={() => run(async () => {
+                const result = await controller.connectDeviceCalendars({ expectedGeneration: state.deviceCalendars.generation });
+                setNotice(result.status === "full_access" ? "Device calendars connected with full access." : `Calendar access: ${result.status.replaceAll("_", " ")}.`);
+              })}
+              onDisconnectDeviceCalendars={() => run(async () => {
+                await controller.disconnectDeviceCalendars({ expectedGeneration: state.deviceCalendars.generation });
+                setNotice("Device calendars disconnected. Saved event history remains available.");
+              })}
+              onCheckDeviceCalendarAccess={() => run(async () => {
+                const result = await controller.checkDeviceCalendarAccess();
+                setNotice(`Calendar access checked: ${result.status.replaceAll("_", " ")}.`);
+              })}
+              onSelectDeviceCalendars={(calendarIds) => run(async () => {
+                await controller.setDeviceCalendarSelection({
+                  expectedGeneration: state.deviceCalendars.generation,
+                  expectedSelectionRevision: state.deviceCalendars.selectionRevision,
+                  calendarIds,
+                });
+              })}
+              onRefreshDeviceCalendars={(continueRunId) => run(async () => {
+                await controller.refreshDeviceCalendars({
+                  expectedGeneration: state.deviceCalendars.generation,
+                  expectedSelectionRevision: state.deviceCalendars.selectionRevision,
+                  ...(continueRunId ? { continueRunId } : {}),
+                });
+                setNotice("The selected device calendars were checked.");
+              })}
               demoMode={isIsolatedDemo}
             />
           </SafeAreaView>
@@ -1487,8 +1587,17 @@ export default function App() {
                 state={state}
                 proposal={currentReviewProposal}
                 dispatchRecords={state.dispatchRecords}
+                deviceEventDispatchRecords={state.deviceCalendars.dispatchRecords}
                 busy={busy}
-                demoMode={isMailSyncDemo}
+                demoMode={isDeviceCalendarsDemo}
+                onInspectDeviceEvent={(recordId) => controller.inspectDeviceEventDispatch(recordId)}
+                onReconcileDeviceEvent={(recordId, input) =>
+                  run(async () => {
+                    const saved = await controller.reconcileDeviceEventDispatch(recordId, input);
+                    setNotice("Check recorded. The device event outcome remains unchanged; nothing was created again.");
+                    return saved;
+                  })
+                }
                 onReconcile={(recordId, input) =>
                   run(async () => {
                     const saved = await controller.reconcileDispatch(
@@ -1560,14 +1669,14 @@ export default function App() {
                 onClose={() => setReview(null)}
                 onEdit={(patch) =>
                   run(async () => {
-                    if (!review) return;
-                    setReview(await controller.editProposal(review.id, patch));
+                    if (!currentReviewProposal) return;
+                    setReview(await controller.editProposal(currentReviewProposal.id, patch, { expectedRevision: currentReviewProposal.revision }));
                   })
                 }
                 onApprove={() =>
                   run(async () => {
-                    if (!review) return;
-                    setReview(await controller.approveProposal(review.id));
+                    if (!currentReviewProposal) return;
+                    setReview(await controller.approveProposal(currentReviewProposal.id, { expectedRevision: currentReviewProposal.revision }));
                     setNotice(
                       "Approved for this exact version. The action remains a separate step.",
                     );
@@ -1575,8 +1684,8 @@ export default function App() {
                 }
                 onExecute={() =>
                   run(async () => {
-                    if (!review) return;
-                    setReview(await controller.executeProposal(review.id));
+                    if (!currentReviewProposal) return;
+                    setReview(await controller.executeProposal(currentReviewProposal.id, { expectedRevision: currentReviewProposal.revision }));
                   })
                 }
                 onDismiss={() =>
@@ -1979,6 +2088,8 @@ function InboxScreen({
   proposals,
   accounts,
   mailbox,
+  deviceCalendars,
+  deviceCalendarAccess,
   onReplyMessage,
   proactive,
   filter,
@@ -1994,6 +2105,8 @@ function InboxScreen({
   proposals: Proposal[];
   accounts: ReturnType<typeof productionController.getSnapshot>["accounts"];
   mailbox: MailboxSnapshotMessage[];
+  deviceCalendars: ReturnType<typeof productionController.getSnapshot>["deviceCalendars"];
+  deviceCalendarAccess: ReturnType<typeof productionController.getSnapshot>["deviceCalendarAccess"]["status"];
   onReplyMessage: (messageId: string) => void;
   proactive: ProactiveState;
   filter: "pending" | "done";
@@ -2077,6 +2190,8 @@ function InboxScreen({
       <ProactiveCandidatesSection
         proactive={proactive}
         accounts={accounts}
+        deviceCalendars={deviceCalendars}
+        deviceCalendarAccess={deviceCalendarAccess}
         busy={busy}
         onDismiss={onDismissCandidate}
         onSnooze={onSnoozeCandidate}
@@ -2417,6 +2532,11 @@ function SettingsScreen({
   onContinueMail,
   onSaveProactiveRule,
   onDeleteProactiveRule,
+  onConnectDeviceCalendars,
+  onDisconnectDeviceCalendars,
+  onCheckDeviceCalendarAccess,
+  onSelectDeviceCalendars,
+  onRefreshDeviceCalendars,
 }: {
   state: ReturnType<typeof productionController.getSnapshot>;
   onClose: () => void;
@@ -2438,6 +2558,11 @@ function SettingsScreen({
     id: string,
     expectedVersion: number,
   ) => Promise<boolean | undefined>;
+  onConnectDeviceCalendars: () => Promise<unknown>;
+  onDisconnectDeviceCalendars: () => Promise<unknown>;
+  onCheckDeviceCalendarAccess: () => Promise<unknown>;
+  onSelectDeviceCalendars: (calendarIds: string[]) => Promise<unknown>;
+  onRefreshDeviceCalendars: (continueRunId?: string) => Promise<unknown>;
   onSave: (p: Partial<AppSettings>) => Promise<unknown>;
   onSaveAccount: (c: {
     provider: "google" | "microsoft" | "local";
@@ -2936,6 +3061,16 @@ function SettingsScreen({
           onSync={onSync}
           onRefreshMail={onRefreshMail}
           onContinueMail={onContinueMail}
+        />
+        <DeviceCalendarsSection
+          state={state}
+          busy={busy}
+          demoMode={isDeviceCalendarsDemo}
+          onConnect={() => void onConnectDeviceCalendars()}
+          onDisconnect={() => void onDisconnectDeviceCalendars()}
+          onCheckAccess={() => void onCheckDeviceCalendarAccess()}
+          onSelection={(ids) => void onSelectDeviceCalendars(ids)}
+          onRefresh={(runId) => void onRefreshDeviceCalendars(runId)}
         />
         <Text style={s.sectionTitle}>Local data</Text>
         <Text style={s.disclaimer}>

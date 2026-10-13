@@ -169,11 +169,10 @@ function MemberRow({ member, people, busy, onEdit, onRemove }: { member: Project
 
 function referenceSummary(reference: KnowledgeReference, options: { reference: KnowledgeReference; label: string }[]) {
   if (reference.kind === 'historical') return `${reference.originalKind} · ${reference.label} (historical)`;
-  const match = options.find(({ reference: candidate }) => candidate.kind === reference.kind && candidate.id === reference.id &&
-    (!('identityKey' in reference) || ('identityKey' in candidate && candidate.identityKey === reference.identityKey && candidate.connectionGeneration === reference.connectionGeneration)) &&
-    (reference.kind !== 'calendar' || (candidate.kind === 'calendar' && candidate.calendarId === reference.calendarId)));
+  const match = options.find(({ reference: candidate }) => referenceKey(candidate) === referenceKey(reference));
   if (match) return match.label;
   if (reference.kind === 'person' || reference.kind === 'project') return `${reference.kind === 'person' ? 'Person' : 'Project'} · historical entity unavailable`;
+  if (reference.kind === 'device_calendar_event') return 'On this iPhone · historical event unavailable';
   return `${reference.kind} · historical source unavailable`;
 }
 
@@ -181,5 +180,6 @@ function referenceKey(reference: KnowledgeReference) {
   if (reference.kind === 'historical') return JSON.stringify([reference.kind, reference.originalKind, reference.label]);
   if (reference.kind === 'mail') return JSON.stringify([reference.kind, reference.id, reference.identityKey, reference.connectionGeneration]);
   if (reference.kind === 'calendar') return JSON.stringify([reference.kind, reference.id, reference.calendarId, reference.identityKey, reference.connectionGeneration]);
+  if (reference.kind === 'device_calendar_event') return JSON.stringify([reference.kind, reference.installationId, reference.generation, reference.calendarId, reference.eventId, reference.occurrenceStart]);
   return JSON.stringify([reference.kind, reference.id]);
 }
