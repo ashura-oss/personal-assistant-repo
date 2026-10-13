@@ -26,6 +26,27 @@ async function saveDocumentCurrent(app: AppControllerImpl, path: string, content
 }
 
 describe('application state controller', () => {
+  it('keeps background mailbox refresh consent disabled for malformed legacy state and owns its generation', async () => {
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store);
+    await app.load();
+    expect(app.getSnapshot().settings).toMatchObject({ backgroundMailRefreshEnabled: false, backgroundRefreshGeneration: 0 });
+    await app.saveSettings({ backgroundMailRefreshEnabled: true });
+    expect(app.getSnapshot().settings).toMatchObject({ backgroundMailRefreshEnabled: true, backgroundRefreshGeneration: 1 });
+    await app.saveSettings({ backgroundMailRefreshEnabled: true });
+    expect(app.getSnapshot().settings.backgroundRefreshGeneration).toBe(1);
+    await app.saveSettings({ backgroundMailRefreshEnabled: false });
+    expect(app.getSnapshot().settings).toMatchObject({ backgroundMailRefreshEnabled: false, backgroundRefreshGeneration: 2 });
+    await expect(app.saveSettings({ backgroundRefreshGeneration: 80 } as never)).rejects.toThrow(/managed by this app/i);
+
+    const malformed = structuredClone(store.value!);
+    malformed.settings = { ...malformed.settings, backgroundMailRefreshEnabled: true, backgroundRefreshGeneration: '4' } as never;
+    await store.save(malformed);
+    const reloaded = new AppControllerImpl(store);
+    await reloaded.load();
+    expect(reloaded.getSnapshot().settings).toMatchObject({ backgroundMailRefreshEnabled: false, backgroundRefreshGeneration: 0 });
+  });
+
   it('creates a mail-origin reply from a fresh verified mailbox snapshot without a synthetic note', async () => {
     const store = new MemoryStore();
     const app = new AppControllerImpl(store);

@@ -97,7 +97,7 @@ async function eraseWebTarget(io: WebPrivacyEraseIO, target: PrivacyCleanupTarge
     }
     case 'markdown_mirrors': return; // Markdown documents are inside the app-state database on web.
     case 'internal_export':
-    case 'notifications': return; // These namespaces have no persistent browser implementation.
+    case 'notifications': return; // Browser notifications/background work are not owned by this app backend.
     case 'recovery_audio': return; // Stored in still-audio-v1, removed by browser_audio.
     case 'provider_credentials':
       await io.deleteProviderCredential('speech', beforeMutation);

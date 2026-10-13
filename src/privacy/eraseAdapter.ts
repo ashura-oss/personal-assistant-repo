@@ -1,6 +1,7 @@
 import { SQLitePrivacyControlStore } from './controlStore';
 import type { PrivacyCleanupTarget, PrivacyControlStore, PrivacyEraseAdapter, PrivacyOwner } from './types';
 import { assertCleanupTarget, isUuid, PrivacyEraseAdapterError, safeRelativeMarkdownPath, validateCleanupEpoch } from './eraseAdapter.shared';
+import { MAIL_REFRESH_TASK_NAME } from '../background/backend.types';
 
 type FileInfo = { exists: boolean; isDirectory?: boolean };
 export interface NativePrivacyEraseIO {
@@ -17,6 +18,8 @@ export interface NativePrivacyEraseIO {
   oauthTokenExists(tokenRef: string): Promise<boolean>;
   cancelAndDismissNotifications(beforeMutation: () => Promise<void>): Promise<void>;
   notificationsRemain(): Promise<boolean>;
+  unregisterBackgroundTask(taskName: typeof MAIL_REFRESH_TASK_NAME, beforeMutation: () => Promise<void>): Promise<void>;
+  backgroundTaskRegistered(taskName: typeof MAIL_REFRESH_TASK_NAME): Promise<boolean>;
 }
 
 export interface NativePrivacyEraseAdapterOptions {
@@ -97,6 +100,19 @@ async function createDefaultIO(): Promise<NativePrivacyEraseIO> {
       ]);
       return scheduled.length > 0 || presented.length > 0;
     },
+    async unregisterBackgroundTask(taskName, beforeMutation) {
+      if (taskName !== MAIL_REFRESH_TASK_NAME) throw new PrivacyEraseAdapterError('unsupported_target');
+      await beforeMutation();
+      const { backgroundTaskBackend } = await import('../background/backend.native');
+      await backgroundTaskBackend.unregister(beforeMutation);
+    },
+    async backgroundTaskRegistered(taskName) {
+      if (taskName !== MAIL_REFRESH_TASK_NAME) throw new PrivacyEraseAdapterError('unsupported_target');
+      const { backgroundTaskBackend } = await import('../background/backend.native');
+      const status = await backgroundTaskBackend.getStatus();
+      if (status.state === 'unavailable' || status.state === 'unsupported') throw new PrivacyEraseAdapterError('target_unavailable');
+      return backgroundTaskBackend.isRegistered();
+    },
   };
 }
 
@@ -165,6 +181,7 @@ async function eraseNativeTarget(io: NativePrivacyEraseIO, target: PrivacyCleanu
       return;
     case 'notifications':
       await io.cancelAndDismissNotifications(beforeMutation);
+      await io.unregisterBackgroundTask(MAIL_REFRESH_TASK_NAME, beforeMutation);
       return;
   }
 }
@@ -190,7 +207,7 @@ async function verifyNativeTargetGone(io: NativePrivacyEraseIO, target: PrivacyC
       return true;
     case 'internal_export': return !(await io.exists(join(io.documentDirectory, 'still-export.json'))).exists;
     case 'provider_credentials': return !(await io.providerCredentialExists('speech')) && !(await io.providerCredentialExists('openai'));
-    case 'notifications': return !(await io.notificationsRemain());
+    case 'notifications': return !(await io.notificationsRemain()) && !(await io.backgroundTaskRegistered(MAIL_REFRESH_TASK_NAME));
   }
 }
 

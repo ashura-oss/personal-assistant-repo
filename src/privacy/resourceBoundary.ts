@@ -3,6 +3,7 @@ import type { OAuthTokenStore } from '../connectors';
 import type { NotificationBackend, ForegroundNotificationProjection, PendingNotificationRequest } from '../services/notificationBackend';
 import type { DeviceCalendarBackend } from '../services/deviceCalendarBackend';
 import type { DeviceCalendarReadWindow, DeviceCalendarRow, DeviceEventDispatchRecord } from '../deviceCalendars';
+import type { BackgroundTaskBackend, BackgroundTaskExpirationSubscription } from '../background/backend.types';
 import type { LegacyReminderCancellation, ReminderIntent } from '../reminders';
 import type { PrivacyService, PrivacyWorkspaceSession } from './service';
 import type { PrivacyWriterDescriptor } from './types';
@@ -104,6 +105,37 @@ export interface PrivacyBoundNotificationBackend {
   dispose(): void;
 }
 
+export interface PrivacyBoundBackgroundTaskBackend {
+  readonly backend: BackgroundTaskBackend;
+  dispose(): void;
+}
+
+/** Keeps task registration and status reads inside the existing notification cleanup namespace. */
+export function bindPrivacyBackgroundTaskBackend(raw: BackgroundTaskBackend, input: PrivacyResourceBinding): PrivacyBoundBackgroundTaskBackend {
+  const binding = snapshotBinding(input);
+  const descriptor: PrivacyWriterDescriptor = { kind: 'notification', namespace: 'notifications' };
+  let active = true;
+  const run = <T>(actual: () => Promise<T>) => {
+    if (!active) return Promise.reject(new Error('This workspace background-task session has ended.'));
+    return underWriter(binding, descriptor, actual);
+  };
+  const backend: BackgroundTaskBackend = {
+    getStatus: () => run(() => raw.getStatus()),
+    isRegistered: () => run(() => raw.isRegistered()),
+    register: () => run(() => raw.register()),
+    unregister: (beforeMutation?: () => Promise<void>) => run(() => raw.unregister(beforeMutation ? async () => {
+      if (!active) throw new Error('This workspace background-task session has ended.');
+      await binding.privacy.assertWorkspaceEpoch(binding.session.epoch);
+      await beforeMutation();
+      if (!active) throw new Error('This workspace background-task session has ended.');
+    } : undefined)),
+    addExpirationListener: (listener: () => void): Promise<BackgroundTaskExpirationSubscription> =>
+      run(() => raw.addExpirationListener(() => active && listener())),
+  };
+  Object.freeze(backend);
+  return Object.freeze({ backend, dispose() { active = false; } });
+}
+
 /** Holds notification writer ownership through each native request, including a delayed schedule. */
 export function bindPrivacyNotificationBackend(raw: NotificationBackend, input: PrivacyResourceBinding): PrivacyBoundNotificationBackend {
   const binding = snapshotBinding(input);
@@ -133,6 +165,7 @@ export interface PrivacyResourceBoundary extends PrivacyResourceBinding {
   credentialStore(raw: CredentialStore): CredentialStore;
   oauthTokenStore(raw: OAuthTokenStore & { delete?: (tokenRef: string) => Promise<void> }): PrivacyBoundOAuthTokenStore;
   notificationBackend(raw: NotificationBackend): PrivacyBoundNotificationBackend;
+  backgroundTaskBackend(raw: BackgroundTaskBackend): PrivacyBoundBackgroundTaskBackend;
   deviceCalendarBackend(raw: DeviceCalendarBackend): PrivacyBoundDeviceCalendarBackend;
   withProviderOwnership<T>(actual: () => Promise<T>): Promise<T>;
 }
@@ -145,6 +178,7 @@ export function createPrivacyResourceBoundary(input: PrivacyResourceBinding): Pr
     credentialStore: (raw: CredentialStore) => createPrivacyBoundCredentialStore(raw, binding),
     oauthTokenStore: (raw: OAuthTokenStore & { delete?: (tokenRef: string) => Promise<void> }) => createPrivacyBoundOAuthTokenStore(raw, binding),
     notificationBackend: (raw: NotificationBackend) => bindPrivacyNotificationBackend(raw, binding),
+    backgroundTaskBackend: (raw: BackgroundTaskBackend) => bindPrivacyBackgroundTaskBackend(raw, binding),
     deviceCalendarBackend: (raw: DeviceCalendarBackend) => bindPrivacyDeviceCalendarBackend(raw, binding),
     withProviderOwnership: <T>(actual: () => Promise<T>) => underWriter(binding, { kind: 'provider_credential', namespace: 'provider_credentials' }, actual),
   });

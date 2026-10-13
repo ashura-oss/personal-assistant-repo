@@ -8,12 +8,15 @@ import { fileURLToPath } from 'node:url';
 const MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 const TIMEOUT_MS = 60_000;
 const PODSPEC_LIMIT_BYTES = 64 * 1024;
+const BACKGROUND_TASK_SOURCE_LIMIT_BYTES = 64 * 1024;
+const EXPECTED_BACKGROUND_TASK_VERSION = '57.0.21';
 
 const CHECK_LABELS = Object.freeze({
   bundle: 'iOS bundle identifier and portrait/dark phone settings',
   finalDisplay: 'final introspected plist is dark and portrait-only',
   permissions: 'microphone and full-calendar permissions; no reminders permission',
-  background: 'no iOS background modes',
+  background: 'SDK 57 TaskManager fetch and BackgroundTask processing modes only',
+  expiryBridge: 'pinned Expo task-expiry event bridge matches the patched iOS notification contract',
   transport: 'restricted App Transport Security policy',
   schemes: 'configured URL schemes are registered',
   module: 'StillPrivacy is uniquely autolinked with its native callback',
@@ -41,7 +44,7 @@ function podspecHasAssignment(source, field, valuePattern) {
   return new RegExp(`^\\s*s\\.${escaped}\\s*=\\s*${valuePattern}\\s*$`, 'm').test(source);
 }
 
-export function validateIosConfiguration({ config, autolink, podspecContent, projectRoot }) {
+export function validateIosConfiguration({ config, autolink, podspecContent, projectRoot, backgroundTaskVersion, backgroundTaskSource }) {
   const failures = [];
   const passed = [];
   const mark = (key, valid, failure) => (valid ? passed.push(CHECK_LABELS[key]) : failures.push(failure));
@@ -66,9 +69,26 @@ export function validateIosConfiguration({ config, autolink, podspecContent, pro
       !Object.keys(object(info) ? info : {}).some((key) => /^NSReminders.*UsageDescription$/.test(key)),
     'Required microphone/full-calendar descriptions are missing or a reminders description is present.');
 
-  mark('background', info?.UIBackgroundModes === undefined ||
-    (Array.isArray(info.UIBackgroundModes) && info.UIBackgroundModes.length === 0),
-  'Unexpected iOS background modes are configured.');
+  const backgroundModes = Array.isArray(info?.UIBackgroundModes) ? info.UIBackgroundModes : [];
+  // SDK 57's TaskManager plugin adds fetch; BackgroundTask adds processing.
+  const expectedBackgroundModes = new Set(['fetch', 'processing']);
+  mark('background', backgroundModes.length === expectedBackgroundModes.size &&
+    new Set(backgroundModes).size === expectedBackgroundModes.size &&
+    backgroundModes.every((mode) => expectedBackgroundModes.has(mode)) &&
+    Array.isArray(info?.BGTaskSchedulerPermittedIdentifiers) &&
+    info.BGTaskSchedulerPermittedIdentifiers.length === 1 &&
+    info.BGTaskSchedulerPermittedIdentifiers[0] === 'com.expo.modules.backgroundtask.processing',
+  'iOS background task configuration must contain only SDK 57 TaskManager fetch and BackgroundTask processing modes plus the Expo scheduler identifier.');
+
+  const boundedBackgroundSource = typeof backgroundTaskSource === 'string' &&
+    Buffer.byteLength(backgroundTaskSource, 'utf8') <= BACKGROUND_TASK_SOURCE_LIMIT_BYTES
+    ? backgroundTaskSource
+    : '';
+  const expiryHandler = boundedBackgroundSource.match(/handleTasksExpiredNotification\s*\([^)]*\)\s*\{([\s\S]*?)\n\s*\}/)?.[1] ?? '';
+  mark('expiryBridge', backgroundTaskVersion === EXPECTED_BACKGROUND_TASK_VERSION &&
+    expiryHandler.includes('self.sendEvent(onTasksExpired, [:])') &&
+    !/userInfo\s*\?\[\s*["']url["']\s*\]/.test(expiryHandler),
+  'The pinned Expo background-task expiry bridge does not match the approved notification contract.');
 
   const ats = info?.NSAppTransportSecurity;
   const atsKeys = object(ats) ? Object.keys(ats).sort() : [];
@@ -170,7 +190,22 @@ async function runCheck() {
     }
   } catch { /* The fixed podspec check below reports absence without exposing path details. */ }
 
-  const result = validateIosConfiguration({ config, autolink, podspecContent, projectRoot });
+  let backgroundTaskVersion = '';
+  let backgroundTaskSource = '';
+  try {
+    const backgroundTaskPackage = require.resolve('expo-background-task/package.json');
+    const parsedPackage = JSON.parse(readFileSync(backgroundTaskPackage, 'utf8'));
+    if (parsedPackage?.version === EXPECTED_BACKGROUND_TASK_VERSION) {
+      backgroundTaskVersion = parsedPackage.version;
+      const sourcePath = path.join(path.dirname(backgroundTaskPackage), 'ios/BackgroundTaskModule.swift');
+      const sourceStat = statSync(sourcePath);
+      if (sourceStat.isFile() && sourceStat.size <= BACKGROUND_TASK_SOURCE_LIMIT_BYTES) {
+        backgroundTaskSource = readFileSync(sourcePath, 'utf8');
+      }
+    }
+  } catch { /* The fixed pinned-source check below reports absence without exposing paths. */ }
+
+  const result = validateIosConfiguration({ config, autolink, podspecContent, projectRoot, backgroundTaskVersion, backgroundTaskSource });
   for (const label of result.passed) console.log(`OK ${label}`);
   for (const failure of result.failures) console.error(`FAIL ${failure}`);
   if (!result.ok) process.exitCode = 1;

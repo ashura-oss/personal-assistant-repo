@@ -1,11 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
-import { bindPrivacyDeviceCalendarBackend, bindPrivacyNotificationBackend, createPrivacyBoundCredentialStore, createPrivacyBoundOAuthTokenStore } from '../src/privacy/resourceBoundary';
+import { bindPrivacyBackgroundTaskBackend, bindPrivacyDeviceCalendarBackend, bindPrivacyNotificationBackend, createPrivacyBoundCredentialStore, createPrivacyBoundOAuthTokenStore } from '../src/privacy/resourceBoundary';
 import type { PrivacyService } from '../src/privacy/service';
 import type { NotificationBackend } from '../src/services/notificationBackend';
 import type { OAuthTokenStore } from '../src/connectors';
 import type { PrivacyWriterDescriptor, PrivacyWriterLease, PrivacyWriterScope } from '../src/privacy/types';
 import type { DeviceCalendarBackend } from '../src/services/deviceCalendarBackend';
 import type { DeviceEventDispatchRecord } from '../src/deviceCalendars';
+import type { BackgroundTaskBackend } from '../src/background/backend.types';
 
 const session = { epoch: '20000000-0000-4000-8000-000000000001', runtimeId: 'runtime' };
 
@@ -81,6 +82,39 @@ describe('privacy-bound provider and notification resources', () => {
     bound.dispose();
     expect(handler?.({} as never)).toBe(false);
     expect(descriptors.every((item) => item === undefined || (item as { kind: string; namespace: string }).kind === 'notification' && (item as { namespace: string }).namespace === 'notifications')).toBe(true);
+  });
+
+  it('owns background-task status and registration in the notification cleanup namespace', async () => {
+    const { privacy, descriptors } = privacyMock();
+    let finish!: () => void;
+    let registered = false;
+    let active = 0;
+    const unregisterGuard = vi.fn(async () => {});
+    const raw: BackgroundTaskBackend = {
+      async getStatus() { return { platform: 'ios', state: registered ? 'registered' : 'disabled', registered, message: 'Fixed.' }; },
+      async isRegistered() { return registered; },
+      async register() { await new Promise<void>((resolve) => { finish = resolve; }); registered = true; return this.getStatus(); },
+      async unregister(beforeMutation) { await beforeMutation?.(); registered = false; },
+      async addExpirationListener() { return { remove() {} }; },
+    };
+    const originalWithWriter = privacy.withWriter.bind(privacy);
+    vi.spyOn(privacy, 'withWriter').mockImplementation(async <T>(epoch: string, descriptor: PrivacyWriterDescriptor, work: Parameters<typeof privacy.withWriter<T>>[2]) => {
+      active++;
+      try { return await originalWithWriter(epoch, descriptor, work); } finally { active--; }
+    });
+    const bound = bindPrivacyBackgroundTaskBackend(raw, { privacy, session });
+    const registering = bound.backend.register();
+    await vi.waitFor(() => expect(finish).toBeTypeOf('function'));
+    expect(active).toBe(1);
+    finish();
+    await expect(registering).resolves.toMatchObject({ state: 'registered', registered: true });
+    await expect(bound.backend.isRegistered()).resolves.toBe(true);
+    await expect(bound.backend.getStatus()).resolves.toMatchObject({ state: 'registered' });
+    await bound.backend.unregister(unregisterGuard);
+    expect(unregisterGuard).toHaveBeenCalledTimes(1);
+    expect(descriptors).toEqual(Array.from({ length: 4 }, () => ({ kind: 'notification', namespace: 'notifications' })));
+    bound.dispose();
+    await expect(bound.backend.isRegistered()).rejects.toThrow('session has ended');
   });
 
   it('waits for the device-calendar lease before the final create guard and retains it until native create settles', async () => {

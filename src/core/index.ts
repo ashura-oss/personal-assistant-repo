@@ -454,6 +454,10 @@ export interface ActivityItem {
 export interface AppSettings {
   mode: 'preview' | 'provider';
   timezone: string;
+  /** OS background mail refresh is an explicit opt-in and is disabled for legacy snapshots. */
+  backgroundMailRefreshEnabled?: boolean;
+  /** Advances when the user changes background mail-refresh consent. */
+  backgroundRefreshGeneration?: number;
   /** Speech transcription is an explicit, independent provider opt-in. */
   speechEnabled?: boolean;
   speechEndpoint?: string;
@@ -746,7 +750,7 @@ export interface CalendarConfig {
   connected?: boolean;
 }
 
-export type SettingsPatch = Partial<AppSettings>;
+export type SettingsPatch = Partial<Omit<AppSettings, 'backgroundRefreshGeneration'>>;
 
 export interface SavePersonInput {
   id?: string;
@@ -798,6 +802,7 @@ export interface AppController {
   /** Called only after local privacy cleanup is durably complete. */
   disposeForPrivacy?(): Promise<void>;
   load(): Promise<void>;
+  refreshPersistedWorkspace(): Promise<void>;
   getStartupRecoveryStatus(): Promise<StartupRecoveryStatus>;
   prepareStartupRecovery(): Promise<StartupRecoveryPlan>;
   commitStartupRecovery(input: StartupRecoveryCommitInput): Promise<StartupRecoveryReceipt>;

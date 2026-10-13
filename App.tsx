@@ -77,6 +77,8 @@ import { StartupRecoveryScreen } from "./src/ui/StartupRecoveryScreen";
 import { PrivacyCleanupScreen } from "./src/ui/PrivacyCleanupScreen";
 import { PrivacyEraseReview } from "./src/ui/PrivacyEraseReview";
 import { PendingRecordingRecoveryPanel } from "./src/components/PendingRecordingRecoveryPanel";
+import { BackgroundRefreshSection, type BackgroundRefreshActionResult } from "./src/components/BackgroundRefreshSection";
+import type { BackgroundTaskBackend, BackgroundTaskStatus } from "./src/background/backend.types";
 import { TasksSection } from "./src/ui/TasksSection";
 import { IconButton, Button, Field } from "./src/ui/primitives";
 import { C, s } from "./src/ui/theme";
@@ -108,7 +110,8 @@ const isTranscriptionDemo = previewScenario === "transcription";
 const isStartupRecoveryDemo = previewScenario === "startup-recovery";
 const isPrivacyCleanupDemo = previewScenario === "privacy-cleanup";
 const isPendingRecoveryDemo = previewScenario === "pending-recovery";
-const isIsolatedDemo = isDispatchHistoryDemo || isMailSyncDemo || isBackupImportDemo || isKnowledgeDemo || isReminderDemo || isDeviceCalendarsDemo || isTranscriptionDemo || isStartupRecoveryDemo || isPrivacyCleanupDemo || isPendingRecoveryDemo;
+const isBackgroundRefreshDemo = previewScenario === "background-refresh" && Platform.OS === "web";
+const isIsolatedDemo = isDispatchHistoryDemo || isMailSyncDemo || isBackupImportDemo || isKnowledgeDemo || isReminderDemo || isDeviceCalendarsDemo || isTranscriptionDemo || isStartupRecoveryDemo || isPrivacyCleanupDemo || isPendingRecoveryDemo || isBackgroundRefreshDemo;
 
 function useAppState(appController: AppController) {
   return useSyncExternalStore(
@@ -398,6 +401,7 @@ function ProposalCard({
 type WorkspaceBindings = {
   controller: AppController;
   captureJournal?: PendingCaptureJournalPort;
+  backgroundTasks?: BackgroundTaskBackend;
   credentials: ProviderCredentialService;
   audioBoundary?: PrivacyAudioBoundary;
   privacy?: PrivacyService;
@@ -410,6 +414,7 @@ type WorkspaceBindings = {
 type BootstrapState =
   | { kind: "opening" }
   | { kind: "pending_capture_preview" }
+  | { kind: "background_refresh_preview" }
   | { kind: "workspace"; bindings: WorkspaceBindings }
   | { kind: "cleanup"; privacy: PrivacyService; status: PrivacyPublicStatus; reason?: "dedicated_ios_build_required" | "secure_context_and_web_locks_required"; failure?: "storage_unavailable" | "lease_lost" | "verification_incomplete"; samplePreview?: boolean }
   | { kind: "unavailable"; reason: "dedicated_ios_build_required" | "secure_context_and_web_locks_required" | "active_work" | "full_restart_required" | "storage_unavailable"; privacy?: PrivacyService; status?: PrivacyPublicStatus }
@@ -461,6 +466,10 @@ export default function App() {
     void (async () => {
       try {
         if (isIsolatedDemo) {
+          if (isBackgroundRefreshDemo) {
+            if (alive) setBootstrap({ kind: "background_refresh_preview" });
+            return;
+          }
           if (isPendingRecoveryDemo) {
             if (alive) setBootstrap({ kind: "pending_capture_preview" });
             return;
@@ -555,7 +564,7 @@ export default function App() {
         const credentials = credentialModule.createProviderCredentialService(resources.credentialStore(credentialStore));
         const recordingRecovery = await recoveryModule.getRecordingRecoveryService();
         const { createProductionWorkspace } = await import("./src/services/controller");
-        const { controller, captureJournal } = await createProductionWorkspace({
+        const { controller, captureJournal, backgroundTasks } = await createProductionWorkspace({
           privacy,
           session,
           resources,
@@ -565,7 +574,7 @@ export default function App() {
         });
         if (alive) setBootstrap({
           kind: "workspace",
-          bindings: { controller, captureJournal, privacy, session, resources, audioBoundary, credentials, isolated: false },
+          bindings: { controller, captureJournal, backgroundTasks, privacy, session, resources, audioBoundary, credentials, isolated: false },
         });
       } catch {
         if (!alive) return;
@@ -717,6 +726,7 @@ export default function App() {
     <SafeAreaProvider><SafeAreaView style={s.safe}><View style={[s.viewport, { alignItems: "center", justifyContent: "center", gap: 12 }]}><ActivityIndicator color={C.sage} /><Text style={s.accountSub}>Checking local privacy controls…</Text></View></SafeAreaView></SafeAreaProvider>
   );
   if (bootstrap.kind === "pending_capture_preview") return <PendingCapturePreview />;
+  if (bootstrap.kind === "background_refresh_preview") return <BackgroundRefreshPreview />;
   if (bootstrap.kind === "preview_error") return (
     <SafeAreaProvider><SafeAreaView style={s.safe}><View style={s.viewport}><Text style={s.kicker}>ISOLATED PREVIEW</Text><Text style={s.h1}>Sample preview could not load.</Text><Text accessibilityRole="alert" style={s.analysisText}>The sample remained isolated. Reload to try again.</Text><Button label="Reload preview" onPress={() => { if (Platform.OS === "web" && typeof window !== "undefined") window.location.reload(); }} /></View></SafeAreaView></SafeAreaProvider>
   );
@@ -778,10 +788,11 @@ type WorkspaceProps = WorkspaceBindings & {
   onPrivacyInvalidated: () => void;
 };
 
-function Workspace({ controller, captureJournal, credentials, audioBoundary, privacy, session, isolated: isIsolatedDemo, privacyReviewOpen, privacyOutcomeUnknown = false, onPrivacyReview, onPrivacyInvalidated }: WorkspaceProps) {
+function Workspace({ controller, captureJournal, backgroundTasks, credentials, audioBoundary, privacy, session, isolated: isIsolatedDemo, privacyReviewOpen, privacyOutcomeUnknown = false, onPrivacyReview, onPrivacyInvalidated }: WorkspaceProps) {
   const state = useAppState(controller);
   const [tab, setTab] = useState<Tab>(isBackupImportDemo || isKnowledgeDemo || isReminderDemo || isTranscriptionDemo ? "library" : isIsolatedDemo ? "inbox" : "record");
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [backgroundStatusRefreshKey, setBackgroundStatusRefreshKey] = useState(0);
   const [detail, setDetail] = useState<Note | null>(null);
   const [recordingAttachmentNoteId, setRecordingAttachmentNoteId] = useState<string | null>(null);
   const [cancelingTranscriptionId, setCancelingTranscriptionId] = useState<string | undefined>();
@@ -812,6 +823,9 @@ function Workspace({ controller, captureJournal, credentials, audioBoundary, pri
     state.proactive.lastEvaluation?.nextCheckAt,
   );
   const foregroundMailBusy = useRef(false);
+  const foregroundResumeBusy = useRef(false);
+  const reminderReconcileBusy = useRef(false);
+  const initialForegroundRefreshStarted = useRef(false);
   const audio = useAudioCapture(audioBoundary, captureJournal, { ready: startupReady, maxAudioSeconds: state.settings.maxAudioSeconds });
   const refreshAudioPendingRecovery = audio.refreshPendingRecovery;
   const commitAudioCapture = audio.commit;
@@ -1279,6 +1293,23 @@ function Workspace({ controller, captureJournal, credentials, audioBoundary, pri
     },
     [onPrivacyInvalidated, privacyOutcomeUnknown, startupReady],
   );
+  const openSettings = useCallback(() => {
+    if (audio.status === "recording" || audio.status === "paused") {
+      setNotice("Stop the recording before changing background checks.");
+      return;
+    }
+    setBackgroundStatusRefreshKey((value) => value + 1);
+    setSettingsOpen(true);
+  }, [audio.status]);
+  const backgroundActionBlockedReason = audio.status === "recording" || audio.status === "paused"
+    ? "Stop the recording before changing background checks."
+    : pendingCaptureLoading
+      ? "Check the local recording status before changing background checks."
+      : pendingCaptureStatus?.kind === "blocked"
+        ? pendingCaptureStatus.reason === "cleanup_required"
+          ? "Finish pending recording cleanup before changing background checks."
+          : "Check the local recording status before changing background checks."
+      : undefined;
   const openReminder = (record: ReminderRecord) => {
     if (record.origin.kind === "proactive" && record.origin.deviceBinding) {
       const binding = record.origin.deviceBinding;
@@ -1309,9 +1340,24 @@ function Workspace({ controller, captureJournal, credentials, audioBoundary, pri
     if (created) openReminder(created);
   };
 
+  const reconcileReminderAlerts = useCallback(async (duringResume = false) => {
+    if (!startupReady || loading || privacyReviewOpen || isolatedPreviewFailed || (isIsolatedDemo && !isReminderDemo) ||
+        (foregroundResumeBusy.current && !duringResume) || foregroundMailBusy.current || reminderReconcileBusy.current || busyLock.current) return false;
+    reminderReconcileBusy.current = true;
+    try {
+      await controller.reconcileReminderAlerts();
+      return true;
+    } catch {
+      return false;
+    } finally {
+      reminderReconcileBusy.current = false;
+    }
+  }, [controller, isolatedPreviewFailed, isIsolatedDemo, loading, privacyReviewOpen, startupReady]);
+
   useEffect(() => {
     if (!startupReady || loading || privacyReviewOpen || isolatedPreviewFailed || (isIsolatedDemo && !isReminderDemo)) return;
-    const reconcile = () => { void controller.reconcileReminderAlerts().catch(() => undefined); };
+    if (!isIsolatedDemo) return;
+    const reconcile = () => { void reconcileReminderAlerts(); };
     const initial = setTimeout(reconcile, 0);
     let wasActive = NativeAppState.currentState === "active";
     const native = NativeAppState.addEventListener("change", (next) => {
@@ -1331,55 +1377,72 @@ function Workspace({ controller, captureJournal, credentials, audioBoundary, pri
       removeWeb = () => document.removeEventListener("visibilitychange", onVisibility);
     }
     return () => { clearTimeout(initial); native.remove(); removeWeb?.(); };
-  }, [controller, isolatedPreviewFailed, isIsolatedDemo, loading, privacyReviewOpen, startupReady]);
-  const refreshForegroundMail = useCallback(async () => {
-    if (isIsolatedDemo || privacyReviewOpen || !startupReady || loading || foregroundMailBusy.current) return;
+  }, [controller, isolatedPreviewFailed, isIsolatedDemo, loading, privacyReviewOpen, reconcileReminderAlerts, startupReady]);
+
+  const refreshForegroundMail = useCallback(async (duringResume = false) => {
+    if (isIsolatedDemo || privacyReviewOpen || !startupReady || loading || backgroundActionBlockedReason || busyLock.current ||
+        (foregroundResumeBusy.current && !duringResume) || foregroundMailBusy.current || reminderReconcileBusy.current) return false;
     foregroundMailBusy.current = true;
     try {
       await controller.refreshForegroundMail();
+      return true;
     } catch (error) {
       setNotice(messageOf(error));
+      return false;
     } finally {
       foregroundMailBusy.current = false;
     }
-  }, [controller, isIsolatedDemo, loading, privacyReviewOpen, startupReady]);
+  }, [backgroundActionBlockedReason, controller, isIsolatedDemo, loading, privacyReviewOpen, startupReady]);
+
+  const refreshOnForegroundResume = useCallback(async () => {
+    if (isIsolatedDemo || privacyReviewOpen || !startupReady || loading || backgroundActionBlockedReason || busyLock.current ||
+        foregroundResumeBusy.current || foregroundMailBusy.current || reminderReconcileBusy.current) return;
+    foregroundResumeBusy.current = true;
+    try {
+      await controller.refreshPersistedWorkspace();
+      if (privacyReviewOpen || backgroundActionBlockedReason || busyLock.current) return;
+      const reconciled = await reconcileReminderAlerts(true);
+      if (!reconciled) return;
+      if (privacyReviewOpen || backgroundActionBlockedReason || busyLock.current) return;
+      await refreshForegroundMail(true);
+    } catch (error) {
+      if (isPrivacyBootstrapError(error)) onPrivacyInvalidated();
+      else setNotice("Local data could not be refreshed after returning. Open Settings to retry when other work has finished.");
+    } finally {
+      foregroundResumeBusy.current = false;
+    }
+  }, [backgroundActionBlockedReason, controller, isIsolatedDemo, loading, onPrivacyInvalidated, privacyReviewOpen, reconcileReminderAlerts, refreshForegroundMail, startupReady]);
 
   useEffect(() => {
     if (!startupReady || loading || isIsolatedDemo || privacyReviewOpen) return;
-    const initialRefresh = setTimeout(() => {
-      void refreshForegroundMail();
+    const initialRefresh = initialForegroundRefreshStarted.current ? undefined : setTimeout(() => {
+      if (initialForegroundRefreshStarted.current) return;
+      initialForegroundRefreshStarted.current = true;
+      void (async () => {
+        const reconciled = await reconcileReminderAlerts();
+        if (reconciled) await refreshForegroundMail();
+      })();
     }, 0);
-
-    let previousNativeState = NativeAppState.currentState;
-    const nativeSubscription = NativeAppState.addEventListener(
-      "change",
-      (nextState) => {
-        if (previousNativeState !== "active" && nextState === "active") {
-          void refreshForegroundMail();
-        }
-        previousNativeState = nextState;
-      },
-    );
-
-    let removeWebListener: (() => void) | undefined;
     if (Platform.OS === "web" && typeof document !== "undefined") {
       let wasVisible = document.visibilityState === "visible";
       const onVisibilityChange = () => {
         const isVisible = document.visibilityState === "visible";
-        if (!wasVisible && isVisible) void refreshForegroundMail();
+        if (!wasVisible && isVisible) void refreshOnForegroundResume();
         wasVisible = isVisible;
       };
       document.addEventListener("visibilitychange", onVisibilityChange);
-      removeWebListener = () =>
+      return () => {
+        if (initialRefresh !== undefined) clearTimeout(initialRefresh);
         document.removeEventListener("visibilitychange", onVisibilityChange);
+      };
     }
-
-    return () => {
-      clearTimeout(initialRefresh);
-      nativeSubscription.remove();
-      removeWebListener?.();
-    };
-  }, [isIsolatedDemo, loading, privacyReviewOpen, refreshForegroundMail, startupReady]);
+    let previousNativeState = NativeAppState.currentState;
+    const nativeSubscription = NativeAppState.addEventListener("change", (nextState) => {
+      if (previousNativeState !== "active" && nextState === "active") void refreshOnForegroundResume();
+      previousNativeState = nextState;
+    });
+    return () => { if (initialRefresh !== undefined) clearTimeout(initialRefresh); nativeSubscription.remove(); };
+  }, [isIsolatedDemo, loading, privacyReviewOpen, reconcileReminderAlerts, refreshForegroundMail, refreshOnForegroundResume, startupReady]);
   useEffect(() => {
     if (!startupReady || loading || isIsolatedDemo || privacyReviewOpen) return;
     const checkPermission = () => {
@@ -1765,6 +1828,69 @@ function Workspace({ controller, captureJournal, credentials, audioBoundary, pri
     [controller, run],
   );
 
+  const applyBackgroundRefresh = useCallback(async (enabled: boolean) => {
+    if (isIsolatedDemo || !backgroundTasks || backgroundActionBlockedReason) return undefined;
+    return run(async () => {
+      try {
+        await controller.refreshPersistedWorkspace();
+      } catch (error) {
+        if (isPrivacyBootstrapError(error)) throw error;
+        return { error: "refresh" as const };
+      }
+      try {
+        await controller.saveSettings({ backgroundMailRefreshEnabled: enabled });
+      } catch (error) {
+        if (isPrivacyBootstrapError(error)) throw error;
+        return { error: "preference" as const };
+      }
+      try {
+        if (enabled) {
+          const status = await backgroundTasks.register();
+          return { status };
+        }
+        await backgroundTasks.unregister();
+        return { status: await backgroundTasks.getStatus() };
+      } catch (error) {
+        if (isPrivacyBootstrapError(error)) throw error;
+        return { error: "registration" as const };
+      }
+    });
+  }, [backgroundActionBlockedReason, backgroundTasks, controller, isIsolatedDemo, run]);
+
+  const retryBackgroundRefresh = useCallback(async () => {
+    if (isIsolatedDemo || !backgroundTasks || backgroundActionBlockedReason) return undefined;
+    return run(async () => {
+      try {
+        await controller.refreshPersistedWorkspace();
+      } catch (error) {
+        if (isPrivacyBootstrapError(error)) throw error;
+        return { error: "refresh" as const };
+      }
+      try {
+        const desiredEnabled = controller.getSnapshot().settings.backgroundMailRefreshEnabled === true;
+        if (desiredEnabled) {
+          const status = await backgroundTasks.register();
+          return { status };
+        }
+        await backgroundTasks.unregister();
+        return { status: await backgroundTasks.getStatus() };
+      } catch (error) {
+        if (isPrivacyBootstrapError(error)) throw error;
+        return { error: "registration" as const };
+      }
+    });
+  }, [backgroundActionBlockedReason, backgroundTasks, controller, isIsolatedDemo, run]);
+
+  const refreshLocalData = useCallback(() => run(async () => {
+    try {
+      await controller.refreshPersistedWorkspace();
+      return true;
+    } catch (error) {
+      if (isPrivacyBootstrapError(error)) throw error;
+      return false;
+    }
+  }), [controller, run]);
+
   if (isIsolatedDemo && isolatedPreviewFailed) {
     return (
       <SafeAreaProvider>
@@ -1825,7 +1951,7 @@ function Workspace({ controller, captureJournal, credentials, audioBoundary, pri
             <IconButton
               name="settings-outline"
               label="Open settings"
-              onPress={() => setSettingsOpen(true)}
+            onPress={openSettings}
             />
           </View>
           {isIsolatedDemo ? (
@@ -2037,7 +2163,7 @@ function Workspace({ controller, captureJournal, credentials, audioBoundary, pri
                     return;
                   }
                   if (!state.settings.speechEnabled || !state.settings.speechEndpoint) {
-                    setSettingsOpen(true);
+                    openSettings();
                     return;
                   }
                   void run(async () => {
@@ -2082,7 +2208,7 @@ function Workspace({ controller, captureJournal, credentials, audioBoundary, pri
                     setNotice("Speech settings are disabled in this sample preview.");
                     return;
                   }
-                  setSettingsOpen(true);
+                  openSettings();
                 }}
                 onAttachRecording={() =>
                   setRecordingAttachmentNoteId(detail.id)
@@ -2304,6 +2430,13 @@ function Workspace({ controller, captureJournal, credentials, audioBoundary, pri
             <SettingsScreen
               state={state}
               busy={busy}
+              open={settingsOpen && !backgroundActionBlockedReason}
+              backgroundTasks={backgroundTasks}
+              backgroundStatusRefreshKey={backgroundStatusRefreshKey}
+              backgroundActionBlockedReason={backgroundActionBlockedReason}
+              onSetBackgroundRefresh={applyBackgroundRefresh}
+              onRetryBackgroundRefresh={retryBackgroundRefresh}
+              onRefreshLocalData={refreshLocalData}
               onClose={() => setSettingsOpen(false)}
               onSave={(patch) => run(() => controller.saveSettings(patch))}
               onSaveAccount={(c) => run(() => controller.saveAccount(c))}
@@ -2686,6 +2819,88 @@ function PendingCapturePreview() {
             onRetryCleanup={() => void simulate(() => { choose(empty); setNotice("Sample cleanup check completed. No file was removed."); })}
           />
           {notice ? <Text accessibilityLiveRegion="polite" style={s.analysisText}>{notice}</Text> : null}
+        </ScrollView>
+      </SafeAreaView>
+    </SafeAreaProvider>
+  );
+}
+
+function BackgroundRefreshPreview() {
+  type DemoCase = "off" | "registration-failure" | "residual" | "restricted";
+  const [desiredEnabled, setDesiredEnabled] = useState(false);
+  const [refreshKey, setRefreshKey] = useState(0);
+  const caseRef = useRef<DemoCase>("off");
+  const statusRef = useRef<BackgroundTaskStatus>({ platform: "ios", state: "disabled", registered: false, message: "Sample task is not registered." });
+  const failedOnce = useRef(false);
+  const [backend] = useState<BackgroundTaskBackend>(() => ({
+    async getStatus() { return statusRef.current; },
+    async isRegistered() { return statusRef.current.registered; },
+    async register() {
+      if (caseRef.current === "registration-failure" && !failedOnce.current) {
+        failedOnce.current = true;
+        throw new Error("Sample registration failure.");
+      }
+      if (caseRef.current === "restricted") return statusRef.current;
+      statusRef.current = { platform: "ios", state: "registered", registered: true, message: "Sample task is registered; iOS chooses when it runs." };
+      return statusRef.current;
+    },
+    async unregister() {
+      statusRef.current = { platform: "ios", state: "disabled", registered: false, message: "Sample task is not registered." };
+    },
+    async addExpirationListener() { return { remove() {} }; },
+  }));
+  const chooseCase = (next: DemoCase) => {
+    caseRef.current = next;
+    failedOnce.current = false;
+    if (next === "residual") {
+      setDesiredEnabled(false);
+      statusRef.current = { platform: "ios", state: "registered", registered: true, message: "Sample task is still registered." };
+    } else if (next === "restricted") {
+      setDesiredEnabled(true);
+      statusRef.current = { platform: "ios", state: "restricted", registered: false, message: "Sample background execution is restricted." };
+    } else if (next === "registration-failure") {
+      setDesiredEnabled(true);
+      statusRef.current = { platform: "ios", state: "disabled", registered: false, message: "Sample task is not registered." };
+    } else {
+      setDesiredEnabled(false);
+      statusRef.current = { platform: "ios", state: "disabled", registered: false, message: "Sample task is not registered." };
+    }
+    setRefreshKey((value) => value + 1);
+  };
+  const act = async (enabled: boolean, savePreference: boolean): Promise<BackgroundRefreshActionResult> => {
+    if (savePreference) setDesiredEnabled(enabled);
+    try {
+      const status = enabled ? await backend.register() : (await backend.unregister(), await backend.getStatus());
+      return { status };
+    } catch {
+      return { status: await backend.getStatus(), error: "registration" };
+    }
+  };
+  return (
+    <SafeAreaProvider>
+      <SafeAreaView style={s.safe}>
+        <ScrollView contentContainerStyle={s.scroll}>
+          <Text style={s.kicker}>SAMPLE BACKGROUND REFRESH</Text>
+          <Text style={s.h1Small}>In-memory only · simulated task status</Text>
+          <Text style={s.intro}>No app storage, credentials, provider calls, or iOS task registration is used.</Text>
+          <Text style={s.label}>Choose a status to preview</Text>
+          <View style={s.pills}>
+            {(["off", "registration-failure", "residual", "restricted"] as const).map((item) => (
+              <Pressable key={item} accessibilityRole="button" accessibilityLabel={`Show ${item.replaceAll("-", " ")} sample`} onPress={() => chooseCase(item)} style={[s.pill, { minHeight: 44, justifyContent: "center" }]}>
+                <Text style={s.pillText}>{item.replaceAll("-", " ")}</Text>
+              </Pressable>
+            ))}
+          </View>
+          <BackgroundRefreshSection
+            open
+            desiredEnabled={desiredEnabled}
+            backend={backend}
+            busy={false}
+            sampleMode
+            refreshKey={refreshKey}
+            onSetDesired={(enabled) => act(enabled, true)}
+            onRetry={() => act(desiredEnabled, false)}
+          />
         </ScrollView>
       </SafeAreaView>
     </SafeAreaProvider>
@@ -3416,6 +3631,13 @@ function LibraryScreen({
 function SettingsScreen({
   state,
   busy,
+  open,
+  backgroundTasks,
+  backgroundStatusRefreshKey,
+  backgroundActionBlockedReason,
+  onSetBackgroundRefresh,
+  onRetryBackgroundRefresh,
+  onRefreshLocalData,
   demoMode,
   onClose,
   onSave,
@@ -3441,6 +3663,13 @@ function SettingsScreen({
   onRefreshDeviceCalendars,
 }: {
   state: AppState;
+  open: boolean;
+  backgroundTasks?: BackgroundTaskBackend;
+  backgroundStatusRefreshKey: number;
+  backgroundActionBlockedReason?: string;
+  onSetBackgroundRefresh: (enabled: boolean) => Promise<BackgroundRefreshActionResult | undefined>;
+  onRetryBackgroundRefresh: () => Promise<BackgroundRefreshActionResult | undefined>;
+  onRefreshLocalData: () => Promise<boolean | undefined>;
   onClose: () => void;
   busy: boolean;
   demoMode: boolean;
@@ -3504,6 +3733,7 @@ function SettingsScreen({
     String(state.settings.maxOutputTokens),
   );
   const [budget, setBudget] = useState(String(state.settings.monthlyBudgetUsd));
+  const [localRefreshMessage, setLocalRefreshMessage] = useState("");
   const [maxAttempts, setMaxAttempts] = useState(
     String(state.settings.maxAttempts),
   );
@@ -3871,10 +4101,24 @@ function SettingsScreen({
           label="Recorded requests this month"
           value={String(state.usage.requests)}
         />
-        <LimitRow
-          label="Background refresh"
-          value="Foreground only in this preview"
+        <BackgroundRefreshSection
+          open={open}
+          desiredEnabled={state.settings.backgroundMailRefreshEnabled === true}
+          backend={backgroundTasks}
+          refreshKey={backgroundStatusRefreshKey}
+          busy={busy || Boolean(backgroundActionBlockedReason)}
+          blockedReason={backgroundActionBlockedReason}
+          onSetDesired={onSetBackgroundRefresh}
+          onRetry={onRetryBackgroundRefresh}
         />
+        <Button label="Refresh local data" tone="quiet" disabled={demoMode || busy || Boolean(backgroundActionBlockedReason)} onPress={() => {
+          setLocalRefreshMessage("Refreshing local data…");
+          void onRefreshLocalData().then((refreshed) => setLocalRefreshMessage(refreshed
+            ? "Local data refreshed."
+            : "Local data could not be refreshed. Try again when other work has finished."));
+        }} />
+        <Text style={s.disclaimer}>Reloads changes saved while the app was away. It does not check mail; use Inbox for that.</Text>
+        {localRefreshMessage ? <Text accessibilityLiveRegion="polite" style={s.disclaimer}>{localRefreshMessage}</Text> : null}
         <Button
           label="Save limits & retention"
           tone="quiet"

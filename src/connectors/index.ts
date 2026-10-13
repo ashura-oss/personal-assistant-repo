@@ -101,6 +101,12 @@ export class ProviderWriteRejectedError extends ProviderHttpError {
   }
 }
 
+/** Background read policy can skip an expired/rejected access token without refresh or auth mutation. */
+export class ProviderAccessTokenUnavailableError extends Error {
+  readonly code = 'provider_token_unavailable' as const;
+  constructor() { super('Provider access token is unavailable.'); this.name = 'ProviderAccessTokenUnavailableError'; }
+}
+
 class ProviderResponseTooLargeError extends Error {
   constructor() { super('Provider response exceeded the selected-message response bound.'); this.name = 'ProviderResponseTooLargeError'; }
 }
@@ -587,7 +593,7 @@ export class ConnectorClient {
     finally { if (timer) clearTimeout(timer); outerSignal?.removeEventListener('abort', forwardAbort); }
   }
 
-  private async token(account: Account, guard?: RequestGuard, signal?: AbortSignal): Promise<StoredOAuthToken> {
+  private async token(account: Account, guard?: RequestGuard, signal?: AbortSignal, allowRefresh = true): Promise<StoredOAuthToken> {
     this.assertConnectionCurrent(account);
     accountIdentity(account);
     if (account.authStatus !== 'connected') throw new Error('Account requires authentication.');
@@ -595,6 +601,7 @@ export class ConnectorClient {
     if (!token) throw new Error('Account token is missing.');
     assertIdentity(account, token);
     if (token.expiresAt > this.now() + 60_000) return token;
+    if (!allowRefresh) throw new ProviderAccessTokenUnavailableError();
     return this.refreshSingleflight(account, token, guard, false, signal);
   }
 
@@ -672,9 +679,9 @@ export class ConnectorClient {
     if (this.deps.isConnectionCurrent && !this.deps.isConnectionCurrent(account)) throw new Error('Account connection changed during provider work; reconnect before continuing.');
   }
 
-  private async request(account: Account, rawUrl: string, kind: 'mail' | 'calendar', init: RequestInit = {}, retryAuth = true, guard?: RequestGuard, onDispatched?: () => void, signal?: AbortSignal, beforeDispatch?: () => void, responseByteLimit?: number): Promise<Response> {
+  private async request(account: Account, rawUrl: string, kind: 'mail' | 'calendar', init: RequestInit = {}, retryAuth = true, guard?: RequestGuard, onDispatched?: () => void, signal?: AbortSignal, beforeDispatch?: () => void, responseByteLimit?: number, allowTokenRefresh = true): Promise<Response> {
     const url = safeUrl(rawUrl, account.provider, kind);
-    const token = await this.token(account, guard, signal);
+    const token = await this.token(account, guard, signal, allowTokenRefresh);
     this.assertConnectionCurrent(account);
     let response: Response;
     const requestHeaders = account.provider === 'microsoft' && kind === 'mail' ? graphImmutableHeaders(init) : new Headers(init.headers);
@@ -687,6 +694,7 @@ export class ConnectorClient {
       await this.deps.onAuthStatus?.(account.id, 'reauth_required');
       return response;
     }
+    if (!allowTokenRefresh) throw new ProviderAccessTokenUnavailableError();
     if (!token.refreshToken) return this.reauth(account, 'reauth_required', 'Provider rejected the access token.');
     const refreshed = await this.refreshSingleflight(account, token, guard, true, signal);
     return this.requestWithToken(url, refreshed, init, guard, signal, account.provider === 'microsoft' && kind === 'mail');
@@ -723,8 +731,8 @@ export class ConnectorClient {
     return this.boundedFetch(url.toString(), { ...init, redirect: 'error', headers }, guard, undefined, undefined, signal);
   }
 
-  private async json<T>(account: Account, url: string, kind: 'mail' | 'calendar', init?: RequestInit, guard?: RequestGuard, signal?: AbortSignal): Promise<T> {
-    const response = await this.request(account, url, kind, init, true, guard, undefined, signal);
+  private async json<T>(account: Account, url: string, kind: 'mail' | 'calendar', init?: RequestInit, guard?: RequestGuard, signal?: AbortSignal, allowTokenRefresh = true): Promise<T> {
+    const response = await this.request(account, url, kind, init, true, guard, undefined, signal, undefined, undefined, allowTokenRefresh);
     if (!response.ok) throw new ProviderHttpError(response.status);
     try { return await response.json() as T; }
     catch { throw new Error('Provider returned an invalid JSON response.'); }
@@ -733,7 +741,7 @@ export class ConnectorClient {
   /** Reads exactly one hydrated INBOX page for a fixed half-open time window. */
   async syncMessageWindow(account: Account, options: {
     timeMin: string; timeMax: string; cursor?: string; pageSize?: number;
-    guard?: RequestGuard; signal?: AbortSignal; onPage?: MessageWindowPageCallback;
+    guard?: RequestGuard; signal?: AbortSignal; onPage?: MessageWindowPageCallback; allowTokenRefresh?: boolean;
   }): Promise<MessageWindowSyncResult> {
     capability(account, 'mail.read');
     const query = describeMessageWindowQuery(account, options);
@@ -768,7 +776,7 @@ export class ConnectorClient {
     let nextCursor: string | undefined;
     let pageItems: MessageSummary[];
     if (account.provider === 'google') {
-      const page = await this.json<{ messages?: Array<{ id?: string; threadId?: string }>; nextPageToken?: string }>(account, url.toString(), 'mail', undefined, options.guard, options.signal);
+      const page = await this.json<{ messages?: Array<{ id?: string; threadId?: string }>; nextPageToken?: string }>(account, url.toString(), 'mail', undefined, options.guard, options.signal, options.allowTokenRefresh ?? true);
       if (page.messages !== undefined && !Array.isArray(page.messages)) throw new Error('Gmail returned an invalid message page.');
       if ((page.messages?.length ?? 0) > size) throw new Error('Gmail returned more messages than the requested page size; page was not committed.');
       nextCursor = page.nextPageToken
@@ -784,7 +792,7 @@ export class ConnectorClient {
           detailUrl.searchParams.set('format', 'metadata');
           for (const name of ['Subject', 'From', 'Reply-To', 'To', 'Cc', 'Message-ID', 'References', 'In-Reply-To']) detailUrl.searchParams.append('metadataHeaders', name);
           detailUrl.searchParams.set('fields', 'id,threadId,historyId,sizeEstimate,snippet,internalDate,labelIds,payload(headers)');
-          detail = await this.json(account, detailUrl.toString(), 'mail', undefined, options.guard, options.signal);
+          detail = await this.json(account, detailUrl.toString(), 'mail', undefined, options.guard, options.signal, options.allowTokenRefresh ?? true);
         } catch (error) {
           if (error instanceof ProviderHttpError && error.status === 404) { unavailableIds.push(listed.id); continue; }
           throw error;
@@ -820,7 +828,7 @@ export class ConnectorClient {
         replyTo?: Array<{ emailAddress?: { address?: string } }>; toRecipients?: Array<{ emailAddress?: { address?: string } }>;
         ccRecipients?: Array<{ emailAddress?: { address?: string } }>; internetMessageId?: string;
         internetMessageHeaders?: Array<{ name?: string; value?: string }>;
-      }>; '@odata.nextLink'?: string }>(account, url.toString(), 'mail', undefined, options.guard, options.signal);
+      }>; '@odata.nextLink'?: string }>(account, url.toString(), 'mail', undefined, options.guard, options.signal, options.allowTokenRefresh ?? true);
       if (!Array.isArray(page.value)) throw new Error('Microsoft returned an invalid message page.');
       if (page.value.length > size) throw new Error('Microsoft returned more messages than the requested page size; page was not committed.');
       nextCursor = page['@odata.nextLink'];

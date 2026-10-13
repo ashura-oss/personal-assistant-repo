@@ -6,6 +6,7 @@ import { createWebPrivacyEraseAdapter, type WebPrivacyEraseIO } from '../src/pri
 /* eslint-enable import/no-duplicates */
 import { createWebSpeechAudioService, speechStagingMemoryCount } from '../src/audio/speechUpload.web';
 import type { Note } from '../src/core';
+import { MAIL_REFRESH_TASK_NAME } from '../src/background/backend.types';
 import { PrivacyEraseAdapterError, safeRelativeMarkdownPath } from '../src/privacy/eraseAdapter.shared';
 import { createEmptyPrivacyControlState, validatePrivacyControlState } from '../src/privacy/schema';
 import { PRIVACY_NAMESPACES, type PrivacyCleanupTarget, type PrivacyControlState, type PrivacyControlStore, type PrivacyOwner } from '../src/privacy/types';
@@ -52,6 +53,7 @@ function nativeIO(): NativePrivacyEraseIO & { removed: string[] } {
   const files = new Set(['file:///docs/still-export.json', 'file:///docs/memory/PROFILE.md']);
   const secrets = new Set(['speech', 'openai', tokenRef]);
   const removed: string[] = [];
+  let backgroundRegistered = true;
   return {
     removed,
     documentDirectory: 'file:///docs/', cacheDirectory: 'file:///cache/',
@@ -65,6 +67,8 @@ function nativeIO(): NativePrivacyEraseIO & { removed: string[] } {
     async oauthTokenExists(ref) { return secrets.has(ref); },
     async cancelAndDismissNotifications(check) { await check(); removed.push('notifications'); },
     async notificationsRemain() { return false; },
+    async unregisterBackgroundTask(name, check) { await check(); expect(name).toBe(MAIL_REFRESH_TASK_NAME); backgroundRegistered = false; removed.push(`background:${name}`); },
+    async backgroundTaskRegistered(name) { expect(name).toBe(MAIL_REFRESH_TASK_NAME); return backgroundRegistered; },
   };
 }
 
@@ -109,6 +113,16 @@ describe('privacy erase adapter', () => {
     });
     await expect(adapter.erase(target, epoch)).rejects.toBeInstanceOf(PrivacyEraseAdapterError);
     expect(io.removed).toEqual(['credential:speech']);
+  });
+
+  it('erases only the fixed background task and verifies its registration is gone', async () => {
+    const target: PrivacyCleanupTarget = { kind: 'namespace', namespace: 'notifications' };
+    const io = nativeIO();
+    const adapter = createPrivacyEraseAdapter({ controlStore: storeReturning(() => stateFor(target)), getOwner: async () => iosOwner, io });
+    await adapter.erase(target, epoch);
+    expect(io.removed).toContain('notifications');
+    expect(io.removed).toContain(`background:${MAIL_REFRESH_TASK_NAME}`);
+    expect(await adapter.verifyGone(target, epoch)).toBe(true);
   });
 
   it('fails closed for an unimplemented privileged state-database deletion seam', async () => {

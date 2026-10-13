@@ -16,13 +16,19 @@ const podspecContent = `Pod::Spec.new do |s|
   s.dependency 'ExpoModulesCore'
 end
 `;
+const backgroundTaskSource = `
+  @objc func handleTasksExpiredNotification(_ notification: Notification) {
+    self.sendEvent(onTasksExpired, [:])
+  }
+`;
 
 function validFixture() {
   const configuredPlist = {
     NSMicrophoneUsageDescription: 'Microphone access description',
     NSCalendarsUsageDescription: 'Calendar access description',
     NSCalendarsFullAccessUsageDescription: 'Full calendar access description',
-    UIBackgroundModes: [],
+    UIBackgroundModes: ['processing', 'fetch'],
+    BGTaskSchedulerPermittedIdentifiers: ['com.expo.modules.backgroundtask.processing'],
     NSAppTransportSecurity: { NSAllowsArbitraryLoads: false, NSAllowsLocalNetworking: true },
     CFBundleURLTypes: [{ CFBundleURLSchemes: ['still', 'com.still.voiceassistant'] }],
   };
@@ -50,6 +56,8 @@ function validFixture() {
       }],
     },
     podspecContent,
+    backgroundTaskVersion: '57.0.21',
+    backgroundTaskSource,
     projectRoot,
   };
 }
@@ -109,6 +117,43 @@ describe('read-only iOS config validation', () => {
     const finalLight = validFixture();
     finalLight.config._internal.modResults.ios.infoPlist.UIUserInterfaceStyle = 'Light';
     expect(validateIosConfiguration(finalLight).failures).toContain('The final introspected plist is missing dark style or includes an unsupported orientation.');
+  });
+
+  it('requires exactly the unordered SDK TaskManager and BackgroundTask modes', () => {
+    const missingMode = validFixture();
+    missingMode.config._internal.modResults.ios.infoPlist.UIBackgroundModes = ['processing'];
+    expect(validateIosConfiguration(missingMode).failures).toContain('iOS background task configuration must contain only SDK 57 TaskManager fetch and BackgroundTask processing modes plus the Expo scheduler identifier.');
+
+    const duplicateMode = validFixture();
+    duplicateMode.config._internal.modResults.ios.infoPlist.UIBackgroundModes.push('fetch');
+    expect(validateIosConfiguration(duplicateMode).failures).toContain('iOS background task configuration must contain only SDK 57 TaskManager fetch and BackgroundTask processing modes plus the Expo scheduler identifier.');
+
+    const extraMode = validFixture();
+    extraMode.config._internal.modResults.ios.infoPlist.UIBackgroundModes.push('audio');
+    expect(validateIosConfiguration(extraMode).failures).toContain('iOS background task configuration must contain only SDK 57 TaskManager fetch and BackgroundTask processing modes plus the Expo scheduler identifier.');
+
+    const remoteNotification = validFixture();
+    remoteNotification.config._internal.modResults.ios.infoPlist.UIBackgroundModes.push('remote-notification');
+    expect(validateIosConfiguration(remoteNotification).failures).toContain('iOS background task configuration must contain only SDK 57 TaskManager fetch and BackgroundTask processing modes plus the Expo scheduler identifier.');
+
+    const extraIdentifier = validFixture();
+    extraIdentifier.config._internal.modResults.ios.infoPlist.BGTaskSchedulerPermittedIdentifiers.push('unexpected.task');
+    expect(validateIosConfiguration(extraIdentifier).failures).toContain('iOS background task configuration must contain only SDK 57 TaskManager fetch and BackgroundTask processing modes plus the Expo scheduler identifier.');
+  });
+
+  it('rejects an unpatched or version-drifted Expo expiry bridge', () => {
+    const oldGuard = validFixture();
+    oldGuard.backgroundTaskSource = `
+      @objc func handleTasksExpiredNotification(_ notification: Notification) {
+        guard let url = notification.userInfo?["url"] as? URL else { return }
+        self.sendEvent(onTasksExpired, [:])
+      }
+    `;
+    expect(validateIosConfiguration(oldGuard).failures).toContain('The pinned Expo background-task expiry bridge does not match the approved notification contract.');
+
+    const wrongVersion = validFixture();
+    wrongVersion.backgroundTaskVersion = '57.0.22';
+    expect(validateIosConfiguration(wrongVersion).failures).toContain('The pinned Expo background-task expiry bridge does not match the approved notification contract.');
   });
 
   it('rejects a podspec without its required homepage metadata', () => {

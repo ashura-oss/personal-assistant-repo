@@ -1,6 +1,6 @@
 # iOS build handoff
 
-**Status:** The local static iOS configuration gate passed eight checks. No Expo account/project association, Apple signing setup, device registration, EAS build, TestFlight submission, or native installation has been performed. The repository is being edited on Windows; do not treat a JavaScript export as a native build.
+**Status:** The local static iOS configuration gate passed nine checks. No Expo account/project association, Apple signing setup, device registration, EAS build, TestFlight submission, or native installation has been performed. The repository is being edited on Windows; do not treat a JavaScript export as a native build.
 
 ## Local checks on Windows
 
@@ -18,11 +18,11 @@ npm run lint
 
 The gate checked the configured bundle/presentation settings, permission and background-mode configuration, transport policy, URL scheme registration, unique StillPrivacy autolinking, and local podspec metadata. It does not install CocoaPods, compile Swift, sign an app, or prove the native module works. The gate passed; the actual CocoaPods and native build steps remain unrun.
 
-The related checks also passed: `npx expo install --check`, Expo Doctor (21/21 checks), TypeScript, and lint. The full suite passed 633 tests across 61 files on 2026-10-13 at 14:36 SGT; lint had zero errors and 40 existing warnings. These are project and configuration checks, not native compilation evidence.
+The latest project verification snapshot passed 677 tests across 65 files at 16:46:10 SGT on 2026-10-13, TypeScript, lint with zero errors and 40 existing warnings, the nine-check iOS configuration gate, and the `patch-package` postinstall. Expo Doctor (21/21) and dependency alignment also passed in the preceding local setup checks. Phase 24 web export passed with 619 modules across 12 bundles (960 KB entry, 662 KB controller, 117 KB common, 441-byte backend stub); unsigned iOS JavaScript/Hermes export passed with 913 modules and a 4.3 MB bundle. These are project and configuration checks, not native compilation evidence.
 
 ## Custom iOS build requirement
 
-Still requires its local `StillPrivacy` Expo module to obtain the process-stable runtime identity used by full privacy cleanup. Expo Go does not contain this local module and cannot validate that path. A development or distribution build made from this project is required. OAuth redirect changes also require a new native build.
+Still requires its local `StillPrivacy` Expo module to obtain the process-stable runtime identity used by full privacy cleanup. Expo Go does not contain this local module and cannot validate that path. A development or distribution build made from this project is required. OAuth redirect changes also require a new native build. Background mail refresh uses the installed SDK's official config-plugin chain to configure iOS background modes; the app registers its task only after explicit enablement. Static review is not proof of task registration or execution.
 
 The `eas.json` profiles currently mean:
 

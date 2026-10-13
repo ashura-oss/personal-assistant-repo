@@ -71,6 +71,7 @@ import { createPrivacyResourceBoundary, type PrivacyResourceBoundary } from '../
 import { createPrivacyAudioBoundary, createPrivacyBoundRecordingRecoveryService, createPrivacyBoundSpeechAudioService, type PrivacyAudioBoundary } from '../privacy/audioBoundary';
 import { createProviderCredentialService, type ProviderCredentialService } from './credentials';
 import { credentialStore } from '../storage/credentials';
+import type { BackgroundTaskBackend } from '../background/backend.types';
 
 const now = () => new Date().toISOString();
 const ASSIST_CONTRACT_VERSION = 'assist-v3';
@@ -239,7 +240,7 @@ function deepFreeze<T>(value: T): T {
 }
 
 const DEFAULT_SETTINGS: AppSettings = {
-  mode: 'preview', timezone: validTimezone(), speechEnabled: false, maxContextTokens: 6000, maxRequestBytes: 24000, maxOutputTokens: 1200, monthlyBudgetUsd: 5,
+  mode: 'preview', timezone: validTimezone(), speechEnabled: false, backgroundMailRefreshEnabled: false, backgroundRefreshGeneration: 0, maxContextTokens: 6000, maxRequestBytes: 24000, maxOutputTokens: 1200, monthlyBudgetUsd: 5,
   reasoningEffort: 'none', maxAttempts: 2, maxCallsPerDay: 20, maxAudioSeconds: 600, audioRetention: 'keep',
 };
 
@@ -917,7 +918,11 @@ function normalizeLoadedState(value: unknown): NormalizedLoadedState {
       sourceNoteId: candidate.sourceNoteId, sourceRevision: candidate.sourceRevision as number, proposalId: candidate.proposalId });
   }
   const tasks = [...savedTasks, ...migratedTasks.filter((task) => !savedTasks.some((saved) => saved.id === task.id))];
-  const settings = { ...DEFAULT_SETTINGS, ...rawSettings, speechEnabled: rawSettings.speechEnabled === true, timezone: validTimezone(rawSettings.timezone), maxRequestBytes };
+  const backgroundRefreshGenerationValid = Number.isSafeInteger(rawSettings.backgroundRefreshGeneration) && Number(rawSettings.backgroundRefreshGeneration) >= 0;
+  const backgroundRefreshGeneration = backgroundRefreshGenerationValid ? Number(rawSettings.backgroundRefreshGeneration) : 0;
+  const settings = { ...DEFAULT_SETTINGS, ...rawSettings, speechEnabled: rawSettings.speechEnabled === true,
+    backgroundMailRefreshEnabled: rawSettings.backgroundMailRefreshEnabled === true && backgroundRefreshGenerationValid, backgroundRefreshGeneration,
+    timezone: validTimezone(rawSettings.timezone), maxRequestBytes };
   const retainedTranscriptionQuarantine = (value as { transcriptionQuarantine?: unknown }).transcriptionQuarantine;
   const transcriptionQuarantine: unknown[] = Array.isArray(retainedTranscriptionQuarantine)
     ? clone(retainedTranscriptionQuarantine) : retainedTranscriptionQuarantine === undefined ? [] : [retainedTranscriptionQuarantine];
@@ -1064,7 +1069,7 @@ function normalizeLoadedState(value: unknown): NormalizedLoadedState {
 }
 
 export interface ControllerIntegrationDependencies {
-  privacySession?: { epoch: string; assertCurrent(): Promise<void> };
+  privacySession?: { epoch: string; assertCurrent(): Promise<void>; getStatus?(): Promise<import('../privacy/types').PrivacyPublicStatus> };
   credentials?: ProviderCredentialService;
   writeDocument?: (path: string, content: string) => Promise<void>;
   tokenStore?: OAuthTokenStore;
@@ -1083,6 +1088,7 @@ export interface ControllerIntegrationDependencies {
   disposePrivacyResources?: () => void;
   reminderBackend?: NotificationBackend;
   deviceCalendarBackend?: DeviceCalendarBackend;
+  backgroundTasks?: BackgroundTaskBackend;
 }
 
 interface BackupImportSession {
@@ -1844,6 +1850,45 @@ export class AppControllerImpl implements AppController {
         : 'App startup failed. Use the explicit retry or recovery flow before continuing.');
     }
     return this.openStartupData();
+  }
+
+  /** Refreshes the UI cache after a headless worker changed the durable workspace. */
+  async refreshPersistedWorkspace(): Promise<void> {
+    await this.assertPrivacySessionCurrent();
+    if (!this.loaded || this.startupRecoveryPhase !== 'ready') {
+      throw new Error('Workspace refresh is available only after startup is ready.');
+    }
+    const busy = () => Boolean(
+      this.processJobs.size || this.assistJobs.size || this.activeSyncCount || this.syncJobs.size ||
+      this.mailLaneJobs.size || this.foregroundMailJob || this.syncAbortControllers.size ||
+      this.credentialCleanupJob || this.installingTokenRefs.size || this.mailReplyGenerations.size ||
+      this.backupImportSessions.size || this.knowledgeActivationSessions.size ||
+      this.recordingAttachmentSessions.size || this.recordingAttachmentJobs.size ||
+      this.transcriptionJobs.size || this.transcriptionCleanupJob || this.transcriptionCleanupPromises.size ||
+      this.deviceCalendarJob || this.deviceEventJobs.size || this.deviceEventLateResults.size || this.deviceEventCreateTimers.size ||
+      this.reminderJobs.size || this.reminderLegacyJobs.size || this.reminderReconcileJob
+    );
+    if (busy()) throw new Error('The workspace is busy. Try refreshing after current actions finish.');
+    const capturedGeneration = this.bootstrapGeneration;
+    const refresh = this.transactionQueue.then(async () => {
+      await this.assertPrivacySessionCurrent();
+      if (capturedGeneration !== this.bootstrapGeneration || !this.loaded || this.startupRecoveryPhase !== 'ready') {
+        throw new Error('The workspace changed before it could be refreshed. Reopen the app and try again.');
+      }
+      if (busy()) throw new Error('The workspace is busy. Try refreshing after current actions finish.');
+      const privacyStatus = await this.integration.privacySession?.getStatus?.();
+      await this.assertPrivacySessionCurrent();
+      if (privacyStatus && (privacyStatus.phase !== 'ready' || privacyStatus.activeWriterCount !== 0 ||
+          privacyStatus.pendingCleanupCount !== 0 || privacyStatus.failedCleanupCount !== 0)) {
+        throw new Error('Workspace storage is still in use. Try refreshing after current actions finish.');
+      }
+      this.bootstrapGeneration += 1;
+      this.loaded = false;
+      this.loadPromise = undefined;
+      await this.openStartupData();
+    });
+    this.transactionQueue = refresh.then(() => undefined, () => undefined);
+    await refresh;
   }
 
   private async openStartupData(): Promise<void> {
@@ -5299,8 +5344,10 @@ export class AppControllerImpl implements AppController {
   }
 
   async saveSettings(patch: SettingsPatch): Promise<AppSettings> {
+    if ('backgroundRefreshGeneration' in (patch as object)) throw new Error('Background refresh generation is managed by this app.');
     const sanitized: SettingsPatch = { ...patch };
     if ('speechEnabled' in sanitized && typeof sanitized.speechEnabled !== 'boolean') throw new Error('Choose whether cloud transcription is enabled.');
+    if ('backgroundMailRefreshEnabled' in sanitized && typeof sanitized.backgroundMailRefreshEnabled !== 'boolean') throw new Error('Choose whether background mailbox refresh is enabled.');
     if ('speechEndpoint' in sanitized) sanitized.speechEndpoint = sanitized.speechEndpoint ? validateAzureEndpoint(sanitized.speechEndpoint, 'speech') : undefined;
     if ('openAiEndpoint' in sanitized) sanitized.openAiEndpoint = sanitized.openAiEndpoint ? validateAzureEndpoint(sanitized.openAiEndpoint, 'openai') : undefined;
     if (sanitized.model && sanitized.model !== 'gpt-6-luna') throw new Error('This app is configured for GPT-6 Luna only.');
@@ -5320,6 +5367,13 @@ export class AppControllerImpl implements AppController {
     }
     return this.mutate((state) => {
       this.rollUsage(state);
+      const backgroundChanged = 'backgroundMailRefreshEnabled' in sanitized &&
+        sanitized.backgroundMailRefreshEnabled !== (state.settings.backgroundMailRefreshEnabled === true);
+      if (backgroundChanged) {
+        const generation = state.settings.backgroundRefreshGeneration ?? 0;
+        if (!Number.isSafeInteger(generation) || generation < 0 || generation >= Number.MAX_SAFE_INTEGER) throw new Error('Background refresh settings cannot be updated.');
+        state.settings.backgroundRefreshGeneration = generation + 1;
+      }
       Object.assign(state.settings, sanitized);
       this.rollUsage(state);
       addActivity(state, 'local_action', 'Settings saved locally.');
@@ -6919,7 +6973,7 @@ export interface ProductionWorkspaceOptions {
   pendingCaptureNativeIO?: PendingCaptureNativeIO;
 }
 
-export async function createProductionWorkspace(options: ProductionWorkspaceOptions = {}): Promise<{ controller: AppController; captureJournal?: PendingCaptureJournalPort }> {
+export async function createProductionWorkspace(options: ProductionWorkspaceOptions = {}): Promise<{ controller: AppController; backgroundTasks: BackgroundTaskBackend; captureJournal?: PendingCaptureJournalPort }> {
   const privacy = options.privacy ?? options.resources?.privacy ?? await getDefaultPrivacyService();
   if (options.resources && options.resources.privacy !== privacy) throw new Error('Privacy resource boundary belongs to a different control service.');
   const requestedSession = options.session ?? options.resources?.session;
@@ -6965,6 +7019,8 @@ export async function createProductionWorkspace(options: ProductionWorkspaceOpti
   let factoryConnector: ConnectorClient | undefined;
   const boundNotifications = resources.notificationBackend(options.integration?.reminderBackend ?? createNotificationBackend());
   const boundDeviceCalendars = resources.deviceCalendarBackend(options.integration?.deviceCalendarBackend ?? getDeviceCalendarBackend());
+  const rawBackgroundTasks = options.integration?.backgroundTasks ?? (await import('../background/backend')).backgroundTaskBackend;
+  const boundBackgroundTasks = resources.backgroundTaskBackend(rawBackgroundTasks);
   const integration: ControllerIntegrationDependencies = {
     ...defaultIntegration,
     ...options.integration,
@@ -6976,10 +7032,11 @@ export async function createProductionWorkspace(options: ProductionWorkspaceOpti
       : removeAudio(uri)),
     reminderBackend: boundNotifications.backend,
     deviceCalendarBackend: boundDeviceCalendars.backend,
-    disposePrivacyResources: () => { boundNotifications.dispose(); boundDeviceCalendars.dispose(); },
+    disposePrivacyResources: () => { boundNotifications.dispose(); boundDeviceCalendars.dispose(); boundBackgroundTasks.dispose(); },
     privacySession: {
       epoch: session.epoch,
       assertCurrent: () => privacy.assertWorkspaceEpoch(session.epoch),
+      getStatus: () => privacy.getStatus(),
     },
     writeDocument: async (path, content) => {
       await privacy.withWriter(session.epoch, { kind: 'markdown_mirror', namespace: 'markdown_mirrors', legacyMarkdownPath: path }, () => rawWriteDocument(path, content));
@@ -7018,7 +7075,7 @@ export async function createProductionWorkspace(options: ProductionWorkspaceOpti
     openAi: options.providers?.openAi ?? new AzureOpenAIClient(fetch, () => providerCredentials.readProviderCredential('openai'), resources.withProviderOwnership),
   };
   implementation = new AppControllerImpl(boundStore, providers, integration, pendingCaptureController);
-  return { controller: createPrivacyBoundController(implementation, privacy, session), ...(captureJournal ? { captureJournal } : {}) };
+  return { controller: createPrivacyBoundController(implementation, privacy, session), backgroundTasks: boundBackgroundTasks.backend, ...(captureJournal ? { captureJournal } : {}) };
 }
 
 export async function createProductionController(options: ProductionWorkspaceOptions = {}): Promise<AppController> {

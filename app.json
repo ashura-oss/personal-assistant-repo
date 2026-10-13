@@ -15,7 +15,7 @@
           "NSAllowsArbitraryLoads": false,
           "NSAllowsLocalNetworking": true
         },
-        "UIBackgroundModes": []
+        "UIBackgroundModes": ["processing"]
       }
     },
     "android": {
@@ -56,6 +56,7 @@
           "defaultChannel": "reminders"
         }
       ],
+      "expo-background-task",
       "expo-sharing",
       "expo-font",
       "expo-asset",
