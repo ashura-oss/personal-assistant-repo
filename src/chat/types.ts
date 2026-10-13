@@ -16,6 +16,7 @@ export type ChatTurn = Readonly<{
   createdAt: string;
   captureTimeZone: string;
   reply?: ChatReplySnapshot;
+  replySha256?: string;
 }>;
 
 export type ChatConversation = Readonly<{
@@ -42,4 +43,21 @@ export type SelectedChatContext = Readonly<{
   turns: readonly ChatContextTurn[];
   omittedTurnCount: number;
   includedBytes: number;
+}>;
+
+export type ChatTurnDTO = Readonly<{
+  id: string;
+  noteId: string;
+  userText: string;
+  createdAt: string;
+  reply?: Pick<ChatReplySnapshot, 'summary' | 'answer' | 'clarifications' | 'completedAt'>;
+  job?: import('../services/openRouterBatchJobs').AssistantBatchJobDTO;
+}>;
+
+export type ChatConversationDTO = Readonly<{
+  id: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  turns: readonly ChatTurnDTO[];
 }>;

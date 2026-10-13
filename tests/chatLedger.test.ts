@@ -19,7 +19,7 @@ function turn(index: 1 | 2 | 3 | 4, createdSecond: number, reply?: boolean): Cha
     ...(reply ? { reply: {
       summary: `summary ${index}`, answer: `answer ${index}`, clarifications: index === 1 ? ['first clarification'] : [],
       completedAt: at(createdSecond + 1), requestSha256: 'a'.repeat(64), requestProfileVersion: index === 2 ? 2 : 1,
-    } } : {}),
+    }, replySha256: 'b'.repeat(64) } : {}),
   };
   return result;
 }
@@ -58,6 +58,12 @@ describe('chat ledger', () => {
     expect(() => validateChatLedger({ version: 1, conversations: [conversation([turn(1, 3, true), turn(2, 2)])] })).toThrow(/monotonic/i);
     const undefinedReply = { ...turn(1, 1), reply: undefined };
     expect(() => validateChatLedger({ version: 1, conversations: [conversation([undefinedReply])] })).toThrow(/reply/i);
+    const missingReplyDigest = { ...turn(1, 1, true), replySha256: undefined };
+    expect(() => validateChatLedger({ version: 1, conversations: [conversation([missingReplyDigest])] })).toThrow(/digest/i);
+    const digestWithoutReply = { ...turn(1, 1), replySha256: 'b'.repeat(64) };
+    expect(() => validateChatLedger({ version: 1, conversations: [conversation([digestWithoutReply])] })).toThrow(/digest/i);
+    const malformedReplyDigest = { ...turn(1, 1, true), replySha256: `${'b'.repeat(64)}\n` };
+    expect(() => validateChatLedger({ version: 1, conversations: [conversation([malformedReplyDigest])] })).toThrow(/digest/i);
   });
 
   it('accepts both reply profiles and long immutable reply snapshots', () => {
@@ -72,8 +78,8 @@ describe('chat ledger', () => {
   it('allows earlier requests to finish after later turns were created', () => {
     const firstPending = turn(1, 1);
     const secondPending = turn(2, 2);
-    const lateFirst = { ...firstPending, reply: { ...turn(1, 1, true).reply!, completedAt: at(4) } };
-    const laterReply = { ...secondPending, reply: { ...turn(2, 2, true).reply!, completedAt: at(5) } };
+    const lateFirst = { ...firstPending, reply: { ...turn(1, 1, true).reply!, completedAt: at(4) }, replySha256: 'b'.repeat(64) };
+    const laterReply = { ...secondPending, reply: { ...turn(2, 2, true).reply!, completedAt: at(5) }, replySha256: 'b'.repeat(64) };
     const checked = validateChatLedger({ version: 1, conversations: [conversation([lateFirst, laterReply], 6)] });
     expect(checked.conversations[0].turns.map((item) => item.createdAt)).toEqual([at(1), at(2)]);
     expect(checked.conversations[0].turns.map((item) => item.reply?.completedAt)).toEqual([at(4), at(5)]);

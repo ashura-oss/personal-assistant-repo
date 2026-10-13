@@ -23,6 +23,23 @@ export interface OpenRouterBatchAccounting {
   readonly totalTokens?: number;
 }
 
+export interface OpenRouterChatContextReference {
+  readonly turnId: string;
+  readonly jobId: string;
+  readonly noteId: string;
+  readonly noteRevision: number;
+  readonly replySha256: string;
+  readonly replyProfileVersion: 1 | 2;
+}
+
+/** Private binding for the exact ordered history used by one assistant_chat request. */
+export interface OpenRouterChatBinding {
+  readonly conversationId: string;
+  readonly turnId: string;
+  readonly context: readonly OpenRouterChatContextReference[];
+  readonly omittedTurnCount: number;
+}
+
 /** Private persisted job record. Raw request text never enters AppState/public projections. */
 export interface OpenRouterBatchJob {
   readonly id: string;
@@ -55,6 +72,7 @@ export interface OpenRouterBatchJob {
   readonly requestBody?: string;
   readonly sourceVersions?: Readonly<Record<string, string>>;
   readonly appliedNoteRevision?: number;
+  readonly chatBinding?: OpenRouterChatBinding;
 }
 
 export type OpenRouterBatchContentJob = OpenRouterBatchJob & {
@@ -135,11 +153,53 @@ function validAccounting(value: unknown): value is OpenRouterBatchAccounting {
   return true;
 }
 
+function validChatBinding(value: unknown): value is OpenRouterChatBinding {
+  const row = record(value);
+  const plainDataObject = (candidate: Record<string, unknown>) => {
+    const prototype = Object.getPrototypeOf(candidate);
+    return (prototype === Object.prototype || prototype === null) && Reflect.ownKeys(candidate).every((key) => {
+      if (typeof key !== 'string') return false;
+      const descriptor = Object.getOwnPropertyDescriptor(candidate, key);
+      return Boolean(descriptor?.enumerable && Object.prototype.hasOwnProperty.call(descriptor, 'value'));
+    });
+  };
+  if (!row || !plainDataObject(row) || !exactKeys(row, ['conversationId', 'turnId', 'context', 'omittedTurnCount']) ||
+      typeof row.conversationId !== 'string' || row.conversationId.length !== 36 || !UUID_V4.test(row.conversationId) ||
+      typeof row.turnId !== 'string' || row.turnId.length !== 36 || !UUID_V4.test(row.turnId) ||
+      !Number.isSafeInteger(row.omittedTurnCount) || (row.omittedTurnCount as number) < 0 ||
+      !Array.isArray(row.context) || Object.getPrototypeOf(row.context) !== Array.prototype || row.context.length > 5_000) return false;
+  const contextKeys = Reflect.ownKeys(row.context);
+  if (contextKeys.some((key) => key !== 'length' && (typeof key !== 'string' || !/^(0|[1-9]\d*)$/.test(key))) ||
+      contextKeys.filter((key) => key !== 'length').length !== row.context.length ||
+      !Object.prototype.hasOwnProperty.call(Object.getOwnPropertyDescriptor(row.context, 'length') ?? {}, 'value') ||
+      contextKeys.some((key) => {
+        if (key === 'length') return false;
+        const descriptor = Object.getOwnPropertyDescriptor(row.context, key);
+        return !descriptor?.enumerable || !Object.prototype.hasOwnProperty.call(descriptor, 'value');
+      })) return false;
+  const seenTurnIds = new Set<string>();
+  const seenJobIds = new Set<string>();
+  const seenNoteIds = new Set<string>();
+  return row.context.every((candidate) => {
+    const item = record(candidate);
+    if (!item || !plainDataObject(item) || !exactKeys(item, ['turnId', 'jobId', 'noteId', 'noteRevision', 'replySha256', 'replyProfileVersion']) ||
+      typeof item.turnId !== 'string' || item.turnId.length !== 36 || !UUID_V4.test(item.turnId) ||
+      typeof item.jobId !== 'string' || item.jobId.length !== 36 || !UUID_V4.test(item.jobId) ||
+      typeof item.noteId !== 'string' || item.noteId.length !== 36 || !UUID_V4.test(item.noteId) ||
+      Number.isSafeInteger(item.noteRevision) === false || (item.noteRevision as number) <= 0 ||
+      typeof item.replySha256 !== 'string' || item.replySha256.length !== 64 || !SHA256.test(item.replySha256) ||
+      (item.replyProfileVersion !== 1 && item.replyProfileVersion !== 2)) return false;
+    if (seenTurnIds.has(item.turnId) || seenJobIds.has(item.jobId) || seenNoteIds.has(item.noteId)) return false;
+    seenTurnIds.add(item.turnId); seenJobIds.add(item.jobId); seenNoteIds.add(item.noteId);
+    return true;
+  });
+}
+
 function validJob(value: unknown): value is OpenRouterBatchJob {
   const row = record(value);
   const commonRequired = ['id', 'customId', 'kind', 'status', 'createdAt', 'updatedAt', 'model', 'effort', 'requestSha256', 'unknownCharge'];
   const commonOptional = ['batchId', 'accounting', 'failureCode'];
-  if (!row || !exactKeys(row, commonRequired, [...commonOptional, 'sourceRemoved', 'noteId', 'noteRevision', 'intent', 'question', 'knowledgeSelection', 'capturedAt', 'captureTimeZone', 'answeredAsOf', 'settingsFingerprint', 'sourceFingerprint', 'requestProfileVersion', 'requestBytes', 'omittedSourceCount', 'requestBody', 'sourceVersions', 'appliedNoteRevision'])) return false;
+  if (!row || !exactKeys(row, commonRequired, [...commonOptional, 'sourceRemoved', 'noteId', 'noteRevision', 'intent', 'question', 'knowledgeSelection', 'capturedAt', 'captureTimeZone', 'answeredAsOf', 'settingsFingerprint', 'sourceFingerprint', 'requestProfileVersion', 'requestBytes', 'omittedSourceCount', 'requestBody', 'sourceVersions', 'appliedNoteRevision', 'chatBinding'])) return false;
   if (typeof row.id !== 'string' || row.id.length !== 36 || !UUID_V4.test(row.id) || row.customId !== row.id ||
       row.kind !== 'note_assistance' || typeof row.status !== 'string' || !STATUSES.has(row.status) ||
       !canonicalIso(row.createdAt) || !canonicalIso(row.updatedAt) ||
@@ -147,15 +207,16 @@ function validJob(value: unknown): value is OpenRouterBatchJob {
       typeof row.requestSha256 !== 'string' || row.requestSha256.length !== 64 || !SHA256.test(row.requestSha256) || typeof row.unknownCharge !== 'boolean') return false;
   if (row.batchId !== undefined && (typeof row.batchId !== 'string' || row.batchId.length < 1 || row.batchId.length > 256 || /[^A-Za-z0-9_-]/.test(row.batchId))) return false;
   if (row.accounting !== undefined && !validAccounting(row.accounting)) return false;
+  if (row.chatBinding !== undefined && !validChatBinding(row.chatBinding)) return false;
   if (row.failureCode !== undefined && (typeof row.failureCode !== 'string' || !['not_submitted', 'provider_failed', 'expired', 'invalid_result', 'stale_result', 'result_not_retained'].includes(row.failureCode))) return false;
   if ((row.status === 'result_not_retained') !== (row.failureCode === 'result_not_retained')) return false;
   if (row.sourceRemoved === true) {
     return row.status === 'source_removed' && (row.requestProfileVersion === 1 || row.requestProfileVersion === 2) &&
-      exactKeys(row, [...commonRequired, 'sourceRemoved', 'requestProfileVersion'], commonOptional);
+      exactKeys(row, [...commonRequired, 'sourceRemoved', 'requestProfileVersion'], [...commonOptional, 'chatBinding']);
   }
   if (row.sourceRemoved !== undefined || row.status === 'source_removed' || !exactKeys(row,
     [...commonRequired, 'settingsFingerprint', 'sourceFingerprint', 'requestProfileVersion', 'requestBytes', 'omittedSourceCount', 'requestBody', 'sourceVersions'],
-    [...commonOptional, 'noteId', 'noteRevision', 'intent', 'question', 'knowledgeSelection', 'capturedAt', 'captureTimeZone', 'answeredAsOf', 'appliedNoteRevision'])) return false;
+    [...commonOptional, 'noteId', 'noteRevision', 'intent', 'question', 'knowledgeSelection', 'capturedAt', 'captureTimeZone', 'answeredAsOf', 'appliedNoteRevision', 'chatBinding'])) return false;
   if (typeof row.settingsFingerprint !== 'string' || row.settingsFingerprint.length !== 64 || !SHA256.test(row.settingsFingerprint) ||
       typeof row.sourceFingerprint !== 'string' || row.sourceFingerprint.length !== 64 || !SHA256.test(row.sourceFingerprint) ||
       (row.requestProfileVersion !== 1 && row.requestProfileVersion !== 2) ||
@@ -252,12 +313,17 @@ export function isOpenRouterBatchContentJob(job: OpenRouterBatchJob): job is Ope
     typeof job.sourceFingerprint === 'string' && (job.requestProfileVersion === 1 || job.requestProfileVersion === 2) && !!job.sourceVersions;
 }
 
-export function tombstoneOpenRouterBatchJob(job: OpenRouterBatchJob, updatedAt: string): OpenRouterBatchTombstone {
-  if (job.sourceRemoved) return job as OpenRouterBatchTombstone;
+export function tombstoneOpenRouterBatchJob(job: OpenRouterBatchJob, updatedAt: string, stripChatBinding = false): OpenRouterBatchTombstone {
+  if (job.sourceRemoved) {
+    if (!stripChatBinding || !job.chatBinding) return job as OpenRouterBatchTombstone;
+    const { chatBinding: _chatBinding, ...contentFreeReceipt } = job;
+    return Object.freeze(contentFreeReceipt) as OpenRouterBatchTombstone;
+  }
   return Object.freeze({
     id: job.id, customId: job.customId, kind: job.kind, sourceRemoved: true,
     status: 'source_removed', createdAt: job.createdAt, updatedAt,
     model: job.model, effort: job.effort, requestProfileVersion: job.requestProfileVersion ?? 1, requestSha256: job.requestSha256,
+    ...(!stripChatBinding && job.chatBinding ? { chatBinding: job.chatBinding } : {}),
     ...(job.batchId ? { batchId: job.batchId } : {}),
     unknownCharge: job.unknownCharge,
     ...(job.accounting ? { accounting: job.accounting } : {}),

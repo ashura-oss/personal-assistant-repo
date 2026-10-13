@@ -86,6 +86,8 @@ import { PrivacyEraseReview } from "./src/ui/PrivacyEraseReview";
 import { PendingRecordingRecoveryPanel } from "./src/components/PendingRecordingRecoveryPanel";
 import { BackgroundRefreshSection, type BackgroundRefreshActionResult } from "./src/components/BackgroundRefreshSection";
 import { AssistantBatchHistorySection } from "./src/ui/AssistantBatchHistorySection";
+import { ChatSection } from "./src/ui/ChatSection";
+import { runAcceptedChatSubmission } from "./src/ui/chatSubmission";
 import { createSpeechTranscriptionAdmission, runExplicitSpeechTranscriptionAction } from "./src/ui/speechTranscriptionAction";
 import type { AssistantBatchJobDTO } from "./src/services/openRouterBatchJobs";
 import { MailAlertPreview } from "./src/dev/mailAlertPreview";
@@ -110,7 +112,7 @@ import type { PrivacyResourceBoundary } from "./src/privacy/resourceBoundary";
 import type { PrivacyAudioBoundary } from "./src/privacy/audioBoundary";
 import type { PrivacyPublicStatus, PrivacyErasePlan } from "./src/privacy/types";
 
-type Tab = "inbox" | "record" | "library";
+type Tab = "inbox" | "record" | "chat" | "library";
 
 const previewScenario =
   typeof __DEV__ !== "undefined" && __DEV__
@@ -131,7 +133,9 @@ const isMailAlertDemo = previewScenario === "mail-alerts" && Platform.OS === "we
 const isMailAlertTapsDemo = previewScenario === "mail-alert-taps" && Platform.OS === "web";
 const isProactiveRecoveryDemo = previewScenario === "proactive-recovery" && Platform.OS === "web";
 const isOpenRouterBatchDemo = previewScenario === "openrouter-batch" && Platform.OS === "web";
-const isIsolatedDemo = isDispatchHistoryDemo || isMailSyncDemo || isBackupImportDemo || isKnowledgeDemo || isReminderDemo || isDeviceCalendarsDemo || isTranscriptionDemo || isStartupRecoveryDemo || isPrivacyCleanupDemo || isPendingRecoveryDemo || isBackgroundRefreshDemo || isMailAlertDemo || isMailAlertTapsDemo || isProactiveRecoveryDemo || isOpenRouterBatchDemo;
+const isOpenRouterChatDemo = previewScenario === "openrouter-chat" && Platform.OS === "web";
+const isIsolatedDemo = isDispatchHistoryDemo || isMailSyncDemo || isBackupImportDemo || isKnowledgeDemo || isReminderDemo || isDeviceCalendarsDemo || isTranscriptionDemo || isStartupRecoveryDemo || isPrivacyCleanupDemo || isPendingRecoveryDemo || isBackgroundRefreshDemo || isMailAlertDemo || isMailAlertTapsDemo || isProactiveRecoveryDemo || isOpenRouterBatchDemo || isOpenRouterChatDemo;
+const productionChatSubmissionEnabled = true;
 
 type LlmProviderChoice = "azure" | "openrouter";
 
@@ -257,7 +261,7 @@ function knowledgeReferenceOptions(state: AppState) {
     ...state.knowledge.projects.map((entity) => entity.narrativePath),
   ]);
   const references: { reference: KnowledgeReference; label: string }[] = [
-    ...state.notes.map((note) => ({ reference: { kind: 'note' as const, id: note.id }, label: `Note · ${(note.transcript || 'Untitled note').slice(0, 70)}` })),
+    ...state.notes.filter((note) => note.origin !== 'assistant_chat').map((note) => ({ reference: { kind: 'note' as const, id: note.id }, label: `Note · ${(note.transcript || 'Untitled note').slice(0, 70)}` })),
     ...state.tasks.map((task) => ({ reference: { kind: 'task' as const, id: task.id }, label: `Task · ${task.title}` })),
     ...state.documents.filter((document) => !structuredNarrativePaths.has(document.path)).map((document) => ({ reference: { kind: 'document' as const, id: document.path }, label: `Document · ${friendlyDocumentName(document.path)}` })),
     ...state.knowledge.people.filter((person) => !person.archivedAt).map((person) => ({ reference: { kind: 'person' as const, id: person.id }, label: `Person · ${person.name}${person.importOrigin?.kind === 'backup_knowledge' ? ' · Imported copy' : ''}` })),
@@ -302,7 +306,7 @@ function knowledgeReferenceOptions(state: AppState) {
 function knowledgeEvidenceLabels(state: AppState) {
   const labels: Record<string, string> = Object.create(null) as Record<string, string>;
   labels.transcript = 'Saved note transcript';
-  for (const note of state.notes) {
+  for (const note of state.notes.filter((item) => item.origin !== 'assistant_chat')) {
     const label = `Note · ${(note.transcript || 'Untitled note').slice(0, 70)}`;
     labels[note.id] = label;
     labels[`note:${note.id}`] = label;
@@ -489,6 +493,7 @@ type WorkspaceBindings = {
   mailAlertTaps?: MailAlertTapBackend;
   privacyPreview?: boolean;
   batchPreviewMetrics?: () => { postCount: number; getCount: number };
+  chatPreviewMetrics?: () => { postCount: number; getCount: number };
   isolated: boolean;
 };
 
@@ -569,6 +574,12 @@ export default function App() {
             const { createOpenRouterBatchPreview } = await import("./src/dev/openRouterBatchPreview");
             const selected = await createOpenRouterBatchPreview();
             if (alive) setBootstrap({ kind: "workspace", bindings: { controller: selected.controller, credentials: previewCredentialService, batchPreviewMetrics: selected.getMetrics, isolated: true } });
+            return;
+          }
+          if (isOpenRouterChatDemo) {
+            const { createOpenRouterChatPreview } = await import("./src/dev/openRouterBatchPreview");
+            const selected = await createOpenRouterChatPreview();
+            if (alive) setBootstrap({ kind: "workspace", bindings: { controller: selected.controller, credentials: previewCredentialService, chatPreviewMetrics: selected.getMetrics, isolated: true } });
             return;
           }
           if (isBackgroundRefreshDemo) {
@@ -896,9 +907,9 @@ type WorkspaceProps = WorkspaceBindings & {
   onPrivacyInvalidated: () => void;
 };
 
-function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps, credentials, audioBoundary, privacy, session, batchPreviewMetrics, isolated: isIsolatedDemo, privacyReviewOpen, privacyOutcomeUnknown = false, onPrivacyReview, onPrivacyInvalidated }: WorkspaceProps) {
+function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps, credentials, audioBoundary, privacy, session, batchPreviewMetrics, chatPreviewMetrics, isolated: isIsolatedDemo, privacyReviewOpen, privacyOutcomeUnknown = false, onPrivacyReview, onPrivacyInvalidated }: WorkspaceProps) {
   const state = useAppState(controller);
-  const [tab, setTab] = useState<Tab>(isBackupImportDemo || isKnowledgeDemo || isReminderDemo || isTranscriptionDemo ? "library" : isIsolatedDemo ? "inbox" : "record");
+  const [tab, setTab] = useState<Tab>(isOpenRouterChatDemo ? "chat" : isBackupImportDemo || isKnowledgeDemo || isReminderDemo || isTranscriptionDemo ? "library" : isIsolatedDemo ? "inbox" : "record");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [backgroundStatusRefreshKey, setBackgroundStatusRefreshKey] = useState(0);
   const [detail, setDetail] = useState<Note | null>(null);
@@ -936,6 +947,11 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
   const [proactiveRecoveryUnknownId, setProactiveRecoveryUnknownId] = useState<string | undefined>();
   const [proactiveRecoveryRefreshedId, setProactiveRecoveryRefreshedId] = useState<string | undefined>();
   const [proactiveRecoverySheetOpen, setProactiveRecoverySheetOpen] = useState(false);
+  const [selectedChatConversationId, setSelectedChatConversationId] = useState<string | undefined>();
+  const [chatDeleteReviewOpen, setChatDeleteReviewOpen] = useState(false);
+  const [chatInteractionLocked, setChatInteractionLocked] = useState(false);
+  const chatInteractionLock = useRef(false);
+  const [chatActionFilterNoteId, setChatActionFilterNoteId] = useState<string | undefined>();
   const [foregroundResumeRefreshing, setForegroundResumeRefreshing] = useState(false);
   const [foregroundCatchupComplete, setForegroundCatchupComplete] = useState(isIsolatedDemo);
   const reminderReviewRecord = reminderReviewId
@@ -1027,7 +1043,8 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
   const checkedReviewFreshnessKey = useRef("");
   const mailAlertTapOverlaysOpen = settingsOpen || Boolean(detail) || manualOpen || Boolean(review) ||
     Boolean(replyMessageId) || Boolean(reminderReviewId) || Boolean(doc) || Boolean(recordingAttachmentNoteId) ||
-    Boolean(mailAlertTapResolution) || proactiveRecoverySheetOpen || privacyReviewOpen || privacyOutcomeUnknown;
+    Boolean(mailAlertTapResolution) || proactiveRecoverySheetOpen || privacyReviewOpen || privacyOutcomeUnknown ||
+    chatDeleteReviewOpen || chatInteractionLocked;
   const mailAlertTapCaptureBlocked = audio.status !== "idle" || Boolean(captureJournal &&
     (pendingCaptureLoading || pendingCaptureStatus?.kind !== "empty"));
   const mailAlertTapAutoReady = !isIsolatedDemo && !privacyReviewOpen && !privacyOutcomeUnknown &&
@@ -1198,19 +1215,43 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
     }
   }, [controller, refreshStartupRecoveryStatus, startupRecoveryBusy]);
 
-  const notes = [...state.notes].sort((a, b) =>
+  const notes = [...state.notes].filter((note) => note.origin !== "assistant_chat").sort((a, b) =>
     b.createdAt.localeCompare(a.createdAt),
   );
   const filteredNotes = notes.filter((n) =>
     `${n.title} ${n.transcript}`.toLowerCase().includes(query.toLowerCase()),
   );
   const proposals = state.proposals.filter((p) =>
-    inboxFilter === "pending"
+    (!chatActionFilterNoteId || p.noteId === chatActionFilterNoteId) && (inboxFilter === "pending"
       ? ["draft", "approved", "dispatching", "failed"].includes(p.status)
       : ["accepted", "executed", "dismissed", "simulated", "unknown"].includes(
           p.status,
-        ),
+        )),
   );
+  const chatConversations = state.assistantChatConversations ?? [];
+  const selectedChatConversation = chatConversations.find((item) => item.id === selectedChatConversationId);
+  const chatRecoveryMessage = state.assistantChatRecoveryStatus?.message ?? state.assistantBatchRecoveryStatus?.message ??
+    (state.mailAlertRefreshRequired ? "Saved data changed. Refresh local data before continuing." : undefined) ??
+    state.proactiveMailAlertRecoveryStatus?.message ?? state.backupRecoveryStatus?.message ??
+    state.knowledgeRecoveryStatus?.message ?? state.reminderRecoveryStatus?.message ??
+    (captureJournal && pendingCaptureStatus?.kind === "blocked" ? "Recording recovery needs attention before Chat can continue." : undefined);
+  const chatAppBlocked = !startupReady || loading || isolatedPreviewFailed || privacyReviewOpen || privacyOutcomeUnknown ||
+    audio.status !== "idle" || pendingCaptureLoading || Boolean(captureJournal && pendingCaptureStatus?.kind !== "empty") ||
+    foregroundResumeRefreshing || !foregroundCatchupComplete || proactiveRecoverySheetOpen || proactiveRecoveryRequiresRefresh ||
+    Boolean(review || replyMessageId || reminderReviewId || detail || doc || recordingAttachmentNoteId || manualOpen || settingsOpen || mailAlertTapResolution);
+  const chatDisabledReason = isOpenRouterChatDemo
+    ? undefined
+    : !productionChatSubmissionEnabled
+      ? "Chat submission is temporarily disabled while the request path completes its final review. You can still create and read local conversations."
+      : chatRecoveryMessage ?? (chatAppBlocked
+        ? "Finish recovery or close the current review before using Chat."
+        : state.settings.mode !== "provider" || state.settings.llmProvider !== "openrouter"
+          ? "Choose OpenRouter in Provider mode to enable queued chat."
+          : undefined);
+  const chatEnabled = isOpenRouterChatDemo || (productionChatSubmissionEnabled && !isIsolatedDemo && !chatDisabledReason &&
+    !chatAppBlocked && !busy &&
+    !chatDeleteReviewOpen && !state.assistantChatRecoveryStatus && !state.assistantBatchRecoveryStatus && !state.mailAlertRefreshRequired &&
+    state.settings.mode === "provider" && state.settings.llmProvider === "openrouter");
   const activeDetailNote = detail
     ? state.notes.find((note) => note.id === detail.id)
     : undefined;
@@ -1559,6 +1600,63 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
     setBackgroundStatusRefreshKey((value) => value + 1);
     setSettingsOpen(true);
   }, [audio.status]);
+  const chatCreateConversation = useCallback(async () => {
+    if (chatAppBlocked || busy || chatDeleteReviewOpen || Boolean(mailAlertTapResolution)) {
+      setNotice("Chat is unavailable until startup and recovery are ready.");
+      return;
+    }
+    const created = await run(async () => {
+      const conversation = await controller.createChatConversation();
+      setSelectedChatConversationId(conversation.id);
+      setNotice("Conversation created on this device.");
+      return conversation;
+    });
+    if (!created) setNotice("The conversation could not be created yet. Wait for startup or recovery to finish, then try again.");
+  }, [busy, chatAppBlocked, chatDeleteReviewOpen, controller, mailAlertTapResolution, run]);
+  const chatSend = useCallback(async (text: string) => {
+    return runAcceptedChatSubmission(run, async () => {
+      if (!isOpenRouterChatDemo && !productionChatSubmissionEnabled) {
+        throw new Error("Chat submission is temporarily disabled.");
+      }
+      if (!isOpenRouterChatDemo && (state.settings.mode !== "provider" || state.settings.llmProvider !== "openrouter")) {
+        openSettings();
+        throw new Error("Choose OpenRouter in Provider mode before sending a chat message.");
+      }
+      if (!isOpenRouterChatDemo) {
+        const credentialStatus = await credentials.getCredentials();
+        if (credentialStatus.openRouterConfigured !== true) {
+          openSettings();
+          throw new Error("Save an OpenRouter API key in Settings before sending a chat message.");
+        }
+      }
+      if (!selectedChatConversation) throw new Error("Create or select a conversation before sending a message.");
+      const accepted = await controller.submitChatTurn({ conversationId: selectedChatConversation.id, text });
+      if (!accepted || accepted.kind !== "accepted") throw new Error("The chat request was not explicitly accepted.");
+      setNotice(isOpenRouterChatDemo
+        ? "SAMPLE · Simulated message saved. Its request status is shown below. No provider or external service was contacted."
+        : "Message saved. Its request status is shown below.");
+      return accepted;
+    });
+  }, [controller, credentials, openSettings, run, selectedChatConversation, state.settings.llmProvider, state.settings.mode]);
+  const chatDeleteConversation = useCallback(async (conversationId: string) => {
+    const result = await run(async () => {
+      await controller.deleteChatConversation(conversationId);
+      if (selectedChatConversationId === conversationId) setSelectedChatConversationId(undefined);
+      setNotice("Conversation removed from this device. Billing and submission receipts remain.");
+      return true;
+    });
+    if (result !== true) throw new Error("Conversation removal could not be confirmed.");
+    return result;
+  }, [controller, run, selectedChatConversationId]);
+  const setChatInteraction = useCallback((active: boolean) => {
+    chatInteractionLock.current = active;
+    setChatInteractionLocked(active);
+  }, []);
+  const openChatActions = useCallback((noteId: string) => {
+    setChatActionFilterNoteId(noteId);
+    setInboxFilter("pending");
+    setTab("inbox");
+  }, []);
   const backgroundActionBlockedReason = audio.status === "recording" || audio.status === "paused"
     ? "Stop the recording before changing background checks."
     : pendingCaptureLoading
@@ -2322,7 +2420,9 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
           {isIsolatedDemo ? (
             <View style={s.notice}>
               <Text style={s.noticeText}>
-                {isOpenRouterBatchDemo
+                {isOpenRouterChatDemo
+                  ? "Sample OpenRouter Chat · in-memory only · no external access"
+                  : isOpenRouterBatchDemo
                   ? "Sample OpenRouter Batch · in-memory only · no external access"
                   : isDispatchHistoryDemo
                   ? "Sample history · no external actions"
@@ -2345,6 +2445,11 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
               {isOpenRouterBatchDemo && batchPreviewMetrics ? (
                 <Text style={s.noticeText}>
                   Simulated requests: {batchPreviewMetrics().postCount} submissions · {batchPreviewMetrics().getCount} explicit checks
+                </Text>
+              ) : null}
+              {isOpenRouterChatDemo && chatPreviewMetrics ? (
+                <Text style={s.noticeText}>
+                  Simulated chat requests: {chatPreviewMetrics().postCount} submissions · {chatPreviewMetrics().getCount} explicit checks
                 </Text>
               ) : null}
             </View>
@@ -2468,7 +2573,7 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
                 proposals={state.proposals.filter(
                   (p) => p.noteId === detail.id,
                 )}
-                busy={busy}
+                busy={busy || loading || !startupReady}
                 preview={state.settings.mode === "preview"}
                 demoMode={isIsolatedDemo}
                 transcriptionDemoMode={isTranscriptionDemo}
@@ -2696,6 +2801,38 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
                   )
                 }
               />
+            ) : tab === "chat" ? (
+              <ChatSection
+                conversations={chatConversations}
+                selectedConversationId={selectedChatConversationId}
+                turns={selectedChatConversation?.turns ?? []}
+                busy={busy}
+                enabled={chatEnabled}
+                reviewBlocked={chatAppBlocked || Boolean(mailAlertTapResolution)}
+                disabledReason={chatDisabledReason}
+                recoveryMessage={chatRecoveryMessage}
+                samplePreview={isOpenRouterChatDemo}
+                onDeleteReviewChange={(open) => {
+                  setChatDeleteReviewOpen(open);
+                  setChatInteraction(open);
+                }}
+                onInteractionLockChange={setChatInteraction}
+                onSelectConversation={setSelectedChatConversationId}
+                onDeleteConversation={chatDeleteConversation}
+                onCreateConversation={chatCreateConversation}
+                onSend={chatSend}
+                onOpenActions={openChatActions}
+                onCheckJob={(jobId) => run(async () => {
+                  const updated = await controller.refreshAssistantBatch(jobId);
+                  setNotice(isOpenRouterChatDemo
+                    ? "SAMPLE · Simulated request status checked."
+                    : updated.status === "completed"
+                      ? "A validated reply is saved in this conversation."
+                      : "Request status checked.");
+                  return updated;
+                })}
+                onRetryJobCleanup={(jobId) => controller.retryAssistantBatchCleanup(jobId)}
+              />
             ) : tab === "record" ? (
               <RecordScreen
                 audio={audio}
@@ -2729,7 +2866,14 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
                 onCancel={confirmCancel}
               />
             ) : tab === "inbox" ? (
-              <InboxScreen
+              <>
+                {chatActionFilterNoteId ? (
+                  <View style={{ paddingHorizontal: 16, paddingTop: 8, gap: 8 }}>
+                    <Text style={s.sectionTitle}>Suggested actions from this chat turn</Text>
+                    <Button label="View all actions" tone="quiet" onPress={() => setChatActionFilterNoteId(undefined)} />
+                  </View>
+                ) : null}
+                <InboxScreen
                 proposals={proposals}
                 accounts={state.accounts}
                 mailbox={state.mailbox}
@@ -2761,7 +2905,8 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
                 onGetCandidateSource={(candidateId) =>
                   controller.getProactiveCandidateSource(candidateId)
                 }
-              />
+                />
+              </>
             ) : (
               <LibraryScreen
                 notes={filteredNotes}
@@ -2845,15 +2990,19 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
               />
             )}
           </View>
-          {!detail && !manualOpen && !settingsOpen && (
+          {!detail && !manualOpen && !settingsOpen && !chatInteractionLocked && (
             <View style={s.tabBar} accessibilityRole="tablist">
-              {(["inbox", "record", "library"] as Tab[]).map((item) => (
+              {(["inbox", "record", "chat", "library"] as Tab[]).map((item) => (
                 <Pressable
                   key={item}
                   accessibilityRole="tab"
                   accessibilityLabel={`${item[0].toUpperCase() + item.slice(1)} tab`}
                   accessibilityState={{ selected: tab === item }}
-                  onPress={() => setTab(item)}
+                  disabled={busy || chatInteractionLocked || chatDeleteReviewOpen}
+                  onPress={() => {
+                    if (busyLock.current || chatInteractionLock.current || chatDeleteReviewOpen) return;
+                    setTab(item);
+                  }}
                   style={s.tab}
                 >
                   <Ionicons
@@ -2864,7 +3013,9 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
                         ? "file-tray-outline"
                         : item === "record"
                           ? "mic-outline"
-                          : "book-outline"
+                          : item === "chat"
+                            ? "chatbubble-outline"
+                            : "book-outline"
                     }
                     size={19}
                     color={tab === item ? C.text : C.muted}
@@ -3070,10 +3221,12 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
                       )
                     : undefined;
                   setReview(null);
-                  if (sourceNote) openNote(sourceNote);
-                  setNotice(
-                    "Run Assist again on this note to rebuild current suggestions.",
-                  );
+                  if (sourceNote?.origin === "assistant_chat") {
+                    setNotice("This suggestion came from a chat request. Start a new chat message to ask for a revision.");
+                  } else {
+                    if (sourceNote) openNote(sourceNote);
+                    setNotice("Run Assist again on this note to rebuild current suggestions.");
+                  }
                 }}
                 onRetrySourceCheck={() => {
                   checkedReviewFreshnessKey.current = "";
@@ -3121,7 +3274,7 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
           controller={controller}
           busy={busy}
           demoMode={isMailSyncDemo}
-          notes={state.notes}
+          notes={notes}
           documents={state.documents}
           onClose={() => setReplyMessageId(null)}
           onSave={saveMailReply}

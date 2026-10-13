@@ -1,29 +1,14 @@
-import React, { useRef, useState } from 'react';
-import { KeyboardAvoidingView, Platform, Pressable, ScrollView, Text, TextInput, View } from 'react-native';
-import type { AssistantBatchJobDTO } from '../services/openRouterBatchJobs';
+import React, { useEffect, useRef, useState } from 'react';
+import { KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView, Text, TextInput, View } from 'react-native';
+import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
+import type { ChatConversationDTO, ChatTurnDTO } from '../chat/types';
 import { AssistantBatchJobCard } from './AssistantBatchJobCard';
 import { Button } from './primitives';
+import { isAcceptedChatSubmission } from './chatSubmission';
 import { C, s } from './theme';
 
-export type ChatConversation = Readonly<{
-  id: string;
-  title: string;
-  createdAt: string;
-}>;
-
-export type ChatTurn = Readonly<{
-  id: string;
-  userText: string;
-  createdAt: string;
-  reply?: Readonly<{
-    summary?: string;
-    answer?: string;
-    clarifications?: readonly string[];
-    completedAt: string;
-  }>;
-  job?: AssistantBatchJobDTO;
-  noteId?: string;
-}>;
+export type ChatConversation = ChatConversationDTO;
+export type ChatTurn = ChatTurnDTO;
 
 export type ChatSectionProps = {
   conversations: readonly ChatConversation[];
@@ -31,7 +16,12 @@ export type ChatSectionProps = {
   turns: readonly ChatTurn[];
   busy: boolean;
   enabled: boolean;
+  reviewBlocked?: boolean;
   recoveryMessage?: string;
+  disabledReason?: string;
+  samplePreview?: boolean;
+  onDeleteReviewChange?: (open: boolean) => void;
+  onInteractionLockChange?: (active: boolean) => void;
   onSelectConversation: (conversationId: string) => void;
   onDeleteConversation?: (conversationId: string) => Promise<unknown> | unknown;
   onCreateConversation: () => void;
@@ -107,7 +97,12 @@ export function ChatSection({
   turns,
   busy,
   enabled,
+  reviewBlocked = false,
   recoveryMessage,
+  disabledReason,
+  samplePreview = false,
+  onDeleteReviewChange,
+  onInteractionLockChange,
   onSelectConversation,
   onDeleteConversation,
   onCreateConversation,
@@ -120,40 +115,129 @@ export function ChatSection({
   const [sending, setSending] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [sendError, setSendError] = useState<string>();
+  const [deleteReviewOpen, setDeleteReviewOpen] = useState(false);
+  const [deleteReviewConversationId, setDeleteReviewConversationId] = useState<string>();
   const sendLock = useRef(false);
   const deleteLock = useRef(false);
+  const deleteOperationLock = useRef(false);
+  const deleteReviewOpenRef = useRef(false);
+  const interactionLock = useRef(false);
+  const callbacks = useRef({ onDeleteReviewChange, onInteractionLockChange });
   const trimmedDraft = draft.trim();
-  const navigationBlocked = busy || sending || deleting || Boolean(recoveryMessage);
+  const navigationBlocked = busy || sending || deleting || deleteReviewOpen || reviewBlocked || Boolean(recoveryMessage);
   const selectedConversation = conversations.find((conversation) => conversation.id === selectedConversationId);
 
+  const notifyReview = (open: boolean) => callbacks.current.onDeleteReviewChange?.(open);
+  const notifyInteractionLock = (active: boolean) => {
+    if (interactionLock.current === active) return;
+    interactionLock.current = active;
+    callbacks.current.onInteractionLockChange?.(active);
+  };
+
+  useEffect(() => {
+    callbacks.current = { onDeleteReviewChange, onInteractionLockChange };
+  }, [onDeleteReviewChange, onInteractionLockChange]);
+
+  useEffect(() => {
+    if (!deleteReviewOpen) return;
+    const reviewConversationStillExists = deleteReviewConversationId &&
+      conversations.some((conversation) => conversation.id === deleteReviewConversationId);
+    if (!reviewConversationStillExists || selectedConversationId !== deleteReviewConversationId || recoveryMessage || reviewBlocked) {
+      let active = true;
+      const reviewedId = deleteReviewConversationId;
+      void Promise.resolve().then(() => {
+        if (!active || !deleteReviewOpenRef.current || deleteReviewConversationId !== reviewedId) return;
+        deleteReviewOpenRef.current = false;
+        setDeleteReviewOpen(false);
+        setDeleteReviewConversationId(undefined);
+        notifyReview(false);
+        if (!deleting) {
+          deleteLock.current = false;
+          notifyInteractionLock(false);
+        }
+      });
+      return () => { active = false; };
+    }
+  }, [conversations, deleteReviewConversationId, deleteReviewOpen, deleting, recoveryMessage, reviewBlocked, selectedConversationId]);
+
+  useEffect(() => () => {
+    deleteReviewOpenRef.current = false;
+    callbacks.current.onDeleteReviewChange?.(false);
+    if (interactionLock.current) {
+      interactionLock.current = false;
+      callbacks.current.onInteractionLockChange?.(false);
+    }
+  }, []);
+
   const send = async () => {
-    if (!enabled || busy || Boolean(recoveryMessage) || sendLock.current || deleteLock.current || !trimmedDraft) return;
+    if (!enabled || !selectedConversation || busy || reviewBlocked || Boolean(recoveryMessage) || sendLock.current || deleteLock.current || !trimmedDraft) return;
     sendLock.current = true;
     setSending(true);
+    notifyInteractionLock(true);
     setSendError(undefined);
     try {
-      await onSend(trimmedDraft);
+      const result = await onSend(trimmedDraft);
+      if (!isAcceptedChatSubmission(result) || result.conversationId !== selectedConversation.id) {
+        throw new Error('Submission was not explicitly accepted.');
+      }
       setDraft('');
     } catch {
       setSendError('Could not confirm submission. Check saved messages and request status before sending again. Your draft is still here.');
     } finally {
       setSending(false);
       sendLock.current = false;
+      notifyInteractionLock(false);
     }
   };
 
-  const deleteSelectedConversation = async () => {
-    if (!selectedConversation || !onDeleteConversation || busy || Boolean(recoveryMessage) || sendLock.current || deleteLock.current) return;
+  const openDeleteReview = () => {
+    if (!selectedConversation || !onDeleteConversation || busy || reviewBlocked || Boolean(recoveryMessage) || sendLock.current || deleteLock.current) return;
     deleteLock.current = true;
+    deleteReviewOpenRef.current = true;
+    setDeleteReviewConversationId(selectedConversation.id);
+    setDeleteReviewOpen(true);
+    notifyReview(true);
+    notifyInteractionLock(true);
+  };
+
+  const closeDeleteReview = () => {
+    if (!deleteReviewOpenRef.current || deleting) return;
+    deleteReviewOpenRef.current = false;
+    deleteLock.current = false;
+    setDeleteReviewOpen(false);
+    setDeleteReviewConversationId(undefined);
+    notifyReview(false);
+    notifyInteractionLock(false);
+  };
+
+  const confirmDeleteSelectedConversation = async () => {
+    const reviewConversation = conversations.find((conversation) => conversation.id === deleteReviewConversationId);
+    if (!reviewConversation || selectedConversationId !== deleteReviewConversationId || !onDeleteConversation || busy || reviewBlocked || Boolean(recoveryMessage) || sendLock.current || deleting || deleteOperationLock.current || !deleteLock.current || !deleteReviewOpenRef.current) return;
+    deleteLock.current = true;
+    deleteOperationLock.current = true;
     setDeleting(true);
     setSendError(undefined);
+    let deleted = false;
     try {
-      await onDeleteConversation(selectedConversation.id);
+      await onDeleteConversation(reviewConversation.id);
+      deleted = true;
+      deleteReviewOpenRef.current = false;
+      setDeleteReviewOpen(false);
+      setDeleteReviewConversationId(undefined);
+      notifyReview(false);
     } catch {
       setSendError('Could not confirm conversation removal. Check saved messages and request status.');
     } finally {
-      deleteLock.current = false;
+      deleteOperationLock.current = false;
       setDeleting(false);
+      if (deleted || !deleteReviewOpenRef.current) {
+        deleteLock.current = false;
+        notifyInteractionLock(false);
+      } else {
+        // A failed removal keeps the review actionable for an explicit retry or Cancel.
+        deleteLock.current = true;
+        notifyInteractionLock(true);
+      }
     }
   };
 
@@ -169,7 +253,8 @@ export function ChatSection({
           <Button label="New conversation" tone="quiet" disabled={navigationBlocked} onPress={() => { if (!busy && !sending && !deleting && !recoveryMessage && !sendLock.current && !deleteLock.current) onCreateConversation(); }} />
         </View>
 
-        {!enabled ? <Text style={styles.notice}>Enable OpenRouter analysis in Settings to send a message.</Text> : null}
+        {samplePreview ? <Text style={styles.sampleBadge}>SAMPLE · Simulated Batch requests and replies. No provider or external service is contacted.</Text> : null}
+        {!enabled && disabledReason ? <Text style={styles.notice}>{disabledReason}</Text> : null}
         {recoveryMessage ? <Text accessibilityRole="alert" style={styles.warning}>{recoveryMessage}</Text> : null}
 
         {conversations.length ? (
@@ -189,12 +274,13 @@ export function ChatSection({
         ) : (
           <Text style={styles.notice}>Start a conversation with a question or request.</Text>
         )}
+        {selectedConversation ? null : conversations.length ? <Text style={styles.notice}>Select a conversation to continue, or create a new one.</Text> : null}
         {selectedConversation && onDeleteConversation ? (
           <Button
             label={deleting ? 'Deleting conversation…' : 'Delete conversation'}
             tone="quiet"
-            disabled={busy || sending || deleting || Boolean(recoveryMessage)}
-            onPress={() => { void deleteSelectedConversation(); }}
+            disabled={busy || sending || deleting || deleteReviewOpen || Boolean(recoveryMessage)}
+            onPress={openDeleteReview}
           />
         ) : null}
 
@@ -246,24 +332,37 @@ export function ChatSection({
           <Text style={styles.composerLabel}>Message</Text>
           <TextInput
             accessibilityLabel="Chat message"
-            accessibilityHint="Write a message, then choose Send Batch request."
+            accessibilityHint="Write a message, then choose Send."
             value={draft}
             onChangeText={(value) => { setDraft(value); setSendError(undefined); }}
             placeholder="Ask a question or describe what you need…"
             placeholderTextColor={C.muted}
             multiline
-            editable={!busy && !sending && !deleting && !recoveryMessage}
+            editable={!busy && !sending && !deleting && !deleteReviewOpen && !reviewBlocked && !recoveryMessage}
             textAlignVertical="top"
             style={styles.input}
           />
           {sendError ? <Text accessibilityRole="alert" style={styles.warning}>{sendError}</Text> : null}
           <Button
-            label={sending ? 'Submitting…' : 'Send Batch request'}
-            disabled={!enabled || busy || sending || deleting || Boolean(recoveryMessage) || !trimmedDraft}
+            label={sending ? 'Submitting…' : 'Send'}
+            disabled={!enabled || !selectedConversation || busy || sending || deleting || deleteReviewOpen || reviewBlocked || Boolean(recoveryMessage) || !trimmedDraft}
             onPress={() => { void send(); }}
           />
         </View>
       </ScrollView>
+      <Modal visible={deleteReviewOpen} transparent animationType="fade" onRequestClose={closeDeleteReview}>
+        <SafeAreaProvider>
+          <SafeAreaView style={styles.reviewSafe}>
+            <View style={styles.reviewCard}>
+              <Text style={styles.reviewTitle}>Delete this conversation?</Text>
+              <Text style={styles.reviewCopy}>This removes its messages and local request content. Small billing and submission receipts remain. OpenRouter may retain requests already submitted to its service.</Text>
+              {sendError ? <Text accessibilityRole="alert" style={styles.warning}>{sendError}</Text> : null}
+              <Button label={deleting ? 'Deleting…' : 'Delete conversation'} tone="danger" disabled={deleting || busy || reviewBlocked || Boolean(recoveryMessage) || selectedConversationId !== deleteReviewConversationId} onPress={() => { void confirmDeleteSelectedConversation(); }} />
+              <Button label="Cancel" tone="quiet" disabled={deleting} onPress={closeDeleteReview} />
+            </View>
+          </SafeAreaView>
+        </SafeAreaProvider>
+      </Modal>
     </KeyboardAvoidingView>
   );
 }
@@ -291,4 +390,9 @@ const styles = {
   composer: { padding: 13, gap: 9, borderWidth: 1, borderColor: C.border, borderRadius: 17, backgroundColor: C.card },
   composerLabel: { color: C.text, fontSize: 13, fontWeight: '600' as const },
   input: { minHeight: 96, maxHeight: 220, padding: 12, borderWidth: 1, borderColor: C.border, borderRadius: 12, color: C.text, backgroundColor: C.input, fontSize: 15, lineHeight: 22 },
+  sampleBadge: { color: C.sage, backgroundColor: C.card, borderColor: C.sage, borderWidth: 1, borderRadius: 12, padding: 12, fontSize: 12, lineHeight: 18, fontWeight: '700' as const },
+  reviewSafe: { flex: 1, justifyContent: 'center' as const, padding: 20, backgroundColor: 'rgba(0,0,0,0.72)' },
+  reviewCard: { width: '100%' as const, maxWidth: 460, alignSelf: 'center' as const, gap: 14, padding: 20, borderRadius: 18, borderWidth: 1, borderColor: C.border, backgroundColor: C.card },
+  reviewTitle: { color: C.text, fontSize: 20, fontWeight: '700' as const },
+  reviewCopy: { color: C.muted, fontSize: 14, lineHeight: 21 },
 };

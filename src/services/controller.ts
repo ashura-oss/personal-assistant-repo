@@ -96,10 +96,13 @@ import {
 } from './openRouter';
 import { OpenRouterSpeechClient } from './openRouterSpeech';
 import { OpenRouterSpeechAdapter } from './openRouterSpeechAdapter';
+import { emptyChatLedger, selectCompletedChatContext, validateChatLedger } from '../chat/ledger';
+import type { ChatConversation, ChatConversationDTO, ChatReplySnapshot, ReadonlyChatLedger } from '../chat/types';
 import {
   emptyOpenRouterBatchLedger, validateOpenRouterBatchLedger, assistantBatchJobDTO, accountingFromInspection,
   isOpenRouterBatchContentJob, tombstoneOpenRouterBatchJob,
-  type AssistantBatchJobDTO, type OpenRouterBatchJob, type OpenRouterBatchLedger, type OpenRouterBatchAccounting,
+  type AssistantBatchJobDTO, type OpenRouterBatchJob, type OpenRouterBatchContentJob, type OpenRouterBatchLedger, type OpenRouterBatchAccounting,
+  type OpenRouterChatBinding,
 } from './openRouterBatchJobs';
 
 const now = () => new Date().toISOString();
@@ -604,7 +607,7 @@ function assistContext(state: AppState, note: Note, intent: AssistIntent, questi
     query: `${question ?? ''}\n${note.transcript}`,
     intent,
     documents: allDocuments.map((doc) => ({ path: doc.path, revision: doc.revision, content: doc.content, updatedAt: doc.updatedAt, selectionPriority: linkedDocumentPaths.has(doc.path) ? 1 as const : 0 as const })),
-    notes: state.notes.filter((item) => linkedNoteIds.has(item.id) && item.id !== note.id).map((item) => ({ id: item.id, title: item.title, revision: item.revision, transcript: item.transcript, updatedAt: item.capturedAt ?? item.createdAt, selectionPriority: 1 as const })),
+    notes: state.notes.filter((item) => item.origin !== 'assistant_chat' && linkedNoteIds.has(item.id) && item.id !== note.id).map((item) => ({ id: item.id, title: item.title, revision: item.revision, transcript: item.transcript, updatedAt: item.capturedAt ?? item.createdAt, selectionPriority: 1 as const })),
     knowledge: knowledgeSources,
     tasks: taskQuery || linkedTaskIds.size ? state.tasks.filter((task) => taskQuery || linkedTaskIds.has(task.id)).map((task) => ({ id: task.id, title: task.title, body: task.body, status: task.status, dueAt: task.dueAt, updatedAt: task.completedAt ?? task.createdAt, selectionPriority: (linkedTaskIds.has(task.id) ? 1 : 0) as 0 | 1 })) : [],
     calendars: state.calendars.flatMap((calendar) => {
@@ -1307,9 +1310,14 @@ export class AppControllerImpl implements AppController {
   private assistantBatchLedgerHasRaw = false;
   private assistantBatchLedger = emptyOpenRouterBatchLedger();
   private assistantBatchLedgerMalformed = false;
+  private assistantChatLedgerRaw?: unknown;
+  private assistantChatLedgerHasRaw = false;
+  private assistantChatLedger: ReadonlyChatLedger = emptyChatLedger();
+  private assistantChatLedgerMalformed = false;
   private assistantBatchCleanupRetries = new Map<string, () => Promise<void>>();
   private activeBatchNoteOperations = new Set<string>();
   private activeBatchJobInspections = new Set<string>();
+  private activeChatConversationSubmissions = new Set<string>();
   private proactiveRecoveryPlan?: {
     readonly publicPlan: ProactiveRecoveryPlan;
     readonly preparedAtMs: number;
@@ -1435,9 +1443,14 @@ export class AppControllerImpl implements AppController {
     this.assistantBatchLedgerHasRaw = false;
     this.assistantBatchLedger = emptyOpenRouterBatchLedger();
     this.assistantBatchLedgerMalformed = false;
+    this.assistantChatLedgerRaw = undefined;
+    this.assistantChatLedgerHasRaw = false;
+    this.assistantChatLedger = emptyChatLedger();
+    this.assistantChatLedgerMalformed = false;
     this.assistantBatchCleanupRetries.clear();
     this.activeBatchNoteOperations.clear();
     this.activeBatchJobInspections.clear();
+    this.activeChatConversationSubmissions.clear();
     this.proactiveRecoveryInspectionOperationId = undefined;
     this.proactiveRecoveryExpectedReceipt = undefined;
     this.proactiveRecoveryReceiptReadAfterRefresh = false;
@@ -1999,14 +2012,19 @@ export class AppControllerImpl implements AppController {
     return this.persistedStateWithBatchLedger(state);
   }
 
-  private persistedStateWithBatchLedger(state: AppState, batchLedger?: OpenRouterBatchLedger): AppState {
-    const result = { ...state } as AppState & { dispatchRecordQuarantine?: DispatchRecordQuarantineEntry[]; proactiveQuarantine?: unknown; proactiveRecoveryArchives?: unknown; proactiveMailAlertQuarantine?: unknown[]; backupImportQuarantine?: unknown[]; knowledgeQuarantine?: unknown[]; reminderQuarantine?: unknown[]; deviceCalendarQuarantine?: unknown[]; transcriptionQuarantine?: unknown[]; openRouterBatchLedger?: unknown; assistantBatchJobs?: unknown; assistantBatchRecoveryStatus?: unknown };
+  private persistedStateWithBatchLedger(state: AppState, batchLedger?: OpenRouterBatchLedger, chatLedger?: ReadonlyChatLedger): AppState {
+    const result = { ...state } as AppState & { dispatchRecordQuarantine?: DispatchRecordQuarantineEntry[]; proactiveQuarantine?: unknown; proactiveRecoveryArchives?: unknown; proactiveMailAlertQuarantine?: unknown[]; backupImportQuarantine?: unknown[]; knowledgeQuarantine?: unknown[]; reminderQuarantine?: unknown[]; deviceCalendarQuarantine?: unknown[]; transcriptionQuarantine?: unknown[]; openRouterBatchLedger?: unknown; assistantChatLedger?: unknown; assistantBatchJobs?: unknown; assistantBatchRecoveryStatus?: unknown; assistantChatConversations?: unknown; assistantChatRecoveryStatus?: unknown };
     delete result.assistantBatchJobs;
     delete result.assistantBatchRecoveryStatus;
+    delete result.assistantChatConversations;
+    delete result.assistantChatRecoveryStatus;
     delete result.transcriptionRequestCleanupPending;
     if (batchLedger) result.openRouterBatchLedger = clone(batchLedger);
     else if (this.assistantBatchLedgerHasRaw) result.openRouterBatchLedger = clone(this.assistantBatchLedgerRaw);
     else result.openRouterBatchLedger = clone(this.assistantBatchLedger);
+    if (chatLedger) result.assistantChatLedger = clone(chatLedger);
+    else if (this.assistantChatLedgerHasRaw) result.assistantChatLedger = clone(this.assistantChatLedgerRaw);
+    else result.assistantChatLedger = clone(this.assistantChatLedger);
     if (this.dispatchRecordQuarantine.length) result.dispatchRecordQuarantine = clone(this.dispatchRecordQuarantine);
     else delete result.dispatchRecordQuarantine;
     if (this.dispatchRecordQuarantine.length) result.dispatchRecoveryStatus = {
@@ -2034,14 +2052,27 @@ export class AppControllerImpl implements AppController {
   }
 
   private publicState(state: AppState): AppState {
-    const result = clone(state) as AppState & { dispatchRecordQuarantine?: unknown; proactiveQuarantine?: unknown; proactiveRecoveryArchives?: unknown; proactiveMailAlertQuarantine?: unknown; backupImportQuarantine?: unknown; knowledgeQuarantine?: unknown; reminderQuarantine?: unknown; deviceCalendarQuarantine?: unknown; transcriptionQuarantine?: unknown; openRouterBatchLedger?: unknown; assistantBatchJobs?: unknown };
+    const result = clone(state) as AppState & { dispatchRecordQuarantine?: unknown; proactiveQuarantine?: unknown; proactiveRecoveryArchives?: unknown; proactiveMailAlertQuarantine?: unknown; backupImportQuarantine?: unknown; knowledgeQuarantine?: unknown; reminderQuarantine?: unknown; deviceCalendarQuarantine?: unknown; transcriptionQuarantine?: unknown; openRouterBatchLedger?: unknown; assistantChatLedger?: unknown; assistantBatchJobs?: unknown; assistantChatConversations?: unknown; assistantChatRecoveryStatus?: unknown };
     delete result.openRouterBatchLedger;
+    delete result.assistantChatLedger;
+    delete result.assistantChatConversations;
+    delete result.assistantChatRecoveryStatus;
     result.assistantBatchJobs = this.assistantBatchLedgerMalformed ? [] : this.assistantBatchLedger.jobs.map((job) => assistantBatchJobDTO(job, this.assistantBatchCleanupRetries.has(job.id)));
     if (this.assistantBatchLedgerMalformed) result.assistantBatchRecoveryStatus = {
       blocked: true,
       message: 'Saved Batch history could not be validated and is held privately. Batch actions are disabled until local data is refreshed.',
     };
     else delete result.assistantBatchRecoveryStatus;
+    if (this.assistantChatLedgerMalformed) {
+      const hiddenChatNoteIds = new Set(state.notes.filter((note) => note.origin === 'assistant_chat').map((note) => note.id));
+      result.notes = result.notes.filter((note) => note.origin !== 'assistant_chat');
+      result.proposals = result.proposals.filter((proposal) => !proposal.noteId || !hiddenChatNoteIds.has(proposal.noteId));
+      result.activity = result.activity.filter((item) => !item.noteId || !hiddenChatNoteIds.has(item.noteId));
+      result.assistantChatConversations = [];
+      result.assistantChatRecoveryStatus = { blocked: true, message: 'Saved chat history could not be validated and is held privately. Chat actions are disabled until local data is refreshed.' };
+    } else {
+      result.assistantChatConversations = this.chatConversationDTOs();
+    }
     delete result.dispatchRecordQuarantine;
     if (this.dispatchRecordQuarantine.length) result.dispatchRecoveryStatus = {
       quarantinedCount: this.dispatchRecordQuarantine.length,
@@ -2070,6 +2101,180 @@ export class AppControllerImpl implements AppController {
     };
     else delete result.mailAlertRefreshRequired;
     return result;
+  }
+
+  private chatConversationDTOs(): ChatConversationDTO[] {
+    if (this.assistantChatLedgerMalformed) return [];
+    return this.assistantChatLedger.conversations.map((conversation) => Object.freeze({
+      id: conversation.id, title: conversation.title, createdAt: conversation.createdAt, updatedAt: conversation.updatedAt,
+      turns: Object.freeze(conversation.turns.map((turn) => {
+        const job = this.assistantBatchLedger.jobs.find((item) => item.id === turn.jobId);
+        const dto = job ? assistantBatchJobDTO(job, this.assistantBatchCleanupRetries.has(job.id)) : undefined;
+        return Object.freeze({ id: turn.id, noteId: turn.noteId, userText: turn.userText, createdAt: turn.createdAt,
+          ...(turn.reply ? { reply: Object.freeze({ summary: turn.reply.summary, answer: turn.reply.answer,
+            clarifications: Object.freeze([...turn.reply.clarifications]), completedAt: turn.reply.completedAt }) } : {}),
+          ...(dto ? { job: dto } : {}) });
+      })),
+    }));
+  }
+
+  private chatLedgerLinksAreValid(ledger: ReadonlyChatLedger, state: AppState): boolean {
+    if (this.assistantBatchLedgerMalformed) return false;
+    const turns = new Map<string, { conversation: ChatConversation; index: number; turn: ChatConversation['turns'][number] }>();
+    for (const conversation of ledger.conversations) conversation.turns.forEach((turn, index) => turns.set(turn.id, { conversation, index, turn }));
+    const linkedNotes = new Set<string>();
+    const linkedJobs = new Set<string>();
+    for (const { conversation, index, turn } of turns.values()) {
+      const note = state.notes.find((candidate) => candidate.id === turn.noteId);
+      const job = this.assistantBatchLedger.jobs.find((candidate) => candidate.id === turn.jobId);
+      const binding = job?.chatBinding;
+      if (!note || note.origin !== 'assistant_chat' || note.revision !== turn.noteRevision || note.transcript !== turn.userText ||
+          note.title !== 'Chat message' || note.audioUri || note.durationSeconds !== 0 || note.createdAt !== turn.createdAt ||
+          (note.capturedAt ?? note.createdAt) !== turn.createdAt || (note.captureTimeZone || 'UTC') !== turn.captureTimeZone || !job) return false;
+      if (job.sourceRemoved) {
+        if (turn.reply || turn.replySha256 || note.analysis || note.processingFingerprint || binding) return false;
+        linkedNotes.add(turn.noteId);
+        linkedJobs.add(turn.jobId);
+        continue;
+      }
+      if (!binding || job.noteId !== turn.noteId || job.noteRevision !== turn.noteRevision ||
+          job.kind !== 'note_assistance' || job.intent !== 'answer' || job.question !== 'Respond to the current user message.' ||
+          binding.conversationId !== conversation.id || binding.turnId !== turn.id) return false;
+      if (turn.reply && (!turn.replySha256 || job.requestSha256 !== turn.reply.requestSha256 || job.requestProfileVersion !== turn.reply.requestProfileVersion ||
+          !['completed', 'result_stale', 'source_removed'].includes(job.status))) return false;
+      const contextTurnIds = new Set<string>();
+      let lastContextIndex = -1;
+      for (const reference of binding.context) {
+        if (contextTurnIds.has(reference.turnId)) return false;
+        contextTurnIds.add(reference.turnId);
+        const prior = turns.get(reference.turnId);
+        if (!prior || prior.conversation.id !== conversation.id || prior.index <= lastContextIndex || prior.index >= index || !prior.turn.reply ||
+            prior.turn.jobId !== reference.jobId || prior.turn.noteId !== reference.noteId || prior.turn.noteRevision !== reference.noteRevision ||
+            prior.turn.replySha256 !== reference.replySha256 || prior.turn.reply.requestProfileVersion !== reference.replyProfileVersion) return false;
+        lastContextIndex = prior.index;
+      }
+      linkedNotes.add(turn.noteId);
+      linkedJobs.add(turn.jobId);
+    }
+    return state.notes.every((note) => note.origin !== 'assistant_chat' || linkedNotes.has(note.id)) &&
+      this.assistantBatchLedger.jobs.every((job) => !job.chatBinding || linkedJobs.has(job.id));
+  }
+
+  private async chatReplyDigest(reply: ChatReplySnapshot): Promise<string> {
+    return Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, stableJson(reply), { encoding: Crypto.CryptoEncoding.HEX });
+  }
+
+  private chatSourcesFromBinding(state: AppState, binding: OpenRouterChatBinding): AssistantSourceInput[] {
+    if (this.assistantChatLedgerMalformed || this.assistantBatchLedgerMalformed) throw new Error('Saved chat history could not be validated. Refresh local data before continuing.');
+    const conversation = this.assistantChatLedger.conversations.find((item) => item.id === binding.conversationId);
+    const currentIndex = conversation?.turns.findIndex((turn) => turn.id === binding.turnId) ?? -1;
+    if (!conversation || currentIndex < 0) throw new Error('The saved conversation context is no longer available.');
+    const current = conversation.turns[currentIndex];
+    const currentNote = state.notes.find((note) => note.id === current.noteId);
+    const currentJob = this.assistantBatchLedger.jobs.find((job) => job.id === current.jobId);
+    if (!currentNote || currentNote.origin !== 'assistant_chat' ||
+        currentNote.revision !== current.noteRevision || currentNote.transcript !== current.userText || !currentJob || !currentJob.chatBinding ||
+        currentJob.sourceRemoved || currentJob.kind !== 'note_assistance' || currentJob.noteId !== current.noteId || currentJob.noteRevision !== current.noteRevision ||
+        currentJob.intent !== 'answer' || currentJob.question !== 'Respond to the current user message.' ||
+        currentJob.chatBinding.conversationId !== binding.conversationId || currentJob.chatBinding.turnId !== binding.turnId ||
+        currentJob.requestSha256.length !== 64) throw new Error('The saved chat message changed. This reply can no longer be applied.');
+    const sources: AssistantSourceInput[] = [];
+    for (const reference of binding.context) {
+      const priorIndex = conversation.turns.findIndex((turn) => turn.id === reference.turnId);
+      const prior = conversation.turns[priorIndex];
+      const priorNote = prior && state.notes.find((note) => note.id === prior.noteId);
+      const priorJob = prior && this.assistantBatchLedger.jobs.find((job) => job.id === prior.jobId);
+      if (priorIndex < 0 || priorIndex >= currentIndex || !prior?.reply || !priorNote || priorNote.origin !== 'assistant_chat' ||
+          priorNote.revision !== reference.noteRevision || priorNote.transcript !== prior.userText || prior.jobId !== reference.jobId ||
+          priorNote.analysis?.stale === true ||
+          prior.noteId !== reference.noteId || prior.replySha256 !== reference.replySha256 ||
+          prior.reply.requestProfileVersion !== reference.replyProfileVersion || priorJob?.status !== 'completed' || priorJob.sourceRemoved ||
+          priorJob.requestSha256 !== prior.reply.requestSha256 || priorJob.requestProfileVersion !== reference.replyProfileVersion ||
+          !prior.replySha256) {
+        throw new Error('The saved conversation context changed. This reply can no longer be applied.');
+      }
+      sources.push({ id: `chat_turn:${prior.id}`, revision: prior.noteRevision,
+        text: `Earlier user message (captured ${prior.createdAt} in ${prior.captureTimeZone}):\n${prior.userText}\n\nEarlier assistant reply (completed ${prior.reply.completedAt}):\n${prior.reply.answer || prior.reply.summary}${prior.reply.clarifications.length ? `\n\nClarifications:\n${prior.reply.clarifications.join('\n')}` : ''}`,
+        required: false, kind: 'note', title: `Earlier conversation turn ${prior.createdAt}`, updatedAt: prior.reply.completedAt, selectionPriority: 1 });
+    }
+    return sources;
+  }
+
+  private async chatTurnMatchesFrozenRequest(
+    state: AppState,
+    conversation: ChatConversation,
+    turn: ChatConversation['turns'][number],
+    memo: { results: Map<string, Promise<boolean>>; active: Set<string> } = { results: new Map(), active: new Set() },
+  ): Promise<boolean> {
+    if (memo.active.has(turn.jobId)) return false;
+    const cached = memo.results.get(turn.jobId);
+    if (cached) return cached;
+    memo.active.add(turn.jobId);
+    const validation = Promise.resolve().then(async (): Promise<boolean> => {
+    const note = state.notes.find((candidate) => candidate.id === turn.noteId);
+    const job = this.assistantBatchLedger.jobs.find((candidate) => candidate.id === turn.jobId);
+    if (!turn.reply || !turn.replySha256 || !note || note.origin !== 'assistant_chat' || note.analysis?.stale === true ||
+        note.revision !== turn.noteRevision || note.transcript !== turn.userText || !job || job.status !== 'completed' || job.sourceRemoved ||
+        job.noteId !== turn.noteId || job.noteRevision !== turn.noteRevision || job.requestSha256 !== turn.reply.requestSha256 ||
+        job.requestProfileVersion !== turn.reply.requestProfileVersion || await this.chatReplyDigest(turn.reply) !== turn.replySha256) return false;
+    try {
+      const context = assistContext(state, note, job.intent!, job.question, [...(job.knowledgeSelection ?? [])]);
+      const chatSources = await this.chatSourcesForBinding(state, job.chatBinding!, memo);
+      const rebuilt = await new OpenRouterBatchRequestBuilder().prepareAnalysis(note, context.documents, state.settings, {
+        intent: job.intent, question: job.question, chatMode: true,
+        additionalSources: [...context.additionalSources, ...chatSources],
+        preselection: { omittedSourceCount: context.omittedSourceCount + job.chatBinding!.omittedTurnCount, omittedSourceIds: context.omittedSourceIds },
+      }, job.requestProfileVersion);
+      const requestDigest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, rebuilt.body, { encoding: Crypto.CryptoEncoding.HEX });
+      const sourceDigest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, stableJson(rebuilt.sourceVersions), { encoding: Crypto.CryptoEncoding.HEX });
+      return rebuilt.body === job.requestBody && requestDigest === job.requestSha256 && sourceDigest === job.sourceFingerprint &&
+        sameSourceVersions({ ...rebuilt.sourceVersions }, { ...job.sourceVersions });
+    } catch { return false; }
+    });
+    memo.results.set(turn.jobId, validation);
+    try { return await validation; }
+    finally { memo.active.delete(turn.jobId); }
+  }
+
+  private async chatSourcesForBinding(
+    state: AppState,
+    binding: OpenRouterChatBinding,
+    memo: { results: Map<string, Promise<boolean>>; active: Set<string> } = { results: new Map(), active: new Set() },
+  ): Promise<AssistantSourceInput[]> {
+    const sources = this.chatSourcesFromBinding(state, binding);
+    const conversation = this.assistantChatLedger.conversations.find((item) => item.id === binding.conversationId);
+    for (const reference of binding.context) {
+      const turn = conversation?.turns.find((candidate) => candidate.id === reference.turnId);
+      if (!turn?.reply || !turn.replySha256 || await this.chatReplyDigest(turn.reply) !== turn.replySha256 || turn.replySha256 !== reference.replySha256) {
+        throw new Error('The saved conversation reply changed. This reply can no longer be applied.');
+      }
+      if (!conversation || !await this.chatTurnMatchesFrozenRequest(state, conversation, turn, memo)) {
+        throw new Error('The saved conversation source changed. This reply can no longer be applied.');
+      }
+    }
+    return sources;
+  }
+
+  private chatLedgerWithReply(binding: OpenRouterChatBinding, reply: ChatReplySnapshot, replySha256: string): ReadonlyChatLedger {
+    if (this.assistantChatLedgerMalformed) throw new Error('Saved chat history could not be validated. Refresh local data before continuing.');
+    let found = false;
+    const conversations = this.assistantChatLedger.conversations.map((conversation) => {
+      if (conversation.id !== binding.conversationId) return conversation;
+      const turns = conversation.turns.map((turn) => {
+        if (turn.id !== binding.turnId) return turn;
+        if (turn.reply) {
+          if (turn.reply.requestSha256 !== reply.requestSha256 || turn.reply.requestProfileVersion !== reply.requestProfileVersion || turn.replySha256 !== replySha256) throw new Error('The saved chat reply already differs.');
+          found = true;
+          return turn;
+        }
+        found = true;
+        return Object.freeze({ ...turn, reply, replySha256 });
+      });
+      const updatedAt = Date.parse(reply.completedAt) > Date.parse(conversation.updatedAt) ? reply.completedAt : conversation.updatedAt;
+      return found ? Object.freeze({ ...conversation, updatedAt, turns: Object.freeze(turns) }) : conversation;
+    });
+    if (!found) throw new Error('The saved chat turn was not found.');
+    return validateChatLedger({ version: 1, conversations });
   }
 
   private async evaluateProactiveDraft(state: AppState): Promise<boolean> {
@@ -2189,6 +2394,7 @@ export class AppControllerImpl implements AppController {
     operation: (draft: AppState) => T | Promise<T>,
     saveOptions?: (draft: AppState, result: T) => Parameters<StateStore['save']>[1],
     batchLedgerForCommit?: (draft: AppState, result: T) => OpenRouterBatchLedger | undefined,
+    chatLedgerForCommit?: (draft: AppState, result: T) => ReadonlyChatLedger | undefined,
   ): Promise<T> {
     await this.assertPrivacySessionCurrent();
     const capturedBootstrapGeneration = this.bootstrapGeneration;
@@ -2209,8 +2415,9 @@ export class AppControllerImpl implements AppController {
       draft.reminders = validateReminderState(draft.reminders);
       draft.transcription = clone(validateTranscriptionState(draft.transcription));
       let batchLedger = batchLedgerForCommit?.(draft, result);
+      let chatLedger = chatLedgerForCommit?.(draft, result);
       if (batchLedger) {
-        const serializedCandidate = JSON.stringify(this.persistedStateWithBatchLedger(draft, batchLedger));
+        const serializedCandidate = JSON.stringify(this.persistedStateWithBatchLedger(draft, batchLedger, chatLedger));
         if (typeof serializedCandidate !== 'string' || recoveryUtf8Bytes(serializedCandidate, STATE_SNAPSHOT_READ_MAX_BYTES) > STATE_SNAPSHOT_READ_MAX_BYTES) {
           const oldById = new Map(this.assistantBatchLedger.jobs.map((job) => [job.id, job]));
           const eligible = batchLedger.jobs.filter((job) => {
@@ -2228,6 +2435,7 @@ export class AppControllerImpl implements AppController {
             }),
           });
           draft = before;
+          chatLedger = undefined;
           newCancellationIntents = [];
           const receiptCandidate = JSON.stringify(this.persistedStateWithBatchLedger(draft, batchLedger));
           if (typeof receiptCandidate !== 'string' || recoveryUtf8Bytes(receiptCandidate, STATE_SNAPSHOT_READ_MAX_BYTES) > STATE_SNAPSHOT_READ_MAX_BYTES) {
@@ -2237,7 +2445,7 @@ export class AppControllerImpl implements AppController {
       }
       await this.assertPrivacySessionCurrent();
       try {
-        await this.store.save(this.persistedStateWithBatchLedger(draft, batchLedger), saveOptions?.(draft, result));
+        await this.store.save(this.persistedStateWithBatchLedger(draft, batchLedger, chatLedger), saveOptions?.(draft, result));
         await this.assertPrivacySessionCurrent();
         if (capturedBootstrapGeneration !== this.bootstrapGeneration || this.startupRecoveryPhase !== 'ready') {
           throw new Error('The app workspace changed while the update was being saved. Reopen the app before continuing.');
@@ -2247,6 +2455,12 @@ export class AppControllerImpl implements AppController {
           this.assistantBatchLedgerHasRaw = false;
           this.assistantBatchLedgerRaw = undefined;
           this.assistantBatchLedgerMalformed = false;
+        }
+        if (chatLedger) {
+          this.assistantChatLedger = validateChatLedger(chatLedger);
+          this.assistantChatLedgerHasRaw = false;
+          this.assistantChatLedgerRaw = undefined;
+          this.assistantChatLedgerMalformed = false;
         }
         this.state = draft;
         this.snapshot = deepFreeze(this.publicState(draft));
@@ -2400,10 +2614,19 @@ export class AppControllerImpl implements AppController {
     if (provenance.expiresAt && (!Number.isFinite(Date.parse(provenance.expiresAt)) || Date.now() >= Date.parse(provenance.expiresAt))) throw new Error('This answer-based suggestion expired at the next question-time window. Run Assist again before approving or continuing it.');
     if (!Array.isArray(provenance.knowledgeSelection)) throw new Error('This suggestion has no saved knowledge selection. Run Assist again before approving it.');
     const { documents, additionalSources } = assistContext(state, note, provenance.intent, provenance.question, provenance.knowledgeSelection);
+    let chatSources: AssistantSourceInput[] = [];
+    if (note.origin === 'assistant_chat') {
+      const turn = this.assistantChatLedger.conversations.flatMap((conversation) => conversation.turns).find((candidate) => candidate.noteId === note.id);
+      const job = turn && this.assistantBatchLedger.jobs.find((candidate) => candidate.id === turn.jobId);
+      if (this.assistantChatLedgerMalformed || this.assistantBatchLedgerMalformed || !turn || !job?.chatBinding) {
+        throw new Error('Saved chat history could not be validated. Refresh local data before continuing.');
+      }
+      chatSources = this.chatSourcesFromBinding(state, job.chatBinding);
+    }
     const inputs: AssistantSourceInput[] = [
       { id: 'transcript', revision: note.revision, text: note.transcript, required: true, kind: 'note', title: 'Recorded transcript' },
       ...documents.map((document) => ({ id: `doc:${document.path}`, revision: document.revision, text: document.content, required: true, kind: 'document' as const, title: document.path, updatedAt: document.updatedAt })),
-      ...additionalSources,
+      ...additionalSources, ...chatSources,
     ];
     const byId = new Map(inputs.map((source) => [source.id, source]));
     const selected = provenance.sources.map((expected) => {
@@ -2458,6 +2681,19 @@ export class AppControllerImpl implements AppController {
       return this.mailReplyDependencyProjection(state, proposal, provenance);
     }
     const { inputs, policyInputs, provenance } = this.proposalDependencyInputs(state, proposal);
+    const proposalNote = proposal.noteId ? state.notes.find((item) => item.id === proposal.noteId) : undefined;
+    if (proposalNote?.origin === 'assistant_chat') {
+      const conversation = this.assistantChatLedger.conversations.find((item) => item.turns.some((turn) => turn.noteId === proposalNote.id));
+      const turn = conversation?.turns.find((item) => item.noteId === proposalNote.id);
+      const job = turn && this.assistantBatchLedger.jobs.find((item) => item.id === turn.jobId);
+      const memo = { results: new Map<string, Promise<boolean>>(), active: new Set<string>() };
+      if (!conversation || !turn?.reply || !turn.replySha256 || !job?.chatBinding || job.status !== 'completed' || job.sourceRemoved ||
+          await this.chatReplyDigest(turn.reply) !== turn.replySha256 ||
+          !await this.chatTurnMatchesFrozenRequest(state, conversation, turn, memo)) {
+        throw new Error('The saved conversation source changed. Run Assist again before approving or continuing this action.');
+      }
+      await this.chatSourcesForBinding(state, job.chatBinding, memo);
+    }
     const catalog = await createSourceCatalog(inputs, async (bytes) =>
       Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, new TextDecoder().decode(bytes)));
     const current = Object.fromEntries(catalog.sources.map((source) => [source.id, source.version]));
@@ -3236,6 +3472,10 @@ export class AppControllerImpl implements AppController {
     this.assistantBatchLedgerHasRaw = false;
     this.assistantBatchLedger = emptyOpenRouterBatchLedger();
     this.assistantBatchLedgerMalformed = false;
+    this.assistantChatLedgerRaw = undefined;
+    this.assistantChatLedgerHasRaw = false;
+    this.assistantChatLedger = emptyChatLedger();
+    this.assistantChatLedgerMalformed = false;
     this.assistantBatchCleanupRetries.clear();
     this.proactiveRecoveryInspectionOperationId = undefined;
     this.proactiveRecoveryExpectedReceipt = undefined;
@@ -3301,6 +3541,29 @@ export class AppControllerImpl implements AppController {
         this.assistantBatchLedger = emptyOpenRouterBatchLedger();
       }
     }
+    if (loaded && Object.prototype.hasOwnProperty.call(loaded, 'assistantChatLedger')) {
+      this.assistantChatLedgerHasRaw = true;
+      this.assistantChatLedgerRaw = clone((loaded as AppState & { assistantChatLedger?: unknown }).assistantChatLedger);
+      let verifiedLedger: ReturnType<typeof validateChatLedger> | undefined;
+      let invalidLedger = false;
+      try {
+        const candidate = validateChatLedger(this.assistantChatLedgerRaw);
+        for (const conversation of candidate.conversations) {
+          for (const turn of conversation.turns) {
+            if (!turn.reply) continue;
+            if (!turn.replySha256 || await this.chatReplyDigest(turn.reply) !== turn.replySha256) {
+              throw new Error('Saved Chat reply digest did not match.');
+            }
+          }
+        }
+        verifiedLedger = candidate;
+      } catch { invalidLedger = true; }
+      // Both success and failure follow awaits. Fence before mutating ledger flags or continuing normalization.
+      await this.assertPrivacySessionCurrent(allowMailAlertRefresh);
+      if (capturedBootstrapGeneration !== this.bootstrapGeneration) throw new Error('The app workspace changed while startup was loading. Reopen the app before continuing.');
+      if (invalidLedger) this.assistantChatLedgerMalformed = true;
+      else if (verifiedLedger) this.assistantChatLedger = verifiedLedger;
+    }
     this.proactiveRecoveryArchivesRaw = undefined;
     this.proactiveRecoveryArchivesValidated = undefined;
     this.proactiveRecoveryArchivesMalformed = false;
@@ -3312,6 +3575,7 @@ export class AppControllerImpl implements AppController {
     }
     const normalized: NormalizedLoadedState = loaded ? normalizeLoadedState(loaded) : initialState();
     delete (normalized as AppState & { openRouterBatchLedger?: unknown }).openRouterBatchLedger;
+    delete (normalized as AppState & { assistantChatLedger?: unknown }).assistantChatLedger;
     delete (normalized as AppState & { proactiveRecoveryArchives?: unknown }).proactiveRecoveryArchives;
     this.dispatchRecordQuarantine = clone(normalized.dispatchRecordQuarantine ?? []);
     delete normalized.dispatchRecordQuarantine;
@@ -3327,6 +3591,13 @@ export class AppControllerImpl implements AppController {
     delete (normalized as AppState & { deviceCalendarQuarantine?: unknown[] }).deviceCalendarQuarantine;
     this.state = normalized;
     this.state.transcription = clone(normalized.transcription);
+    if (!this.assistantChatLedgerMalformed && !this.chatLedgerLinksAreValid(this.assistantChatLedger, this.state)) {
+      this.assistantChatLedgerMalformed = true;
+      this.assistantChatLedger = emptyChatLedger();
+    } else if (!this.assistantChatLedgerMalformed) {
+      this.assistantChatLedgerHasRaw = false;
+      this.assistantChatLedgerRaw = undefined;
+    }
     const persisted = loaded as (AppState & { proactiveQuarantine?: unknown }) | undefined;
     const proactive = normalizeProactiveData(persisted?.proactive, persisted?.proactiveQuarantine);
     this.proactiveQuarantine = proactive.quarantine;
@@ -3608,6 +3879,7 @@ export class AppControllerImpl implements AppController {
   async updateTranscript(id: string, text: string): Promise<Note> {
     const result = await this.mutate((state) => {
       const note = this.note(state, id);
+      if (note.origin === 'assistant_chat') throw new Error('Chat messages are immutable. Continue the conversation or delete it from Chat.');
       note.transcript = text.trim();
       note.title = note.transcript ? note.transcript.split(/\s+/).slice(0, 7).join(' ').slice(0, 72) : 'Audio note';
       note.revision += 1;
@@ -3632,6 +3904,7 @@ export class AppControllerImpl implements AppController {
     const initial = this.snapshot;
     const note = initial.notes.find((item) => item.id === noteId);
     if (!note) throw new Error('Note was not found.');
+    if (note.origin === 'assistant_chat') throw new Error('Chat messages cannot be attached to audio recordings.');
     if (note.revision !== input.expectedRevision) throw new Error('The note changed before file selection. Review the current note and try again.');
     if (note.importOrigin?.kind !== 'backup_import' || note.importOrigin.audioMissing !== true || note.audioUri) {
       throw new Error('Only an imported note with missing audio can receive a selected replacement recording.');
@@ -3715,6 +3988,7 @@ export class AppControllerImpl implements AppController {
     await this.load();
     const session = this.recordingAttachmentSessions.get(input.sessionId);
     if (!session || session.status !== 'applying' || session.preview.planHash !== input.planHash) throw new Error('Recording preview is missing or no longer matches. Select the file again.');
+    if (this.snapshot.notes.find((item) => item.id === session.preview.noteId)?.origin === 'assistant_chat') throw new Error('Chat messages cannot be attached to audio recordings.');
     const atStart = Date.now();
     if (atStart < session.preparedAtMs || atStart - session.preparedAtMs >= 15 * 60_000) {
       this.recordingAttachmentSessions.delete(input.sessionId);
@@ -3794,6 +4068,7 @@ export class AppControllerImpl implements AppController {
     return this.mutate((state) => {
       const note = state.notes.find((item) => item.id === noteId);
       if (!note) throw new Error('Note was not found.');
+      if (note.origin === 'assistant_chat') throw new Error('Chat message timestamps are fixed when the message is sent.');
       if (note.revision !== input.expectedRevision) throw new Error('The note changed before time zone confirmation. Review its current revision and try again.');
       if (note.importOrigin?.kind !== 'backup_import' || note.importOrigin.originalTimeZoneUnknown !== true) {
         throw new Error('This note does not need an original time zone confirmation.');
@@ -3831,6 +4106,12 @@ export class AppControllerImpl implements AppController {
 
   private sourceReference(state: AppState, sourceId: string, note: Note): KnowledgeReference | undefined {
     if (sourceId === 'transcript') return { kind: 'note', id: note.id };
+    if (sourceId.startsWith('chat_turn:')) {
+      const turnId = sourceId.slice('chat_turn:'.length);
+      const turn = this.assistantChatLedger.conversations.flatMap((conversation) => conversation.turns).find((item) => item.id === turnId);
+      return turn && state.notes.some((item) => item.id === turn.noteId && item.origin === 'assistant_chat')
+        ? { kind: 'note', id: turn.noteId } : undefined;
+    }
     if (sourceId.startsWith('note:')) {
       try { const id = decodeURIComponent(sourceId.slice(5)); return state.notes.some((item) => item.id === id) ? { kind: 'note', id } : undefined; }
       catch { return undefined; }
@@ -3926,13 +4207,22 @@ export class AppControllerImpl implements AppController {
       const note = state.notes.find((item) => item.id === noteId);
       if (!note?.analysis) return { changed: false, result: undefined };
       const analysis = note.analysis;
+      const chatTurn = note.origin === 'assistant_chat'
+        ? this.assistantChatLedger.conversations.flatMap((conversation) => conversation.turns).find((turn) => turn.noteId === note.id)
+        : undefined;
+      const chatJob = chatTurn && this.assistantBatchLedger.jobs.find((job) => job.id === chatTurn.jobId);
+      if (note.origin === 'assistant_chat' && (!chatTurn || !chatJob?.chatBinding || this.assistantChatLedgerMalformed || this.assistantBatchLedgerMalformed)) {
+        throw new Error('Saved chat history could not be validated. Refresh local data before continuing.');
+      }
       const boundFingerprint = analysis.fingerprint;
       const boundSourceRevision = analysis.sourceRevision;
       const { documents, additionalSources, omittedSourceCount, omittedSourceIds } = assistContext(state, note, analysis.intent, analysis.question, analysis.knowledgeSelection ?? []);
+      const chatSources = chatJob?.chatBinding ? await this.chatSourcesForBinding(state, chatJob.chatBinding) : [];
       const request = {
         intent: analysis.intent, question: analysis.question,
-        ...(analysis.answeredAsOf ? { queryTimeAnchor: analysis.answeredAsOf, queryTimeZone: analysis.answerTimeZone ?? state.settings.timezone } : {}),
-        additionalSources, preselection: { omittedSourceCount, omittedSourceIds },
+        ...(chatJob?.chatBinding ? { chatMode: true as const } : {}),
+        ...(!chatJob?.chatBinding && analysis.answeredAsOf ? { queryTimeAnchor: analysis.answeredAsOf, queryTimeZone: analysis.answerTimeZone ?? state.settings.timezone } : {}),
+        additionalSources: [...additionalSources, ...chatSources], preselection: { omittedSourceCount: omittedSourceCount + (chatJob?.chatBinding?.omittedTurnCount ?? 0), omittedSourceIds },
       };
       let currentVersions: Record<string, string>;
       if (state.settings.mode === 'provider' && analysis.source === 'provider') {
@@ -3964,7 +4254,7 @@ export class AppControllerImpl implements AppController {
       const settingsChanged = !priorFingerprint?.settings || providerSettingsChanged ||
         priorFingerprint.contractVersion !== ASSIST_CONTRACT_VERSION ||
         (analysis.source === 'provider') !== (state.settings.mode === 'provider');
-      const answerWindowExpired = Boolean(analysis.answeredAsOf &&
+      const answerWindowExpired = Boolean(!chatJob?.chatBinding && analysis.answeredAsOf &&
         Math.floor(Date.now() / 900_000) !== Math.floor(Date.parse(analysis.answeredAsOf) / 900_000));
       const stale = analysis.sourceRevision !== note.revision || settingsChanged || answerWindowExpired || !sameSourceVersions(analysis.sourceVersions, currentVersions);
       if (Boolean(analysis.stale) === stale) return { changed: false, result: analysis };
@@ -4001,6 +4291,170 @@ export class AppControllerImpl implements AppController {
     finally { this.activeBatchNoteOperations.delete(noteId); }
   }
 
+  async createChatConversation(title?: string): Promise<ChatConversationDTO> {
+    if (this.assistantChatLedgerMalformed || this.assistantBatchLedgerMalformed) throw new Error('Saved chat history could not be validated. Refresh local data before continuing.');
+    const createdAt = now();
+    const conversation: ChatConversation = Object.freeze({
+      id: newId(), title: title?.trim() || 'New chat', createdAt, updatedAt: createdAt, turns: Object.freeze([]),
+    });
+    await this.mutate(() => {
+      if (this.assistantChatLedgerMalformed || this.assistantBatchLedgerMalformed) throw new Error('Saved chat history could not be validated. Refresh local data before continuing.');
+      return conversation;
+    }, undefined, undefined, () => validateChatLedger({
+      version: 1, conversations: [...this.assistantChatLedger.conversations, conversation],
+    }));
+    return this.chatConversationDTOs().find((item) => item.id === conversation.id)!;
+  }
+
+  async submitChatTurn(input: { conversationId: string; text: string; knowledgeSelection?: KnowledgeSelection }): Promise<{ kind: 'accepted'; conversationId: string; turnId: string; jobId: string }> {
+    if (this.activeChatConversationSubmissions.has(input.conversationId)) throw new Error('A message in this conversation is still being submitted. Try again after it settles.');
+    this.activeChatConversationSubmissions.add(input.conversationId);
+    try {
+      if (this.assistantChatLedgerMalformed || this.assistantBatchLedgerMalformed) throw new Error('Saved chat history could not be validated. Refresh local data before continuing.');
+      const capturedBootstrapGeneration = this.bootstrapGeneration;
+      const createdAt = now();
+      const staged = await this.mutate(async (draft) => {
+        if (this.assistantChatLedgerMalformed || this.assistantBatchLedgerMalformed) throw new Error('Saved chat history could not be validated. Refresh local data before continuing.');
+        if (draft.settings.mode !== 'provider' || draft.settings.llmProvider !== 'openrouter') throw new Error('Select OpenRouter in Provider mode before sending a chat message.');
+        const existingConversation = this.assistantChatLedger.conversations.find((item) => item.id === input.conversationId);
+        if (!existingConversation) throw new Error('This chat could not be validated. Refresh local data before continuing.');
+        const knowledgeSelection = normalizeKnowledgeSelection(input.knowledgeSelection ?? []);
+        for (const selected of knowledgeSelection) if (!getKnowledgeEntity(draft.knowledge, selected.kind, selected.id)) throw new Error('A selected knowledge source is no longer available. Refresh the selection and try again.');
+        const message = input.text;
+        if (typeof message !== 'string' || !message.trim()) throw new Error('Enter a message before sending it.');
+        const timezone = validTimezone(draft.settings.timezone);
+        const noteId = newId();
+        const turnId = newId();
+        const jobId = newId();
+        const note: Note = {
+          id: noteId, title: 'Chat message', transcript: message, durationSeconds: 0, createdAt,
+          capturedAt: createdAt, captureTimeZone: timezone, status: 'recorded', origin: 'assistant_chat', revision: 1,
+        };
+        const eligibleJobIds = new Set<string>();
+        const validationMemo = { results: new Map<string, Promise<boolean>>(), active: new Set<string>() };
+        for (const job of this.assistantBatchLedger.jobs) {
+          if (job.status !== 'completed' || job.sourceRemoved || !job.chatBinding) continue;
+          const prior = existingConversation.turns.find((turn) => turn.id === job.chatBinding!.turnId);
+          if (prior && await this.chatTurnMatchesFrozenRequest(draft, existingConversation, prior, validationMemo)) eligibleJobIds.add(job.id);
+        }
+        // The newly submitted turn is not in persisted history yet. Select against a
+        // temporary immutable extension so the helper retains one canonical ordering.
+        const pendingTurn = Object.freeze({ id: '__new_turn__', noteId, noteRevision: 1, jobId, userText: message,
+          createdAt, captureTimeZone: timezone });
+        const conversationForSelection: ChatConversation = Object.freeze({ ...existingConversation,
+          updatedAt: createdAt, turns: Object.freeze([...existingConversation.turns, pendingTurn]) });
+        const history = selectCompletedChatContext(conversationForSelection, pendingTurn.id, eligibleJobIds, 48 * 1024);
+        const historySources: AssistantSourceInput[] = [];
+        const contextReferences: OpenRouterChatBinding['context'][number][] = [];
+        for (const selected of history.turns) {
+          const prior = existingConversation.turns.find((turn) => turn.id === selected.turnId);
+          if (!prior?.reply) throw new Error('Earlier chat context changed. Refresh the conversation before sending.');
+          const sourceNote = draft.notes.find((candidate) => candidate.id === prior.noteId);
+          if (!sourceNote || sourceNote.revision !== prior.noteRevision || sourceNote.transcript !== prior.userText || sourceNote.origin !== 'assistant_chat') {
+            throw new Error('Earlier chat context changed. Refresh the conversation before sending.');
+          }
+          historySources.push({ id: `chat_turn:${prior.id}`, revision: prior.noteRevision,
+            text: `Earlier user message (captured ${prior.createdAt} in ${prior.captureTimeZone}):\n${prior.userText}\n\nEarlier assistant reply (completed ${prior.reply.completedAt}):\n${prior.reply.answer || prior.reply.summary}${prior.reply.clarifications.length ? `\n\nClarifications:\n${prior.reply.clarifications.join('\n')}` : ''}`,
+            required: false, kind: 'note', title: `Earlier conversation turn ${prior.createdAt}`, updatedAt: prior.reply.completedAt, selectionPriority: 1 });
+          const replySha256 = await this.chatReplyDigest(prior.reply);
+          if (replySha256 !== prior.replySha256) throw new Error('Earlier chat reply changed. Refresh the conversation before sending.');
+          contextReferences.push(Object.freeze({ turnId: prior.id, jobId: prior.jobId, noteId: prior.noteId,
+            noteRevision: prior.noteRevision, replySha256, replyProfileVersion: prior.reply.requestProfileVersion }));
+        }
+        const chatBinding: OpenRouterChatBinding = Object.freeze({ conversationId: existingConversation.id, turnId,
+          context: Object.freeze(contextReferences), omittedTurnCount: history.omittedTurnCount });
+        const context = assistContext(draft, note, 'answer', 'Respond to the current user message.', knowledgeSelection);
+        const prepared = await new OpenRouterBatchRequestBuilder().prepareAnalysis(note, context.documents, draft.settings, {
+          intent: 'answer', question: 'Respond to the current user message.', chatMode: true,
+          additionalSources: [...context.additionalSources, ...historySources],
+          preselection: { omittedSourceCount: context.omittedSourceCount + history.omittedTurnCount, omittedSourceIds: context.omittedSourceIds },
+        });
+        const body = JSON.parse(prepared.body) as { reasoning: { effort: 'none' | 'low' } };
+        const job: OpenRouterBatchJob = Object.freeze({
+          id: jobId, customId: jobId, kind: 'note_assistance', status: 'preparing', createdAt, updatedAt: createdAt,
+          noteId, noteRevision: note.revision, intent: 'answer', question: 'Respond to the current user message.',
+          knowledgeSelection: Object.freeze(knowledgeSelection.map((row) => Object.freeze({ ...row }))),
+          capturedAt: createdAt, captureTimeZone: timezone,
+          settingsFingerprint: await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, stableJson(openRouterSettingsBinding(draft.settings)), { encoding: Crypto.CryptoEncoding.HEX }),
+          sourceFingerprint: await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, stableJson(prepared.sourceVersions), { encoding: Crypto.CryptoEncoding.HEX }),
+          requestProfileVersion: prepared.requestProfileVersion, model: OPENROUTER_BATCH_MODEL, effort: body.reasoning.effort,
+          requestBytes: new TextEncoder().encode(prepared.body).byteLength, omittedSourceCount: prepared.omittedSourceCount,
+          requestBody: prepared.body,
+          requestSha256: await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, prepared.body, { encoding: Crypto.CryptoEncoding.HEX }),
+          sourceVersions: Object.freeze({ ...prepared.sourceVersions }), chatBinding, unknownCharge: false,
+        });
+        const turn = Object.freeze({ id: turnId, noteId, noteRevision: 1, jobId, userText: message, createdAt, captureTimeZone: timezone });
+        const updatedAt = Date.parse(createdAt) > Date.parse(existingConversation.updatedAt) ? createdAt : existingConversation.updatedAt;
+        const nextConversation: ChatConversation = Object.freeze({ ...existingConversation, updatedAt,
+          turns: Object.freeze([...existingConversation.turns, turn]) });
+        draft.notes.unshift(note);
+        const nextChatLedger = validateChatLedger({ version: 1, conversations: this.assistantChatLedger.conversations.map((conversation) =>
+          conversation.id === nextConversation.id ? nextConversation : conversation) });
+        return { job, noteId, turnId, conversationId: existingConversation.id, nextChatLedger, preparedState: draft };
+      }, undefined,
+      (_draft, result) => validateOpenRouterBatchLedger({ version: 1, jobs: [...this.assistantBatchLedger.jobs, result.job] }),
+      (_draft, result) => result.nextChatLedger);
+      if (!isOpenRouterBatchContentJob(staged.job)) throw new Error('The prepared chat request could not be retained.');
+      // The user turn and immutable request were already durably saved. Network or
+      // acknowledgement failures remain visible on that same safe job receipt.
+      try {
+        await this.dispatchPreparedBatch(staged.job, capturedBootstrapGeneration, this.state);
+      } catch {
+        const currentConversation = this.assistantChatLedger.conversations.find((item) => item.id === staged.conversationId);
+        const currentTurn = currentConversation?.turns.find((item) => item.id === staged.turnId);
+        const currentJob = this.assistantBatchLedger.jobs.find((item) => item.id === staged.job.id);
+        const durableSameContext = this.loaded && this.bootstrapGeneration === capturedBootstrapGeneration &&
+          this.startupRecoveryPhase === 'ready' && !this.mailAlertRefreshRequired && !this.assistantChatLedgerMalformed &&
+          !this.assistantBatchLedgerMalformed && this.state.notes.some((item) => item.id === staged.noteId && item.origin === 'assistant_chat' &&
+            item.revision === 1 && item.transcript === currentTurn?.userText) &&
+          currentTurn?.id === staged.turnId && currentTurn.jobId === staged.job.id && currentTurn.noteId === staged.noteId &&
+          currentJob?.id === staged.job.id && currentJob.noteId === staged.noteId && currentJob.requestSha256 === staged.job.requestSha256 &&
+          currentJob.requestBody === staged.job.requestBody && currentJob.chatBinding?.conversationId === staged.conversationId &&
+          currentJob.chatBinding.turnId === staged.turnId && this.chatLedgerLinksAreValid(this.assistantChatLedger, this.state);
+        if (!durableSameContext) throw new Error('The chat submission outcome could not be confirmed. Refresh local data before continuing.');
+        // The durable turn/job is still tied to this exact loaded workspace. Keep it
+        // visible as accepted even when transport acknowledgment is unknown; never replay here.
+      }
+      return { kind: 'accepted', conversationId: staged.conversationId, turnId: staged.turnId, jobId: staged.job.id };
+    } finally {
+      this.activeChatConversationSubmissions.delete(input.conversationId);
+    }
+  }
+
+  async deleteChatConversation(id: string): Promise<void> {
+    if (this.assistantChatLedgerMalformed || this.assistantBatchLedgerMalformed) throw new Error('Saved chat history could not be validated. Refresh local data before continuing.');
+    const conversation = this.assistantChatLedger.conversations.find((item) => item.id === id);
+    if (!conversation) return;
+    if (this.activeChatConversationSubmissions.has(id)) throw new Error('Wait for the current chat submission to settle before deleting this conversation.');
+    const noteIds = new Set(conversation.turns.map((turn) => turn.noteId));
+    const jobIds = new Set(conversation.turns.map((turn) => turn.jobId));
+    if (conversation.turns.some((turn) => this.activeBatchJobInspections.has(turn.jobId)) || [...noteIds].some((noteId) => this.activeBatchNoteOperations.has(noteId))) {
+      throw new Error('Wait for the current chat request to settle before deleting this conversation.');
+    }
+    await this.mutate(async (draft) => {
+      if (this.assistantChatLedgerMalformed || this.assistantBatchLedgerMalformed) throw new Error('Saved chat history could not be validated. Refresh local data before continuing.');
+      if (draft.proposals.some((proposal) => proposal.noteId && noteIds.has(proposal.noteId) && ['dispatching', 'unknown'].includes(proposal.status))) {
+        throw new Error('Wait for the in-progress external action before deleting this conversation.');
+      }
+      for (const proposal of draft.proposals.filter((item) => item.noteId && noteIds.has(item.noteId) && item.kind === 'reminder')) {
+        await this.enqueueLegacyReminderCancellation(draft, proposal.id, proposal.notificationRevision ?? proposal.revision);
+      }
+      for (const reminder of draft.reminders.records.filter((item) => noteIds.has(item.origin.kind === 'note' ? item.origin.noteId : '') && item.status !== 'cancelled' && item.status !== 'completed')) {
+        this.cancellationForCurrentIntent(draft, reminder);
+        reminder.revision += 1; reminder.status = 'cancelled'; reminder.updatedAt = now(); delete reminder.currentIntentId;
+      }
+      draft.notes = draft.notes.filter((note) => !noteIds.has(note.id));
+      draft.proposals = draft.proposals.filter((proposal) => !proposal.noteId || !noteIds.has(proposal.noteId));
+      draft.activity = draft.activity.filter((item) => !item.noteId || !noteIds.has(item.noteId));
+      draft.knowledge.suggestions = draft.knowledge.suggestions.filter((suggestion) =>
+        !noteIds.has(suggestion.sourceNoteId ?? '') || suggestion.status !== 'pending');
+    }, undefined,
+    () => validateOpenRouterBatchLedger({ version: 1, jobs: this.assistantBatchLedger.jobs.map((job) =>
+      jobIds.has(job.id) ? tombstoneOpenRouterBatchJob(job, now(), true) : job) }),
+    () => validateChatLedger({ version: 1, conversations: this.assistantChatLedger.conversations.filter((item) => item.id !== id) }));
+    await this.reconcileReminderAlerts();
+  }
+
   private async submitNoteBatchInternal(noteId: string, options: { intent?: AssistIntent; question?: string; knowledgeSelection?: KnowledgeSelection }): Promise<AssistantBatchJobDTO> {
     if (!this.openRouterBatchClient) throw new Error('The OpenRouter Batch service is unavailable in this workspace.');
     if (this.assistantBatchLedgerMalformed) throw new Error('Saved Batch history could not be validated. Refresh local data before continuing.');
@@ -4017,6 +4471,7 @@ export class AppControllerImpl implements AppController {
       if (this.assistantBatchLedgerMalformed) throw new Error('Saved Batch history could not be validated. Refresh local data before continuing.');
       if (draft.settings.mode !== 'provider' || draft.settings.llmProvider !== 'openrouter') throw new Error('Select OpenRouter in Provider mode before queuing a Batch.');
       const note = this.note(draft, noteId);
+      if (note.origin === 'assistant_chat') throw new Error('Chat messages are queued only from their conversation.');
       this.requireConfirmedCaptureTimeZone(note);
       if (!note.transcript.trim()) throw new Error('This note has no transcript to queue.');
       for (const selected of knowledgeSelection) if (!getKnowledgeEntity(draft.knowledge, selected.kind, selected.id)) throw new Error('A selected knowledge source is no longer available. Refresh the selection and try again.');
@@ -4053,8 +4508,11 @@ export class AppControllerImpl implements AppController {
       version: 1, jobs: [...this.assistantBatchLedger.jobs, createdJob],
     }));
     if (!isOpenRouterBatchContentJob(staged) || typeof staged.requestBody !== 'string') throw new Error('The prepared Batch request could not be retained.');
+    return this.dispatchPreparedBatch(staged, capturedBootstrapGeneration, this.state);
+  }
 
-    const preparedState = this.state;
+  private async dispatchPreparedBatch(staged: OpenRouterBatchContentJob, capturedBootstrapGeneration: number, preparedState: AppState): Promise<AssistantBatchJobDTO> {
+    if (!this.openRouterBatchClient) throw new Error('The OpenRouter Batch service is unavailable in this workspace.');
     let submittingState: AppState | undefined;
     const submittedContextIsCurrent = () => this.loaded && this.bootstrapGeneration === capturedBootstrapGeneration &&
       this.state === (submittingState ?? preparedState) && this.startupRecoveryPhase === 'ready' && !this.mailAlertRefreshRequired;
@@ -4188,11 +4646,13 @@ export class AppControllerImpl implements AppController {
       if (settingsFingerprint !== job.settingsFingerprint || !note || note.revision !== job.noteRevision ||
           fresh.settings.mode !== 'provider' || fresh.settings.llmProvider !== 'openrouter') throw new Error('The saved analysis sources changed.');
       const context = assistContext(fresh, note, job.intent!, job.question, [...(job.knowledgeSelection ?? [])]);
+      const chatSources = job.chatBinding ? await this.chatSourcesForBinding(fresh, job.chatBinding) : [];
       prepared = await new OpenRouterBatchRequestBuilder().prepareAnalysis(note, context.documents, fresh.settings, {
         intent: job.intent, question: job.question,
-        ...(job.answeredAsOf ? { queryTimeAnchor: job.answeredAsOf, queryTimeZone: fresh.settings.timezone } : {}),
-        additionalSources: context.additionalSources,
-        preselection: { omittedSourceCount: context.omittedSourceCount, omittedSourceIds: context.omittedSourceIds },
+        ...(job.chatBinding ? { chatMode: true as const } : {}),
+        ...(!job.chatBinding && job.answeredAsOf ? { queryTimeAnchor: job.answeredAsOf, queryTimeZone: fresh.settings.timezone } : {}),
+        additionalSources: [...context.additionalSources, ...chatSources],
+        preselection: { omittedSourceCount: context.omittedSourceCount + (job.chatBinding?.omittedTurnCount ?? 0), omittedSourceIds: context.omittedSourceIds },
       }, job.requestProfileVersion);
       requireInspectionContext();
       const digest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, prepared.body, { encoding: Crypto.CryptoEncoding.HEX });
@@ -4211,6 +4671,20 @@ export class AppControllerImpl implements AppController {
       requireInspectionContext();
       return this.updateOpenRouterBatchJob(job.id, (current) => ({ ...current, status: 'result_invalid', unknownCharge: accounting?.providerReportedCostUsd === undefined, failureCode: 'invalid_result', ...(accounting ? { accounting } : {}), updatedAt: now() }), { state: capturedState, generation: capturedGeneration });
     }
+    let chatReply: ChatReplySnapshot | undefined;
+    let chatReplySha256: string | undefined;
+    if (job.chatBinding) {
+      try {
+        chatReply = Object.freeze({ summary: generated.summary, answer: generated.answer,
+          clarifications: Object.freeze([...generated.clarifications]), completedAt: now(),
+          requestSha256: job.requestSha256, requestProfileVersion: job.requestProfileVersion ?? 1 });
+        chatReplySha256 = await this.chatReplyDigest(chatReply);
+        this.chatLedgerWithReply(job.chatBinding, chatReply, chatReplySha256);
+      } catch {
+        requireInspectionContext();
+        return this.updateOpenRouterBatchJob(job.id, (current) => ({ ...current, status: 'result_invalid', unknownCharge: accounting?.providerReportedCostUsd === undefined, failureCode: 'invalid_result', ...(accounting ? { accounting } : {}), updatedAt: now() }), { state: capturedState, generation: capturedGeneration });
+      }
+    }
     requireInspectionContext();
     const analysis = await this.runAssistNote(job.noteId!, {
       intent: job.intent, question: job.question, knowledgeSelection: [...(job.knowledgeSelection ?? [])], forceRefresh: true,
@@ -4226,6 +4700,7 @@ export class AppControllerImpl implements AppController {
         ...(applied.stale ? { failureCode: 'stale_result' as const } : { appliedNoteRevision: applied.sourceRevision }),
         updatedAt: now(),
       })),
+      ...(job.chatBinding && chatReply && chatReplySha256 ? { chatBinding: job.chatBinding, nextChatLedger: () => this.chatLedgerWithReply(job.chatBinding!, chatReply!, chatReplySha256!) } : {}),
     });
     return this.batchDTO(job.id) ?? assistantBatchJobDTO({ ...job, status: analysis.stale ? 'result_stale' : 'completed' });
   }
@@ -4286,6 +4761,87 @@ export class AppControllerImpl implements AppController {
     if (this.assistantBatchLedgerMalformed) throw new Error('Saved Batch history is invalid. Refresh local data before changing or deleting content.');
   }
 
+  private sourceRemovalCommit(predicate: (job: OpenRouterBatchJob) => boolean): {
+    batch: (draft: AppState) => OpenRouterBatchLedger | undefined;
+    chat: () => ReadonlyChatLedger | undefined;
+  } {
+    let nextChatLedger: ReadonlyChatLedger | undefined;
+    return {
+      batch: (draft) => {
+        this.assertBatchLedgerCanDropContent();
+        const directlyAffected = this.assistantBatchLedger.jobs.filter((job) => isOpenRouterBatchContentJob(job) && predicate(job));
+        if (!directlyAffected.length) return undefined;
+
+        if (this.assistantChatLedgerMalformed && (draft.notes.some((note) => note.origin === 'assistant_chat') ||
+            this.assistantBatchLedger.jobs.some((job) => job.chatBinding))) {
+          throw new Error('Saved chat history could not be validated. Refresh local data before changing captured sources.');
+        }
+
+        const affectedTurnIds = new Set<string>();
+        const affectedJobIds = new Set(directlyAffected.map((job) => job.id));
+        for (const job of directlyAffected) {
+          if (job.chatBinding) affectedTurnIds.add(job.chatBinding.turnId);
+          for (const turn of this.assistantChatLedger.conversations.flatMap((conversation) => conversation.turns)) {
+            if (turn.jobId === job.id) affectedTurnIds.add(turn.id);
+          }
+        }
+        // A later request may quote an earlier reply without sharing its original
+        // document fingerprint. Follow the persisted context DAG to redact only
+        // that reply and its actual descendants.
+        let expanded = true;
+        while (expanded) {
+          expanded = false;
+          for (const job of this.assistantBatchLedger.jobs) {
+            if (!isOpenRouterBatchContentJob(job) || !job.chatBinding || affectedJobIds.has(job.id)) continue;
+            if (job.chatBinding.context.some((reference) => affectedTurnIds.has(reference.turnId))) {
+              affectedJobIds.add(job.id);
+              affectedTurnIds.add(job.chatBinding.turnId);
+              expanded = true;
+            }
+          }
+        }
+
+        const affectedTurnRows = this.assistantChatLedger.conversations.flatMap((conversation) => conversation.turns
+          .filter((turn) => affectedTurnIds.has(turn.id)).map((turn) => ({ conversation, turn })));
+        const affectedNoteIds = new Set(affectedTurnRows.map(({ turn }) => turn.noteId));
+        if (Array.from(affectedJobIds).some((id) => this.activeBatchJobInspections.has(id)) ||
+            Array.from(affectedNoteIds).some((id) => this.activeBatchNoteOperations.has(id)) ||
+            affectedTurnRows.some(({ conversation }) => this.activeChatConversationSubmissions.has(conversation.id))) {
+          throw new Error('A Chat or Batch operation is still using this source. Try again after it finishes.');
+        }
+        if (directlyAffected.some((job) => job.noteId && this.activeBatchNoteOperations.has(job.noteId))) {
+          throw new Error('A Batch operation is still using this source. Try again after it finishes.');
+        }
+
+        if (affectedTurnIds.size) {
+          for (const note of draft.notes) if (affectedNoteIds.has(note.id)) {
+            delete note.analysis;
+            delete note.processingFingerprint;
+            note.status = 'recorded';
+          }
+          draft.proposals = draft.proposals.filter((proposal) => !affectedNoteIds.has(proposal.noteId ?? '') ||
+            proposal.status === 'dispatching' || proposal.status === 'unknown');
+          draft.activity = draft.activity.filter((item) => !affectedNoteIds.has(item.noteId ?? ''));
+          draft.knowledge.suggestions = draft.knowledge.suggestions.filter((item) =>
+            !affectedNoteIds.has(item.sourceNoteId ?? '') || item.status !== 'pending');
+          nextChatLedger = validateChatLedger({ version: 1, conversations: this.assistantChatLedger.conversations.map((conversation) => ({
+            ...conversation,
+            turns: conversation.turns.map((turn) => affectedTurnIds.has(turn.id)
+              ? (() => { const { reply: _reply, replySha256: _replySha256, ...redacted } = turn; return redacted; })()
+              : turn),
+          })) });
+        }
+
+        const affectedIds = new Set([...affectedJobIds]);
+        return validateOpenRouterBatchLedger({ version: 1, jobs: this.assistantBatchLedger.jobs.map((job) => {
+          if (!affectedIds.has(job.id) && !predicate(job)) return job;
+          return tombstoneOpenRouterBatchJob(job, now(), Boolean(job.chatBinding || affectedJobIds.has(job.id)));
+        }) });
+      },
+      chat: () => nextChatLedger,
+    };
+  }
+
   private tombstoneOpenRouterBatchJobs(predicate: (job: OpenRouterBatchJob) => boolean): OpenRouterBatchLedger {
     this.assertBatchLedgerCanDropContent();
     const archivedAt = now();
@@ -4299,7 +4855,7 @@ export class AppControllerImpl implements AppController {
     id: string,
     options: { intent?: AssistIntent; question?: string; forceRefresh?: boolean; knowledgeSelection?: KnowledgeSelection } = {},
     requestedAt = new Date(),
-    batch?: { prepared: PreparedOpenRouterAnalysis; generated: DraftAnalysis; capturedState: AppState; capturedGeneration: number; jobId: string; nextLedger: (analysis: NoteAssistResult) => OpenRouterBatchLedger },
+    batch?: { prepared: PreparedOpenRouterAnalysis; generated: DraftAnalysis; capturedState: AppState; capturedGeneration: number; jobId: string; nextLedger: (analysis: NoteAssistResult) => OpenRouterBatchLedger; chatBinding?: OpenRouterChatBinding; nextChatLedger?: () => ReadonlyChatLedger },
   ): Promise<NoteAssistResult> {
     const requireBatchContext = () => {
       if (batch && (!this.loaded || this.state !== batch.capturedState || this.bootstrapGeneration !== batch.capturedGeneration ||
@@ -4315,16 +4871,19 @@ export class AppControllerImpl implements AppController {
     const state = this.snapshot;
     const note = state.notes.find((item) => item.id === id);
     if (!note) throw new Error('Note was not found.');
+    if ((note.origin === 'assistant_chat') !== Boolean(batch?.chatBinding)) throw new Error('Chat messages can only be processed through their saved conversation request.');
     this.requireConfirmedCaptureTimeZone(note);
     if (!note.transcript.trim()) throw new Error('This audio note has no transcript. Enter text or connect the speech provider before processing.');
     const knowledgeSelection = normalizeKnowledgeSelection(options.knowledgeSelection ?? []);
     for (const selected of knowledgeSelection) if (!getKnowledgeEntity(state.knowledge, selected.kind, selected.id)) throw new Error('One of the selected people or projects no longer exists. Refresh the selection and try again.');
     const sourceRevision = note.revision;
-    const { documents: contextDocs, additionalSources: localSources, omittedSourceCount, omittedSourceIds } = assistContext(state, note, intent, question, knowledgeSelection);
+    const { documents: contextDocs, additionalSources: baseSources, omittedSourceCount, omittedSourceIds } = assistContext(state, note, intent, question, knowledgeSelection);
+    const chatSources = batch?.chatBinding ? await this.chatSourcesForBinding(state, batch.chatBinding) : [];
+    const localSources = [...baseSources, ...chatSources];
     const capturedAt = note.capturedAt ?? note.createdAt;
-    const answeredAsOf = intent === 'answer' && question ? requestedAt.toISOString() : undefined;
+    const answeredAsOf = intent === 'answer' && question && !batch?.chatBinding ? requestedAt.toISOString() : undefined;
     const queryBucket = answeredAsOf ? Math.floor(requestedAt.getTime() / 900_000) : undefined;
-    const request = { intent, question, ...(answeredAsOf ? { queryTimeAnchor: answeredAsOf, queryTimeZone: state.settings.timezone } : {}), additionalSources: localSources, preselection: { omittedSourceCount, omittedSourceIds } };
+    const request = { intent, question, ...(batch?.chatBinding ? { chatMode: true as const } : {}), ...(answeredAsOf ? { queryTimeAnchor: answeredAsOf, queryTimeZone: state.settings.timezone } : {}), additionalSources: localSources, preselection: { omittedSourceCount: omittedSourceCount + (batch?.chatBinding?.omittedTurnCount ?? 0), omittedSourceIds } };
     const prepared = batch?.prepared ?? (state.settings.mode === 'provider'
       ? (state.settings.llmProvider === 'openrouter'
         ? await new OpenRouterBatchRequestBuilder().prepareAnalysis(note, contextDocs, state.settings, request)
@@ -4349,7 +4908,7 @@ export class AppControllerImpl implements AppController {
       async (bytes) => Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, new TextDecoder().decode(bytes))) : undefined;
     requireBatchContext();
     const sourceVersions = prepared?.sourceVersions ?? Object.fromEntries(offlineCatalog?.sources.map((source) => [source.id, source.version]) ?? [['transcript', transcriptVersion]]);
-    const processingFingerprint = JSON.stringify({ contractVersion: ASSIST_CONTRACT_VERSION, transcript: note.transcript, sourceRevision, sources: sourceVersions, settings: batch ? openRouterSettingsBinding(state.settings) : state.settings, intent, question, knowledgeSelection,
+    const processingFingerprint = JSON.stringify({ contractVersion: ASSIST_CONTRACT_VERSION, transcript: note.transcript, sourceRevision, sources: sourceVersions, settings: batch ? openRouterSettingsBinding(state.settings) : state.settings, intent, question, knowledgeSelection, ...(batch?.chatBinding ? { chatBinding: batch.chatBinding } : {}),
       capturedAt, captureTimeZone: note.captureTimeZone || state.settings.timezone,
       ...(answeredAsOf ? { queryBucket, queryTimeZone: state.settings.timezone } : {}),
     });
@@ -4427,9 +4986,10 @@ export class AppControllerImpl implements AppController {
         : JSON.stringify(draft.settings) !== JSON.stringify(state.settings);
       try {
         const currentContext = assistContext(draft, current, intent, question, knowledgeSelection);
+        const currentChatSources = batch?.chatBinding ? await this.chatSourcesForBinding(draft, batch.chatBinding) : [];
         let currentVersions: Record<string, string>;
         if (draft.settings.mode === 'provider') {
-          const currentRequest = { intent, question, ...(answeredAsOf ? { queryTimeAnchor: answeredAsOf, queryTimeZone: state.settings.timezone } : {}), additionalSources: currentContext.additionalSources, preselection: { omittedSourceCount: currentContext.omittedSourceCount, omittedSourceIds: currentContext.omittedSourceIds } };
+          const currentRequest = { intent, question, ...(batch?.chatBinding ? { chatMode: true as const } : {}), ...(answeredAsOf ? { queryTimeAnchor: answeredAsOf, queryTimeZone: state.settings.timezone } : {}), additionalSources: [...currentContext.additionalSources, ...currentChatSources], preselection: { omittedSourceCount: currentContext.omittedSourceCount + (batch?.chatBinding?.omittedTurnCount ?? 0), omittedSourceIds: currentContext.omittedSourceIds } };
           currentVersions = draft.settings.llmProvider === 'openrouter'
             ? (await new OpenRouterBatchRequestBuilder().prepareAnalysis(current, currentContext.documents, draft.settings, currentRequest)).sourceVersions
             : (await this.openAiClient.prepare(current, currentContext.documents, draft.settings, currentRequest)).sourceVersions;
@@ -4487,7 +5047,7 @@ export class AppControllerImpl implements AppController {
       ];
       current.status = 'processed';
       current.processingFingerprint = processingFingerprint;
-      const memorySuggestionIds = this.materializeAssistantMemorySuggestions(draft, generated.memorySuggestions, current, memorySuggestionFingerprint);
+      const memorySuggestionIds = batch?.chatBinding ? [] : this.materializeAssistantMemorySuggestions(draft, generated.memorySuggestions, current, memorySuggestionFingerprint);
       if (memorySuggestionIds.length) this.validateKnowledgeAndBackup(draft);
       const analysis: NoteAssistResult = {
         noteId: id, sourceRevision, intent, ...(question ? { question } : {}), fingerprint: processingFingerprint,
@@ -4498,7 +5058,7 @@ export class AppControllerImpl implements AppController {
         includedSourceIds: generated.includedSourceIds, includedSources: generated.includedSources, omittedSourceIds: generated.omittedSourceIds, omittedSourceCount: generated.omittedSourceCount, sourceVersions: generated.sourceVersions, knowledgeSelection,
       };
       current.analysis = analysis;
-      const docs = [
+      const docs = batch?.chatBinding ? [] : [
         ...recordJournal(draft, `processed:${id}:r${sourceRevision}`, `Processed note ${current.title}; ${created.length} review suggestion(s) created.`),
         ...created.filter((proposal) => !existingByAction.has(proposal.sourceActionKey!)).map((proposal) => appendInference(draft, proposal, state.settings.mode)),
         ...memorySuggestionIds.flatMap(() => draft.documents.filter((document) => document.path === 'memory/INFERENCES.md')),
@@ -4508,7 +5068,8 @@ export class AppControllerImpl implements AppController {
         : `Preview mode extracted ${created.length} suggestion${created.length === 1 ? '' : 's'} from your transcript. No provider was contacted.`, { noteId: id });
       if (memorySuggestionIds.length) this.validateKnowledgeAndBackup(draft);
       return { proposals: selected, analysis, docs: [...new Map(docs.map((document) => [document.path, document])).values()] };
-    }, undefined, batch ? (_draft, applied) => batch.nextLedger(applied.analysis) : undefined);
+    }, undefined, batch ? (_draft, applied) => batch.nextLedger(applied.analysis) : undefined,
+    batch?.nextChatLedger ? () => batch.nextChatLedger!() : undefined);
     const resultNotRetained = batch && this.assistantBatchLedger.jobs.some((job) => job.id === batch.jobId && job.status === 'result_not_retained');
     if (!resultNotRetained) await Promise.all(result.docs.map((document) => this.mirrorDocument(document)));
     return result.analysis;
@@ -4656,6 +5217,7 @@ export class AppControllerImpl implements AppController {
     const initial = this.snapshot;
     const note = initial.notes.find((item) => item.id === id);
     if (!note) throw new Error('Note was not found.');
+    if (note.origin === 'assistant_chat') throw new Error('Chat messages cannot be transcribed from audio.');
     if (requestedRevision >= 0 && note.revision !== requestedRevision) throw new Error('The note changed before transcription. Review the current note and try again.');
     if (!note.audioUri) throw new Error('This note has no audio to transcribe.');
     if (note.audioAttachment?.durationStatus === 'unknown') throw new Error('This replacement recording has no verified duration. It cannot be sent for transcription.');
@@ -6600,6 +7162,9 @@ export class AppControllerImpl implements AppController {
     if (new TextEncoder().encode(input.narrative).length > 16 * 1024) throw new Error('Knowledge narrative is limited to 16 KiB.');
     let replacesCapturedKnowledge = false;
     let savedEntityId: string | undefined;
+    const sourceRemoval = this.sourceRemovalCommit((job) => Boolean(savedEntityId &&
+      (job.sourceVersions?.[`knowledge:${kind}:${savedEntityId}`] !== undefined ||
+        job.sourceVersions?.[`doc:${kind === 'person' ? 'people' : 'projects'}/${savedEntityId}.md`] !== undefined)));
     const saved = await this.mutate((state) => {
       this.assertKnowledgeWritable();
       const id = input.id ?? this.freshStateId(state);
@@ -6639,8 +7204,7 @@ export class AppControllerImpl implements AppController {
       this.validateKnowledgeAndBackup(state);
       const savedEntity = getKnowledgeEntity(state.knowledge, kind, id)!;
       return { entity: savedEntity as Person | Project, document: nextDocument };
-    }, undefined, () => replacesCapturedKnowledge && savedEntityId ? this.tombstoneOpenRouterBatchJobs((job) => isOpenRouterBatchContentJob(job) &&
-      (job.sourceVersions?.[`knowledge:${kind}:${savedEntityId}`] !== undefined || job.sourceVersions?.[`doc:${kind === 'person' ? 'people' : 'projects'}/${savedEntityId}.md`] !== undefined)) : undefined);
+    }, undefined, (draft) => replacesCapturedKnowledge ? sourceRemoval.batch(draft) : undefined, () => sourceRemoval.chat());
     await this.mirrorDocument(saved.document);
     await this.mirrorKnowledgeJournals();
     return saved.entity;
@@ -6674,6 +7238,7 @@ export class AppControllerImpl implements AppController {
     this.assertKnowledgeWritable();
     if (this.activeBatchNoteOperations.size) throw new Error('A Batch request is still using saved context. Try again after it finishes.');
     let removesCapturedKnowledge = false;
+    const sourceRemoval = this.sourceRemovalCommit((job) => job.sourceVersions?.[`knowledge:${command.entityKind}:${command.entityId}`] !== undefined);
     return this.mutate((state) => {
       this.assertKnowledgeWritable();
       if (this.activeBatchNoteOperations.size) throw new Error('A Batch request is still using saved context. Try again after it finishes.');
@@ -6688,8 +7253,7 @@ export class AppControllerImpl implements AppController {
       markAnalysesStale(state, [`knowledge:${command.entityKind}:${command.entityId}`]);
       this.validateKnowledgeAndBackup(state);
       return result;
-    }, undefined, () => removesCapturedKnowledge ? this.tombstoneOpenRouterBatchJobs((job) => isOpenRouterBatchContentJob(job) &&
-      job.sourceVersions?.[`knowledge:${command.entityKind}:${command.entityId}`] !== undefined) : undefined);
+    }, undefined, (draft) => removesCapturedKnowledge ? sourceRemoval.batch(draft) : undefined, () => sourceRemoval.chat());
   }
 
   async saveKnowledgeFact(input: SaveKnowledgeFactInput): Promise<KnowledgeFact> {
@@ -6945,6 +7509,7 @@ export class AppControllerImpl implements AppController {
     this.assertKnowledgeWritable();
     let removesCapturedKnowledge = false;
     let changedKnowledgeSourceKey: string | undefined;
+    const sourceRemoval = this.sourceRemovalCommit((job) => Boolean(changedKnowledgeSourceKey && job.sourceVersions?.[changedKnowledgeSourceKey] !== undefined));
     const result = await this.mutate(async (state) => {
       this.assertKnowledgeWritable();
       const suggestion = state.knowledge.suggestions.find((item) => item.id === id);
@@ -7006,8 +7571,7 @@ export class AppControllerImpl implements AppController {
       addActivity(state, 'local_action', `A reviewed memory suggestion was added to ${target.name}.`, { noteId: suggestion.sourceNoteId });
       this.validateKnowledgeAndBackup(state);
       return suggestion;
-    }, undefined, () => removesCapturedKnowledge && changedKnowledgeSourceKey ? this.tombstoneOpenRouterBatchJobs((job) =>
-      isOpenRouterBatchContentJob(job) && job.sourceVersions?.[changedKnowledgeSourceKey!] !== undefined) : undefined);
+    }, undefined, (draft) => removesCapturedKnowledge ? sourceRemoval.batch(draft) : undefined, () => sourceRemoval.chat());
     await this.mirrorKnowledgeJournals();
     return result;
   }
@@ -7020,6 +7584,8 @@ export class AppControllerImpl implements AppController {
     if (entityPath && new TextEncoder().encode(content).length > 16 * 1024) throw new Error('Knowledge narrative is limited to 16 KiB.');
     let removesCapturedSource = false;
     let affectedKnowledgeSourceKey: string | undefined;
+    const sourceRemoval = this.sourceRemovalCommit((job) =>
+      job.sourceVersions?.[`doc:${cleanPath}`] !== undefined || Boolean(affectedKnowledgeSourceKey && job.sourceVersions?.[affectedKnowledgeSourceKey] !== undefined));
     const document = await this.mutate((state) => {
       if (entityPath) this.assertKnowledgeWritable();
       const existing = state.documents.find((item) => item.path === cleanPath);
@@ -7052,8 +7618,7 @@ export class AppControllerImpl implements AppController {
       if (changed) markAnalysesStale(state, [`doc:${cleanPath}`]);
       if (entityMatch) this.validateKnowledgeAndBackup(state);
       return next;
-    }, undefined, () => removesCapturedSource ? this.tombstoneOpenRouterBatchJobs((job) => isOpenRouterBatchContentJob(job) &&
-      (job.sourceVersions?.[`doc:${cleanPath}`] !== undefined || Boolean(affectedKnowledgeSourceKey && job.sourceVersions?.[affectedKnowledgeSourceKey] !== undefined))) : undefined);
+    }, undefined, (draft) => removesCapturedSource ? sourceRemoval.batch(draft) : undefined, () => sourceRemoval.chat());
     await this.mirrorDocument(document);
     return document;
   }
@@ -8664,8 +9229,11 @@ export class AppControllerImpl implements AppController {
 
   async deleteNote(id: string): Promise<void> {
     this.assertBatchLedgerCanDropContent();
+    if (this.assistantChatLedgerMalformed && this.state.notes.some((note) => note.id === id && note.origin === 'assistant_chat')) throw new Error('Saved chat history could not be validated. Refresh local data before continuing.');
+    if (this.state.notes.find((note) => note.id === id)?.origin === 'assistant_chat') throw new Error('Delete this message from its Chat conversation.');
     if (this.activeBatchNoteOperations.has(id)) throw new Error('A Batch request is still using this note. Try again after it finishes.');
     const audioUri = this.snapshot.notes.find((note) => note.id === id)?.audioUri;
+    const sourceRemoval = this.sourceRemovalCommit((job) => job.noteId === id || job.sourceVersions?.[`note:${id}`] !== undefined);
     await this.mutate(async (state) => {
       if (this.activeBatchNoteOperations.has(id)) throw new Error('A Batch request is still using this note. Try again after it finishes.');
       if (state.proposals.some((proposal) => proposal.noteId === id && (proposal.kind !== 'reminder' && ['dispatching', 'unknown'].includes(proposal.status)))) throw new Error('Wait for the in-progress external action result before deleting this note.');
@@ -8680,7 +9248,7 @@ export class AppControllerImpl implements AppController {
       state.notes = state.notes.filter((item) => item.id !== id);
       state.proposals = state.proposals.filter((item) => item.noteId !== id);
       state.activity = state.activity.filter((item) => item.noteId !== id);
-    }, undefined, () => this.tombstoneOpenRouterBatchJobs((job) => isOpenRouterBatchContentJob(job) && job.noteId === id));
+    }, undefined, (draft) => sourceRemoval.batch(draft), () => sourceRemoval.chat());
     await this.reconcileReminderAlerts();
     if (audioUri) {
       try { await (this.integration.removeAudio?.(audioUri) ?? removeAudio(audioUri, this.integration.audioBoundary)); }

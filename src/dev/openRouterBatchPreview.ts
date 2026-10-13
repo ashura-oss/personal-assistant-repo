@@ -19,9 +19,9 @@ import type { BackgroundTaskBackend } from '../background/backend.types';
 import type { RecordingRecoveryService } from '../audio/recovery.types';
 import type { SpeechAudioService } from '../audio/speechUpload.types';
 
-function assertPreviewEnabled() {
+function assertPreviewEnabled(scenario: 'openrouter-batch' | 'openrouter-chat' = 'openrouter-batch') {
   if (typeof __DEV__ === 'undefined' || !__DEV__ || Platform.OS !== 'web' ||
-      process.env.EXPO_PUBLIC_PREVIEW_SCENARIO !== 'openrouter-batch') {
+      process.env.EXPO_PUBLIC_PREVIEW_SCENARIO !== scenario) {
     throw new Error('The Batch sample is available only in its isolated development browser scenario.');
   }
 }
@@ -103,19 +103,23 @@ function jsonResponse(body: unknown, status: number): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
 }
 
-function makeSampleBatchClient() {
+function makeSampleBatchClient(maxRequests = 1) {
   const jobs = new Map<string, { customId: string; inspectionCount: number }>();
+  const customIds = new Set<string>();
+  const submittedMessages: unknown[][] = [];
   let postCount = 0;
   let getCount = 0;
   const fetcher: typeof fetch = async (input, init) => {
     const url = String(input);
     const method = init?.method ?? 'GET';
     if (url === OPENROUTER_BATCH_ENDPOINT && method === 'POST') {
-      if (postCount > 0) throw sampleOnlyError();
-      postCount += 1;
-      const payload = JSON.parse(String(init?.body)) as { requests?: { custom_id?: string }[] };
+      const payload = JSON.parse(String(init?.body)) as { requests?: { custom_id?: string; body?: { messages?: unknown[] } }[] };
       const customId = payload.requests?.[0]?.custom_id ?? '';
-      const batchId = 'sample_batch_001';
+      if (postCount >= maxRequests || !customId || customIds.has(customId) || payload.requests?.length !== 1) throw sampleOnlyError();
+      postCount += 1;
+      customIds.add(customId);
+      submittedMessages.push(payload.requests?.[0]?.body?.messages ?? []);
+      const batchId = `sample_batch_${String(postCount).padStart(3, '0')}`;
       jobs.set(batchId, { customId, inspectionCount: 0 });
       return jsonResponse({
         id: batchId,
@@ -169,14 +173,28 @@ function makeSampleBatchClient() {
     assertCredentialGeneration: () => undefined,
     assertBeforeStart: () => undefined,
   });
-  return { client, getMetrics: () => ({ postCount, getCount }) };
+  return {
+    client,
+    getMetrics: () => ({ postCount, getCount }),
+    getSubmittedMessages: () => submittedMessages.map((messages) => structuredClone(messages)),
+  };
 }
 
 /** Uses the real controller ledger with a volatile store and a deterministic in-process transport. */
 export async function createOpenRouterBatchPreview() {
-  assertPreviewEnabled();
+  assertPreviewEnabled('openrouter-batch');
+  return createPreviewWorkspace(1, true);
+}
+
+/** Closed multi-turn fixture for Chat. Each distinct local request may be submitted once. */
+export async function createOpenRouterChatPreview() {
+  assertPreviewEnabled('openrouter-chat');
+  return createPreviewWorkspace(4, false);
+}
+
+async function createPreviewWorkspace(maxRequests: number, seedNote: boolean) {
   const { AppControllerImpl } = await import('../services/controller');
-  const batch = makeSampleBatchClient();
+  const batch = makeSampleBatchClient(maxRequests);
   const controller = new AppControllerImpl(new MemoryStore(), {
     speech: new AzureSpeechClient({ fetcher: denyNetwork, readKey: async () => null }),
     openAi: new AzureOpenAIClient(denyNetwork, async () => null),
@@ -205,13 +223,16 @@ export async function createOpenRouterBatchPreview() {
     openRouterModel: 'openai/gpt-6-luna:batch',
     openRouterReasoningEffort: 'low',
   });
-  await controller.saveNote({
-    transcript: 'Fictional sample note: prepare a short review of the launch timeline next week.',
-    capturedAt: '2026-10-13T09:00:00.000Z',
-    captureTimeZone: 'Asia/Singapore',
-  });
+  if (seedNote) {
+    await controller.saveNote({
+      transcript: 'Fictional sample note: prepare a short review of the launch timeline next week.',
+      capturedAt: '2026-10-13T09:00:00.000Z',
+      captureTimeZone: 'Asia/Singapore',
+    });
+  }
   return {
     controller,
     getMetrics: batch.getMetrics,
+    getSubmittedMessages: batch.getSubmittedMessages,
   };
 }

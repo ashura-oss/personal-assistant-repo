@@ -763,13 +763,17 @@ function analysisHistory(note: AppState['notes'][number]): PortableHistoryEntry[
 /** Build an allowlisted DTO. Runtime-only fields and authority are deliberately not projected. */
 export function createPortableBackup(state: AppState, metadata: PortableBackupMetadata): PortableBackupV3 {
   const history: PortableHistoryEntry[] = [];
-  const currentNoteIds = new Set(state.notes.map((note) => note.id));
+  // Chat conversations have their own future inert export contract. The legacy
+  // note backup must not accidentally serialize their canonical message notes.
+  const assistantChatNoteIds = new Set(state.notes.filter((note) => note.origin === 'assistant_chat').map((note) => note.id));
+  const portableNotes = state.notes.filter((note) => note.origin !== 'assistant_chat');
+  const currentNoteIds = new Set(portableNotes.map((note) => note.id));
   const stateKnowledge = (state as AppState & { knowledge?: KnowledgeState }).knowledge ?? emptyKnowledgeState();
   const stateDocuments = (state as AppState & { documents: PortableDocument[] }).documents;
   const backup: PortableBackupV3 = {
     format: PORTABLE_BACKUP_FORMAT, schemaVersion: PORTABLE_BACKUP_SCHEMA_VERSION,
     exportId: validateId(metadata.exportId, 'Backup export ID'), exportedAt: validateDate(metadata.exportedAt, 'Backup export time'), audioIncluded: false,
-    notes: state.notes.map((note) => {
+    notes: portableNotes.map((note) => {
       const importOrigin = (note as typeof note & { importOrigin?: { audioMissing?: boolean; originalTimeZoneUnknown?: boolean } }).importOrigin;
       const originalTimeZoneUnknown = importOrigin?.originalTimeZoneUnknown === true;
       return { sourceId: note.id, title: note.title, transcript: note.transcript, durationSeconds: note.durationSeconds,
@@ -778,7 +782,7 @@ export function createPortableBackup(state: AppState, metadata: PortableBackupMe
         ...(originalTimeZoneUnknown ? { originalTimeZoneUnknown: true as const } : {}),
         ...(note.audioUri || importOrigin?.audioMissing ? { audioMissing: true as const } : {}) };
     }),
-    tasks: state.tasks.map((task) => {
+    tasks: state.tasks.filter((task) => !task.sourceNoteId || !assistantChatNoteIds.has(task.sourceNoteId)).map((task) => {
       const sourceNoteId = task.sourceNoteId && currentNoteIds.has(task.sourceNoteId) ? task.sourceNoteId : undefined;
       const importOrigin = task.importOrigin;
       const unresolvedSourceNoteId = sourceNoteId ? undefined : importOrigin?.originalSourceNoteId ?? task.sourceNoteId;
@@ -790,13 +794,13 @@ export function createPortableBackup(state: AppState, metadata: PortableBackupMe
     archivedDocuments: [], knowledge: createPortableKnowledge(stateKnowledge, stateDocuments), archivedKnowledge: [],
     history,
   };
-  for (const note of state.notes) history.push(...analysisHistory(note));
-  for (const proposal of state.proposals) history.push(proposalHistory(proposal, state.activity));
+  for (const note of portableNotes) history.push(...analysisHistory(note));
+  for (const proposal of state.proposals) if (!proposal.noteId || !assistantChatNoteIds.has(proposal.noteId)) history.push(proposalHistory(proposal, state.activity));
   for (const reminder of state.reminders?.records ?? []) history.push({ kind: 'proposal', sourceId: `reminder:${reminder.id}`,
     title: 'Reminder — imported history',
     content: [`Title: ${reminder.title}`, `Details: ${reminder.body}`, `Due: ${reminder.dueAt}`, `Display time zone: ${reminder.displayTimeZone}`].join('\n'),
     status: `${reminder.status} (unverified imported history)`, ...(reminder.createdAt ? { occurredAt: reminder.createdAt } : {}) });
-  for (const attempt of state.transcription?.attempts ?? []) history.push({ kind: 'activity', sourceId: `transcription:${attempt.id}`,
+  for (const attempt of state.transcription?.attempts ?? []) if (!assistantChatNoteIds.has(attempt.noteId)) history.push({ kind: 'activity', sourceId: `transcription:${attempt.id}`,
     ...(currentNoteIds.has(attempt.noteId) ? { sourceNoteId: attempt.noteId } : {}), title: 'Voice transcription — imported history',
     content: [attempt.durationMilliseconds ? `Provider duration: ${attempt.durationMilliseconds} ms` : '', attempt.billedEstimateSeconds ? `Estimated billed duration: ${attempt.billedEstimateSeconds} seconds` : ''].filter(Boolean).join('\n'),
     status: `${attempt.outcome} (unverified imported transcription history)`, occurredAt: attempt.terminalAt ?? attempt.createdAt });
@@ -832,7 +836,7 @@ export function createPortableBackup(state: AppState, metadata: PortableBackupMe
         `All day: ${typeof details.allDay === 'boolean' ? (details.allDay ? 'yes' : 'no') : typeof details.isAllDay === 'boolean' ? (details.isAllDay ? 'yes' : 'no') : 'unknown'}`].filter((line) => !line.endsWith(': ')).join('\n');
     })(),
     status: `Imported calendar snapshot; unverified${event.observedAt ? '' : ' — Original time unavailable'}`, ...(event.observedAt ? { occurredAt: event.observedAt } : {}), provider: 'calendar provider', reference: event.providerEventId });
-  for (const item of state.activity) history.push({ kind: 'activity', sourceId: `activity:${item.id}`, ...(item.noteId ? { sourceNoteId: item.noteId } : {}),
+  for (const item of state.activity) if (!item.noteId || !assistantChatNoteIds.has(item.noteId)) history.push({ kind: 'activity', sourceId: `activity:${item.id}`, ...(item.noteId ? { sourceNoteId: item.noteId } : {}),
     title: 'Activity — imported history', content: item.message, status: item.type, occurredAt: item.createdAt });
   const archives = (state as AppState & { importedBackups?: ImportedBackupArchive[] }).importedBackups;
   if (Array.isArray(archives)) for (const archive of archives) {

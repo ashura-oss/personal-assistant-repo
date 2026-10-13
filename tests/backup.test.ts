@@ -53,6 +53,26 @@ function knowledgeWithProviderReference() {
 }
 
 describe('portable backup schema', () => {
+  it('omits Chat content while preserving unrelated orphaned note history', () => {
+    const state = emptyState();
+    state.notes.push({ id: 'chat-note', title: 'Chat message', transcript: 'CHAT_PRIVATE_SENTENCE', durationSeconds: 0,
+      createdAt: at, capturedAt: at, captureTimeZone: 'Asia/Singapore', status: 'recorded', revision: 1, origin: 'assistant_chat' });
+    state.proposals.push(
+      { id: 'chat-proposal', noteId: 'chat-note', kind: 'task', title: 'CHAT_PRIVATE_TITLE', body: 'CHAT_PRIVATE_BODY', status: 'draft', revision: 1, recipients: [], evidence: [] },
+      { id: 'orphan-proposal', noteId: 'deleted-legacy-note', kind: 'task', title: 'Legacy orphan', body: 'Keep unrelated orphan history', status: 'dismissed', revision: 1, recipients: [], evidence: [] },
+    );
+    state.activity.push(
+      { id: 'chat-activity', noteId: 'chat-note', type: 'proposal_created', message: 'CHAT_PRIVATE_ACTIVITY', createdAt: at },
+      { id: 'orphan-activity', noteId: 'deleted-legacy-note', type: 'error', message: 'Keep unrelated orphan activity', createdAt: at },
+    );
+    const backup = createPortableBackup(state, { exportId: 'chat-exclusion', exportedAt: at });
+    const text = JSON.stringify(backup);
+    expect(backup.notes).toHaveLength(0);
+    expect(text).not.toContain('CHAT_PRIVATE');
+    expect(text).toContain('Legacy orphan');
+    expect(text).toContain('Keep unrelated orphan activity');
+  });
+
   it('projects only portable content and strips local audio paths and authority fields', () => {
     const state = emptyState();
     state.notes.push({ id: 'n1', title: 'Note', transcript: 'Useful transcript', audioUri: 'file:///private/device/clip.m4a', durationSeconds: 15,

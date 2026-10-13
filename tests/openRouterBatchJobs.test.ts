@@ -68,4 +68,24 @@ describe('private OpenRouter Batch ledger receipts', () => {
     expect(tombstoneOpenRouterBatchJob(current.jobs[0]!, at).requestProfileVersion).toBe(2);
     expect(() => validateOpenRouterBatchLedger({ version: 1, jobs: [contentJob({ requestProfileVersion: 2, requestBody: bodyFor(1) })] })).toThrow(/integrity validation/i);
   });
+
+  it('requires dense, unique, plain Chat context bindings', () => {
+    const context = { turnId: '20000000-0000-4000-8000-000000000002', jobId: '20000000-0000-4000-8000-000000000003',
+      noteId: '20000000-0000-4000-8000-000000000004', noteRevision: 1, replySha256: 'e'.repeat(64), replyProfileVersion: 2 as const };
+    const valid = contentJob({ chatBinding: { conversationId: operationId, turnId: '20000000-0000-4000-8000-000000000005', context: [context], omittedTurnCount: 0 } });
+    expect(validateOpenRouterBatchLedger({ version: 1, jobs: [valid] }).jobs).toHaveLength(1);
+    expect(() => validateOpenRouterBatchLedger({ version: 1, jobs: [{ ...valid, chatBinding: { ...valid.chatBinding!, context: [context, context] } }] })).toThrow(/integrity validation/i);
+    const sparse = new Array(2) as unknown[];
+    sparse[1] = context;
+    expect(() => validateOpenRouterBatchLedger({ version: 1, jobs: [{ ...valid, chatBinding: { ...valid.chatBinding!, context: sparse } }] })).toThrow(/integrity validation/i);
+    const symbolic = [context] as unknown[] & { [key: symbol]: string };
+    symbolic[Symbol('hidden')] = 'not JSON-safe';
+    expect(() => validateOpenRouterBatchLedger({ version: 1, jobs: [{ ...valid, chatBinding: { ...valid.chatBinding!, context: symbolic } }] })).toThrow(/integrity validation/i);
+    let getterInvoked = false;
+    const accessor = [] as unknown[];
+    Object.defineProperty(accessor, '0', { enumerable: true, configurable: true, get: () => { getterInvoked = true; return context; } });
+    accessor.length = 1;
+    expect(() => validateOpenRouterBatchLedger({ version: 1, jobs: [{ ...valid, chatBinding: { ...valid.chatBinding!, context: accessor } }] })).toThrow(/integrity validation/i);
+    expect(getterInvoked).toBe(false);
+  });
 });

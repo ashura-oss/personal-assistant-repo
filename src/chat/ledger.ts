@@ -98,7 +98,7 @@ function parseReply(value: unknown): ChatReplySnapshot {
 
 function parseTurn(value: unknown): ChatTurn {
   if (!object(value)) fail('Chat turn is invalid.');
-  exactKeys(value, ['id', 'noteId', 'noteRevision', 'jobId', 'userText', 'createdAt', 'captureTimeZone'], ['reply']);
+  exactKeys(value, ['id', 'noteId', 'noteRevision', 'jobId', 'userText', 'createdAt', 'captureTimeZone'], ['reply', 'replySha256']);
   const base = {
     id: uuid(value.id, 'Chat turn ID'),
     noteId: uuid(value.noteId, 'Chat note ID'),
@@ -108,8 +108,13 @@ function parseTurn(value: unknown): ChatTurn {
     createdAt: timestamp(value.createdAt, 'Chat turn time'),
     captureTimeZone: timeZone(value.captureTimeZone),
   };
-  return Object.freeze(Object.prototype.hasOwnProperty.call(value, 'reply')
-    ? { ...base, reply: parseReply(value.reply) }
+  const hasReply = Object.prototype.hasOwnProperty.call(value, 'reply');
+  const hasReplyDigest = Object.prototype.hasOwnProperty.call(value, 'replySha256');
+  if (hasReply !== hasReplyDigest || (hasReplyDigest && (typeof value.replySha256 !== 'string' || value.replySha256.length !== 64 || !SHA256.test(value.replySha256)))) {
+    fail('Chat reply digest binding is invalid.');
+  }
+  return Object.freeze(hasReply
+    ? { ...base, reply: parseReply(value.reply), replySha256: value.replySha256 as string }
     : base);
 }
 

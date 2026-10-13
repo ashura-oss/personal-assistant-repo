@@ -2,15 +2,20 @@ import { describe, expect, it, vi } from 'vitest';
 import * as Crypto from 'expo-crypto';
 import { assistantResponseSchema } from '../src/assistant';
 import { AppControllerImpl } from '../src/services/controller';
-import { OpenRouterBatchClient, OPENROUTER_BATCH_BODY_MODEL, OPENROUTER_CHAT_COMPLETIONS_PATH, type OpenRouterBatchInspection } from '../src/services/openRouter';
+import { OpenRouterBatchClient, OpenRouterBatchRequestBuilder, OPENROUTER_BATCH_BODY_MODEL, OPENROUTER_CHAT_COMPLETIONS_PATH, type OpenRouterBatchInspection } from '../src/services/openRouter';
 import type { AppState } from '../src/core';
 import type { StateStore } from '../src/storage/contracts';
 
 class MemoryStore implements StateStore {
   value?: AppState;
   saves = 0;
+  failAfterCommit = false;
   async load() { return this.value ? structuredClone(this.value) : undefined; }
-  async save(state: AppState) { this.saves += 1; this.value = structuredClone(state); }
+  async save(state: AppState) {
+    this.saves += 1;
+    this.value = structuredClone(state);
+    if (this.failAfterCommit) { this.failAfterCommit = false; throw new Error('fixture lost the save acknowledgement'); }
+  }
   async clear() { this.value = undefined; }
 }
 
@@ -62,6 +67,239 @@ function completedInspection(customId: string, content = JSON.stringify({
 }
 
 describe('OpenRouter Batch controller lifecycle', () => {
+  it('freezes Chat replies by reply digest, reuses only the saved prior context, and deletes its content-free receipts', async () => {
+    const postedBodies: Record<string, unknown>[] = [];
+    const fakeClient = {
+      submit: async (input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => {
+        await before();
+        assert();
+        postedBodies.push(JSON.parse(input.requestBody) as Record<string, unknown>);
+        return { batchId: `batch_chat_${postedBodies.length}`, status: 'validating', endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH,
+          model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h', total: 1, completed: 0, failed: 0 };
+      },
+      inspect: async (batchId: string, customId: string) => ({ ...completedInspection(customId, JSON.stringify({
+        summary: 'Bring the draft outline.', answer: 'Bring the outline and a question for the team.', decisions: [], citations: [], clarifications: [], proposals: [], memorySuggestions: [],
+      })), batchId }),
+    } as unknown as OpenRouterBatchClient;
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient });
+    await app.load();
+    await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
+    const conversation = await app.createChatConversation('Planning');
+    const first = await app.submitChatTurn({ conversationId: conversation.id, text: 'What should I bring?' });
+    const outOfOrder = await app.submitChatTurn({ conversationId: conversation.id, text: 'What is the follow-up?' });
+    let persisted = store.value as AppState & { assistantChatLedger: { conversations: { turns: { replySha256: string; reply: { requestSha256: string } }[] }[] }; openRouterBatchLedger: { jobs: { id: string; requestSha256: string; chatBinding?: { context: { replySha256: string }[] } }[] } };
+    const outOfOrderJob = persisted.openRouterBatchLedger.jobs.find((job) => job.id === outOfOrder.jobId);
+    expect(outOfOrderJob?.chatBinding?.context).toHaveLength(0);
+    expect(JSON.stringify(postedBodies[1])).not.toContain('What should I bring?');
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(Date.now() + 20 * 60_000));
+    const firstResult = await app.refreshAssistantBatch(first.jobId);
+    expect(firstResult.status).toBe('completed');
+    vi.useRealTimers();
+
+    persisted = store.value as typeof persisted;
+    const firstTurn = persisted.assistantChatLedger.conversations[0]?.turns[0];
+    expect(firstTurn?.replySha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(firstTurn?.replySha256).not.toBe(firstTurn?.reply.requestSha256);
+
+    const second = await app.submitChatTurn({ conversationId: conversation.id, text: 'Anything else?' });
+    persisted = store.value as typeof persisted;
+    const secondJob = persisted.openRouterBatchLedger.jobs.find((job) => job.id === second.jobId);
+    expect(secondJob?.chatBinding?.context).toHaveLength(1);
+    expect(secondJob?.chatBinding?.context[0]?.replySha256).toBe(firstTurn?.replySha256);
+    const secondMessages = (postedBodies[2]?.messages as { content: string }[] | undefined) ?? [];
+    expect(secondMessages.some((message) => message.content.includes('What should I bring?'))).toBe(true);
+    expect(secondMessages.some((message) => message.content.includes('Bring the outline and a question for the team.'))).toBe(true);
+    expect(app.getSnapshot().assistantChatConversations?.[0]?.turns[0]?.reply).not.toHaveProperty('requestSha256');
+
+    await app.deleteChatConversation(conversation.id);
+    const deleted = store.value as AppState & { assistantChatLedger: { conversations: unknown[] }; openRouterBatchLedger: { jobs: Record<string, unknown>[] } };
+    expect(deleted.assistantChatLedger.conversations).toHaveLength(0);
+    expect(deleted.notes.filter((note) => note.origin === 'assistant_chat')).toHaveLength(0);
+    expect(deleted.openRouterBatchLedger.jobs.every((job) => job.status === 'source_removed' && !('requestBody' in job) && !('chatBinding' in job))).toBe(true);
+    expect(JSON.stringify(deleted)).not.toContain('What should I bring?');
+    expect(JSON.stringify(deleted)).not.toContain('Bring the outline and a question for the team.');
+  });
+
+  it('does not claim an ambiguously acknowledged Chat save or send again after reload', async () => {
+    let posts = 0;
+    const fakeClient = { submit: async () => { posts += 1; throw new Error('unexpected dispatch'); } } as unknown as OpenRouterBatchClient;
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient });
+    await app.load();
+    await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
+    const conversation = await app.createChatConversation('Uncertain save');
+    store.failAfterCommit = true;
+    await expect(app.submitChatTurn({ conversationId: conversation.id, text: 'CANARY durable turn' })).rejects.toThrow(/acknowledgement/i);
+    expect(posts).toBe(0);
+
+    const reloaded = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient });
+    await reloaded.load();
+    expect(reloaded.getSnapshot().assistantChatConversations?.[0]?.turns).toHaveLength(1);
+    expect(reloaded.getSnapshot().assistantChatConversations?.[0]?.turns[0]?.job?.status).toBe('failed');
+    expect(posts).toBe(0);
+  });
+
+  it('quarantines a malformed Chat ledger and hides its synthetic notes', async () => {
+    const store = new MemoryStore();
+    const seed = new AppControllerImpl(store, {});
+    await seed.load();
+    store.value = {
+      ...store.value!,
+      notes: [{ id: '20000000-0000-4000-8000-000000000010', title: 'Chat message', transcript: 'CANARY hidden chat', durationSeconds: 0,
+        createdAt: '2026-10-13T10:00:00.000Z', capturedAt: '2026-10-13T10:00:00.000Z', captureTimeZone: 'UTC', status: 'recorded', revision: 1, origin: 'assistant_chat' }],
+      assistantChatLedger: { version: 1, conversations: [], unexpected: 'private malformed data' },
+    } as AppState;
+    const app = new AppControllerImpl(store, {});
+    await app.load();
+    expect(app.getSnapshot().notes.some((note) => note.origin === 'assistant_chat')).toBe(false);
+    expect(app.getSnapshot().assistantChatConversations).toEqual([]);
+    expect(app.getSnapshot().assistantChatRecoveryStatus?.blocked).toBe(true);
+    await expect(app.createChatConversation('Blocked')).rejects.toThrow(/validated/i);
+  });
+
+  it('recomputes immutable Chat reply digests on reload and preserves tampered raw history privately', async () => {
+    const store = new MemoryStore();
+    const fakeClient = {
+      submit: (input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => fakeSubmit('batch_chat_digest', input, before, assert),
+      inspect: async (_batchId: string, customId: string) => completedInspection(customId, JSON.stringify({
+        summary: 'Verified summary.', answer: 'VERIFIED_CHAT_REPLY', decisions: [], citations: [], clarifications: [], proposals: [], memorySuggestions: [],
+      })),
+    } as unknown as OpenRouterBatchClient;
+    const app = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient });
+    await app.load();
+    await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
+    const conversation = await app.createChatConversation('Digest check');
+    const accepted = await app.submitChatTurn({ conversationId: conversation.id, text: 'Summarize this.' });
+    await app.refreshAssistantBatch(accepted.jobId);
+
+    const intact = new AppControllerImpl(store);
+    await intact.load();
+    expect(intact.getSnapshot().assistantChatRecoveryStatus?.blocked).not.toBe(true);
+    expect(intact.getSnapshot().assistantChatConversations?.[0]?.turns[0]?.reply?.answer).toBe('VERIFIED_CHAT_REPLY');
+
+    const persisted = store.value as AppState & { assistantChatLedger: { conversations: { turns: { reply: { answer: string }; replySha256: string }[] }[] } };
+    persisted.assistantChatLedger.conversations[0]!.turns[0]!.reply.answer = 'TAMPERED_CHAT_REPLY';
+    store.value = structuredClone(persisted);
+    const tampered = new AppControllerImpl(store);
+    await tampered.load();
+    expect(tampered.getSnapshot().assistantChatRecoveryStatus?.blocked).toBe(true);
+    expect(tampered.getSnapshot().assistantChatConversations).toEqual([]);
+    expect(tampered.getSnapshot().notes.some((note) => note.origin === 'assistant_chat')).toBe(false);
+    const preserved = store.value as typeof persisted;
+    expect(preserved.assistantChatLedger.conversations[0]?.turns[0]?.reply.answer).toBe('TAMPERED_CHAT_REPLY');
+    expect(preserved.assistantChatLedger.conversations[0]?.turns[0]?.replySha256).toBe(persisted.assistantChatLedger.conversations[0]?.turns[0]?.replySha256);
+  });
+
+  it('does not let a rejected old reply digest quarantine or publish into a replacement workspace', async () => {
+    const store = new MemoryStore();
+    const fakeClient = {
+      submit: (input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => fakeSubmit('batch_chat_stale_digest', input, before, assert),
+      inspect: async (_batchId: string, customId: string) => completedInspection(customId, JSON.stringify({
+        summary: 'Stable summary.', answer: 'DEFERRED_DIGEST_REPLY', decisions: [], citations: [], clarifications: [], proposals: [], memorySuggestions: [],
+      })),
+    } as unknown as OpenRouterBatchClient;
+    const seed = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient });
+    await seed.load();
+    await seed.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
+    const conversation = await seed.createChatConversation('Stale digest load');
+    const accepted = await seed.submitChatTurn({ conversationId: conversation.id, text: 'Keep the current workspace.' });
+    await seed.refreshAssistantBatch(accepted.jobId);
+
+    const replacement = new AppControllerImpl(store);
+    const originalDigest = Crypto.digestStringAsync.bind(Crypto);
+    let releaseDigest!: () => void;
+    let reachedDigest!: () => void;
+    const digestStarted = new Promise<void>((resolve) => { reachedDigest = resolve; });
+    const digestGate = new Promise<void>((resolve) => { releaseDigest = resolve; });
+    const spy = vi.spyOn(Crypto, 'digestStringAsync').mockImplementation(async (algorithm, value, options) => {
+      if (typeof value === 'string' && value.includes('DEFERRED_DIGEST_REPLY')) {
+        reachedDigest();
+        await digestGate;
+        throw new Error('digest failed after workspace disposal');
+      }
+      return originalDigest(algorithm, value, options);
+    });
+    try {
+      const loading = replacement.load();
+      await digestStarted;
+      await replacement.disposeForPrivacy();
+      releaseDigest();
+      await expect(loading).rejects.toThrow(/workspace changed|privacy/i);
+      expect(replacement.getSnapshot().notes).toHaveLength(0);
+      expect(replacement.getSnapshot().assistantChatRecoveryStatus?.blocked).not.toBe(true);
+      expect(replacement.getSnapshot().assistantChatConversations ?? []).toHaveLength(0);
+    } finally {
+      releaseDigest();
+      spy.mockRestore();
+    }
+  });
+
+  it('keeps a grounded Chat task proposal actionable after a delayed Batch reply', async () => {
+    const store = new MemoryStore();
+    const fakeClient = {
+      submit: (input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => fakeSubmit('batch_chat_delayed_action', input, before, assert),
+      inspect: async (_batchId: string, customId: string) => completedInspection(customId, JSON.stringify({
+        summary: 'Prepare the outline.', answer: 'Prepare a short outline before the meeting.', decisions: [], citations: [], clarifications: [],
+        proposals: [{ kind: 'task', title: 'Prepare the outline', body: 'Bring a short outline to the meeting.', recipients: [], dueAt: null,
+          evidence: ['Please prepare a short outline.'] }], memorySuggestions: [],
+      })),
+    } as unknown as OpenRouterBatchClient;
+    const app = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient });
+    await app.load();
+    await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
+    const conversation = await app.createChatConversation('Delayed action');
+    const accepted = await app.submitChatTurn({ conversationId: conversation.id, text: 'Please prepare a short outline.' });
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(Date.now() + 20 * 60_000));
+    try {
+      expect((await app.refreshAssistantBatch(accepted.jobId)).status).toBe('completed');
+      const proposal = app.getSnapshot().proposals.find((item) => item.kind === 'task');
+      expect(proposal).toBeDefined();
+      expect(proposal?.provenance).toMatchObject({ capturedAt: app.getSnapshot().notes.find((note) => note.id === proposal?.noteId)?.capturedAt });
+      expect(proposal?.provenance).not.toHaveProperty('answeredAsOf');
+      expect(proposal?.provenance).not.toHaveProperty('expiresAt');
+      const approved = await app.approveProposal(proposal!.id, { expectedRevision: proposal!.revision });
+      expect(approved.status).toBe('approved');
+      const executed = await app.executeProposal(approved.id, { expectedRevision: approved.revision });
+      expect(executed.status).toBe('executed');
+      expect(app.getSnapshot().tasks.some((task) => task.title === 'Prepare the outline')).toBe(true);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('rejects a Chat child task when an ancestor source changes without an explicit analysis refresh', async () => {
+    let inspectionNumber = 0;
+    const store = new MemoryStore();
+    const fakeClient = {
+      submit: (input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => fakeSubmit(`batch_chat_ancestor_${input.operationId}`, input, before, assert),
+      inspect: async (_batchId: string, customId: string) => {
+        inspectionNumber += 1;
+        const response = inspectionNumber === 1
+          ? { summary: 'Source summary.', answer: 'The source describes a planning checklist.', decisions: [], citations: [], clarifications: [], proposals: [], memorySuggestions: [] }
+          : { summary: 'A task was suggested.', answer: 'Prepare a short outline.', decisions: [], citations: [], clarifications: [],
+              proposals: [{ kind: 'task', title: 'Prepare a short outline', body: 'Bring the outline.', recipients: [], dueAt: null,
+                evidence: ['Please prepare an outline.'] }], memorySuggestions: [] };
+        return completedInspection(customId, JSON.stringify(response));
+      },
+    } as unknown as OpenRouterBatchClient;
+    const app = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient });
+    await app.load();
+    await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
+    const person = await app.savePerson({ name: 'Maya', aliases: [], narrative: 'Current planning source details.' });
+    const conversation = await app.createChatConversation('Ancestor validation');
+    const first = await app.submitChatTurn({ conversationId: conversation.id, text: 'Summarize this source.', knowledgeSelection: [{ kind: 'person', id: person.id }] });
+    expect((await app.refreshAssistantBatch(first.jobId)).status).toBe('completed');
+    const child = await app.submitChatTurn({ conversationId: conversation.id, text: 'Please prepare an outline.' });
+    expect((await app.refreshAssistantBatch(child.jobId)).status).toBe('completed');
+    const proposal = app.getSnapshot().proposals.find((item) => item.kind === 'task');
+    expect(proposal).toBeDefined();
+
+    const currentPerson = app.getSnapshot().knowledge.people.find((item) => item.id === person.id)!;
+    await app.setKnowledgeEntityArchived({ kind: 'person', id: person.id, expectedRevision: currentPerson.revision, archived: true });
+    await expect(app.approveProposal(proposal!.id, { expectedRevision: proposal!.revision })).rejects.toThrow(/source|context|selection/i);
+  });
+
   it('saves a one-time job before POST, then strips removed note/request text in the same deletion save', async () => {
     const store = new MemoryStore();
     const app = new AppControllerImpl(store, {}, { openRouterBatchClient: client() });
@@ -502,6 +740,76 @@ describe('OpenRouter Batch controller lifecycle', () => {
     const saved = store.value as (AppState & { openRouterBatchLedger: { jobs: Record<string, unknown>[] } });
     expect(saved.openRouterBatchLedger.jobs[0]).toMatchObject({ id: queued.id, status: 'source_removed', requestProfileVersion: 2 });
     expect(JSON.stringify(saved)).not.toContain('PRIVATE_DOCUMENT_CANARY');
+  });
+
+  it('redacts only source-dependent Chat replies and descendants when a captured document changes', async () => {
+    const posted: string[] = [];
+    let submitted = 0;
+    const fakeClient = {
+      submit: async (input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => {
+        await before(); assert(); posted.push(input.requestBody); submitted += 1;
+        return { batchId: `batch_chat_redaction_${submitted}`, status: 'validating', endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH,
+          model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h', total: 1, completed: 0, failed: 0 };
+      },
+      inspect: async (_batchId: string, customId: string) => completedInspection(customId, JSON.stringify({
+        summary: 'Private summary.', answer: 'PRIVATE_CHAT_REPLY_CANARY', decisions: [], citations: [], clarifications: [], proposals: [], memorySuggestions: [],
+      })),
+    } as unknown as OpenRouterBatchClient;
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient });
+    await app.load();
+    await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
+    const person = await app.savePerson({ name: 'Maya', aliases: [], narrative: 'PRIVATE_CHAT_SOURCE_CANARY' });
+    const conversation = await app.createChatConversation('Source dependent');
+    const first = await app.submitChatTurn({ conversationId: conversation.id, text: 'What does this source say?', knowledgeSelection: [{ kind: 'person', id: person.id }] });
+    expect(posted[0]).toContain('PRIVATE_CHAT_SOURCE_CANARY');
+    const independent = await app.submitChatTurn({ conversationId: conversation.id, text: 'A separate question before the first reply.' });
+    expect(posted[1]).not.toContain('PRIVATE_CHAT_SOURCE_CANARY');
+    expect(posted[1]).not.toContain('PRIVATE_CHAT_REPLY_CANARY');
+    expect((await app.refreshAssistantBatch(first.jobId)).status).toBe('completed');
+    const second = await app.submitChatTurn({ conversationId: conversation.id, text: 'What did you say before?' });
+    expect(posted[2]).toContain('PRIVATE_CHAT_REPLY_CANARY');
+    expect((await app.refreshAssistantBatch(second.jobId)).status).toBe('completed');
+    const rebuildSpy = vi.spyOn(OpenRouterBatchRequestBuilder.prototype, 'prepareAnalysis');
+    const descendant = await app.submitChatTurn({ conversationId: conversation.id, text: 'Continue from those answers.' });
+    // Two eligible prior roots rebuild once each, plus one build for this request.
+    expect(rebuildSpy).toHaveBeenCalledTimes(3);
+    rebuildSpy.mockRestore();
+
+    const savedPerson = app.getSnapshot().knowledge.people.find((row) => row.id === person.id)!;
+    const narrative = app.getSnapshot().documents.find((row) => row.path === person.narrativePath)!;
+    await app.savePerson({ id: person.id, expectedRevision: savedPerson.revision, expectedDocumentRevision: narrative.revision,
+      name: 'Maya', aliases: [], narrative: 'The source was removed.' });
+
+    const persisted = store.value as AppState & {
+      assistantChatLedger: { conversations: { turns: { jobId: string; reply?: unknown; replySha256?: string }[] }[] };
+      openRouterBatchLedger: { jobs: Record<string, unknown>[] };
+    };
+    const turns = persisted.assistantChatLedger.conversations[0]?.turns ?? [];
+    expect(turns).toHaveLength(4);
+    expect([turns[0], turns[2], turns[3]].every((turn) => !turn.reply && !turn.replySha256)).toBe(true);
+    expect(turns[1]?.reply).toBeUndefined();
+    const jobs = persisted.openRouterBatchLedger.jobs.filter((job) => [first.jobId, second.jobId, descendant.jobId].includes(String(job.id)));
+    expect(jobs).toHaveLength(3);
+    expect(jobs.every((job) => job.status === 'source_removed' && !('requestBody' in job) && !('chatBinding' in job))).toBe(true);
+    const independentJob = persisted.openRouterBatchLedger.jobs.find((job) => job.id === independent.jobId);
+    expect(independentJob).toMatchObject({ id: independent.jobId, status: 'queued' });
+    expect(independentJob).toHaveProperty('requestBody');
+    expect(persisted.notes.filter((note) => note.origin === 'assistant_chat')).toHaveLength(4);
+    expect(persisted.notes.filter((note) => note.origin === 'assistant_chat').every((note) => !note.analysis && !note.processingFingerprint)).toBe(true);
+    expect(JSON.stringify(persisted)).not.toContain('PRIVATE_CHAT_SOURCE_CANARY');
+    expect(JSON.stringify(persisted)).not.toContain('PRIVATE_CHAT_REPLY_CANARY');
+
+    const reloaded = new AppControllerImpl(store);
+    await reloaded.load();
+    expect(reloaded.getSnapshot().assistantChatRecoveryStatus?.blocked).not.toBe(true);
+    const restoredTurns = reloaded.getSnapshot().assistantChatConversations?.[0]?.turns ?? [];
+    expect(restoredTurns).toHaveLength(4);
+    expect(restoredTurns[0]?.reply).toBeUndefined();
+    expect(restoredTurns[1]?.reply).toBeUndefined();
+    expect(restoredTurns[1]?.job?.status).toBe('queued');
+    expect(restoredTurns[2]?.reply).toBeUndefined();
+    expect(restoredTurns[3]?.reply).toBeUndefined();
   });
 
   it('tombstones captured knowledge content when a reviewed suggestion changes the entity', async () => {

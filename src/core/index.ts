@@ -77,6 +77,8 @@ export interface Note {
   createdAt: string;
   capturedAt?: string;
   status: NoteStatus;
+  /** Local conversation-owned synthetic note; generic note actions must not mutate it. */
+  origin?: 'assistant_chat';
   /** Increments whenever transcript or attached recording changes; approvals bind to this source revision. */
   revision: number;
   /** Persisted identity of the last analysis inputs, so retries/reloads do not repeat paid calls. */
@@ -668,6 +670,10 @@ export interface AppState {
   mailAlertRefreshRequired?: { required: true; message: 'Saved data changed. Refresh local data before continuing.' };
   /** Safe Batch job summaries only; raw request/result material remains in a private controller sidecar. */
   assistantBatchJobs?: import('../services/openRouterBatchJobs').AssistantBatchJobDTO[];
+  /** Safe local chat snapshots. The provider request/job bindings remain private. */
+  assistantChatConversations?: import('../chat/types').ChatConversationDTO[];
+  /** Fixed notice; malformed chat state is retained privately and blocks chat operations. */
+  assistantChatRecoveryStatus?: { blocked: true; message: 'Saved chat history could not be validated and is held privately. Chat actions are disabled until local data is refreshed.' };
   /** Fixed notice for an invalid private Batch ledger. */
   assistantBatchRecoveryStatus?: { blocked: true; message: 'Saved Batch history could not be validated and is held privately. Batch actions are disabled until local data is refreshed.' };
   /** Imported material is inert archive data; it is never assistant context or live authority. */
@@ -848,6 +854,9 @@ export interface AppController {
   processNote(id: string): Promise<Proposal[]>;
   assistNote(id: string, options?: { intent?: AssistIntent; question?: string; forceRefresh?: boolean; knowledgeSelection?: KnowledgeSelection }): Promise<NoteAssistResult>;
   submitNoteBatch(noteId: string, options?: { intent?: AssistIntent; question?: string; knowledgeSelection?: KnowledgeSelection }): Promise<import('../services/openRouterBatchJobs').AssistantBatchJobDTO>;
+  createChatConversation(title?: string): Promise<import('../chat/types').ChatConversationDTO>;
+  submitChatTurn(input: { conversationId: string; text: string; knowledgeSelection?: KnowledgeSelection }): Promise<{ kind: 'accepted'; conversationId: string; turnId: string; jobId: string }>;
+  deleteChatConversation(id: string): Promise<void>;
   refreshAssistantBatch(jobId: string): Promise<import('../services/openRouterBatchJobs').AssistantBatchJobDTO>;
   retryAssistantBatchCleanup(jobId: string): Promise<import('../services/openRouterBatchJobs').AssistantBatchJobDTO>;
   refreshAnalysisStatus(noteId: string): Promise<NoteAssistResult | undefined>;
