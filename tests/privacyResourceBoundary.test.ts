@@ -42,7 +42,7 @@ describe('privacy-bound provider and notification resources', () => {
     const { privacy, descriptors } = privacyMock();
     let finish!: () => void;
     let completed = false;
-    const raw = { get: vi.fn(async () => null), set: vi.fn(async () => { await new Promise<void>((resolve) => { finish = resolve; }); }), delete: vi.fn(async () => undefined) };
+    const raw = { get: vi.fn(async () => null), set: vi.fn(async (key: string) => { if (key === 'azure.speech.subscription-key') await new Promise<void>((resolve) => { finish = resolve; }); }), delete: vi.fn(async () => undefined) };
     const store = createPrivacyBoundCredentialStore(raw, { privacy, session });
     const operation = store.set('azure.speech.subscription-key', 'opaque').then(() => { completed = true; });
     await vi.waitFor(() => expect(raw.set).toHaveBeenCalledTimes(1));
@@ -50,6 +50,8 @@ describe('privacy-bound provider and notification resources', () => {
     expect(descriptors).toEqual([{ kind: 'provider_credential', namespace: 'provider_credentials' }]);
     finish();
     await operation;
+    await store.set('openrouter.api-key', 'private-provider-key');
+    expect(raw.set).toHaveBeenLastCalledWith('openrouter.api-key', 'private-provider-key');
     expect(() => store.get('arbitrary-key')).toThrow('outside the provider credential store');
   });
 

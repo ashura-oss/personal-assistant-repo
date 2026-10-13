@@ -12,8 +12,8 @@ export interface WebPrivacyEraseIO {
   stateDatabaseGone(): Promise<boolean>;
   deleteDatabase(name: 'voice-assistant' | 'still-audio-v1', beforeMutation: () => Promise<void>): Promise<void>;
   databaseDeletionConfirmed(name: 'voice-assistant' | 'still-audio-v1'): boolean;
-  deleteProviderCredential(kind: 'speech' | 'openai', beforeMutation: () => Promise<void>): Promise<void>;
-  providerCredentialExists(kind: 'speech' | 'openai'): Promise<boolean>;
+  deleteProviderCredential(kind: 'speech' | 'openai' | 'openrouter', beforeMutation: () => Promise<void>): Promise<void>;
+  providerCredentialExists(kind: 'speech' | 'openai' | 'openrouter'): Promise<boolean>;
   deleteOAuthToken(tokenRef: string, beforeMutation: () => Promise<void>): Promise<void>;
   oauthTokenExists(tokenRef: string): Promise<boolean>;
 }
@@ -58,7 +58,7 @@ function createDefaultWebIO(): WebPrivacyEraseIO {
     async providerCredentialExists(kind) {
       const { getCredentials } = await import('../services/credentials');
       const status = await getCredentials();
-      return kind === 'speech' ? status.speechConfigured : status.openAiConfigured;
+      return kind === 'speech' ? status.speechConfigured : kind === 'openai' ? status.openAiConfigured : status.openRouterConfigured === true;
     },
     async deleteOAuthToken(tokenRef, beforeMutation) {
       const { deleteOAuthToken } = await import('../auth/tokenStore');
@@ -100,8 +100,10 @@ async function eraseWebTarget(io: WebPrivacyEraseIO, target: PrivacyCleanupTarge
     case 'notifications': return; // Browser notifications/background work are not owned by this app backend.
     case 'recovery_audio': return; // Stored in still-audio-v1, removed by browser_audio.
     case 'provider_credentials':
-      await io.deleteProviderCredential('speech', beforeMutation);
-      await io.deleteProviderCredential('openai', beforeMutation);
+      {
+        const results = await Promise.allSettled((['speech', 'openai', 'openrouter'] as const).map(async (kind) => io.deleteProviderCredential(kind, beforeMutation)));
+        if (results.some((result) => result.status === 'rejected')) throw new PrivacyEraseAdapterError('target_unavailable');
+      }
       return;
   }
 }
@@ -131,7 +133,10 @@ async function webTargetGone(io: WebPrivacyEraseIO, target: PrivacyCleanupTarget
       const staging = await import('../audio/speechUpload.web');
       return staging.speechStagingMemoryCount() === 0;
     }
-    case 'provider_credentials': return !(await io.providerCredentialExists('speech')) && !(await io.providerCredentialExists('openai'));
+    case 'provider_credentials': {
+      const results = await Promise.allSettled((['speech', 'openai', 'openrouter'] as const).map(async (kind) => io.providerCredentialExists(kind)));
+      return results.every((result) => result.status === 'fulfilled' && !result.value);
+    }
   }
 }
 

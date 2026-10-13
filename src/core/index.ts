@@ -456,6 +456,14 @@ export interface ActivityItem {
 
 export interface AppSettings {
   mode: 'preview' | 'provider';
+  /** Selects the provider independently from local Preview mode; missing legacy values remain Azure. */
+  llmProvider?: 'azure' | 'openrouter';
+  /** Fixed OpenRouter model slug for the versioned request profile. */
+  openRouterModel?: 'openai/gpt-6-luna:batch';
+  /** OpenRouter keeps its own selected effort when the Azure profile is changed. */
+  openRouterReasoningEffort?: 'none' | 'low';
+  /** Controlled profile version; changed request construction invalidates captured analysis fingerprints. */
+  llmRequestContractVersion?: 1;
   timezone: string;
   /** OS background mail refresh is an explicit opt-in and is disabled for legacy snapshots. */
   backgroundMailRefreshEnabled?: boolean;

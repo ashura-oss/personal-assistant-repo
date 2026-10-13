@@ -128,6 +128,60 @@ const isMailAlertTapsDemo = previewScenario === "mail-alert-taps" && Platform.OS
 const isProactiveRecoveryDemo = previewScenario === "proactive-recovery" && Platform.OS === "web";
 const isIsolatedDemo = isDispatchHistoryDemo || isMailSyncDemo || isBackupImportDemo || isKnowledgeDemo || isReminderDemo || isDeviceCalendarsDemo || isTranscriptionDemo || isStartupRecoveryDemo || isPrivacyCleanupDemo || isPendingRecoveryDemo || isBackgroundRefreshDemo || isMailAlertDemo || isMailAlertTapsDemo || isProactiveRecoveryDemo;
 
+type LlmProviderChoice = "azure" | "openrouter";
+
+export function buildLlmProviderSettingsPatch(
+  provider: LlmProviderChoice,
+  values: {
+    endpoint: string;
+    deployment: string;
+    model: string;
+    azureEffort: "none" | "low";
+    openRouterEffort: "none" | "low";
+    maxRequestBytes: number;
+    maxOutputTokens: number;
+    monthlyBudgetUsd: number;
+    maxAttempts: number;
+    maxCallsPerDay: number;
+  },
+): Partial<AppSettings> {
+  if (provider === "openrouter") {
+    return {
+      llmProvider: "openrouter",
+      openRouterModel: "openai/gpt-6-luna:batch",
+      openRouterReasoningEffort: values.openRouterEffort,
+    };
+  }
+  return {
+    llmProvider: "azure",
+    openAiEndpoint: values.endpoint,
+    openAiDeployment: values.deployment,
+    model: values.model,
+    reasoningEffort: values.azureEffort,
+    maxRequestBytes: values.maxRequestBytes,
+    maxOutputTokens: values.maxOutputTokens,
+    monthlyBudgetUsd: values.monthlyBudgetUsd,
+    maxAttempts: values.maxAttempts,
+    maxCallsPerDay: values.maxCallsPerDay,
+  };
+}
+
+export function buildProviderCredentialInput(
+  provider: LlmProviderChoice,
+  speechSubscriptionKey: string,
+  openAiApiKey: string,
+  openRouterApiKey: string,
+): { speechSubscriptionKey?: string; openAiApiKey?: string; openRouterApiKey?: string } {
+  const speech = speechSubscriptionKey.trim();
+  const llmKey = (provider === "azure" ? openAiApiKey : openRouterApiKey).trim();
+  return {
+    ...(speech ? { speechSubscriptionKey: speech } : {}),
+    ...(llmKey
+      ? provider === "azure" ? { openAiApiKey: llmKey } : { openRouterApiKey: llmKey }
+      : {}),
+  };
+}
+
 function useAppState(appController: AppController) {
   return useSyncExternalStore(
     (listener) => appController.subscribe(listener),
@@ -443,6 +497,9 @@ const previewCredentialService: ProviderCredentialService = {
   currentSpeechCredentialGeneration: () => 0,
   assertSpeechCredentialGeneration: () => { throw new Error("Provider credentials are unavailable in sample previews."); },
   readSpeechCredentialSnapshot: async () => ({ key: null, generation: 0 }),
+  currentProviderCredentialGeneration: () => 0,
+  assertProviderCredentialGeneration: () => { throw new Error("Provider credentials are unavailable in sample previews."); },
+  readProviderCredentialSnapshot: async () => ({ key: null, generation: 0 }),
   getCredentials: async () => ({ speechConfigured: false, openAiConfigured: false }),
   readProviderCredential: async () => null,
   setCredentials: async () => { throw new Error("Provider credentials are unavailable in sample previews."); },
@@ -4085,8 +4142,9 @@ function SettingsScreen({
   onSaveCredentials: (c: {
     speechSubscriptionKey?: string;
     openAiApiKey?: string;
+    openRouterApiKey?: string;
   }) => Promise<unknown>;
-  onDeleteCredentials: (kind?: "speech" | "openai") => Promise<unknown>;
+  onDeleteCredentials: (kind?: "speech" | "openai" | "openrouter") => Promise<unknown>;
   credentialService: ProviderCredentialService;
   privacyEraseAvailable?: boolean;
   onDeleteLocalData: () => void;
@@ -4111,6 +4169,9 @@ function SettingsScreen({
                   ? "Recovery is unavailable. Existing saved data has not been reset."
                   : "";
   const [endpoint, setEndpoint] = useState(state.settings.openAiEndpoint ?? "");
+  const [llmProvider, setLlmProvider] = useState<"azure" | "openrouter">(
+    state.settings.llmProvider ?? "azure",
+  );
   const [deployment, setDeployment] = useState(
     state.settings.openAiDeployment ?? "",
   );
@@ -4119,7 +4180,9 @@ function SettingsScreen({
   );
   const [model, setModel] = useState(state.settings.model ?? "gpt-6-luna");
   const [effort, setEffort] = useState<"none" | "low">(
-    state.settings.reasoningEffort ?? "none",
+    state.settings.llmProvider === "openrouter"
+      ? state.settings.openRouterReasoningEffort ?? "low"
+      : state.settings.reasoningEffort ?? "none",
   );
   const [maxRequestKb, setMaxRequestKb] = useState(
     String(Math.round((state.settings.maxRequestBytes ?? 24000) / 1000)),
@@ -4147,9 +4210,11 @@ function SettingsScreen({
   );
   const [speechKey, setSpeechKey] = useState("");
   const [openAiKey, setOpenAiKey] = useState("");
+  const [openRouterKey, setOpenRouterKey] = useState("");
   const [credentialStatus, setCredentialStatus] = useState({
     speechConfigured: false,
     openAiConfigured: false,
+    openRouterConfigured: false,
   });
   const [email, setEmail] = useState("");
   const [accountName, setAccountName] = useState("");
@@ -4161,37 +4226,41 @@ function SettingsScreen({
   useEffect(() => {
     if (demoMode) return;
     credentialService.getCredentials()
-      .then(setCredentialStatus)
+      .then((status) => setCredentialStatus({
+        speechConfigured: status.speechConfigured,
+        openAiConfigured: status.openAiConfigured,
+        openRouterConfigured: status.openRouterConfigured === true,
+      }))
       .catch((e) => onNotice(messageOf(e)));
   }, [credentialService, demoMode, onNotice]);
   const saveSettings = async () => {
+    const azure = llmProvider === "azure";
     const requestKb = Number(maxRequestKb);
-    if (!Number.isFinite(requestKb) || requestKb < 4 || requestKb > 96) {
+    if (azure && (!Number.isFinite(requestKb) || requestKb < 4 || requestKb > 96)) {
       onNotice("Set the request size from 4 to 96 KB.");
       return;
     }
     const outputTokens = Number(maxOutput);
-    if (
-      !Number.isFinite(outputTokens) ||
-      outputTokens < 1 ||
-      outputTokens > 2400
-    ) {
+    if (azure && (!Number.isFinite(outputTokens) || outputTokens < 1 || outputTokens > 2400)) {
       onNotice("Set the output limit from 1 to 2,400 tokens.");
       return;
     }
     const result = await onSave({
       mode: providerEnabled ? "provider" : "preview",
+      ...buildLlmProviderSettingsPatch(llmProvider, {
+        endpoint,
+        deployment,
+        model,
+        azureEffort: effort,
+        openRouterEffort: effort,
+        maxRequestBytes: Math.round(requestKb * 1000),
+        maxOutputTokens: outputTokens,
+        monthlyBudgetUsd: Number(budget),
+        maxAttempts: Number(maxAttempts),
+        maxCallsPerDay: Number(dailyLimit),
+      }),
       speechEnabled,
-      openAiEndpoint: endpoint,
-      openAiDeployment: deployment,
       speechEndpoint,
-      model,
-      reasoningEffort: effort,
-      maxRequestBytes: Math.round(requestKb * 1000),
-      maxOutputTokens: outputTokens,
-      monthlyBudgetUsd: Number(budget),
-      maxAttempts: Number(maxAttempts),
-      maxCallsPerDay: Number(dailyLimit),
       maxAudioSeconds: Number(maxAudioSeconds),
       audioRetention: retention,
     });
@@ -4203,13 +4272,13 @@ function SettingsScreen({
       );
   };
   const saveKeys = async () => {
-    const result = await onSaveCredentials({
-      speechSubscriptionKey: speechKey || undefined,
-      openAiApiKey: openAiKey || undefined,
-    });
+    const result = await onSaveCredentials(
+      buildProviderCredentialInput(llmProvider, speechKey, openAiKey, openRouterKey),
+    );
     if (result) {
       setSpeechKey("");
       setOpenAiKey("");
+      setOpenRouterKey("");
       setCredentialStatus(result as typeof credentialStatus);
       onNotice(
         Platform.OS === "web"
@@ -4289,14 +4358,15 @@ function SettingsScreen({
         ) : null}
         <View style={s.providerToggle}>
           <View style={{ flex: 1 }}>
-            <Text style={s.accountName}>Enable Azure analysis</Text>
+            <Text style={s.accountName}>Enable provider analysis</Text>
             <Text style={s.accountSub}>
-              Your saved transcript and selected context will be sent for
-              analysis when you request it.
+              {llmProvider === "azure"
+                ? "Your saved transcript and selected context will be sent to Azure when you request analysis."
+                : "Your saved transcript and selected context will be sent to OpenRouter when you request analysis."}
             </Text>
           </View>
           <Switch
-            accessibilityLabel="Enable Azure analysis"
+            accessibilityLabel="Enable provider analysis"
             value={providerEnabled}
             onValueChange={setProviderEnabled}
             disabled={demoMode}
@@ -4320,32 +4390,68 @@ function SettingsScreen({
             thumbColor={C.text}
           />
         </View>
-        <Text style={s.sectionTitle}>Azure · optional</Text>
-        <Field
-          label="OpenAI endpoint"
-          value={endpoint}
-          onChangeText={setEndpoint}
-          placeholder="https://your-resource.openai.azure.com/openai/v1/"
-          keyboardType="url"
-        />
-        <Field
-          label="Deployment name"
-          value={deployment}
-          onChangeText={setDeployment}
-          placeholder="Your Azure deployment"
-        />
+        <Text style={s.sectionTitle}>AI provider</Text>
+        <View style={s.pills}>
+          {(["azure", "openrouter"] as const).map((value) => (
+            <Pressable
+              key={value}
+              accessibilityRole="radio"
+              accessibilityState={{ checked: llmProvider === value }}
+              accessibilityLabel={`Use ${value === "azure" ? "Azure" : "OpenRouter"}`}
+              onPress={() => {
+                setLlmProvider(value);
+                setEffort(value === "openrouter"
+                  ? state.settings.openRouterReasoningEffort ?? "low"
+                  : state.settings.reasoningEffort ?? "none");
+              }}
+              style={[s.pill, llmProvider === value && s.pillActive]}
+            >
+              <Text style={[s.pillText, llmProvider === value && s.pillTextActive]}>
+                {value === "azure" ? "Azure" : "OpenRouter"}
+              </Text>
+            </Pressable>
+          ))}
+        </View>
+        {llmProvider === "azure" ? (
+          <>
+            <Text style={s.disclaimer}>Azure OpenAI · optional</Text>
+            <Field
+              label="Azure OpenAI endpoint"
+              value={endpoint}
+              onChangeText={setEndpoint}
+              placeholder="https://your-resource.openai.azure.com/openai/v1/"
+              keyboardType="url"
+            />
+            <Field
+              label="Azure deployment name"
+              value={deployment}
+              onChangeText={setDeployment}
+              placeholder="Your Azure deployment"
+            />
+            <Field
+              label="Azure model"
+              value={model}
+              onChangeText={setModel}
+              placeholder="gpt-6-luna"
+            />
+          </>
+        ) : (
+          <View style={s.analysisStale}>
+            <Text style={s.accountName}>OpenRouter model</Text>
+            <Text accessibilityLabel="OpenRouter batch model openai/gpt-6-luna:batch" style={s.analysisText}>
+              openai/gpt-6-luna:batch
+            </Text>
+            <Text style={s.disclaimer}>
+              Batch requests may take up to 24 hours. OpenRouter retains batch inputs and results for 30 days or until the batch is deleted. No running token or cost estimate is shown; cost appears only when the provider reports a final result.
+            </Text>
+          </View>
+        )}
         <Field
           label="Speech endpoint"
           value={speechEndpoint}
           onChangeText={setSpeechEndpoint}
           placeholder="Speech resource endpoint"
           keyboardType="url"
-        />
-        <Field
-          label="Model"
-          value={model}
-          onChangeText={setModel}
-          placeholder="gpt-6-luna"
         />
         <Text style={s.label}>Reasoning effort</Text>
         <View style={s.pills}>
@@ -4381,23 +4487,39 @@ function SettingsScreen({
                   : "Not configured"
               }
             />
-            <Field
-              label="OpenAI API key"
-              secureTextEntry
-              value={openAiKey}
-              onChangeText={setOpenAiKey}
-              placeholder={
-                credentialStatus.openAiConfigured
-                  ? Platform.OS === "web"
-                    ? "Saved in this session · enter to replace"
-                    : "Saved securely · enter to replace"
-                  : "Not configured"
-              }
-            />
+            {llmProvider === "azure" ? (
+              <Field
+                label="Azure OpenAI API key"
+                secureTextEntry
+                value={openAiKey}
+                onChangeText={setOpenAiKey}
+                placeholder={
+                  credentialStatus.openAiConfigured
+                    ? Platform.OS === "web"
+                      ? "Saved in this session · enter to replace"
+                      : "Saved securely · enter to replace"
+                    : "Not configured"
+                }
+              />
+            ) : (
+              <Field
+                label="OpenRouter API key"
+                secureTextEntry
+                value={openRouterKey}
+                onChangeText={setOpenRouterKey}
+                placeholder={
+                  credentialStatus.openRouterConfigured
+                    ? Platform.OS === "web"
+                      ? "Saved in this session · enter to replace"
+                      : "Saved securely · enter to replace"
+                    : "Not configured"
+                }
+              />
+            )}
             <Text style={s.disclaimer}>
               Native credentials use platform secure storage. Browser preview
-              keeps credentials in memory only. Azure access, browser CORS, and
-              real transcription remain unverified.
+              keeps credentials in memory only. No provider request is made by
+              saving a key.
             </Text>
             <Button
               label={
@@ -4406,11 +4528,12 @@ function SettingsScreen({
                   : "Save entered keys securely"
               }
               tone="quiet"
-              disabled={!speechKey && !openAiKey}
+              disabled={!speechKey && (llmProvider === "azure" ? !openAiKey : !openRouterKey)}
               onPress={() => void saveKeys()}
             />
             {credentialStatus.speechConfigured ||
-            credentialStatus.openAiConfigured ? (
+            credentialStatus.openAiConfigured ||
+            credentialStatus.openRouterConfigured ? (
               <Button
                 label="Remove all provider keys"
                 tone="danger"
@@ -4426,7 +4549,8 @@ function SettingsScreen({
             ) : null}
           </>
         )}
-        <Text style={s.sectionTitle}>Limits & retention</Text>
+        <Text style={s.sectionTitle}>{llmProvider === "openrouter" ? "Retention" : "Limits & retention"}</Text>
+        {llmProvider === "azure" ? <>
         <Field
           label="Maximum request size · KB"
           value={maxRequestKb}
@@ -4465,6 +4589,7 @@ function SettingsScreen({
           onChangeText={setDailyLimit}
           keyboardType="numeric"
         />
+        </> : null}
         <Field
           label="Maximum recording length · seconds"
           value={maxAudioSeconds}
@@ -4487,14 +4612,14 @@ function SettingsScreen({
             </Pressable>
           ))}
         </View>
-        <LimitRow
+        {llmProvider === "azure" ? <LimitRow
           label="Usage cost estimate"
           value={
             state.usage.priceKnown
               ? `$${state.usage.estimatedCostUsd.toFixed(2)}`
               : "Unknown · no verified rate card"
           }
-        />
+        /> : null}
         <LimitRow
           label="Recorded requests this month"
           value={String(state.usage.requests)}

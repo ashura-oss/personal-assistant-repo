@@ -21,6 +21,19 @@ const backgroundTaskSource = `
     self.sendEvent(onTasksExpired, [:])
   }
 `;
+const expoFetchSource = `
+export async function fetch(input, init) { return response; }
+export async function withFetchLifetime<T>() {
+  const normalized = await normalizeBodyInitAsync(body);
+  response.abort();
+  beforeStart?.();
+  request.start();
+  if (!cancelAcknowledged) await retryCancel();
+  if (!cancelAcknowledged) await cancelAcknowledgement;
+  onCancelPending?.(retryCancel);
+}
+`;
+const expoRequestTypeSource = 'public cancel(): Promise<void>;';
 
 function validFixture() {
   const configuredPlist = {
@@ -58,6 +71,9 @@ function validFixture() {
     podspecContent,
     backgroundTaskVersion: '57.0.21',
     backgroundTaskSource,
+    expoFetchVersion: '57.0.28',
+    expoFetchSource,
+    expoRequestTypeSource,
     projectRoot,
   };
 }
@@ -154,6 +170,15 @@ describe('read-only iOS config validation', () => {
     const wrongVersion = validFixture();
     wrongVersion.backgroundTaskVersion = '57.0.22';
     expect(validateIosConfiguration(wrongVersion).failures).toContain('The pinned Expo background-task expiry bridge does not match the approved notification contract.');
+  });
+
+  it('rejects an unpatched or version-drifted Expo native request lifetime helper', () => {
+    const missing = validFixture();
+    missing.expoFetchSource = 'export async function fetch() { return response; }';
+    expect(validateIosConfiguration(missing).failures).toContain('The pinned Expo fetch lifetime/cancellation helper is missing or changed.');
+    const wrongVersion = validFixture();
+    wrongVersion.expoFetchVersion = '57.0.29';
+    expect(validateIosConfiguration(wrongVersion).failures).toContain('The pinned Expo fetch lifetime/cancellation helper is missing or changed.');
   });
 
   it('rejects a podspec without its required homepage metadata', () => {

@@ -12,8 +12,8 @@ export interface NativePrivacyEraseIO {
   deleteDirectory(uri: string): Promise<void>;
   deleteStateDatabase?(beforeMutation: () => Promise<void>): Promise<void>;
   verifyStateDatabaseGone?(): Promise<boolean>;
-  deleteProviderCredential(kind: 'speech' | 'openai', beforeMutation: () => Promise<void>): Promise<void>;
-  providerCredentialExists(kind: 'speech' | 'openai'): Promise<boolean>;
+  deleteProviderCredential(kind: 'speech' | 'openai' | 'openrouter', beforeMutation: () => Promise<void>): Promise<void>;
+  providerCredentialExists(kind: 'speech' | 'openai' | 'openrouter'): Promise<boolean>;
   deleteOAuthToken(tokenRef: string, beforeMutation: () => Promise<void>): Promise<void>;
   oauthTokenExists(tokenRef: string): Promise<boolean>;
   cancelAndDismissNotifications(beforeMutation: () => Promise<void>): Promise<void>;
@@ -92,7 +92,8 @@ async function createDefaultIO(): Promise<NativePrivacyEraseIO> {
     },
     async providerCredentialExists(kind) {
       const SecureStore = await import('expo-secure-store');
-      return (await SecureStore.getItemAsync(kind === 'speech' ? 'azure.speech.subscription-key' : 'azure.openai.api-key')) !== null;
+      const key = kind === 'speech' ? 'azure.speech.subscription-key' : kind === 'openai' ? 'azure.openai.api-key' : 'openrouter.api-key';
+      return (await SecureStore.getItemAsync(key)) !== null;
     },
     async deleteOAuthToken(tokenRef, beforeMutation) {
       const { deleteOAuthToken } = await import('../auth/tokenStore');
@@ -195,8 +196,10 @@ async function eraseNativeTarget(io: NativePrivacyEraseIO, target: PrivacyCleanu
       await beforeMutation(); await removeFile(io, join(io.documentDirectory, 'still-export.json'));
       return;
     case 'provider_credentials':
-      await io.deleteProviderCredential('speech', beforeMutation);
-      await io.deleteProviderCredential('openai', beforeMutation);
+      {
+        const results = await Promise.allSettled((['speech', 'openai', 'openrouter'] as const).map(async (kind) => io.deleteProviderCredential(kind, beforeMutation)));
+        if (results.some((result) => result.status === 'rejected')) throw new PrivacyEraseAdapterError('target_unavailable');
+      }
       return;
     case 'notifications':
       await io.cancelAndDismissNotifications(beforeMutation);
@@ -225,7 +228,10 @@ async function verifyNativeTargetGone(io: NativePrivacyEraseIO, target: PrivacyC
       }
       return true;
     case 'internal_export': return !(await io.exists(join(io.documentDirectory, 'still-export.json'))).exists;
-    case 'provider_credentials': return !(await io.providerCredentialExists('speech')) && !(await io.providerCredentialExists('openai'));
+    case 'provider_credentials': {
+      const results = await Promise.allSettled((['speech', 'openai', 'openrouter'] as const).map(async (kind) => io.providerCredentialExists(kind)));
+      return results.every((result) => result.status === 'fulfilled' && !result.value);
+    }
     case 'notifications': return !(await io.notificationsRemain()) && !(await io.backgroundTaskRegistered(MAIL_REFRESH_TASK_NAME));
   }
 }

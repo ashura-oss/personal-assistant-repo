@@ -18,6 +18,7 @@ import { STATE_SNAPSHOT_READ_MAX_BYTES } from '../storage/contracts';
 import { recoveryUtf8Bytes, STARTUP_RECOVERY_SESSION_MS, validateRecoveryId, validateRecoveryIso, validateRecoveryReceipt, validateReplacementSnapshot, type StartupRecoveryInspection, type StartupRecoveryPlan, type StartupRecoveryReceipt, type StartupRecoveryCommitInput } from '../storage/startupRecovery';
 import { writePrivateDocument } from '../storage/documents';
 import { AzureOpenAIClient, AzureSpeechClient, ReplyGenerationError, ReplyGenerationPreDispatchError, validateAzureEndpoint, type DraftAnalysis, type ReplyGenerationUsage } from './azure';
+import { AssistantClientRouter, type AssistantModelClient } from './assistantClient';
 import {
   createNotificationBackend, isMatchingPending, isOwnedLegacyReminderCancellation, NotificationBackendError,
 } from './notificationBackend';
@@ -256,7 +257,8 @@ function deepFreeze<T>(value: T): T {
 }
 
 const DEFAULT_SETTINGS: AppSettings = {
-  mode: 'preview', timezone: validTimezone(), speechEnabled: false, backgroundMailRefreshEnabled: false, backgroundRefreshGeneration: 0, maxContextTokens: 6000, maxRequestBytes: 24000, maxOutputTokens: 1200, monthlyBudgetUsd: 5,
+  mode: 'preview', llmProvider: 'azure', openRouterModel: 'openai/gpt-6-luna:batch', openRouterReasoningEffort: 'low', llmRequestContractVersion: 1,
+  timezone: validTimezone(), speechEnabled: false, backgroundMailRefreshEnabled: false, backgroundRefreshGeneration: 0, maxContextTokens: 6000, maxRequestBytes: 24000, maxOutputTokens: 1200, monthlyBudgetUsd: 5,
   reasoningEffort: 'none', maxAttempts: 2, maxCallsPerDay: 20, maxAudioSeconds: 600, audioRetention: 'keep',
 };
 
@@ -934,7 +936,11 @@ function normalizeLoadedState(value: unknown): NormalizedLoadedState {
   const tasks = [...savedTasks, ...migratedTasks.filter((task) => !savedTasks.some((saved) => saved.id === task.id))];
   const backgroundRefreshGenerationValid = Number.isSafeInteger(rawSettings.backgroundRefreshGeneration) && Number(rawSettings.backgroundRefreshGeneration) >= 0;
   const backgroundRefreshGeneration = backgroundRefreshGenerationValid ? Number(rawSettings.backgroundRefreshGeneration) : 0;
-  const settings = { ...DEFAULT_SETTINGS, ...rawSettings, speechEnabled: rawSettings.speechEnabled === true,
+  const settings = { ...DEFAULT_SETTINGS, ...rawSettings, llmProvider: rawSettings.llmProvider === 'openrouter' ? 'openrouter' as const : 'azure' as const,
+    openRouterModel: rawSettings.openRouterModel === 'openai/gpt-6-luna:batch' ? 'openai/gpt-6-luna:batch' as const : DEFAULT_SETTINGS.openRouterModel,
+    openRouterReasoningEffort: rawSettings.openRouterReasoningEffort === 'none' ? 'none' as const : 'low' as const,
+    llmRequestContractVersion: 1 as const,
+    speechEnabled: rawSettings.speechEnabled === true,
     backgroundMailRefreshEnabled: rawSettings.backgroundMailRefreshEnabled === true && backgroundRefreshGenerationValid, backgroundRefreshGeneration,
     timezone: validTimezone(rawSettings.timezone), maxRequestBytes };
   const retainedTranscriptionQuarantine = (value as { transcriptionQuarantine?: unknown }).transcriptionQuarantine;
@@ -1188,7 +1194,7 @@ export class AppControllerImpl implements AppController {
   private analysisCache = new Map<string, DraftAnalysis>();
   private mirrorDirty = new Set<string>();
   private readonly speechClient: AzureSpeechClient;
-  private readonly openAiClient: AzureOpenAIClient;
+  private readonly openAiClient: AssistantModelClient;
   private readonly connector?: ConnectorClient;
   private activeSyncCount = 0;
   private syncQueue: (() => void)[] = [];
@@ -1258,7 +1264,7 @@ export class AppControllerImpl implements AppController {
 
   constructor(
     private readonly store: StateStore = stateStore,
-    providers: { speech?: AzureSpeechClient; openAi?: AzureOpenAIClient } = {},
+    providers: { speech?: AzureSpeechClient; openAi?: AssistantModelClient } = {},
     private readonly integration: ControllerIntegrationDependencies = {},
     private readonly pendingCapture?: PendingCaptureControllerPort,
   ) {
@@ -1271,7 +1277,8 @@ export class AppControllerImpl implements AppController {
         assertCredentialGeneration: (generation: number) => credentials.assertSpeechCredentialGeneration(generation),
       } : {}),
     });
-    this.openAiClient = providers.openAi ?? new AzureOpenAIClient(fetch, credentials ? () => credentials.readProviderCredential('openai') : undefined);
+    const llmCredentials = credentials ?? createProviderCredentialService(credentialStore);
+    this.openAiClient = new AssistantClientRouter(providers.openAi ?? new AzureOpenAIClient(fetch, () => llmCredentials.readProviderCredential('openai')));
     this.connector = integration.tokenStore && integration.connectorFactory
       ? integration.connectorFactory(integration.tokenStore, (accountId, status) => this.handleConnectorAuthStatus(accountId, status))
       : undefined;
@@ -6390,6 +6397,10 @@ export class AppControllerImpl implements AppController {
     if ('backgroundMailRefreshEnabled' in sanitized && typeof sanitized.backgroundMailRefreshEnabled !== 'boolean') throw new Error('Choose whether background mailbox refresh is enabled.');
     if ('speechEndpoint' in sanitized) sanitized.speechEndpoint = sanitized.speechEndpoint ? validateAzureEndpoint(sanitized.speechEndpoint, 'speech') : undefined;
     if ('openAiEndpoint' in sanitized) sanitized.openAiEndpoint = sanitized.openAiEndpoint ? validateAzureEndpoint(sanitized.openAiEndpoint, 'openai') : undefined;
+    if ('llmProvider' in sanitized && !['azure', 'openrouter'].includes(String(sanitized.llmProvider))) throw new Error('Choose a supported language model provider.');
+    if ('openRouterModel' in sanitized && sanitized.openRouterModel !== 'openai/gpt-6-luna:batch') throw new Error('Choose a supported OpenRouter Batch model.');
+    if ('openRouterReasoningEffort' in sanitized && !['none', 'low'].includes(String(sanitized.openRouterReasoningEffort))) throw new Error('OpenRouter reasoning effort must be none or low.');
+    if ('llmRequestContractVersion' in sanitized) throw new Error('The assistant request profile is controlled by this app.');
     if (sanitized.model && sanitized.model !== 'gpt-6-luna') throw new Error('This app is configured for GPT-6 Luna only.');
     if (sanitized.reasoningEffort && !['none', 'low'].includes(sanitized.reasoningEffort)) throw new Error('Reasoning effort must be none or low.');
     if (sanitized.mode && !['preview', 'provider'].includes(sanitized.mode)) throw new Error('Choose Preview or Provider mode.');
@@ -6985,7 +6996,7 @@ export class AppControllerImpl implements AppController {
     if ([...this.mailReplyGenerations.values()].some((item) => item.messageId === input.messageId)) throw new Error('Another Generate request for this message is still running. Wait for it to finish.');
     const capturedSettings = clone(state.settings);
     const generation = (async (): Promise<MailReplyTextGenerationResult> => {
-      let generated: Awaited<ReturnType<AzureOpenAIClient['generateReply']>>;
+      let generated: Awaited<ReturnType<AssistantModelClient['generateReply']>>;
       let reservation: { month: string; day: string; reserve: number } | undefined;
       const assertProjection = (current: AppState = this.snapshot) => {
         if (this.mailAlertRefreshRequired || this.mailReplyGenerationProjection(current, input.messageId, input.sourceDigest, input.textDigest, input.noteId, input.noteRevision) !== capturedProjection) {
@@ -8035,7 +8046,7 @@ export interface ProductionWorkspaceOptions {
   audioBoundary?: PrivacyAudioBoundary;
   credentials?: ProviderCredentialService;
   store?: StateStore;
-  providers?: { speech?: AzureSpeechClient; openAi?: AzureOpenAIClient };
+  providers?: { speech?: AzureSpeechClient; openAi?: AssistantModelClient };
   integration?: ControllerIntegrationDependencies;
   pendingCaptureNativeIO?: PendingCaptureNativeIO;
 }

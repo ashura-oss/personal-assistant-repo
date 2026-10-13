@@ -10,6 +10,8 @@ const TIMEOUT_MS = 60_000;
 const PODSPEC_LIMIT_BYTES = 64 * 1024;
 const BACKGROUND_TASK_SOURCE_LIMIT_BYTES = 64 * 1024;
 const EXPECTED_BACKGROUND_TASK_VERSION = '57.0.21';
+const EXPECTED_EXPO_VERSION = '57.0.28';
+const FETCH_SOURCE_LIMIT_BYTES = 64 * 1024;
 
 const CHECK_LABELS = Object.freeze({
   bundle: 'iOS bundle identifier and portrait/dark phone settings',
@@ -17,6 +19,7 @@ const CHECK_LABELS = Object.freeze({
   permissions: 'microphone and full-calendar permissions; no reminders permission',
   background: 'SDK 57 TaskManager fetch and BackgroundTask processing modes only',
   expiryBridge: 'pinned Expo task-expiry event bridge matches the patched iOS notification contract',
+  nativeFetchLifetime: 'pinned Expo native fetch lifetime helper awaits explicit cancellation acknowledgement',
   transport: 'restricted App Transport Security policy',
   schemes: 'configured URL schemes are registered',
   module: 'StillPrivacy is uniquely autolinked with its native callback',
@@ -44,7 +47,7 @@ function podspecHasAssignment(source, field, valuePattern) {
   return new RegExp(`^\\s*s\\.${escaped}\\s*=\\s*${valuePattern}\\s*$`, 'm').test(source);
 }
 
-export function validateIosConfiguration({ config, autolink, podspecContent, projectRoot, backgroundTaskVersion, backgroundTaskSource }) {
+export function validateIosConfiguration({ config, autolink, podspecContent, projectRoot, backgroundTaskVersion, backgroundTaskSource, expoFetchVersion, expoFetchSource, expoRequestTypeSource }) {
   const failures = [];
   const passed = [];
   const mark = (key, valid, failure) => (valid ? passed.push(CHECK_LABELS[key]) : failures.push(failure));
@@ -89,6 +92,24 @@ export function validateIosConfiguration({ config, autolink, podspecContent, pro
     expiryHandler.includes('self.sendEvent(onTasksExpired, [:])') &&
     !/userInfo\s*\?\[\s*["']url["']\s*\]/.test(expiryHandler),
   'The pinned Expo background-task expiry bridge does not match the approved notification contract.');
+
+  const boundedExpoFetchSource = typeof expoFetchSource === 'string' && Buffer.byteLength(expoFetchSource, 'utf8') <= FETCH_SOURCE_LIMIT_BYTES
+    ? expoFetchSource
+    : '';
+  const lifetimeHelper = boundedExpoFetchSource.match(/export async function withFetchLifetime[\s\S]*?\n}\n/)?.[0] ?? '';
+  const abortBeforeCancel = lifetimeHelper.indexOf('response.abort();') >= 0 &&
+    lifetimeHelper.indexOf('response.abort();') < lifetimeHelper.indexOf('await retryCancel()');
+  const normalizedBeforeFence = lifetimeHelper.indexOf('normalizeBodyInitAsync(body)') >= 0 &&
+    lifetimeHelper.indexOf('normalizeBodyInitAsync(body)') < lifetimeHelper.indexOf('beforeStart?.();');
+  const finalFenceBeforeStart = lifetimeHelper.indexOf('beforeStart?.();') >= 0 &&
+    lifetimeHelper.indexOf('beforeStart?.();') < lifetimeHelper.indexOf('request.start(');
+  mark('nativeFetchLifetime', expoFetchVersion === EXPECTED_EXPO_VERSION &&
+    boundedExpoFetchSource.includes('export async function fetch(') &&
+    lifetimeHelper.includes('await cancelAcknowledgement') && lifetimeHelper.includes('onCancelPending?.(retryCancel)') &&
+    abortBeforeCancel && normalizedBeforeFence && finalFenceBeforeStart && typeof expoRequestTypeSource === 'string' &&
+    Buffer.byteLength(expoRequestTypeSource, 'utf8') <= FETCH_SOURCE_LIMIT_BYTES &&
+    /public\s+cancel\(\):\s*Promise<void>/.test(expoRequestTypeSource),
+  'The pinned Expo fetch lifetime/cancellation helper is missing or changed.');
 
   const ats = info?.NSAppTransportSecurity;
   const atsKeys = object(ats) ? Object.keys(ats).sort() : [];
@@ -205,7 +226,25 @@ async function runCheck() {
     }
   } catch { /* The fixed pinned-source check below reports absence without exposing paths. */ }
 
-  const result = validateIosConfiguration({ config, autolink, podspecContent, projectRoot, backgroundTaskVersion, backgroundTaskSource });
+  let expoFetchVersion = '';
+  let expoFetchSource = '';
+  let expoRequestTypeSource = '';
+  try {
+    const expoPackage = require.resolve('expo/package.json');
+    const parsedPackage = JSON.parse(readFileSync(expoPackage, 'utf8'));
+    if (parsedPackage?.version === EXPECTED_EXPO_VERSION) {
+      expoFetchVersion = parsedPackage.version;
+      const expoRoot = path.dirname(expoPackage);
+      const fetchPath = path.join(expoRoot, 'src/winter/fetch/fetch.ts');
+      const requestTypePath = path.join(expoRoot, 'src/winter/fetch/NativeRequest.ts');
+      const fetchStat = statSync(fetchPath);
+      const requestTypeStat = statSync(requestTypePath);
+      if (fetchStat.isFile() && fetchStat.size <= FETCH_SOURCE_LIMIT_BYTES) expoFetchSource = readFileSync(fetchPath, 'utf8');
+      if (requestTypeStat.isFile() && requestTypeStat.size <= FETCH_SOURCE_LIMIT_BYTES) expoRequestTypeSource = readFileSync(requestTypePath, 'utf8');
+    }
+  } catch { /* The fixed pinned-source check below reports absence without exposing paths. */ }
+
+  const result = validateIosConfiguration({ config, autolink, podspecContent, projectRoot, backgroundTaskVersion, backgroundTaskSource, expoFetchVersion, expoFetchSource, expoRequestTypeSource });
   for (const label of result.passed) console.log(`OK ${label}`);
   for (const failure of result.failures) console.error(`FAIL ${failure}`);
   if (!result.ok) process.exitCode = 1;

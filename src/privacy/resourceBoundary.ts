@@ -8,7 +8,7 @@ import type { LegacyReminderCancellation, ReminderIntent } from '../reminders';
 import type { PrivacyService, PrivacyWorkspaceSession } from './service';
 import type { PrivacyWriterDescriptor, PrivacyWriterScope } from './types';
 
-const CREDENTIAL_KEYS = new Set(['azure.speech.subscription-key', 'azure.openai.api-key']);
+const CREDENTIAL_KEYS = new Set(['azure.speech.subscription-key', 'azure.openai.api-key', 'openrouter.api-key']);
 
 export interface PrivacyResourceBinding {
   readonly privacy: PrivacyService;

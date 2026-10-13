@@ -103,7 +103,7 @@ const webOwner: PrivacyOwner = { platform: 'web', runtimeId: '30000000-0000-4000
 function nativeIO(): NativePrivacyEraseIO & { removed: string[] } {
   const dirs = new Set(['file:///docs/ExpoAudio/', 'file:///docs/recording-recovery/', 'file:///cache/speech-upload/', 'file:///cache/DocumentPicker/', 'file:///docs/StillDocuments-v1/', 'file:///docs/memory/', 'file:///docs/logs/', 'file:///docs/notes/', 'file:///docs/people/', 'file:///docs/projects/']);
   const files = new Set(['file:///docs/still-export.json', 'file:///docs/memory/PROFILE.md']);
-  const secrets = new Set(['speech', 'openai', tokenRef]);
+  const secrets = new Set(['speech', 'openai', 'openrouter', tokenRef]);
   const removed: string[] = [];
   let backgroundRegistered = true;
   return {
@@ -126,7 +126,7 @@ function nativeIO(): NativePrivacyEraseIO & { removed: string[] } {
 
 function webIO(): WebPrivacyEraseIO & { removed: string[] } {
   const removed: string[] = [];
-  const credentials = new Set(['speech', 'openai', tokenRef]);
+  const credentials = new Set(['speech', 'openai', 'openrouter', tokenRef]);
   const dbs = new Set<string>();
   return {
     removed,
@@ -167,6 +167,60 @@ describe('privacy erase adapter', () => {
     expect(io.removed).toEqual(['credential:speech']);
   });
 
+  it('deletes and verifies the isolated OpenRouter credential with the other app-owned provider keys', async () => {
+    const target: PrivacyCleanupTarget = { kind: 'namespace', namespace: 'provider_credentials' };
+    const io = nativeIO();
+    const adapter = createPrivacyEraseAdapter({ controlStore: storeReturning(() => stateFor(target)), getOwner: async () => iosOwner, io });
+    await adapter.erase(target, epoch);
+    expect(io.removed).toContain('credential:openrouter');
+    expect(await io.providerCredentialExists('openrouter')).toBe(false);
+    expect(await adapter.verifyGone(target, epoch)).toBe(true);
+  });
+
+  it('drains native credential deletion siblings after a synchronous bridge throw', async () => {
+    const target: PrivacyCleanupTarget = { kind: 'namespace', namespace: 'provider_credentials' };
+    const io = nativeIO();
+    let release!: () => void;
+    let started!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const began = new Promise<void>((resolve) => { started = resolve; });
+    io.deleteProviderCredential = (kind, check) => {
+      if (kind === 'speech') throw new Error('private secure-store error');
+      if (kind === 'openai') return (async () => { await check(); started(); await held; })();
+      return Promise.resolve();
+    };
+    const adapter = createPrivacyEraseAdapter({ controlStore: storeReturning(() => stateFor(target)), getOwner: async () => iosOwner, io });
+    let settled = false;
+    const erase = adapter.erase(target, epoch).finally(() => { settled = true; });
+    await began;
+    expect(settled).toBe(false);
+    release();
+    await expect(erase).rejects.toMatchObject({ code: 'target_unavailable' });
+    expect(settled).toBe(true);
+  });
+
+  it('drains web credential verification siblings after a synchronous bridge throw', async () => {
+    const target: PrivacyCleanupTarget = { kind: 'namespace', namespace: 'provider_credentials' };
+    const io = webIO();
+    let release!: () => void;
+    let started!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const began = new Promise<void>((resolve) => { started = resolve; });
+    io.providerCredentialExists = (kind) => {
+      if (kind === 'speech') throw new Error('private credential lookup failure');
+      if (kind === 'openai') return (async () => { started(); await held; return false; })();
+      return Promise.resolve(false);
+    };
+    const adapter = createWebPrivacyEraseAdapter({ controlStore: storeReturning(() => stateFor(target)), getOwner: async () => webOwner, io });
+    let settled = false;
+    const verification = adapter.verifyGone(target, epoch).finally(() => { settled = true; });
+    await began;
+    expect(settled).toBe(false);
+    release();
+    await expect(verification).resolves.toBe(false);
+    expect(settled).toBe(true);
+  });
+
   it('erases only the fixed background task and verifies its registration is gone', async () => {
     const target: PrivacyCleanupTarget = { kind: 'namespace', namespace: 'notifications' };
     const io = nativeIO();
@@ -205,6 +259,16 @@ describe('privacy erase adapter', () => {
     expect(io.removed).toEqual(['state-db']);
     const changed = createWebPrivacyEraseAdapter({ controlStore: storeReturning(() => { throw new Error('journal unavailable'); }), getOwner: async () => webOwner, io });
     await expect(changed.erase(target, epoch)).rejects.toMatchObject({ code: 'target_unavailable' });
+  });
+
+  it('deletes and verifies the isolated OpenRouter credential in browser storage', async () => {
+    const target: PrivacyCleanupTarget = { kind: 'namespace', namespace: 'provider_credentials' };
+    const io = webIO();
+    const adapter = createWebPrivacyEraseAdapter({ controlStore: storeReturning(() => stateFor(target)), getOwner: async () => webOwner, io });
+    await adapter.erase(target, epoch);
+    expect(io.removed).toContain('credential:openrouter');
+    expect(await io.providerCredentialExists('openrouter')).toBe(false);
+    expect(await adapter.verifyGone(target, epoch)).toBe(true);
   });
 
   it('clears and verifies all instance-local web speech staging maps', async () => {
