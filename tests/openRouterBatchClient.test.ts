@@ -7,6 +7,9 @@ import {
   OpenRouterBatchClient,
   OpenRouterBatchDispatchError,
 } from '../src/services/openRouter';
+import type { PrivacyControlState, PrivacyControlStore, PrivacyEraseAdapter, PrivacyOwner } from '../src/privacy/types';
+
+vi.mock('expo', () => ({ requireOptionalNativeModule: () => null }));
 
 const operationId = '20000000-0000-4000-8000-000000000001';
 const requestBody = JSON.stringify({
@@ -69,12 +72,125 @@ describe('OpenRouter Batch client', () => {
     expect(result).toEqual({ batchId: 'batch_fixture_1', status: 'validating', endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH, model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h', total: 1, completed: 0, failed: 0 });
   });
 
+  it('finishes credential reads and durable reservation before acquiring provider request ownership', async () => {
+    let owned = false;
+    const events: string[] = [];
+    const client = new OpenRouterBatchClient({
+      fetcher: async () => acceptedBatch(),
+      withRequestOwnership: async (work) => {
+        expect(owned).toBe(false);
+        owned = true;
+        events.push('ownership:start');
+        try { return await work(); } finally { owned = false; events.push('ownership:settled'); }
+      },
+      readCredentialSnapshot: async () => {
+        expect(owned).toBe(false);
+        events.push('credential:read');
+        return { key: 'fictional-key', generation: 7 };
+      },
+      assertCredentialGeneration: () => undefined,
+      assertBeforeStart: () => { expect(owned).toBe(true); events.push('dispatch:fence'); },
+    });
+
+    await client.submit({ operationId, requestBody }, async () => {
+      expect(owned).toBe(false);
+      events.push('reservation:committed');
+    });
+    expect(events).toEqual(['credential:read', 'reservation:committed', 'ownership:start', 'dispatch:fence', 'ownership:settled']);
+  });
+
+  it('does not reacquire credential or app-state writers inside a provider writer when native cleanup queues', async () => {
+    vi.stubGlobal('__DEV__', false);
+    const [arbitrationModule, schema, boundaryModule, serviceModule] = await Promise.all([
+      import('../src/privacy/arbitration'), import('../src/privacy/schema'), import('../src/privacy/resourceBoundary'), import('../src/privacy/service'),
+    ]);
+    const { createNativePrivacyArbitration } = arbitrationModule;
+    const { createEmptyPrivacyControlState, validatePrivacyControlState } = schema;
+    const { createPrivacyResourceBoundary } = boundaryModule;
+    const { createPrivacyService } = serviceModule;
+    const epoch = 'caa27bbc-5a14-4b73-a8fa-90c6a90207c4';
+    const owner: PrivacyOwner = { platform: 'ios', runtimeId: epoch, processLaunchId: '6b7b5f77-1b6a-4b94-aeb7-7d76a2098131', bundleIdentifier: 'com.still.voiceassistant' };
+    let controlState = createEmptyPrivacyControlState(epoch);
+    const controlStore: PrivacyControlStore = {
+      async read() { return structuredClone(validatePrivacyControlState(controlState)); },
+      async compareAndSwap(expectedRevision: string, next: PrivacyControlState) {
+        if (controlState.revision !== expectedRevision) throw new Error('revision conflict');
+        controlState = structuredClone(validatePrivacyControlState(next));
+      },
+    };
+    const arbitration = createNativePrivacyArbitration({ getRuntimeOwner: async () => owner, waitTimeoutMs: 1_000 });
+    const eraseAdapter: PrivacyEraseAdapter = { async erase() {}, async verifyGone() { return true; } };
+    const privacy = createPrivacyService({ controlStore, arbitration, eraseAdapter });
+    const session = await privacy.openWorkspace();
+    const resources = createPrivacyResourceBoundary({ privacy, session });
+    const rawCredentials = { async get() { return 'fictional-key'; }, async set() {}, async delete() {} };
+    const credentials = resources.credentialStore(rawCredentials);
+    let queueCleanup!: () => void;
+    let cleanupStarted!: () => void;
+    let releaseCleanup!: () => void;
+    const cleanupQueued = new Promise<void>((resolve) => { queueCleanup = resolve; });
+    const cleanupEntering = new Promise<void>((resolve) => { cleanupStarted = resolve; });
+    const cleanupGate = new Promise<void>((resolve) => { releaseCleanup = resolve; });
+    let cleanupPromise: Promise<void> | undefined;
+    let finishResponse!: (response: Response) => void;
+    const delayedResponse = new Promise<Response>((resolve) => { finishResponse = resolve; });
+    let fetchStarted!: () => void;
+    const fetched = new Promise<void>((resolve) => { fetchStarted = resolve; });
+    const client = new OpenRouterBatchClient({
+      withRequestOwnership: (actual) => resources.withProviderOwnership(async () => {
+        cleanupPromise = arbitration.withCleanupLock(async () => { cleanupStarted(); await cleanupGate; });
+        queueCleanup();
+        await Promise.resolve();
+        return actual();
+      }),
+      fetcher: (async () => { fetchStarted(); return delayedResponse; }) as typeof fetch,
+      readCredentialSnapshot: async () => ({ key: await credentials.get('openrouter.api-key'), generation: 9 }),
+      assertCredentialGeneration: () => undefined,
+      assertBeforeStart: () => undefined,
+    });
+    const submit = client.submit({ operationId, requestBody }, async () => {
+      await privacy.withWriter(session.epoch, { kind: 'app_state', namespace: 'state_database' }, async () => undefined);
+    });
+
+    await cleanupQueued;
+    await fetched;
+    expect(cleanupPromise).toBeDefined();
+    let cleanupHasEntered = false;
+    void cleanupEntering.then(() => { cleanupHasEntered = true; });
+    await Promise.resolve();
+    expect(cleanupHasEntered).toBe(false);
+    finishResponse(acceptedBatch('batch_native_arbitration'));
+    await expect(submit).resolves.toMatchObject({ batchId: 'batch_native_arbitration' });
+    await cleanupEntering;
+    releaseCleanup();
+    await cleanupPromise;
+  });
+
   it('does not invoke the durable callback or fetch without a credential', async () => {
     const fetcher = vi.fn(async () => acceptedBatch());
     const before = vi.fn(async () => undefined);
     const { client } = makeClient(fetcher as unknown as typeof fetch, { key: null });
     await expect(client.submit({ operationId, requestBody }, before)).rejects.toMatchObject({ phase: 'pre_dispatch' });
     expect(before).not.toHaveBeenCalled();
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it.each(['batch_fixture_1\n', 'batch/unsafe'])('rejects unsafe provider acknowledgement identifiers before accepting a submitted job: %j', async (id) => {
+    const fetcher = vi.fn(async () => new Response(JSON.stringify({
+      id, object: 'batch', endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH, model: OPENROUTER_BATCH_BODY_MODEL,
+      completion_window: '24h', status: 'validating', request_counts: { total: 1, completed: 0, failed: 0 },
+    }), { status: 202 }));
+    const { client } = makeClient(fetcher as unknown as typeof fetch);
+    await expect(client.submit({ operationId, requestBody }, async () => undefined)).rejects.toMatchObject({ phase: 'unknown' });
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it('rejects a local operation UUID with a trailing newline before any durable intent', async () => {
+    const fetcher = vi.fn(async () => acceptedBatch());
+    const admission = vi.fn(async () => undefined);
+    const { client } = makeClient(fetcher as unknown as typeof fetch);
+    await expect(client.submit({ operationId: `${operationId}\n`, requestBody }, admission)).rejects.toMatchObject({ phase: 'pre_dispatch' });
+    expect(admission).not.toHaveBeenCalled();
     expect(fetcher).not.toHaveBeenCalled();
   });
 

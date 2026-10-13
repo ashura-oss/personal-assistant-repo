@@ -17,7 +17,7 @@ import type { StateStore } from '../storage/contracts';
 import { STATE_SNAPSHOT_READ_MAX_BYTES } from '../storage/contracts';
 import { recoveryUtf8Bytes, STARTUP_RECOVERY_SESSION_MS, validateRecoveryId, validateRecoveryIso, validateRecoveryReceipt, validateReplacementSnapshot, type StartupRecoveryInspection, type StartupRecoveryPlan, type StartupRecoveryReceipt, type StartupRecoveryCommitInput } from '../storage/startupRecovery';
 import { writePrivateDocument } from '../storage/documents';
-import { AzureOpenAIClient, AzureSpeechClient, ReplyGenerationError, ReplyGenerationPreDispatchError, validateAzureEndpoint, type DraftAnalysis, type ReplyGenerationUsage } from './azure';
+import { AzureOpenAIClient, AzureSpeechClient, ReplyGenerationError, ReplyGenerationPreDispatchError, validateAzureEndpoint, type DraftAnalysis, type PreparedAnalysis, type ReplyGenerationUsage } from './azure';
 import { AssistantClientRouter, type AssistantModelClient } from './assistantClient';
 import {
   createNotificationBackend, isMatchingPending, isOwnedLegacyReminderCancellation, NotificationBackendError,
@@ -47,7 +47,7 @@ import { ConnectorClient, ProviderWriteRejectedError, describeMessageWindowQuery
 import { scopeGrantsCapability } from '../connectors/oauth';
 import { oauthTokenStore, deleteOAuthToken } from '../auth/tokenStore';
 import { Platform } from 'react-native';
-import { buildLocalSourceSet, buildOfflinePreview, createSourceCatalog, type AssistantSourceInput } from '../assistant';
+import { buildLocalSourceSet, buildOfflinePreview, createSourceCatalog, validateAssistantResponse, type AssistantSourceInput, type AssistantResponse } from '../assistant';
 import { isMailTextFresh, normalizeMailText, utf8Bytes, validSelectedMailTextSnapshot, MAX_SELECTED_MAIL_TEXT_BYTES, MAIL_TEXT_FRESHNESS_MS } from '../mailText';
 import { appendDispatchReconciliation, createDispatchRecord, recordDispatchOutcome, validateDispatchRecord } from '../dispatch';
 import type { DispatchOutcome, DispatchRecord, DispatchReconciliation } from '../dispatch';
@@ -89,6 +89,15 @@ import { createPrivacyAudioBoundary, createPrivacyBoundRecordingRecoveryService,
 import { createProviderCredentialService, type ProviderCredentialService } from './credentials';
 import { credentialStore } from '../storage/credentials';
 import type { BackgroundTaskBackend } from '../background/backend.types';
+import {
+  OPENROUTER_BATCH_MODEL, OPENROUTER_BATCH_BODY_MODEL, OpenRouterBatchClient, OpenRouterBatchDispatchError,
+  OpenRouterBatchRequestBuilder, isOpenRouterBatchRequestProfile, type OpenRouterBatchInspection, type PreparedOpenRouterAnalysis,
+} from './openRouter';
+import {
+  emptyOpenRouterBatchLedger, validateOpenRouterBatchLedger, assistantBatchJobDTO, accountingFromInspection,
+  isOpenRouterBatchContentJob, tombstoneOpenRouterBatchJob,
+  type AssistantBatchJobDTO, type OpenRouterBatchJob, type OpenRouterBatchLedger, type OpenRouterBatchAccounting,
+} from './openRouterBatchJobs';
 
 const now = () => new Date().toISOString();
 const ASSIST_CONTRACT_VERSION = 'assist-v3';
@@ -661,6 +670,70 @@ function sameSourceVersions(left: Record<string, string>, right: Record<string, 
   return leftIds.length === rightIds.length && leftIds.every((id, index) => id === rightIds[index] && left[id] === right[id]);
 }
 
+function openRouterSettingsBinding(settings: AppSettings): Record<string, unknown> {
+  return {
+    mode: settings.mode,
+    llmProvider: settings.llmProvider ?? 'azure',
+    openRouterModel: settings.openRouterModel ?? OPENROUTER_BATCH_MODEL,
+    openRouterReasoningEffort: settings.openRouterReasoningEffort ?? 'low',
+    llmRequestContractVersion: settings.llmRequestContractVersion ?? 1,
+    timezone: settings.timezone,
+  };
+}
+
+function assistantSettingsFingerprintMatches(fingerprint: string, settings: AppSettings): boolean {
+  if (fingerprint === JSON.stringify(settings)) return true;
+  try {
+    const parsed: unknown = JSON.parse(fingerprint);
+    return isRecord(parsed) && parsed.llmProvider === 'openrouter' &&
+      stableJson(parsed) === stableJson(openRouterSettingsBinding(settings));
+  } catch { return false; }
+}
+
+function parseBatchAssistantResult(inspection: OpenRouterBatchInspection, prepared: PreparedOpenRouterAnalysis): { response: AssistantResponse; generated: DraftAnalysis } {
+  const result = inspection.result;
+  const body = result?.responseBody;
+  if (inspection.status !== 'completed' || inspection.metadataValidation !== 'valid' || inspection.resultValidation !== 'valid' ||
+      !result || result.statusCode !== 200 || result.errorPresent || result.finishReason !== 'stop' || !isRecord(body) ||
+      ![OPENROUTER_BATCH_BODY_MODEL, 'openai/gpt-6-luna-20260922'].includes(String(body.model))) {
+    throw new Error('The Batch result did not match the saved analysis request.');
+  }
+  const choices = body.choices;
+  if (!Array.isArray(choices) || choices.length !== 1 || !isRecord(choices[0]) || choices[0].index !== 0 ||
+      choices[0].finish_reason !== 'stop' || !isRecord(choices[0].message) || choices[0].message.role !== 'assistant' ||
+      choices[0].message.refusal !== undefined || typeof choices[0].message.content !== 'string' || choices[0].message.content.length > 128 * 1024) {
+    throw new Error('The Batch result did not contain one complete structured analysis.');
+  }
+  let parsed: unknown;
+  try { parsed = JSON.parse(choices[0].message.content); }
+  catch { throw new Error('The Batch result was not valid structured analysis.'); }
+  const response = validateAssistantResponse(parsed, prepared.catalog, prepared.selection);
+  const accounting = accountingFromInspection(inspection);
+  const generated: DraftAnalysis = {
+    summary: response.summary,
+    answer: response.answer,
+    decisions: response.decisions,
+    citations: response.citations,
+    clarifications: response.clarifications,
+    proposals: response.proposals.map((proposal) => ({
+      kind: proposal.kind, title: proposal.title, body: proposal.body, recipients: [...proposal.recipients],
+      ...(proposal.dueAt ? { dueAt: proposal.dueAt } : {}),
+      evidence: proposal.evidence.map((quote) => ({ quote, source: 'transcript' })),
+    })),
+    memorySuggestions: response.memorySuggestions,
+    includedSourceIds: [...prepared.includedSourceIds],
+    includedSources: prepared.includedSources.map((source) => ({ ...source })),
+    omittedSourceIds: [...prepared.omittedSourceIds],
+    omittedSourceCount: prepared.omittedSourceCount,
+    sourceVersions: { ...prepared.sourceVersions },
+    inputTokens: accounting?.promptTokens ?? 0,
+    outputTokens: accounting?.completionTokens ?? 0,
+    attempts: 1,
+    usageEstimated: false,
+  };
+  return { response, generated };
+}
+
 function offlineAssistInputs(note: Note, intent: AssistIntent, question: string | undefined, additionalSources: AssistantSourceInput[], calendarAvailable: boolean): AssistantSourceInput[] {
   const taskQuestion = intent === 'answer' && /\b(task|tasks|todo|to-do|action item)\b/i.test(question ?? '');
   const calendarQuestion = intent === 'answer' && /\b(calendar|meeting|event|upcoming|tomorrow|today|next)\b/i.test(question ?? '') && calendarAvailable;
@@ -756,7 +829,7 @@ function sourceActionKey(note: Note, kind: Proposal['kind'], evidence: Proposal[
 
 function createProposalProvenance(input: {
   analysisFingerprint: string; note: Note; intent: AssistIntent; question?: string;
-  sourceVersions: Record<string, string>; policySources: ProposalProvenance['policySources']; settings: AppSettings; answeredAsOf?: string; knowledgeSelection?: KnowledgeSelection;
+  sourceVersions: Record<string, string>; policySources: ProposalProvenance['policySources']; settings: AppSettings; settingsFingerprint?: string; answeredAsOf?: string; knowledgeSelection?: KnowledgeSelection;
 }): ProposalProvenance | undefined {
   const sources = Object.entries(input.sourceVersions).map(([sourceId, sourceVersion]) => {
     const match = /^(\d+):([a-f0-9]{64})$/i.exec(sourceVersion);
@@ -774,7 +847,7 @@ function createProposalProvenance(input: {
     intent: input.intent, ...(input.question ? { question: input.question } : {}),
     knowledgeSelection: clone(input.knowledgeSelection ?? []),
     sources: sources as NonNullable<typeof sources[number]>[], policySources: input.policySources,
-    settingsFingerprint: JSON.stringify(input.settings),
+    settingsFingerprint: input.settingsFingerprint ?? JSON.stringify(input.settings),
     ...(input.answeredAsOf ? { answeredAsOf: input.answeredAsOf, expiresAt } : {}),
   };
 }
@@ -1127,6 +1200,7 @@ export interface ControllerIntegrationDependencies {
   mailAlertBackend?: MailAlertNotificationBackend;
   mailAlertTapBackend?: MailAlertTapBackend;
   withMailAlertNotificationWriter?: <T>(actual: (scope: PrivacyWriterScope, store: ExistingWorkspaceWriterStore) => Promise<T>) => Promise<T>;
+  openRouterBatchClient?: OpenRouterBatchClient;
 }
 
 interface BackupImportSession {
@@ -1195,6 +1269,7 @@ export class AppControllerImpl implements AppController {
   private mirrorDirty = new Set<string>();
   private readonly speechClient: AzureSpeechClient;
   private readonly openAiClient: AssistantModelClient;
+  private readonly openRouterBatchClient?: OpenRouterBatchClient;
   private readonly connector?: ConnectorClient;
   private activeSyncCount = 0;
   private syncQueue: (() => void)[] = [];
@@ -1211,6 +1286,13 @@ export class AppControllerImpl implements AppController {
   private proactiveRecoveryArchivesValidated?: ProactiveRecoveryArchiveState;
   private proactiveRecoveryArchivesMalformed = false;
   private proactiveRecoveryUnavailableReason?: { readonly reason: 'evidence_too_large'; readonly state: AppState; readonly bootstrapGeneration: number };
+  private assistantBatchLedgerRaw?: unknown;
+  private assistantBatchLedgerHasRaw = false;
+  private assistantBatchLedger = emptyOpenRouterBatchLedger();
+  private assistantBatchLedgerMalformed = false;
+  private assistantBatchCleanupRetries = new Map<string, () => Promise<void>>();
+  private activeBatchNoteOperations = new Set<string>();
+  private activeBatchJobInspections = new Set<string>();
   private proactiveRecoveryPlan?: {
     readonly publicPlan: ProactiveRecoveryPlan;
     readonly preparedAtMs: number;
@@ -1279,6 +1361,7 @@ export class AppControllerImpl implements AppController {
     });
     const llmCredentials = credentials ?? createProviderCredentialService(credentialStore);
     this.openAiClient = new AssistantClientRouter(providers.openAi ?? new AzureOpenAIClient(fetch, () => llmCredentials.readProviderCredential('openai')));
+    this.openRouterBatchClient = integration.openRouterBatchClient;
     this.connector = integration.tokenStore && integration.connectorFactory
       ? integration.connectorFactory(integration.tokenStore, (accountId, status) => this.handleConnectorAuthStatus(accountId, status))
       : undefined;
@@ -1323,6 +1406,13 @@ export class AppControllerImpl implements AppController {
     this.proactiveRecoveryArchivesValidated = undefined;
     this.proactiveRecoveryArchivesMalformed = false;
     this.proactiveRecoveryUnavailableReason = undefined;
+    this.assistantBatchLedgerRaw = undefined;
+    this.assistantBatchLedgerHasRaw = false;
+    this.assistantBatchLedger = emptyOpenRouterBatchLedger();
+    this.assistantBatchLedgerMalformed = false;
+    this.assistantBatchCleanupRetries.clear();
+    this.activeBatchNoteOperations.clear();
+    this.activeBatchJobInspections.clear();
     this.proactiveRecoveryInspectionOperationId = undefined;
     this.proactiveRecoveryExpectedReceipt = undefined;
     this.proactiveRecoveryReceiptReadAfterRefresh = false;
@@ -1843,7 +1933,16 @@ export class AppControllerImpl implements AppController {
   }
 
   private persistedState(state: AppState): AppState {
-    const result = { ...state } as AppState & { dispatchRecordQuarantine?: DispatchRecordQuarantineEntry[]; proactiveQuarantine?: unknown; proactiveRecoveryArchives?: unknown; proactiveMailAlertQuarantine?: unknown[]; backupImportQuarantine?: unknown[]; knowledgeQuarantine?: unknown[]; reminderQuarantine?: unknown[]; deviceCalendarQuarantine?: unknown[]; transcriptionQuarantine?: unknown[] };
+    return this.persistedStateWithBatchLedger(state);
+  }
+
+  private persistedStateWithBatchLedger(state: AppState, batchLedger?: OpenRouterBatchLedger): AppState {
+    const result = { ...state } as AppState & { dispatchRecordQuarantine?: DispatchRecordQuarantineEntry[]; proactiveQuarantine?: unknown; proactiveRecoveryArchives?: unknown; proactiveMailAlertQuarantine?: unknown[]; backupImportQuarantine?: unknown[]; knowledgeQuarantine?: unknown[]; reminderQuarantine?: unknown[]; deviceCalendarQuarantine?: unknown[]; transcriptionQuarantine?: unknown[]; openRouterBatchLedger?: unknown; assistantBatchJobs?: unknown; assistantBatchRecoveryStatus?: unknown };
+    delete result.assistantBatchJobs;
+    delete result.assistantBatchRecoveryStatus;
+    if (batchLedger) result.openRouterBatchLedger = clone(batchLedger);
+    else if (this.assistantBatchLedgerHasRaw) result.openRouterBatchLedger = clone(this.assistantBatchLedgerRaw);
+    else result.openRouterBatchLedger = clone(this.assistantBatchLedger);
     if (this.dispatchRecordQuarantine.length) result.dispatchRecordQuarantine = clone(this.dispatchRecordQuarantine);
     else delete result.dispatchRecordQuarantine;
     if (this.dispatchRecordQuarantine.length) result.dispatchRecoveryStatus = {
@@ -1871,7 +1970,14 @@ export class AppControllerImpl implements AppController {
   }
 
   private publicState(state: AppState): AppState {
-    const result = clone(state) as AppState & { dispatchRecordQuarantine?: unknown; proactiveQuarantine?: unknown; proactiveRecoveryArchives?: unknown; proactiveMailAlertQuarantine?: unknown; backupImportQuarantine?: unknown; knowledgeQuarantine?: unknown; reminderQuarantine?: unknown; deviceCalendarQuarantine?: unknown; transcriptionQuarantine?: unknown };
+    const result = clone(state) as AppState & { dispatchRecordQuarantine?: unknown; proactiveQuarantine?: unknown; proactiveRecoveryArchives?: unknown; proactiveMailAlertQuarantine?: unknown; backupImportQuarantine?: unknown; knowledgeQuarantine?: unknown; reminderQuarantine?: unknown; deviceCalendarQuarantine?: unknown; transcriptionQuarantine?: unknown; openRouterBatchLedger?: unknown; assistantBatchJobs?: unknown };
+    delete result.openRouterBatchLedger;
+    result.assistantBatchJobs = this.assistantBatchLedgerMalformed ? [] : this.assistantBatchLedger.jobs.map((job) => assistantBatchJobDTO(job, this.assistantBatchCleanupRetries.has(job.id)));
+    if (this.assistantBatchLedgerMalformed) result.assistantBatchRecoveryStatus = {
+      blocked: true,
+      message: 'Saved Batch history could not be validated and is held privately. Batch actions are disabled until local data is refreshed.',
+    };
+    else delete result.assistantBatchRecoveryStatus;
     delete result.dispatchRecordQuarantine;
     if (this.dispatchRecordQuarantine.length) result.dispatchRecoveryStatus = {
       quarantinedCount: this.dispatchRecordQuarantine.length,
@@ -2015,6 +2121,7 @@ export class AppControllerImpl implements AppController {
   private async mutate<T>(
     operation: (draft: AppState) => T | Promise<T>,
     saveOptions?: (draft: AppState, result: T) => Parameters<StateStore['save']>[1],
+    batchLedgerForCommit?: (draft: AppState, result: T) => OpenRouterBatchLedger | undefined,
   ): Promise<T> {
     await this.assertPrivacySessionCurrent();
     const capturedBootstrapGeneration = this.bootstrapGeneration;
@@ -2034,12 +2141,19 @@ export class AppControllerImpl implements AppController {
       await this.evaluateProactiveDraft(draft);
       draft.reminders = validateReminderState(draft.reminders);
       draft.transcription = clone(validateTranscriptionState(draft.transcription));
+      const batchLedger = batchLedgerForCommit?.(draft, result);
       await this.assertPrivacySessionCurrent();
       try {
-        await this.store.save(this.persistedState(draft), saveOptions?.(draft, result));
+        await this.store.save(this.persistedStateWithBatchLedger(draft, batchLedger), saveOptions?.(draft, result));
         await this.assertPrivacySessionCurrent();
         if (capturedBootstrapGeneration !== this.bootstrapGeneration || this.startupRecoveryPhase !== 'ready') {
           throw new Error('The app workspace changed while the update was being saved. Reopen the app before continuing.');
+        }
+        if (batchLedger) {
+          this.assistantBatchLedger = validateOpenRouterBatchLedger(batchLedger);
+          this.assistantBatchLedgerHasRaw = false;
+          this.assistantBatchLedgerRaw = undefined;
+          this.assistantBatchLedgerMalformed = false;
         }
         this.state = draft;
         this.snapshot = deepFreeze(this.publicState(draft));
@@ -2047,7 +2161,7 @@ export class AppControllerImpl implements AppController {
       } catch (error) {
         // A storage write can commit before save/ownership acknowledgement fails.
         // Require an explicit reload before this instance can write again.
-        this.setMailAlertRefreshRequired();
+        if (capturedBootstrapGeneration === this.bootstrapGeneration) this.setMailAlertRefreshRequired();
         throw error;
       }
       await this.cancelNewMailAlertIntents(newCancellationIntents);
@@ -2089,7 +2203,7 @@ export class AppControllerImpl implements AppController {
           this.snapshot = deepFreeze(this.publicState(draft));
           this.emit();
         } catch (error) {
-          this.setMailAlertRefreshRequired();
+          if (capturedBootstrapGeneration === this.bootstrapGeneration) this.setMailAlertRefreshRequired();
           throw error;
         }
         await this.cancelNewMailAlertIntents(newCancellationIntents);
@@ -2188,7 +2302,7 @@ export class AppControllerImpl implements AppController {
     if (provenance.capturedAt !== (note.capturedAt ?? note.createdAt) || provenance.captureTimeZone !== (note.captureTimeZone || state.settings.timezone)) {
       throw new Error('The recording time anchor changed. Run Assist again before approving or continuing this action.');
     }
-    if (provenance.settingsFingerprint !== JSON.stringify(state.settings)) throw new Error('Assistant settings changed. Run Assist again before approving or continuing this action.');
+    if (!assistantSettingsFingerprintMatches(provenance.settingsFingerprint, state.settings)) throw new Error('Assistant settings changed. Run Assist again before approving or continuing this action.');
     if (provenance.answeredAsOf && !Number.isFinite(Date.parse(provenance.answeredAsOf))) throw new Error('This suggestion has an invalid question-time anchor. Run Assist again before approving it.');
     if (provenance.expiresAt && (!Number.isFinite(Date.parse(provenance.expiresAt)) || Date.now() >= Date.parse(provenance.expiresAt))) throw new Error('This answer-based suggestion expired at the next question-time window. Run Assist again before approving or continuing it.');
     if (!Array.isArray(provenance.knowledgeSelection)) throw new Error('This suggestion has no saved knowledge selection. Run Assist again before approving it.');
@@ -3025,6 +3139,11 @@ export class AppControllerImpl implements AppController {
     this.proactiveRecoveryArchivesValidated = undefined;
     this.proactiveRecoveryArchivesMalformed = false;
     this.proactiveRecoveryUnavailableReason = undefined;
+    this.assistantBatchLedgerRaw = undefined;
+    this.assistantBatchLedgerHasRaw = false;
+    this.assistantBatchLedger = emptyOpenRouterBatchLedger();
+    this.assistantBatchLedgerMalformed = false;
+    this.assistantBatchCleanupRetries.clear();
     this.proactiveRecoveryInspectionOperationId = undefined;
     this.proactiveRecoveryExpectedReceipt = undefined;
     this.proactiveRecoveryReceiptReadAfterRefresh = false;
@@ -3052,6 +3171,43 @@ export class AppControllerImpl implements AppController {
     const loaded = await this.store.load();
     await this.assertPrivacySessionCurrent(allowMailAlertRefresh);
     if (capturedBootstrapGeneration !== this.bootstrapGeneration) throw new Error('The app workspace changed while startup was loading. Reopen the app before continuing.');
+    this.assistantBatchLedgerRaw = undefined;
+    this.assistantBatchLedgerHasRaw = false;
+    this.assistantBatchLedger = emptyOpenRouterBatchLedger();
+    this.assistantBatchLedgerMalformed = false;
+    this.assistantBatchCleanupRetries.clear();
+    if (loaded && Object.prototype.hasOwnProperty.call(loaded, 'openRouterBatchLedger')) {
+      this.assistantBatchLedgerHasRaw = true;
+      this.assistantBatchLedgerRaw = clone((loaded as AppState & { openRouterBatchLedger?: unknown }).openRouterBatchLedger);
+      try {
+        const validated = validateOpenRouterBatchLedger(this.assistantBatchLedgerRaw);
+        for (const job of validated.jobs) {
+          if (!isOpenRouterBatchContentJob(job)) continue;
+          if (typeof job.requestBody !== 'string' || typeof job.requestBytes !== 'number') throw new Error('Incomplete saved Batch request binding.');
+          const bodyBytes = new TextEncoder().encode(job.requestBody).byteLength;
+          const digest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, job.requestBody, { encoding: Crypto.CryptoEncoding.HEX });
+          const parsedBody = JSON.parse(job.requestBody) as unknown;
+          if (bodyBytes !== job.requestBytes || digest !== job.requestSha256 || !isOpenRouterBatchRequestProfile(parsedBody) ||
+              (parsedBody as { reasoning: { effort: string } }).reasoning.effort !== job.effort ||
+              (parsedBody as { response_format: { json_schema: { name: string } } }).response_format.json_schema.name !== 'note_assistance') {
+            throw new Error('Invalid saved Batch request binding.');
+          }
+        }
+        this.assistantBatchLedger = Object.freeze({
+          version: validated.version,
+          jobs: Object.freeze(validated.jobs.map((job) => job.status === 'submitting'
+            ? Object.freeze({ ...job, status: 'submission_unknown' as const, updatedAt: now() })
+            : job.status === 'preparing'
+              ? Object.freeze({ ...job, status: 'failed' as const, failureCode: 'not_submitted' as const, updatedAt: now() })
+              : job)),
+        });
+        this.assistantBatchLedgerHasRaw = false;
+        this.assistantBatchLedgerRaw = undefined;
+      } catch {
+        this.assistantBatchLedgerMalformed = true;
+        this.assistantBatchLedger = emptyOpenRouterBatchLedger();
+      }
+    }
     this.proactiveRecoveryArchivesRaw = undefined;
     this.proactiveRecoveryArchivesValidated = undefined;
     this.proactiveRecoveryArchivesMalformed = false;
@@ -3062,6 +3218,7 @@ export class AppControllerImpl implements AppController {
       catch { this.proactiveRecoveryArchivesMalformed = true; }
     }
     const normalized: NormalizedLoadedState = loaded ? normalizeLoadedState(loaded) : initialState();
+    delete (normalized as AppState & { openRouterBatchLedger?: unknown }).openRouterBatchLedger;
     delete (normalized as AppState & { proactiveRecoveryArchives?: unknown }).proactiveRecoveryArchives;
     this.dispatchRecordQuarantine = clone(normalized.dispatchRecordQuarantine ?? []);
     delete normalized.dispatchRecordQuarantine;
@@ -3686,7 +3843,9 @@ export class AppControllerImpl implements AppController {
       };
       let currentVersions: Record<string, string>;
       if (state.settings.mode === 'provider' && analysis.source === 'provider') {
-        currentVersions = (await this.openAiClient.prepare(note, documents, state.settings, request)).sourceVersions;
+        currentVersions = state.settings.llmProvider === 'openrouter'
+          ? (await new OpenRouterBatchRequestBuilder().prepareAnalysis(note, documents, state.settings, request)).sourceVersions
+          : (await this.openAiClient.prepare(note, documents, state.settings, request)).sourceVersions;
       } else {
         const calendarAvailable = usableDeviceCalendarSnapshot(state) || state.calendars.some((calendar) => {
           const account = state.accounts.find((item) => item.id === calendar.accountId);
@@ -3706,7 +3865,10 @@ export class AppControllerImpl implements AppController {
       }
       let priorFingerprint: { settings?: AppSettings; contractVersion?: string } | undefined;
       try { priorFingerprint = JSON.parse(analysis.fingerprint) as { settings?: AppSettings; contractVersion?: string }; } catch { priorFingerprint = undefined; }
-      const settingsChanged = !priorFingerprint?.settings || JSON.stringify(priorFingerprint.settings) !== JSON.stringify(state.settings) ||
+      const providerSettingsChanged = priorFingerprint?.settings?.llmProvider === 'openrouter'
+        ? stableJson(priorFingerprint.settings) !== stableJson(openRouterSettingsBinding(state.settings))
+        : JSON.stringify(priorFingerprint?.settings) !== JSON.stringify(state.settings);
+      const settingsChanged = !priorFingerprint?.settings || providerSettingsChanged ||
         priorFingerprint.contractVersion !== ASSIST_CONTRACT_VERSION ||
         (analysis.source === 'provider') !== (state.settings.mode === 'provider');
       const answerWindowExpired = Boolean(analysis.answeredAsOf &&
@@ -3732,7 +3894,326 @@ export class AppControllerImpl implements AppController {
     return job;
   }
 
-  private async runAssistNote(id: string, options: { intent?: AssistIntent; question?: string; forceRefresh?: boolean; knowledgeSelection?: KnowledgeSelection } = {}, requestedAt = new Date()): Promise<NoteAssistResult> {
+  rememberOpenRouterBatchCleanup(operationId: string, retry: () => Promise<void>): void {
+    if (operationId.length !== 36 || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(operationId)) return;
+    this.assistantBatchCleanupRetries.set(operationId, retry);
+    this.snapshot = deepFreeze(this.publicState(this.state));
+    this.emit();
+  }
+
+  async submitNoteBatch(noteId: string, options: { intent?: AssistIntent; question?: string; knowledgeSelection?: KnowledgeSelection } = {}): Promise<AssistantBatchJobDTO> {
+    if (this.activeBatchNoteOperations.has(noteId)) throw new Error('A Batch request for this note is still settling. Try again after it finishes.');
+    this.activeBatchNoteOperations.add(noteId);
+    try { return await this.submitNoteBatchInternal(noteId, options); }
+    finally { this.activeBatchNoteOperations.delete(noteId); }
+  }
+
+  private async submitNoteBatchInternal(noteId: string, options: { intent?: AssistIntent; question?: string; knowledgeSelection?: KnowledgeSelection }): Promise<AssistantBatchJobDTO> {
+    if (!this.openRouterBatchClient) throw new Error('The OpenRouter Batch service is unavailable in this workspace.');
+    if (this.assistantBatchLedgerMalformed) throw new Error('Saved Batch history could not be validated. Refresh local data before continuing.');
+    const intent = options.intent ?? 'assist';
+    const question = options.question?.trim() || undefined;
+    if (!['assist', 'summarize', 'answer', 'extract'].includes(intent)) throw new Error('Choose a supported Assist action.');
+    if (intent === 'answer' && !question) throw new Error('Add a question before asking about this note.');
+    const knowledgeSelection = normalizeKnowledgeSelection(options.knowledgeSelection ?? []);
+    const createdAt = now();
+    const capturedBootstrapGeneration = this.bootstrapGeneration;
+    let prepared!: PreparedOpenRouterAnalysis;
+    let createdJob!: OpenRouterBatchJob;
+    const staged = await this.mutate(async (draft) => {
+      if (this.assistantBatchLedgerMalformed) throw new Error('Saved Batch history could not be validated. Refresh local data before continuing.');
+      if (draft.settings.mode !== 'provider' || draft.settings.llmProvider !== 'openrouter') throw new Error('Select OpenRouter in Provider mode before queuing a Batch.');
+      const note = this.note(draft, noteId);
+      this.requireConfirmedCaptureTimeZone(note);
+      if (!note.transcript.trim()) throw new Error('This note has no transcript to queue.');
+      for (const selected of knowledgeSelection) if (!getKnowledgeEntity(draft.knowledge, selected.kind, selected.id)) throw new Error('A selected knowledge source is no longer available. Refresh the selection and try again.');
+      const context = assistContext(draft, note, intent, question, knowledgeSelection);
+      const answeredAsOf = intent === 'answer' ? createdAt : undefined;
+      const request = {
+        intent, question,
+        ...(answeredAsOf ? { queryTimeAnchor: answeredAsOf, queryTimeZone: draft.settings.timezone } : {}),
+        additionalSources: context.additionalSources,
+        preselection: { omittedSourceCount: context.omittedSourceCount, omittedSourceIds: context.omittedSourceIds },
+      };
+      prepared = await new OpenRouterBatchRequestBuilder().prepareAnalysis(note, context.documents, draft.settings, request);
+      if (this.assistantBatchLedger.jobs.some((job) => job.noteId === noteId && ['preparing', 'submitting', 'submission_unknown', 'queued', 'processing', 'cleanup_pending'].includes(job.status))) {
+        throw new Error('This note already has an unfinished Batch job. Inspect that saved job before queuing another.');
+      }
+      const body = JSON.parse(prepared.body) as { reasoning: { effort: 'none' | 'low' } };
+      const jobId = newId();
+      createdJob = Object.freeze({
+        id: jobId, customId: jobId, kind: 'note_assistance', status: 'preparing', createdAt, updatedAt: createdAt,
+        noteId, noteRevision: note.revision, intent, ...(question ? { question } : {}),
+        knowledgeSelection: Object.freeze(knowledgeSelection.map((row) => Object.freeze({ ...row }))),
+        capturedAt: note.capturedAt ?? note.createdAt, captureTimeZone: note.captureTimeZone || draft.settings.timezone,
+        ...(answeredAsOf ? { answeredAsOf } : {}),
+        settingsFingerprint: await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, stableJson(openRouterSettingsBinding(draft.settings)), { encoding: Crypto.CryptoEncoding.HEX }),
+        sourceFingerprint: await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, stableJson(prepared.sourceVersions), { encoding: Crypto.CryptoEncoding.HEX }),
+        requestProfileVersion: 1, model: OPENROUTER_BATCH_MODEL, effort: body.reasoning.effort,
+        requestBytes: new TextEncoder().encode(prepared.body).byteLength, omittedSourceCount: prepared.omittedSourceCount,
+        requestBody: prepared.body,
+        requestSha256: await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, prepared.body, { encoding: Crypto.CryptoEncoding.HEX }),
+        sourceVersions: Object.freeze({ ...prepared.sourceVersions }), unknownCharge: false,
+      });
+      return createdJob;
+    }, undefined, () => validateOpenRouterBatchLedger({
+      version: 1, jobs: [...this.assistantBatchLedger.jobs, createdJob],
+    }));
+    if (!isOpenRouterBatchContentJob(staged) || typeof staged.requestBody !== 'string') throw new Error('The prepared Batch request could not be retained.');
+
+    const preparedState = this.state;
+    let submittingState: AppState | undefined;
+    const submittedContextIsCurrent = () => this.loaded && this.bootstrapGeneration === capturedBootstrapGeneration &&
+      this.state === (submittingState ?? preparedState) && this.startupRecoveryPhase === 'ready' && !this.mailAlertRefreshRequired;
+    try {
+      const ack = await this.openRouterBatchClient.submit({ operationId: staged.id, requestBody: staged.requestBody }, async () => {
+        if (!this.loaded || this.bootstrapGeneration !== capturedBootstrapGeneration || this.state !== preparedState || this.mailAlertRefreshRequired || this.assistantBatchLedgerMalformed) throw new Error('The saved note changed before Batch submission.');
+        await this.updateOpenRouterBatchJob(staged.id, (job) => ({ ...job, status: 'submitting', unknownCharge: true, updatedAt: now() }), { state: preparedState, generation: capturedBootstrapGeneration });
+        submittingState = this.state;
+      }, () => {
+        if (!submittingState || this.state !== submittingState || !this.loaded || this.mailAlertRefreshRequired ||
+            this.startupRecoveryPhase !== 'ready' || this.assistantBatchLedgerMalformed || this.bootstrapGeneration !== capturedBootstrapGeneration) {
+          throw new Error('The saved note changed before Batch submission.');
+        }
+        const current = this.assistantBatchLedger.jobs.find((job) => job.id === staged.id);
+        if (!current || current.status !== 'submitting' || current.requestSha256 !== staged.requestSha256) throw new Error('The saved Batch request changed before submission.');
+      });
+      if (!submittedContextIsCurrent() || !submittingState) throw new Error('The Batch acknowledgement belongs to an earlier workspace session.');
+      return await this.updateOpenRouterBatchJob(staged.id, (job) => ({ ...job, status: 'queued', batchId: ack.batchId, updatedAt: now() }), { state: submittingState, generation: capturedBootstrapGeneration });
+    } catch (error) {
+      if (this.assistantBatchCleanupRetries.has(staged.id) && submittedContextIsCurrent()) return this.batchDTO(staged.id);
+      if (!submittedContextIsCurrent()) throw error;
+      if (error instanceof OpenRouterBatchDispatchError && error.phase === 'pre_dispatch') {
+        await this.updateOpenRouterBatchJob(staged.id, (job) => ({ ...job, status: 'failed', unknownCharge: false, failureCode: 'not_submitted', updatedAt: now() }), { state: this.state, generation: capturedBootstrapGeneration }).catch(() => undefined);
+      } else if (error instanceof OpenRouterBatchDispatchError && error.phase === 'unknown') {
+        await this.updateOpenRouterBatchJob(staged.id, (job) => ({ ...job, status: 'submission_unknown', unknownCharge: true, updatedAt: now() }), { state: this.state, generation: capturedBootstrapGeneration }).catch(() => undefined);
+      }
+      throw error;
+    }
+  }
+
+  async refreshAssistantBatch(jobId: string): Promise<AssistantBatchJobDTO> {
+    if (this.activeBatchJobInspections.has(jobId)) throw new Error('A Batch status check for this job is already settling. Try again after it finishes.');
+    const initial = this.assistantBatchLedger.jobs.find((candidate) => candidate.id === jobId);
+    const noteId = initial && isOpenRouterBatchContentJob(initial) ? initial.noteId : undefined;
+    if (noteId && this.activeBatchNoteOperations.has(noteId)) throw new Error('A Batch request for this note is still settling. Try again after it finishes.');
+    this.activeBatchJobInspections.add(jobId);
+    if (noteId) this.activeBatchNoteOperations.add(noteId);
+    try { return await this.refreshAssistantBatchInternal(jobId); }
+    finally {
+      this.activeBatchJobInspections.delete(jobId);
+      if (noteId) this.activeBatchNoteOperations.delete(noteId);
+    }
+  }
+
+  private async refreshAssistantBatchInternal(jobId: string): Promise<AssistantBatchJobDTO> {
+    if (!this.openRouterBatchClient) throw new Error('The OpenRouter Batch service is unavailable in this workspace.');
+    if (this.assistantBatchLedgerMalformed) throw new Error('Saved Batch history could not be validated. Refresh local data before continuing.');
+    const job = this.assistantBatchLedger.jobs.find((candidate) => candidate.id === jobId);
+    if (!job) throw new Error('The saved Batch job was not found.');
+    if (!isOpenRouterBatchContentJob(job)) {
+      if (!job.batchId || job.accounting?.providerReportedCostUsd !== undefined || !this.openRouterBatchClient || this.assistantBatchCleanupRetries.has(job.id)) return this.batchDTO(job.id);
+      const capturedState = this.state;
+      const capturedGeneration = this.bootstrapGeneration;
+      const inspection = await this.openRouterBatchClient.inspect(job.batchId, job.customId, () => {
+        if (this.state !== capturedState || capturedGeneration !== this.bootstrapGeneration || !this.loaded || this.mailAlertRefreshRequired || this.startupRecoveryPhase !== 'ready') {
+          throw new Error('The saved Batch receipt changed before inspection.');
+        }
+      });
+      if (this.state !== capturedState || this.bootstrapGeneration !== capturedGeneration) throw new Error('The saved Batch receipt changed during inspection.');
+      const accounting = this.mergeBatchAccounting(job.accounting, accountingFromInspection(inspection));
+      return this.updateOpenRouterBatchJob(job.id, (current) => ({
+        ...current,
+        ...(inspection.batchId ? { batchId: inspection.batchId } : {}),
+        ...(accounting ? { accounting } : {}),
+        unknownCharge: accounting?.providerReportedCostUsd === undefined,
+        updatedAt: now(),
+      }), { state: capturedState, generation: capturedGeneration });
+    }
+    const accountingOnly = ['failed', 'expired', 'cancelled', 'result_stale', 'result_invalid'].includes(job.status);
+    if (!job.batchId || (!accountingOnly && !['queued', 'processing', 'completed'].includes(job.status)) ||
+        (job.status === 'completed' && job.accounting?.providerReportedCostUsd !== undefined) ||
+        (accountingOnly && job.accounting?.providerReportedCostUsd !== undefined)) return this.batchDTO(job.id);
+    if (this.assistantBatchCleanupRetries.has(job.id)) return this.batchDTO(job.id);
+    const capturedState = this.state;
+    const capturedGeneration = this.bootstrapGeneration;
+    const inspectionContextIsCurrent = () => this.loaded && this.state === capturedState &&
+      this.bootstrapGeneration === capturedGeneration && this.startupRecoveryPhase === 'ready' && !this.mailAlertRefreshRequired;
+    const requireInspectionContext = () => {
+      if (!inspectionContextIsCurrent()) throw new Error('The saved Batch job changed during inspection. Refresh local data before continuing.');
+    };
+    let inspection: OpenRouterBatchInspection;
+    try {
+      inspection = await this.openRouterBatchClient.inspect(job.batchId, job.customId, () => {
+        if (this.state !== capturedState || capturedGeneration !== this.bootstrapGeneration || !this.loaded || this.mailAlertRefreshRequired ||
+            this.startupRecoveryPhase !== 'ready' || this.assistantBatchLedgerMalformed) throw new Error('Local Batch context changed before inspection.');
+      });
+    } catch (error) {
+      if (this.assistantBatchCleanupRetries.has(job.id) && this.state === capturedState && this.bootstrapGeneration === capturedGeneration) return this.batchDTO(job.id);
+      throw error;
+    }
+    requireInspectionContext();
+    const accounting = this.mergeBatchAccounting(job.accounting, accountingFromInspection(inspection));
+    if (accountingOnly) {
+      return this.updateOpenRouterBatchJob(job.id, (current) => ({
+        ...current,
+        ...(inspection.batchId ? { batchId: inspection.batchId } : {}),
+        unknownCharge: accounting?.providerReportedCostUsd === undefined,
+        ...(accounting ? { accounting } : {}), updatedAt: now(),
+      }), { state: capturedState, generation: capturedGeneration });
+    }
+    if (inspection.status !== 'completed') {
+      const nextStatus: OpenRouterBatchJob['status'] = inspection.status === 'failed' ? 'failed' :
+        inspection.status === 'expired' ? 'expired' : inspection.status === 'cancelled' ? 'cancelled' :
+          ['in_progress', 'finalizing', 'cancelling'].includes(inspection.status) ? 'processing' : 'queued';
+      return this.updateOpenRouterBatchJob(job.id, (current) => ({
+        ...current, status: nextStatus,
+        ...(['failed', 'expired'].includes(nextStatus) ? { failureCode: nextStatus === 'expired' ? 'expired' as const : 'provider_failed' as const } : {}),
+        unknownCharge: accounting?.providerReportedCostUsd === undefined,
+        ...(accounting ? { accounting } : {}), updatedAt: now(),
+      }), { state: capturedState, generation: capturedGeneration });
+    }
+    if (inspection.metadataValidation !== 'valid' || inspection.resultValidation !== 'valid') {
+      return this.updateOpenRouterBatchJob(job.id, (current) => ({
+        ...current, status: 'result_invalid', failureCode: 'invalid_result',
+        unknownCharge: accounting?.providerReportedCostUsd === undefined,
+        ...(accounting ? { accounting } : {}), updatedAt: now(),
+      }), { state: capturedState, generation: capturedGeneration });
+    }
+    if (job.status !== 'queued' && job.status !== 'processing') {
+      return this.updateOpenRouterBatchJob(job.id, (current) => ({
+        ...current, unknownCharge: accounting?.providerReportedCostUsd === undefined,
+        ...(accounting ? { accounting } : {}), updatedAt: now(),
+      }), { state: capturedState, generation: capturedGeneration });
+    }
+    let prepared: PreparedOpenRouterAnalysis | undefined;
+    try {
+      requireInspectionContext();
+      const fresh = this.state;
+      const settingsFingerprint = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, stableJson(openRouterSettingsBinding(fresh.settings)), { encoding: Crypto.CryptoEncoding.HEX });
+      const note = fresh.notes.find((item) => item.id === job.noteId);
+      if (settingsFingerprint !== job.settingsFingerprint || !note || note.revision !== job.noteRevision ||
+          fresh.settings.mode !== 'provider' || fresh.settings.llmProvider !== 'openrouter') throw new Error('The saved analysis sources changed.');
+      const context = assistContext(fresh, note, job.intent!, job.question, [...(job.knowledgeSelection ?? [])]);
+      prepared = await new OpenRouterBatchRequestBuilder().prepareAnalysis(note, context.documents, fresh.settings, {
+        intent: job.intent, question: job.question,
+        ...(job.answeredAsOf ? { queryTimeAnchor: job.answeredAsOf, queryTimeZone: fresh.settings.timezone } : {}),
+        additionalSources: context.additionalSources,
+        preselection: { omittedSourceCount: context.omittedSourceCount, omittedSourceIds: context.omittedSourceIds },
+      });
+      requireInspectionContext();
+      const digest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, prepared.body, { encoding: Crypto.CryptoEncoding.HEX });
+      const sourceDigest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, stableJson(prepared.sourceVersions), { encoding: Crypto.CryptoEncoding.HEX });
+      requireInspectionContext();
+      if (prepared.body !== job.requestBody || digest !== job.requestSha256 || sourceDigest !== job.sourceFingerprint || !sameSourceVersions({ ...job.sourceVersions }, { ...prepared.sourceVersions })) throw new Error('The saved analysis sources changed.');
+    } catch {
+      requireInspectionContext();
+      return this.updateOpenRouterBatchJob(job.id, (current) => ({ ...current, status: 'result_stale', unknownCharge: accounting?.providerReportedCostUsd === undefined, failureCode: 'stale_result', ...(accounting ? { accounting } : {}), updatedAt: now() }), { state: capturedState, generation: capturedGeneration });
+    }
+    requireInspectionContext();
+    let generated: DraftAnalysis;
+    try {
+      generated = parseBatchAssistantResult(inspection, prepared).generated;
+    } catch {
+      requireInspectionContext();
+      return this.updateOpenRouterBatchJob(job.id, (current) => ({ ...current, status: 'result_invalid', unknownCharge: accounting?.providerReportedCostUsd === undefined, failureCode: 'invalid_result', ...(accounting ? { accounting } : {}), updatedAt: now() }), { state: capturedState, generation: capturedGeneration });
+    }
+    requireInspectionContext();
+    const analysis = await this.runAssistNote(job.noteId!, {
+      intent: job.intent, question: job.question, knowledgeSelection: [...(job.knowledgeSelection ?? [])], forceRefresh: true,
+    }, new Date(job.answeredAsOf ?? job.createdAt), {
+      prepared, generated,
+      capturedState, capturedGeneration,
+      nextLedger: (applied) => this.updatedBatchLedger(job.id, (current) => ({
+        ...current,
+        status: applied.stale ? 'result_stale' : 'completed',
+        unknownCharge: accounting?.providerReportedCostUsd === undefined,
+        ...(accounting ? { accounting } : {}),
+        ...(applied.stale ? { failureCode: 'stale_result' as const } : { appliedNoteRevision: applied.sourceRevision }),
+        updatedAt: now(),
+      })),
+    });
+    return this.batchDTO(job.id) ?? assistantBatchJobDTO({ ...job, status: analysis.stale ? 'result_stale' : 'completed' });
+  }
+
+  async retryAssistantBatchCleanup(jobId: string): Promise<AssistantBatchJobDTO> {
+    const retry = this.assistantBatchCleanupRetries.get(jobId);
+    if (!retry) return this.batchDTO(jobId);
+    try {
+      await retry();
+      if (this.assistantBatchCleanupRetries.get(jobId) === retry) this.assistantBatchCleanupRetries.delete(jobId);
+      this.snapshot = deepFreeze(this.publicState(this.state));
+      this.emit();
+    } catch { /* The public DTO remains cleanup_pending until this same native handle settles. */ }
+    return this.batchDTO(jobId);
+  }
+
+  private batchDTO(jobId: string): AssistantBatchJobDTO {
+    const job = this.assistantBatchLedger.jobs.find((candidate) => candidate.id === jobId);
+    if (!job) throw new Error('The saved Batch job was not found.');
+    return assistantBatchJobDTO(job, this.assistantBatchCleanupRetries.has(jobId));
+  }
+
+  private mergeBatchAccounting(previous?: OpenRouterBatchAccounting, incoming?: OpenRouterBatchAccounting): OpenRouterBatchAccounting | undefined {
+    if (!previous && !incoming) return undefined;
+    return Object.freeze({ ...(previous ?? {}), ...(incoming ?? {}) });
+  }
+
+  private updatedBatchLedger(jobId: string, update: (job: OpenRouterBatchJob) => OpenRouterBatchJob): OpenRouterBatchLedger {
+    if (this.assistantBatchLedgerMalformed) throw new Error('Saved Batch history could not be validated. Refresh local data before continuing.');
+    let found = false;
+    const jobs = this.assistantBatchLedger.jobs.map((job) => {
+      if (job.id !== jobId) return job;
+      found = true;
+      const updated = update(job);
+      return job.sourceRemoved ? Object.freeze({ ...updated, sourceRemoved: true as const, status: 'source_removed' as const }) : Object.freeze(updated);
+    });
+    if (!found) throw new Error('The saved Batch job was not found.');
+    return validateOpenRouterBatchLedger({ version: 1, jobs });
+  }
+
+  private async updateOpenRouterBatchJob(
+    jobId: string,
+    update: (job: OpenRouterBatchJob) => OpenRouterBatchJob,
+    expectedContext?: { readonly state: AppState; readonly generation: number },
+  ): Promise<AssistantBatchJobDTO> {
+    let nextLedger!: OpenRouterBatchLedger;
+    return this.mutate(() => {
+      if (expectedContext && (!this.loaded || this.state !== expectedContext.state || this.bootstrapGeneration !== expectedContext.generation ||
+          this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired)) {
+        throw new Error('The saved Batch operation belongs to an earlier workspace session.');
+      }
+      nextLedger = this.updatedBatchLedger(jobId, update);
+      return assistantBatchJobDTO(nextLedger.jobs.find((job) => job.id === jobId)!);
+    }, undefined, () => nextLedger);
+  }
+
+  private assertBatchLedgerCanDropContent(): void {
+    if (this.assistantBatchLedgerMalformed) throw new Error('Saved Batch history is invalid. Refresh local data before changing or deleting content.');
+  }
+
+  private tombstoneOpenRouterBatchJobs(predicate: (job: OpenRouterBatchJob) => boolean): OpenRouterBatchLedger {
+    this.assertBatchLedgerCanDropContent();
+    const archivedAt = now();
+    return validateOpenRouterBatchLedger({
+      version: 1,
+      jobs: this.assistantBatchLedger.jobs.map((job) => predicate(job) ? tombstoneOpenRouterBatchJob(job, archivedAt) : job),
+    });
+  }
+
+  private async runAssistNote(
+    id: string,
+    options: { intent?: AssistIntent; question?: string; forceRefresh?: boolean; knowledgeSelection?: KnowledgeSelection } = {},
+    requestedAt = new Date(),
+    batch?: { prepared: PreparedOpenRouterAnalysis; generated: DraftAnalysis; capturedState: AppState; capturedGeneration: number; nextLedger: (analysis: NoteAssistResult) => OpenRouterBatchLedger },
+  ): Promise<NoteAssistResult> {
+    const requireBatchContext = () => {
+      if (batch && (!this.loaded || this.state !== batch.capturedState || this.bootstrapGeneration !== batch.capturedGeneration ||
+          this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired)) {
+        throw new Error('The saved Batch result belongs to an earlier workspace session. Refresh local data before continuing.');
+      }
+    };
+    requireBatchContext();
     const intent = options.intent ?? 'assist';
     const question = options.question?.trim() || undefined;
     if (!['assist', 'summarize', 'answer', 'extract'].includes(intent)) throw new Error('Choose a supported assist action.');
@@ -3750,7 +4231,12 @@ export class AppControllerImpl implements AppController {
     const answeredAsOf = intent === 'answer' && question ? requestedAt.toISOString() : undefined;
     const queryBucket = answeredAsOf ? Math.floor(requestedAt.getTime() / 900_000) : undefined;
     const request = { intent, question, ...(answeredAsOf ? { queryTimeAnchor: answeredAsOf, queryTimeZone: state.settings.timezone } : {}), additionalSources: localSources, preselection: { omittedSourceCount, omittedSourceIds } };
-    const prepared = state.settings.mode === 'provider' ? await this.openAiClient.prepare(note, contextDocs, state.settings, request) : undefined;
+    const prepared = batch?.prepared ?? (state.settings.mode === 'provider'
+      ? (state.settings.llmProvider === 'openrouter'
+        ? await new OpenRouterBatchRequestBuilder().prepareAnalysis(note, contextDocs, state.settings, request)
+        : await this.openAiClient.prepare(note, contextDocs, state.settings, request))
+      : undefined);
+    requireBatchContext();
     const transcriptVersion = `${note.revision}:${await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, note.transcript.replace(/\r\n?/g, '\n').normalize('NFC'))}`;
     const hasCompleteRemoteCalendar = state.calendars.some((calendar) => {
       const account = state.accounts.find((item) => item.id === calendar.accountId);
@@ -3767,20 +4253,24 @@ export class AppControllerImpl implements AppController {
     const offlineInputs = offlineAssistInputs(note, intent, question, localSources, hasCompleteRemoteCalendar || hasUsableDeviceCalendar);
     const offlineCatalog = state.settings.mode === 'preview' ? await createSourceCatalog(offlineInputs,
       async (bytes) => Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, new TextDecoder().decode(bytes))) : undefined;
+    requireBatchContext();
     const sourceVersions = prepared?.sourceVersions ?? Object.fromEntries(offlineCatalog?.sources.map((source) => [source.id, source.version]) ?? [['transcript', transcriptVersion]]);
-    const processingFingerprint = JSON.stringify({ contractVersion: ASSIST_CONTRACT_VERSION, transcript: note.transcript, sourceRevision, sources: sourceVersions, settings: state.settings, intent, question, knowledgeSelection,
+    const processingFingerprint = JSON.stringify({ contractVersion: ASSIST_CONTRACT_VERSION, transcript: note.transcript, sourceRevision, sources: sourceVersions, settings: batch ? openRouterSettingsBinding(state.settings) : state.settings, intent, question, knowledgeSelection,
       capturedAt, captureTimeZone: note.captureTimeZone || state.settings.timezone,
       ...(answeredAsOf ? { queryBucket, queryTimeZone: state.settings.timezone } : {}),
     });
-    if (!options.forceRefresh && note.analysis?.fingerprint === processingFingerprint) return clone(note.analysis);
+    if (!batch && !options.forceRefresh && note.analysis?.fingerprint === processingFingerprint) return clone(note.analysis);
     let generated: DraftAnalysis;
-    if (state.settings.mode === 'provider') {
+    if (batch) {
+      generated = batch.generated;
+    } else if (state.settings.mode === 'provider') {
+      if (state.settings.llmProvider === 'openrouter') throw new Error('OpenRouter analysis must be queued as a Batch job.');
       const cached = options.forceRefresh ? undefined : this.analysisCache.get(processingFingerprint);
       if (cached) {
         generated = cached;
       } else {
         let reservation: { month: string; day: string; reserve: number } | undefined;
-        generated = await this.openAiClient.analyze(note, contextDocs, state.settings, undefined, async () => { reservation = await this.recordProviderAttempt('model', state.settings); }, request, prepared);
+        generated = await this.openAiClient.analyze(note, contextDocs, state.settings, undefined, async () => { reservation = await this.recordProviderAttempt('model', state.settings); }, request, prepared as PreparedAnalysis | undefined);
         await this.settleModelUsage(generated, state.settings, reservation);
         this.analysisCache.set(processingFingerprint, generated);
       }
@@ -3818,8 +4308,10 @@ export class AppControllerImpl implements AppController {
     }));
     const policyCatalog = await createSourceCatalog(policyInputs, async (bytes) =>
       Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, new TextDecoder().decode(bytes)));
+    requireBatchContext();
     const policySources = policyCatalog.sources.map((source) => ({ sourceId: source.id, revision: source.revision, sourceVersion: source.version }));
     const memorySuggestionFingerprint = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, processingFingerprint, { encoding: Crypto.CryptoEncoding.HEX });
+    requireBatchContext();
     const created: Proposal[] = generated.proposals.map((draft) => ({
       id: newId(), noteId: note.id, ...draft,
       ...(draft.kind === 'reminder' && draft.dueAt && Number.isFinite(Date.parse(draft.dueAt))
@@ -3827,20 +4319,26 @@ export class AppControllerImpl implements AppController {
       status: 'draft', revision: 1,
       recipients: [...draft.recipients], sourceRevision: note.revision, evidence: draft.evidence.map((item) => ({ ...item })),
       sourceActionKey: sourceActionKey(note, draft.kind, draft.evidence),
-      provenance: createProposalProvenance({ analysisFingerprint: processingFingerprint, note, intent, question, knowledgeSelection, sourceVersions: generated.sourceVersions, policySources, settings: state.settings, answeredAsOf }),
+      provenance: createProposalProvenance({ analysisFingerprint: processingFingerprint, note, intent, question, knowledgeSelection, sourceVersions: generated.sourceVersions, policySources, settings: state.settings,
+        ...(batch ? { settingsFingerprint: stableJson(openRouterSettingsBinding(state.settings)) } : {}), answeredAsOf }),
       requiresRebuild: false,
     }));
 
     const result = await this.mutate(async (draft) => {
+      requireBatchContext();
       const current = this.note(draft, id);
       if (current.revision !== sourceRevision) throw new Error('The transcript changed during processing. Process the updated note again.');
-      let stale = JSON.stringify(draft.settings) !== JSON.stringify(state.settings);
+      let stale = batch
+        ? stableJson(openRouterSettingsBinding(draft.settings)) !== stableJson(openRouterSettingsBinding(state.settings))
+        : JSON.stringify(draft.settings) !== JSON.stringify(state.settings);
       try {
         const currentContext = assistContext(draft, current, intent, question, knowledgeSelection);
         let currentVersions: Record<string, string>;
         if (draft.settings.mode === 'provider') {
           const currentRequest = { intent, question, ...(answeredAsOf ? { queryTimeAnchor: answeredAsOf, queryTimeZone: state.settings.timezone } : {}), additionalSources: currentContext.additionalSources, preselection: { omittedSourceCount: currentContext.omittedSourceCount, omittedSourceIds: currentContext.omittedSourceIds } };
-          currentVersions = (await this.openAiClient.prepare(current, currentContext.documents, draft.settings, currentRequest)).sourceVersions;
+          currentVersions = draft.settings.llmProvider === 'openrouter'
+            ? (await new OpenRouterBatchRequestBuilder().prepareAnalysis(current, currentContext.documents, draft.settings, currentRequest)).sourceVersions
+            : (await this.openAiClient.prepare(current, currentContext.documents, draft.settings, currentRequest)).sourceVersions;
         } else {
           const calendarAvailable = draft.calendars.some((calendar) => {
             const account = draft.accounts.find((item) => item.id === calendar.accountId);
@@ -3851,10 +4349,13 @@ export class AppControllerImpl implements AppController {
           const catalog = await createSourceCatalog(localInputs, async (bytes) => Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, new TextDecoder().decode(bytes)));
           currentVersions = Object.fromEntries(catalog.sources.map((source) => [source.id, source.version]));
         }
+        requireBatchContext();
         stale ||= !sameSourceVersions(generated.sourceVersions, currentVersions);
       } catch {
+        requireBatchContext();
         stale = true;
       }
+      requireBatchContext();
       if (stale) {
         const analysis: NoteAssistResult = {
           noteId: id, sourceRevision, intent, ...(question ? { question } : {}), fingerprint: processingFingerprint,
@@ -3913,7 +4414,7 @@ export class AppControllerImpl implements AppController {
         : `Preview mode extracted ${created.length} suggestion${created.length === 1 ? '' : 's'} from your transcript. No provider was contacted.`, { noteId: id });
       if (memorySuggestionIds.length) this.validateKnowledgeAndBackup(draft);
       return { proposals: selected, analysis, docs: [...new Map(docs.map((document) => [document.path, document])).values()] };
-    });
+    }, undefined, batch ? (_draft, applied) => batch.nextLedger(applied.analysis) : undefined);
     await Promise.all(result.docs.map((document) => this.mirrorDocument(document)));
     return result.analysis;
   }
@@ -5950,12 +6451,20 @@ export class AppControllerImpl implements AppController {
   private async saveKnowledgeEntity(kind: KnowledgeEntityKind, input: SavePersonInput | SaveProjectInput): Promise<Person | Project> {
     this.assertKnowledgeWritable();
     if (new TextEncoder().encode(input.narrative).length > 16 * 1024) throw new Error('Knowledge narrative is limited to 16 KiB.');
+    let replacesCapturedKnowledge = false;
+    let savedEntityId: string | undefined;
     const saved = await this.mutate((state) => {
       this.assertKnowledgeWritable();
       const id = input.id ?? this.freshStateId(state);
+      savedEntityId = id;
       const path = `${kind === 'person' ? 'people' : 'projects'}/${id}.md`;
       const collection = kind === 'person' ? state.knowledge.people : state.knowledge.projects;
       const existing = collection.find((item) => item.id === id);
+      replacesCapturedKnowledge = Boolean(existing);
+      if (replacesCapturedKnowledge) {
+        this.assertBatchLedgerCanDropContent();
+        if (this.activeBatchNoteOperations.size) throw new Error('A Batch request is still using saved context. Try again after it finishes.');
+      }
       if (existing && input.expectedRevision !== existing.revision) throw new Error('This knowledge entry changed. Refresh it before saving.');
       if (!existing && input.id) throw new Error('Person or project was not found.');
       if (!existing && stateEntityIds(state).has(id)) throw new Error('The requested person or project ID is already in use.');
@@ -5983,7 +6492,8 @@ export class AppControllerImpl implements AppController {
       this.validateKnowledgeAndBackup(state);
       const savedEntity = getKnowledgeEntity(state.knowledge, kind, id)!;
       return { entity: savedEntity as Person | Project, document: nextDocument };
-    });
+    }, undefined, () => replacesCapturedKnowledge && savedEntityId ? this.tombstoneOpenRouterBatchJobs((job) => isOpenRouterBatchContentJob(job) &&
+      (job.sourceVersions?.[`knowledge:${kind}:${savedEntityId}`] !== undefined || job.sourceVersions?.[`doc:${kind === 'person' ? 'people' : 'projects'}/${savedEntityId}.md`] !== undefined)) : undefined);
     await this.mirrorDocument(saved.document);
     await this.mirrorKnowledgeJournals();
     return saved.entity;
@@ -6013,18 +6523,26 @@ export class AppControllerImpl implements AppController {
     });
   }
 
-  private updateKnowledgeItem<T>(command: KnowledgeItemCommand, update: (entity: Person | Project, state: AppState) => T): Promise<T> {
+  private updateKnowledgeItem<T>(command: KnowledgeItemCommand, update: (entity: Person | Project, state: AppState) => T, removesSource = false): Promise<T> {
     this.assertKnowledgeWritable();
+    if (this.activeBatchNoteOperations.size) throw new Error('A Batch request is still using saved context. Try again after it finishes.');
+    let removesCapturedKnowledge = false;
     return this.mutate((state) => {
       this.assertKnowledgeWritable();
+      if (this.activeBatchNoteOperations.size) throw new Error('A Batch request is still using saved context. Try again after it finishes.');
+      if (this.assistantBatchLedgerMalformed) this.assertBatchLedgerCanDropContent();
       const entity = this.findKnowledgeEntity(state, command.entityKind, command.entityId);
+      removesCapturedKnowledge = removesSource || this.assistantBatchLedger.jobs.some((job) => isOpenRouterBatchContentJob(job) &&
+        job.sourceVersions?.[`knowledge:${command.entityKind}:${command.entityId}`] !== undefined);
+      if (removesCapturedKnowledge) this.assertBatchLedgerCanDropContent();
       if (entity.revision !== command.expectedEntityRevision) throw new Error('This knowledge entry changed. Refresh it before saving.');
       const result = update(entity, state);
       entity.revision += 1; entity.updatedAt = now();
       markAnalysesStale(state, [`knowledge:${command.entityKind}:${command.entityId}`]);
       this.validateKnowledgeAndBackup(state);
       return result;
-    });
+    }, undefined, () => removesCapturedKnowledge ? this.tombstoneOpenRouterBatchJobs((job) => isOpenRouterBatchContentJob(job) &&
+      job.sourceVersions?.[`knowledge:${command.entityKind}:${command.entityId}`] !== undefined) : undefined);
   }
 
   async saveKnowledgeFact(input: SaveKnowledgeFactInput): Promise<KnowledgeFact> {
@@ -6036,7 +6554,7 @@ export class AppControllerImpl implements AppController {
     });
   }
   async removeKnowledgeFact(input: KnowledgeItemCommand): Promise<void> {
-    await this.updateKnowledgeItem(input, (entity) => { const index = entity.facts.findIndex((item) => item.id === input.itemId); if (index < 0) throw new Error('Fact was not found.'); entity.facts.splice(index, 1); });
+    await this.updateKnowledgeItem(input, (entity) => { const index = entity.facts.findIndex((item) => item.id === input.itemId); if (index < 0) throw new Error('Fact was not found.'); entity.facts.splice(index, 1); }, true);
   }
   async saveKnowledgeContact(input: SaveKnowledgeContactInput): Promise<ContactClaim> {
     return this.updateKnowledgeItem(input, (entity, state) => {
@@ -6048,7 +6566,7 @@ export class AppControllerImpl implements AppController {
     });
   }
   async removeKnowledgeContact(input: KnowledgeItemCommand & { entityKind: 'person' }): Promise<void> {
-    await this.updateKnowledgeItem(input, (entity) => { if (!('contacts' in entity)) throw new Error('Person was not found.'); const index = entity.contacts.findIndex((item) => item.id === input.itemId); if (index < 0) throw new Error('Contact was not found.'); entity.contacts.splice(index, 1); });
+    await this.updateKnowledgeItem(input, (entity) => { if (!('contacts' in entity)) throw new Error('Person was not found.'); const index = entity.contacts.findIndex((item) => item.id === input.itemId); if (index < 0) throw new Error('Contact was not found.'); entity.contacts.splice(index, 1); }, true);
   }
   async saveKnowledgeSourceLink(input: SaveKnowledgeSourceLinkInput): Promise<KnowledgeSourceLink> {
     return this.updateKnowledgeItem(input, (entity, state) => {
@@ -6060,7 +6578,7 @@ export class AppControllerImpl implements AppController {
     });
   }
   async removeKnowledgeSourceLink(input: KnowledgeItemCommand): Promise<void> {
-    await this.updateKnowledgeItem(input, (entity) => { const index = entity.sourceLinks.findIndex((item) => item.id === input.itemId); if (index < 0) throw new Error('Source link was not found.'); entity.sourceLinks.splice(index, 1); });
+    await this.updateKnowledgeItem(input, (entity) => { const index = entity.sourceLinks.findIndex((item) => item.id === input.itemId); if (index < 0) throw new Error('Source link was not found.'); entity.sourceLinks.splice(index, 1); }, true);
   }
   async saveKnowledgeMember(input: SaveKnowledgeMemberInput): Promise<ProjectMember> {
     return this.updateKnowledgeItem(input, (entity, state) => {
@@ -6074,7 +6592,7 @@ export class AppControllerImpl implements AppController {
     });
   }
   async removeKnowledgeMember(input: KnowledgeItemCommand & { entityKind: 'project' }): Promise<void> {
-    await this.updateKnowledgeItem(input, (entity) => { if (!('members' in entity)) throw new Error('Project was not found.'); const index = entity.members.findIndex((item) => item.id === input.itemId); if (index < 0) throw new Error('Project member was not found.'); entity.members.splice(index, 1); });
+    await this.updateKnowledgeItem(input, (entity) => { if (!('members' in entity)) throw new Error('Project was not found.'); const index = entity.members.findIndex((item) => item.id === input.itemId); if (index < 0) throw new Error('Project member was not found.'); entity.members.splice(index, 1); }, true);
   }
 
   async createKnowledgeSuggestionFromNote(input: { noteId: string; sourceId: string; quote: string; targetKind: KnowledgeEntityKind; targetId: string; change: KnowledgeChange }): Promise<KnowledgeSuggestion> {
@@ -6278,6 +6796,8 @@ export class AppControllerImpl implements AppController {
 
   async reviewKnowledgeSuggestion(id: string, input: ReviewKnowledgeSuggestionInput): Promise<KnowledgeSuggestion> {
     this.assertKnowledgeWritable();
+    let removesCapturedKnowledge = false;
+    let changedKnowledgeSourceKey: string | undefined;
     const result = await this.mutate(async (state) => {
       this.assertKnowledgeWritable();
       const suggestion = state.knowledge.suggestions.find((item) => item.id === id);
@@ -6293,6 +6813,13 @@ export class AppControllerImpl implements AppController {
       }
       const target = this.findKnowledgeEntity(state, suggestion.change.entityKind, suggestion.change.entityId);
       if (target.archivedAt || target.revision !== suggestion.targetRevision || (input.targetRevision !== undefined && input.targetRevision !== target.revision)) throw new Error('The target person or project changed. Refresh the suggestion before accepting it.');
+      this.assertBatchLedgerCanDropContent();
+      changedKnowledgeSourceKey = `knowledge:${suggestion.change.entityKind}:${suggestion.change.entityId}`;
+      removesCapturedKnowledge = this.assistantBatchLedger.jobs.some((job) => isOpenRouterBatchContentJob(job) &&
+        job.sourceVersions?.[changedKnowledgeSourceKey!] !== undefined);
+      if (removesCapturedKnowledge) {
+        if (this.activeBatchNoteOperations.size) throw new Error('A Batch request is still using saved context. Try again after it finishes.');
+      }
       if (suggestion.change.type === 'add_source_link') {
         this.assertKnowledgeReferenceExists(state, suggestion.change.reference);
         if (suggestion.change.reference.kind === 'person' || suggestion.change.reference.kind === 'project') {
@@ -6332,7 +6859,8 @@ export class AppControllerImpl implements AppController {
       addActivity(state, 'local_action', `A reviewed memory suggestion was added to ${target.name}.`, { noteId: suggestion.sourceNoteId });
       this.validateKnowledgeAndBackup(state);
       return suggestion;
-    });
+    }, undefined, () => removesCapturedKnowledge && changedKnowledgeSourceKey ? this.tombstoneOpenRouterBatchJobs((job) =>
+      isOpenRouterBatchContentJob(job) && job.sourceVersions?.[changedKnowledgeSourceKey!] !== undefined) : undefined);
     await this.mirrorKnowledgeJournals();
     return result;
   }
@@ -6343,6 +6871,8 @@ export class AppControllerImpl implements AppController {
     const entityPath = /^people\/[0-9a-f-]+\.md$/.test(cleanPath) || /^projects\/[0-9a-f-]+\.md$/.test(cleanPath);
     if (entityPath) this.assertKnowledgeWritable();
     if (entityPath && new TextEncoder().encode(content).length > 16 * 1024) throw new Error('Knowledge narrative is limited to 16 KiB.');
+    let removesCapturedSource = false;
+    let affectedKnowledgeSourceKey: string | undefined;
     const document = await this.mutate((state) => {
       if (entityPath) this.assertKnowledgeWritable();
       const existing = state.documents.find((item) => item.path === cleanPath);
@@ -6351,6 +6881,7 @@ export class AppControllerImpl implements AppController {
       const entityMatch = /^people\/([0-9a-f-]+)\.md$/.exec(cleanPath) ?? /^projects\/([0-9a-f-]+)\.md$/.exec(cleanPath);
       if (entityMatch) {
         const kind: KnowledgeEntityKind = cleanPath.startsWith('people/') ? 'person' : 'project';
+        affectedKnowledgeSourceKey = `knowledge:${kind}:${entityMatch[1]}`;
         const entity = state.knowledge[kind === 'person' ? 'people' : 'projects'].find((item) => item.id === entityMatch[1]);
         if (entity && options.expectedEntityRevision !== entity.revision) throw new Error('This person or project changed. Refresh it before saving its narrative.');
         if (!entity && options.expectedEntityRevision !== undefined) throw new Error('This person or project was removed.');
@@ -6358,6 +6889,12 @@ export class AppControllerImpl implements AppController {
       }
       if (existing?.content === content) return existing;
       const changed = existing?.content !== content;
+      if (existing && changed) {
+        this.assertBatchLedgerCanDropContent();
+        if (this.activeBatchNoteOperations.size) throw new Error('A Batch request is still using saved context. Try again after it finishes.');
+      }
+      removesCapturedSource = Boolean(existing && changed && this.assistantBatchLedger.jobs.some((job) => isOpenRouterBatchContentJob(job) &&
+      (job.sourceVersions?.[`doc:${cleanPath}`] !== undefined || Boolean(affectedKnowledgeSourceKey && job.sourceVersions?.[affectedKnowledgeSourceKey] !== undefined))));
       const next: ContextDocument = { path: cleanPath, content, revision: (existing?.revision ?? 0) + 1, updatedAt: now() };
       if (existing) Object.assign(existing, next); else state.documents.unshift(next);
       if (entityMatch) {
@@ -6368,7 +6905,8 @@ export class AppControllerImpl implements AppController {
       if (changed) markAnalysesStale(state, [`doc:${cleanPath}`]);
       if (entityMatch) this.validateKnowledgeAndBackup(state);
       return next;
-    });
+    }, undefined, () => removesCapturedSource ? this.tombstoneOpenRouterBatchJobs((job) => isOpenRouterBatchContentJob(job) &&
+      (job.sourceVersions?.[`doc:${cleanPath}`] !== undefined || Boolean(affectedKnowledgeSourceKey && job.sourceVersions?.[affectedKnowledgeSourceKey] !== undefined))) : undefined);
     await this.mirrorDocument(document);
     return document;
   }
@@ -7977,8 +8515,11 @@ export class AppControllerImpl implements AppController {
   }
 
   async deleteNote(id: string): Promise<void> {
+    this.assertBatchLedgerCanDropContent();
+    if (this.activeBatchNoteOperations.has(id)) throw new Error('A Batch request is still using this note. Try again after it finishes.');
     const audioUri = this.snapshot.notes.find((note) => note.id === id)?.audioUri;
     await this.mutate(async (state) => {
+      if (this.activeBatchNoteOperations.has(id)) throw new Error('A Batch request is still using this note. Try again after it finishes.');
       if (state.proposals.some((proposal) => proposal.noteId === id && (proposal.kind !== 'reminder' && ['dispatching', 'unknown'].includes(proposal.status)))) throw new Error('Wait for the in-progress external action result before deleting this note.');
       for (const proposal of state.proposals.filter((item) => item.noteId === id && item.kind === 'reminder')) {
         const revisions = new Set([proposal.notificationRevision ?? proposal.revision]);
@@ -7991,7 +8532,7 @@ export class AppControllerImpl implements AppController {
       state.notes = state.notes.filter((item) => item.id !== id);
       state.proposals = state.proposals.filter((item) => item.noteId !== id);
       state.activity = state.activity.filter((item) => item.noteId !== id);
-    });
+    }, undefined, () => this.tombstoneOpenRouterBatchJobs((job) => isOpenRouterBatchContentJob(job) && job.noteId === id));
     await this.reconcileReminderAlerts();
     if (audioUri) {
       try { await (this.integration.removeAudio?.(audioUri) ?? removeAudio(audioUri, this.integration.audioBoundary)); }
@@ -8092,6 +8633,15 @@ export async function createProductionWorkspace(options: ProductionWorkspaceOpti
   const rawTokenStore = options.integration?.tokenStore ?? oauthTokenStore;
   const tokenStore = resources.oauthTokenStore(rawTokenStore);
   const providerCredentials = options.credentials ?? options.integration?.credentials ?? createProviderCredentialService(resources.credentialStore(credentialStore));
+  const batchTransport = await import('./openRouterTransport');
+  const openRouterBatchClient = options.integration?.openRouterBatchClient ?? new OpenRouterBatchClient({
+    withResponseLifetime: batchTransport.openRouterTransportWithResponseLifetime,
+    withRequestOwnership: resources.withProviderOwnership,
+    readCredentialSnapshot: () => providerCredentials.readProviderCredentialSnapshot('openrouter'),
+    assertCredentialGeneration: (generation) => providerCredentials.assertProviderCredentialGeneration('openrouter', generation),
+    assertBeforeStart: () => undefined,
+    onCancelPending: (operationId, retryCancel) => implementation?.rememberOpenRouterBatchCleanup(operationId, retryCancel),
+  });
   const rawWriteDocument = options.integration?.writeDocument ?? writePrivateDocument;
   const configuredConnectorFactory = options.integration?.connectorFactory;
   let factoryConnector: ConnectorClient | undefined;
@@ -8106,6 +8656,7 @@ export async function createProductionWorkspace(options: ProductionWorkspaceOpti
     ...defaultIntegration,
     ...options.integration,
     credentials: providerCredentials,
+    openRouterBatchClient,
     audioBoundary,
     speechAudioService: options.integration?.speechAudioService ?? createPrivacyBoundSpeechAudioService(audioBoundary),
     removeAudio: async (uri) => audioBoundary.withAudioWrite(() => options.integration?.removeAudio

@@ -662,6 +662,10 @@ export interface AppState {
   proactiveMailAlertRecoveryStatus?: { quarantined: true; message: 'Some saved mail alert settings could not be validated and are held privately. New mail alerts are disabled until recovery.' };
   /** Fixed in-memory gate if scoped alert settlement detects unrelated workspace changes. */
   mailAlertRefreshRequired?: { required: true; message: 'Saved data changed. Refresh local data before continuing.' };
+  /** Safe Batch job summaries only; raw request/result material remains in a private controller sidecar. */
+  assistantBatchJobs?: import('../services/openRouterBatchJobs').AssistantBatchJobDTO[];
+  /** Fixed notice for an invalid private Batch ledger. */
+  assistantBatchRecoveryStatus?: { blocked: true; message: 'Saved Batch history could not be validated and is held privately. Batch actions are disabled until local data is refreshed.' };
   /** Imported material is inert archive data; it is never assistant context or live authority. */
   importedBackups: import('../backup').ImportedBackupArchive[];
   backupRecoveryStatus?: { quarantinedArchiveCount: number; message: 'Some imported backup archive data could not be validated and is held privately.' };
@@ -839,6 +843,9 @@ export interface AppController {
   updateTranscript(id: string, text: string): Promise<Note>;
   processNote(id: string): Promise<Proposal[]>;
   assistNote(id: string, options?: { intent?: AssistIntent; question?: string; forceRefresh?: boolean; knowledgeSelection?: KnowledgeSelection }): Promise<NoteAssistResult>;
+  submitNoteBatch(noteId: string, options?: { intent?: AssistIntent; question?: string; knowledgeSelection?: KnowledgeSelection }): Promise<import('../services/openRouterBatchJobs').AssistantBatchJobDTO>;
+  refreshAssistantBatch(jobId: string): Promise<import('../services/openRouterBatchJobs').AssistantBatchJobDTO>;
+  retryAssistantBatchCleanup(jobId: string): Promise<import('../services/openRouterBatchJobs').AssistantBatchJobDTO>;
   refreshAnalysisStatus(noteId: string): Promise<NoteAssistResult | undefined>;
   checkProposalFreshness(id: string): Promise<{ current: boolean; reason?: string }>;
   reconcileDispatch(recordId: string, input: { disposition: import('../dispatch').DispatchReconciliation; note: string; remoteId?: string }): Promise<import('../dispatch').DispatchRecord>;

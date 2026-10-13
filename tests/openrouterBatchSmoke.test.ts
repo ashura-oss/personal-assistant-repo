@@ -87,6 +87,10 @@ async function seedLocatedDiagnostic(path: string, candidateId = "batch_candidat
 }
 
 describe("closed OpenRouter Batch readiness utility", () => {
+  it("rejects a smoke custom ID with a trailing newline", () => {
+    expect(() => createSmokeRequest(`${customId}\n`)).toThrow("invalid_request");
+  });
+
   it("builds exactly one strict fictional JSON request with pinned provider and no token cap", () => {
     const body = createSmokeRequest(customId);
     expect(Object.keys(body)).toEqual(["endpoint", "model", "provider", "completion_window", "requests"]);
@@ -146,10 +150,10 @@ describe("closed OpenRouter Batch readiness utility", () => {
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
 
-  it("rejects unsafe service IDs in submission acknowledgements", async () => {
+  it.each(["batch/unsafe", "batch_fixture_1\n"])("rejects unsafe service IDs in submission acknowledgements: %j", async (id) => {
     const { common, journalPath } = await setup();
     const fetcher = vi.fn(async () => new Response(JSON.stringify({
-      id: "batch/unsafe", status: "validating", endpoint: "/v1/chat/completions",
+      id, status: "validating", endpoint: "/v1/chat/completions",
       model: "openai/gpt-6-luna", completion_window: "24h",
       request_counts: { total: 1, completed: 0, failed: 0 },
     }), { status: 202 }));

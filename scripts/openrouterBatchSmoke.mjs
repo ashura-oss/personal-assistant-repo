@@ -13,8 +13,6 @@ const TIMEOUT_MS = 60_000;
 const JOURNAL_VERSION = 1;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const BATCH_ID = /^[A-Za-z0-9_-]{1,256}$/;
-const SAFE_PROVIDER_ID = /^[A-Za-z0-9_-]{1,256}$/;
 const BATCH_STATUSES = ['validating', 'in_progress', 'finalizing', 'completed', 'failed', 'cancelling', 'cancelled', 'expired'];
 
 const appData = process.env.LOCALAPPDATA || join(homedir(), 'AppData', 'Local');
@@ -30,7 +28,7 @@ const smokeSchema = {
 };
 
 export function createSmokeRequest(customId) {
-  if (typeof customId !== 'string' || !UUID.test(customId)) throw new Error('invalid_request');
+  if (!isUuid(customId)) throw new Error('invalid_request');
   return {
     endpoint: '/v1/chat/completions',
     model: MODEL,
@@ -56,8 +54,8 @@ export function createSmokeRequest(customId) {
 function safeJournal(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || value.version !== JOURNAL_VERSION) return null;
   if (!['submission_unknown', 'submitted', 'validating', 'in_progress', 'finalizing', 'completed', 'failed', 'cancelling', 'cancelled', 'expired'].includes(value.status)) return null;
-  if (!UUID.test(value.customId || '')) return null;
-  if (value.batchId !== undefined && !BATCH_ID.test(value.batchId)) return null;
+  if (!isUuid(value.customId)) return null;
+  if (value.batchId !== undefined && !isSafeOpaqueId(value.batchId)) return null;
   if (value.status !== 'submission_unknown' && !value.batchId) return null;
   if (value.model !== MODEL || value.requestCount !== 1 || !isCanonicalIso(value.createdAt)) return null;
   if (value.checkedAt !== undefined && !isCanonicalIso(value.checkedAt)) return null;
@@ -79,10 +77,10 @@ function safeDiagnostic(value) {
   const isLegacy = value.status === undefined && Object.keys(value).every((key) => legacyKeys.has(key));
   const status = isLegacy ? 'located' : value.status;
   if (!['locating', 'located', 'verification_unknown', 'verifying', 'verified', 'not_owned'].includes(status)) return null;
-  if (!UUID.test(value.sourceCustomId || '') || !isCanonicalIso(value.sourceCreatedAt)) return null;
+  if (!isUuid(value.sourceCustomId) || !isCanonicalIso(value.sourceCreatedAt)) return null;
   if (!isCanonicalIso(value.checkedAt) && status !== 'locating') return null;
   if (!Array.isArray(value.candidateIds) || value.candidateIds.length > 2
-      || value.candidateIds.some((id) => typeof id !== 'string' || !SAFE_PROVIDER_ID.test(id))) return null;
+      || value.candidateIds.some((id) => !isSafeOpaqueId(id))) return null;
   const unique = [...new Set(value.candidateIds)];
   if (unique.length !== value.candidateIds.length) return null;
   const verification = value.verification;
@@ -117,6 +115,14 @@ function isCanonicalIso(value) {
   if (typeof value !== 'string' || value.length > 32) return false;
   const date = new Date(value);
   return Number.isFinite(date.getTime()) && date.toISOString() === value;
+}
+
+function isUuid(value) {
+  return typeof value === 'string' && value.length === 36 && UUID.test(value);
+}
+
+function isSafeOpaqueId(value) {
+  return typeof value === 'string' && value.length >= 1 && value.length <= 256 && !/[^A-Za-z0-9_-]/.test(value);
 }
 
 async function readJournalJson(fs, filePath) {
@@ -266,10 +272,10 @@ function safeCandidateSummary(candidate, index) {
 }
 
 function classifyProviderId(value) {
-  if (typeof value !== 'string' || value.length === 0 || value.length > 256 || !SAFE_PROVIDER_ID.test(value)) return 'unsafe';
+  if (!isSafeOpaqueId(value)) return 'unsafe';
   if (value.startsWith('batch_')) return 'batch_';
   if (value.startsWith('batch-')) return 'batch-';
-  if (CANONICAL_UUID.test(value)) return 'uuid';
+  if (value.length === 36 && CANONICAL_UUID.test(value)) return 'uuid';
   return 'opaque_safe';
 }
 
@@ -589,7 +595,7 @@ export function createOpenRouterBatchSmokeRunner({
       try { key = await readKey(); }
       catch { safeOutput(out, { mode: 'submit', status: 'blocked', model: MODEL, requestCount: 1 }); return { status: 'blocked' }; }
       const customId = uuid();
-      if (!UUID.test(customId)) throw new Error('invalid_local_id');
+      if (!isUuid(customId)) throw new Error('invalid_local_id');
       const intent = {
         version: JOURNAL_VERSION,
         status: 'submission_unknown',
@@ -610,7 +616,7 @@ export function createOpenRouterBatchSmokeRunner({
           return { status: 'submission_unknown' };
         }
         const payload = await readBoundedJson(response);
-        if (!payload || typeof payload !== 'object' || !BATCH_ID.test(payload.id || '') || payload.status !== 'validating' || payload.endpoint !== '/v1/chat/completions' || !isExpectedModel(payload.model) || payload.completion_window !== '24h' || payload.request_counts?.total !== 1) {
+        if (!payload || typeof payload !== 'object' || !isSafeOpaqueId(payload.id) || payload.status !== 'validating' || payload.endpoint !== '/v1/chat/completions' || !isExpectedModel(payload.model) || payload.completion_window !== '24h' || payload.request_counts?.total !== 1) {
           safeOutput(out, { mode: 'submit', status: 'submission_unknown', model: MODEL, requestCount: 1 });
           return { status: 'submission_unknown' };
         }

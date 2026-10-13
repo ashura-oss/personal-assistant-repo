@@ -47,7 +47,7 @@ export interface OpenRouterBatchClientDependencies {
     onCancelPending?: (retryCancel: () => Promise<void>) => void,
     beforeStart?: () => void
   ) => Promise<T>;
-  readonly onCancelPending?: (retryCancel: () => Promise<void>) => void;
+  readonly onCancelPending?: (operationId: string, retryCancel: () => Promise<void>) => void;
   /** Owns the actual fetch and complete response-body read, including late native settlement. */
   readonly withRequestOwnership: <T>(actualRequest: () => Promise<T>) => Promise<T>;
   readonly readCredentialSnapshot: () => Promise<OpenRouterBatchCredentialSnapshot>;
@@ -280,6 +280,8 @@ const replySchema = {
 } as const;
 
 const byteLength = (value: string): number => new TextEncoder().encode(value).byteLength;
+const isOpaqueBatchId = (value: unknown): value is string => typeof value === 'string' && value.length >= 1 && value.length <= 256 && !/[^A-Za-z0-9_-]/.test(value);
+const isCanonicalUuidV4 = (value: unknown): value is string => typeof value === 'string' && value.length === 36 && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
 
 function buildOpenRouterAnalysisBody(instructions: string, userInput: string, settings: AppSettings): string {
   const body: OpenRouterBatchRequest = Object.freeze({
@@ -346,7 +348,7 @@ export class OpenRouterBatchRequestBuilder {
 function parseAck(value: unknown): OpenRouterBatchAck {
   const row = safeObject(value);
   const counts = parseBatchCounts(row?.request_counts);
-  if (!row || typeof row.id !== 'string' || !/^[A-Za-z0-9_-]{1,256}$/.test(row.id) ||
+  if (!row || !isOpaqueBatchId(row.id) ||
       row.object !== 'batch' || row.endpoint !== OPENROUTER_CHAT_COMPLETIONS_PATH ||
       !isBatchMetadataModel(row.model) || row.completion_window !== OPENROUTER_BATCH_COMPLETION_WINDOW ||
       row.status !== 'validating' || counts.total !== 1 || counts.completed !== 0 || counts.failed !== 0) {
@@ -362,9 +364,11 @@ function parseAck(value: unknown): OpenRouterBatchAck {
 export class OpenRouterBatchClient {
   constructor(private readonly dependencies: OpenRouterBatchClientDependencies) {}
 
-  private withResponseLifetime<T>(input: string, init: RequestInit, consumeResponse: (response: Response) => Promise<T>, beforeStart: () => void): Promise<T> {
+  private withResponseLifetime<T>(input: string, init: RequestInit, consumeResponse: (response: Response) => Promise<T>, operationId: string, beforeStart: () => void): Promise<T> {
     if (this.dependencies.withResponseLifetime) {
-      return this.dependencies.withResponseLifetime(input, init, consumeResponse, this.dependencies.onCancelPending, beforeStart);
+      return this.dependencies.withResponseLifetime(input, init, consumeResponse,
+        this.dependencies.onCancelPending ? (retryCancel) => this.dependencies.onCancelPending!(operationId, retryCancel) : undefined,
+        beforeStart);
     }
     if (!this.dependencies.fetcher) throw new Error('The OpenRouter response transport is unavailable.');
     beforeStart();
@@ -374,8 +378,9 @@ export class OpenRouterBatchClient {
   async submit(
     input: { operationId: string; requestBody: string },
     onBeforeDispatch: () => Promise<void>,
+    assertBeforeStart: () => void = this.dependencies.assertBeforeStart,
   ): Promise<OpenRouterBatchAck> {
-    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(input.operationId)) throw new OpenRouterBatchDispatchError('pre_dispatch', 'The Batch operation identifier is invalid.');
+    if (!isCanonicalUuidV4(input.operationId)) throw new OpenRouterBatchDispatchError('pre_dispatch', 'The Batch operation identifier is invalid.');
     let requestBody: unknown;
     try { requestBody = JSON.parse(input.requestBody) as unknown; }
     catch { throw new OpenRouterBatchDispatchError('pre_dispatch', 'The prepared Batch request was invalid.'); }
@@ -394,15 +399,18 @@ export class OpenRouterBatchClient {
 
     let dispatched = false;
     try {
+      // Credential reads and the durable reservation use their own short writer
+      // scopes. Do both before taking provider ownership to avoid nested privacy
+      // writer acquisition while a cleanup lock is queued.
+      const credential = await this.dependencies.readCredentialSnapshot();
+      this.dependencies.assertCredentialGeneration(credential.generation);
+      if (!credential.key) throw new OpenRouterBatchDispatchError('pre_dispatch', 'Configure an OpenRouter API key before submitting a Batch.');
+      await onBeforeDispatch();
+      this.dependencies.assertCredentialGeneration(credential.generation);
       return await this.dependencies.withRequestOwnership(async () => {
-        const credential = await this.dependencies.readCredentialSnapshot();
-        this.dependencies.assertCredentialGeneration(credential.generation);
-        if (!credential.key) throw new OpenRouterBatchDispatchError('pre_dispatch', 'Configure an OpenRouter API key before submitting a Batch.');
-        await onBeforeDispatch();
-        this.dependencies.assertCredentialGeneration(credential.generation);
         const beforeStart = () => {
           this.dependencies.assertCredentialGeneration(credential.generation);
-          this.dependencies.assertBeforeStart();
+          assertBeforeStart();
           dispatched = true;
         };
         return await this.withResponseLifetime(OPENROUTER_BATCH_ENDPOINT, {
@@ -414,7 +422,7 @@ export class OpenRouterBatchClient {
           const parsed = await readBoundedJson(response);
           if (!response.ok || response.status !== 202) throw new Error('The OpenRouter Batch submission was not accepted.');
           return parseAck(parsed);
-        }, beforeStart);
+        }, input.operationId, beforeStart);
       });
     } catch (error) {
       if (error instanceof OpenRouterBatchDispatchError) throw error;
@@ -425,17 +433,17 @@ export class OpenRouterBatchClient {
   }
 
   /** Performs one explicit status read for a saved batch; it never polls or downloads separately. */
-  async inspect(batchId: string, customId: string): Promise<OpenRouterBatchInspection> {
-    if (!/^[A-Za-z0-9_-]{1,256}$/.test(batchId) || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(customId)) {
+  async inspect(batchId: string, customId: string, assertBeforeStart: () => void = this.dependencies.assertBeforeStart): Promise<OpenRouterBatchInspection> {
+    if (!isOpaqueBatchId(batchId) || !isCanonicalUuidV4(customId)) {
       throw new Error('The saved Batch identifiers are invalid.');
     }
+    const credential = await this.dependencies.readCredentialSnapshot();
+    this.dependencies.assertCredentialGeneration(credential.generation);
+    if (!credential.key) throw new Error('Configure an OpenRouter API key to inspect this saved Batch.');
     return this.dependencies.withRequestOwnership(async () => {
-      const credential = await this.dependencies.readCredentialSnapshot();
-      this.dependencies.assertCredentialGeneration(credential.generation);
-      if (!credential.key) throw new Error('Configure an OpenRouter API key to inspect this saved Batch.');
       const beforeStart = () => {
         this.dependencies.assertCredentialGeneration(credential.generation);
-        this.dependencies.assertBeforeStart();
+        assertBeforeStart();
       };
       return await this.withResponseLifetime(`${OPENROUTER_BATCH_ENDPOINT}/${encodeURIComponent(batchId)}`, {
         method: 'GET',
@@ -445,7 +453,7 @@ export class OpenRouterBatchClient {
         const parsed = await readBoundedJson(response);
         if (!response.ok) throw new Error('The OpenRouter Batch status could not be read.');
         return parseInspection(parsed, batchId, customId);
-      }, beforeStart);
+      }, customId, beforeStart);
     });
   }
 }
