@@ -1,17 +1,17 @@
 # Native iOS quality audit
 
 **Date:** 2026-10-13
-**Scope:** Source review of the Expo SDK 57 / React Native 0.86.3 application, with native iOS audio lifecycle as the priority. This report records source-level risks and proposed verification; it does not claim that the findings have been reproduced on a physical device.
+**Scope:** Source review of the Expo SDK 57 / React Native 0.86.3 application, with native iOS audio lifecycle as the priority. Source changes and React hook regressions are recorded separately from physical-device behavior; no finding below is claimed as reproduced on a physical iPhone.
 
 ## Findings
 
-### P1 — Explicit pause can resume microphone capture while Still says it is paused
+### P1 — Explicit pause could resume microphone capture while Still said it was paused (source fix and hook tests; device unverified)
 
-The native hook's pause path leaves `allowsRecording` enabled. The installed Expo Audio module can reactivate the recording session on foreground resume when recording is allowed, including while the recorder remains paused. The native module accepts a paused recorder, and Still can continue displaying the paused state. This creates a mismatch between user expectation and microphone/session behavior.
+The reviewed pause path left `allowsRecording` enabled. The installed Expo Audio module can reactivate recording on foreground when recording is allowed, even for a prepared/paused recorder. The source fix now disables recording mode during the owned pause action and requires an explicit Resume action to re-enable it and resume capture. Fresh native facts are checked through the capture action path. React hook regressions cover the UI/control contract, but native foreground behavior has not been validated on a signed iPhone.
 
-**Review anchors:** `src/audio/useAudioCapture.native.ts:87-97` pauses the recorder and updates Still's status without disabling recording mode. Installed `node_modules/expo-audio/ios/AudioModule.swift:109-112,723-728` resumes prepared recorders on foreground when `allowsRecording` is true; `node_modules/expo-audio/ios/AudioRecorder.swift:121-128,160-168` accepts `.paused` as a recordable state.
+**Original review anchors:** `src/audio/useAudioCapture.native.ts:87-97` performed the unsafe pause sequence. Installed `node_modules/expo-audio/ios/AudioModule.swift:109-112,723-728` resumes prepared recorders on foreground when `allowsRecording` is true; `node_modules/expo-audio/ios/AudioRecorder.swift:121-128,160-168` accepts `.paused` as a recordable state.
 
-**Verify and fix:** On a physical iPhone, start and pause recording, background Still, then foreground it without pressing Resume. Observe the native audio session and recorder state while Still remains paused. Under the existing serialized `runAction` ownership, pause should call `recorder.pause()`, await `setAudioModeAsync({allowsRecording:false})`, and verify the native inactive proof before reporting paused. Resume should explicitly re-enable recording mode and call `recorder.record()` within the owned capture action. Add a native regression around paused → background → foreground; the UI must remain paused and audio capture must not resume until explicit Resume.
+**Remaining verification:** On a physical iPhone, pause, background and foreground without pressing Resume, then confirm the session and recorder remain inactive. Resume explicitly and verify one capture resumes. The source and React tests do not establish native runtime behavior.
 
 ### P1/P2 — Native recording can exceed the configured duration and become unsaveable
 
@@ -21,13 +21,19 @@ The UI stop threshold uses the configured limit, but asynchronous/native duratio
 
 **Verify and fix:** Exercise the cap on-device under load and with delayed duration callbacks, including a configured cap lower than the platform maximum. Use the native duration limit where practical, but preserve a reliable measured final duration before the SDK completion/reset path. Propagate that exact measurement through stop, note save, and Speech validation. Do not clamp displayed or persisted duration with `Math.min` when the underlying clip is longer; report the true measurement and a truthful reason if the clip cannot be retained or uploaded. Test just below, exactly at, and just above each cap.
 
-### P2 — Call/Siri interruption can leave UI state out of sync with the recorder
+### P2 — Call/Siri interruption could leave UI state out of sync with the recorder (source recovery added; device unverified)
 
-The native recorder pauses when an interruption begins, but Still may continue to report `recording` while the native recorder is paused. On interruption end, Expo reactivates the audio session and calls its player-resume routine only when the system supplies `.shouldResume`; that routine also restarts recorders that still allow recording. Without `.shouldResume`, the recorder remains paused while Still may still show `recording`; with it, an allowed recorder may resume without a Still Resume action. The SDK does not expose a dedicated JavaScript pause-interruption callback. A cached initial inactive status must not be treated as proof that a new interruption occurred; the hook needs fresh native facts.
+The native recorder may pause when an interruption begins without a dedicated JavaScript pause-interruption callback. Expo's end handling depends on `.shouldResume`; its resume routine can also restart recorders that still allow recording. The hook now coalesces native status samples into owned fresh reads, distinguishes cached initial SDK samples from actionable facts, and updates interruption/recovery status without granting a new capture action. Resume behavior and UI consistency across real call/Siri interruptions remain unverified on device.
 
-**Review anchors:** Installed `node_modules/expo-audio/ios/AudioModule.swift:565-612` pauses recorders when the AVAudioSession interruption begins; `:615-621` gates resumption on `.shouldResume`, and `:663-689` resumes players plus recorders that allow recording. `node_modules/expo-audio/ios/AudioRecorder.swift:189-240` emits finish/error/media-reset status, but no dedicated JavaScript pause-interruption callback. Still's current state polling is in `src/audio/useAudioCapture.native.ts:220-242`.
+**Original review anchors:** Installed `node_modules/expo-audio/ios/AudioModule.swift:565-612` pauses recorders when the AVAudioSession interruption begins; `:615-621` gates resumption on `.shouldResume`, and `:663-689` resumes players plus recorders that allow recording. `node_modules/expo-audio/ios/AudioRecorder.swift:189-240` emits finish/error/media-reset status, but no dedicated JavaScript pause-interruption callback. The original Still polling path was at `src/audio/useAudioCapture.native.ts:220-242`; the current hook uses coalesced owned fresh reads.
 
-**Verify and fix:** Test incoming and outgoing calls, Siri, route changes, both `.shouldResume` outcomes, and app foreground/background while recording and while paused. Compare native `isRecording`, `canRecord`, recorder status, Still's visible state, and timer. Do not wait for an SDK callback that is not exposed. Trigger a fresh native-fact sync from lifecycle-adjacent paths, serialized with capture actions, and use bounded polling only where required; distinguish the initial cached inactive seed from an actual later transition. Ensure explicit pause disables recording mode under the existing lease so Expo's conditional auto-resume cannot restart it. Preserve user intent and require explicit resume where appropriate. Add tests for initial cached state, fresh sync, and interruption/resume ordering.
+**Remaining verification:** Test incoming/outgoing calls, Siri, route changes, both `.shouldResume` outcomes, and foreground/background transitions while recording and paused. Compare native `isRecording`, `canRecord`, recorder status, Still's visible state, and timer. No dedicated JS pause-interruption callback is available, so validation must use fresh native facts and lifecycle-adjacent checks. Verify the implemented explicit-pause behavior prevents unintended resume and that the UI truthfully reflects native interruption state.
+
+### P1 — A second recording could overwrite a previously saved recording (fresh-URI source fix and hook regression; device unverified)
+
+Expo's recorder retains its native URI when `prepareToRecordAsync()` is called without options; Apple documents that `prepareToRecord()` overwrites an existing file at the recorder URL. Preparing without options can therefore destroy a saved recording when a later capture starts. Each new capture now explicitly passes complete native recording options, which causes the SDK to create a fresh UUID-backed file URL; Resume does not prepare a new recording. A React hook regression models the SDK's reused-URI behavior and checks that recording, stopping, saving, and starting a second capture leaves the first file unchanged.
+
+**Remaining verification:** On a dedicated iPhone, record and save a clip, then start a second clip and confirm a distinct file is used and the first clip's bytes and playback remain unchanged. See Apple's [`prepareToRecord()` documentation](https://developer.apple.com/documentation/avfaudio/avaudiorecorder/preparetorecord%28%29). This source/test finding is not device-proven.
 
 ### P2 — Month-boundary usage settlement (fixed in controller tests; provider behavior unverified)
 
@@ -39,17 +45,21 @@ The reviewed source issue is fixed in controller commit `479e1eb`: model usage s
 
 ## Priority and performance follow-up
 
-The month-boundary model settlement issue is fixed at source and controller-test level as described above; actual provider behavior is unverified. The native pause/foreground-resume, interruption-state, and duration/save-policy findings remain open pending code changes and physical-device validation.
+The month-boundary model settlement issue is fixed at source and controller-test level as described above; actual provider behavior is unverified. Explicit pause and interruption recovery have source-level fixes and React hook tests, and the second-recording overwrite path has a fresh-URI source fix and regression. All three still require physical-device validation. The native duration/final-measurement and save/upload-cap policy remains open.
 
 After those correctness changes, profile a release build on a representative iPhone before optimizing. Review anchors from the audit include the workspace/capture subscription in `App.tsx:803`, repeated sorting and freshness-fingerprint serialization in `App.tsx:958,992`, and the analysis cache keyed by transcript/settings fingerprints near `src/services/controller.ts:1146,2599-2611`. Recording meter/duration updates can trigger repeated derived work. Isolate rapidly changing capture UI and memoize derived views only if a release-profile trace shows a measurable issue. Add a small, bounded analysis-cache eviction policy only after measuring its size and reuse; keep revision checks intact.
 
 Preserve the controller's serialized mutation boundary: clone and validate before persistence, persist atomically, then publish the new snapshot. The codebase is large enough that broad controller refactoring without representative profiling and regression coverage would add risk. Existing web/native aliases and mocks are useful unit coverage, but they are not a substitute for physical-device behavior tests.
 
-The separate privacy-lease review already added a recorder termination proof for resolved no-op `stop()` calls. A lease remains held until the stop is verified by native state (or the approved audio-mode disable sequence); false status flags alone do not prove termination. That change does not close the pause-resume, interruption-state, or duration-limit findings above.
+The separate privacy-lease review added a recorder termination proof for resolved no-op `stop()` calls. A lease remains held until the stop is verified by native state (or the approved audio-mode disable sequence); false status flags alone do not prove termination. The original clip's URI/identity is retained through ambiguous replacement status and a wrong callback URI is blocked, but durable pending-capture recovery across process restart is not implemented. A last-known original duration is not the final decoded measurement; neither that sample nor the source lifecycle tests close the duration-cap/final-measurement finding.
+
+**Phase 20 source/test checkpoint:** Capture lifecycle and fresh-file changes were committed in `577bce9`; React hook regressions exercise the source contracts described above. Root reported 551 tests across 53 files at 12:59:33 SGT on 2026-10-13, with typecheck passing and lint at zero errors/40 existing warnings. The native-focused set had 31 tests. Web and unsigned iOS JavaScript exports also passed, but neither compiles or executes the Swift module. All physical iPhone rows in [`IOS_VALIDATION.md`](IOS_VALIDATION.md) remain NOT RUN. These results do not establish native microphone behavior, exact final decoded duration, or provider acceptance.
 
 ## References
 
 - [React `useSyncExternalStore`](https://react.dev/reference/react/useSyncExternalStore)
+- [React `act`](https://react.dev/reference/react/act)
+- [Vitest test environments](https://vitest.dev/guide/environment.html)
 - [React: Synchronizing with Effects](https://react.dev/learn/synchronizing-with-effects)
 - [Expo Audio SDK documentation](https://docs.expo.dev/versions/latest/sdk/audio/)
 - [React Native performance overview](https://reactnative.dev/docs/performance)
