@@ -3,6 +3,12 @@ import * as Crypto from 'expo-crypto';
 import type { AppState } from '../core';
 import { STORAGE_KEY, type StateStore } from './contracts';
 import {
+  PENDING_CAPTURE_MAX_BYTES, PENDING_CAPTURE_STORAGE_KEY, assertPendingCaptureConsumption,
+  assertPendingCaptureTransition, emptyPendingCaptureSlot, readPendingCaptureSlot,
+  resolvePendingCaptureUri, serializePendingCaptureSlot, validatePendingCaptureRecord,
+  validatePendingCaptureUuid, type ConsumePendingCapture, type PendingCaptureBackend, type PendingCaptureRead,
+} from './pendingCapture';
+import {
   createStartupRecoveryBackend, recoveryUtf8Bytes, validateRecoveryId, validateRecoveryReceipt,
   validateRecoveryIso, validateRecoveryReceiptRecord, type StartupRecoveryArchiveRecord, type StartupRecoveryPersistence,
   type StartupRecoveryReceiptRecord, type StartupRecoverySnapshot, type StartupRecoveryTransaction,
@@ -73,7 +79,23 @@ export type SQLiteStateStoreOptions = {
   randomId?: () => string;
   sha256?: (raw: string) => Promise<string>;
   now?: () => number;
+  resolvePendingCaptureUri?: (path: string) => string;
 };
+
+async function readPendingCapture(tx: SQLiteExecutor): Promise<{ read: PendingCaptureRead; raw?: string }> {
+  const meta = await tx.getFirstAsync<{ schema_version: number; bytes: number }>('SELECT schema_version,length(CAST(value AS BLOB)) AS bytes FROM app_state WHERE key=?', PENDING_CAPTURE_STORAGE_KEY);
+  if (!meta) return { read: Object.freeze({ kind: 'empty', revision: null }) };
+  if (!Number.isSafeInteger(meta.schema_version) || meta.schema_version < 1) return { read: Object.freeze({ kind: 'blocked', reason: 'unreadable' }) };
+  if (meta.schema_version > 1) return { read: Object.freeze({ kind: 'blocked', reason: 'unsupported' }) };
+  if (!Number.isSafeInteger(meta.bytes) || meta.bytes < 0 || meta.bytes > PENDING_CAPTURE_MAX_BYTES) return { read: Object.freeze({ kind: 'blocked', reason: 'unreadable' }) };
+  const row = await tx.getFirstAsync<{ value: string }>('SELECT value FROM app_state WHERE key=? AND length(CAST(value AS BLOB))<=?', PENDING_CAPTURE_STORAGE_KEY, PENDING_CAPTURE_MAX_BYTES);
+  if (!row || typeof row.value !== 'string') return { read: Object.freeze({ kind: 'blocked', reason: 'unreadable' }) };
+  return { read: readPendingCaptureSlot(row.value, meta.bytes), raw: row.value };
+}
+
+async function writePendingCapture(tx: SQLiteExecutor, raw: string): Promise<void> {
+  await tx.runAsync('INSERT INTO app_state(key,value,schema_version,updated_at) VALUES(?,?,1,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,schema_version=excluded.schema_version,updated_at=excluded.updated_at', PENDING_CAPTURE_STORAGE_KEY, raw, new Date().toISOString());
+}
 
 function defaultSha256(raw: string): Promise<string> {
   return Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, raw);
@@ -189,28 +211,117 @@ export class SQLiteStateStore implements StateStore {
   private readonly openDatabase: () => Promise<SQLiteTransactionDatabase>;
   private readonly fixedDatabase?: Promise<SQLiteTransactionDatabase>;
   private readonly tracksProductionHandle: boolean;
+  private operationQueue: Promise<void> = Promise.resolve();
   private initialized?: Promise<SQLiteTransactionDatabase>;
   private generationBaseline = false;
   private originGeneration?: string;
   private currentGeneration?: string;
   readonly recovery;
+  readonly pendingCapture: PendingCaptureBackend;
   private readonly randomId: () => string;
   private readonly lifecycleGeneration = stateDatabaseLifecycleGeneration;
+  private readonly resolvePendingCaptureUriOption?: (path: string) => string;
 
   constructor(options: SQLiteStateStoreOptions = {}) {
     this.fixedDatabase = options.database;
     this.tracksProductionHandle = options.database === undefined && options.openDatabase === undefined;
     this.openDatabase = options.openDatabase ?? (() => SQLite.openDatabaseAsync(DB_NAME) as Promise<SQLiteTransactionDatabase>);
     this.randomId = options.randomId ?? Crypto.randomUUID;
+    this.resolvePendingCaptureUriOption = options.resolvePendingCaptureUri;
     const owner = this;
     const persistence: StartupRecoveryPersistence = { withTransaction: async <T>(work: (tx: StartupRecoveryTransaction) => Promise<T>) => {
-      const db = await owner.initialize();
-      return persistenceFor(db).withTransaction(work);
+      return owner.enqueue(async () => {
+        const db = await owner.initialize();
+        return persistenceFor(db).withTransaction(work);
+      });
     } };
     this.recovery = createStartupRecoveryBackend({
       persistence, randomId: this.randomId, now: options.now, sha256: options.sha256 ?? defaultSha256,
       getOpenedGeneration: async () => this.generationBaseline ? { originGeneration: this.originGeneration, currentGeneration: this.currentGeneration } : undefined,
     });
+    const assertLoadedGeneration = async (tx: SQLiteExecutor, action: string) => {
+      if (!this.generationBaseline) throw new Error('Load the current workspace before accessing pending recording data.');
+      const row = await tx.getFirstAsync<{ value: string }>('SELECT value FROM storage_meta WHERE key=?', GENERATION_KEY);
+      const current = row ? validateGeneration(row.value) : undefined;
+      if (current !== this.currentGeneration) throw new Error(`Saved data changed in another workspace. Reload before ${action}.`);
+    };
+    const nextRevision = (current?: string) => {
+      const revision = validatePendingCaptureUuid(this.randomId());
+      if (revision === current) throw new Error('Pending recording revision could not be advanced.');
+      return revision;
+    };
+    this.pendingCapture = {
+      read: () => this.enqueue(async () => {
+        const db = await this.initialize();
+        let read!: PendingCaptureRead;
+        await db.withExclusiveTransactionAsync(async (rawTx) => {
+          const tx = rawTx as SQLiteExecutor;
+          await assertLoadedGeneration(tx, 'read');
+          read = (await readPendingCapture(tx)).read;
+        });
+        return read;
+      }),
+      create: (expectedEmptyRevision, captureValue) => {
+        const expectedRevision = expectedEmptyRevision;
+        const capture = validatePendingCaptureRecord(captureValue);
+        if (capture.phase !== 'prepared' || capture.replacementPaths.length || capture.replacementOverflow || capture.inspection) throw new Error('A new pending recording must be in prepared state.');
+        return this.enqueue(async () => {
+        const db = await this.initialize();
+        let result!: PendingCaptureRead;
+        await db.withExclusiveTransactionAsync(async (rawTx) => {
+          const tx = rawTx as SQLiteExecutor;
+          await assertLoadedGeneration(tx, 'create');
+          const current = (await readPendingCapture(tx)).read;
+          if (current.kind !== 'empty' || current.revision !== expectedRevision) throw new Error('Pending recording slot changed before capture was saved.');
+          const revision = nextRevision(current.revision ?? undefined);
+          await writePendingCapture(tx, serializePendingCaptureSlot({ version: 1, revision, capture }));
+          result = Object.freeze({ kind: 'valid', revision, capture });
+        });
+        return result;
+        });
+      },
+      update: (expected, captureValue) => {
+        const expectedSnapshot = Object.freeze({ id: validatePendingCaptureUuid(expected.id), revision: validatePendingCaptureUuid(expected.revision) });
+        const nextValue = validatePendingCaptureRecord(captureValue);
+        return this.enqueue(async () => {
+        const db = await this.initialize();
+        let result!: PendingCaptureRead;
+        await db.withExclusiveTransactionAsync(async (rawTx) => {
+          const tx = rawTx as SQLiteExecutor;
+          await assertLoadedGeneration(tx, 'update');
+          const current = (await readPendingCapture(tx)).read;
+          if (current.kind !== 'valid' || current.revision !== expectedSnapshot.revision || current.capture.id !== expectedSnapshot.id) throw new Error('Pending recording changed before update.');
+          const capture = assertPendingCaptureTransition(current.capture, nextValue);
+          const revision = nextRevision(current.revision);
+          await writePendingCapture(tx, serializePendingCaptureSlot({ version: 1, revision, capture }));
+          result = Object.freeze({ kind: 'valid', revision, capture });
+        });
+        return result;
+        });
+      },
+      clearAfterDiscard: (expected) => {
+        const expectedSnapshot = Object.freeze({ id: validatePendingCaptureUuid(expected.id), revision: validatePendingCaptureUuid(expected.revision) });
+        return this.enqueue(async () => {
+        const db = await this.initialize();
+        await db.withExclusiveTransactionAsync(async (rawTx) => {
+          const tx = rawTx as SQLiteExecutor;
+          await assertLoadedGeneration(tx, 'discard');
+          const current = (await readPendingCapture(tx)).read;
+          if (current.kind !== 'valid' || current.revision !== expectedSnapshot.revision || current.capture.id !== expectedSnapshot.id || current.capture.phase !== 'discarding' || current.capture.replacementOverflow) throw new Error('Pending recording cannot be cleared before discard verification.');
+          const revision = nextRevision(current.revision);
+          await writePendingCapture(tx, serializePendingCaptureSlot(emptyPendingCaptureSlot(revision)));
+        });
+        });
+      },
+    };
+  }
+
+  private async enqueue<T>(work: () => Promise<T>): Promise<T> {
+    const previous = this.operationQueue;
+    let unlock!: () => void;
+    this.operationQueue = new Promise<void>((resolve) => { unlock = resolve; });
+    await previous;
+    try { return await work(); } finally { unlock(); }
   }
 
   private async initialize(): Promise<SQLiteTransactionDatabase> {
@@ -238,73 +349,115 @@ export class SQLiteStateStore implements StateStore {
   }
 
   async load(): Promise<AppState | undefined> {
-    const db = await this.initialize();
-    const loaded: { row?: { value: string; schema_version: number } | null } = {};
-    let generation: string | undefined;
-    await db.withExclusiveTransactionAsync(async (tx) => {
-      loaded.row = await tx.getFirstAsync<{ value: string; schema_version: number }>('SELECT value, schema_version FROM app_state WHERE key = ?', STORAGE_KEY);
-      const metadata = await tx.getFirstAsync<{ value: string }>('SELECT value FROM storage_meta WHERE key = ?', GENERATION_KEY);
-      if (metadata) generation = validateGeneration(metadata.value);
+    return this.enqueue(async () => {
+      const db = await this.initialize();
+      const loaded: { row?: { value: string; schema_version: number } | null } = {};
+      let generation: string | undefined;
+      await db.withExclusiveTransactionAsync(async (tx) => {
+        loaded.row = await tx.getFirstAsync<{ value: string; schema_version: number }>('SELECT value, schema_version FROM app_state WHERE key = ?', STORAGE_KEY);
+        const metadata = await tx.getFirstAsync<{ value: string }>('SELECT value FROM storage_meta WHERE key = ?', GENERATION_KEY);
+        if (metadata) generation = validateGeneration(metadata.value);
+      });
+      let state: AppState | undefined;
+      if (loaded.row) {
+        if (loaded.row.schema_version > SCHEMA_VERSION) throw new Error('This data was saved by a newer version of the app. Update the app before opening it.');
+        try { state = JSON.parse(loaded.row.value) as AppState; }
+        catch { throw new Error('Saved app data could not be read. Your local database was preserved for recovery.'); }
+      }
+      this.originGeneration = generation;
+      this.currentGeneration = generation;
+      this.generationBaseline = true;
+      return state;
     });
-    let state: AppState | undefined;
-    if (loaded.row) {
-      if (loaded.row.schema_version > SCHEMA_VERSION) throw new Error('This data was saved by a newer version of the app. Update the app before opening it.');
-      try { state = JSON.parse(loaded.row.value) as AppState; }
-      catch { throw new Error('Saved app data could not be read. Your local database was preserved for recovery.'); }
-    }
-    this.originGeneration = generation;
-    this.currentGeneration = generation;
-    this.generationBaseline = true;
-    return state;
   }
 
-  async save(state: AppState): Promise<void> {
-    const db = await this.initialize();
-    const raw = JSON.stringify(state);
-    const generation = validateRecoveryId(this.randomId(), 'Storage generation');
-    await db.withExclusiveTransactionAsync(async (tx) => {
-      const current = await tx.getFirstAsync<{ value: string }>('SELECT value FROM storage_meta WHERE key = ?', GENERATION_KEY);
-      const currentGeneration = current ? validateGeneration(current.value) : undefined;
-      const hasSnapshot = Boolean(await tx.getFirstAsync<{ key: string }>('SELECT key FROM app_state WHERE key = ?', STORAGE_KEY));
-      if (this.generationBaseline) {
-        if (currentGeneration !== this.currentGeneration) throw new Error('Saved data changed in another workspace. Reload before saving.');
-      } else if (hasSnapshot || currentGeneration !== undefined) throw new Error('Load the current workspace before saving.');
-      const sql = tx as SQLiteExecutor;
-      await sql.runAsync('INSERT INTO app_state(key,value,schema_version,updated_at) VALUES(?,?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,schema_version=excluded.schema_version,updated_at=excluded.updated_at', STORAGE_KEY, raw, SCHEMA_VERSION, new Date().toISOString());
-      await sql.runAsync('INSERT INTO storage_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', GENERATION_KEY, generation);
+  async save(state: AppState, options?: { consumePendingCapture: ConsumePendingCapture }): Promise<void> {
+    const rawSnapshot = JSON.stringify(state);
+    const stateSnapshot = JSON.parse(rawSnapshot) as AppState;
+    const consume = options?.consumePendingCapture
+      ? Object.freeze({
+          id: validatePendingCaptureUuid(options.consumePendingCapture.id),
+          revision: validatePendingCaptureUuid(options.consumePendingCapture.revision),
+          noteId: validatePendingCaptureUuid(options.consumePendingCapture.noteId),
+        })
+      : undefined;
+    await this.enqueue(async () => {
+      const db = await this.initialize();
+      const raw = rawSnapshot;
+      const generation = validateRecoveryId(this.randomId(), 'Storage generation');
+      let resolvedUri: string | undefined;
+      if (consume) {
+        let current!: PendingCaptureRead;
+        await db.withExclusiveTransactionAsync(async (rawTx) => { current = (await readPendingCapture(rawTx as SQLiteExecutor)).read; });
+        if (current.kind !== 'valid' || current.capture.id !== consume.id || current.revision !== consume.revision) throw new Error('Pending recording changed before it could be attached.');
+        if (this.resolvePendingCaptureUriOption) resolvedUri = this.resolvePendingCaptureUriOption(current.capture.originalPath);
+        else {
+          const fileSystem = await import('expo-file-system/legacy');
+          if (!fileSystem.documentDirectory) throw new Error('Pending recording storage is unavailable.');
+          resolvedUri = resolvePendingCaptureUri(fileSystem.documentDirectory, current.capture.originalPath);
+        }
+      }
+      await db.withExclusiveTransactionAsync(async (tx) => {
+        const current = await tx.getFirstAsync<{ value: string }>('SELECT value FROM storage_meta WHERE key = ?', GENERATION_KEY);
+        const currentGeneration = current ? validateGeneration(current.value) : undefined;
+        const hasSnapshot = Boolean(await tx.getFirstAsync<{ key: string }>('SELECT key FROM app_state WHERE key = ?', STORAGE_KEY));
+        if (this.generationBaseline) {
+          if (currentGeneration !== this.currentGeneration) throw new Error('Saved data changed in another workspace. Reload before saving.');
+        } else if (hasSnapshot || currentGeneration !== undefined) throw new Error('Load the current workspace before saving.');
+        let consumedCaptureRaw: string | undefined;
+        if (consume) {
+          const currentPending = await readPendingCapture(tx as SQLiteExecutor);
+          const prior = await tx.getFirstAsync<{ value: string }>('SELECT value FROM app_state WHERE key=?', STORAGE_KEY);
+          const capture = assertPendingCaptureConsumption(stateSnapshot, prior?.value, currentPending.read, consume, resolvedUri!);
+          if (currentPending.read.kind !== 'valid') throw new Error('Pending recording changed before it could be attached.');
+          const revision = validatePendingCaptureUuid(this.randomId());
+          if (revision === currentPending.read.revision) throw new Error('Pending recording revision could not be advanced.');
+          consumedCaptureRaw = serializePendingCaptureSlot({ version: 1, revision, consumedCaptureId: capture.id });
+        }
+        const sql = tx as SQLiteExecutor;
+        await sql.runAsync('INSERT INTO app_state(key,value,schema_version,updated_at) VALUES(?,?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,schema_version=excluded.schema_version,updated_at=excluded.updated_at', STORAGE_KEY, raw, SCHEMA_VERSION, new Date().toISOString());
+        await sql.runAsync('INSERT INTO storage_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', GENERATION_KEY, generation);
+        if (consumedCaptureRaw) await writePendingCapture(sql, consumedCaptureRaw);
+      });
+      if (!this.generationBaseline) this.originGeneration = undefined;
+      this.currentGeneration = generation;
+      this.generationBaseline = true;
     });
-    if (!this.generationBaseline) this.originGeneration = undefined;
-    this.currentGeneration = generation;
-    this.generationBaseline = true;
   }
 
   async clear(): Promise<void> {
-    const db = await this.initialize();
-    const generation = validateRecoveryId(this.randomId(), 'Storage generation');
-    await db.withExclusiveTransactionAsync(async (tx) => {
-      const current = await tx.getFirstAsync<{ value: string }>('SELECT value FROM storage_meta WHERE key = ?', GENERATION_KEY);
-      const currentGeneration = current ? validateGeneration(current.value) : undefined;
-      const hasSnapshot = Boolean(await tx.getFirstAsync<{ key: string }>('SELECT key FROM app_state WHERE key = ?', STORAGE_KEY));
-      if (this.generationBaseline) {
-        if (currentGeneration !== this.currentGeneration) throw new Error('Saved data changed in another workspace. Reload before clearing.');
-      } else if (hasSnapshot || currentGeneration !== undefined) throw new Error('Load the current workspace before clearing.');
-      await tx.runAsync('DELETE FROM app_state WHERE key = ?', STORAGE_KEY);
-      await tx.runAsync('INSERT INTO storage_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', GENERATION_KEY, generation);
+    await this.enqueue(async () => {
+      const db = await this.initialize();
+      const generation = validateRecoveryId(this.randomId(), 'Storage generation');
+      await db.withExclusiveTransactionAsync(async (tx) => {
+        const current = await tx.getFirstAsync<{ value: string }>('SELECT value FROM storage_meta WHERE key = ?', GENERATION_KEY);
+        const currentGeneration = current ? validateGeneration(current.value) : undefined;
+        const hasSnapshot = Boolean(await tx.getFirstAsync<{ key: string }>('SELECT key FROM app_state WHERE key = ?', STORAGE_KEY));
+        if (this.generationBaseline) {
+          if (currentGeneration !== this.currentGeneration) throw new Error('Saved data changed in another workspace. Reload before clearing.');
+        } else if (hasSnapshot || currentGeneration !== undefined) throw new Error('Load the current workspace before clearing.');
+        const pending = (await readPendingCapture(tx as SQLiteExecutor)).read;
+        if (pending.kind !== 'empty') throw new Error('Discard the pending recording before clearing the workspace.');
+        await tx.runAsync('DELETE FROM app_state WHERE key = ?', STORAGE_KEY);
+        await tx.runAsync('INSERT INTO storage_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', GENERATION_KEY, generation);
+      });
+      if (!this.generationBaseline) this.originGeneration = undefined;
+      this.currentGeneration = generation;
+      this.generationBaseline = true;
     });
-    if (!this.generationBaseline) this.originGeneration = undefined;
-    this.currentGeneration = generation;
-    this.generationBaseline = true;
   }
 
   async assertCurrent(): Promise<void> {
-    if (!this.generationBaseline) throw new Error('The current workspace has not been loaded.');
-    const db = await this.initialize();
-    let currentGeneration: string | undefined;
-    await db.withExclusiveTransactionAsync(async (tx) => {
-      const row = await tx.getFirstAsync<{ value: string }>('SELECT value FROM storage_meta WHERE key = ?', GENERATION_KEY);
-      currentGeneration = row ? validateGeneration(row.value) : undefined;
+    await this.enqueue(async () => {
+      if (!this.generationBaseline) throw new Error('The current workspace has not been loaded.');
+      const db = await this.initialize();
+      let currentGeneration: string | undefined;
+      await db.withExclusiveTransactionAsync(async (tx) => {
+        const row = await tx.getFirstAsync<{ value: string }>('SELECT value FROM storage_meta WHERE key = ?', GENERATION_KEY);
+        currentGeneration = row ? validateGeneration(row.value) : undefined;
+      });
+      if (currentGeneration !== this.currentGeneration) throw new Error('Saved data changed in another workspace. Reload before continuing.');
     });
-    if (currentGeneration !== this.currentGeneration) throw new Error('Saved data changed in another workspace. Reload before continuing.');
   }
 }
 

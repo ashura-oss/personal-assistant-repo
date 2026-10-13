@@ -1,5 +1,11 @@
 import type { AppState } from '../core';
 import { STORAGE_KEY, type StateStore } from './contracts';
+import {
+  PENDING_CAPTURE_STORAGE_KEY, assertPendingCaptureConsumption, assertPendingCaptureTransition,
+  emptyPendingCaptureSlot, readPendingCaptureSlot, serializePendingCaptureSlot,
+  validatePendingCaptureRecord, validatePendingCaptureUuid,
+  type ConsumePendingCapture, type PendingCaptureBackend, type PendingCaptureRead,
+} from './pendingCapture';
 import { closeBrowserDatabaseConnections, registerBrowserDatabase } from './browserDatabaseRegistry';
 import {
   createStartupRecoveryBackend, recoveryUtf8Bytes, validateRecoveryId, validateRecoveryIso,
@@ -260,7 +266,13 @@ function persistenceFor(factory: IDBFactory, randomId: () => string, expectedGen
   return { withTransaction };
 }
 
-export type IndexedDbStateStoreOptions = { factory?: IDBFactory; randomId?: () => string; sha256?: (raw: string) => Promise<string>; now?: () => number };
+export type IndexedDbStateStoreOptions = { factory?: IDBFactory; randomId?: () => string; sha256?: (raw: string) => Promise<string>; now?: () => number; resolvePendingCaptureUri?: (path: string) => string };
+
+async function readPendingCapture(store: IDBObjectStore): Promise<PendingCaptureRead> {
+  const key = await requestResult(store.getKey(PENDING_CAPTURE_STORAGE_KEY));
+  if (key === undefined) return Object.freeze({ kind: 'empty', revision: null });
+  return readPendingCaptureSlot(await requestResult(store.get(PENDING_CAPTURE_STORAGE_KEY)));
+}
 
 function deferredDefaultFactory(): IDBFactory {
   return { open(name: string, version?: number) {
@@ -271,8 +283,11 @@ function deferredDefaultFactory(): IDBFactory {
 
 export class IndexedDbStateStore implements StateStore {
   readonly recovery;
+  readonly pendingCapture: PendingCaptureBackend;
   private readonly factory: IDBFactory;
   private readonly randomId: () => string;
+  private readonly resolvePendingCaptureUriOption?: (path: string) => string;
+  private operationQueue: Promise<void> = Promise.resolve();
   private readonly lifecycleGeneration = appStorageLifecycleGeneration;
   private generationBaseline = false;
   private originGeneration?: string;
@@ -280,10 +295,90 @@ export class IndexedDbStateStore implements StateStore {
   constructor(options: IndexedDbStateStoreOptions = {}) {
     this.factory = options.factory ?? deferredDefaultFactory();
     this.randomId = options.randomId ?? (() => crypto.randomUUID());
+    this.resolvePendingCaptureUriOption = options.resolvePendingCaptureUri;
+    const owner = this;
     this.recovery = createStartupRecoveryBackend({
-      persistence: persistenceFor(this.factory, this.randomId, this.lifecycleGeneration), randomId: this.randomId, now: options.now, sha256: options.sha256,
+      persistence: { withTransaction: (work) => owner.enqueue(() => persistenceFor(owner.factory, owner.randomId, owner.lifecycleGeneration).withTransaction(work)) }, randomId: this.randomId, now: options.now, sha256: options.sha256,
       getOpenedGeneration: async () => this.generationBaseline ? { originGeneration: this.originGeneration, currentGeneration: this.currentGeneration } : undefined,
     });
+    const assertLoadedGeneration = async (store: IDBObjectStore, action: string) => {
+      if (!this.generationBaseline) throw new Error('Load the current workspace before accessing pending recording data.');
+      const generation = cleanGeneration(await requestResult(store.get(GENERATION_KEY)));
+      const normalized = generation === 'legacy' ? undefined : generation;
+      if (normalized !== this.currentGeneration) throw new Error(`Saved data changed in another workspace. Reload before ${action}.`);
+    };
+    const nextRevision = (current?: string) => {
+      const revision = validatePendingCaptureUuid(this.randomId());
+      if (revision === current) throw new Error('Pending recording revision could not be advanced.');
+      return revision;
+    };
+    this.pendingCapture = {
+      read: () => this.enqueue(() => this.withTransaction('readonly', async (store) => {
+        await assertLoadedGeneration(store, 'read');
+        return readPendingCapture(store);
+      })),
+      create: (expectedEmptyRevision, captureValue) => {
+        const expectedRevision = expectedEmptyRevision;
+        const capture = validatePendingCaptureRecord(captureValue);
+        if (capture.phase !== 'prepared' || capture.replacementPaths.length || capture.replacementOverflow || capture.inspection) throw new Error('A new pending recording must be in prepared state.');
+        return this.enqueue(() => this.withTransaction('readwrite', async (store) => {
+        await assertLoadedGeneration(store, 'create');
+        const current = await readPendingCapture(store);
+        if (current.kind !== 'empty' || current.revision !== expectedRevision) throw new Error('Pending recording slot changed before capture was saved.');
+        const revision = nextRevision(current.revision ?? undefined);
+        store.put(serializePendingCaptureSlot({ version: 1, revision, capture }), PENDING_CAPTURE_STORAGE_KEY);
+        return Object.freeze({ kind: 'valid', revision, capture });
+        }));
+      },
+      update: (expected, captureValue) => {
+        const expectedSnapshot = Object.freeze({ id: validatePendingCaptureUuid(expected.id), revision: validatePendingCaptureUuid(expected.revision) });
+        const nextValue = validatePendingCaptureRecord(captureValue);
+        return this.enqueue(() => this.withTransaction('readwrite', async (store) => {
+        await assertLoadedGeneration(store, 'update');
+        const current = await readPendingCapture(store);
+        if (current.kind !== 'valid' || current.revision !== expectedSnapshot.revision || current.capture.id !== expectedSnapshot.id) throw new Error('Pending recording changed before update.');
+        const capture = assertPendingCaptureTransition(current.capture, nextValue);
+        const revision = nextRevision(current.revision);
+        store.put(serializePendingCaptureSlot({ version: 1, revision, capture }), PENDING_CAPTURE_STORAGE_KEY);
+        return Object.freeze({ kind: 'valid', revision, capture });
+        }));
+      },
+      clearAfterDiscard: (expected) => {
+        const expectedSnapshot = Object.freeze({ id: validatePendingCaptureUuid(expected.id), revision: validatePendingCaptureUuid(expected.revision) });
+        return this.enqueue(() => this.withTransaction('readwrite', async (store) => {
+        await assertLoadedGeneration(store, 'discard');
+        const current = await readPendingCapture(store);
+        if (current.kind !== 'valid' || current.revision !== expectedSnapshot.revision || current.capture.id !== expectedSnapshot.id || current.capture.phase !== 'discarding' || current.capture.replacementOverflow) throw new Error('Pending recording cannot be cleared before discard verification.');
+        store.put(serializePendingCaptureSlot(emptyPendingCaptureSlot(nextRevision(current.revision))), PENDING_CAPTURE_STORAGE_KEY);
+        }));
+      },
+    };
+  }
+
+  private async enqueue<T>(work: () => Promise<T>): Promise<T> {
+    const previous = this.operationQueue;
+    let unlock!: () => void;
+    this.operationQueue = new Promise<void>((resolve) => { unlock = resolve; });
+    await previous;
+    try { return await work(); } finally { unlock(); }
+  }
+
+  private async withTransaction<T>(mode: IDBTransactionMode, work: (store: IDBObjectStore) => Promise<T>): Promise<T> {
+    this.assertActive();
+    const db = await openDb(this.factory, this.lifecycleGeneration);
+    let tx: IDBTransaction | undefined;
+    let done: Promise<void> | undefined;
+    try {
+      tx = db.transaction(STORE_NAME, mode, mode === 'readwrite' ? { durability: 'strict' } : undefined);
+      done = transactionComplete(tx);
+      const result = await work(tx.objectStore(STORE_NAME));
+      await done;
+      return result;
+    } catch (error) {
+      try { tx?.abort(); } catch { /* transaction may already have finished */ }
+      await done?.catch(() => undefined);
+      throw error;
+    } finally { closeTracked(db); }
   }
 
   private assertActive(): void {
@@ -291,106 +386,115 @@ export class IndexedDbStateStore implements StateStore {
   }
 
   async load(): Promise<AppState | undefined> {
-    this.assertActive();
-    const db = await openDb(this.factory, this.lifecycleGeneration);
-    try {
-      const tx = db.transaction(STORE_NAME, 'readonly');
-      const done = transactionComplete(tx);
-      const store = tx.objectStore(STORE_NAME);
-      const raw = await requestResult(store.get(STORAGE_KEY));
-      const schema = cleanSchema(await requestResult(store.get(SCHEMA_KEY)));
-      const generation = cleanGeneration(await requestResult(store.get(GENERATION_KEY)));
-      if (raw !== undefined && typeof raw !== 'string') throw new Error('Saved browser data is unavailable.');
-      if (schema > 1) throw new Error('This data was saved by a newer version of the app. Update the app before opening it.');
-      let state: AppState | undefined;
-      if (raw !== undefined) {
-        try { state = JSON.parse(raw) as AppState; }
-        catch { throw new Error('Saved app data could not be read. Browser storage was preserved for recovery.'); }
-      }
-      await done;
-      this.originGeneration = generation === 'legacy' ? undefined : generation;
-      this.currentGeneration = this.originGeneration;
-      this.generationBaseline = true;
-      return state;
-    } finally { closeTracked(db); }
+    return this.enqueue(async () => {
+      this.assertActive();
+      const db = await openDb(this.factory, this.lifecycleGeneration);
+      try {
+        const tx = db.transaction(STORE_NAME, 'readonly');
+        const done = transactionComplete(tx);
+        const store = tx.objectStore(STORE_NAME);
+        const raw = await requestResult(store.get(STORAGE_KEY));
+        const schema = cleanSchema(await requestResult(store.get(SCHEMA_KEY)));
+        const generation = cleanGeneration(await requestResult(store.get(GENERATION_KEY)));
+        if (raw !== undefined && typeof raw !== 'string') throw new Error('Saved browser data is unavailable.');
+        if (schema > 1) throw new Error('This data was saved by a newer version of the app. Update the app before opening it.');
+        let state: AppState | undefined;
+        if (raw !== undefined) {
+          try { state = JSON.parse(raw) as AppState; }
+          catch { throw new Error('Saved app data could not be read. Browser storage was preserved for recovery.'); }
+        }
+        await done;
+        this.originGeneration = generation === 'legacy' ? undefined : generation;
+        this.currentGeneration = this.originGeneration;
+        this.generationBaseline = true;
+        return state;
+      } finally { closeTracked(db); }
+    });
   }
 
-  async save(state: AppState): Promise<void> {
-    this.assertActive();
-    const raw = JSON.stringify(state);
-    const bytes = recoveryUtf8Bytes(raw);
-    const generation = validateRecoveryId(this.randomId(), 'Storage generation');
-    const db = await openDb(this.factory, this.lifecycleGeneration);
-    let tx: IDBTransaction | undefined;
-    let done: Promise<void> | undefined;
-    try {
-      tx = db.transaction(STORE_NAME, 'readwrite');
-      done = transactionComplete(tx);
-      const store = tx.objectStore(STORE_NAME);
-      const [currentGeneration, snapshotKey] = await Promise.all([requestResult(store.get(GENERATION_KEY)), requestResult(store.getKey(STORAGE_KEY))]);
-      const generationValue = cleanGeneration(currentGeneration);
-      const normalizedCurrent = generationValue === 'legacy' ? undefined : generationValue;
-      if (this.generationBaseline) {
-        if (normalizedCurrent !== this.currentGeneration) throw new Error('Saved data changed in another workspace. Reload before saving.');
-      } else if (snapshotKey !== undefined || normalizedCurrent !== undefined) throw new Error('Load the current workspace before saving.');
-      store.put(raw, STORAGE_KEY);
-      store.put({ schemaVersion: 1 }, SCHEMA_KEY);
-      store.put({ bytes }, SIZE_KEY);
-      store.put(generation, GENERATION_KEY);
-      await done;
+  async save(state: AppState, options?: { consumePendingCapture: ConsumePendingCapture }): Promise<void> {
+    const rawSnapshot = JSON.stringify(state);
+    const stateSnapshot = JSON.parse(rawSnapshot) as AppState;
+    const consume = options?.consumePendingCapture
+      ? Object.freeze({
+          id: validatePendingCaptureUuid(options.consumePendingCapture.id),
+          revision: validatePendingCaptureUuid(options.consumePendingCapture.revision),
+          noteId: validatePendingCaptureUuid(options.consumePendingCapture.noteId),
+        })
+      : undefined;
+    await this.enqueue(async () => {
+      this.assertActive();
+      const raw = rawSnapshot;
+      const bytes = recoveryUtf8Bytes(raw);
+      const generation = validateRecoveryId(this.randomId(), 'Storage generation');
+      const resolvedUri = consume ? this.resolvePendingCaptureUriOption?.(await this.withTransaction('readonly', async (store) => {
+        const generationValue = cleanGeneration(await requestResult(store.get(GENERATION_KEY)));
+        const normalized = generationValue === 'legacy' ? undefined : generationValue;
+        if (!this.generationBaseline || normalized !== this.currentGeneration) throw new Error('Saved data changed in another workspace. Reload before attaching a pending recording.');
+        const pending = await readPendingCapture(store);
+        if (pending.kind !== 'valid' || pending.revision !== consume.revision || pending.capture.id !== consume.id) throw new Error('Pending recording changed before it could be attached.');
+        return pending.capture.originalPath;
+      })) : undefined;
+      if (consume && !resolvedUri) throw new Error('Pending recording storage is unavailable in this runtime.');
+      await this.withTransaction('readwrite', async (store) => {
+        const [currentGeneration, snapshotKey] = await Promise.all([requestResult(store.get(GENERATION_KEY)), requestResult(store.getKey(STORAGE_KEY))]);
+        const generationValue = cleanGeneration(currentGeneration);
+        const normalizedCurrent = generationValue === 'legacy' ? undefined : generationValue;
+        if (this.generationBaseline) {
+          if (normalizedCurrent !== this.currentGeneration) throw new Error('Saved data changed in another workspace. Reload before saving.');
+        } else if (snapshotKey !== undefined || normalizedCurrent !== undefined) throw new Error('Load the current workspace before saving.');
+        if (consume) {
+          const pending = await readPendingCapture(store);
+          const priorValue = await requestResult(store.get(STORAGE_KEY));
+          if (priorValue !== undefined && typeof priorValue !== 'string') throw new Error('Saved browser data is unavailable.');
+          const capture = assertPendingCaptureConsumption(stateSnapshot, priorValue as string | undefined, pending, consume, resolvedUri!);
+          const tombstoneRevision = validatePendingCaptureUuid(this.randomId());
+          if (pending.kind !== 'valid' || tombstoneRevision === pending.revision) throw new Error('Pending recording revision could not be advanced.');
+          store.put(serializePendingCaptureSlot({ version: 1, revision: tombstoneRevision, consumedCaptureId: capture.id }), PENDING_CAPTURE_STORAGE_KEY);
+        }
+        store.put(raw, STORAGE_KEY);
+        store.put({ schemaVersion: 1 }, SCHEMA_KEY);
+        store.put({ bytes }, SIZE_KEY);
+        store.put(generation, GENERATION_KEY);
+      });
       if (!this.generationBaseline) this.originGeneration = undefined;
       this.currentGeneration = generation;
       this.generationBaseline = true;
-    } catch (error) {
-      try { tx?.abort(); } catch { /* transaction may already have finished */ }
-      await done?.catch(() => undefined);
-      throw error;
-    } finally { closeTracked(db); }
+    });
   }
 
   async clear(): Promise<void> {
-    this.assertActive();
-    const generation = validateRecoveryId(this.randomId(), 'Storage generation');
-    const db = await openDb(this.factory, this.lifecycleGeneration);
-    let tx: IDBTransaction | undefined;
-    let done: Promise<void> | undefined;
-    try {
-      tx = db.transaction(STORE_NAME, 'readwrite');
-      done = transactionComplete(tx);
-      const store = tx.objectStore(STORE_NAME);
-      const [currentGeneration, snapshotKey] = await Promise.all([requestResult(store.get(GENERATION_KEY)), requestResult(store.getKey(STORAGE_KEY))]);
-      const generationValue = cleanGeneration(currentGeneration);
-      const normalizedCurrent = generationValue === 'legacy' ? undefined : generationValue;
-      if (this.generationBaseline) {
-        if (normalizedCurrent !== this.currentGeneration) throw new Error('Saved data changed in another workspace. Reload before clearing.');
-      } else if (snapshotKey !== undefined || normalizedCurrent !== undefined) throw new Error('Load the current workspace before clearing.');
-      store.delete(STORAGE_KEY);
-      store.delete(SIZE_KEY);
-      store.put({ schemaVersion: 1 }, SCHEMA_KEY);
-      store.put(generation, GENERATION_KEY);
-      await done;
+    await this.enqueue(async () => {
+      this.assertActive();
+      const generation = validateRecoveryId(this.randomId(), 'Storage generation');
+      await this.withTransaction('readwrite', async (store) => {
+        const [currentGeneration, snapshotKey] = await Promise.all([requestResult(store.get(GENERATION_KEY)), requestResult(store.getKey(STORAGE_KEY))]);
+        const generationValue = cleanGeneration(currentGeneration);
+        const normalizedCurrent = generationValue === 'legacy' ? undefined : generationValue;
+        if (this.generationBaseline) {
+          if (normalizedCurrent !== this.currentGeneration) throw new Error('Saved data changed in another workspace. Reload before clearing.');
+        } else if (snapshotKey !== undefined || normalizedCurrent !== undefined) throw new Error('Load the current workspace before clearing.');
+        const pending = await readPendingCapture(store);
+        if (pending.kind !== 'empty') throw new Error('Discard the pending recording before clearing the workspace.');
+        store.delete(STORAGE_KEY);
+        store.delete(SIZE_KEY);
+        store.put({ schemaVersion: 1 }, SCHEMA_KEY);
+        store.put(generation, GENERATION_KEY);
+      });
       if (!this.generationBaseline) this.originGeneration = undefined;
       this.currentGeneration = generation;
       this.generationBaseline = true;
-    } catch (error) {
-      try { tx?.abort(); } catch { /* transaction may already have finished */ }
-      await done?.catch(() => undefined);
-      throw error;
-    } finally { closeTracked(db); }
+    });
   }
 
   async assertCurrent(): Promise<void> {
-    this.assertActive();
-    if (!this.generationBaseline) throw new Error('The current workspace has not been loaded.');
-    const db = await openDb(this.factory, this.lifecycleGeneration);
-    try {
-      const tx = db.transaction(STORE_NAME, 'readonly');
-      const done = transactionComplete(tx);
-      const generation = cleanGeneration(await requestResult(tx.objectStore(STORE_NAME).get(GENERATION_KEY)));
-      await done;
+    await this.enqueue(async () => {
+      this.assertActive();
+      if (!this.generationBaseline) throw new Error('The current workspace has not been loaded.');
+      const generation = await this.withTransaction('readonly', (store) => requestResult(store.get(GENERATION_KEY)).then(cleanGeneration));
       const normalized = generation === 'legacy' ? undefined : generation;
       if (normalized !== this.currentGeneration) throw new Error('Saved data changed in another workspace. Reload before continuing.');
-    } finally { closeTracked(db); }
+    });
   }
 }
 

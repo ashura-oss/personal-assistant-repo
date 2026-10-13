@@ -1,4 +1,5 @@
 import type { StateStore } from '../storage/contracts';
+import type { ConsumePendingCapture } from '../storage/pendingCapture';
 import type { StartupRecoveryBackend } from '../storage/startupRecovery';
 import type { PrivacyService, PrivacyWorkspaceSession } from './service';
 
@@ -16,7 +17,12 @@ export function bindWorkspaceStorage(
   const recovery = store.recovery ? bindRecovery(store.recovery, withStateWriter) : undefined;
   return {
     load: () => withStateWriter(() => store.load()),
-    save: (state) => withStateWriter(() => store.save(state)),
+    save: (state, options) => {
+      const consumePendingCapture: ConsumePendingCapture | undefined = options?.consumePendingCapture
+        ? Object.freeze({ ...options.consumePendingCapture })
+        : undefined;
+      return withStateWriter(() => store.save(state, consumePendingCapture ? { consumePendingCapture } : undefined));
+    },
     clear: () => withStateWriter(() => store.clear()),
     ...(store.assertCurrent ? { assertCurrent: () => withStateWriter(() => store.assertCurrent!()) } : {}),
     ...(recovery ? { recovery } : {}),
