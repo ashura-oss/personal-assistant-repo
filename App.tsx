@@ -50,6 +50,7 @@ import { SpeechTranscriptionError } from "./src/transcription/types";
 import { useAudioCapture } from "./src/audio/useAudioCapture";
 import { RecordingAutoStopGate } from "./src/audio/autoStop";
 import type { AudioCapture } from "./src/audio/types";
+import type { PendingCaptureJournalPort, PendingCaptureReceipt, PendingCaptureSafeStatus } from "./src/audio/pendingCaptureService.types";
 import type { ProviderCredentialService } from "./src/services/credentials";
 import * as FileSystem from "expo-file-system/legacy";
 import * as Sharing from "expo-sharing";
@@ -75,6 +76,7 @@ import { DeviceCalendarsSection } from "./src/ui/DeviceCalendarsSection";
 import { StartupRecoveryScreen } from "./src/ui/StartupRecoveryScreen";
 import { PrivacyCleanupScreen } from "./src/ui/PrivacyCleanupScreen";
 import { PrivacyEraseReview } from "./src/ui/PrivacyEraseReview";
+import { PendingRecordingRecoveryPanel } from "./src/components/PendingRecordingRecoveryPanel";
 import { TasksSection } from "./src/ui/TasksSection";
 import { IconButton, Button, Field } from "./src/ui/primitives";
 import { C, s } from "./src/ui/theme";
@@ -105,7 +107,8 @@ const isDeviceCalendarsDemo = previewScenario === "device-calendars";
 const isTranscriptionDemo = previewScenario === "transcription";
 const isStartupRecoveryDemo = previewScenario === "startup-recovery";
 const isPrivacyCleanupDemo = previewScenario === "privacy-cleanup";
-const isIsolatedDemo = isDispatchHistoryDemo || isMailSyncDemo || isBackupImportDemo || isKnowledgeDemo || isReminderDemo || isDeviceCalendarsDemo || isTranscriptionDemo || isStartupRecoveryDemo || isPrivacyCleanupDemo;
+const isPendingRecoveryDemo = previewScenario === "pending-recovery";
+const isIsolatedDemo = isDispatchHistoryDemo || isMailSyncDemo || isBackupImportDemo || isKnowledgeDemo || isReminderDemo || isDeviceCalendarsDemo || isTranscriptionDemo || isStartupRecoveryDemo || isPrivacyCleanupDemo || isPendingRecoveryDemo;
 
 function useAppState(appController: AppController) {
   return useSyncExternalStore(
@@ -394,6 +397,7 @@ function ProposalCard({
 
 type WorkspaceBindings = {
   controller: AppController;
+  captureJournal?: PendingCaptureJournalPort;
   credentials: ProviderCredentialService;
   audioBoundary?: PrivacyAudioBoundary;
   privacy?: PrivacyService;
@@ -405,6 +409,7 @@ type WorkspaceBindings = {
 
 type BootstrapState =
   | { kind: "opening" }
+  | { kind: "pending_capture_preview" }
   | { kind: "workspace"; bindings: WorkspaceBindings }
   | { kind: "cleanup"; privacy: PrivacyService; status: PrivacyPublicStatus; reason?: "dedicated_ios_build_required" | "secure_context_and_web_locks_required"; failure?: "storage_unavailable" | "lease_lost" | "verification_incomplete"; samplePreview?: boolean }
   | { kind: "unavailable"; reason: "dedicated_ios_build_required" | "secure_context_and_web_locks_required" | "active_work" | "full_restart_required" | "storage_unavailable"; privacy?: PrivacyService; status?: PrivacyPublicStatus }
@@ -456,6 +461,10 @@ export default function App() {
     void (async () => {
       try {
         if (isIsolatedDemo) {
+          if (isPendingRecoveryDemo) {
+            if (alive) setBootstrap({ kind: "pending_capture_preview" });
+            return;
+          }
           if (isPrivacyCleanupDemo) {
             const preview = await import("./src/dev/privacyPreview");
             const selected = privacyPreviewRef.current ?? await preview.createPrivacyCleanupPreview();
@@ -545,8 +554,8 @@ export default function App() {
         const { credentialStore } = await import("./src/storage/credentials");
         const credentials = credentialModule.createProviderCredentialService(resources.credentialStore(credentialStore));
         const recordingRecovery = await recoveryModule.getRecordingRecoveryService();
-        const { createProductionController } = await import("./src/services/controller");
-        const controller = await createProductionController({
+        const { createProductionWorkspace } = await import("./src/services/controller");
+        const { controller, captureJournal } = await createProductionWorkspace({
           privacy,
           session,
           resources,
@@ -556,7 +565,7 @@ export default function App() {
         });
         if (alive) setBootstrap({
           kind: "workspace",
-          bindings: { controller, privacy, session, resources, audioBoundary, credentials, isolated: false },
+          bindings: { controller, captureJournal, privacy, session, resources, audioBoundary, credentials, isolated: false },
         });
       } catch {
         if (!alive) return;
@@ -707,6 +716,7 @@ export default function App() {
   if (bootstrap.kind === "opening") return (
     <SafeAreaProvider><SafeAreaView style={s.safe}><View style={[s.viewport, { alignItems: "center", justifyContent: "center", gap: 12 }]}><ActivityIndicator color={C.sage} /><Text style={s.accountSub}>Checking local privacy controls…</Text></View></SafeAreaView></SafeAreaProvider>
   );
+  if (bootstrap.kind === "pending_capture_preview") return <PendingCapturePreview />;
   if (bootstrap.kind === "preview_error") return (
     <SafeAreaProvider><SafeAreaView style={s.safe}><View style={s.viewport}><Text style={s.kicker}>ISOLATED PREVIEW</Text><Text style={s.h1}>Sample preview could not load.</Text><Text accessibilityRole="alert" style={s.analysisText}>The sample remained isolated. Reload to try again.</Text><Button label="Reload preview" onPress={() => { if (Platform.OS === "web" && typeof window !== "undefined") window.location.reload(); }} /></View></SafeAreaView></SafeAreaProvider>
   );
@@ -768,7 +778,7 @@ type WorkspaceProps = WorkspaceBindings & {
   onPrivacyInvalidated: () => void;
 };
 
-function Workspace({ controller, credentials, audioBoundary, privacy, session, isolated: isIsolatedDemo, privacyReviewOpen, privacyOutcomeUnknown = false, onPrivacyReview, onPrivacyInvalidated }: WorkspaceProps) {
+function Workspace({ controller, captureJournal, credentials, audioBoundary, privacy, session, isolated: isIsolatedDemo, privacyReviewOpen, privacyOutcomeUnknown = false, onPrivacyReview, onPrivacyInvalidated }: WorkspaceProps) {
   const state = useAppState(controller);
   const [tab, setTab] = useState<Tab>(isBackupImportDemo || isKnowledgeDemo || isReminderDemo || isTranscriptionDemo ? "library" : isIsolatedDemo ? "inbox" : "record");
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -789,6 +799,10 @@ function Workspace({ controller, credentials, audioBoundary, privacy, session, i
   const [startupRecoveryPlan, setStartupRecoveryPlan] = useState<StartupRecoveryPlan | undefined>();
   const [startupRecoveryBusy, setStartupRecoveryBusy] = useState(false);
   const [startupRecoveryError, setStartupRecoveryError] = useState("");
+  const [pendingCaptureStatus, setPendingCaptureStatus] = useState<PendingCaptureSafeStatus | null>(null);
+  const [pendingCaptureLoading, setPendingCaptureLoading] = useState(Boolean(captureJournal));
+  const [pendingCaptureBusy, setPendingCaptureBusy] = useState(false);
+  const [pendingCaptureError, setPendingCaptureError] = useState("");
   const reminderReviewRecord = reminderReviewId
     ? state.reminders.records.find((item) => item.id === reminderReviewId)
     : undefined;
@@ -798,7 +812,40 @@ function Workspace({ controller, credentials, audioBoundary, privacy, session, i
     state.proactive.lastEvaluation?.nextCheckAt,
   );
   const foregroundMailBusy = useRef(false);
-  const audio = useAudioCapture(audioBoundary);
+  const audio = useAudioCapture(audioBoundary, captureJournal, { ready: startupReady, maxAudioSeconds: state.settings.maxAudioSeconds });
+  const refreshAudioPendingRecovery = audio.refreshPendingRecovery;
+  const commitAudioCapture = audio.commit;
+  const refreshPendingCaptureStatus = useCallback(async () => {
+    if (!captureJournal || isIsolatedDemo) return undefined;
+    setPendingCaptureLoading(true);
+    try {
+      const safe = await controller.getPendingCaptureStatus();
+      setPendingCaptureStatus(safe);
+      setPendingCaptureError("");
+      await refreshAudioPendingRecovery?.();
+      return safe;
+    } catch {
+      const safe: PendingCaptureSafeStatus = { kind: "blocked", reason: "unreadable" };
+      setPendingCaptureStatus(safe);
+      setPendingCaptureError("The local recording status could not be checked. Retry before starting another recording.");
+      return safe;
+    } finally { setPendingCaptureLoading(false); }
+  }, [captureJournal, controller, isIsolatedDemo, refreshAudioPendingRecovery]);
+  useEffect(() => {
+    if (!startupReady || !captureJournal || isIsolatedDemo) return;
+    let current = true;
+    void controller.getPendingCaptureStatus().then(async (safe) => {
+      if (!current) return;
+      setPendingCaptureStatus(safe);
+      setPendingCaptureError("");
+      await refreshAudioPendingRecovery?.();
+    }).catch(() => {
+      if (!current) return;
+      setPendingCaptureStatus({ kind: "blocked", reason: "unreadable" });
+      setPendingCaptureError("The local recording status could not be checked. Retry before starting another recording.");
+    }).finally(() => { if (current) setPendingCaptureLoading(false); });
+    return () => { current = false; };
+  }, [captureJournal, controller, isIsolatedDemo, refreshAudioPendingRecovery, startupReady]);
   const openPrivacyReview = useCallback(() => {
     if (privacyOutcomeUnknown) return;
     if (busy || audio.status === "recording" || audio.status === "paused") {
@@ -1419,9 +1466,116 @@ function Workspace({ controller, credentials, audioBoundary, privacy, session, i
       setBusy(false);
     }
   };
+  const saveInspectedPendingCapture = useCallback(async (receipt: PendingCaptureReceipt, durationSeconds: number): Promise<boolean> => {
+    setPendingCaptureBusy(true);
+    try {
+      const note = await controller.savePendingCapture(receipt);
+      commitAudioCapture(note.id);
+      setDetail(note);
+      setNotice(durationSeconds > state.settings.maxAudioSeconds
+        ? "Saved locally. This recording exceeds your Speech limit; adjust it in Settings before transcribing."
+        : "Recording saved on this device. Add a transcript to create a reviewable proposal.");
+      await refreshPendingCaptureStatus();
+      return true;
+    } catch (error) {
+      setPendingCaptureError("The recording could not be saved from its current recovery state. Review the refreshed status.");
+      await refreshPendingCaptureStatus();
+      throw error;
+    } finally { setPendingCaptureBusy(false); }
+  }, [commitAudioCapture, controller, refreshPendingCaptureStatus, state.settings.maxAudioSeconds]);
+
+  const applyPendingCaptureResult = useCallback(async (receipt: PendingCaptureReceipt): Promise<boolean> => {
+    setPendingCaptureBusy(true);
+    try {
+      const inspected = await controller.inspectPendingCapture(receipt);
+      setPendingCaptureStatus(inspected);
+      if (inspected.kind !== "pending" || inspected.inspection !== "known" || !inspected.canSave) {
+        setNotice(inspected.kind === "pending" && inspected.inspection === "known" && (inspected.durationSeconds ?? 0) > 600
+          ? "This recording exceeds 10 minutes and cannot be saved as a note. Export or discard it from the recovery panel."
+          : "The recording needs review before it can be saved. Use the recovery panel to inspect it.");
+        await refreshAudioPendingRecovery?.();
+        return false;
+      }
+      return await saveInspectedPendingCapture(inspected.receipt, inspected.durationSeconds ?? 0);
+    } catch {
+      setPendingCaptureError("The recording could not be inspected. Its original audio remains in recovery.");
+      await refreshPendingCaptureStatus();
+      setNotice("Recording inspection failed. Retry from the recovery panel.");
+      return false;
+    } finally { setPendingCaptureBusy(false); }
+  }, [controller, refreshAudioPendingRecovery, refreshPendingCaptureStatus, saveInspectedPendingCapture]);
+
+  const inspectPendingCapture = useCallback((receipt: PendingCaptureReceipt) => {
+    void run(async () => {
+      setPendingCaptureBusy(true);
+      try {
+        const safe = await controller.inspectPendingCapture(receipt);
+        setPendingCaptureStatus(safe);
+        setPendingCaptureError("");
+        setNotice(safe.kind === "pending" && safe.inspection === "known"
+          ? "Recording status checked. Review the measured duration before saving."
+          : "Recording status checked. Its duration could not be confirmed.");
+        await refreshAudioPendingRecovery?.();
+      } catch {
+        setPendingCaptureError("The recording could not be inspected. Its original audio remains in recovery.");
+        setNotice("Recording inspection failed. Retry from the recovery panel.");
+        await refreshPendingCaptureStatus();
+      } finally { setPendingCaptureBusy(false); }
+    });
+  }, [controller, refreshAudioPendingRecovery, refreshPendingCaptureStatus, run]);
+
+  const exportPendingCapture = useCallback((receipt: PendingCaptureReceipt) => {
+    void run(async () => {
+      setPendingCaptureBusy(true);
+      try {
+        await controller.exportPendingCapture(receipt);
+        setNotice("Export sheet closed. The original recording remains on this device.");
+      } finally {
+        await refreshPendingCaptureStatus();
+        setPendingCaptureBusy(false);
+      }
+    });
+  }, [controller, refreshPendingCaptureStatus, run]);
+
+  const discardPendingCapture = useCallback((receipt?: PendingCaptureReceipt) => {
+    void run(async () => {
+      setPendingCaptureBusy(true);
+      try {
+        if (receipt) {
+          const safe = await controller.discardPendingCapture(receipt);
+          setPendingCaptureStatus(safe);
+        } else {
+          await audio.cancel();
+        }
+        setNotice("Recording discard was checked. Review the local status below.");
+      } finally {
+        await refreshPendingCaptureStatus();
+        setPendingCaptureBusy(false);
+      }
+    });
+  }, [audio, controller, refreshPendingCaptureStatus, run]);
+
+  const retryPendingCaptureCleanup = useCallback(() => {
+    void run(async () => {
+      setPendingCaptureBusy(true);
+      try {
+        const safe = await controller.retryPendingCaptureSourceRelease();
+        setPendingCaptureStatus(safe);
+        setPendingCaptureError("");
+      } finally {
+        await refreshPendingCaptureStatus();
+        setPendingCaptureBusy(false);
+      }
+    });
+  }, [controller, refreshPendingCaptureStatus, run]);
+
   const saveRecording = useCallback(async (): Promise<boolean> => {
     const result = await audio.stop();
     if (!result) return false;
+    if (result.kind === "pending_capture") {
+      await refreshPendingCaptureStatus();
+      return applyPendingCaptureResult(result.receipt);
+    }
     const note = await controller.saveNote({
       transcript: "",
       audioUri: result.uri,
@@ -1435,7 +1589,18 @@ function Workspace({ controller, credentials, audioBoundary, privacy, session, i
       "Recording saved on this device. Add a transcript to create a reviewable proposal.",
     );
     return true;
-  }, [audio, controller]);
+  }, [applyPendingCaptureResult, audio, controller, refreshPendingCaptureStatus]);
+  const savePendingFromPanel = useCallback((receipt: PendingCaptureReceipt) => {
+    void run(async () => {
+      const current = pendingCaptureStatus;
+      if (current?.kind !== "pending" || current.inspection !== "known" || !current.canSave || current.receipt.id !== receipt.id || current.receipt.revision !== receipt.revision) {
+        await refreshPendingCaptureStatus();
+        setNotice("Recording status changed. Review the refreshed status before saving.");
+        return;
+      }
+      await saveInspectedPendingCapture(receipt, current.durationSeconds ?? 0);
+    });
+  }, [pendingCaptureStatus, refreshPendingCaptureStatus, run, saveInspectedPendingCapture]);
   const autoStopGate = useRef(new RecordingAutoStopGate());
   useEffect(() => {
     const gate = autoStopGate.current;
@@ -1481,7 +1646,10 @@ function Workspace({ controller, credentials, audioBoundary, privacy, session, i
       "Discard this recording?",
       "This recording has not been saved.",
       () => {
-        void run(() => audio.cancel());
+        void run(async () => {
+          await audio.cancel();
+          await refreshPendingCaptureStatus();
+        });
       },
     );
   const connectAccount = useCallback(
@@ -1951,6 +2119,17 @@ function Workspace({ controller, credentials, audioBoundary, privacy, session, i
                 audio={audio}
                 busy={busy}
                 demoMode={isIsolatedDemo}
+                startDisabled={Boolean((Platform.OS !== "web" && !captureJournal) || (captureJournal && (pendingCaptureLoading || !pendingCaptureStatus || pendingCaptureStatus.kind !== "empty")))}
+                recoveryStatus={captureJournal ? pendingCaptureStatus : Platform.OS !== "web" ? { kind: "blocked", reason: "unsupported" } : null}
+                recoveryLoading={Boolean(captureJournal && pendingCaptureLoading)}
+                recoveryBusy={busy || pendingCaptureBusy}
+                recoveryError={pendingCaptureError}
+                onRefreshRecovery={() => void run(refreshPendingCaptureStatus)}
+                onInspectRecovery={inspectPendingCapture}
+                onSaveRecovery={savePendingFromPanel}
+                onExportRecovery={exportPendingCapture}
+                onDiscardRecovery={discardPendingCapture}
+                onRetryRecoveryCleanup={retryPendingCaptureCleanup}
                 recent={notes.slice(0, 3)}
                 onOpen={openNote}
                 onSeeAll={() => setTab("library")}
@@ -1960,10 +2139,10 @@ function Workspace({ controller, credentials, audioBoundary, privacy, session, i
                     ? setNotice(
                         "Microphone recording is disabled in the sample preview.",
                       )
-                    : run(() => audio.start())
+                    : void run(async () => { await audio.start(); })
                 }
-                onPause={() => run(() => audio.pause())}
-                onResume={() => run(() => audio.resume())}
+                onPause={() => void run(async () => { await audio.pause(); })}
+                onResume={() => void run(async () => { await audio.resume(); })}
                 onStop={() => run(saveRecording)}
                 onCancel={confirmCancel}
               />
@@ -2449,10 +2628,85 @@ function Workspace({ controller, credentials, audioBoundary, privacy, session, i
   );
 }
 
+function PendingCapturePreview() {
+  const sampleReceipt: PendingCaptureReceipt = { id: "10000000-0000-4000-8000-000000000041", revision: "10000000-0000-4000-8000-000000000042" };
+  const [status, setStatus] = useState<PendingCaptureSafeStatus>({
+    kind: "pending", receipt: sampleReceipt, phase: "needs_inspection", capturedAt: "2026-10-13T04:00:00.000Z",
+    inspection: "not_checked", canSave: false, canExport: true, canDiscard: true, replacementOverflow: false,
+  });
+  const [notice, setNotice] = useState("");
+  const [busy, setBusy] = useState(false);
+  const empty: PendingCaptureSafeStatus = { kind: "empty" };
+  const choose = (value: PendingCaptureSafeStatus) => { setStatus(value); setNotice(""); };
+  const caseStatus = (name: string): PendingCaptureSafeStatus => {
+    const base = { kind: "pending" as const, receipt: sampleReceipt, capturedAt: "2026-10-13T04:00:00.000Z", canExport: true, canDiscard: true, replacementOverflow: false };
+    switch (name) {
+      case "Oversize": return { ...base, phase: "needs_inspection", inspection: "known", durationSeconds: 601, canSave: false };
+      case "Unknown": return { ...base, phase: "needs_inspection", inspection: "unknown", canSave: false };
+      case "Missing": return { ...base, phase: "needs_inspection", inspection: "missing", canSave: false, canExport: false };
+      case "Discarding": return { ...base, phase: "discarding", inspection: "known", durationSeconds: 4.125, canSave: false };
+      case "Overflow": return { ...base, phase: "needs_inspection", inspection: "unknown", canSave: false, replacementOverflow: true };
+      case "Cleanup": return { kind: "blocked", reason: "cleanup_required" };
+      case "Unreadable": return { kind: "blocked", reason: "unreadable" };
+      default: return { ...base, phase: "needs_inspection", inspection: "not_checked", canSave: false };
+    }
+  };
+  const simulate = async (action: () => void) => { setBusy(true); try { action(); } finally { setBusy(false); } };
+  return (
+    <SafeAreaProvider>
+      <SafeAreaView style={s.safe}>
+        <ScrollView contentContainerStyle={s.scroll}>
+          <Text style={s.kicker}>SAMPLE RECORDING RECOVERY</Text>
+          <Text style={s.h1Small}>No microphone or external actions.</Text>
+          <Text style={s.intro}>This isolated preview uses fictional status only. No file, device storage, or recording is accessed.</Text>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8 }}>
+            {["Unfinished", "Oversize", "Unknown", "Missing", "Discarding", "Overflow", "Cleanup", "Unreadable"].map((name) => (
+              <Pressable key={name} accessibilityRole="button" accessibilityLabel={`Show sample ${name.toLowerCase()} status`} onPress={() => choose(caseStatus(name))} style={{ minHeight: 44, paddingHorizontal: 12, justifyContent: "center", borderRadius: 22, backgroundColor: C.card, borderColor: C.border, borderWidth: 1 }}>
+                <Text style={{ color: C.text, fontSize: 13 }}>{name}</Text>
+              </Pressable>
+            ))}
+          </ScrollView>
+          <PendingRecordingRecoveryPanel
+            status={status}
+            busy={busy}
+            sampleMode
+            onRefresh={() => void simulate(() => { choose(caseStatus("Unfinished")); setNotice("Sample status refreshed. No file was read."); })}
+            onInspect={() => void simulate(() => { choose({ kind: "pending", receipt: sampleReceipt, phase: "inspected", capturedAt: "2026-10-13T04:00:00.000Z", inspection: "known", durationSeconds: 4.125, canSave: true, canExport: true, canDiscard: true, replacementOverflow: false }); setNotice("Sample duration checked: 4.125 seconds. No file was inspected."); })}
+            onSave={() => void simulate(() => { choose(empty); setNotice("Sample saved locally. No file or device was used."); })}
+            onExport={() => void simulate(() => setNotice("Sample export is disabled. No file was opened."))}
+            onDiscard={() => void simulate(() => {
+              if (status.kind === "pending" && status.replacementOverflow) {
+                choose({ ...status, phase: "discarding", canSave: false, canExport: false, canDiscard: true });
+                setNotice("Some sample files could not be tracked. Local-data cleanup is still needed; no file was deleted.");
+                return;
+              }
+              choose(empty);
+              setNotice("Sample recovery record cleared. No file was deleted.");
+            })}
+            onRetryCleanup={() => void simulate(() => { choose(empty); setNotice("Sample cleanup check completed. No file was removed."); })}
+          />
+          {notice ? <Text accessibilityLiveRegion="polite" style={s.analysisText}>{notice}</Text> : null}
+        </ScrollView>
+      </SafeAreaView>
+    </SafeAreaProvider>
+  );
+}
+
 function RecordScreen({
   audio,
   busy,
   demoMode,
+  startDisabled,
+  recoveryStatus,
+  recoveryLoading,
+  recoveryBusy,
+  recoveryError,
+  onRefreshRecovery,
+  onInspectRecovery,
+  onSaveRecovery,
+  onExportRecovery,
+  onDiscardRecovery,
+  onRetryRecoveryCleanup,
   recent,
   onOpen,
   onSeeAll,
@@ -2466,6 +2720,17 @@ function RecordScreen({
   audio: AudioCapture;
   busy: boolean;
   demoMode: boolean;
+  startDisabled: boolean;
+  recoveryStatus: PendingCaptureSafeStatus | null;
+  recoveryLoading: boolean;
+  recoveryBusy: boolean;
+  recoveryError: string;
+  onRefreshRecovery: () => void;
+  onInspectRecovery: (receipt: PendingCaptureReceipt) => void;
+  onSaveRecovery: (receipt: PendingCaptureReceipt) => void;
+  onExportRecovery: (receipt: PendingCaptureReceipt) => void;
+  onDiscardRecovery: (receipt?: PendingCaptureReceipt) => void;
+  onRetryRecoveryCleanup: () => void;
   recent: Note[];
   onOpen: (n: Note) => void;
   onSeeAll: () => void;
@@ -2562,16 +2827,29 @@ function RecordScreen({
               />
             </View>
           </>
+        ) : recoveryLoading || (recoveryStatus && recoveryStatus.kind !== "empty") ? (
+          <PendingRecordingRecoveryPanel
+            status={recoveryStatus}
+            loading={recoveryLoading}
+            busy={recoveryBusy}
+            error={recoveryError}
+            onRefresh={onRefreshRecovery}
+            onInspect={onInspectRecovery}
+            onSave={onSaveRecovery}
+            onExport={onExportRecovery}
+            onDiscard={onDiscardRecovery}
+            onRetryCleanup={onRetryRecoveryCleanup}
+          />
         ) : audio.hasPending ? (
           <>
-            <Ionicons name="cloud-upload-outline" size={29} color={C.sage} />
+            <Ionicons name="save-outline" size={29} color={C.sage} />
             <Text style={s.micTitle}>Recording ready to save</Text>
             <Text style={s.micSub}>
               The audio is preserved. Retry if storage was unavailable.
             </Text>
             <Button
               label={busy ? "Saving…" : "Save recording"}
-              disabled={busy}
+              disabled={busy || startDisabled}
               onPress={onStop}
               icon="save-outline"
             />

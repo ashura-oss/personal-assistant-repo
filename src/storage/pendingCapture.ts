@@ -60,10 +60,12 @@ function validTimeZone(value: unknown): string {
   return value;
 }
 
-function canonicalCapturePath(value: unknown): string {
+export function validatePendingCapturePath(value: unknown): string {
   if (typeof value !== 'string' || utf8Bytes(value) > MAX_PATH_BYTES || !CAPTURE_PATH.test(value)) throw new Error('Pending recording data is invalid.');
   return value;
 }
+
+const canonicalCapturePath = validatePendingCapturePath;
 
 function validateInspection(value: unknown): PendingCaptureInspection {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Pending recording data is invalid.');

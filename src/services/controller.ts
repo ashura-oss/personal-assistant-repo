@@ -64,6 +64,9 @@ import type { PreparedSpeechAudio, SpeechAudioService } from '../audio/speechUpl
 import { getDefaultPrivacyService, type PrivacyService, type PrivacyWorkspaceSession } from '../privacy/service';
 import { createPrivacyBoundController } from '../privacy/controllerBoundary';
 import { bindWorkspaceStorage } from '../privacy/workspaceStorage';
+import { createPendingCaptureService } from '../audio/pendingCaptureService';
+import type { PendingCaptureControllerPort, PendingCaptureJournalPort, PendingCaptureReceipt, PendingCaptureSafeStatus } from '../audio/pendingCaptureService.types';
+import type { PendingCaptureNativeIO } from '../audio/pendingCaptureNativeIO.types';
 import { createPrivacyResourceBoundary, type PrivacyResourceBoundary } from '../privacy/resourceBoundary';
 import { createPrivacyAudioBoundary, createPrivacyBoundRecordingRecoveryService, createPrivacyBoundSpeechAudioService, type PrivacyAudioBoundary } from '../privacy/audioBoundary';
 import { createProviderCredentialService, type ProviderCredentialService } from './credentials';
@@ -1195,6 +1198,7 @@ export class AppControllerImpl implements AppController {
     private readonly store: StateStore = stateStore,
     providers: { speech?: AzureSpeechClient; openAi?: AzureOpenAIClient } = {},
     private readonly integration: ControllerIntegrationDependencies = {},
+    private readonly pendingCapture?: PendingCaptureControllerPort,
   ) {
     const credentials = integration.credentials;
     this.speechClient = providers.speech ?? new AzureSpeechClient({
@@ -1487,7 +1491,10 @@ export class AppControllerImpl implements AppController {
   }
 
   /** Serialize the complete read-modify-write operation; failed writes never mutate committed state. */
-  private async mutate<T>(operation: (draft: AppState) => T | Promise<T>): Promise<T> {
+  private async mutate<T>(
+    operation: (draft: AppState) => T | Promise<T>,
+    saveOptions?: (draft: AppState, result: T) => Parameters<StateStore['save']>[1],
+  ): Promise<T> {
     await this.assertPrivacySessionCurrent();
     const capturedBootstrapGeneration = this.bootstrapGeneration;
     const run = this.transactionQueue.then(async () => {
@@ -1504,7 +1511,7 @@ export class AppControllerImpl implements AppController {
       draft.reminders = validateReminderState(draft.reminders);
       draft.transcription = clone(validateTranscriptionState(draft.transcription));
       await this.assertPrivacySessionCurrent();
-      await this.store.save(this.persistedState(draft));
+      await this.store.save(this.persistedState(draft), saveOptions?.(draft, result));
       await this.assertPrivacySessionCurrent();
       if (capturedBootstrapGeneration !== this.bootstrapGeneration || this.startupRecoveryPhase !== 'ready') {
         throw new Error('The app workspace changed while the update was being saved. Reopen the app before continuing.');
@@ -2183,6 +2190,116 @@ export class AppControllerImpl implements AppController {
     });
     await Promise.all(result.docs.map((document) => this.mirrorDocument(document)));
     return result.note;
+  }
+
+  async getPendingCaptureStatus(): Promise<PendingCaptureSafeStatus> {
+    await this.load();
+    return this.pendingCapture ? await this.pendingCapture.getStatus() : Object.freeze({ kind: 'blocked', reason: 'unsupported' });
+  }
+
+  async inspectPendingCapture(receipt: PendingCaptureReceipt): Promise<PendingCaptureSafeStatus> {
+    await this.load();
+    if (!this.pendingCapture) throw new Error('Pending recording recovery is unavailable on this platform.');
+    return this.pendingCapture.inspect(Object.freeze({ ...receipt }));
+  }
+
+  async exportPendingCapture(receipt: PendingCaptureReceipt): Promise<void> {
+    await this.load();
+    if (!this.pendingCapture) throw new Error('Pending recording export is unavailable on this platform.');
+    return this.pendingCapture.export(Object.freeze({ ...receipt }));
+  }
+
+  async discardPendingCapture(receipt: PendingCaptureReceipt): Promise<PendingCaptureSafeStatus> {
+    await this.load();
+    if (!this.pendingCapture) throw new Error('Pending recording discard is unavailable on this platform.');
+    return this.pendingCapture.discard(Object.freeze({ ...receipt }));
+  }
+
+  async retryPendingCaptureSourceRelease(): Promise<PendingCaptureSafeStatus> {
+    await this.load();
+    if (!this.pendingCapture) throw new Error('Pending recording cleanup is unavailable on this platform.');
+    return this.pendingCapture.retryPendingCaptureSourceRelease();
+  }
+
+  private async refreshAfterPendingCaptureCommit(): Promise<void> {
+    const generation = ++this.bootstrapGeneration;
+    this.startupRecoveryPhase = 'failed';
+    const refresh = this.transactionQueue.then(async () => {
+      if (generation !== this.bootstrapGeneration) throw new Error('The app workspace changed while the pending recording was being checked.');
+      this.loaded = false;
+      this.loadPromise = undefined;
+      await this.openStartupData();
+    });
+    this.transactionQueue = refresh.then(() => undefined, () => undefined);
+    await refresh;
+  }
+
+  private validConsumedPendingNote(note: Note | undefined, captureId: string): note is Note {
+    if (!note || note.id !== captureId || note.status !== 'recorded' || note.revision !== 1 || note.transcript !== '' ||
+        typeof note.audioUri !== 'string' || !/^file:\/\/[^\u0000-\u0020?#]+\/ExpoAudio\/recording-[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.m4a$/i.test(note.audioUri) ||
+        !Number.isFinite(note.durationSeconds) || note.durationSeconds <= 0 || note.durationSeconds > 600) return false;
+    if (typeof note.capturedAt !== 'string') return false;
+    const capturedAt = Date.parse(note.capturedAt);
+    if (!Number.isFinite(capturedAt) || new Date(capturedAt).toISOString() !== note.capturedAt) return false;
+    if (typeof note.captureTimeZone !== 'string') return false;
+    try { new Intl.DateTimeFormat('en-US', { timeZone: note.captureTimeZone }).format(0); }
+    catch { return false; }
+    return true;
+  }
+
+  async savePendingCapture(receiptValue: PendingCaptureReceipt): Promise<Note> {
+    const receipt = Object.freeze({ id: receiptValue.id, revision: receiptValue.revision });
+    await this.load();
+    if (!this.pendingCapture) throw new Error('Pending recording save is unavailable on this platform.');
+    let adoption: Awaited<ReturnType<PendingCaptureControllerPort['readForAdoption']>> | undefined;
+    let consumeWriteStarted = false;
+    try {
+      const result = await this.mutate(async (state) => {
+        adoption = await this.pendingCapture!.readForAdoption(receipt);
+        const capture = adoption.capture;
+        if (state.notes.some((note) => note.id === capture.id)) throw new Error('This recording is already in saved data.');
+        const durationSeconds = capture.inspection?.outcome === 'known' ? capture.inspection.durationSeconds : undefined;
+        if (durationSeconds === undefined || durationSeconds <= 0 || durationSeconds > 600) throw new Error('This recording is not eligible to save. Inspect it first.');
+        const note: Note = {
+          id: capture.id, title: 'Audio note', transcript: '', audioUri: adoption.uri, durationSeconds,
+          createdAt: now(), capturedAt: capture.capturedAt, captureTimeZone: capture.captureTimeZone,
+          status: 'recorded', revision: 1,
+        };
+        state.notes.unshift(note);
+        addActivity(state, 'note_saved', 'Audio saved. No transcript has been created yet.', { noteId: note.id });
+        const docs = [...ensureMemoryDocuments(state), ...recordJournal(state, `note:${note.id}:r${note.revision}`, `Saved note ${note.title} (note ID ${note.id}, transcript revision ${note.revision}).`), ...ensurePeriodDocuments(state)];
+        return { note, docs };
+      }, () => {
+        consumeWriteStarted = true;
+        return { consumePendingCapture: { id: receipt.id, revision: receipt.revision, noteId: receipt.id } };
+      });
+      await Promise.all(result.docs.map((document) => this.mirrorDocument(document)));
+      return result.note;
+    } catch {
+      if (!consumeWriteStarted) {
+        const existing = this.state.notes.find((item) => item.id === receipt.id);
+        if (existing && this.validConsumedPendingNote(existing, receipt.id)) {
+          try {
+            if (await this.pendingCapture.readConsumedEvidence(receipt.id)) return clone(existing);
+          } catch { /* A held source-cleanup lease fails fast; it is not a reason to reload workspace state. */ }
+        }
+        throw new Error('The pending recording could not be saved. Check its status before trying again.');
+      }
+      // A process may lose the acknowledgement after the storage transaction committed.
+      // Reload the exact persisted slot/snapshot before deciding whether adoption won.
+      try {
+        await this.refreshAfterPendingCaptureCommit();
+        const consumed = await this.pendingCapture.readConsumedEvidence(receipt.id);
+        const note = this.state.notes.find((item) => item.id === receipt.id);
+        const inspected = adoption?.capture.inspection;
+        const expectedDuration = inspected?.outcome === 'known' ? inspected.durationSeconds : undefined;
+        if (consumed && this.validConsumedPendingNote(note, receipt.id)) {
+          if (!adoption || (note.audioUri === adoption.uri && note.capturedAt === adoption.capture.capturedAt &&
+              note.captureTimeZone === adoption.capture.captureTimeZone && note.durationSeconds === expectedDuration)) return clone(note);
+        }
+      } catch { /* Keep the original fixed failure if neither side can be verified. */ }
+      throw new Error('The pending recording could not be saved. Check its status before trying again.');
+    }
   }
 
   async updateTranscript(id: string, text: string): Promise<Note> {
@@ -6790,7 +6907,7 @@ export default controller;
  * confirms that no erase is active. Callers should use this factory at the app
  * bootstrap boundary before rendering or invoking data-bearing controller APIs.
  */
-export async function createProductionController(options: {
+export interface ProductionWorkspaceOptions {
   privacy?: PrivacyService;
   session?: PrivacyWorkspaceSession;
   resources?: PrivacyResourceBoundary;
@@ -6799,7 +6916,10 @@ export async function createProductionController(options: {
   store?: StateStore;
   providers?: { speech?: AzureSpeechClient; openAi?: AzureOpenAIClient };
   integration?: ControllerIntegrationDependencies;
-} = {}): Promise<AppController> {
+  pendingCaptureNativeIO?: PendingCaptureNativeIO;
+}
+
+export async function createProductionWorkspace(options: ProductionWorkspaceOptions = {}): Promise<{ controller: AppController; captureJournal?: PendingCaptureJournalPort }> {
   const privacy = options.privacy ?? options.resources?.privacy ?? await getDefaultPrivacyService();
   if (options.resources && options.resources.privacy !== privacy) throw new Error('Privacy resource boundary belongs to a different control service.');
   const requestedSession = options.session ?? options.resources?.session;
@@ -6823,7 +6943,20 @@ export async function createProductionController(options: {
   });
   const resources = options.resources ?? createPrivacyResourceBoundary({ privacy, session });
   let implementation: AppControllerImpl | undefined;
-  const boundStore = bindWorkspaceStorage(options.store ?? createPlatformStateStore(), privacy, session);
+  const rawStore = options.store ?? createPlatformStateStore();
+  const boundStore = bindWorkspaceStorage(rawStore, privacy, session);
+  let captureJournal: PendingCaptureJournalPort | undefined;
+  let pendingCaptureController: PendingCaptureControllerPort | undefined;
+  if (Platform.OS === 'ios' && rawStore.pendingCapture) {
+    let nativeIO = options.pendingCaptureNativeIO;
+    if (!nativeIO) {
+      const native = await import('../audio/pendingCaptureNativeIO.native');
+      nativeIO = native.pendingCaptureNativeIO;
+    }
+    const service = createPendingCaptureService({ backend: rawStore.pendingCapture, privacy, session, nativeIO });
+    captureJournal = service.journal;
+    pendingCaptureController = service.controller;
+  }
   const rawTokenStore = options.integration?.tokenStore ?? oauthTokenStore;
   const tokenStore = resources.oauthTokenStore(rawTokenStore);
   const providerCredentials = options.credentials ?? options.integration?.credentials ?? createProviderCredentialService(resources.credentialStore(credentialStore));
@@ -6884,6 +7017,10 @@ export async function createProductionController(options: {
     }),
     openAi: options.providers?.openAi ?? new AzureOpenAIClient(fetch, () => providerCredentials.readProviderCredential('openai'), resources.withProviderOwnership),
   };
-  implementation = new AppControllerImpl(boundStore, providers, integration);
-  return createPrivacyBoundController(implementation, privacy, session);
+  implementation = new AppControllerImpl(boundStore, providers, integration, pendingCaptureController);
+  return { controller: createPrivacyBoundController(implementation, privacy, session), ...(captureJournal ? { captureJournal } : {}) };
+}
+
+export async function createProductionController(options: ProductionWorkspaceOptions = {}): Promise<AppController> {
+  return (await createProductionWorkspace(options)).controller;
 }

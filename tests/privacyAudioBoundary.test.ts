@@ -1,28 +1,34 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CaptureStillActiveError, createPrivacyAudioBoundary, createPrivacyBoundNativeSpeechAudioIO, createPrivacyBoundRecordingRecoveryService } from '../src/privacy/audioBoundary';
+import { createPrivacyService } from '../src/privacy/service';
 import type { PrivacyService, PrivacyWorkspaceSession } from '../src/privacy/service';
-import type { PrivacyWriterDescriptor, PrivacyWriterLease } from '../src/privacy/types';
+import type { PrivacyControlState, PrivacyControlStore, PrivacyOwner, PrivacyWriterDescriptor, PrivacyWriterLease, PrivacyWriterScope } from '../src/privacy/types';
+import { createEmptyPrivacyControlState, validatePrivacyControlState } from '../src/privacy/schema';
 import type { RecordingRecoveryService } from '../src/audio/recovery.types';
 import type { NativeSpeechAudioIO } from '../src/audio/speechUpload.types';
 
+vi.mock('expo', () => ({ requireOptionalNativeModule: () => undefined }));
+afterEach(() => vi.unstubAllGlobals());
+
 function deferred<T = void>() {
-  let resolve!: (value: T | PromiseLike<T>) => void;
+  let resolvePromise!: (value: T | PromiseLike<T>) => void;
   let reject!: (error: unknown) => void;
-  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
-  return { promise, resolve, reject };
+  const promise = new Promise<T>((res, rej) => { resolvePromise = res; reject = rej; });
+  return { promise, resolve: (value?: T | PromiseLike<T>) => resolvePromise(value as T), reject };
 }
 
 function makePrivacy() {
   const events: string[] = [];
   let epoch = 'epoch-1';
+  const scope = Object.freeze({}) as PrivacyWriterScope;
   const service = {
     async assertWorkspaceEpoch(expected: string) {
       events.push(`assert:${expected}`);
       if (expected !== epoch) throw new Error('stale workspace');
     },
-    async withWriter<T>(_epoch: string, descriptor: PrivacyWriterDescriptor, work: (lease: PrivacyWriterLease) => Promise<T>) {
+    async withWriter<T>(_epoch: string, descriptor: PrivacyWriterDescriptor, work: (lease: PrivacyWriterLease, scope: PrivacyWriterScope) => Promise<T>) {
       events.push(`acquire:${descriptor.kind}:${descriptor.namespace}`);
-      try { return await work({ id: 'lease', epoch: _epoch, owner: { platform: 'web', runtimeId: 'runtime' }, kind: descriptor.kind, namespace: descriptor.namespace, createdAt: new Date(0).toISOString() }); }
+      try { return await work({ id: 'lease', epoch: _epoch, owner: { platform: 'web', runtimeId: 'runtime' }, kind: descriptor.kind, namespace: descriptor.namespace, createdAt: new Date(0).toISOString() }, scope); }
       finally { events.push('release'); }
     },
     async registerNamespace(_epoch: string, namespace: string) { events.push(`register:${namespace}`); },
@@ -30,9 +36,195 @@ function makePrivacy() {
   return { service, events, setEpoch(value: string) { epoch = value; } };
 }
 
+class ActualControlStore implements PrivacyControlStore {
+  state: PrivacyControlState = createEmptyPrivacyControlState('10000000-0000-4000-8000-000000000001');
+  holdRelease?: { started: { resolve(): void }; gate: { promise: Promise<void> } };
+  failRelease = false;
+
+  async read() { return structuredClone(validatePrivacyControlState(this.state)); }
+  async compareAndSwap(expectedRevision: string, next: PrivacyControlState) {
+    if (expectedRevision !== this.state.revision) throw Object.assign(new Error('conflict'), { code: 'conflict' });
+    const isRelease = next.writerLeases.length < this.state.writerLeases.length;
+    if (isRelease && this.failRelease) { this.failRelease = false; throw new Error('lease release failed'); }
+    if (isRelease && this.holdRelease) {
+      const pending = this.holdRelease;
+      this.holdRelease = undefined;
+      pending.started.resolve();
+      await pending.gate.promise;
+    }
+    this.state = structuredClone(validatePrivacyControlState(next));
+  }
+}
+
+async function actualPrivacyRuntime() {
+  const { createNativePrivacyArbitration } = await import('../src/privacy/arbitration');
+  const owner: PrivacyOwner = {
+    platform: 'ios', runtimeId: '10000000-0000-4000-8000-000000000002',
+    processLaunchId: '10000000-0000-4000-8000-000000000003', bundleIdentifier: 'com.still.voiceassistant',
+  };
+  const control = new ActualControlStore();
+  const arbitration = createNativePrivacyArbitration({ getRuntimeOwner: async () => owner, waitTimeoutMs: 2_000 });
+  const privacy = createPrivacyService({
+    controlStore: control,
+    arbitration,
+    eraseAdapter: { async erase() {}, async verifyGone() { return true; } },
+  });
+  const workspace = await privacy.openWorkspace();
+  return { control, privacy, arbitration, workspace };
+}
+
 const session: PrivacyWorkspaceSession = Object.freeze({ epoch: 'epoch-1', runtimeId: 'runtime' });
 
 describe('privacy-bound audio IO', () => {
+  it('waits for writer release before rejecting a failed ordinary start', async () => {
+    const events: string[] = [];
+    const releaseStarted = deferred();
+    const release = deferred();
+    const scope = Object.freeze({}) as PrivacyWriterScope;
+    const service = {
+      async assertWorkspaceEpoch() {},
+      async withWriter<T>(_epoch: string, _descriptor: PrivacyWriterDescriptor, work: (lease: PrivacyWriterLease, scope: PrivacyWriterScope) => Promise<T>) {
+        try {
+          return await work({ id: 'lease', epoch: 'epoch-1', owner: { platform: 'web', runtimeId: 'runtime' }, kind: 'audio_capture', namespace: 'browser_audio', createdAt: new Date(0).toISOString() }, scope);
+        } finally {
+          releaseStarted.resolve();
+          await release.promise;
+          events.push('released');
+        }
+      },
+      async registerNamespace() {},
+      async registerTokenRef() {},
+    };
+    const boundary = createPrivacyAudioBoundary({ privacy: service as unknown as PrivacyService, session, captureNamespace: 'browser_audio' });
+    const capture = boundary.beginCapture(async () => { throw new Error('setup failed'); });
+    let readySettled = false;
+    const ready = capture.ready.catch((error) => { readySettled = true; throw error; });
+    await releaseStarted.promise;
+    await Promise.resolve();
+    expect(readySettled).toBe(false);
+    expect(events).toEqual([]);
+    release.resolve();
+    await expect(ready).rejects.toThrow('setup failed');
+    expect(readySettled).toBe(true);
+    expect(events).toEqual(['released']);
+  });
+
+  it('reports uncertain start immediately but retains the capture writer for an explicit stop proof', async () => {
+    const mock = makePrivacy();
+    const boundary = createPrivacyAudioBoundary({ privacy: mock.service, session, captureNamespace: 'browser_audio' });
+    const capture = boundary.beginCapture(async () => { throw new CaptureStillActiveError('status uncertain'); });
+    await expect(capture.ready).rejects.toBeInstanceOf(CaptureStillActiveError);
+    expect(mock.events).not.toContain('release');
+    await expect(capture.stop(async () => { mock.events.push('stop:proved'); return 'stopped'; })).resolves.toBe('stopped');
+    expect(mock.events).toContain('stop:proved');
+    expect(mock.events).toContain('release');
+  });
+
+  it('runs stop after a post-start workspace assertion fails, then releases only after quiescence', async () => {
+    const mock = makePrivacy();
+    const boundary = createPrivacyAudioBoundary({ privacy: mock.service, session, captureNamespace: 'browser_audio' });
+    const capture = boundary.beginCapture(async () => { mock.setEpoch('stale-epoch'); });
+    await expect(capture.ready).rejects.toBeInstanceOf(CaptureStillActiveError);
+    expect(mock.events).not.toContain('release');
+    await expect(capture.stop(async () => {
+      mock.events.push('stop:actual-recorder');
+      mock.setEpoch(session.epoch);
+      return 'stopped';
+    })).resolves.toBe('stopped');
+    expect(mock.events).toContain('stop:actual-recorder');
+    expect(mock.events).toContain('release');
+  });
+
+  it('passes the live writer scope to start/actions/stop while retaining zero-argument callback compatibility', async () => {
+    const mock = makePrivacy();
+    const boundary = createPrivacyAudioBoundary({ privacy: mock.service, session, captureNamespace: 'browser_audio' });
+    let startScope: PrivacyWriterScope | undefined;
+    let actionScope: PrivacyWriterScope | undefined;
+    let stopScope: PrivacyWriterScope | undefined;
+    const capture = boundary.beginCapture(async (scope) => { startScope = scope; });
+    await capture.ready;
+    await capture.runAction(async (scope) => { actionScope = scope; });
+    await capture.runAction(async () => { mock.events.push('zero-argument-action'); });
+    await capture.stop(async (scope) => { stopScope = scope; return 'done'; });
+    expect(startScope).toBe(actionScope);
+    expect(stopScope).toBe(startScope);
+    expect(mock.events).toContain('zero-argument-action');
+  });
+
+  it('admits scoped capture child IO behind queued native exclusive work', async () => {
+    vi.stubGlobal('__DEV__', true);
+    const { privacy, arbitration, workspace, control } = await actualPrivacyRuntime();
+    const boundary = createPrivacyAudioBoundary({ privacy, session: workspace, captureNamespace: 'native_recordings' });
+    const startWaiting = deferred();
+    const allowChild = deferred();
+    const childStarted = deferred();
+    const childDone = deferred();
+    let exclusiveStarted = false;
+    const capture = boundary.beginCapture(async (scope) => {
+      startWaiting.resolve();
+      await allowChild.promise;
+      await privacy.withExistingWriter(scope, workspace.epoch, { kind: 'recording_recovery', namespace: 'recovery_audio' }, async () => {
+        childStarted.resolve();
+        childDone.resolve();
+      });
+    });
+    const parentReadyToContinue = capture.ready;
+    // The start callback is waiting under its real native writer lease; queue an
+    // exclusive request before allowing its child to register and perform IO.
+    await startWaiting.promise;
+    const exclusive = arbitration.withCleanupLock(async () => { exclusiveStarted = true; });
+    allowChild.resolve();
+    await childStarted.promise;
+    await childDone.promise;
+    await parentReadyToContinue;
+    expect(exclusiveStarted).toBe(false);
+    expect(control.state.ownedNamespaces).toContain('recovery_audio');
+    await capture.stop(async (scope) => {
+      await privacy.withExistingWriter(scope, workspace.epoch, { kind: 'recording_recovery', namespace: 'recovery_audio' }, async () => undefined);
+      return 'stopped';
+    });
+    await exclusive;
+    expect(exclusiveStarted).toBe(true);
+  });
+
+  it('coalesces public stop until the engine has completed lease release', async () => {
+    vi.stubGlobal('__DEV__', true);
+    const { privacy, workspace, control } = await actualPrivacyRuntime();
+    const boundary = createPrivacyAudioBoundary({ privacy, session: workspace, captureNamespace: 'native_recordings' });
+    const releaseStarted = deferred();
+    const releaseGate = deferred();
+    control.holdRelease = { started: releaseStarted, gate: releaseGate };
+    const capture = boundary.beginCapture(async () => undefined);
+    await capture.ready;
+    let stopCalls = 0;
+    let settled = false;
+    const first = capture.stop(async () => { stopCalls += 1; return 'saved'; });
+    const second = capture.stop(async () => { stopCalls += 1; return 'duplicate'; });
+    void first.finally(() => { settled = true; });
+    await releaseStarted.promise;
+    expect(first).toBe(second);
+    expect(stopCalls).toBe(1);
+    expect(settled).toBe(false);
+    expect(control.state.writerLeases).toHaveLength(1);
+    releaseGate.resolve();
+    await expect(Promise.all([first, second])).resolves.toEqual(['saved', 'saved']);
+    expect(settled).toBe(true);
+    expect(control.state.writerLeases).toEqual([]);
+  });
+
+  it('surfaces a terminal lease-release failure instead of reporting a successful stop', async () => {
+    vi.stubGlobal('__DEV__', true);
+    const { privacy, workspace, control } = await actualPrivacyRuntime();
+    const boundary = createPrivacyAudioBoundary({ privacy, session: workspace, captureNamespace: 'native_recordings' });
+    const capture = boundary.beginCapture(async () => undefined);
+    await capture.ready;
+    control.failRelease = true;
+    await expect(capture.stop(async () => 'saved')).rejects.toThrow('lease release failed');
+    expect(control.state.writerLeases).toHaveLength(1);
+    await expect(privacy.reconcileStartupWriters()).resolves.toMatchObject({ phase: 'ready' });
+    expect(control.state.writerLeases).toEqual([]);
+  });
+
   it('keeps the capture writer lease until actual stop/reset settles, including queued pause work', async () => {
     const mock = makePrivacy();
     const boundary = createPrivacyAudioBoundary({ privacy: mock.service, session, captureNamespace: 'browser_audio' });

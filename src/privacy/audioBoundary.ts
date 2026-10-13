@@ -1,5 +1,5 @@
 import type { PrivacyService, PrivacyWorkspaceSession } from './service';
-import type { PrivacyNamespace, PrivacyWriterLease } from './types';
+import type { PrivacyNamespace, PrivacyWriterScope } from './types';
 import type { RecordingRecoveryService, StagedRecording, AudioRecoveryMetadata } from '../audio/recovery.types';
 import { Platform } from 'react-native';
 import type { NativeSpeechAudioIO, SpeechAudioService } from '../audio/speechUpload.types';
@@ -16,9 +16,9 @@ export interface PrivacyCaptureSession {
   /** Resolves when permission/setup and recorder start have completed under the lease. */
   readonly ready: Promise<void>;
   /** Pause/resume operations share the active capture lease without nesting another lock. */
-  runAction<T>(work: () => Promise<T>): Promise<T>;
+  runAction<T>(work: (scope: PrivacyWriterScope) => Promise<T>): Promise<T>;
   /** The writer lease remains held through the actual stop, persistence, and mode reset. */
-  stop<T>(actualStopAndReset: () => Promise<T>): Promise<T>;
+  stop<T>(actualStopAndReset: (scope: PrivacyWriterScope) => Promise<T>): Promise<T>;
 }
 
 /** Throw when stop has not been proven to finish; the lease remains held for a retry. */
@@ -32,9 +32,9 @@ export class CaptureStillActiveError extends Error {
 export interface PrivacyAudioBoundary {
   readonly binding: PrivacyAudioBinding;
   assertCurrent(): Promise<void>;
-  withAudioRead<T>(actualRead: () => Promise<T>): Promise<T>;
-  withAudioWrite<T>(actualWrite: () => Promise<T>): Promise<T>;
-  beginCapture(actualPermissionPrepareAndStart: () => Promise<void>): PrivacyCaptureSession;
+  withAudioRead<T>(actualRead: (scope: PrivacyWriterScope) => Promise<T>): Promise<T>;
+  withAudioWrite<T>(actualWrite: (scope: PrivacyWriterScope) => Promise<T>): Promise<T>;
+  beginCapture(actualPermissionPrepareAndStart: (scope: PrivacyWriterScope) => Promise<void>): PrivacyCaptureSession;
   withRecordingPicker<T>(pickCopyAndCleanup: () => Promise<T>): Promise<T>;
   withBackupPicker<T>(pickReadAndCleanup: () => Promise<T>): Promise<T>;
   withRecoveryIO<T>(actualIO: () => Promise<T>): Promise<T>;
@@ -51,11 +51,11 @@ export function createPrivacyAudioBoundary(bindingInput: PrivacyAudioBinding): P
 
   const withWriter = <T>(
     descriptor: { kind: 'audio_capture' | 'recording_recovery' | 'picker_cache'; namespace: PrivacyNamespace },
-    actualIO: (lease: PrivacyWriterLease) => Promise<T>,
-  ) => privacy.withWriter(session.epoch, descriptor, async (lease) => {
+    actualIO: (scope: PrivacyWriterScope) => Promise<T>,
+  ) => privacy.withWriter(session.epoch, descriptor, async (_lease, scope) => {
     let result: T;
     try {
-      result = await actualIO(lease);
+      result = await actualIO(scope);
     } catch (error) {
       await privacy.assertWorkspaceEpoch(session.epoch);
       throw error;
@@ -67,38 +67,56 @@ export function createPrivacyAudioBoundary(bindingInput: PrivacyAudioBinding): P
   return Object.freeze({
     binding,
     assertCurrent: () => privacy.assertWorkspaceEpoch(session.epoch),
-    withAudioRead: <T>(actualRead: () => Promise<T>): Promise<T> => withWriter(
+    withAudioRead: <T>(actualRead: (scope: PrivacyWriterScope) => Promise<T>): Promise<T> => withWriter(
       { kind: 'audio_capture', namespace: binding.captureNamespace },
-      async () => actualRead(),
+      async (scope) => actualRead(scope),
     ),
-    withAudioWrite: <T>(actualWrite: () => Promise<T>): Promise<T> => withWriter(
+    withAudioWrite: <T>(actualWrite: (scope: PrivacyWriterScope) => Promise<T>): Promise<T> => withWriter(
       { kind: 'audio_capture', namespace: binding.captureNamespace },
-      async () => actualWrite(),
+      async (scope) => actualWrite(scope),
     ),
-    beginCapture(actualStart: () => Promise<void>) {
+    beginCapture(actualStart: (scope: PrivacyWriterScope) => Promise<void>) {
       let readyResolve!: () => void;
       let readyReject!: (error: unknown) => void;
       const ready = new Promise<void>((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
-      type StopRequest = { work: () => Promise<unknown>; resolve: (value: unknown) => void; reject: (reason: unknown) => void };
+      type StopRequest = { work: (scope: PrivacyWriterScope) => Promise<unknown>; rejectActive: (reason: unknown) => void };
       const stopRequests: StopRequest[] = [];
       let wakeStopLoop: (() => void) | undefined;
       let stopRequested = false;
       let leaseFinished = false;
       let completionError: unknown;
       let readyComplete = false;
+      let captureScope: PrivacyWriterScope | undefined;
       let actionQueue: Promise<void> = Promise.resolve();
       let pendingStop: Promise<unknown> | undefined;
       const completion = withWriter(
         { kind: 'audio_capture', namespace: binding.captureNamespace },
-        async () => {
+        async (scope) => {
+          captureScope = scope;
+          let started = false;
           try {
-            await actualStart();
-            await privacy.assertWorkspaceEpoch(session.epoch);
-            readyComplete = true;
-            readyResolve();
+            await actualStart(scope);
+            started = true;
           } catch (error) {
-            readyReject(error);
             if (!(error instanceof CaptureStillActiveError)) throw error;
+            completionError = error;
+            // Start may have reached the device before its final status was
+            // confirmed. Report this immediately, but retain the parent lease
+            // and stop loop for an explicit stop proof.
+            readyReject(error);
+          }
+          if (started) {
+            try {
+              await privacy.assertWorkspaceEpoch(session.epoch);
+              readyComplete = true;
+              readyResolve();
+            } catch {
+              const error = new CaptureStillActiveError('Recording started, but its workspace status could not be confirmed. Stop and verify the recorder before leaving.');
+              completionError = error;
+              // The recorder may be running despite an unreadable or stale
+              // workspace check. Keep the writer until actual stop settles.
+              readyReject(error);
+            }
           }
           while (true) {
             if (!stopRequests.length) await new Promise<void>((resolve) => { wakeStopLoop = resolve; });
@@ -106,17 +124,18 @@ export function createPrivacyAudioBoundary(bindingInput: PrivacyAudioBinding): P
             if (!request) continue;
             await actionQueue;
             try {
-              const result = await request.work();
+              const result = await request.work(scope);
               await privacy.assertWorkspaceEpoch(session.epoch);
-              request.resolve(result);
               leaseFinished = true;
+              completionError = undefined;
               return result;
             } catch (error) {
-              request.reject(error);
-              if (!(error instanceof CaptureStillActiveError)) {
-                leaseFinished = true;
-                throw error;
+              if (error instanceof CaptureStillActiveError) {
+                request.rejectActive(error);
+                continue;
               }
+              leaseFinished = true;
+              throw error;
             }
           }
         },
@@ -127,17 +146,19 @@ export function createPrivacyAudioBoundary(bindingInput: PrivacyAudioBinding): P
         leaseFinished = true;
         completionError = error;
         readyReject(error);
-        for (const request of stopRequests.splice(0)) request.reject(error);
+        for (const request of stopRequests.splice(0)) request.rejectActive(error);
         wakeStopLoop?.();
       });
       return Object.freeze({
         ready,
-        async runAction<T>(work: () => Promise<T>): Promise<T> {
+        async runAction<T>(work: (scope: PrivacyWriterScope) => Promise<T>): Promise<T> {
           if (stopRequested) throw new Error('The recording is already stopping.');
           if (!readyComplete) {
             await ready;
             if (stopRequested) throw new Error('The recording is already stopping.');
           }
+          const scope = captureScope;
+          if (!scope) throw new Error('The recording scope is no longer available.');
           let resolveResult!: (value: T) => void;
           let rejectResult!: (reason: unknown) => void;
           const resultPromise = new Promise<T>((resolve, reject) => {
@@ -147,7 +168,7 @@ export function createPrivacyAudioBoundary(bindingInput: PrivacyAudioBinding): P
           actionQueue = actionQueue.then(async () => {
             try {
               await privacy.assertWorkspaceEpoch(session.epoch);
-              const result = await work();
+              const result = await work(scope);
               await privacy.assertWorkspaceEpoch(session.epoch);
               resolveResult(result);
             } catch (error) {
@@ -156,7 +177,7 @@ export function createPrivacyAudioBoundary(bindingInput: PrivacyAudioBinding): P
           });
           return resultPromise;
         },
-        stop<T>(actualStopAndReset: () => Promise<T>): Promise<T> {
+        stop<T>(actualStopAndReset: (scope: PrivacyWriterScope) => Promise<T>): Promise<T> {
           if (pendingStop) return pendingStop as Promise<T>;
           if (leaseFinished) return Promise.reject(completionError ?? new Error('The capture lease has already ended.'));
           stopRequested = true;
@@ -164,10 +185,19 @@ export function createPrivacyAudioBoundary(bindingInput: PrivacyAudioBinding): P
           let reject!: (reason: unknown) => void;
           const result = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
           pendingStop = result;
+          const settle = () => {
+            if (pendingStop === result) pendingStop = undefined;
+          };
+          // Resolve only after the entire writer callback, final epoch assertion,
+          // child-scope drain, and durable lease release have completed.
+          void completion.then(
+            (value) => { settle(); resolve(value as T); },
+            (error) => { settle(); reject(error); },
+          );
+          void result.catch(() => undefined);
           stopRequests.push({
             work: actualStopAndReset,
-            resolve: (value) => { pendingStop = undefined; resolve(value as T); },
-            reject: (reason) => { pendingStop = undefined; reject(reason); },
+            rejectActive: (reason) => { settle(); reject(reason); },
           });
           wakeStopLoop?.(); wakeStopLoop = undefined;
           return result;

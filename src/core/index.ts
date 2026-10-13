@@ -4,6 +4,7 @@ import type { AudioRecoveryMetadata } from '../audio/recovery.types';
 import type { KnowledgeState, KnowledgeEntityKind, KnowledgeFact, ContactClaim, KnowledgeSourceLink, ProjectMember, KnowledgeSuggestion, KnowledgeChange, KnowledgeEvidence } from '../knowledge/types';
 import type { ReminderRecord, ReminderState, ReminderPayload } from '../reminders';
 import type { StartupRecoveryInspection, StartupRecoveryPlan, StartupRecoveryReceipt, StartupRecoveryCommitInput } from '../storage/startupRecovery';
+import type { PendingCaptureReceipt, PendingCaptureSafeStatus } from '../audio/pendingCaptureService.types';
 
 export type NoteStatus = 'recorded' | 'processed' | 'error';
 export type ProposalKind = 'task' | 'reminder' | 'email' | 'event' | 'memory';
@@ -802,6 +803,12 @@ export interface AppController {
   commitStartupRecovery(input: StartupRecoveryCommitInput): Promise<StartupRecoveryReceipt>;
   cancelStartupRecovery(): Promise<void>;
   retryStartup(): Promise<void>;
+  getPendingCaptureStatus(): Promise<PendingCaptureSafeStatus>;
+  inspectPendingCapture(receipt: PendingCaptureReceipt): Promise<PendingCaptureSafeStatus>;
+  exportPendingCapture(receipt: PendingCaptureReceipt): Promise<void>;
+  discardPendingCapture(receipt: PendingCaptureReceipt): Promise<PendingCaptureSafeStatus>;
+  retryPendingCaptureSourceRelease(): Promise<PendingCaptureSafeStatus>;
+  savePendingCapture(receipt: PendingCaptureReceipt): Promise<Note>;
   saveNote(input: SaveNoteInput): Promise<Note>;
   confirmImportedNoteTimeZone(noteId: string, input: { timeZone: string; expectedRevision: number }): Promise<Note>;
   prepareRecordingAttachment(noteId: string, input: { expectedRevision: number }): Promise<RecordingAttachmentPreview | null>;

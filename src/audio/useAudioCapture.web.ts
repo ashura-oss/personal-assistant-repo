@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { CaptureStillActiveError } from '../privacy/audioBoundary';
 import type { PrivacyAudioBoundary, PrivacyCaptureSession } from '../privacy/audioBoundary';
 import type { AudioCapture } from './types';
+import type { PendingCaptureJournalPort } from './pendingCaptureService.types';
+import type { NativeAudioCaptureOptions } from './useAudioCapture.native';
 import { getAudio, putAudio, removeAudio } from './blobStore.web';
 
 type PendingClip = { blob: Blob; uri: string; durationSeconds: number; capturedAt: string; captureTimeZone: string };
@@ -10,7 +12,7 @@ function isRecorderActive(active: MediaRecorder | null | undefined): boolean {
   return !!active && active.state !== 'inactive';
 }
 
-export function useAudioCapture(boundary?: PrivacyAudioBoundary): AudioCapture {
+export function useAudioCapture(boundary?: PrivacyAudioBoundary, _journal?: PendingCaptureJournalPort, _options?: NativeAudioCaptureOptions): AudioCapture {
   const [status, setStatus] = useState<AudioCapture['status']>('idle');
   const [durationSeconds, setDurationSeconds] = useState(0);
   const [meter, setMeter] = useState<number[]>(Array.from({ length: 37 }, (_, i) => 0.14 + (i % 5) * 0.07));

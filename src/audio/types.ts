@@ -1,4 +1,7 @@
 export type AudioStatus = 'idle' | 'recording' | 'paused';
+export type AudioCaptureStopResult =
+  | Readonly<{ kind: 'pending_capture'; receipt: import('./pendingCaptureService.types').PendingCaptureReceipt }>
+  | Readonly<{ kind?: 'legacy'; uri: string; durationSeconds: number; capturedAt: string; captureTimeZone: string }>;
 export interface AudioCapture {
   status: AudioStatus;
   canResume: boolean;
@@ -10,8 +13,9 @@ export interface AudioCapture {
   start(): Promise<void>;
   pause(): Promise<void>;
   resume(): Promise<void>;
-  stop(): Promise<{ uri: string; durationSeconds: number; capturedAt: string; captureTimeZone: string } | null>;
+  stop(): Promise<AudioCaptureStopResult | null>;
   cancel(): Promise<void>;
-  commit(uri: string): void;
+  commit(captureIdOrUri: string): void;
+  refreshPendingRecovery?(): Promise<void>;
   play(uri: string): Promise<void>;
 }
