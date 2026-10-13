@@ -1,7 +1,7 @@
 import * as SQLite from 'expo-sqlite';
 import * as Crypto from 'expo-crypto';
 import type { AppState } from '../core';
-import { STORAGE_KEY, type StateStore } from './contracts';
+import { STATE_SNAPSHOT_READ_MAX_BYTES, STORAGE_KEY, type StateStore } from './contracts';
 import {
   PENDING_CAPTURE_MAX_BYTES, PENDING_CAPTURE_STORAGE_KEY, assertPendingCaptureConsumption,
   assertPendingCaptureTransition, emptyPendingCaptureSlot, readPendingCaptureSlot,
@@ -368,6 +368,35 @@ export class SQLiteStateStore implements StateStore {
       this.currentGeneration = generation;
       this.generationBaseline = true;
       return state;
+    });
+  }
+
+  async readCurrentSnapshot(): Promise<Readonly<{ raw: string; schemaVersion: number }> | undefined> {
+    return this.enqueue(async () => {
+      if (!this.generationBaseline) throw new Error('Load the current workspace before reading its persisted snapshot.');
+      const db = await this.initialize();
+      let snapshot: Readonly<{ raw: string; schemaVersion: number }> | undefined;
+      await db.withExclusiveTransactionAsync(async (tx) => {
+        const metadata = await tx.getFirstAsync<{ value: string }>('SELECT value FROM storage_meta WHERE key = ?', GENERATION_KEY);
+        const generation = metadata ? validateGeneration(metadata.value) : undefined;
+        if (generation !== this.currentGeneration) throw new Error('Saved data changed in another workspace. Reload before reading its persisted snapshot.');
+
+        const rowMeta = await tx.getFirstAsync<{ schema_version: number; bytes: number }>(
+          'SELECT schema_version, length(CAST(value AS BLOB)) AS bytes FROM app_state WHERE key = ?', STORAGE_KEY);
+        if (!rowMeta) return;
+        if (!Number.isSafeInteger(rowMeta.schema_version) || rowMeta.schema_version < 1) throw new Error('Saved app data schema is unavailable.');
+        if (rowMeta.schema_version > SCHEMA_VERSION) throw new Error('Saved app data was created by a newer version.');
+        if (!Number.isSafeInteger(rowMeta.bytes) || rowMeta.bytes < 0 || rowMeta.bytes > STATE_SNAPSHOT_READ_MAX_BYTES) {
+          throw new Error('Saved app data exceeds the bounded snapshot read limit.');
+        }
+        const row = await tx.getFirstAsync<{ value: string }>(
+          'SELECT value FROM app_state WHERE key = ? AND length(CAST(value AS BLOB)) <= ?', STORAGE_KEY, STATE_SNAPSHOT_READ_MAX_BYTES);
+        if (!row || typeof row.value !== 'string' || recoveryUtf8Bytes(row.value, STATE_SNAPSHOT_READ_MAX_BYTES) !== rowMeta.bytes) {
+          throw new Error('Saved app data could not be read as a bounded exact snapshot.');
+        }
+        snapshot = Object.freeze({ raw: row.value, schemaVersion: rowMeta.schema_version });
+      });
+      return snapshot;
     });
   }
 

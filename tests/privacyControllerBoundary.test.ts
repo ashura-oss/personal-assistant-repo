@@ -9,6 +9,7 @@ import { createPrivacyService } from '../src/privacy/service';
 import type { PrivacyControlState, PrivacyControlStore, PrivacyEraseAdapter, PrivacyOwner, PrivacyWriterArbitration } from '../src/privacy/types';
 import type { PrivacyService } from '../src/privacy/service';
 import { createPrivacyResourceBoundary } from '../src/privacy/resourceBoundary';
+import { bindWorkspaceStorage } from '../src/privacy/workspaceStorage';
 
 const id = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
 
@@ -113,6 +114,28 @@ describe('privacy controller boundary', () => {
     } finally { finish(); }
     await save;
     expect((await privacy.getStatus()).activeWriterCount).toBe(0);
+  });
+
+  it('holds the state writer for exact-snapshot reads and withholds a result after late epoch invalidation', async () => {
+    const { privacy, control } = makePrivacy();
+    const session = await privacy.openWorkspace();
+    const store = new Store() as Store & { readCurrentSnapshot(): Promise<{ raw: string; schemaVersion: number }> };
+    let finish!: () => void;
+    let began!: () => void;
+    const gate = new Promise<void>((resolve) => { finish = resolve; });
+    const started = new Promise<void>((resolve) => { began = resolve; });
+    store.readCurrentSnapshot = async () => { began(); await gate; return { raw: '{"private":"raw"}', schemaVersion: 1 }; };
+    const bound = bindWorkspaceStorage(store, privacy, session);
+    let exposed: unknown;
+    const read = bound.readCurrentSnapshot!().then((value) => { exposed = value; return value; });
+    try {
+      await started;
+      expect((await privacy.getStatus()).activeWriterCount).toBe(1);
+      control.state = { ...control.state, epoch: id(70), revision: id(71) };
+    } finally { finish(); }
+
+    await expect(read).rejects.toMatchObject({ code: 'stale_epoch' });
+    expect(exposed).toBeUndefined();
   });
 
   it('holds the mirror writer lease until the real filesystem callback settles', async () => {

@@ -1,5 +1,5 @@
 import type { AppState } from '../core';
-import { STORAGE_KEY, type StateStore } from './contracts';
+import { STATE_SNAPSHOT_READ_MAX_BYTES, STORAGE_KEY, type StateStore } from './contracts';
 import {
   PENDING_CAPTURE_STORAGE_KEY, assertPendingCaptureConsumption, assertPendingCaptureTransition,
   emptyPendingCaptureSlot, readPendingCaptureSlot, serializePendingCaptureSlot,
@@ -419,6 +419,29 @@ export class IndexedDbStateStore implements StateStore {
         return state;
       } finally { closeTracked(db); }
     });
+  }
+
+  async readCurrentSnapshot(): Promise<Readonly<{ raw: string; schemaVersion: number }> | undefined> {
+    return this.enqueue(() => this.withTransaction('readonly', async (store) => {
+      this.assertActive();
+      if (!this.generationBaseline) throw new Error('Load the current workspace before reading its persisted snapshot.');
+      const [generationValue, rawValue, schemaValue, sizeValue] = await Promise.all([
+        requestResult(store.get(GENERATION_KEY)), requestResult(store.get(STORAGE_KEY)),
+        requestResult(store.get(SCHEMA_KEY)), requestResult(store.get(SIZE_KEY)),
+      ]);
+      const generation = cleanGeneration(generationValue);
+      const normalizedGeneration = generation === 'legacy' ? undefined : generation;
+      if (normalizedGeneration !== this.currentGeneration) throw new Error('Saved data changed in another workspace. Reload before reading its persisted snapshot.');
+      const schemaVersion = cleanSchema(schemaValue);
+      if (schemaVersion > 1) throw new Error('Saved app data was created by a newer version.');
+      if (rawValue === undefined) return undefined;
+      if (typeof rawValue !== 'string') throw new Error('Saved browser data is unavailable.');
+      const bytes = recoveryUtf8Bytes(rawValue, STATE_SNAPSHOT_READ_MAX_BYTES);
+      if (bytes > STATE_SNAPSHOT_READ_MAX_BYTES || cleanSize(sizeValue, rawValue) !== bytes) {
+        throw new Error('Saved app data exceeds the bounded snapshot read limit or has invalid size metadata.');
+      }
+      return Object.freeze({ raw: rawValue, schemaVersion });
+    }));
   }
 
   async save(state: AppState, options?: { consumePendingCapture: ConsumePendingCapture }): Promise<void> {

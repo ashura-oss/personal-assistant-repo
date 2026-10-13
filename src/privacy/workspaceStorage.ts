@@ -1,4 +1,4 @@
-import type { StateStore } from '../storage/contracts';
+import type { PersistedStateSnapshot, StateStore } from '../storage/contracts';
 import type { ConsumePendingCapture } from '../storage/pendingCapture';
 import type { StartupRecoveryBackend } from '../storage/startupRecovery';
 import type { PrivacyWriterScope } from './types';
@@ -19,6 +19,7 @@ export function bindWorkspaceStorage(
 ): StateStore {
   const sessionEpoch = String(session.epoch);
   const capturedSession = Object.freeze({ epoch: sessionEpoch, runtimeId: String(session.runtimeId) });
+  const readCurrentSnapshot = store.readCurrentSnapshot?.bind(store);
   const withStateWriter = <T>(work: () => Promise<T>) => privacy.withWriter(
     capturedSession.epoch,
     { kind: 'app_state', namespace: 'state_database' },
@@ -27,6 +28,11 @@ export function bindWorkspaceStorage(
   const recovery = store.recovery ? bindRecovery(store.recovery, withStateWriter) : undefined;
   return {
     load: () => withStateWriter(() => store.load()),
+    ...(readCurrentSnapshot ? { readCurrentSnapshot: async (): Promise<PersistedStateSnapshot | undefined> => {
+      const result = await withStateWriter(readCurrentSnapshot);
+      await privacy.assertWorkspaceEpoch(capturedSession.epoch);
+      return result;
+    } } : {}),
     save: (state: Parameters<StateStore['save']>[0], options?: Parameters<StateStore['save']>[1]) => {
       const consumePendingCapture: ConsumePendingCapture | undefined = options?.consumePendingCapture
         ? Object.freeze({ ...options.consumePendingCapture })
