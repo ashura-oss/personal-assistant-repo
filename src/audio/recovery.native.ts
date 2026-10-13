@@ -2,7 +2,7 @@ import * as Crypto from 'expo-crypto';
 import * as DocumentPicker from 'expo-document-picker';
 import { File } from 'expo-file-system';
 import * as FileSystem from 'expo-file-system/legacy';
-import { createAudioPlayer } from 'expo-audio';
+import { AudioDurationProbeError, measureNativeAudioDuration } from './audioDurationProbe.native';
 import {
   assertRecoveryByteLength,
   boundedRecoveryDuration,
@@ -14,7 +14,6 @@ import {
 import type { AudioRecoveryMetadata, RecordingRecoveryService, StagedRecording } from './recovery.types';
 
 const PRIVATE_FOLDER = 'recording-recovery/';
-const PROBE_TIMEOUT_MS = 10_000;
 const UUID_PATTERN = '[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
 
 function bytesToHex(bytes: Uint8Array): string {
@@ -58,40 +57,19 @@ async function readBytes(uri: string, expectedSize: number): Promise<Uint8Array>
 
 async function probeDuration(uri: string, maxDurationSeconds: number): Promise<Pick<AudioRecoveryMetadata, 'durationStatus' | 'durationSeconds'>> {
   if (!Number.isFinite(maxDurationSeconds) || maxDurationSeconds <= 0) throw new Error('The maximum recording duration is invalid.');
-  const player = createAudioPlayer(uri);
-  let subscription: { remove(): void } | undefined;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  let cleaned = false;
-  const cleanup = () => {
-    if (cleaned) return;
-    cleaned = true;
-    if (timer !== undefined) clearTimeout(timer);
-    try { subscription?.remove(); } catch { /* cleanup is best effort */ }
-    try { player.remove(); } catch { /* cleanup is best effort */ }
-  };
   try {
-    return await new Promise((resolve, reject) => {
-      let settled = false;
-      const onStatus = (status: typeof player.currentStatus) => {
-        if (!status.isLoaded) {
-          if (status.playbackState === 'error') finish(undefined, new Error('The selected recording could not be decoded as audio.'));
-          return;
-        }
-        try { finish(boundedRecoveryDuration(status.duration, Math.min(MAX_DURATION_SECONDS, maxDurationSeconds))); }
-        catch (error) { finish(undefined, error instanceof Error ? error : new Error('The audio duration is invalid.')); }
-      };
-      const finish = (result?: Pick<AudioRecoveryMetadata, 'durationStatus' | 'durationSeconds'>, error?: Error) => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        if (error) reject(error); else resolve(result!);
-      };
-      timer = setTimeout(() => finish(undefined, new Error('The selected recording did not finish loading within 10 seconds.')), PROBE_TIMEOUT_MS);
-      subscription = player.addListener('playbackStatusUpdate', onStatus);
-      onStatus(player.currentStatus);
-    });
+    const measurement = await measureNativeAudioDuration(uri);
+    if (measurement.outcome === 'unknown') {
+      if (measurement.reason === 'zero') return boundedRecoveryDuration(0, Math.min(MAX_DURATION_SECONDS, maxDurationSeconds));
+      return { durationStatus: 'unknown' };
+    }
+    return boundedRecoveryDuration(measurement.durationSeconds, Math.min(MAX_DURATION_SECONDS, maxDurationSeconds));
   } catch (error) {
-    cleanup();
+    if (error instanceof AudioDurationProbeError) {
+      if (error.code === 'timeout') throw new Error('The selected recording did not finish loading within 10 seconds.');
+      if (error.code === 'decode_error') throw new Error('The selected recording could not be decoded as audio.');
+      if (error.code === 'invalid_duration') throw new Error('The audio duration is invalid.');
+    }
     throw error;
   }
 }
