@@ -471,6 +471,8 @@ export interface AppSettings {
   backgroundRefreshGeneration?: number;
   /** Speech transcription is an explicit, independent provider opt-in. */
   speechEnabled?: boolean;
+  /** Missing values preserve the legacy Azure Speech provider. */
+  speechProvider?: 'azure' | 'openrouter';
   speechEndpoint?: string;
   speechRegion?: string;
   openAiEndpoint?: string;
@@ -635,6 +637,8 @@ export interface AppState {
   settings: AppSettings;
   usage: UsageLedger;
   transcription: import('../transcription').TranscriptionState;
+  /** Transient, local cancellation state; never persisted or exported. */
+  transcriptionRequestCleanupPending?: { attemptId: string }[];
   transcriptionRecoveryStatus?: { quarantined: true; message: 'Some speech-transcription history could not be validated and is held privately. New cloud transcription is disabled until recovery.' };
   mailbox: MailboxSnapshotMessage[];
   selectedMailTexts: SelectedMailTextSnapshot[];
@@ -851,6 +855,7 @@ export interface AppController {
   reconcileDispatch(recordId: string, input: { disposition: import('../dispatch').DispatchReconciliation; note: string; remoteId?: string }): Promise<import('../dispatch').DispatchRecord>;
   transcribeNote(id: string, options?: { expectedRevision: number }): Promise<Note>;
   cancelTranscription(noteId: string, input?: { attemptId?: string }): Promise<{ status: 'cancelled' | 'already_terminal' | 'not_running' }>;
+  retryTranscriptionRequestCleanup(attemptId: string): Promise<void>;
   editProposal(id: string, patch: ProposalPatch, options?: { expectedRevision: number }): Promise<Proposal>;
   approveProposal(id: string, options?: { expectedRevision: number }): Promise<Proposal>;
   executeProposal(id: string, options?: { expectedRevision: number }): Promise<Proposal>;

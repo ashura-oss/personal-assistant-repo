@@ -75,7 +75,7 @@ import type { ContactClaim, KnowledgeChange, KnowledgeEntityKind, KnowledgeEvide
 import { BACKUP_LIMITS, canonicalPortableContent, legacyCanonicalPortableContentV2, createPortableBackup, parsePortableBackup, summarizePortableBackup, validatePortableDocumentPath, validateImportedBackupArchive } from '../backup';
 import type { ImportedBackupArchive, PortableBackupV3, PortableKnowledgeCohort } from '../backup';
 import { SpeechTranscriptionError, validateTranscriptionState, validateSpeechAudioSnapshot } from '../transcription';
-import type { SpeechAudioSnapshot, SpeechAttemptCode, SpeechTranscriptionResult, TranscriptionAttempt, TranscriptionState } from '../transcription';
+import type { AnySpeechTranscriptionResult, OpenRouterSpeechTranscriptionResult, SpeechAudioSnapshot, SpeechAttemptCode, TranscriptionAttempt, TranscriptionState } from '../transcription';
 import type { PreparedSpeechAudio, SpeechAudioService } from '../audio/speechUpload.types';
 import { getDefaultPrivacyService, type PrivacyService, type PrivacyWorkspaceSession } from '../privacy/service';
 import { createPrivacyBoundController } from '../privacy/controllerBoundary';
@@ -93,6 +93,8 @@ import {
   OPENROUTER_BATCH_MODEL, OPENROUTER_BATCH_BODY_MODEL, OpenRouterBatchClient, OpenRouterBatchDispatchError,
   OpenRouterBatchRequestBuilder, isOpenRouterBatchRequestProfile, type OpenRouterBatchInspection, type PreparedOpenRouterAnalysis,
 } from './openRouter';
+import { OpenRouterSpeechClient } from './openRouterSpeech';
+import { OpenRouterSpeechAdapter } from './openRouterSpeechAdapter';
 import {
   emptyOpenRouterBatchLedger, validateOpenRouterBatchLedger, assistantBatchJobDTO, accountingFromInspection,
   isOpenRouterBatchContentJob, tombstoneOpenRouterBatchJob,
@@ -218,11 +220,12 @@ function stableJson(value: unknown): string {
 
 function transcriptionSourceProjection(note: Note, settings: AppSettings): TranscriptionAttempt['source'] {
   const attachment = note.audioAttachment;
+  const provider = settings.speechProvider === 'openrouter' ? 'openrouter' : 'azure';
   return {
     audioUri: note.audioUri ?? '', durationSeconds: note.durationSeconds,
     capturedAt: new Date(note.capturedAt ?? note.createdAt).toISOString(),
     captureTimeZone: validTimezone(note.captureTimeZone ?? settings.timezone),
-    speechEnabled: settings.speechEnabled === true, maxAudioSeconds: settings.maxAudioSeconds,
+    speechEnabled: settings.speechEnabled === true, maxAudioSeconds: settings.maxAudioSeconds, provider,
     ...(attachment ? { audioAttachment: {
       fileName: attachment.fileName, format: attachment.format, mimeType: attachment.mimeType,
       byteLength: attachment.byteLength, sha256: attachment.sha256, durationStatus: attachment.durationStatus,
@@ -232,7 +235,9 @@ function transcriptionSourceProjection(note: Note, settings: AppSettings): Trans
 }
 
 function speechSettingsProjection(settings: AppSettings): string {
+  if (settings.speechProvider === 'openrouter') return stableJson({ provider: 'openrouter', speechEnabled: settings.speechEnabled === true, maxAudioSeconds: settings.maxAudioSeconds });
   return stableJson({
+    provider: 'azure',
     speechEnabled: settings.speechEnabled === true,
     speechEndpoint: settings.speechEndpoint ?? '',
     maxAudioSeconds: settings.maxAudioSeconds,
@@ -257,6 +262,9 @@ function speechErrorCode(error: unknown): SpeechAttemptCode {
     default: return 'audio_invalid';
   }
 }
+function isOpenRouterSpeechResult(value: AnySpeechTranscriptionResult): value is OpenRouterSpeechTranscriptionResult {
+  return 'provider' in value && value.provider === 'openrouter';
+}
 function deepFreeze<T>(value: T): T {
   if (value && typeof value === 'object' && !Object.isFrozen(value)) {
     Object.freeze(value);
@@ -267,7 +275,7 @@ function deepFreeze<T>(value: T): T {
 
 const DEFAULT_SETTINGS: AppSettings = {
   mode: 'preview', llmProvider: 'azure', openRouterModel: 'openai/gpt-6-luna:batch', openRouterReasoningEffort: 'low', llmRequestContractVersion: 1,
-  timezone: validTimezone(), speechEnabled: false, backgroundMailRefreshEnabled: false, backgroundRefreshGeneration: 0, maxContextTokens: 6000, maxRequestBytes: 24000, maxOutputTokens: 1200, monthlyBudgetUsd: 5,
+  timezone: validTimezone(), speechEnabled: false, speechProvider: 'azure', backgroundMailRefreshEnabled: false, backgroundRefreshGeneration: 0, maxContextTokens: 6000, maxRequestBytes: 24000, maxOutputTokens: 1200, monthlyBudgetUsd: 5,
   reasoningEffort: 'none', maxAttempts: 2, maxCallsPerDay: 20, maxAudioSeconds: 600, audioRetention: 'keep',
 };
 
@@ -1014,6 +1022,7 @@ function normalizeLoadedState(value: unknown): NormalizedLoadedState {
     openRouterReasoningEffort: rawSettings.openRouterReasoningEffort === 'none' ? 'none' as const : 'low' as const,
     llmRequestContractVersion: 1 as const,
     speechEnabled: rawSettings.speechEnabled === true,
+    speechProvider: rawSettings.speechProvider === 'openrouter' ? 'openrouter' as const : 'azure' as const,
     backgroundMailRefreshEnabled: rawSettings.backgroundMailRefreshEnabled === true && backgroundRefreshGenerationValid, backgroundRefreshGeneration,
     timezone: validTimezone(rawSettings.timezone), maxRequestBytes };
   const retainedTranscriptionQuarantine = (value as { transcriptionQuarantine?: unknown }).transcriptionQuarantine;
@@ -1201,6 +1210,7 @@ export interface ControllerIntegrationDependencies {
   mailAlertTapBackend?: MailAlertTapBackend;
   withMailAlertNotificationWriter?: <T>(actual: (scope: PrivacyWriterScope, store: ExistingWorkspaceWriterStore) => Promise<T>) => Promise<T>;
   openRouterBatchClient?: OpenRouterBatchClient;
+  openRouterSpeechAdapter?: OpenRouterSpeechAdapter;
 }
 
 interface BackupImportSession {
@@ -1268,6 +1278,7 @@ export class AppControllerImpl implements AppController {
   private analysisCache = new Map<string, DraftAnalysis>();
   private mirrorDirty = new Set<string>();
   private readonly speechClient: AzureSpeechClient;
+  private readonly openRouterSpeechAdapter?: OpenRouterSpeechAdapter;
   private readonly openAiClient: AssistantModelClient;
   private readonly openRouterBatchClient?: OpenRouterBatchClient;
   private readonly connector?: ConnectorClient;
@@ -1327,6 +1338,9 @@ export class AppControllerImpl implements AppController {
   private transcriptionQuarantine: unknown[] = [];
   private transcriptionJobs = new Map<string, { attemptId: string; sourceRevision: number; leaseId: string; controller: AbortController; promise: Promise<Note> }>();
   private transcriptionCleanupJob?: Promise<void>;
+  private readonly speechRequestCleanupRetries = new Map<string, () => Promise<void>>();
+  private readonly speechRequestCleanupAttemptIds = new Map<string, string>();
+  private readonly speechRequestCleanupRuns = new Map<string, Promise<void>>();
   private readonly reminderBackend: NotificationBackend;
   private readonly mailAlertBackend: MailAlertNotificationBackend;
   private reminderReconcileJob?: Promise<void>;
@@ -1346,7 +1360,7 @@ export class AppControllerImpl implements AppController {
 
   constructor(
     private readonly store: StateStore = stateStore,
-    providers: { speech?: AzureSpeechClient; openAi?: AssistantModelClient } = {},
+    providers: { speech?: AzureSpeechClient; speechOpenRouter?: OpenRouterSpeechAdapter; openAi?: AssistantModelClient } = {},
     private readonly integration: ControllerIntegrationDependencies = {},
     private readonly pendingCapture?: PendingCaptureControllerPort,
   ) {
@@ -1359,6 +1373,7 @@ export class AppControllerImpl implements AppController {
         assertCredentialGeneration: (generation: number) => credentials.assertSpeechCredentialGeneration(generation),
       } : {}),
     });
+    this.openRouterSpeechAdapter = providers.speechOpenRouter ?? integration.openRouterSpeechAdapter;
     const llmCredentials = credentials ?? createProviderCredentialService(credentialStore);
     this.openAiClient = new AssistantClientRouter(providers.openAi ?? new AzureOpenAIClient(fetch, () => llmCredentials.readProviderCredential('openai')));
     this.openRouterBatchClient = integration.openRouterBatchClient;
@@ -1373,6 +1388,10 @@ export class AppControllerImpl implements AppController {
   async disposeForPrivacy(): Promise<void> {
     this.bootstrapGeneration += 1;
     this.speechClient.disposeMemory();
+    this.openRouterSpeechAdapter?.disposeMemory();
+    this.speechRequestCleanupRetries.clear();
+    this.speechRequestCleanupAttemptIds.clear();
+    this.speechRequestCleanupRuns.clear();
     for (const controller of this.syncAbortControllers.values()) controller.abort();
     for (const job of this.transcriptionJobs.values()) job.controller.abort();
     for (const timer of this.deviceEventCreateTimers.values()) clearTimeout(timer);
@@ -1873,7 +1892,13 @@ export class AppControllerImpl implements AppController {
       for (const leaseId of this.transcriptionCleanupPromises) activeLeaseIds.add(leaseId);
       for (const lease of this.snapshot.transcription.cleanupLeases.filter((item) => item.outcome === 'pending_cleanup' && !activeLeaseIds.has(item.leaseId)).slice(0, 8)) {
         try {
-          await this.speechClient.releaseUploadLease(lease.leaseId);
+          const attempt = this.snapshot.transcription.attempts.find((item) => item.id === lease.attemptId && item.leaseId === lease.leaseId);
+          if (attempt?.provider === 'openrouter') {
+            if (!this.openRouterSpeechAdapter) continue;
+            await this.openRouterSpeechAdapter.releaseUploadLease(lease.leaseId);
+          } else {
+            await this.speechClient.releaseUploadLease(lease.leaseId);
+          }
           await this.mutate((state) => {
             const current = state.transcription.cleanupLeases.find((item) => item.leaseId === lease.leaseId && item.attemptId === lease.attemptId);
             if (current?.outcome === 'pending_cleanup') current.outcome = 'released';
@@ -1901,6 +1926,38 @@ export class AppControllerImpl implements AppController {
       this.transcriptionCleanupPromises.delete(leaseId);
       this.markTranscriptionCleanupPending(leaseId);
     });
+  }
+
+  rememberSpeechRequestCleanup(leaseId: string, retryCancel: () => Promise<void>): void {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(leaseId)) return;
+    const attempt = this.snapshot.transcription.attempts.find((item) => item.leaseId === leaseId && item.provider === 'openrouter');
+    if (!attempt || !this.transcriptionJobs.has(attempt.noteId)) return;
+    this.speechRequestCleanupRetries.set(leaseId, retryCancel);
+    this.speechRequestCleanupAttemptIds.set(leaseId, attempt.id);
+    this.snapshot = deepFreeze(this.publicState(this.state));
+    this.emit();
+  }
+
+  async retryTranscriptionRequestCleanup(attemptId: string): Promise<void> {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(attemptId)) throw new Error('Speech request cleanup is unavailable.');
+    const leaseId = [...this.speechRequestCleanupAttemptIds.entries()].find(([, id]) => id === attemptId)?.[0];
+    const retry = leaseId ? this.speechRequestCleanupRetries.get(leaseId) : undefined;
+    if (!leaseId || !retry) throw new Error('Speech request cleanup is no longer available in this workspace.');
+    const active = this.speechRequestCleanupRuns.get(leaseId);
+    if (active) return active;
+    const capturedBootstrapGeneration = this.bootstrapGeneration;
+    const run = (async () => {
+      await retry();
+      if (capturedBootstrapGeneration !== this.bootstrapGeneration || this.speechRequestCleanupRetries.get(leaseId) !== retry) return;
+      this.speechRequestCleanupRetries.delete(leaseId);
+      this.speechRequestCleanupAttemptIds.delete(leaseId);
+      this.snapshot = deepFreeze(this.publicState(this.state));
+      this.emit();
+    })().finally(() => {
+      if (this.speechRequestCleanupRuns.get(leaseId) === run) this.speechRequestCleanupRuns.delete(leaseId);
+    });
+    this.speechRequestCleanupRuns.set(leaseId, run);
+    return run;
   }
 
   private addTranscriptionAttempt(state: AppState, attempt: TranscriptionAttempt): void {
@@ -1940,6 +1997,7 @@ export class AppControllerImpl implements AppController {
     const result = { ...state } as AppState & { dispatchRecordQuarantine?: DispatchRecordQuarantineEntry[]; proactiveQuarantine?: unknown; proactiveRecoveryArchives?: unknown; proactiveMailAlertQuarantine?: unknown[]; backupImportQuarantine?: unknown[]; knowledgeQuarantine?: unknown[]; reminderQuarantine?: unknown[]; deviceCalendarQuarantine?: unknown[]; transcriptionQuarantine?: unknown[]; openRouterBatchLedger?: unknown; assistantBatchJobs?: unknown; assistantBatchRecoveryStatus?: unknown };
     delete result.assistantBatchJobs;
     delete result.assistantBatchRecoveryStatus;
+    delete result.transcriptionRequestCleanupPending;
     if (batchLedger) result.openRouterBatchLedger = clone(batchLedger);
     else if (this.assistantBatchLedgerHasRaw) result.openRouterBatchLedger = clone(this.assistantBatchLedgerRaw);
     else result.openRouterBatchLedger = clone(this.assistantBatchLedger);
@@ -1997,6 +2055,9 @@ export class AppControllerImpl implements AppController {
     delete result.reminderQuarantine;
     delete result.deviceCalendarQuarantine;
     delete result.transcriptionQuarantine;
+    const cleanupAttemptIds = [...new Set(this.speechRequestCleanupAttemptIds.values())].sort();
+    if (cleanupAttemptIds.length) result.transcriptionRequestCleanupPending = cleanupAttemptIds.map((attemptId) => ({ attemptId }));
+    else delete result.transcriptionRequestCleanupPending;
     if (this.mailAlertRefreshRequired) result.mailAlertRefreshRequired = {
       required: true,
       message: 'Saved data changed. Refresh local data before continuing.',
@@ -4565,16 +4626,23 @@ export class AppControllerImpl implements AppController {
     if (!note.audioUri) throw new Error('This note has no audio to transcribe.');
     if (note.audioAttachment?.durationStatus === 'unknown') throw new Error('This replacement recording has no verified duration. It cannot be sent for transcription.');
     if (!Number.isFinite(note.durationSeconds) || note.durationSeconds <= 0 || note.durationSeconds > initial.settings.maxAudioSeconds) throw new Error('The recording duration is outside the configured transcription limit.');
-    if (!initial.settings.speechEnabled) throw new Error('Enable Azure Speech transcription in Settings before transcribing.');
-    const speechEndpoint = initial.settings.speechEndpoint;
-    if (!speechEndpoint) throw new Error('Add an Azure Speech endpoint before transcribing.');
+    if (!initial.settings.speechEnabled) throw new Error('Enable cloud speech transcription in Settings before transcribing.');
+    const speechProvider = initial.settings.speechProvider === 'openrouter' ? 'openrouter' : 'azure';
+    if (speechProvider === 'azure' && !initial.settings.speechEndpoint) throw new Error('Add an Azure Speech endpoint before transcribing.');
+    if (speechProvider === 'openrouter' && !this.openRouterSpeechAdapter) throw new Error('OpenRouter speech transcription is unavailable in this workspace.');
     const sourceRevision = note.revision;
     const source = transcriptionSourceProjection(note, initial.settings);
     const settings = clone(initial.settings);
     const settingsProjection = speechSettingsProjection(settings);
     job.sourceRevision = sourceRevision;
-    const attempt: TranscriptionAttempt = {
-      id: attemptId, leaseId: job.leaseId, noteId: id, sourceRevision, source, endpoint: validateAzureEndpoint(speechEndpoint, 'speech'),
+    const attempt: TranscriptionAttempt = speechProvider === 'openrouter' ? {
+      id: attemptId, leaseId: job.leaseId, noteId: id, sourceRevision, source,
+      provider: 'openrouter', profileVersion: 1, model: 'openai/gpt-4o-mini-transcribe',
+      endpoint: 'https://openrouter.ai/api/v1/audio/transcriptions', locale: 'auto',
+      createdAt: now(), dispatchStarted: false, outcome: 'preparing',
+    } : {
+      id: attemptId, leaseId: job.leaseId, noteId: id, sourceRevision, source,
+      provider: 'azure', endpoint: validateAzureEndpoint(initial.settings.speechEndpoint!, 'speech'),
       locale: 'en-US', createdAt: now(), dispatchStarted: false, outcome: 'preparing',
     };
     await this.mutate((state) => {
@@ -4613,8 +4681,7 @@ export class AppControllerImpl implements AppController {
       if (!preparedSnapshot || stableJson(snapshot) !== stableJson(preparedSnapshot)) throw new Error('Prepared audio changed before dispatch.');
       await this.mutate((state) => {
         const savedAttempt = ensureCurrent(state, 'preparing');
-        const claim = this.reserveProviderAttemptDraft(state, 'speech', settings);
-        savedAttempt.reservation = claim;
+        if (savedAttempt.provider !== 'openrouter') savedAttempt.reservation = this.reserveProviderAttemptDraft(state, 'speech', settings);
         savedAttempt.dispatchStarted = true;
         savedAttempt.outcome = 'pending';
       });
@@ -4626,35 +4693,64 @@ export class AppControllerImpl implements AppController {
       const currentAttempt = current.transcription.attempts.find((item) => item.id === attemptId);
       if (controller.signal.aborted || this.mailAlertRefreshRequired || this.transcriptionQuarantine.length || !current.settings.speechEnabled || speechSettingsProjection(current.settings) !== settingsProjection ||
           !currentNote || currentNote.revision !== sourceRevision || stableJson(transcriptionSourceProjection(currentNote, current.settings)) !== stableJson(source) ||
-          currentAttempt?.outcome !== 'pending' || !currentAttempt.reservation || stableJson(currentAttempt.prepared) !== stableJson(preparedSnapshot) || stableJson(snapshot) !== stableJson(preparedSnapshot)) {
+          currentAttempt?.outcome !== 'pending' || currentAttempt.provider !== speechProvider || (speechProvider === 'azure' && !currentAttempt.reservation) || stableJson(currentAttempt.prepared) !== stableJson(preparedSnapshot) || stableJson(snapshot) !== stableJson(preparedSnapshot)) {
         throw new Error('The note, audio, settings, or transcription claim changed before upload. No audio was sent.');
       }
     };
 
     let providerCleanup: Promise<void> | undefined;
-    let providerResult: SpeechTranscriptionResult | undefined;
+    let providerResult: AnySpeechTranscriptionResult | undefined;
     try {
-      const result = await this.speechClient.transcribe(note, settings, controller.signal, onAttempt, beforeDispatch, onPrepared, leaseId);
+      const result = speechProvider === 'openrouter'
+        ? await this.openRouterSpeechAdapter!.transcribe(note, settings, controller.signal, onAttempt, beforeDispatch, onPrepared, leaseId)
+        : await this.speechClient.transcribe(note, settings, controller.signal, onAttempt, beforeDispatch, onPrepared, leaseId);
       providerResult = result;
       providerCleanup = result.cleanupPromise;
-      if (!Number.isSafeInteger(result.durationMilliseconds) || result.durationMilliseconds <= 0 || result.durationMilliseconds > 600_000 ||
-          !Number.isSafeInteger(result.billedEstimateSeconds) || result.billedEstimateSeconds !== Math.ceil(result.durationMilliseconds / 1000)) {
+      if (isOpenRouterSpeechResult(result) && result.outcome !== 'completed') {
+        await this.mutate((state) => {
+          const savedAttempt = state.transcription.attempts.find((item) => item.id === attemptId);
+          if (!savedAttempt || savedAttempt.provider !== 'openrouter' || !savedAttempt.dispatchStarted) throw new Error('The dispatched OpenRouter speech receipt was not found.');
+          savedAttempt.actualUsage = result.usage;
+          savedAttempt.unknownCharge = result.unknownCharge;
+          savedAttempt.outcome = result.outcome === 'no_speech' ? 'no_speech' : 'failed';
+          savedAttempt.code = result.outcome === 'no_speech' ? 'no_speech' : 'invalid_response';
+          savedAttempt.terminalAt = now();
+          const lease = state.transcription.cleanupLeases.find((item) => item.leaseId === leaseId);
+          if (lease) lease.outcome = 'pending_cleanup';
+        });
+        const noSpeech = result.outcome === 'no_speech';
+        throw new SpeechTranscriptionError(
+          noSpeech ? 'OpenRouter detected no speech. The audio note was left unchanged.' : 'OpenRouter returned an invalid transcription. Its actual usage, if reported, was retained.',
+          noSpeech ? 'no_speech' : 'invalid_response', true, undefined, undefined, result.cleanupPromise, result.usage, result.unknownCharge,
+        );
+      }
+      if (!isOpenRouterSpeechResult(result) && (!Number.isSafeInteger(result.durationMilliseconds) || result.durationMilliseconds <= 0 || result.durationMilliseconds > 600_000 ||
+          !Number.isSafeInteger(result.billedEstimateSeconds) || result.billedEstimateSeconds !== Math.ceil(result.durationMilliseconds / 1000))) {
         throw new SpeechTranscriptionError('Speech duration could not be verified; provider charge status is unknown.', 'provider_unknown', true);
       }
       const transcriptHash = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, result.transcript);
       const savedNote = await this.mutate((state) => {
         const savedAttempt = state.transcription.attempts.find((item) => item.id === attemptId);
-        if (!savedAttempt?.dispatchStarted || !savedAttempt.reservation) throw new Error('The dispatched transcription receipt was not found.');
-        this.settleSpeechUsageDraft(state, result.billedEstimateSeconds, settings, savedAttempt.reservation);
+        if (!savedAttempt?.dispatchStarted || (savedAttempt.provider === 'azure' && !savedAttempt.reservation)) throw new Error('The dispatched transcription receipt was not found.');
+        if (isOpenRouterSpeechResult(result)) {
+          if (savedAttempt.provider !== 'openrouter') throw new Error('The speech provider changed after upload.');
+          savedAttempt.actualUsage = result.usage;
+          savedAttempt.unknownCharge = result.unknownCharge;
+        } else {
+          if (savedAttempt.provider === 'openrouter') throw new Error('The speech provider changed after upload.');
+          this.settleSpeechUsageDraft(state, result.billedEstimateSeconds, settings, savedAttempt.reservation!);
+        }
         const current = state.notes.find((item) => item.id === id);
         const matches = Boolean(!controller.signal.aborted && current && current.revision === sourceRevision && stableJson(transcriptionSourceProjection(current, state.settings)) === stableJson(source));
         savedAttempt.outcome = controller.signal.aborted ? 'cancelled' : matches ? 'completed' : 'discarded';
         if (controller.signal.aborted) savedAttempt.code = 'cancelled';
         else if (!matches) savedAttempt.code = 'discarded';
         savedAttempt.terminalAt = now();
-        savedAttempt.durationMilliseconds = result.durationMilliseconds;
-        savedAttempt.billedEstimateSeconds = result.billedEstimateSeconds;
-        savedAttempt.rateEstimated = settings.speechUsdPerMinute === undefined;
+        if (!isOpenRouterSpeechResult(result)) {
+          savedAttempt.durationMilliseconds = result.durationMilliseconds;
+          savedAttempt.billedEstimateSeconds = result.billedEstimateSeconds;
+          savedAttempt.rateEstimated = settings.speechUsdPerMinute === undefined;
+        }
         savedAttempt.transcriptSha256 = transcriptHash.toLowerCase();
         const lease = state.transcription.cleanupLeases.find((item) => item.leaseId === leaseId);
         if (lease) lease.outcome = 'pending_cleanup';
@@ -4669,7 +4765,7 @@ export class AppControllerImpl implements AppController {
           if (['executed', 'accepted', 'simulated', 'dismissed', 'dispatching', 'unknown'].includes(proposal.status)) continue;
           this.invalidate(proposal); proposal.status = 'draft';
         }
-        addActivity(state, 'local_action', 'Audio transcribed by Azure Speech and saved to the note.', { noteId: id });
+        addActivity(state, 'local_action', isOpenRouterSpeechResult(result) ? 'Audio transcribed with OpenRouter and saved to the note.' : 'Audio transcribed by Azure Speech and saved to the note.', { noteId: id });
         return { note: current, discarded: false };
       });
       if (savedNote.discarded || !savedNote.note) throw new Error('The note changed while transcription was in progress. The valid provider result was recorded but not applied.');
@@ -4706,12 +4802,24 @@ export class AppControllerImpl implements AppController {
           const savedAttempt = state.transcription.attempts.find((item) => item.id === attemptId);
           if (!savedAttempt || ['completed', 'no_speech', 'failed', 'unknown', 'discarded', 'cancelled'].includes(savedAttempt.outcome)) return;
           const dispatched = typed ? typed.dispatched : savedAttempt.dispatchStarted;
-          if (!dispatched && savedAttempt.reservation) {
-            this.finishTranscriptionReservationDraft(state, savedAttempt.reservation);
-            delete savedAttempt.reservation;
-            savedAttempt.dispatchStarted = false;
+          if (!dispatched) {
+            if (savedAttempt.reservation) {
+              this.finishTranscriptionReservationDraft(state, savedAttempt.reservation);
+              delete savedAttempt.reservation;
+              savedAttempt.dispatchStarted = false;
+            } else if (savedAttempt.provider === 'openrouter') {
+              // The durable attempt callback can run before the provider writer
+              // is granted. A final credential/source fence may still reject
+              // there, so that callback is not proof that HTTP started.
+              savedAttempt.dispatchStarted = false;
+            }
           }
-          const duration = typed?.durationMilliseconds ?? providerResult?.durationMilliseconds;
+          const duration = typed?.durationMilliseconds ?? (providerResult && isOpenRouterSpeechResult(providerResult) ? undefined : providerResult?.durationMilliseconds);
+          if (savedAttempt.provider === 'openrouter' && dispatched) {
+            const openRouterResult = providerResult && isOpenRouterSpeechResult(providerResult) ? providerResult : undefined;
+            savedAttempt.actualUsage = typed?.providerUsage ?? openRouterResult?.usage;
+            savedAttempt.unknownCharge = typed?.unknownCharge ?? openRouterResult?.unknownCharge ?? true;
+          }
           if (dispatched && Number.isSafeInteger(duration) && duration! > 0 && duration! <= 600_000 && savedAttempt.reservation) {
             const billed = Math.ceil(duration! / 1000);
             this.settleSpeechUsageDraft(state, billed, settings, savedAttempt.reservation);
@@ -4721,7 +4829,9 @@ export class AppControllerImpl implements AppController {
           }
           const code: SpeechAttemptCode = typed ? speechErrorCode(error) : dispatched ? 'provider_unknown' : speechErrorCode(error);
           savedAttempt.code = code; savedAttempt.terminalAt = now();
-          savedAttempt.outcome = dispatched ? code === 'no_speech' ? 'no_speech' : code === 'provider_rejected' ? 'failed' : code === 'cancelled' ? 'cancelled' : 'unknown' : code === 'cancelled' ? 'cancelled' : 'failed';
+          savedAttempt.outcome = dispatched
+            ? code === 'no_speech' ? 'no_speech' : code === 'provider_rejected' ? 'failed' : code === 'cancelled' && savedAttempt.provider !== 'openrouter' ? 'cancelled' : 'unknown'
+            : code === 'cancelled' ? 'cancelled' : 'failed';
           const lease = state.transcription.cleanupLeases.find((item) => item.leaseId === leaseId);
           if (lease) lease.outcome = 'pending_cleanup';
         });
@@ -6932,6 +7042,7 @@ export class AppControllerImpl implements AppController {
     if ('backgroundRefreshGeneration' in (patch as object)) throw new Error('Background refresh generation is managed by this app.');
     const sanitized: SettingsPatch = { ...patch };
     if ('speechEnabled' in sanitized && typeof sanitized.speechEnabled !== 'boolean') throw new Error('Choose whether cloud transcription is enabled.');
+    if ('speechProvider' in sanitized && !['azure', 'openrouter'].includes(String(sanitized.speechProvider))) throw new Error('Choose a supported speech transcription provider.');
     if ('backgroundMailRefreshEnabled' in sanitized && typeof sanitized.backgroundMailRefreshEnabled !== 'boolean') throw new Error('Choose whether background mailbox refresh is enabled.');
     if ('speechEndpoint' in sanitized) sanitized.speechEndpoint = sanitized.speechEndpoint ? validateAzureEndpoint(sanitized.speechEndpoint, 'speech') : undefined;
     if ('openAiEndpoint' in sanitized) sanitized.openAiEndpoint = sanitized.openAiEndpoint ? validateAzureEndpoint(sanitized.openAiEndpoint, 'openai') : undefined;
@@ -8587,7 +8698,7 @@ export interface ProductionWorkspaceOptions {
   audioBoundary?: PrivacyAudioBoundary;
   credentials?: ProviderCredentialService;
   store?: StateStore;
-  providers?: { speech?: AzureSpeechClient; openAi?: AssistantModelClient };
+  providers?: { speech?: AzureSpeechClient; speechOpenRouter?: OpenRouterSpeechAdapter; openAi?: AssistantModelClient };
   integration?: ControllerIntegrationDependencies;
   pendingCaptureNativeIO?: PendingCaptureNativeIO;
 }
@@ -8652,13 +8763,26 @@ export async function createProductionWorkspace(options: ProductionWorkspaceOpti
   const mailAlertTaps = options.integration?.mailAlertTapBackend ?? createMailAlertTapBackend({
     withNotificationOwnership: (actual) => resources.withMailAlertNotificationWriter(() => actual()),
   });
+  const speechAudioService = options.integration?.speechAudioService ?? createPrivacyBoundSpeechAudioService(audioBoundary);
+  const openRouterSpeechAdapter = options.integration?.openRouterSpeechAdapter ?? (() => {
+    const client = new OpenRouterSpeechClient({
+      withRequestOwnership: (actual) => privacy.withWriter(session.epoch, { kind: 'speech_upload', namespace: 'speech_staging' }, actual),
+      withResponseLifetime: batchTransport.openRouterTransportWithResponseLifetime,
+      readCredentialSnapshot: () => providerCredentials.readProviderCredentialSnapshot('openrouter'),
+      assertCredentialGeneration: (generation) => providerCredentials.assertProviderCredentialGeneration('openrouter', generation),
+      assertBeforeStart: () => undefined,
+      onCancelPending: (leaseId) => implementation?.rememberSpeechRequestCleanup(leaseId, () => client.retryPendingCleanup(leaseId)),
+    });
+    return new OpenRouterSpeechAdapter({ audio: speechAudioService, client });
+  })();
   const integration: ControllerIntegrationDependencies = {
     ...defaultIntegration,
     ...options.integration,
     credentials: providerCredentials,
     openRouterBatchClient,
     audioBoundary,
-    speechAudioService: options.integration?.speechAudioService ?? createPrivacyBoundSpeechAudioService(audioBoundary),
+    speechAudioService,
+    openRouterSpeechAdapter,
     removeAudio: async (uri) => audioBoundary.withAudioWrite(() => options.integration?.removeAudio
       ? options.integration.removeAudio(uri)
       : removeAudio(uri)),
@@ -8707,6 +8831,7 @@ export async function createProductionWorkspace(options: ProductionWorkspaceOpti
       assertCredentialGeneration: (generation) => providerCredentials.assertSpeechCredentialGeneration(generation),
       withRequestOwnership: (actualRequest) => privacy.withWriter(session.epoch, { kind: 'speech_upload', namespace: 'speech_staging' }, actualRequest),
     }),
+    speechOpenRouter: options.providers?.speechOpenRouter ?? openRouterSpeechAdapter,
     openAi: options.providers?.openAi ?? new AzureOpenAIClient(fetch, () => providerCredentials.readProviderCredential('openai'), resources.withProviderOwnership),
   };
   implementation = new AppControllerImpl(boundStore, providers, integration, pendingCaptureController);

@@ -56,6 +56,19 @@ describe('OpenRouterSpeechClient', () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
+  it('runs the per-call source fence after ownership is acquired and before HTTP starts', async () => {
+    const events: string[] = [];
+    const fetcher = vi.fn(async () => new Response('{}', { status: 200 }));
+    const subject = new OpenRouterSpeechClient(dependencies({
+      withRequestOwnership: async (actual) => { events.push('ownership'); return actual(); },
+      fetcher,
+    }));
+    await expect(subject.transcribe(call({ assertBeforeStart: () => { events.push('source-fence'); throw new Error('changed'); } })))
+      .rejects.toMatchObject({ code: 'pre_dispatch', dispatched: false });
+    expect(events).toEqual(['ownership', 'source-fence']);
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
   it('does not start HTTP when the durable pre-dispatch callback fails', async () => {
     const fetcher = vi.fn(async () => new Response('{}', { status: 200 }));
     const client = new OpenRouterSpeechClient(dependencies({ fetcher }));

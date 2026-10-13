@@ -7,6 +7,8 @@ export const SPEECH_MAX_AUDIO_SECONDS = 600;
 export const SPEECH_MAX_AUDIO_BYTES = 40 * 1024 * 1024;
 export const SPEECH_MAX_RESPONSE_BYTES = 1024 * 1024;
 export const SPEECH_MAX_TRANSCRIPT_BYTES = 128 * 1024;
+export const OPENROUTER_SPEECH_ENDPOINT = 'https://openrouter.ai/api/v1/audio/transcriptions' as const;
+export const OPENROUTER_SPEECH_MODEL = 'openai/gpt-4o-mini-transcribe' as const;
 
 export type SpeechAudioSnapshot = Readonly<{
   leaseId: string;
@@ -28,6 +30,29 @@ export type SpeechTranscriptionResult = Readonly<{
   cleanupPromise?: Promise<void>;
 }>;
 
+export type OpenRouterSpeechActualUsage = Readonly<{
+  seconds?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  costUsd?: number;
+}>;
+
+type OpenRouterSpeechResultBase = Readonly<{
+  provider: 'openrouter';
+  profileVersion: 1;
+  usage?: OpenRouterSpeechActualUsage;
+  attempts: 1;
+  cleanupPromise?: Promise<void>;
+}>;
+
+export type OpenRouterSpeechTranscriptionResult = OpenRouterSpeechResultBase & (
+  | Readonly<{ outcome: 'completed'; transcript: string; unknownCharge: boolean }>
+  | Readonly<{ outcome: 'no_speech' | 'invalid_response'; transcript?: never; unknownCharge: boolean }>
+);
+
+export type AnySpeechTranscriptionResult = SpeechTranscriptionResult | OpenRouterSpeechTranscriptionResult;
+
 export type SpeechTranscriptionErrorCode =
   | 'invalid_audio' | 'unsupported_format' | 'audio_changed' | 'credential_missing'
   | 'stale_credential' | 'cancelled' | 'timeout' | 'provider_rejected'
@@ -42,6 +67,8 @@ export class SpeechTranscriptionError extends Error {
     readonly durationMilliseconds?: number,
     options?: ErrorOptions,
     readonly cleanupPromise?: Promise<void>,
+    readonly providerUsage?: OpenRouterSpeechActualUsage,
+    readonly unknownCharge?: boolean,
   ) { super(message, options); }
 }
 
@@ -58,30 +85,54 @@ export interface TranscriptionSourceProjection {
   captureTimeZone: string;
   speechEnabled: boolean;
   maxAudioSeconds: number;
+  provider?: 'azure' | 'openrouter';
   audioAttachment?: AudioRecoveryMetadata;
 }
 
-export interface TranscriptionAttempt {
+interface TranscriptionAttemptBase {
   id: string;
   leaseId: string;
   noteId: string;
   sourceRevision: number;
   source: TranscriptionSourceProjection;
   endpoint: string;
-  locale: 'en-US';
   createdAt: string;
   prepared?: SpeechAudioSnapshot;
-  reservation?: { month: string; day: string; reserve: number };
   dispatchStarted: boolean;
   outcome: TranscriptionOutcome;
   terminalAt?: string;
   code?: SpeechAttemptCode;
-  durationMilliseconds?: number;
-  billedEstimateSeconds?: number;
-  rateEstimated?: boolean;
   transcriptSha256?: string;
   lateObservations?: { at: string; kind: 'provider_duration' | 'cleanup_complete'; durationMilliseconds?: number }[];
 }
+
+export type AzureTranscriptionAttempt = TranscriptionAttemptBase & {
+  provider?: 'azure';
+  endpoint: string;
+  locale: 'en-US';
+  reservation?: { month: string; day: string; reserve: number };
+  durationMilliseconds?: number;
+  billedEstimateSeconds?: number;
+  rateEstimated?: boolean;
+  actualUsage?: never;
+  unknownCharge?: never;
+};
+
+export type OpenRouterTranscriptionAttempt = TranscriptionAttemptBase & {
+  provider: 'openrouter';
+  profileVersion: 1;
+  model: typeof OPENROUTER_SPEECH_MODEL;
+  endpoint: typeof OPENROUTER_SPEECH_ENDPOINT;
+  locale: 'auto';
+  reservation?: never;
+  durationMilliseconds?: never;
+  billedEstimateSeconds?: never;
+  rateEstimated?: never;
+  actualUsage?: OpenRouterSpeechActualUsage;
+  unknownCharge?: boolean;
+};
+
+export type TranscriptionAttempt = AzureTranscriptionAttempt | OpenRouterTranscriptionAttempt;
 
 export interface TranscriptionCleanupLease {
   leaseId: string;

@@ -1,6 +1,6 @@
 import {
   TRANSCRIPTION_MAX_ATTEMPTS, TRANSCRIPTION_MAX_CLEANUP_LEASES, TRANSCRIPTION_SCHEMA_VERSION,
-  validateSpeechAudioSnapshot, type TranscriptionAttempt, type TranscriptionCleanupLease,
+  OPENROUTER_SPEECH_ENDPOINT, OPENROUTER_SPEECH_MODEL, validateSpeechAudioSnapshot, type TranscriptionAttempt, type TranscriptionCleanupLease,
   type TranscriptionState,
 } from './types';
 export * from './types';
@@ -26,14 +26,14 @@ const safeInteger = (value: unknown, min: number, max: number, label: string): n
 function validateAttempt(value: unknown): TranscriptionAttempt {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Transcription attempt is invalid.');
   const row = value as Record<string, unknown>;
-  const allowedAttemptKeys = new Set(['id', 'leaseId', 'noteId', 'sourceRevision', 'source', 'endpoint', 'locale', 'createdAt', 'prepared', 'reservation', 'dispatchStarted', 'outcome', 'terminalAt', 'code', 'durationMilliseconds', 'billedEstimateSeconds', 'rateEstimated', 'transcriptSha256', 'lateObservations']);
+  const allowedAttemptKeys = new Set(['id', 'leaseId', 'noteId', 'sourceRevision', 'source', 'endpoint', 'provider', 'profileVersion', 'model', 'locale', 'createdAt', 'prepared', 'reservation', 'dispatchStarted', 'outcome', 'terminalAt', 'code', 'durationMilliseconds', 'billedEstimateSeconds', 'rateEstimated', 'transcriptSha256', 'actualUsage', 'unknownCharge', 'lateObservations']);
   if (Object.keys(row).some((key) => !allowedAttemptKeys.has(key))) throw new Error('Transcription attempt contains unsupported fields.');
   if (typeof row.id !== 'string' || !UUID.test(row.id) || typeof row.noteId !== 'string' || !UUID.test(row.noteId)) throw new Error('Transcription attempt identity is invalid.');
   if (typeof row.leaseId !== 'string' || !UUID.test(row.leaseId)) throw new Error('Transcription upload lease is invalid.');
   const sourceRevision = safeInteger(row.sourceRevision, 1, Number.MAX_SAFE_INTEGER, 'Transcription source revision');
   if (!row.source || typeof row.source !== 'object' || Array.isArray(row.source)) throw new Error('Transcription source snapshot is invalid.');
   const sourceRow = row.source as Record<string, unknown>;
-  const allowedSourceKeys = new Set(['audioUri', 'durationSeconds', 'capturedAt', 'captureTimeZone', 'speechEnabled', 'maxAudioSeconds', 'audioAttachment']);
+  const allowedSourceKeys = new Set(['audioUri', 'durationSeconds', 'capturedAt', 'captureTimeZone', 'speechEnabled', 'maxAudioSeconds', 'provider', 'audioAttachment']);
   if (Object.keys(sourceRow).some((key) => !allowedSourceKeys.has(key))) throw new Error('Transcription source contains unsupported fields.');
   const audioUri = cleanText(sourceRow.audioUri, 2048, 'Audio URI');
   if (!(audioUri.startsWith('file://') || audioUri.startsWith('indexeddb-audio:')) || audioUri.includes('..')) throw new Error('Transcription audio source URI is invalid.');
@@ -43,7 +43,9 @@ function validateAttempt(value: unknown): TranscriptionAttempt {
   if (typeof sourceRow.captureTimeZone !== 'string' || sourceRow.captureTimeZone.length > 128) throw new Error('Transcription capture time zone is invalid.');
   try { new Intl.DateTimeFormat('en-US', { timeZone: sourceRow.captureTimeZone }); } catch { throw new Error('Transcription capture time zone is invalid.'); }
   if (sourceRow.speechEnabled !== true || typeof sourceRow.maxAudioSeconds !== 'number' || !Number.isFinite(sourceRow.maxAudioSeconds) || sourceRow.maxAudioSeconds <= 0 || sourceRow.maxAudioSeconds > 600 || durationSeconds > sourceRow.maxAudioSeconds) throw new Error('Transcription Speech settings snapshot is invalid.');
-  let source: TranscriptionAttempt['source'] = { audioUri, durationSeconds, capturedAt, captureTimeZone: sourceRow.captureTimeZone, speechEnabled: sourceRow.speechEnabled, maxAudioSeconds: sourceRow.maxAudioSeconds };
+  const sourceProvider = sourceRow.provider === undefined ? 'azure' : sourceRow.provider;
+  if (sourceProvider !== 'azure' && sourceProvider !== 'openrouter') throw new Error('Speech provider snapshot is invalid.');
+  let source: TranscriptionAttempt['source'] = { audioUri, durationSeconds, capturedAt, captureTimeZone: sourceRow.captureTimeZone, speechEnabled: sourceRow.speechEnabled, maxAudioSeconds: sourceRow.maxAudioSeconds, ...(sourceRow.provider !== undefined ? { provider: sourceProvider } : {}) };
   if (sourceRow.audioAttachment !== undefined) {
     const a = sourceRow.audioAttachment as Record<string, unknown>;
     const allowedAttachmentKeys = new Set(['fileName', 'format', 'mimeType', 'byteLength', 'sha256', 'durationStatus', 'durationSeconds']);
@@ -59,11 +61,16 @@ function validateAttempt(value: unknown): TranscriptionAttempt {
     source = { ...source, audioAttachment: { fileName: cleanText(a.fileName, 512, 'Audio file name'), format, mimeType: a.mimeType, byteLength: a.byteLength as number, sha256: a.sha256.toLowerCase(), durationStatus: a.durationStatus, ...(attachmentDuration ? { durationSeconds: attachmentDuration } : {}) } };
   }
   if (new TextEncoder().encode(JSON.stringify(source)).byteLength > 16 * 1024) throw new Error('Transcription source snapshot exceeds its storage limit.');
+  const provider = row.provider === undefined ? 'azure' : row.provider;
+  if (provider !== 'azure' && provider !== 'openrouter') throw new Error('Speech provider is invalid.');
   const endpoint = cleanText(row.endpoint, 512, 'Speech endpoint');
-  let parsedEndpoint: URL;
-  try { parsedEndpoint = new URL(endpoint); } catch { throw new Error('Speech endpoint is invalid.'); }
-  if (parsedEndpoint.protocol !== 'https:' || parsedEndpoint.origin !== endpoint || !/\.(cognitiveservices\.azure\.com|api\.cognitive\.microsoft\.com)$/i.test(parsedEndpoint.hostname)) throw new Error('Speech endpoint is invalid.');
-  if (row.locale !== 'en-US') throw new Error('Speech locale is invalid.');
+  if (provider === 'azure') {
+    let parsedEndpoint: URL;
+    try { parsedEndpoint = new URL(endpoint); } catch { throw new Error('Speech endpoint is invalid.'); }
+    if (parsedEndpoint.protocol !== 'https:' || parsedEndpoint.origin !== endpoint || !/\.(cognitiveservices\.azure\.com|api\.cognitive\.microsoft\.com)$/i.test(parsedEndpoint.hostname)) throw new Error('Speech endpoint is invalid.');
+    if (row.locale !== 'en-US' || row.profileVersion !== undefined || row.model !== undefined || row.actualUsage !== undefined || row.unknownCharge !== undefined) throw new Error('Azure speech profile is invalid.');
+  } else if (endpoint !== OPENROUTER_SPEECH_ENDPOINT || row.locale !== 'auto' || row.profileVersion !== 1 || row.model !== OPENROUTER_SPEECH_MODEL) throw new Error('OpenRouter speech profile is invalid.');
+  if (sourceProvider !== provider) throw new Error('Speech provider snapshot does not match the attempt.');
   const createdAt = canonicalTime(row.createdAt, 'Transcription creation time');
   const outcome = row.outcome;
   if (typeof outcome !== 'string' || !OUTCOMES.has(outcome)) throw new Error('Transcription outcome is invalid.');
@@ -88,21 +95,39 @@ function validateAttempt(value: unknown): TranscriptionAttempt {
   const billedEstimateSeconds = row.billedEstimateSeconds === undefined ? undefined : safeInteger(row.billedEstimateSeconds, 1, 600, 'Transcription billed duration');
   const transcriptSha256 = row.transcriptSha256 === undefined ? undefined : typeof row.transcriptSha256 === 'string' && HASH.test(row.transcriptSha256) ? row.transcriptSha256.toLowerCase() : (() => { throw new Error('Transcript fingerprint is invalid.'); })();
   const rateEstimated = row.rateEstimated === undefined ? undefined : typeof row.rateEstimated === 'boolean' ? row.rateEstimated : (() => { throw new Error('Speech estimate state is invalid.'); })();
-  if (outcome === 'preparing' && (dispatchStarted || reservation || terminal || code || durationMilliseconds || billedEstimateSeconds || rateEstimated !== undefined || transcriptSha256)) throw new Error('Preparing attempts cannot be dispatched, reserved, or terminal.');
-  if (outcome === 'pending' && (!dispatchStarted || !reservation || !prepared || terminal || code || durationMilliseconds || billedEstimateSeconds || rateEstimated !== undefined || transcriptSha256)) throw new Error('Pending attempts require prepared audio, a dispatch claim, and reservation.');
+  let actualUsage: NonNullable<Extract<TranscriptionAttempt, { provider: 'openrouter' }>['actualUsage']> | undefined;
+  if (row.actualUsage !== undefined) {
+    const usage = row.actualUsage as Record<string, unknown>;
+    const usageKeys = new Set(['seconds', 'inputTokens', 'outputTokens', 'totalTokens', 'costUsd']);
+    if (!usage || typeof usage !== 'object' || Array.isArray(usage) || Object.keys(usage).some((key) => !usageKeys.has(key)) || Object.keys(usage).length === 0) throw new Error('OpenRouter speech usage is invalid.');
+    const checked: Record<string, number> = {};
+    for (const key of usageKeys) {
+      const value = usage[key];
+      if (value === undefined) continue;
+      if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || (key !== 'seconds' && key !== 'costUsd' && !Number.isSafeInteger(value))) throw new Error('OpenRouter speech usage is invalid.');
+      checked[key] = value;
+    }
+    actualUsage = Object.freeze(checked) as NonNullable<Extract<TranscriptionAttempt, { provider: 'openrouter' }>['actualUsage']>;
+  }
+  const unknownCharge = row.unknownCharge === undefined ? undefined : typeof row.unknownCharge === 'boolean' ? row.unknownCharge : (() => { throw new Error('OpenRouter charge state is invalid.'); })();
+  if (provider === 'openrouter' && (reservation !== undefined || durationMilliseconds !== undefined || billedEstimateSeconds !== undefined || rateEstimated !== undefined)) throw new Error('OpenRouter attempts cannot contain Azure reservations or estimates.');
+  if (outcome === 'preparing' && (dispatchStarted || reservation || terminal || code || durationMilliseconds || billedEstimateSeconds || rateEstimated !== undefined || transcriptSha256 || actualUsage || unknownCharge !== undefined)) throw new Error('Preparing attempts cannot be dispatched, reserved, or terminal.');
+  if (outcome === 'pending' && (!dispatchStarted || (provider === 'azure' && !reservation) || !prepared || terminal || code || durationMilliseconds || billedEstimateSeconds || rateEstimated !== undefined || transcriptSha256 || actualUsage || unknownCharge !== undefined)) throw new Error('Pending attempts require prepared audio and a provider-specific dispatch claim.');
   if (['completed', 'no_speech', 'failed', 'unknown', 'discarded', 'cancelled'].includes(outcome) && !terminal) throw new Error('Terminal attempts require an outcome time.');
-  if (dispatchStarted && (!reservation || !prepared)) throw new Error('Dispatched attempts require prepared audio and a reservation.');
+  if (dispatchStarted && (!prepared || (provider === 'azure' && !reservation) || (provider === 'openrouter' && reservation !== undefined))) throw new Error('Dispatched attempts require prepared audio and a provider-specific claim.');
   if (terminal && Date.parse(terminal) < Date.parse(createdAt)) throw new Error('Transcription terminal time predates its creation.');
-  if (outcome === 'completed' && (!durationMilliseconds || !transcriptSha256 || !dispatchStarted || !prepared || code || rateEstimated === undefined)) throw new Error('Completed attempts require verified provider output.');
-  if (outcome === 'discarded' && (!durationMilliseconds || !transcriptSha256 || !dispatchStarted || !prepared || code !== 'discarded' || rateEstimated === undefined)) throw new Error('Discarded attempts require verified provider output.');
+  if (outcome === 'completed' && (!transcriptSha256 || !dispatchStarted || !prepared || code || (provider === 'azure' && (!durationMilliseconds || rateEstimated === undefined)) || (provider === 'openrouter' && durationMilliseconds !== undefined))) throw new Error('Completed attempts require verified provider output.');
+  if (outcome === 'discarded' && (!transcriptSha256 || !dispatchStarted || !prepared || code !== 'discarded' ||
+      (provider === 'azure' && (!durationMilliseconds || rateEstimated === undefined)) ||
+      (provider === 'openrouter' && (durationMilliseconds !== undefined || unknownCharge === undefined)))) throw new Error('Discarded attempts require verified provider output.');
   if (durationMilliseconds && billedEstimateSeconds !== Math.ceil(durationMilliseconds / 1000)) throw new Error('Transcription billed duration does not match the provider duration.');
-  if (outcome === 'no_speech' && (!durationMilliseconds || !dispatchStarted || !prepared || code !== 'no_speech' || transcriptSha256 || rateEstimated === undefined)) throw new Error('No-speech attempts require a valid provider duration.');
-  if (outcome === 'unknown' && (!dispatchStarted || !prepared || !['timeout', 'provider_unknown', 'invalid_response'].includes(String(code)))) throw new Error('Unknown attempts require an uncertain dispatched upload.');
+  if (outcome === 'no_speech' && (!dispatchStarted || !prepared || code !== 'no_speech' || transcriptSha256 || (provider === 'azure' && (!durationMilliseconds || rateEstimated === undefined)) || (provider === 'openrouter' && durationMilliseconds !== undefined))) throw new Error('No-speech attempts require a verified provider response.');
+  if (outcome === 'unknown' && (!dispatchStarted || !prepared || !['timeout', 'provider_unknown', 'invalid_response', 'cancelled'].includes(String(code)) || (provider === 'openrouter' && unknownCharge === undefined))) throw new Error('Unknown attempts require an uncertain dispatched upload with explicit charge knowledge.');
   if (outcome === 'failed' && (dispatchStarted ? !['provider_rejected', 'invalid_response'].includes(String(code)) : !code || ['provider_rejected', 'provider_unknown', 'timeout', 'invalid_response', 'no_speech'].includes(String(code)))) throw new Error('Failed attempt outcome does not match its dispatch result.');
-  if (outcome === 'failed' && code === 'provider_rejected' && (durationMilliseconds !== undefined || billedEstimateSeconds !== undefined || rateEstimated !== undefined || transcriptSha256 !== undefined)) throw new Error('A rejected provider request cannot contain verified usage.');
+  if (outcome === 'failed' && code === 'provider_rejected' && provider === 'azure' && (durationMilliseconds !== undefined || billedEstimateSeconds !== undefined || rateEstimated !== undefined || transcriptSha256 !== undefined)) throw new Error('A rejected provider request cannot contain verified usage.');
   if (outcome === 'failed' && code === 'invalid_response' && transcriptSha256 !== undefined) throw new Error('An invalid provider response cannot contain a transcript fingerprint.');
   if (outcome === 'cancelled' && (code !== 'cancelled' || dispatchStarted && !prepared)) throw new Error('Cancelled attempt outcome is inconsistent.');
-  if (!dispatchStarted && (durationMilliseconds || billedEstimateSeconds || rateEstimated !== undefined || transcriptSha256)) throw new Error('A pre-dispatch attempt cannot contain provider usage.');
+  if (!dispatchStarted && (durationMilliseconds || billedEstimateSeconds || rateEstimated !== undefined || transcriptSha256 || actualUsage !== undefined || unknownCharge !== undefined)) throw new Error('A pre-dispatch attempt cannot contain provider usage.');
   if (!durationMilliseconds && (billedEstimateSeconds !== undefined || rateEstimated !== undefined)) throw new Error('Speech usage estimates require a verified duration.');
   const lateObservations = Array.isArray(row.lateObservations) ? row.lateObservations.map((entry) => {
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error('Late speech observation is invalid.');
@@ -115,9 +140,11 @@ function validateAttempt(value: unknown): TranscriptionAttempt {
     return Object.freeze({ at: canonicalTime(o.at, 'Late observation time'), kind: o.kind, ...(d ? { durationMilliseconds: d } : {}) });
   }) : row.lateObservations === undefined ? undefined : (() => { throw new Error('Late speech observations are invalid.'); })();
   if (lateObservations && lateObservations.length > 4) throw new Error('Too many late speech observations.');
+  if (provider === 'openrouter' && lateObservations?.some((entry) => entry.kind === 'provider_duration')) throw new Error('OpenRouter attempts cannot contain Azure duration observations.');
   if (lateObservations?.some((entry) => !terminal || Date.parse(entry.at) < Date.parse(terminal))) throw new Error('Late speech observations must follow the terminal outcome.');
+  if (provider === 'openrouter' && dispatchStarted && terminal && unknownCharge !== (actualUsage?.costUsd === undefined)) throw new Error('OpenRouter charge knowledge must match reported actual cost.');
   const frozenSource = Object.freeze({ ...source, ...(source.audioAttachment ? { audioAttachment: Object.freeze({ ...source.audioAttachment }) } : {}) });
-  return Object.freeze({ id: row.id, leaseId: row.leaseId, noteId: row.noteId, sourceRevision, source: frozenSource, endpoint, locale: 'en-US', createdAt, ...(prepared ? { prepared } : {}), ...(reservation ? { reservation: Object.freeze(reservation) } : {}), dispatchStarted, outcome: outcome as TranscriptionAttempt['outcome'], ...(terminal ? { terminalAt: terminal } : {}), ...(code ? { code } : {}), ...(durationMilliseconds ? { durationMilliseconds } : {}), ...(billedEstimateSeconds ? { billedEstimateSeconds } : {}), ...(rateEstimated !== undefined ? { rateEstimated } : {}), ...(transcriptSha256 ? { transcriptSha256 } : {}), ...(lateObservations ? { lateObservations: Object.freeze(lateObservations) as unknown as TranscriptionAttempt['lateObservations'] } : {}) });
+  return Object.freeze({ id: row.id, leaseId: row.leaseId, noteId: row.noteId, sourceRevision, source: frozenSource, endpoint, ...(provider !== 'azure' || row.provider !== undefined ? { provider } : {}), ...(provider === 'openrouter' ? { profileVersion: 1 as const, model: OPENROUTER_SPEECH_MODEL } : {}), locale: provider === 'azure' ? 'en-US' as const : 'auto' as const, createdAt, ...(prepared ? { prepared } : {}), ...(reservation ? { reservation: Object.freeze(reservation) } : {}), dispatchStarted, outcome: outcome as TranscriptionAttempt['outcome'], ...(terminal ? { terminalAt: terminal } : {}), ...(code ? { code } : {}), ...(durationMilliseconds ? { durationMilliseconds } : {}), ...(billedEstimateSeconds ? { billedEstimateSeconds } : {}), ...(rateEstimated !== undefined ? { rateEstimated } : {}), ...(transcriptSha256 ? { transcriptSha256 } : {}), ...(actualUsage ? { actualUsage } : {}), ...(unknownCharge !== undefined ? { unknownCharge } : {}), ...(lateObservations ? { lateObservations: Object.freeze(lateObservations) as unknown as TranscriptionAttempt['lateObservations'] } : {}) } as TranscriptionAttempt);
 }
 
 function validateLease(value: unknown): TranscriptionCleanupLease {
