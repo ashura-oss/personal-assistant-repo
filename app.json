@@ -11,6 +11,10 @@
       "bundleIdentifier": "com.still.voiceassistant",
       "infoPlist": {
         "NSMicrophoneUsageDescription": "Still records voice notes only when you tap Record.",
+        "NSAppTransportSecurity": {
+          "NSAllowsArbitraryLoads": false,
+          "NSAllowsLocalNetworking": true
+        },
         "UIBackgroundModes": []
       }
     },

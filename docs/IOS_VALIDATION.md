@@ -2,6 +2,14 @@
 
 This is a manual test plan for a dedicated signed iOS build of Still. It is not a release approval or a request to erase anyone's real data. Use a dedicated test device/build, disposable local records, fictional content, and test provider accounts. Do not run destructive privacy cleanup against a personal or production workspace. Every row below is **NOT RUN**; web and unsigned JavaScript exports do not count as native iOS evidence.
 
+## Build configuration and module packaging
+
+The local `check:ios-config` static gate passed, but the following native packaging checks have not been run:
+
+| ID | Preconditions and steps | Expected result and evidence | Status |
+| --- | --- | --- | --- |
+| CFG-01 | On a macOS/Xcode build host with the chosen Expo project and Apple team, install CocoaPods dependencies and build development and preview profiles. Inspect the generated app's embedded StillPrivacy module and its runtime identity; also inspect a production/store-classified archive before any submission. | The module compiles and is embedded in each intended custom build; development and preview classification match their EAS profiles; Expo Go remains unsupported. Capture pod installation/build logs, profile, archive classification, and module startup result. Static JavaScript or Expo config checks do not count. | NOT RUN |
+
 ## Build and capture
 
 | ID | Preconditions and steps | Expected result and evidence | Status |

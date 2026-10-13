@@ -12,7 +12,8 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "check:ios-config": "node scripts/check-ios-config.mjs"
   },
   "dependencies": {
     "@expo/vector-icons": "^15.0.3",

@@ -71,6 +71,12 @@ The phase 21 statement above that the pending record was not yet wired is histor
 
 No physical iPhone, app-kill recovery, native mode/recorder ordering, writer-contention, sharing, or exact final-duration proof is available. In particular, source and mock evidence do not establish that the operating system has fully stopped the recorder, that the measured duration is the exact decoded file duration, or that files remain correct through iOS process termination and sharing.
 
+## Phase 23 · static iOS configuration packaging check
+
+`npm run check:ios-config` passed its eight static checks, independently reviewed by Astra. Expo dependency alignment and Doctor (21/21), TypeScript, and the 633-test/61-file suite also passed; full lint had zero errors and 40 existing warnings. The check covers Expo configuration, required permission strings, restricted ATS policy, URL scheme registration, unique StillPrivacy autolinking, and podspec metadata. The local StillPrivacy podspec now contains the required `homepage` field described in the [CocoaPods podspec reference](https://guides.cocoapods.org/syntax/podspec.html#homepage). The checked-in ATS settings explicitly set `NSAllowsArbitraryLoads=false` and `NSAllowsLocalNetworking=true`; an earlier synthetic inspection result was not the checked-in setting and did not establish a vulnerability.
+
+This is static configuration evidence only. There is no CocoaPods installation or podspec lint, Swift compile, signed build, Expo/EAS account setup, device registration, or physical iPhone evidence. The local gate cannot prove that StillPrivacy is linked or functional in a generated app binary. See [the build handoff](IOS_BUILD.md) and [the iOS validation matrix](IOS_VALIDATION.md).
+
 ## References
 
 - [React `useSyncExternalStore`](https://react.dev/reference/react/useSyncExternalStore)

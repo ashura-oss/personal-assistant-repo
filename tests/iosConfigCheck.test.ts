@@ -1,0 +1,119 @@
+import path from 'node:path';
+import { describe, expect, it } from 'vitest';
+import { validateIosConfiguration } from '../scripts/check-ios-config.mjs';
+
+const projectRoot = process.cwd();
+const podspecDir = path.join(projectRoot, 'modules/still-privacy/ios');
+const podspecContent = `Pod::Spec.new do |s|
+  s.name = 'StillPrivacy'
+  s.version = '1.0.0'
+  s.summary = 'Native process identity'
+  s.license = { :type => 'UNLICENSED' }
+  s.author = 'Still'
+  s.homepage = 'https://docs.expo.dev/modules/overview/'
+  s.platforms = { :ios => '16.4' }
+  s.source = { :path => '.' }
+  s.dependency 'ExpoModulesCore'
+end
+`;
+
+function validFixture() {
+  const configuredPlist = {
+    NSMicrophoneUsageDescription: 'Microphone access description',
+    NSCalendarsUsageDescription: 'Calendar access description',
+    NSCalendarsFullAccessUsageDescription: 'Full calendar access description',
+    UIBackgroundModes: [],
+    NSAppTransportSecurity: { NSAllowsArbitraryLoads: false, NSAllowsLocalNetworking: true },
+    CFBundleURLTypes: [{ CFBundleURLSchemes: ['still', 'com.still.voiceassistant'] }],
+  };
+  return {
+    config: {
+      orientation: 'portrait', scheme: ['still'], userInterfaceStyle: 'dark',
+      ios: {
+        supportsTablet: false,
+        bundleIdentifier: 'com.still.voiceassistant',
+        infoPlist: { ...configuredPlist },
+      },
+      _internal: { modResults: { ios: { infoPlist: {
+        ...configuredPlist,
+        UIUserInterfaceStyle: 'Dark',
+        UISupportedInterfaceOrientations: ['UIInterfaceOrientationPortrait', 'UIInterfaceOrientationPortraitUpsideDown'],
+      } } } },
+    },
+    autolink: {
+      modules: [{
+        packageName: 'still-privacy',
+        debugOnly: false,
+        swiftModuleNames: ['StillPrivacy'],
+        modules: [{ class: 'StillPrivacyModule' }],
+        pods: [{ podName: 'StillPrivacy', podspecDir }],
+      }],
+    },
+    podspecContent,
+    projectRoot,
+  };
+}
+
+describe('read-only iOS config validation', () => {
+  it('accepts the expected app config and resolved StillPrivacy callback/pod', () => {
+    const result = validateIosConfiguration(validFixture());
+    expect(result.ok).toBe(true);
+    expect(result.failures).toEqual([]);
+  });
+
+  it('rejects a missing or duplicate native module registration', () => {
+    const missing = validFixture();
+    missing.autolink.modules = [];
+    expect(validateIosConfiguration(missing).failures).toContain('StillPrivacy is missing, duplicated, or resolved to an unexpected native callback/pod.');
+
+    const duplicate = validFixture();
+    duplicate.autolink.modules.push(duplicate.autolink.modules[0]);
+    expect(validateIosConfiguration(duplicate).failures).toContain('StillPrivacy is missing, duplicated, or resolved to an unexpected native callback/pod.');
+  });
+
+  it('rejects a dropped native callback and mismatched local podspec resolution', () => {
+    const droppedCallback = validFixture();
+    droppedCallback.autolink.modules[0].modules = [];
+    expect(validateIosConfiguration(droppedCallback).failures).toContain('StillPrivacy is missing, duplicated, or resolved to an unexpected native callback/pod.');
+
+    const wrongPod = validFixture();
+    wrongPod.autolink.modules[0].pods[0].podspecDir = path.join(projectRoot, 'elsewhere');
+    expect(validateIosConfiguration(wrongPod).failures).toContain('StillPrivacy is missing, duplicated, or resolved to an unexpected native callback/pod.');
+
+    const extraCallback = validFixture();
+    extraCallback.autolink.modules[0].modules.push({ class: 'UnexpectedModule' });
+    expect(validateIosConfiguration(extraCallback).failures).toContain('StillPrivacy is missing, duplicated, or resolved to an unexpected native callback/pod.');
+
+    const releaseOnly = validFixture();
+    releaseOnly.autolink.modules[0].debugOnly = true;
+    expect(validateIosConfiguration(releaseOnly).failures).toContain('StillPrivacy is missing, duplicated, or resolved to an unexpected native callback/pod.');
+  });
+
+  it('rejects broad ATS policy, missing permissions, and unregistered configured schemes', () => {
+    const wrongTransport = validFixture();
+    wrongTransport.config._internal.modResults.ios.infoPlist.NSAppTransportSecurity.NSAllowsArbitraryLoads = true;
+    expect(validateIosConfiguration(wrongTransport).failures).toContain('App Transport Security is broader than the approved local-networking policy.');
+
+    const missingPermission = validFixture();
+    delete (missingPermission.config._internal.modResults.ios.infoPlist as Record<string, unknown>).NSCalendarsFullAccessUsageDescription;
+    expect(validateIosConfiguration(missingPermission).failures).toContain('Required microphone/full-calendar descriptions are missing or a reminders description is present.');
+
+    const droppedScheme = validFixture();
+    droppedScheme.config._internal.modResults.ios.infoPlist.CFBundleURLTypes = [];
+    expect(validateIosConfiguration(droppedScheme).failures).toContain('One or more configured URL schemes are missing from the resolved iOS URL types.');
+
+    const configOnly = validFixture();
+    delete (configOnly.config._internal.modResults.ios as Record<string, unknown>).infoPlist;
+    expect(validateIosConfiguration(configOnly).failures).toContain('The final introspected plist is missing dark style or includes an unsupported orientation.');
+
+    const finalLight = validFixture();
+    finalLight.config._internal.modResults.ios.infoPlist.UIUserInterfaceStyle = 'Light';
+    expect(validateIosConfiguration(finalLight).failures).toContain('The final introspected plist is missing dark style or includes an unsupported orientation.');
+  });
+
+  it('rejects a podspec without its required homepage metadata', () => {
+    const missingHomepage = validFixture();
+    missingHomepage.podspecContent = missingHomepage.podspecContent.replace("  s.homepage = 'https://docs.expo.dev/modules/overview/'\n", '');
+    expect(validateIosConfiguration(missingHomepage).failures).toContain('The local StillPrivacy podspec is missing required bounded metadata.');
+  });
+});

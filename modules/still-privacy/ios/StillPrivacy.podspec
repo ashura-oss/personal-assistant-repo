@@ -5,6 +5,7 @@ Pod::Spec.new do |s|
   s.description    = 'Exposes native process identity for local privacy arbitration.'
   s.license        = { :type => 'UNLICENSED' }
   s.author         = 'Still'
+  s.homepage       = 'https://docs.expo.dev/modules/overview/'
   s.platforms      = { :ios => '16.4' }
   s.source         = { :path => '.' }
   s.static_framework = true
