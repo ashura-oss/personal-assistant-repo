@@ -8,8 +8,10 @@ import {
   View,
 } from "react-native";
 import type { AssistIntent, Note, NoteAssistResult, Proposal } from "../core";
+import type { TranscriptionAttempt } from "../transcription";
 import type { KnowledgeChange, KnowledgeEntityKind, Person, Project } from "../knowledge/types";
 import { Button, Field, IconButton } from "./primitives";
+import { TranscriptionPanel } from "./TranscriptionPanel";
 import { C, s } from "./theme";
 
 function validTimeZone(value: string) {
@@ -29,7 +31,12 @@ type Props = {
   busy: boolean;
   preview: boolean;
   demoMode: boolean;
+  transcriptionDemoMode?: boolean;
   providerReady: boolean;
+  speechEnabled: boolean;
+  transcriptionAttempts: readonly TranscriptionAttempt[];
+  cancelingTranscriptionId?: string;
+  transcriptionRequestRunning?: boolean;
   analysisStatusError?: string;
   analysisStatusChecking?: boolean;
   people?: Person[];
@@ -46,7 +53,9 @@ type Props = {
   }) => void;
   onCreateMemorySuggestion: (input: { noteId: string; sourceId: string; quote: string; targetKind: KnowledgeEntityKind; targetId: string; change: KnowledgeChange }) => Promise<unknown>;
   onOpenProposals: () => void;
-  onTranscribe: () => void;
+  onTranscribe: (expectedRevision: number) => void;
+  onCancelTranscription: (attemptId: string) => void;
+  onOpenSpeechSettings: () => void;
   onAttachRecording: () => void;
   onPlay: () => void;
   onExportAudio: () => void;
@@ -68,7 +77,12 @@ export function NoteDetail({
   busy,
   preview,
   demoMode,
+  transcriptionDemoMode = false,
   providerReady,
+  speechEnabled,
+  transcriptionAttempts,
+  cancelingTranscriptionId,
+  transcriptionRequestRunning = false,
   analysisStatusError,
   analysisStatusChecking,
   people = [],
@@ -81,6 +95,8 @@ export function NoteDetail({
   onCreateMemorySuggestion,
   onOpenProposals,
   onTranscribe,
+  onCancelTranscription,
+  onOpenSpeechSettings,
   onAttachRecording,
   onPlay,
   onExportAudio,
@@ -274,30 +290,20 @@ export function NoteDetail({
           Audio is never transcribed automatically. Your transcript stays
           editable.
         </Text>
-        {note.audioUri && !text.trim() ? (
-          <View style={s.setupCard}>
-            <Text style={s.setupTitle}>
-              {note.audioAttachment?.durationStatus === "unknown"
-                ? "Transcription unavailable"
-                : "Transcription requires Azure setup"}
-            </Text>
-            <Text style={s.setupBody}>
-              {note.audioAttachment?.durationStatus === "unknown"
-                ? "Still could not verify this recording’s duration, so it cannot be sent for transcription. You can write a transcript by hand."
-                : "You can add a transcript manually now. Configure Azure Speech when credentials are available."}
-            </Text>
-            <Button
-              label={
-                providerReady
-                  ? "Transcribe with Azure Speech"
-                  : "Set up Azure Speech"
-              }
-              tone="quiet"
-              icon="mic-outline"
-              disabled={note.audioAttachment?.durationStatus === "unknown" || demoMode}
-              onPress={onTranscribe}
-            />
-          </View>
+        {note.audioUri || transcriptionAttempts.length > 0 ? (
+          <TranscriptionPanel
+            note={note}
+            attempts={transcriptionAttempts}
+            enabled={speechEnabled}
+            configured={providerReady}
+            busy={busy || dirty}
+            requestRunning={transcriptionRequestRunning}
+            demoMode={transcriptionDemoMode}
+            cancelingAttemptId={cancelingTranscriptionId}
+            onTranscribe={onTranscribe}
+            onCancel={onCancelTranscription}
+            onOpenSettings={onOpenSpeechSettings}
+          />
         ) : null}
 
         {text.trim() ? (

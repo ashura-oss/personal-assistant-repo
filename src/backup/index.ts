@@ -796,6 +796,10 @@ export function createPortableBackup(state: AppState, metadata: PortableBackupMe
     title: 'Reminder — imported history',
     content: [`Title: ${reminder.title}`, `Details: ${reminder.body}`, `Due: ${reminder.dueAt}`, `Display time zone: ${reminder.displayTimeZone}`].join('\n'),
     status: `${reminder.status} (unverified imported history)`, ...(reminder.createdAt ? { occurredAt: reminder.createdAt } : {}) });
+  for (const attempt of state.transcription?.attempts ?? []) history.push({ kind: 'activity', sourceId: `transcription:${attempt.id}`,
+    ...(currentNoteIds.has(attempt.noteId) ? { sourceNoteId: attempt.noteId } : {}), title: 'Voice transcription — imported history',
+    content: [attempt.durationMilliseconds ? `Provider duration: ${attempt.durationMilliseconds} ms` : '', attempt.billedEstimateSeconds ? `Estimated billed duration: ${attempt.billedEstimateSeconds} seconds` : ''].filter(Boolean).join('\n'),
+    status: `${attempt.outcome} (unverified imported transcription history)`, occurredAt: attempt.terminalAt ?? attempt.createdAt });
   for (const record of state.dispatchRecords) {
     const payload = record.payload.kind === 'email'
       ? [`Subject: ${record.payload.email.subject}`, `To: ${record.payload.email.to.join(', ')}`, `Cc: ${record.payload.email.cc.join(', ')}`, `Bcc: ${record.payload.email.bcc.join(', ')}`, `Email body: ${record.payload.email.text}`]

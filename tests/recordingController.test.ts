@@ -302,12 +302,20 @@ describe('imported recording recovery', () => {
   it('clears replacement provenance and marks audio missing when delete-after-transcription detaches the clip', async () => {
     const store = new MemoryStore();
     const recovery = fakeRecovery();
-    const speech = { transcribe: vi.fn(async () => ({ transcript: 'Recovered transcript.', durationSeconds: 42, attempts: 1 })) } as unknown as AzureSpeechClient;
+    const speech = {
+      transcribe: vi.fn(async (_note, _settings, _signal, onAttempt, beforeDispatch, onPrepared, leaseId) => {
+        const prepared = { leaseId, platform: 'web', format: 'wav', mimeType: 'audio/wav', byteLength: 128, sha256: 'b'.repeat(64), durationSeconds: 42,
+          upload: { blob: new Blob(['voice']), fileName: 'replacement.wav' } };
+        await onPrepared(prepared); await onAttempt(prepared); beforeDispatch(prepared);
+        return { transcript: 'Recovered transcript.', durationMilliseconds: 42_000, durationSeconds: 42, billedEstimateSeconds: 42, attempts: 1, cleanupPromise: Promise.resolve() };
+      }),
+      releaseUploadLease: vi.fn(async () => undefined),
+    } as unknown as AzureSpeechClient;
     const app = new AppControllerImpl(store, { speech }, { recordingRecovery: recovery });
     const note = await importedNote(app);
     const preview = await app.prepareRecordingAttachment(note.id, { expectedRevision: note.revision });
     const attached = await app.attachRecording({ sessionId: preview!.sessionId, planHash: preview!.planHash });
-    await app.saveSettings({ mode: 'provider', audioRetention: 'delete_after_transcription' });
+    await app.saveSettings({ mode: 'preview', speechEnabled: true, speechEndpoint: 'https://example.cognitiveservices.azure.com', audioRetention: 'delete_after_transcription' });
     const transcribed = await app.transcribeNote(note.id);
     expect(speech.transcribe).toHaveBeenCalledTimes(1);
     expect(transcribed).toMatchObject({ transcript: 'Recovered transcript.', status: 'recorded', revision: attached.revision + 2, importOrigin: { audioMissing: true } });

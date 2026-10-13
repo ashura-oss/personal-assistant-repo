@@ -50,6 +50,8 @@ import { createBackupScenario } from "./src/dev/backupScenario";
 import { createKnowledgeScenario } from "./src/dev/knowledgeScenario";
 import { createReminderPreview } from "./src/dev/reminderPreview";
 import { createDeviceCalendarPreview } from "./src/dev/deviceCalendarPreview";
+import { createTranscriptionPreview } from "./src/dev/transcriptionPreview";
+import { SpeechTranscriptionError } from "./src/transcription/types";
 import { useAudioCapture } from "./src/audio/useAudioCapture";
 import type { AudioCapture } from "./src/audio/types";
 import {
@@ -101,7 +103,8 @@ const isBackupImportDemo = previewScenario === "backup-import";
 const isKnowledgeDemo = previewScenario === "knowledge";
 const isReminderDemo = previewScenario === "reminders";
 const isDeviceCalendarsDemo = previewScenario === "device-calendars";
-const isIsolatedDemo = isDispatchHistoryDemo || isMailSyncDemo || isBackupImportDemo || isKnowledgeDemo || isReminderDemo || isDeviceCalendarsDemo;
+const isTranscriptionDemo = previewScenario === "transcription";
+const isIsolatedDemo = isDispatchHistoryDemo || isMailSyncDemo || isBackupImportDemo || isKnowledgeDemo || isReminderDemo || isDeviceCalendarsDemo || isTranscriptionDemo;
 
 function useAppState(appController: AppController) {
   return useSyncExternalStore(
@@ -394,10 +397,12 @@ export default function App() {
   const [controller, setController] =
     useState<AppController>(productionController);
   const state = useAppState(controller);
-  const [tab, setTab] = useState<Tab>(isBackupImportDemo || isKnowledgeDemo || isReminderDemo ? "library" : isIsolatedDemo ? "inbox" : "record");
+  const [tab, setTab] = useState<Tab>(isBackupImportDemo || isKnowledgeDemo || isReminderDemo || isTranscriptionDemo ? "library" : isIsolatedDemo ? "inbox" : "record");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [detail, setDetail] = useState<Note | null>(null);
   const [recordingAttachmentNoteId, setRecordingAttachmentNoteId] = useState<string | null>(null);
+  const [cancelingTranscriptionId, setCancelingTranscriptionId] = useState<string | undefined>();
+  const [transcribingNoteId, setTranscribingNoteId] = useState<string | undefined>();
   const [review, setReview] = useState<Proposal | null>(null);
   const [replyMessageId, setReplyMessageId] = useState<string | null>(null);
   const [reminderReviewId, setReminderReviewId] = useState<string | null>(null);
@@ -464,6 +469,8 @@ export default function App() {
                   ? await createReminderPreview()
                   : isDeviceCalendarsDemo
                     ? await createDeviceCalendarPreview()
+                    : isTranscriptionDemo
+                      ? await createTranscriptionPreview()
             : productionController;
         if (!mounted) return;
         setController(selected);
@@ -1117,6 +1124,8 @@ export default function App() {
                         ? "Sample reminders · in-memory only · simulated alerts"
                     : isDeviceCalendarsDemo
                       ? "Sample device calendars · in-memory only · simulated native calls"
+                      : isTranscriptionDemo
+                        ? "Sample transcription · in-memory only · no API used"
                         : "Sample knowledge · in-memory only · no external actions"}
               </Text>
             </View>
@@ -1178,7 +1187,9 @@ export default function App() {
           {busy ? (
             <View style={s.busy}>
               <ActivityIndicator color={C.sage} />
-              <Text style={s.busyText}>Saving locally…</Text>
+              <Text style={s.busyText}>{transcribingNoteId
+                ? isTranscriptionDemo ? "Running sample transcription…" : "Transcribing recording…"
+                : "Saving locally…"}</Text>
             </View>
           ) : null}
           <View style={s.page}>
@@ -1226,6 +1237,11 @@ export default function App() {
                 busy={busy}
                 preview={state.settings.mode === "preview"}
                 demoMode={isIsolatedDemo}
+                transcriptionDemoMode={isTranscriptionDemo}
+                speechEnabled={state.settings.speechEnabled === true}
+                transcriptionAttempts={state.transcription.attempts.filter((attempt) => attempt.noteId === detail.id)}
+                cancelingTranscriptionId={cancelingTranscriptionId}
+                transcriptionRequestRunning={transcribingNoteId === detail.id}
                 analysisStatusError={
                   analysisStatusError?.key === analysisFreshnessKey
                     ? analysisStatusError.message
@@ -1294,19 +1310,49 @@ export default function App() {
                   setTab("inbox");
                   setDetail(null);
                 }}
-                onTranscribe={() =>
-                  state.settings.speechEndpoint
-                    ? run(async () => {
-                        const updated = await controller.transcribeNote(
-                          detail.id,
-                        );
-                        setDetail(updated);
-                        setNotice(
-                          "Transcript saved. Review it before asking about this note.",
-                        );
-                      })
-                    : setSettingsOpen(true)
-                }
+                onTranscribe={(expectedRevision) => {
+                  if (!state.settings.speechEnabled || !state.settings.speechEndpoint) {
+                    setSettingsOpen(true);
+                    return;
+                  }
+                  void run(async () => {
+                    setTranscribingNoteId(detail.id);
+                    try {
+                      const updated = await controller.transcribeNote(
+                        detail.id,
+                        { expectedRevision },
+                      );
+                      setDetail(updated);
+                      setNotice(
+                        isTranscriptionDemo
+                          ? "Sample transcript saved — Azure was not contacted."
+                          : "Azure Speech transcript saved. Review it before asking about this note.",
+                      );
+                    } catch (error) {
+                      if (!isTranscriptionDemo) throw error;
+                      setNotice(sampleTranscriptionErrorNotice(error));
+                    } finally {
+                      setTranscribingNoteId(undefined);
+                    }
+                  });
+                }}
+                onCancelTranscription={(attemptId) => {
+                  if (cancelingTranscriptionId) return;
+                  setCancelingTranscriptionId(attemptId);
+                  void controller.cancelTranscription(detail.id, { attemptId })
+                    .then((result) => {
+                      setNotice(
+                        result.status === "cancelled"
+                          ? "Transcription cancellation requested."
+                          : result.status === "already_terminal"
+                            ? "Transcription history recovered. Review its status before starting another upload."
+                            : "No active transcription request was found.",
+                      );
+                    })
+                    .catch((error) => setNotice(messageOf(error)))
+                    .finally(() => setCancelingTranscriptionId(undefined));
+                }}
+                onOpenSpeechSettings={() => setSettingsOpen(true)}
                 onAttachRecording={() =>
                   setRecordingAttachmentNoteId(detail.id)
                 }
@@ -2612,6 +2658,9 @@ function SettingsScreen({
   const [providerEnabled, setProviderEnabled] = useState(
     state.settings.mode === "provider",
   );
+  const [speechEnabled, setSpeechEnabled] = useState(
+    state.settings.speechEnabled === true,
+  );
   const [speechKey, setSpeechKey] = useState("");
   const [openAiKey, setOpenAiKey] = useState("");
   const [credentialStatus, setCredentialStatus] = useState({
@@ -2648,6 +2697,7 @@ function SettingsScreen({
     }
     const result = await onSave({
       mode: providerEnabled ? "provider" : "preview",
+      speechEnabled,
       openAiEndpoint: endpoint,
       openAiDeployment: deployment,
       speechEndpoint,
@@ -2762,6 +2812,22 @@ function SettingsScreen({
             accessibilityLabel="Enable Azure analysis"
             value={providerEnabled}
             onValueChange={setProviderEnabled}
+            disabled={demoMode}
+            trackColor={{ false: C.border, true: C.sage }}
+            thumbColor={C.text}
+          />
+        </View>
+        <View style={s.providerToggle}>
+          <View style={{ flex: 1 }}>
+            <Text style={s.accountName}>Enable Azure transcription</Text>
+            <Text style={s.accountSub}>
+              Separate from AI analysis. Still uploads a saved recording only when you choose Transcribe.
+            </Text>
+          </View>
+          <Switch
+            accessibilityLabel="Enable Azure transcription"
+            value={speechEnabled}
+            onValueChange={setSpeechEnabled}
             disabled={demoMode}
             trackColor={{ false: C.border, true: C.sage }}
             thumbColor={C.text}
@@ -3096,6 +3162,16 @@ function messageOf(e: unknown) {
   return e instanceof Error
     ? e.message
     : "Something went wrong. Your saved data is unchanged; try again.";
+}
+function sampleTranscriptionErrorNotice(error: unknown) {
+  if (error instanceof SpeechTranscriptionError) {
+    if (error.code === "no_speech") return "Sample transcription detected no speech — Azure was not contacted.";
+    if (error.code === "cancelled") return "Sample transcription cancelled — Azure was not contacted.";
+    if (error.dispatched || error.code === "provider_unknown" || error.code === "timeout") {
+      return "Sample result is uncertain — Azure was not contacted. A new sample run is a separate request.";
+    }
+  }
+  return "Sample transcription did not complete — Azure was not contacted.";
 }
 function localDateTime(iso?: string) {
   if (!iso) return { date: "", time: "" };

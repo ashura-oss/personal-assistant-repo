@@ -57,6 +57,9 @@ import { emptyKnowledgeState, getKnowledgeEntity, knowledgeContextSources, valid
 import type { ContactClaim, KnowledgeChange, KnowledgeEntityKind, KnowledgeEvidence, KnowledgeFact, KnowledgeReference, KnowledgeSourceLink, KnowledgeSuggestion, Person, Project, ProjectMember } from '../knowledge';
 import { BACKUP_LIMITS, canonicalPortableContent, legacyCanonicalPortableContentV2, createPortableBackup, parsePortableBackup, summarizePortableBackup, validatePortableDocumentPath, validateImportedBackupArchive } from '../backup';
 import type { ImportedBackupArchive, PortableBackupV3, PortableKnowledgeCohort } from '../backup';
+import { SpeechTranscriptionError, validateTranscriptionState, validateSpeechAudioSnapshot } from '../transcription';
+import type { SpeechAudioSnapshot, SpeechAttemptCode, SpeechTranscriptionResult, TranscriptionAttempt, TranscriptionState } from '../transcription';
+import type { PreparedSpeechAudio, SpeechAudioService } from '../audio/speechUpload.types';
 
 const now = () => new Date().toISOString();
 const ASSIST_CONTRACT_VERSION = 'assist-v3';
@@ -174,6 +177,48 @@ function stableJson(value: unknown): string {
   if (value && typeof value === 'object') return `{${Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`).join(',')}}`;
   return JSON.stringify(value) ?? 'null';
 }
+
+function transcriptionSourceProjection(note: Note, settings: AppSettings): TranscriptionAttempt['source'] {
+  const attachment = note.audioAttachment;
+  return {
+    audioUri: note.audioUri ?? '', durationSeconds: note.durationSeconds,
+    capturedAt: new Date(note.capturedAt ?? note.createdAt).toISOString(),
+    captureTimeZone: validTimezone(note.captureTimeZone ?? settings.timezone),
+    speechEnabled: settings.speechEnabled === true, maxAudioSeconds: settings.maxAudioSeconds,
+    ...(attachment ? { audioAttachment: {
+      fileName: attachment.fileName, format: attachment.format, mimeType: attachment.mimeType,
+      byteLength: attachment.byteLength, sha256: attachment.sha256, durationStatus: attachment.durationStatus,
+      ...(attachment.durationSeconds !== undefined ? { durationSeconds: attachment.durationSeconds } : {}),
+    } } : {}),
+  };
+}
+
+function speechSettingsProjection(settings: AppSettings): string {
+  return stableJson({
+    speechEnabled: settings.speechEnabled === true,
+    speechEndpoint: settings.speechEndpoint ?? '',
+    maxAudioSeconds: settings.maxAudioSeconds,
+    speechUsdPerMinute: settings.speechUsdPerMinute ?? null,
+    monthlyBudgetUsd: settings.monthlyBudgetUsd,
+    maxCallsPerDay: settings.maxCallsPerDay,
+  });
+}
+
+function speechErrorCode(error: unknown): SpeechAttemptCode {
+  if (!(error instanceof SpeechTranscriptionError)) return 'audio_invalid';
+  switch (error.code) {
+    case 'unsupported_format': case 'invalid_audio': case 'audio_changed': return 'audio_invalid';
+    case 'credential_missing': return 'credential_missing';
+    case 'stale_credential': return 'stale_credential';
+    case 'cancelled': return 'cancelled';
+    case 'timeout': return 'timeout';
+    case 'provider_rejected': return 'provider_rejected';
+    case 'provider_unknown': return 'provider_unknown';
+    case 'invalid_response': return 'invalid_response';
+    case 'no_speech': return 'no_speech';
+    default: return 'audio_invalid';
+  }
+}
 function deepFreeze<T>(value: T): T {
   if (value && typeof value === 'object' && !Object.isFrozen(value)) {
     Object.freeze(value);
@@ -183,7 +228,7 @@ function deepFreeze<T>(value: T): T {
 }
 
 const DEFAULT_SETTINGS: AppSettings = {
-  mode: 'preview', timezone: validTimezone(), maxContextTokens: 6000, maxRequestBytes: 24000, maxOutputTokens: 1200, monthlyBudgetUsd: 5,
+  mode: 'preview', timezone: validTimezone(), speechEnabled: false, maxContextTokens: 6000, maxRequestBytes: 24000, maxOutputTokens: 1200, monthlyBudgetUsd: 5,
   reasoningEffort: 'none', maxAttempts: 2, maxCallsPerDay: 20, maxAudioSeconds: 600, audioRetention: 'keep',
 };
 
@@ -193,6 +238,7 @@ function initialState(): AppState {
     notes: [], proposals: [], tasks: [], accounts: [], calendars: [], documents: [], activity: [],
     settings: { ...DEFAULT_SETTINGS },
     usage: { month: day.slice(0, 7), day, requests: 0, attemptsToday: 0, inputTokens: 0, outputTokens: 0, transcriptionSeconds: 0, attempts: 0, unknownCharges: 0, reservedUsd: 0, priceKnown: false, estimatedCostUsd: 0 },
+    transcription: { schemaVersion: 1, installationUUID: newId(), attempts: [], cleanupLeases: [] },
     mailbox: [], selectedMailTexts: [], calendarEvents: [], syncStates: {}, pendingCredentialCleanup: [], dispatchRecords: [], dispatchRecordQuarantine: [], mailboxSchemaVersion: 2,
     deviceCalendars: emptyDeviceCalendarState(), deviceCalendarAccess: { status: 'needs_check' },
     proactive: emptyProactiveState(), importedBackups: [], knowledge: emptyKnowledgeState(), reminders: emptyReminderState(newId()),
@@ -706,7 +752,7 @@ function createProposalProvenance(input: {
   };
 }
 
-function normalizeLoadedState(value: unknown): AppState & { backupImportQuarantine?: unknown[]; knowledgeQuarantine?: unknown[]; reminderQuarantine?: unknown[]; deviceCalendarQuarantine?: unknown[] } {
+function normalizeLoadedState(value: unknown): AppState & { backupImportQuarantine?: unknown[]; knowledgeQuarantine?: unknown[]; reminderQuarantine?: unknown[]; deviceCalendarQuarantine?: unknown[]; transcriptionQuarantine?: unknown[] } {
   const defaults = initialState();
   if (!value || typeof value !== 'object') throw new Error('Saved app data is not a valid state snapshot. It was preserved for recovery.');
   const raw = value as Partial<AppState>;
@@ -850,7 +896,16 @@ function normalizeLoadedState(value: unknown): AppState & { backupImportQuaranti
       sourceNoteId: candidate.sourceNoteId, sourceRevision: candidate.sourceRevision as number, proposalId: candidate.proposalId });
   }
   const tasks = [...savedTasks, ...migratedTasks.filter((task) => !savedTasks.some((saved) => saved.id === task.id))];
-  const settings = { ...DEFAULT_SETTINGS, ...rawSettings, timezone: validTimezone(rawSettings.timezone), maxRequestBytes };
+  const settings = { ...DEFAULT_SETTINGS, ...rawSettings, speechEnabled: rawSettings.speechEnabled === true, timezone: validTimezone(rawSettings.timezone), maxRequestBytes };
+  const retainedTranscriptionQuarantine = (value as { transcriptionQuarantine?: unknown }).transcriptionQuarantine;
+  const transcriptionQuarantine: unknown[] = Array.isArray(retainedTranscriptionQuarantine)
+    ? clone(retainedTranscriptionQuarantine) : retainedTranscriptionQuarantine === undefined ? [] : [retainedTranscriptionQuarantine];
+  let transcription: TranscriptionState;
+  if (raw.transcription === undefined) transcription = defaults.transcription;
+  else {
+    try { transcription = clone(validateTranscriptionState(raw.transcription)); }
+    catch { transcription = defaults.transcription; transcriptionQuarantine.push(raw.transcription); }
+  }
   let reminders: ReminderState;
   const retainedReminderQuarantine = (value as { reminderQuarantine?: unknown }).reminderQuarantine;
   const reminderQuarantine: unknown[] = Array.isArray(retainedReminderQuarantine) ? clone(retainedReminderQuarantine) : retainedReminderQuarantine === undefined ? [] : [retainedReminderQuarantine];
@@ -900,6 +955,11 @@ function normalizeLoadedState(value: unknown): AppState & { backupImportQuaranti
       ? { quarantined: true as const, message: 'Some reminder data could not be validated and is held privately. New reminders are disabled until recovery.' as const }
       : undefined,
     deviceCalendars,
+    transcription,
+    ...(transcriptionQuarantine.length ? { transcriptionQuarantine } : {}),
+    transcriptionRecoveryStatus: transcriptionQuarantine.length
+      ? { quarantined: true as const, message: 'Some speech-transcription history could not be validated and is held privately. New cloud transcription is disabled until recovery.' as const }
+      : undefined,
     // Permission state in persisted JSON is informational only. The OS is checked on explicit action/foreground.
     deviceCalendarAccess: { status: 'needs_check' },
     ...(deviceCalendarQuarantine.length ? { deviceCalendarQuarantine } : {}),
@@ -987,6 +1047,7 @@ export interface ControllerIntegrationDependencies {
     onAuthStatus: (accountId: string, status: Account['authStatus']) => Promise<void>,
   ) => ConnectorClient;
   recordingRecovery?: RecordingRecoveryService;
+  speechAudioService?: SpeechAudioService;
   reminderBackend?: NotificationBackend;
   deviceCalendarBackend?: DeviceCalendarBackend;
 }
@@ -1074,6 +1135,10 @@ export class AppControllerImpl implements AppController {
   private recordingAttachmentJobs = new Map<string, Promise<Note>>();
   private recordingAttachmentReceipts = new Map<string, RecordingAttachmentReceipt>();
   private recordingRecoveryPromise?: Promise<RecordingRecoveryService>;
+  private transcriptionCleanupPromises = new Set<string>();
+  private transcriptionQuarantine: unknown[] = [];
+  private transcriptionJobs = new Map<string, { attemptId: string; sourceRevision: number; leaseId: string; controller: AbortController; promise: Promise<Note> }>();
+  private transcriptionCleanupJob?: Promise<void>;
   private readonly reminderBackend: NotificationBackend;
   private reminderReconcileJob?: Promise<void>;
   private reminderReconcileAgain = false;
@@ -1094,7 +1159,7 @@ export class AppControllerImpl implements AppController {
     providers: { speech?: AzureSpeechClient; openAi?: AzureOpenAIClient } = {},
     private readonly integration: ControllerIntegrationDependencies = {},
   ) {
-    this.speechClient = providers.speech ?? new AzureSpeechClient({});
+    this.speechClient = providers.speech ?? new AzureSpeechClient({ audio: integration.speechAudioService });
     this.openAiClient = providers.openAi ?? new AzureOpenAIClient();
     this.connector = integration.tokenStore && integration.connectorFactory
       ? integration.connectorFactory(integration.tokenStore, (accountId, status) => this.handleConnectorAuthStatus(accountId, status))
@@ -1110,6 +1175,61 @@ export class AppControllerImpl implements AppController {
     return this.recordingRecoveryPromise;
   }
 
+  private async retryTranscriptionCleanup(): Promise<void> {
+    if (this.transcriptionCleanupJob) return this.transcriptionCleanupJob;
+    const job = (async () => {
+      const activeLeaseIds = new Set([...this.transcriptionJobs.values()].map((item) => item.leaseId));
+      for (const leaseId of this.transcriptionCleanupPromises) activeLeaseIds.add(leaseId);
+      for (const lease of this.snapshot.transcription.cleanupLeases.filter((item) => item.outcome === 'pending_cleanup' && !activeLeaseIds.has(item.leaseId)).slice(0, 8)) {
+        try {
+          await this.speechClient.releaseUploadLease(lease.leaseId);
+          await this.mutate((state) => {
+            const current = state.transcription.cleanupLeases.find((item) => item.leaseId === lease.leaseId && item.attemptId === lease.attemptId);
+            if (current?.outcome === 'pending_cleanup') current.outcome = 'released';
+          });
+        } catch { /* Keep the bounded lease obligation for the next explicit or startup cleanup pass. */ }
+      }
+    })();
+    this.transcriptionCleanupJob = job;
+    try { await job; } finally { if (this.transcriptionCleanupJob === job) this.transcriptionCleanupJob = undefined; }
+  }
+
+  private markTranscriptionCleanupPending(leaseId: string): void {
+    const lease = this.snapshot.transcription.cleanupLeases.find((item) => item.leaseId === leaseId);
+    if (lease && lease.outcome !== 'released' && ![...this.transcriptionJobs.values()].some((job) => job.leaseId === leaseId)) {
+      void this.mutate((state) => {
+        const current = state.transcription.cleanupLeases.find((item) => item.leaseId === leaseId);
+        if (current && current.outcome !== 'released') current.outcome = 'pending_cleanup';
+      }).then(() => this.retryTranscriptionCleanup()).catch(() => undefined);
+    }
+  }
+
+  private trackTranscriptionCleanup(leaseId: string, cleanup: Promise<void>): void {
+    this.transcriptionCleanupPromises.add(leaseId);
+    void cleanup.catch(() => undefined).finally(() => {
+      this.transcriptionCleanupPromises.delete(leaseId);
+      this.markTranscriptionCleanupPending(leaseId);
+    });
+  }
+
+  private addTranscriptionAttempt(state: AppState, attempt: TranscriptionAttempt): void {
+    const max = 500;
+    while (state.transcription.attempts.length >= max) {
+      const index = state.transcription.attempts.findIndex((item) => ['completed', 'no_speech', 'failed', 'discarded'].includes(item.outcome) || item.outcome === 'cancelled' && !item.dispatchStarted && !item.reservation);
+      if (index < 0) throw new Error('Speech history is full of unresolved attempts. Resolve an existing attempt before starting another transcription.');
+      const [removed] = state.transcription.attempts.splice(index, 1);
+      const leases = state.transcription.cleanupLeases.filter((lease) => lease.attemptId === removed.id);
+      if (leases.some((lease) => lease.outcome !== 'released')) throw new Error('Speech cleanup is still pending. Retry cleanup before starting another transcription.');
+      state.transcription.cleanupLeases = state.transcription.cleanupLeases.filter((lease) => lease.attemptId !== removed.id);
+    }
+    if (state.transcription.cleanupLeases.length >= 500) {
+      const index = state.transcription.cleanupLeases.findIndex((lease) => lease.outcome === 'released');
+      if (index < 0) throw new Error('Speech cleanup history is full of unresolved leases. Retry cleanup before starting another transcription.');
+      state.transcription.cleanupLeases.splice(index, 1);
+    }
+    state.transcription.attempts.push(attempt);
+  }
+
   getSnapshot(): AppState { return this.snapshot; }
   subscribe(listener: (state: AppState) => void): () => void {
     this.listeners.add(listener);
@@ -1122,22 +1242,24 @@ export class AppControllerImpl implements AppController {
   }
 
   private persistedState(state: AppState): AppState {
-    const result = { ...state } as AppState & { proactiveQuarantine?: unknown; backupImportQuarantine?: unknown[]; knowledgeQuarantine?: unknown[]; reminderQuarantine?: unknown[]; deviceCalendarQuarantine?: unknown[] };
+    const result = { ...state } as AppState & { proactiveQuarantine?: unknown; backupImportQuarantine?: unknown[]; knowledgeQuarantine?: unknown[]; reminderQuarantine?: unknown[]; deviceCalendarQuarantine?: unknown[]; transcriptionQuarantine?: unknown[] };
     if (this.proactiveQuarantine) result.proactiveQuarantine = clone(this.proactiveQuarantine);
     if (this.backupImportQuarantine.length) result.backupImportQuarantine = clone(this.backupImportQuarantine);
     if (this.knowledgeQuarantine.length) result.knowledgeQuarantine = clone(this.knowledgeQuarantine);
     if (this.reminderQuarantine.length) result.reminderQuarantine = clone(this.reminderQuarantine);
     if (this.deviceEventQuarantine.length) result.deviceCalendarQuarantine = clone(this.deviceEventQuarantine);
+    if (this.transcriptionQuarantine.length) result.transcriptionQuarantine = clone(this.transcriptionQuarantine);
     return result;
   }
 
   private publicState(state: AppState): AppState {
-    const result = clone(state) as AppState & { proactiveQuarantine?: unknown; backupImportQuarantine?: unknown; knowledgeQuarantine?: unknown; reminderQuarantine?: unknown; deviceCalendarQuarantine?: unknown };
+    const result = clone(state) as AppState & { proactiveQuarantine?: unknown; backupImportQuarantine?: unknown; knowledgeQuarantine?: unknown; reminderQuarantine?: unknown; deviceCalendarQuarantine?: unknown; transcriptionQuarantine?: unknown };
     delete result.proactiveQuarantine;
     delete result.backupImportQuarantine;
     delete result.knowledgeQuarantine;
     delete result.reminderQuarantine;
     delete result.deviceCalendarQuarantine;
+    delete result.transcriptionQuarantine;
     return result;
   }
 
@@ -1262,6 +1384,7 @@ export class AppControllerImpl implements AppController {
       const result = await operation(draft);
       await this.evaluateProactiveDraft(draft);
       draft.reminders = validateReminderState(draft.reminders);
+      draft.transcription = clone(validateTranscriptionState(draft.transcription));
       await this.store.save(this.persistedState(draft));
       this.state = draft;
       this.snapshot = deepFreeze(this.publicState(draft));
@@ -1282,6 +1405,7 @@ export class AppControllerImpl implements AppController {
       if (changed) {
         await this.evaluateProactiveDraft(draft);
         draft.reminders = validateReminderState(draft.reminders);
+        draft.transcription = clone(validateTranscriptionState(draft.transcription));
         await this.store.save(this.persistedState(draft));
         this.state = draft;
         this.snapshot = deepFreeze(this.publicState(draft));
@@ -1590,9 +1714,12 @@ export class AppControllerImpl implements AppController {
     delete (normalized as AppState & { knowledgeQuarantine?: unknown[] }).knowledgeQuarantine;
     this.reminderQuarantine = clone((normalized as AppState & { reminderQuarantine?: unknown[] }).reminderQuarantine ?? []);
     delete (normalized as AppState & { reminderQuarantine?: unknown[] }).reminderQuarantine;
+    this.transcriptionQuarantine = clone((normalized as AppState & { transcriptionQuarantine?: unknown[] }).transcriptionQuarantine ?? []);
+    delete (normalized as AppState & { transcriptionQuarantine?: unknown[] }).transcriptionQuarantine;
     this.deviceEventQuarantine = clone((normalized as AppState & { deviceCalendarQuarantine?: unknown[] }).deviceCalendarQuarantine ?? []);
     delete (normalized as AppState & { deviceCalendarQuarantine?: unknown[] }).deviceCalendarQuarantine;
     this.state = normalized;
+    this.state.transcription = clone(normalized.transcription);
     const persisted = loaded as (AppState & { proactiveQuarantine?: unknown }) | undefined;
     const proactive = normalizeProactiveData(persisted?.proactive, persisted?.proactiveQuarantine);
     this.proactiveQuarantine = proactive.quarantine;
@@ -1635,6 +1762,18 @@ export class AppControllerImpl implements AppController {
         this.state.deviceCalendars.dispatchRecords[this.state.deviceCalendars.dispatchRecords.findIndex((item) => item.id === record.id)] = unknown;
       } catch { /* Invalid history is retained privately by normalization and never becomes authorization. */ }
     }
+    const recoveredSpeech = this.state.transcription.attempts.map((attempt) => {
+      if (attempt.outcome !== 'preparing' && attempt.outcome !== 'pending') return attempt;
+      const terminalAt = new Date(Math.max(Date.now(), Date.parse(attempt.createdAt))).toISOString();
+      return attempt.outcome === 'preparing'
+        ? { ...attempt, outcome: 'failed' as const, code: 'preparation_interrupted' as const, terminalAt }
+        : { ...attempt, outcome: 'unknown' as const, code: 'provider_unknown' as const, terminalAt };
+    });
+    this.state.transcription = {
+      ...this.state.transcription,
+      attempts: recoveredSpeech,
+      cleanupLeases: this.state.transcription.cleanupLeases.map((lease) => lease.outcome === 'owned' ? { ...lease, outcome: 'pending_cleanup' as const } : lease),
+    };
     for (const proposal of this.state.proposals) {
       if (proposal.deviceEventDispatchRecordId && proposal.status === 'dispatching') {
         const record = this.state.deviceCalendars.dispatchRecords.find((item) => item.id === proposal.deviceEventDispatchRecordId);
@@ -1672,6 +1811,7 @@ export class AppControllerImpl implements AppController {
     this.snapshot = deepFreeze(this.publicState(this.state));
     this.loaded = true;
     this.emit();
+    if (this.state.transcription.cleanupLeases.some((lease) => lease.outcome === 'pending_cleanup')) void this.retryTranscriptionCleanup().catch(() => undefined);
     for (const document of this.state.documents) this.mirrorDirty.add(document.path);
     await this.retryDocumentMirrors();
   }
@@ -2264,23 +2404,25 @@ export class AppControllerImpl implements AppController {
     return settings.maxAudioSeconds / 60 * settings.speechUsdPerMinute;
   }
 
+  private reserveProviderAttemptDraft(state: AppState, kind: 'model' | 'speech', requestSettings: AppSettings, guard?: (state: AppState) => void): { month: string; day: string; reserve: number } {
+    this.rollUsage(state);
+    guard?.(state);
+    if (state.usage.attemptsToday >= state.settings.maxCallsPerDay) throw new Error('Daily provider call limit reached. Try again tomorrow or adjust the limit in Settings.');
+    const reserve = this.providerReserve(requestSettings, kind);
+    const knownRates = kind === 'model'
+      ? requestSettings.inputUsdPerMillionTokens !== undefined && requestSettings.outputUsdPerMillionTokens !== undefined
+      : requestSettings.speechUsdPerMinute !== undefined;
+    if (knownRates && (state.settings.monthlyBudgetUsd === 0 || state.usage.estimatedCostUsd + state.usage.reservedUsd + reserve > state.settings.monthlyBudgetUsd)) throw new Error('The configured monthly estimate limit does not have room for this bounded provider request.');
+    state.usage.reservedUsd += reserve;
+    state.usage.attemptsToday += 1;
+    state.usage.attempts += 1;
+    state.usage.unknownCharges += 1;
+    state.usage.lastRequestAt = now();
+    return { month: state.usage.month, day: state.usage.day, reserve };
+  }
+
   private async recordProviderAttempt(kind: 'model' | 'speech', requestSettings: AppSettings, guard?: (state: AppState) => void): Promise<{ month: string; day: string; reserve: number }> {
-    return this.mutate((state) => {
-      this.rollUsage(state);
-      guard?.(state);
-      if (state.usage.attemptsToday >= state.settings.maxCallsPerDay) throw new Error('Daily provider call limit reached. Try again tomorrow or adjust the limit in Settings.');
-      const reserve = this.providerReserve(requestSettings, kind);
-      const knownRates = kind === 'model'
-        ? requestSettings.inputUsdPerMillionTokens !== undefined && requestSettings.outputUsdPerMillionTokens !== undefined
-        : requestSettings.speechUsdPerMinute !== undefined;
-      if (knownRates && (state.settings.monthlyBudgetUsd === 0 || state.usage.estimatedCostUsd + state.usage.reservedUsd + reserve > state.settings.monthlyBudgetUsd)) throw new Error('The configured monthly estimate limit does not have room for this bounded provider request.');
-      state.usage.reservedUsd += reserve;
-      state.usage.attemptsToday += 1;
-      state.usage.attempts += 1;
-      state.usage.unknownCharges += 1;
-      state.usage.lastRequestAt = now();
-      return { month: state.usage.month, day: state.usage.day, reserve };
-    });
+    return this.mutate((state) => this.reserveProviderAttemptDraft(state, kind, requestSettings, guard));
   }
 
   private async rollbackUnsentProviderAttempt(reservation: { month: string; day: string; reserve: number }): Promise<void> {
@@ -2313,76 +2455,262 @@ export class AppControllerImpl implements AppController {
     });
   }
 
-  private async settleSpeechUsage(seconds: number, requestSettings: AppSettings): Promise<void> {
-    await this.mutate((state) => {
-      this.rollUsage(state);
-      state.usage.requests += 1;
-      state.usage.transcriptionSeconds += seconds;
-      state.usage.lastRequestAt = now();
-      const rate = requestSettings.speechUsdPerMinute;
-      if (rate !== undefined) {
-        state.usage.reservedUsd = Math.max(0, state.usage.reservedUsd - this.providerReserve(requestSettings, 'speech'));
-        state.usage.estimatedCostUsd += seconds / 60 * rate;
-        state.usage.unknownCharges = Math.max(0, state.usage.unknownCharges - 1);
-      }
-      state.usage.priceKnown = state.usage.unknownCharges === 0 && rate !== undefined;
-    });
+  private settleSpeechUsageDraft(state: AppState, seconds: number, requestSettings: AppSettings, reservation: { month: string; day: string; reserve: number }): void {
+    if (!Number.isFinite(seconds) || seconds <= 0) throw new Error('Provider duration is invalid.');
+    if (state.usage.month !== reservation.month) return;
+    state.usage.requests += 1;
+    state.usage.transcriptionSeconds += seconds;
+    state.usage.lastRequestAt = now();
+    const rate = requestSettings.speechUsdPerMinute;
+    if (rate !== undefined) {
+      state.usage.reservedUsd = Math.max(0, state.usage.reservedUsd - reservation.reserve);
+      state.usage.estimatedCostUsd += seconds / 60 * rate;
+      state.usage.unknownCharges = Math.max(0, state.usage.unknownCharges - 1);
+    }
+    state.usage.priceKnown = state.usage.unknownCharges === 0 && rate !== undefined;
   }
 
-  async transcribeNote(id: string): Promise<Note> {
-    const state = this.snapshot;
-    const note = state.notes.find((item) => item.id === id);
-    if (!note) throw new Error('Note was not found.');
-    if (note.audioAttachment?.durationStatus === 'unknown') throw new Error('This replacement recording has no verified duration. It cannot be sent for transcription.');
-    const sourceRevision = note.revision;
-    if (state.settings.mode !== 'provider') throw new Error('Select Provider mode and configure Azure Speech before transcribing.');
-    if (state.usage.priceKnown && state.usage.estimatedCostUsd >= state.settings.monthlyBudgetUsd) throw new Error('The configured monthly estimate limit has been reached.');
-    const result = await this.speechClient.transcribe(note, state.settings, undefined, async () => { await this.recordProviderAttempt('speech', state.settings); });
-    await this.settleSpeechUsage(result.durationSeconds, state.settings);
-    const updated = await this.mutate(async (draft) => {
-      const current = this.note(draft, id);
-      if (current.revision !== sourceRevision) throw new Error('The transcript changed during transcription. The provider result was discarded.');
-      current.transcript = result.transcript;
-      current.title = result.transcript.split(/\s+/).slice(0, 7).join(' ').slice(0, 72);
-      current.revision += 1;
-      current.durationSeconds = result.durationSeconds;
-      current.status = 'recorded';
-      for (const proposal of draft.proposals.filter((item) => item.noteId === id)) {
-        if (['executed', 'accepted', 'simulated', 'dismissed', 'dispatching', 'unknown'].includes(proposal.status)) continue;
-        this.invalidate(proposal);
-        proposal.status = 'draft';
-      }
-      addActivity(draft, 'local_action', 'Audio transcribed by Azure Speech and saved to the note.', { noteId: id });
-      return current;
-    });
-    if (state.settings.audioRetention === 'delete_after_transcription' && note.audioUri) {
-      try {
-        const retentionUri = note.audioUri;
-        const detach = await this.mutate((draft) => {
-          const current = this.note(draft, id);
-          if (current.revision !== updated.revision || current.audioUri !== retentionUri) return { note: current, detached: false };
-          delete current.audioUri;
-          delete current.audioAttachment;
-          if (current.importOrigin?.kind === 'backup_import') current.importOrigin = { ...current.importOrigin, audioMissing: true };
-          current.revision += 1;
-          delete current.processingFingerprint;
-          if (current.analysis) current.analysis.stale = true;
-          for (const proposal of draft.proposals.filter((item) => item.noteId === id && ['draft', 'approved', 'failed'].includes(item.status))) {
-            this.invalidate(proposal);
-            proposal.status = 'draft';
-          }
-          addActivity(draft, 'local_action', 'Original recording detached after transcription, as configured.', { noteId: id });
-          return { note: current, detached: true };
-        });
-        if (detach.detached) {
-          try { await removeAudio(retentionUri); } catch { /* The canonical note no longer references this private clip. */ }
-        }
-        return detach.note;
-      } catch {
-        return updated;
-      }
+  private finishTranscriptionReservationDraft(state: AppState, reservation: { month: string; day: string; reserve: number }): void {
+    if (state.usage.month === reservation.month) {
+      state.usage.unknownCharges = Math.max(0, state.usage.unknownCharges - 1);
+      state.usage.reservedUsd = Math.max(0, state.usage.reservedUsd - reservation.reserve);
     }
-    return updated;
+    if (state.usage.day === reservation.day) state.usage.attemptsToday = Math.max(0, state.usage.attemptsToday - 1);
+    state.usage.attempts = Math.max(0, state.usage.attempts - 1);
+    state.usage.priceKnown = state.usage.unknownCharges === 0 && state.settings.speechUsdPerMinute !== undefined;
+  }
+
+  private async recoverOrphanedTranscriptions(noteId: string, excludeAttemptId?: string): Promise<number> {
+    let recovered = 0;
+    if (!this.snapshot.transcription.attempts.some((item) => item.noteId === noteId && item.id !== excludeAttemptId && (item.outcome === 'preparing' || item.outcome === 'pending'))) return 0;
+    await this.mutate((state) => {
+      const activeIds = new Set([...this.transcriptionJobs.values()].map((job) => job.attemptId));
+      const candidates = state.transcription.attempts.filter((item) => item.noteId === noteId && item.id !== excludeAttemptId && !activeIds.has(item.id) && (item.outcome === 'preparing' || item.outcome === 'pending')).slice(-8);
+      for (const attempt of candidates) {
+        const terminalAt = new Date(Math.max(Date.now(), Date.parse(attempt.createdAt))).toISOString();
+        attempt.outcome = attempt.outcome === 'preparing' ? 'failed' : 'unknown';
+        attempt.code = attempt.outcome === 'failed' ? 'preparation_interrupted' : 'provider_unknown';
+        attempt.terminalAt = terminalAt;
+        const lease = state.transcription.cleanupLeases.find((item) => item.leaseId === attempt.leaseId);
+        if (lease && lease.outcome !== 'released') lease.outcome = 'pending_cleanup';
+        recovered += 1;
+      }
+    });
+    return recovered;
+  }
+
+  transcribeNote(id: string, options?: { expectedRevision: number }): Promise<Note> {
+    const requestedRevision = options?.expectedRevision ?? this.snapshot.notes.find((item) => item.id === id)?.revision ?? -1;
+    const existing = this.transcriptionJobs.get(id);
+    if (existing) {
+      if (existing.sourceRevision !== requestedRevision) return Promise.reject(new Error('A transcription is already running for a different note revision.'));
+      return existing.promise;
+    }
+    const controller = new AbortController();
+    const attemptId = newId();
+    const job: { attemptId: string; sourceRevision: number; leaseId: string; controller: AbortController; promise: Promise<Note> } = {
+      attemptId, sourceRevision: requestedRevision, leaseId: newId(), controller, promise: Promise.resolve(undefined as unknown as Note),
+    };
+    const promise = this.transcribeNoteInternal(id, requestedRevision, attemptId, controller, job)
+      .finally(() => {
+        if (this.transcriptionJobs.get(id) === job) this.transcriptionJobs.delete(id);
+        this.markTranscriptionCleanupPending(job.leaseId);
+      });
+    job.promise = promise;
+    this.transcriptionJobs.set(id, job);
+    return promise;
+  }
+
+  private async transcribeNoteInternal(id: string, requestedRevision: number, attemptId: string, controller: AbortController,
+    job: { attemptId: string; sourceRevision: number; leaseId: string; controller: AbortController; promise: Promise<Note> }): Promise<Note> {
+    await this.load();
+    if (this.transcriptionQuarantine.length) throw new Error('Speech-transcription history failed integrity validation. New cloud transcription is disabled until recovery.');
+    if (await this.recoverOrphanedTranscriptions(id, attemptId)) {
+      void this.retryTranscriptionCleanup().catch(() => undefined);
+      throw new Error('An earlier transcription was recovered as interrupted or uncertain. Review its status before starting a new transcription.');
+    }
+    const initial = this.snapshot;
+    const note = initial.notes.find((item) => item.id === id);
+    if (!note) throw new Error('Note was not found.');
+    if (requestedRevision >= 0 && note.revision !== requestedRevision) throw new Error('The note changed before transcription. Review the current note and try again.');
+    if (!note.audioUri) throw new Error('This note has no audio to transcribe.');
+    if (note.audioAttachment?.durationStatus === 'unknown') throw new Error('This replacement recording has no verified duration. It cannot be sent for transcription.');
+    if (!Number.isFinite(note.durationSeconds) || note.durationSeconds <= 0 || note.durationSeconds > initial.settings.maxAudioSeconds) throw new Error('The recording duration is outside the configured transcription limit.');
+    if (!initial.settings.speechEnabled) throw new Error('Enable Azure Speech transcription in Settings before transcribing.');
+    const speechEndpoint = initial.settings.speechEndpoint;
+    if (!speechEndpoint) throw new Error('Add an Azure Speech endpoint before transcribing.');
+    const sourceRevision = note.revision;
+    const source = transcriptionSourceProjection(note, initial.settings);
+    const settings = clone(initial.settings);
+    const settingsProjection = speechSettingsProjection(settings);
+    job.sourceRevision = sourceRevision;
+    const attempt: TranscriptionAttempt = {
+      id: attemptId, leaseId: job.leaseId, noteId: id, sourceRevision, source, endpoint: validateAzureEndpoint(speechEndpoint, 'speech'),
+      locale: 'en-US', createdAt: now(), dispatchStarted: false, outcome: 'preparing',
+    };
+    await this.mutate((state) => {
+      if (this.transcriptionQuarantine.length) throw new Error('Speech-transcription history failed integrity validation.');
+      const current = state.notes.find((item) => item.id === id);
+      if (!current || current.revision !== sourceRevision || stableJson(transcriptionSourceProjection(current, state.settings)) !== stableJson(source) || speechSettingsProjection(state.settings) !== settingsProjection) {
+        throw new Error('The note or transcription settings changed before preparation. Review the current note and try again.');
+      }
+      this.addTranscriptionAttempt(state, attempt);
+      if (state.transcription.cleanupLeases.length >= 500) throw new Error('Speech cleanup history is full. Retry cleanup before transcribing.');
+      state.transcription.cleanupLeases.push({ leaseId: job.leaseId, attemptId, createdAt: now(), outcome: 'owned' });
+    });
+
+    const leaseId = job.leaseId;
+    let preparedSnapshot: SpeechAudioSnapshot | undefined;
+    const ensureCurrent = (state: AppState, outcome: 'preparing' | 'pending') => {
+      const current = state.notes.find((item) => item.id === id);
+      const savedAttempt = state.transcription.attempts.find((item) => item.id === attemptId);
+      if (controller.signal.aborted) throw new Error('Transcription was cancelled.');
+      if (this.transcriptionQuarantine.length || !state.settings.speechEnabled || speechSettingsProjection(state.settings) !== settingsProjection ||
+          !current || current.revision !== sourceRevision || stableJson(transcriptionSourceProjection(current, state.settings)) !== stableJson(source)) throw new Error('The note or transcription settings changed. The transcription request was stopped.');
+      if (!savedAttempt || savedAttempt.sourceRevision !== sourceRevision || savedAttempt.outcome !== outcome) throw new Error('The transcription attempt is no longer active.');
+      return savedAttempt;
+    };
+    const onPrepared = async (prepared: PreparedSpeechAudio) => {
+      const snapshot = validateSpeechAudioSnapshot(prepared);
+      if (snapshot.leaseId !== leaseId) throw new Error('Prepared audio lease does not match this request.');
+      await this.mutate((state) => {
+        const savedAttempt = ensureCurrent(state, 'preparing');
+        savedAttempt.prepared = snapshot;
+        preparedSnapshot = snapshot;
+      });
+    };
+    const onAttempt = async (prepared: PreparedSpeechAudio) => {
+      const snapshot = validateSpeechAudioSnapshot(prepared);
+      if (!preparedSnapshot || stableJson(snapshot) !== stableJson(preparedSnapshot)) throw new Error('Prepared audio changed before dispatch.');
+      await this.mutate((state) => {
+        const savedAttempt = ensureCurrent(state, 'preparing');
+        const claim = this.reserveProviderAttemptDraft(state, 'speech', settings);
+        savedAttempt.reservation = claim;
+        savedAttempt.dispatchStarted = true;
+        savedAttempt.outcome = 'pending';
+      });
+    };
+    const beforeDispatch = (prepared: PreparedSpeechAudio) => {
+      const snapshot = validateSpeechAudioSnapshot(prepared);
+      const current = this.snapshot;
+      const currentNote = current.notes.find((item) => item.id === id);
+      const currentAttempt = current.transcription.attempts.find((item) => item.id === attemptId);
+      if (controller.signal.aborted || this.transcriptionQuarantine.length || !current.settings.speechEnabled || speechSettingsProjection(current.settings) !== settingsProjection ||
+          !currentNote || currentNote.revision !== sourceRevision || stableJson(transcriptionSourceProjection(currentNote, current.settings)) !== stableJson(source) ||
+          currentAttempt?.outcome !== 'pending' || !currentAttempt.reservation || stableJson(currentAttempt.prepared) !== stableJson(preparedSnapshot) || stableJson(snapshot) !== stableJson(preparedSnapshot)) {
+        throw new Error('The note, audio, settings, or transcription claim changed before upload. No audio was sent.');
+      }
+    };
+
+    let providerCleanup: Promise<void> | undefined;
+    let providerResult: SpeechTranscriptionResult | undefined;
+    try {
+      const result = await this.speechClient.transcribe(note, settings, controller.signal, onAttempt, beforeDispatch, onPrepared, leaseId);
+      providerResult = result;
+      providerCleanup = result.cleanupPromise;
+      if (!Number.isSafeInteger(result.durationMilliseconds) || result.durationMilliseconds <= 0 || result.durationMilliseconds > 600_000 ||
+          !Number.isSafeInteger(result.billedEstimateSeconds) || result.billedEstimateSeconds !== Math.ceil(result.durationMilliseconds / 1000)) {
+        throw new SpeechTranscriptionError('Speech duration could not be verified; provider charge status is unknown.', 'provider_unknown', true);
+      }
+      const transcriptHash = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, result.transcript);
+      const savedNote = await this.mutate((state) => {
+        const savedAttempt = state.transcription.attempts.find((item) => item.id === attemptId);
+        if (!savedAttempt?.dispatchStarted || !savedAttempt.reservation) throw new Error('The dispatched transcription receipt was not found.');
+        this.settleSpeechUsageDraft(state, result.billedEstimateSeconds, settings, savedAttempt.reservation);
+        const current = state.notes.find((item) => item.id === id);
+        const matches = Boolean(!controller.signal.aborted && current && current.revision === sourceRevision && stableJson(transcriptionSourceProjection(current, state.settings)) === stableJson(source));
+        savedAttempt.outcome = controller.signal.aborted ? 'cancelled' : matches ? 'completed' : 'discarded';
+        if (controller.signal.aborted) savedAttempt.code = 'cancelled';
+        else if (!matches) savedAttempt.code = 'discarded';
+        savedAttempt.terminalAt = now();
+        savedAttempt.durationMilliseconds = result.durationMilliseconds;
+        savedAttempt.billedEstimateSeconds = result.billedEstimateSeconds;
+        savedAttempt.rateEstimated = settings.speechUsdPerMinute === undefined;
+        savedAttempt.transcriptSha256 = transcriptHash.toLowerCase();
+        const lease = state.transcription.cleanupLeases.find((item) => item.leaseId === leaseId);
+        if (lease) lease.outcome = 'pending_cleanup';
+        if (!matches || !current) return { note: current, discarded: true };
+        current.transcript = result.transcript;
+        current.title = result.transcript.split(/\s+/).slice(0, 7).join(' ').slice(0, 72);
+        current.revision += 1;
+        current.status = 'recorded';
+        delete current.processingFingerprint;
+        if (current.analysis) current.analysis.stale = true;
+        for (const proposal of state.proposals.filter((item) => item.noteId === id)) {
+          if (['executed', 'accepted', 'simulated', 'dismissed', 'dispatching', 'unknown'].includes(proposal.status)) continue;
+          this.invalidate(proposal); proposal.status = 'draft';
+        }
+        addActivity(state, 'local_action', 'Audio transcribed by Azure Speech and saved to the note.', { noteId: id });
+        return { note: current, discarded: false };
+      });
+      if (savedNote.discarded || !savedNote.note) throw new Error('The note changed while transcription was in progress. The valid provider result was recorded but not applied.');
+      let updated = clone(savedNote.note);
+      const terminal = this.snapshot.transcription.attempts.find((item) => item.id === attemptId);
+      if (terminal?.outcome === 'completed' && this.snapshot.settings.audioRetention === 'delete_after_transcription' && source.audioUri) {
+        const retentionUri = source.audioUri;
+        try {
+          const detach = await this.mutate((draft) => {
+            const current = draft.notes.find((item) => item.id === id);
+            if (!current || current.revision !== updated.revision || current.audioUri !== retentionUri || draft.settings.audioRetention !== 'delete_after_transcription' || draft.notes.some((other) => other.id !== id && other.audioUri === retentionUri)) return { note: current, detached: false };
+            delete current.audioUri; delete current.audioAttachment;
+            if (current.importOrigin?.kind === 'backup_import') current.importOrigin = { ...current.importOrigin, audioMissing: true };
+            current.revision += 1; delete current.processingFingerprint; if (current.analysis) current.analysis.stale = true;
+            for (const proposal of draft.proposals.filter((item) => item.noteId === id && ['draft', 'approved', 'failed'].includes(item.status))) { this.invalidate(proposal); proposal.status = 'draft'; }
+            addActivity(draft, 'local_action', 'Original recording detached after transcription, as configured.', { noteId: id });
+            return { note: current, detached: true };
+          });
+          if (detach.detached && detach.note) { try { await removeAudio(retentionUri); } catch { /* The note no longer references this private clip. */ } updated = clone(detach.note); }
+        } catch { /* Durable transcript stays committed if clip cleanup fails. */ }
+      }
+      this.markTranscriptionCleanupPending(leaseId);
+      if (providerCleanup) this.trackTranscriptionCleanup(leaseId, providerCleanup);
+      return updated;
+    } catch (error) {
+      const typed = error instanceof SpeechTranscriptionError ? error : undefined;
+      await this.mutate((state) => {
+        const savedAttempt = state.transcription.attempts.find((item) => item.id === attemptId);
+        if (!savedAttempt || ['completed', 'no_speech', 'failed', 'unknown', 'discarded', 'cancelled'].includes(savedAttempt.outcome)) return;
+        const dispatched = typed ? typed.dispatched : savedAttempt.dispatchStarted;
+        if (!dispatched && savedAttempt.reservation) {
+          this.finishTranscriptionReservationDraft(state, savedAttempt.reservation);
+          delete savedAttempt.reservation;
+          savedAttempt.dispatchStarted = false;
+        }
+        const duration = typed?.durationMilliseconds ?? providerResult?.durationMilliseconds;
+        if (dispatched && Number.isSafeInteger(duration) && duration! > 0 && duration! <= 600_000 && savedAttempt.reservation) {
+          const billed = Math.ceil(duration! / 1000);
+          this.settleSpeechUsageDraft(state, billed, settings, savedAttempt.reservation);
+          savedAttempt.durationMilliseconds = duration;
+          savedAttempt.billedEstimateSeconds = billed;
+          savedAttempt.rateEstimated = settings.speechUsdPerMinute === undefined;
+        }
+        const code: SpeechAttemptCode = typed ? speechErrorCode(error) : dispatched ? 'provider_unknown' : speechErrorCode(error);
+        savedAttempt.code = code; savedAttempt.terminalAt = now();
+        savedAttempt.outcome = dispatched ? code === 'no_speech' ? 'no_speech' : code === 'provider_rejected' ? 'failed' : code === 'cancelled' ? 'cancelled' : 'unknown' : code === 'cancelled' ? 'cancelled' : 'failed';
+        const lease = state.transcription.cleanupLeases.find((item) => item.leaseId === leaseId);
+        if (lease) lease.outcome = 'pending_cleanup';
+      });
+      const cleanup = typed?.cleanupPromise ?? providerCleanup;
+      if (cleanup) this.trackTranscriptionCleanup(leaseId, cleanup);
+      throw error;
+    }
+  }
+
+  async cancelTranscription(noteId: string, input?: { attemptId?: string }): Promise<{ status: 'cancelled' | 'already_terminal' | 'not_running' }> {
+    const job = this.transcriptionJobs.get(noteId);
+    if (job && (!input?.attemptId || input.attemptId === job.attemptId)) {
+      job.controller.abort(new Error('Transcription cancelled by the user.'));
+      return { status: 'cancelled' };
+    }
+    await this.load();
+    const attempt = this.snapshot.transcription.attempts.filter((item) => item.noteId === noteId).at(-1);
+    if (attempt && (attempt.outcome === 'preparing' || attempt.outcome === 'pending') && (!input?.attemptId || input.attemptId === attempt.id)) {
+      await this.recoverOrphanedTranscriptions(noteId);
+      this.markTranscriptionCleanupPending(attempt.leaseId);
+      return { status: 'already_terminal' };
+    }
+    return attempt && ['completed', 'no_speech', 'failed', 'unknown', 'discarded', 'cancelled'].includes(attempt.outcome)
+      ? { status: 'already_terminal' } : { status: 'not_running' };
   }
 
   private assertDeviceCalendarWritable(state: AppState): void {
@@ -4497,6 +4825,7 @@ export class AppControllerImpl implements AppController {
 
   async saveSettings(patch: SettingsPatch): Promise<AppSettings> {
     const sanitized: SettingsPatch = { ...patch };
+    if ('speechEnabled' in sanitized && typeof sanitized.speechEnabled !== 'boolean') throw new Error('Choose whether cloud transcription is enabled.');
     if ('speechEndpoint' in sanitized) sanitized.speechEndpoint = sanitized.speechEndpoint ? validateAzureEndpoint(sanitized.speechEndpoint, 'speech') : undefined;
     if ('openAiEndpoint' in sanitized) sanitized.openAiEndpoint = sanitized.openAiEndpoint ? validateAzureEndpoint(sanitized.openAiEndpoint, 'openai') : undefined;
     if (sanitized.model && sanitized.model !== 'gpt-6-luna') throw new Error('This app is configured for GPT-6 Luna only.');

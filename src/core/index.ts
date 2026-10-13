@@ -452,6 +452,8 @@ export interface ActivityItem {
 export interface AppSettings {
   mode: 'preview' | 'provider';
   timezone: string;
+  /** Speech transcription is an explicit, independent provider opt-in. */
+  speechEnabled?: boolean;
   speechEndpoint?: string;
   speechRegion?: string;
   openAiEndpoint?: string;
@@ -615,6 +617,8 @@ export interface AppState {
   activity: ActivityItem[];
   settings: AppSettings;
   usage: UsageLedger;
+  transcription: import('../transcription').TranscriptionState;
+  transcriptionRecoveryStatus?: { quarantined: true; message: 'Some speech-transcription history could not be validated and is held privately. New cloud transcription is disabled until recovery.' };
   mailbox: MailboxSnapshotMessage[];
   selectedMailTexts: SelectedMailTextSnapshot[];
   calendarEvents: CalendarEventSnapshot[];
@@ -801,7 +805,8 @@ export interface AppController {
   refreshAnalysisStatus(noteId: string): Promise<NoteAssistResult | undefined>;
   checkProposalFreshness(id: string): Promise<{ current: boolean; reason?: string }>;
   reconcileDispatch(recordId: string, input: { disposition: import('../dispatch').DispatchReconciliation; note: string; remoteId?: string }): Promise<import('../dispatch').DispatchRecord>;
-  transcribeNote(id: string): Promise<Note>;
+  transcribeNote(id: string, options?: { expectedRevision: number }): Promise<Note>;
+  cancelTranscription(noteId: string, input?: { attemptId?: string }): Promise<{ status: 'cancelled' | 'already_terminal' | 'not_running' }>;
   editProposal(id: string, patch: ProposalPatch, options?: { expectedRevision: number }): Promise<Proposal>;
   approveProposal(id: string, options?: { expectedRevision: number }): Promise<Proposal>;
   executeProposal(id: string, options?: { expectedRevision: number }): Promise<Proposal>;
