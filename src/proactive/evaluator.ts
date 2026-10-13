@@ -18,7 +18,6 @@ const MAX_DISMISSALS = 5000;
 const MAX_ACTIVE_PER_ACCOUNT = 5;
 const MAX_ACTIVE_TOTAL = 20;
 const MAX_DEFERRED = 200;
-const MAX_CANDIDATE_OUTPUT = MAX_ACTIVE_TOTAL + MAX_DEFERRED;
 const DAY_MS = 86_400_000;
 const EMAIL = /^[^\s<>@,;]+@[^\s<>@,;]+\.[^\s<>@,;]+$/;
 const TIMESTAMP_OFFSET = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,7})?)?(?:Z|[+-]\d{2}:\d{2})$/i;
@@ -49,7 +48,7 @@ function parseTimestamp(value: string | undefined, certifiedUtcNaive: boolean | 
   if (value === undefined) return undefined;
   if (TIMESTAMP_OFFSET.test(value)) {
     const parts = TIMESTAMP_OFFSET_PARTS.exec(value)!;
-    const [, y, m, d, h, min, sec = '0', fraction = '0', zone, zoneHour = '0', zoneMinute = '0'] = parts;
+    const [, y, m, d, h, min, sec = '0', fraction = '0', , zoneHour = '0', zoneMinute = '0'] = parts;
     if (!isCalendarDateValid(Number(y), Number(m), Number(d), Number(h), Number(min), Number(sec)) || Number(zoneHour) > 23 || Number(zoneMinute) > 59) fail(`${label} is invalid.`);
     const normalized = fraction === '0' ? value : value.replace(`.${fraction}`, `.${fraction.slice(0, 3).padEnd(3, '0')}`);
     const date = Date.parse(normalized);
@@ -172,7 +171,7 @@ function isQuiet(now: number, timeZone: string, quiet: { start: string; end: str
   return start < end ? minute >= start && minute < end : minute >= start || minute < end;
 }
 function exactSubstring(text: string, needle: string): string | undefined {
-  const offsets: Array<{ start: number; end: number }> = [];
+  const offsets: { start: number; end: number }[] = [];
   let folded = '';
   let position = 0;
   for (const character of text) {
@@ -203,7 +202,7 @@ function candidateFor(rule: ProactiveRule, source: ProactiveSource, trigger: Pro
     const unreadOnly = trigger.unreadOnly !== false;
     if (unreadOnly && source.isRead === true) return { uncertain: false };
     if (unreadOnly && source.isRead === undefined) return { uncertain: true };
-    const fields: Array<['subject' | 'snippet', string | undefined]> = [['subject', source.subject], ['snippet', source.snippet]];
+    const fields: ['subject' | 'snippet', string | undefined][] = [['subject', source.subject], ['snippet', source.snippet]];
     for (const [field, text] of fields) {
       if (!text) continue;
       for (const keyword of trigger.keywords) {

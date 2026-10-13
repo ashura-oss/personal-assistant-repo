@@ -131,7 +131,7 @@ export interface MessageSummary {
   cc?: string[];
   references?: string;
   inReplyTo?: string;
-  headers?: Array<{ name: string; value: string }>;
+  headers?: { name: string; value: string }[];
 }
 
 export interface SelectedMessageTextResult {
@@ -329,11 +329,11 @@ async function strictSelectedJson(response: Response): Promise<unknown> {
   return JSON.parse(text) as unknown;
 }
 
-function validateCalendarEventPage(value: unknown): asserts value is Array<{
+function validateCalendarEventPage(value: unknown): asserts value is {
   id: string; subject?: string; summary?: string;
   start?: { dateTime?: string; timeZone?: string; date?: string };
   end?: { dateTime?: string; timeZone?: string; date?: string };
-}> | undefined {
+}[] | undefined {
   if (value === undefined) return;
   if (!Array.isArray(value)) throw new Error('Provider returned an invalid calendar event page.');
   if (value.length > MAX_PAGE_SIZE) throw new Error('Provider returned more calendar events than the requested page size; page was not committed.');
@@ -377,7 +377,7 @@ function graphImmutableHeaders(init: RequestInit): Headers {
   return headers;
 }
 
-function boundedHeaders(input: unknown): Array<{ name: string; value: string }> {
+function boundedHeaders(input: unknown): { name: string; value: string }[] {
   if (!Array.isArray(input)) return [];
   const allowed = new Set(['subject', 'from', 'reply-to', 'to', 'cc', 'message-id', 'references', 'in-reply-to']);
   return input.flatMap((item) => {
@@ -424,7 +424,7 @@ function validMessageId(value: string): boolean {
   return value.length <= 998 && /^<[^<>\s\u0000-\u0020\u007f]+@[^<>\s\u0000-\u0020\u007f]+>$/.test(value);
 }
 
-function graphRecipients(values: string[]): Array<{ emailAddress: { address: string } }> {
+function graphRecipients(values: string[]): { emailAddress: { address: string } }[] {
   return emailList(values, 'reply recipient').map((address) => ({ emailAddress: { address } }));
 }
 
@@ -483,10 +483,10 @@ function safeSizeEstimate(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 }
 
-function selectedHeaderSet(value: unknown): { headers: Array<{ name: string; value: string }>; complete: boolean } {
+function selectedHeaderSet(value: unknown): { headers: { name: string; value: string }[]; complete: boolean } {
   const allowed = new Set(['subject', 'from', 'reply-to', 'to', 'cc', 'message-id', 'references', 'in-reply-to']);
   if (!Array.isArray(value)) return { headers: [], complete: false };
-  const headers: Array<{ name: string; value: string }> = [];
+  const headers: { name: string; value: string }[] = [];
   const seen = new Set<string>();
   let complete = true;
   for (const item of value) {
@@ -776,7 +776,7 @@ export class ConnectorClient {
     let nextCursor: string | undefined;
     let pageItems: MessageSummary[];
     if (account.provider === 'google') {
-      const page = await this.json<{ messages?: Array<{ id?: string; threadId?: string }>; nextPageToken?: string }>(account, url.toString(), 'mail', undefined, options.guard, options.signal, options.allowTokenRefresh ?? true);
+      const page = await this.json<{ messages?: { id?: string; threadId?: string }[]; nextPageToken?: string }>(account, url.toString(), 'mail', undefined, options.guard, options.signal, options.allowTokenRefresh ?? true);
       if (page.messages !== undefined && !Array.isArray(page.messages)) throw new Error('Gmail returned an invalid message page.');
       if ((page.messages?.length ?? 0) > size) throw new Error('Gmail returned more messages than the requested page size; page was not committed.');
       nextCursor = page.nextPageToken
@@ -786,7 +786,7 @@ export class ConnectorClient {
       const ids = page.messages ?? [];
       for (const listed of ids) {
         if (typeof listed.id !== 'string' || !listed.id) throw new Error('Gmail returned a message without an ID.');
-        let detail: { id?: string; threadId?: string; historyId?: string; sizeEstimate?: number; snippet?: string; internalDate?: string; labelIds?: string[]; payload?: { headers?: Array<{ name?: string; value?: string }> } };
+        let detail: { id?: string; threadId?: string; historyId?: string; sizeEstimate?: number; snippet?: string; internalDate?: string; labelIds?: string[]; payload?: { headers?: { name?: string; value?: string }[] } };
         try {
           const detailUrl = new URL(`${GOOGLE_API}/messages/${encodeURIComponent(listed.id)}`);
           detailUrl.searchParams.set('format', 'metadata');
@@ -822,13 +822,13 @@ export class ConnectorClient {
           references: get('references')?.slice(0, 2000), inReplyTo: get('in-reply-to')?.slice(0, 1000), headers });
       }
     } else {
-      const page = await this.json<{ value?: Array<{
+      const page = await this.json<{ value?: {
         id?: string; conversationId?: string; changeKey?: string; subject?: string; isRead?: boolean;
         from?: { emailAddress?: { name?: string; address?: string } }; receivedDateTime?: string; bodyPreview?: string;
-        replyTo?: Array<{ emailAddress?: { address?: string } }>; toRecipients?: Array<{ emailAddress?: { address?: string } }>;
-        ccRecipients?: Array<{ emailAddress?: { address?: string } }>; internetMessageId?: string;
-        internetMessageHeaders?: Array<{ name?: string; value?: string }>;
-      }>; '@odata.nextLink'?: string }>(account, url.toString(), 'mail', undefined, options.guard, options.signal, options.allowTokenRefresh ?? true);
+        replyTo?: { emailAddress?: { address?: string } }[]; toRecipients?: { emailAddress?: { address?: string } }[];
+        ccRecipients?: { emailAddress?: { address?: string } }[]; internetMessageId?: string;
+        internetMessageHeaders?: { name?: string; value?: string }[];
+      }[]; '@odata.nextLink'?: string }>(account, url.toString(), 'mail', undefined, options.guard, options.signal, options.allowTokenRefresh ?? true);
       if (!Array.isArray(page.value)) throw new Error('Microsoft returned an invalid message page.');
       if (page.value.length > size) throw new Error('Microsoft returned more messages than the requested page size; page was not committed.');
       nextCursor = page['@odata.nextLink'];
@@ -1001,9 +1001,9 @@ export class ConnectorClient {
         if (options.query) url.searchParams.set('$search', `"${options.query.slice(0, 200).replace(/["\\]/g, '')}"`);
       }
       const page = await this.json<{
-        messages?: Array<{ id: string; threadId?: string }>;
+        messages?: { id: string; threadId?: string }[];
         nextPageToken?: string;
-        value?: Array<{ id: string; subject?: string; from?: { emailAddress?: { address?: string } }; receivedDateTime?: string; bodyPreview?: string }>;
+        value?: { id: string; subject?: string; from?: { emailAddress?: { address?: string } }; receivedDateTime?: string; bodyPreview?: string }[];
         '@odata.nextLink'?: string;
       }>(account, url.toString(), 'mail', options.query && account.provider === 'microsoft' ? { headers: { ConsistencyLevel: 'eventual' } } : undefined, options.guard, options.signal);
       pagesRead++;
@@ -1021,7 +1021,7 @@ export class ConnectorClient {
       if (account.provider === 'google' && detailCount < MAX_DETAILS) {
         for (let i = 0; i < pageItems.length && detailCount < MAX_DETAILS; i++, detailCount++) {
           const item = pageItems[i];
-          const detail = await this.json<{ id: string; threadId?: string; snippet?: string; internalDate?: string; payload?: { headers?: Array<{ name: string; value: string }> } }>(account, `${GOOGLE_API}/messages/${encodeURIComponent(item.id)}?format=metadata&metadataHeaders=Subject&metadataHeaders=From`, 'mail', undefined, options.guard, options.signal);
+          const detail = await this.json<{ id: string; threadId?: string; snippet?: string; internalDate?: string; payload?: { headers?: { name: string; value: string }[] } }>(account, `${GOOGLE_API}/messages/${encodeURIComponent(item.id)}?format=metadata&metadataHeaders=Subject&metadataHeaders=From`, 'mail', undefined, options.guard, options.signal);
           const header = (name: string) => detail.payload?.headers?.find((h) => h.name.toLowerCase() === name.toLowerCase())?.value;
           pageItems[i] = { id: detail.id, threadId: detail.threadId, subject: header('Subject'), from: header('From'), receivedAt: detail.internalDate ? new Date(Number(detail.internalDate)).toISOString() : undefined, snippet: detail.snippet?.slice(0, 500) };
         }
@@ -1045,11 +1045,11 @@ export class ConnectorClient {
         : cursor ? safeUrl(cursor, account.provider, 'calendar', `${GRAPH_API}/me/calendars`) : new URL(`${GRAPH_API}/me/calendars?$top=100`);
       let pageItems: CalendarSummary[];
       if (account.provider === 'google') {
-        const data = await this.json<{ items?: Array<{ id: string; summary?: string; accessRole?: string }>; nextPageToken?: string }>(account, url.toString(), 'calendar', undefined, options.guard, options.signal);
+        const data = await this.json<{ items?: { id: string; summary?: string; accessRole?: string }[]; nextPageToken?: string }>(account, url.toString(), 'calendar', undefined, options.guard, options.signal);
         pageItems = (data.items ?? []).slice(0, 100).map((c) => ({ id: c.id, name: c.summary ?? c.id, writable: c.accessRole === 'owner' || c.accessRole === 'writer' }));
         cursor = data.nextPageToken ? `${GOOGLE_CALENDAR}/users/me/calendarList?maxResults=100&pageToken=${encodeURIComponent(data.nextPageToken)}` : undefined;
       } else {
-        const data = await this.json<{ value?: Array<{ id: string; name?: string; canEdit?: boolean }>; '@odata.nextLink'?: string }>(account, url.toString(), 'calendar', undefined, options.guard, options.signal);
+        const data = await this.json<{ value?: { id: string; name?: string; canEdit?: boolean }[]; '@odata.nextLink'?: string }>(account, url.toString(), 'calendar', undefined, options.guard, options.signal);
         pageItems = (data.value ?? []).slice(0, 100).map((c) => ({ id: c.id, name: c.name ?? c.id, writable: Boolean(c.canEdit) }));
         cursor = data['@odata.nextLink'];
         if (cursor) safeUrl(cursor, account.provider, 'calendar', `${GRAPH_API}/me/calendars`);
@@ -1265,12 +1265,12 @@ export class ConnectorClient {
     return b64(new TextEncoder().encode(message)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
   }
 
-  private async checkedAttachments(payload: EmailProposalPayload): Promise<Array<{ '@odata.type': '#microsoft.graph.fileAttachment'; name: string; contentType: string; contentBytes: string }>> {
+  private async checkedAttachments(payload: EmailProposalPayload): Promise<{ '@odata.type': '#microsoft.graph.fileAttachment'; name: string; contentType: string; contentBytes: string }[]> {
     if (!payload.attachments.length) return [];
     if (!this.deps.loadAttachment || !this.deps.sha256) throw new Error('Attachment verification is unavailable.');
     const totalBytes = payload.attachments.reduce((sum, item) => sum + item.sizeBytes, 0);
     if (!Number.isFinite(totalBytes) || totalBytes > MAX_ATTACHMENT_BYTES) throw new Error('Email attachments exceed the 3 MB total limit.');
-    const out: Array<{ '@odata.type': '#microsoft.graph.fileAttachment'; name: string; contentType: string; contentBytes: string }> = [];
+    const out: { '@odata.type': '#microsoft.graph.fileAttachment'; name: string; contentType: string; contentBytes: string }[] = [];
     for (const attachment of payload.attachments) {
       if (!attachment.id || attachment.fileName.length > 200 || attachment.mimeType.length > 255 || !Number.isInteger(attachment.sizeBytes) || attachment.sizeBytes < 0 || attachment.sizeBytes > MAX_ATTACHMENT_BYTES || !/^[a-f0-9]{64}$/i.test(attachment.sha256) || /[\r\n\0]/.test(attachment.fileName) || !/^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$/i.test(attachment.mimeType)) throw new Error('Invalid attachment metadata.');
       const bytes = await this.deps.loadAttachment(attachment.id);

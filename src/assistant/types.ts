@@ -20,20 +20,20 @@ export interface LocalContextSnapshotInput {
   transcript: { revision: number; text: string };
   query?: string;
   intent?: AssistantIntent;
-  documents?: Array<{ path: string; revision: number; content: string; updatedAt?: string; selectionPriority?: 0 | 1 | 2 }>;
+  documents?: { path: string; revision: number; content: string; updatedAt?: string; selectionPriority?: 0 | 1 | 2 }[];
   knowledge?: AssistantSourceInput[];
   notes?: { id: string; title: string; revision: number; transcript: string; updatedAt?: string; selectionPriority?: 0 | 1 | 2 }[];
-  tasks?: Array<{ id: string; title: string; body: string; status: string; dueAt?: string; updatedAt?: string; selectionPriority?: 0 | 1 | 2 }>;
-  calendars?: Array<{ id: string; accountId: string; identityKey?: string; providerId?: string; name: string; writable: boolean; connected: boolean }>;
-  calendarEvents?: Array<{ id: string; accountId: string; calendarId: string; providerEventId: string; identityKey?: string; subject?: string; start?: string; end?: string; timeZone?: string; selectionPriority?: 0 | 1 | 2 }>;
-  mailbox?: Array<{ id: string; accountId: string; providerMessageId: string; identityKey: string; subject?: string; from?: string; receivedAt?: string; snippet?: string; selectionPriority?: 0 | 1 | 2 }>;
+  tasks?: { id: string; title: string; body: string; status: string; dueAt?: string; updatedAt?: string; selectionPriority?: 0 | 1 | 2 }[];
+  calendars?: { id: string; accountId: string; identityKey?: string; providerId?: string; name: string; writable: boolean; connected: boolean }[];
+  calendarEvents?: { id: string; accountId: string; calendarId: string; providerEventId: string; identityKey?: string; subject?: string; start?: string; end?: string; timeZone?: string; selectionPriority?: 0 | 1 | 2 }[];
+  mailbox?: { id: string; accountId: string; providerMessageId: string; identityKey: string; subject?: string; from?: string; receivedAt?: string; snippet?: string; selectionPriority?: 0 | 1 | 2 }[];
   calendarSnapshot?: {
     identityKey: string;
     timeMin: string;
     timeMax: string;
     asOf: string;
     partial: boolean;
-    events: Array<{ providerEventId: string; subject?: string; start?: string; end?: string; timeZone?: string }>;
+    events: { providerEventId: string; subject?: string; start?: string; end?: string; timeZone?: string }[];
   };
   deviceCalendarSnapshot?: {
     installationId: string;
@@ -123,8 +123,8 @@ export interface OfflinePreviewInput {
   now: string | Date;
   transcriptRevision?: number;
   transcriptSourceVersion?: string;
-  tasks?: Array<{ title: string; status: string; dueAt?: string }>;
-  calendarEvents?: Array<{ subject?: string; start?: string; timeZone?: string }>;
+  tasks?: { title: string; status: string; dueAt?: string }[];
+  calendarEvents?: { subject?: string; start?: string; timeZone?: string }[];
   calendarSnapshotAvailable?: boolean;
   deviceCalendarSnapshotAvailable?: boolean;
   deviceCalendarSnapshotPartial?: boolean;

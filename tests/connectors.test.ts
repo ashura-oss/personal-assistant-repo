@@ -236,7 +236,7 @@ describe('provider connector clients', () => {
     });
     const { client } = fixture({ fetcher: fetcherMock as typeof fetch });
     let guardCalls = 0;
-    const persistedPages: Array<{ count: number; cursor?: string }> = [];
+    const persistedPages: { count: number; cursor?: string }[] = [];
     const result = await client.syncMessages(account, { pageSize: 1000, query: 'from:alex', guard: () => { guardCalls++; }, onPage: (page, cursor) => { persistedPages.push({ count: page.length, cursor }); } });
     expect(result.pagesRead).toBe(3);
     expect(result.partial).toBe(true);
@@ -273,7 +273,7 @@ describe('provider connector clients', () => {
       ] } });
     }) as typeof fetch;
     const { client } = fixture({ fetcher });
-    const pages: Array<{ items: unknown[]; cursor?: string; count: number; metadata: { unavailableIds: string[]; window: { from: string; to: string }; queryFingerprint: string } }> = [];
+    const pages: { items: unknown[]; cursor?: string; count: number; metadata: { unavailableIds: string[]; window: { from: string; to: string }; queryFingerprint: string } }[] = [];
     const result = await client.syncMessageWindow(account, { timeMin: new Date(start).toISOString(), timeMax: new Date(end).toISOString(), pageSize: 3, onPage: (items, cursor, count, metadata) => { pages.push({ items, cursor, count, metadata }); } });
     expect(result.items).toHaveLength(1);
     expect(result.items[0]).toMatchObject({ id: 'in-window', idFormat: 'gmail', senderEmail: 'alex@example.test', replyMetadataComplete: true, providerVersion: 'history-11', sizeEstimate: 250 });
@@ -470,7 +470,7 @@ describe('provider connector clients', () => {
   });
 
   it('atomically reports Gmail messages moved out of INBOX and rejects mismatched hydrated IDs', async () => {
-    const pageStore: Array<{ ids: string[]; unavailable: string[] }> = [];
+    const pageStore: { ids: string[]; unavailable: string[] }[] = [];
     const fetcher = vi.fn(async (input: RequestInfo | URL) => {
       const url = new URL(String(input));
       if (url.pathname.endsWith('/messages') && !url.pathname.includes('/messages/')) return response({ messages: [{ id: 'moved' }, { id: 'unknown-labels' }] });
@@ -585,7 +585,7 @@ describe('provider connector clients', () => {
       return response({ items: [{ id: `cal-${page ?? 'first'}`, summary: 'Calendar', accessRole: 'writer' }], nextPageToken: page === 'two' ? 'three' : page === 'three' ? 'four' : 'two' });
     });
     const { client } = fixture({ fetcher: fetcher as typeof fetch });
-    const saved: Array<{ items: number; cursor?: string; pages: number }> = [];
+    const saved: { items: number; cursor?: string; pages: number }[] = [];
     const result = await client.listCalendars(account, { onPage: (items, cursor, pages) => { saved.push({ items: items.length, cursor, pages }); } });
     expect(result.pagesRead).toBe(3);
     expect(result.partial).toBe(true);
@@ -615,7 +615,7 @@ describe('provider connector clients', () => {
 
   it('certifies only strict UTC Graph calendar dateTimes and retains the UTC preference across continuation pages', async () => {
     const urls: string[] = [];
-    const prefers: Array<string | null> = [];
+    const prefers: (string | null)[] = [];
     const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = new URL(String(input));
       urls.push(url.toString());

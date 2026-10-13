@@ -62,7 +62,7 @@ export function convertHtmlToText(html: string): HtmlTextConversion {
   let openAttributes: Record<string, string> = {};
   let currentTag = '';
   let openHasLinkDestination = false;
-  const stack: Array<{ name: string; skip: boolean; pre: boolean }> = [];
+  const stack: { name: string; skip: boolean; pre: boolean }[] = [];
 
   const stop = (reason: string) => {
     reasons.add(reason);

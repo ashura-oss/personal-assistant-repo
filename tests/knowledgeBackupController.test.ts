@@ -3,6 +3,7 @@ import type { AppState } from '../src/core';
 import { AppControllerImpl } from '../src/services/controller';
 import type { StateStore } from '../src/storage/contracts';
 import { emptyKnowledgeState } from '../src/knowledge';
+import type { Project } from '../src/knowledge/types';
 import { BACKUP_LIMITS, type PortableBackupV3 } from '../src/backup';
 
 class MemoryStore implements StateStore {
@@ -78,7 +79,6 @@ describe('controller portable knowledge backup workflow', () => {
     const { backup, sourcePersonId, sourceProjectId, personFact, contact } = await createPortableKnowledgeBackup();
     const { app, archive, cohort } = await importBackup(backup);
     const sourcePerson = cohort.knowledge.state.people.find((item) => item.id === sourcePersonId)!;
-    const sourceProject = cohort.knowledge.state.projects.find((item) => item.id === sourceProjectId)!;
 
     const personPreview = await app.prepareImportedKnowledgeActivation({ archiveId: archive.id, cohortId: cohort.id, kind: 'person', entityId: sourcePersonId });
     const beforeRevisionMismatch = structuredClone(app.getSnapshot());
@@ -97,10 +97,10 @@ describe('controller portable knowledge backup workflow', () => {
     const projectPreview = await app.prepareImportedKnowledgeActivation({ archiveId: archive.id, cohortId: cohort.id, kind: 'project', entityId: sourceProjectId });
     const activatedProject = await app.activateImportedKnowledgeEntity({ sessionId: projectPreview.sessionId, planHash: projectPreview.planHash });
     expect(activatedProject.entity.id).not.toBe(sourceProjectId);
-    expect((activatedProject.entity as typeof sourceProject).members).toEqual([
+    expect((activatedProject.entity as Project).members).toEqual([
       expect.objectContaining({ personId: activatedPerson.entity.id, role: 'Coordinator' }),
     ]);
-    expect((activatedProject.entity as typeof sourceProject).members[0]).not.toHaveProperty('sourcePersonId');
+    expect((activatedProject.entity as Project).members[0]).not.toHaveProperty('sourcePersonId');
     expect(activatedProject.entity.sourceLinks).toEqual([
       expect.objectContaining({ reference: { kind: 'person', id: activatedPerson.entity.id }, label: 'Project coordinator' }),
     ]);
@@ -120,14 +120,13 @@ describe('controller portable knowledge backup workflow', () => {
     localState.documents.push({ path: `people/${sourcePersonId}.md`, content: 'An unrelated local entry.', revision: 1, updatedAt: stamp });
     await localStore.save(localState);
     const { app, archive, cohort } = await importBackup(backup, localStore);
-    const sourceProject = cohort.knowledge.state.projects.find((item) => item.id === sourceProjectId)!;
 
     const preview = await app.prepareImportedKnowledgeActivation({ archiveId: archive.id, cohortId: cohort.id, kind: 'project', entityId: sourceProjectId });
     expect(preview.unresolvedMemberCount).toBe(1);
     const activated = await app.activateImportedKnowledgeEntity({ sessionId: preview.sessionId, planHash: preview.planHash });
-    expect((activated.entity as typeof sourceProject).members[0]).toMatchObject({ sourcePersonId, label: 'Unavailable imported person', role: 'Coordinator' });
+    expect((activated.entity as Project).members[0]).toMatchObject({ sourcePersonId, label: 'Unavailable imported person', role: 'Coordinator' });
     expect(activated.entity.sourceLinks[0]).toMatchObject({ reference: { kind: 'historical', originalKind: 'person' } });
-    expect((activated.entity as typeof sourceProject).members[0]).not.toHaveProperty('personId');
+    expect((activated.entity as Project).members[0]).not.toHaveProperty('personId');
   });
 
   it('preserves edits to an activated entity when a fresh preview confirms its existing mapping', async () => {
