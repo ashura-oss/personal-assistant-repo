@@ -13,6 +13,7 @@ import type {
   PrivacyWriterLease,
   PrivacyWriterScope,
 } from './types';
+import { isSupportedPrivacyBundleIdentifier } from './bundleIdentity';
 import { PRIVACY_NAMESPACES } from './types';
 
 export type PrivacyEngineErrorCode =
@@ -87,7 +88,7 @@ export class PrivacyEngine {
     let ownershipVerified = false;
     try {
       const owner = await this.dependencies.arbitration.getRuntimeOwner();
-      ownershipVerified = owner.platform === 'web' || (owner.platform === 'ios' && !!owner.processLaunchId && owner.bundleIdentifier === 'com.still.voiceassistant');
+      ownershipVerified = owner.platform === 'web' || (owner.platform === 'ios' && !!owner.processLaunchId && isSupportedPrivacyBundleIdentifier(owner.bundleIdentifier));
     } catch { /* Fixed blocked status; no platform details escape. */ }
     const phase = this.phaseFor(state, ownershipVerified);
     return {
@@ -296,7 +297,7 @@ export class PrivacyEngine {
       this.assertNoCleanup(state);
       if (state.writerLeases.length > 0) throw new PrivacyEngineError('blocked');
       const owner = await this.dependencies.arbitration.getRuntimeOwner();
-      if (owner.platform === 'unsupported' || (owner.platform === 'ios' && (!owner.processLaunchId || owner.bundleIdentifier !== 'com.still.voiceassistant'))) {
+      if (owner.platform === 'unsupported' || (owner.platform === 'ios' && (!owner.processLaunchId || !isSupportedPrivacyBundleIdentifier(owner.bundleIdentifier)))) {
         throw new PrivacyEngineError('unsupported_owner');
       }
       const projection = manifestProjection(state);
@@ -454,9 +455,9 @@ export class PrivacyEngine {
       // The exclusive web cleanup lock proves callbacks protected by the shared writer lock have ended.
       keep = state.writerLeases.filter((lease) => lease.owner.platform !== 'web');
     } else {
-      if (!current.processLaunchId || current.bundleIdentifier !== 'com.still.voiceassistant') throw new PrivacyEngineError('unsupported_owner');
+      if (!current.processLaunchId || !isSupportedPrivacyBundleIdentifier(current.bundleIdentifier)) throw new PrivacyEngineError('unsupported_owner');
       keep = state.writerLeases.filter((lease) => lease.owner.platform !== 'ios' ||
-        !lease.owner.processLaunchId || lease.owner.bundleIdentifier !== 'com.still.voiceassistant' ||
+        !lease.owner.processLaunchId || lease.owner.bundleIdentifier !== current.bundleIdentifier ||
         (lease.owner.processLaunchId === current.processLaunchId && !this.hasSettledLeaseProof(lease)));
     }
     if (keep.length === state.writerLeases.length) throw new PrivacyEngineError('blocked');
@@ -626,7 +627,7 @@ function isVerifiedWriterOwner(owner: PrivacyWriterLease['owner']): boolean {
   if (!UUID_PATTERN.test(owner.runtimeId) || owner.runtimeId !== owner.runtimeId.toLowerCase()) return false;
   if (owner.platform === 'web') return owner.processLaunchId === undefined && owner.bundleIdentifier === undefined;
   return owner.platform === 'ios' && !!owner.processLaunchId && UUID_PATTERN.test(owner.processLaunchId) &&
-    owner.processLaunchId === owner.processLaunchId.toLowerCase() && owner.bundleIdentifier === 'com.still.voiceassistant';
+    owner.processLaunchId === owner.processLaunchId.toLowerCase() && isSupportedPrivacyBundleIdentifier(owner.bundleIdentifier);
 }
 
 function targetKey(target: PrivacyCleanupTarget): string {

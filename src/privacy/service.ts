@@ -1,4 +1,5 @@
 import { PrivacyEngine, PrivacyEngineError } from './engine';
+import { isSupportedPrivacyBundleIdentifier } from './bundleIdentity';
 import type {
   PrivacyCleanupPassResult,
   PrivacyControlStore,
@@ -82,7 +83,7 @@ export function createPrivacyService(dependencies: PrivacyServiceDependencies): 
       try { owner = await dependencies.arbitration.getRuntimeOwner(); }
       catch { throw new PrivacyWorkspaceError('control_unavailable'); }
       if (!isCanonicalUuid(owner.runtimeId) || owner.platform === 'unsupported' || (owner.platform === 'ios' &&
-          (!isCanonicalUuid(owner.processLaunchId) || owner.bundleIdentifier !== 'com.still.voiceassistant'))) {
+          (!isCanonicalUuid(owner.processLaunchId) || !isSupportedPrivacyBundleIdentifier(owner.bundleIdentifier)))) {
         throw new PrivacyWorkspaceError('unsupported_runtime');
       }
       return Object.freeze({ epoch: state.epoch, runtimeId: owner.runtimeId });

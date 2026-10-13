@@ -11,6 +11,7 @@ import {
   type PrivacyWriterKind,
   type PrivacyWriterLease,
 } from './types';
+import { isSupportedPrivacyBundleIdentifier } from './bundleIdentity';
 
 export const PRIVACY_CONTROL_LIMITS = Object.freeze({
   namespaces: 10,
@@ -106,10 +107,10 @@ function parseOwner(input: unknown): PrivacyOwner {
   };
   if (value.processLaunchId !== undefined) owner.processLaunchId = uuid(value.processLaunchId, 'process launch id');
   if (value.bundleIdentifier !== undefined) {
-    if (value.bundleIdentifier !== 'com.still.voiceassistant') return fail('bundle identifier');
-    owner.bundleIdentifier = 'com.still.voiceassistant';
+    if (!isSupportedPrivacyBundleIdentifier(value.bundleIdentifier)) return fail('bundle identifier');
+    owner.bundleIdentifier = value.bundleIdentifier;
   }
-  if (owner.platform === 'ios' && (!owner.processLaunchId || owner.bundleIdentifier !== 'com.still.voiceassistant')) return fail('native writer owner');
+  if (owner.platform === 'ios' && (!owner.processLaunchId || !isSupportedPrivacyBundleIdentifier(owner.bundleIdentifier))) return fail('native writer owner');
   if (owner.platform !== 'ios' && owner.bundleIdentifier !== undefined) return fail('bundle identifier');
   return owner;
 }

@@ -1,4 +1,5 @@
 export * from './types';
+export * from './bundleIdentity';
 export * from './schema';
 export * from './engine';
 export * from './runtime';

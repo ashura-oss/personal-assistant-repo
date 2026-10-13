@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { createNativePrivacyArbitration, PrivacyArbitrationError } from '../src/privacy/arbitration';
+import { createNativePrivacyArbitration, isSupportedNativePrivacyOwner, PrivacyArbitrationError } from '../src/privacy/arbitration';
 import type { PrivacyOwner } from '../src/privacy/types';
 
 vi.mock('expo', () => ({ requireOptionalNativeModule: () => null }));
@@ -21,6 +21,21 @@ function deferred<T = void>() {
 function tick() { return new Promise((resolve) => setTimeout(resolve, 0)); }
 
 describe('native privacy arbitration', () => {
+  it('supports only the exact base or ten-character team-suffixed iOS bundle identity', () => {
+    expect(isSupportedNativePrivacyOwner(owner)).toBe(true);
+    expect(isSupportedNativePrivacyOwner({ ...owner, bundleIdentifier: 'com.still.voiceassistant.A1B2C3D4E5' })).toBe(true);
+    for (const bundleIdentifier of [
+      'com.still.voiceassistant.a1b2c3d4e5',
+      'com.still.voiceassistant.A1B2C3D4E',
+      'com.still.voiceassistant.A1B2C3D4E5X',
+      'com.still.voiceassistant.A1B2C3D4E5\n',
+      'com.still.voiceassistant.extra.A1B2C3D4E5',
+      'com.other.voiceassistant.A1B2C3D4E5',
+    ]) {
+      expect(isSupportedNativePrivacyOwner({ ...owner, bundleIdentifier })).toBe(false);
+    }
+  });
+
   it('waits for writers, gives queued cleanup priority, then admits later writers', async () => {
     const arb = createNativePrivacyArbitration({ getRuntimeOwner: async () => owner, waitTimeoutMs: 500 });
     const firstGate = deferred();

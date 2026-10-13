@@ -146,7 +146,7 @@ describe('privacy erase adapter', () => {
   it('deletes only exact native-owned folders/files and verifies them absent', async () => {
     const target: PrivacyCleanupTarget = { kind: 'namespace', namespace: 'markdown_mirrors' };
     const io = nativeIO();
-    const adapter = createPrivacyEraseAdapter({ controlStore: storeReturning(() => stateFor(target)), getOwner: async () => iosOwner, io });
+    const adapter = createPrivacyEraseAdapter({ controlStore: storeReturning(() => stateFor(target)), getOwner: async () => ({ ...iosOwner, bundleIdentifier: 'com.still.voiceassistant.A1B2C3D4E5' }), io });
     await adapter.erase(target, epoch);
     expect(await adapter.verifyGone(target, epoch)).toBe(true);
     expect(io.removed).toEqual([
@@ -245,6 +245,11 @@ describe('privacy erase adapter', () => {
     const io = nativeIO();
     const unsupported = createPrivacyEraseAdapter({ controlStore: storeReturning(() => stateFor(target)), getOwner: async () => ({ platform: 'unsupported', runtimeId: iosOwner.runtimeId }), io });
     await expect(unsupported.erase(target, epoch)).rejects.toMatchObject({ code: 'unsupported_target' });
+    const malformedBundle = createPrivacyEraseAdapter({
+      controlStore: storeReturning(() => stateFor(target)),
+      getOwner: async () => ({ ...iosOwner, bundleIdentifier: 'com.still.voiceassistant.bad' }), io,
+    });
+    await expect(malformedBundle.erase(target, epoch)).rejects.toMatchObject({ code: 'unsupported_target' });
     const stale = createPrivacyEraseAdapter({ controlStore: storeReturning(() => stateFor(target, '30000000-0000-4000-8000-000000000007')), getOwner: async () => iosOwner, io });
     await expect(stale.erase(target, epoch)).rejects.toMatchObject({ code: 'target_unavailable' });
     expect(io.removed).toEqual([]);

@@ -28,7 +28,7 @@ export interface PrivacyOwner {
   platform: PrivacyPlatform;
   runtimeId: string;
   processLaunchId?: string;
-  bundleIdentifier?: 'com.still.voiceassistant';
+  bundleIdentifier?: string;
 }
 
 export interface PrivacyWriterDescriptor {

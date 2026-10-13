@@ -1,4 +1,5 @@
 import { getPrivacyRuntimeOwner, isCanonicalUuid } from './runtime';
+import { isSupportedPrivacyBundleIdentifier } from './bundleIdentity';
 import type { PrivacyOwner, PrivacyWriterArbitration } from './types';
 
 const MAX_QUEUED = 128;
@@ -37,7 +38,7 @@ export function isSupportedNativePrivacyOwner(owner: PrivacyOwner): boolean {
   return owner.platform === 'ios' &&
     isCanonicalUuid(owner.runtimeId) &&
     isCanonicalUuid(owner.processLaunchId) &&
-    owner.bundleIdentifier === 'com.still.voiceassistant';
+    isSupportedPrivacyBundleIdentifier(owner.bundleIdentifier);
 }
 
 export function createNativePrivacyArbitration(

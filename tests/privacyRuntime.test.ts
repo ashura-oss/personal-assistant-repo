@@ -36,6 +36,24 @@ describe('privacy runtime identity', () => {
     expect(createNativePrivacyOwner({ ...validNativeIdentity, bundleIdentifier: 'other' }, runtimeOne).platform).toBe('unsupported');
   });
 
+  it('accepts and preserves only the exact AltStore signing-team-suffixed app identity', () => {
+    const bundleIdentifier = 'com.still.voiceassistant.A1B2C3D4E5';
+    const suffixedIdentity = { ...validNativeIdentity, bundleIdentifier };
+    expect(validateNativePrivacyRuntimeIdentity(suffixedIdentity)?.bundleIdentifier).toBe(bundleIdentifier);
+    expect(createNativePrivacyOwner(suffixedIdentity, runtimeOne).bundleIdentifier).toBe(bundleIdentifier);
+    for (const invalid of [
+      'com.still.voiceassistant.a1b2c3d4e5',
+      'com.still.voiceassistant.A1B2C3D4E',
+      'com.still.voiceassistant.A1B2C3D4E5X',
+      'com.still.voiceassistant.A1B2C3D4E5\n',
+      'com.still.voiceassistant.A1B2C3D4E-',
+      'com.still.voiceassistant.extra.A1B2C3D4E5',
+      'com.other.voiceassistant.A1B2C3D4E5',
+    ]) {
+      expect(validateNativePrivacyRuntimeIdentity({ ...validNativeIdentity, bundleIdentifier: invalid })).toBeUndefined();
+    }
+  });
+
   it('requires canonical UUIDs for process and JS runtime identities', () => {
     expect(isCanonicalUuid(runtimeOne)).toBe(true);
     expect(isCanonicalUuid('00000000-0000-0000-0000-000000000000')).toBe(false);

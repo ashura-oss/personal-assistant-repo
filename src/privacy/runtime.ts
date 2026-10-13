@@ -1,16 +1,17 @@
 import * as Crypto from 'expo-crypto';
 import { requireOptionalNativeModule } from 'expo';
 import { Platform } from 'react-native';
+import { isSupportedPrivacyBundleIdentifier, PRIVACY_BASE_BUNDLE_IDENTIFIER } from './bundleIdentity';
 import type { PrivacyOwner } from './types';
 
-const EXPECTED_BUNDLE_IDENTIFIER = 'com.still.voiceassistant';
+const EXPECTED_BUNDLE_IDENTIFIER = PRIVACY_BASE_BUNDLE_IDENTIFIER;
 const runtimeId = Crypto.randomUUID().toLowerCase();
 
 export interface NativePrivacyRuntimeIdentity {
   version: 1;
   platform: 'ios';
   processLaunchId: string;
-  bundleIdentifier: 'com.still.voiceassistant';
+  bundleIdentifier: string;
 }
 
 interface NativePrivacyModule {
@@ -31,7 +32,7 @@ export function validateNativePrivacyRuntimeIdentity(value: unknown): NativePriv
   if (
     identity.version !== 1 ||
     identity.platform !== 'ios' ||
-    identity.bundleIdentifier !== EXPECTED_BUNDLE_IDENTIFIER ||
+    !isSupportedPrivacyBundleIdentifier(identity.bundleIdentifier) ||
     !isCanonicalUuid(identity.processLaunchId)
   ) return undefined;
 
@@ -39,7 +40,7 @@ export function validateNativePrivacyRuntimeIdentity(value: unknown): NativePriv
     version: 1,
     platform: 'ios',
     processLaunchId: identity.processLaunchId.toLowerCase(),
-    bundleIdentifier: EXPECTED_BUNDLE_IDENTIFIER,
+    bundleIdentifier: identity.bundleIdentifier,
   };
 }
 
@@ -55,7 +56,7 @@ export function createNativePrivacyOwner(
     platform: 'ios',
     runtimeId: ownerRuntimeId.toLowerCase(),
     processLaunchId: validated.processLaunchId,
-    bundleIdentifier: EXPECTED_BUNDLE_IDENTIFIER,
+    bundleIdentifier: validated.bundleIdentifier,
   };
 }
 

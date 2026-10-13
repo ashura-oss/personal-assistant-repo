@@ -104,6 +104,33 @@ describe('privacy control schema', () => {
     expect(() => validatePrivacyControlState({ ...state, unexpected: 'private sentinel' })).toThrow(/invalid/i);
   });
 
+  it('preserves an allowed team-suffixed writer identity and rejects malformed app suffixes', () => {
+    const state = createEmptyPrivacyControlState(uuid(1));
+    const owner: PrivacyOwner = {
+      platform: 'ios', runtimeId: uuid(2), processLaunchId: uuid(3),
+      bundleIdentifier: 'com.still.voiceassistant.A1B2C3D4E5',
+    };
+    const lease = {
+      id: uuid(4), epoch: state.epoch, owner, kind: 'app_state' as const,
+      namespace: 'state_database' as const, createdAt: '2026-10-13T00:00:00.000Z',
+    };
+    expect(validatePrivacyControlState({ ...state, writerLeases: [lease] }).writerLeases[0]?.owner.bundleIdentifier)
+      .toBe(owner.bundleIdentifier);
+    for (const bundleIdentifier of [
+      'com.still.voiceassistant.a1b2c3d4e5',
+      'com.still.voiceassistant.A1B2C3D4E',
+      'com.still.voiceassistant.A1B2C3D4E5X',
+      'com.still.voiceassistant.A1B2C3D4E5\n',
+      'com.still.voiceassistant.extra.A1B2C3D4E5',
+      'com.other.voiceassistant.A1B2C3D4E5',
+    ]) {
+      expect(() => validatePrivacyControlState({
+        ...state,
+        writerLeases: [{ ...lease, owner: { ...owner, bundleIdentifier } }],
+      })).toThrow(/invalid/i);
+    }
+  });
+
   it('enforces the legacy path byte limit shared with the erasure adapter', () => {
     const state = createEmptyPrivacyControlState(uuid(1));
     const exactLimit = `${'a'.repeat(1_021)}.md`;
@@ -377,6 +404,23 @@ describe('privacy cleanup engine', () => {
     expect(store.state.legacyMarkdownPaths).toEqual(['notes/service-original.md']);
   });
 
+  it('opens a workspace and persists leases with the exact supported team-suffixed identity', async () => {
+    const owner: PrivacyOwner = {
+      platform: 'ios', runtimeId: uuid(77), processLaunchId: uuid(78),
+      bundleIdentifier: 'com.still.voiceassistant.A1B2C3D4E5',
+    };
+    const { store, locks } = setup(owner);
+    const privacy = createPrivacyService({ controlStore: store, arbitration: locks as PrivacyWriterArbitration, eraseAdapter: new TestEraseAdapter() });
+    const session = await privacy.openWorkspace();
+    expect(session.runtimeId).toBe(owner.runtimeId);
+    let leaseBundleIdentifier: string | undefined;
+    await privacy.withWriter(session.epoch, { kind: 'app_state', namespace: 'state_database' }, async () => {
+      leaseBundleIdentifier = store.state.writerLeases[0]?.owner.bundleIdentifier;
+    });
+    expect(leaseBundleIdentifier).toBe(owner.bundleIdentifier);
+    expect(store.state.writerLeases).toEqual([]);
+  });
+
   it('rejects unsupported writer ownership before persisting intent or invoking work', async () => {
     const { engine, store } = setup({ platform: 'unsupported', runtimeId: uuid(77) });
     let called = false;
@@ -573,6 +617,28 @@ describe('privacy cleanup engine', () => {
     expect(store.state.epoch).toBe(epoch);
     expect(store.state.ownedNamespaces).toEqual(['state_database']);
     expect(store.state.legacyMarkdownPaths).toEqual(['notes/keep.md']);
+  });
+
+  it('retires a prior process only for the exact same full bundle identifier', async () => {
+    const bundleA = 'com.still.voiceassistant.A1B2C3D4E5';
+    const current: PrivacyOwner = { platform: 'ios', runtimeId: uuid(841), processLaunchId: uuid(842), bundleIdentifier: bundleA };
+    const prior: PrivacyOwner = { platform: 'ios', runtimeId: uuid(843), processLaunchId: uuid(844), bundleIdentifier: bundleA };
+    const first = setup(current);
+    const lease = {
+      id: uuid(845), epoch: first.store.state.epoch, owner: prior, kind: 'app_state' as const,
+      namespace: 'state_database' as const, createdAt: '2026-10-13T00:00:00.000Z',
+    };
+    first.store.state = validatePrivacyControlState({ ...first.store.state, writerLeases: [lease] });
+    await expect(first.engine.reconcileStartupWriters()).resolves.toMatchObject({ phase: 'ready' });
+    expect(first.store.state.writerLeases).toEqual([]);
+
+    const bundleB = 'com.still.voiceassistant.Z9Y8X7W6V5';
+    const otherCurrent: PrivacyOwner = { ...current, runtimeId: uuid(846), processLaunchId: uuid(847), bundleIdentifier: bundleB };
+    const second = setup(otherCurrent);
+    second.store.state = validatePrivacyControlState({ ...second.store.state, writerLeases: [lease] });
+    const before = structuredClone(second.store.state);
+    await expect(second.engine.reconcileStartupWriters()).resolves.toMatchObject({ phase: 'writer_active' });
+    expect(second.store.state).toEqual(before);
   });
 
   it('keeps same-process unknown leases blocked and leaves active or completed cleanup untouched', async () => {

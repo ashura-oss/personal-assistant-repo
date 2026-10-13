@@ -2,6 +2,7 @@ import { SQLitePrivacyControlStore } from './controlStore';
 import type { PrivacyCleanupTarget, PrivacyControlStore, PrivacyEraseAdapter, PrivacyOwner } from './types';
 import { assertCleanupTarget, isUuid, PrivacyEraseAdapterError, safeRelativeMarkdownPath, validateCleanupEpoch } from './eraseAdapter.shared';
 import { MAIL_REFRESH_TASK_NAME } from '../background/backend.types';
+import { isSupportedPrivacyBundleIdentifier } from './bundleIdentity';
 
 type FileInfo = { exists: boolean; isDirectory?: boolean };
 export interface NativePrivacyEraseIO {
@@ -51,7 +52,7 @@ export async function notificationsRemainFromBridge(bridge: NotificationReadBrid
 
 function supportedOwner(owner: PrivacyOwner): boolean {
   const uuid = (value: unknown) => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
-  return owner.platform === 'ios' && owner.bundleIdentifier === 'com.still.voiceassistant' &&
+  return owner.platform === 'ios' && isSupportedPrivacyBundleIdentifier(owner.bundleIdentifier) &&
     uuid(owner.runtimeId) && uuid(owner.processLaunchId);
 }
 
