@@ -263,5 +263,11 @@ export function useAudioCapture(boundary?: PrivacyAudioBoundary): AudioCapture {
     if (playerObjectUrl.current) URL.revokeObjectURL(playerObjectUrl.current);
   }, []);
 
-  return { status, durationSeconds, meter, error, hasPending, start, pause, resume, stop, cancel, commit, play };
+  return {
+    status,
+    // MediaRecorder is the authoritative resumability source; status alone is not enough after a failed start.
+    // eslint-disable-next-line react-hooks/refs
+    canResume: status === 'paused' && recorder.current?.state === 'paused',
+    durationSeconds, meter, error, hasPending, start, pause, resume, stop, cancel, commit, play,
+  };
 }

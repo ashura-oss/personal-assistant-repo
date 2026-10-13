@@ -1,6 +1,8 @@
 export type AudioStatus = 'idle' | 'recording' | 'paused';
 export interface AudioCapture {
   status: AudioStatus;
+  canResume: boolean;
+  statusLabel?: string;
   durationSeconds: number;
   meter: number[];
   error: string;

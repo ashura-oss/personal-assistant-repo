@@ -2527,7 +2527,7 @@ function RecordScreen({
                 style={[s.liveDot, audio.status === "paused" && s.pausedDot]}
               />
               <Text style={s.liveText}>
-                {audio.status === "paused" ? "Paused" : "Recording"} ·{" "}
+                {audio.statusLabel ?? (audio.status === "paused" ? "Paused" : "Recording")} ·{" "}
                 {formatTime(audio.durationSeconds)}
               </Text>
             </View>
@@ -2540,7 +2540,7 @@ function RecordScreen({
               <Button
                 label={audio.status === "paused" ? "Resume" : "Pause"}
                 tone="quiet"
-                disabled={busy}
+                disabled={busy || (audio.status === "paused" && !audio.canResume)}
                 onPress={audio.status === "paused" ? onResume : onPause}
                 icon={audio.status === "paused" ? "play" : "pause"}
               />
