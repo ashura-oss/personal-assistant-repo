@@ -3,7 +3,7 @@ import { bindPrivacyDeviceCalendarBackend, bindPrivacyNotificationBackend, creat
 import type { PrivacyService } from '../src/privacy/service';
 import type { NotificationBackend } from '../src/services/notificationBackend';
 import type { OAuthTokenStore } from '../src/connectors';
-import type { PrivacyWriterDescriptor, PrivacyWriterLease } from '../src/privacy/types';
+import type { PrivacyWriterDescriptor, PrivacyWriterLease, PrivacyWriterScope } from '../src/privacy/types';
 import type { DeviceCalendarBackend } from '../src/services/deviceCalendarBackend';
 import type { DeviceEventDispatchRecord } from '../src/deviceCalendars';
 
@@ -12,9 +12,9 @@ const session = { epoch: '20000000-0000-4000-8000-000000000001', runtimeId: 'run
 function privacyMock() {
   const descriptors: unknown[] = [];
   const privacy = {
-    async withWriter<T>(_epoch: string, descriptor: PrivacyWriterDescriptor, work: (lease: PrivacyWriterLease) => Promise<T>) {
+    async withWriter<T>(_epoch: string, descriptor: PrivacyWriterDescriptor, work: (lease: PrivacyWriterLease, scope: PrivacyWriterScope) => Promise<T>) {
       descriptors.push(descriptor);
-      return work({} as PrivacyWriterLease);
+      return work({} as PrivacyWriterLease, {} as PrivacyWriterScope);
     },
     async assertWorkspaceEpoch() {},
   } as unknown as PrivacyService;
@@ -64,7 +64,7 @@ describe('privacy-bound provider and notification resources', () => {
     } satisfies NotificationBackend;
     const binding = { privacy, session };
     const originalWithWriter = privacy.withWriter.bind(privacy);
-    vi.spyOn(privacy, 'withWriter').mockImplementation(async <T>(epoch: string, descriptor: PrivacyWriterDescriptor, work: (lease: PrivacyWriterLease) => Promise<T>) => {
+    vi.spyOn(privacy, 'withWriter').mockImplementation(async <T>(epoch: string, descriptor: PrivacyWriterDescriptor, work: Parameters<typeof privacy.withWriter<T>>[2]) => {
       active += 1;
       try { return await originalWithWriter(epoch, descriptor, work); } finally { active -= 1; }
     });
@@ -107,10 +107,10 @@ describe('privacy-bound provider and notification resources', () => {
       },
       async lookupRecord() { return { candidates: [], partial: false, identity: 'unverified' as const }; },
     } as unknown as DeviceCalendarBackend;
-    vi.spyOn(privacy, 'withWriter').mockImplementation(async <T>(_epoch: string, _descriptor: PrivacyWriterDescriptor, work: (lease: PrivacyWriterLease) => Promise<T>) => {
+    vi.spyOn(privacy, 'withWriter').mockImplementation(async <T>(_epoch: string, _descriptor: PrivacyWriterDescriptor, work: Parameters<typeof privacy.withWriter<T>>[2]) => {
       await leaseGate;
       active += 1;
-      try { return await work({} as PrivacyWriterLease); } finally { active -= 1; }
+      try { return await work({} as PrivacyWriterLease, {} as PrivacyWriterScope); } finally { active -= 1; }
     });
     const bound = bindPrivacyDeviceCalendarBackend(raw, { privacy, session });
     const create = bound.backend.createApprovedEvent({} as DeviceEventDispatchRecord, () => true);

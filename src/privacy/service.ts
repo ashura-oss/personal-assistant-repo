@@ -10,6 +10,7 @@ import type {
   PrivacyWriterDescriptor,
   PrivacyWriterLease,
   PrivacyWriterArbitration,
+  PrivacyWriterScope,
 } from './types';
 
 export interface PrivacyWorkspaceSession {
@@ -38,7 +39,9 @@ export class PrivacyWorkspaceError extends Error {
 export interface PrivacyService {
   openWorkspace(): Promise<PrivacyWorkspaceSession>;
   assertWorkspaceEpoch(expectedEpoch: string): Promise<void>;
-  withWriter<T>(sessionEpoch: string, descriptor: PrivacyWriterDescriptor, actualCallback: (lease: PrivacyWriterLease) => Promise<T>): Promise<T>;
+  withWriter<T>(sessionEpoch: string, descriptor: PrivacyWriterDescriptor, actualCallback: (lease: PrivacyWriterLease, scope: PrivacyWriterScope) => Promise<T>): Promise<T>;
+  withExistingWriter<T>(scope: PrivacyWriterScope, sessionEpoch: string, descriptor: PrivacyWriterDescriptor, actualIO: () => Promise<T>): Promise<T>;
+  reconcileStartupWriters(): Promise<PrivacyPublicStatus>;
   getStatus(): Promise<PrivacyPublicStatus>;
   prepareErase(): Promise<PrivacyErasePlan>;
   cancelErase(sessionId: string): Promise<void>;
@@ -90,14 +93,24 @@ export function createPrivacyService(dependencies: PrivacyServiceDependencies): 
       if (state.cleanup && state.cleanup.status !== 'complete') throw new PrivacyWorkspaceError('cleanup_in_progress');
     },
     async withWriter(sessionEpoch, descriptor, actualCallback) {
+      const descriptorSnapshot = Object.freeze({ ...descriptor });
       await this.assertWorkspaceEpoch(sessionEpoch);
-      try { return await engine.withWriter(sessionEpoch, descriptor, actualCallback); }
+      try { return await engine.withWriter(sessionEpoch, descriptorSnapshot, actualCallback); }
       catch (error) {
         if (error instanceof PrivacyEngineError && error.code === 'stale_epoch') throw new PrivacyWorkspaceError('stale_epoch');
         if (error instanceof PrivacyEngineError && error.code === 'cleanup_in_progress') throw new PrivacyWorkspaceError('cleanup_in_progress');
         throw error;
       }
     },
+    async withExistingWriter(scope, sessionEpoch, descriptor, actualIO) {
+      try { return await engine.withExistingWriter(scope, sessionEpoch, descriptor, actualIO); }
+      catch (error) {
+        if (error instanceof PrivacyEngineError && error.code === 'stale_epoch') throw new PrivacyWorkspaceError('stale_epoch');
+        if (error instanceof PrivacyEngineError && error.code === 'cleanup_in_progress') throw new PrivacyWorkspaceError('cleanup_in_progress');
+        throw error;
+      }
+    },
+    reconcileStartupWriters: () => engine.reconcileStartupWriters(),
     getStatus: () => engine.getStatus(),
     prepareErase: () => engine.prepareErase(),
     cancelErase: (sessionId) => engine.cancelErase(sessionId),

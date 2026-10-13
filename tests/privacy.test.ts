@@ -1,5 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { PrivacyEngine, PrivacyEngineError } from '../src/privacy/engine';
+import { createPrivacyService } from '../src/privacy/service';
 import { createEmptyPrivacyControlState, PRIVACY_CONTROL_LIMITS, validatePrivacyControlState } from '../src/privacy/schema';
 import type {
   PrivacyCleanupTarget,
@@ -9,6 +10,10 @@ import type {
   PrivacyOwner,
   PrivacyWriterArbitration,
 } from '../src/privacy/types';
+
+vi.mock('expo', () => ({ requireOptionalNativeModule: () => undefined }));
+
+afterEach(() => vi.unstubAllGlobals());
 
 function uuid(value: number): string {
   return `00000000-0000-4000-8000-${value.toString(16).padStart(12, '0')}`;
@@ -191,6 +196,187 @@ describe('privacy cleanup engine', () => {
     expect(store.state.writerLeases).toHaveLength(0);
   });
 
+  it('admits scoped child I/O behind a queued exclusive request using native fair arbitration', async () => {
+    vi.stubGlobal('__DEV__', true);
+    const { createNativePrivacyArbitration } = await import('../src/privacy/arbitration');
+    const owner: PrivacyOwner = { platform: 'ios', runtimeId: uuid(901), processLaunchId: uuid(902), bundleIdentifier: 'com.still.voiceassistant' };
+    const store = new MemoryControlStore();
+    const arbitration = createNativePrivacyArbitration({ getRuntimeOwner: async () => owner, waitTimeoutMs: 1_000 });
+    let id = 910;
+    const engine = new PrivacyEngine({ controlStore: store, arbitration, adapter: new TestEraseAdapter(), uuid: () => uuid(id++) });
+    let releaseParent!: () => void;
+    let parentStarted!: (scope: import('../src/privacy/types').PrivacyWriterScope) => void;
+    let exclusiveStarted = false;
+    const parentGate = new Promise<void>((resolve) => { releaseParent = resolve; });
+    const parentScope = new Promise<import('../src/privacy/types').PrivacyWriterScope>((resolve) => { parentStarted = resolve; });
+    const parent = engine.withWriter(store.state.epoch, { kind: 'app_state', namespace: 'state_database' }, async (_lease, scope) => {
+      parentStarted(scope);
+      await parentGate;
+    });
+    const scope = await parentScope;
+    const cleanup = arbitration.withCleanupLock(async () => { exclusiveStarted = true; });
+    await Promise.resolve();
+    let childCalled = false;
+    await expect(engine.withExistingWriter(scope, store.state.epoch, {
+      kind: 'recording_recovery', namespace: 'recovery_audio',
+    }, async () => { childCalled = true; })).resolves.toBeUndefined();
+    expect(childCalled).toBe(true);
+    expect(exclusiveStarted).toBe(false);
+    expect(store.state.ownedNamespaces).toContain('recovery_audio');
+    releaseParent();
+    await parent;
+    await cleanup;
+    expect(exclusiveStarted).toBe(true);
+    expect(store.state.writerLeases).toHaveLength(0);
+  });
+
+  it('rejects forged, foreign, wrong-epoch, and sealed scopes before child I/O', async () => {
+    const first = setup();
+    const second = setup();
+    let scope!: import('../src/privacy/types').PrivacyWriterScope;
+    let childCalls = 0;
+    await first.engine.withWriter(first.store.state.epoch, { kind: 'app_state', namespace: 'state_database' }, async (_lease, issued) => {
+      scope = issued;
+      expect(Object.isFrozen(scope)).toBe(true);
+      await expect(first.engine.withExistingWriter(Object.freeze({}) as typeof issued, first.store.state.epoch, {
+        kind: 'recording_recovery', namespace: 'recovery_audio',
+      }, async () => { childCalls += 1; })).rejects.toMatchObject({ code: 'writer_missing' });
+      await expect(second.engine.withExistingWriter(scope, second.store.state.epoch, {
+        kind: 'recording_recovery', namespace: 'recovery_audio',
+      }, async () => { childCalls += 1; })).rejects.toMatchObject({ code: 'writer_missing' });
+      await expect(first.engine.withExistingWriter(scope, uuid(999), {
+        kind: 'recording_recovery', namespace: 'recovery_audio',
+      }, async () => { childCalls += 1; })).rejects.toMatchObject({ code: 'stale_epoch' });
+    });
+    await expect(first.engine.withExistingWriter(scope, first.store.state.epoch, {
+      kind: 'recording_recovery', namespace: 'recovery_audio',
+    }, async () => { childCalls += 1; })).rejects.toMatchObject({ code: 'writer_missing' });
+    expect(childCalls).toBe(0);
+  });
+
+  it('drains a fire-and-forget child after the parent fails and seals further admissions', async () => {
+    const { engine, store, locks } = setup();
+    let releaseChild!: () => void;
+    let childStarted!: (scope: import('../src/privacy/types').PrivacyWriterScope) => void;
+    const childGate = new Promise<void>((resolve) => { releaseChild = resolve; });
+    const started = new Promise<import('../src/privacy/types').PrivacyWriterScope>((resolve) => { childStarted = resolve; });
+    const failure = new Error('parent failure');
+    const parent = engine.withWriter(store.state.epoch, { kind: 'app_state', namespace: 'state_database' }, async (_lease, scope) => {
+      void engine.withExistingWriter(scope, store.state.epoch, { kind: 'recording_recovery', namespace: 'recovery_audio' }, async () => {
+        childStarted(scope);
+        await childGate;
+      });
+      await started;
+      throw failure;
+    });
+    const scope = await started;
+    let settled = false;
+    void parent.catch(() => { settled = true; });
+    await Promise.resolve();
+    expect(locks.writerDepth).toBe(1);
+    expect(settled).toBe(false);
+    releaseChild();
+    await expect(parent).rejects.toBe(failure);
+    expect(locks.writerDepth).toBe(0);
+    await expect(engine.withExistingWriter(scope, store.state.epoch, { kind: 'recording_recovery', namespace: 'recovery_audio' }, async () => undefined))
+      .rejects.toMatchObject({ code: 'writer_missing' });
+  });
+
+  it('snapshots child descriptors and fails closed when intent registration fails', async () => {
+    const { engine, store } = setup();
+    let releaseRead!: () => void;
+    let pauseReads = false;
+    let readStarted!: () => void;
+    const readStartedPromise = new Promise<void>((resolve) => { readStarted = resolve; });
+    const originalRead = store.read.bind(store);
+    store.read = async () => {
+      if (pauseReads) { readStarted(); await new Promise<void>((resolve) => { releaseRead = resolve; }); }
+      return originalRead();
+    };
+    let childCalls = 0;
+    let parentSettled = false;
+    let mutableDescriptor: { kind: 'markdown_mirror'; namespace: 'markdown_mirrors'; legacyMarkdownPath: string } | undefined;
+    const parent = engine.withWriter(store.state.epoch, { kind: 'app_state', namespace: 'state_database' }, async (_lease, issued) => {
+      const descriptor = { kind: 'markdown_mirror' as const, namespace: 'markdown_mirrors' as const, legacyMarkdownPath: 'notes/original.md' };
+      mutableDescriptor = descriptor;
+      pauseReads = true;
+      void engine.withExistingWriter(issued, store.state.epoch, descriptor, async () => { childCalls += 1; });
+      // Parent is allowed to settle while the already-admitted child is still
+      // waiting for durable descriptor registration.
+    }).finally(() => { parentSettled = true; });
+    await readStartedPromise;
+    await Promise.resolve();
+    expect(parentSettled).toBe(false);
+    mutableDescriptor!.legacyMarkdownPath = 'notes/changed.md';
+    releaseRead();
+    pauseReads = false;
+    await parent;
+    const before = childCalls;
+    expect(store.state.legacyMarkdownPaths).toContain('notes/original.md');
+    expect(store.state.legacyMarkdownPaths).not.toContain('notes/changed.md');
+    expect(store.state.writerLeases).toEqual([]);
+    await engine.withWriter(store.state.epoch, { kind: 'app_state', namespace: 'state_database' }, async (_lease, issued) => {
+      await expect(engine.withExistingWriter(issued, store.state.epoch, {
+        kind: 'markdown_mirror', namespace: 'markdown_mirrors', legacyMarkdownPath: '../unsafe.md',
+      }, async () => { childCalls += 1; })).rejects.toMatchObject({ code: 'blocked' });
+    });
+    expect(childCalls).toBe(before);
+    expect(store.state.writerLeases).toHaveLength(0);
+  });
+
+  it('keeps the issued lease immutable and releases the private lease identity', async () => {
+    const { engine, store } = setup();
+    let attemptedMutation = false;
+    await engine.withWriter(store.state.epoch, { kind: 'app_state', namespace: 'state_database' }, async (lease) => {
+      expect(Object.isFrozen(lease)).toBe(true);
+      expect(Object.isFrozen(lease.owner)).toBe(true);
+      try { (lease as { id: string }).id = uuid(777_001); } catch { attemptedMutation = true; }
+      expect(store.state.writerLeases).toHaveLength(1);
+    });
+    expect(attemptedMutation).toBe(true);
+    expect(store.state.writerLeases).toEqual([]);
+  });
+
+  it('snapshots the outer descriptor before waiting for writer arbitration', async () => {
+    const { engine, store, locks } = setup();
+    let unlock!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>((resolve) => { unlock = resolve; });
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    const blocker = locks.withWriterLock(async () => { entered(); await gate; });
+    await started;
+    const descriptor = { kind: 'markdown_mirror' as const, namespace: 'markdown_mirrors' as const, legacyMarkdownPath: 'notes/queued-original.md' };
+    const write = engine.withWriter(store.state.epoch, descriptor, async () => undefined);
+    descriptor.legacyMarkdownPath = 'notes/queued-mutated.md';
+    unlock();
+    await blocker;
+    await write;
+    expect(store.state.legacyMarkdownPaths).toEqual(['notes/queued-original.md']);
+    expect(store.state.writerLeases).toEqual([]);
+  });
+
+  it('snapshots service writer intent before its asynchronous epoch check', async () => {
+    const { store, locks } = setup();
+    let release!: () => void;
+    let readStarted!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const started = new Promise<void>((resolve) => { readStarted = resolve; });
+    const originalRead = store.read.bind(store);
+    let delayed = false;
+    store.read = async () => {
+      if (!delayed) { delayed = true; readStarted(); await gate; }
+      return originalRead();
+    };
+    const privacy = createPrivacyService({ controlStore: store, arbitration: locks as PrivacyWriterArbitration, eraseAdapter: new TestEraseAdapter() });
+    const descriptor = { kind: 'markdown_mirror' as const, namespace: 'markdown_mirrors' as const, legacyMarkdownPath: 'notes/service-original.md' };
+    const write = privacy.withWriter(store.state.epoch, descriptor, async () => undefined);
+    await started;
+    descriptor.legacyMarkdownPath = 'notes/service-mutated.md';
+    release();
+    await write;
+    expect(store.state.legacyMarkdownPaths).toEqual(['notes/service-original.md']);
+  });
+
   it('rejects unsupported writer ownership before persisting intent or invoking work', async () => {
     const { engine, store } = setup({ platform: 'unsupported', runtimeId: uuid(77) });
     let called = false;
@@ -209,8 +395,9 @@ describe('privacy cleanup engine', () => {
       store.failNext = true;
     })).rejects.toThrow(/durable write failed/i);
     expect(store.state.writerLeases).toHaveLength(1);
-    await expect(engine.prepareErase()).resolves.toMatchObject({ operation: 'erase_local_data' });
+    await expect(engine.reconcileStartupWriters()).resolves.toMatchObject({ phase: 'ready' });
     expect(store.state.writerLeases).toEqual([]);
+    await expect(engine.prepareErase()).resolves.toMatchObject({ operation: 'erase_local_data' });
   });
 
   it('keeps an unknown same-process lease blocked after reload when no callback-settled proof exists', async () => {
@@ -366,6 +553,107 @@ describe('privacy cleanup engine', () => {
     const plan = await engine.prepareErase();
     expect(store.state.writerLeases).toEqual([]);
     expect(plan.targetCount).toBe(10);
+  });
+
+  it('reconciles only proven old-process leases and preserves the epoch and manifests', async () => {
+    const priorOwner: PrivacyOwner = { platform: 'ios', runtimeId: uuid(801), processLaunchId: uuid(802), bundleIdentifier: 'com.still.voiceassistant' };
+    const currentOwner: PrivacyOwner = { platform: 'ios', runtimeId: uuid(803), processLaunchId: uuid(804), bundleIdentifier: 'com.still.voiceassistant' };
+    const { engine, store, locks } = setup(currentOwner);
+    const lease = {
+      id: uuid(805), epoch: store.state.epoch, owner: priorOwner, kind: 'app_state' as const,
+      namespace: 'state_database' as const, createdAt: '2026-10-13T00:00:00.000Z',
+    };
+    store.state = validatePrivacyControlState({
+      ...store.state, ownedNamespaces: ['state_database'], legacyMarkdownPaths: ['notes/keep.md'], writerLeases: [lease],
+    });
+    const epoch = store.state.epoch;
+    const result = await engine.reconcileStartupWriters();
+    expect(result.phase).toBe('ready');
+    expect(store.state.writerLeases).toEqual([]);
+    expect(store.state.epoch).toBe(epoch);
+    expect(store.state.ownedNamespaces).toEqual(['state_database']);
+    expect(store.state.legacyMarkdownPaths).toEqual(['notes/keep.md']);
+  });
+
+  it('keeps same-process unknown leases blocked and leaves active or completed cleanup untouched', async () => {
+    const owner: PrivacyOwner = { platform: 'ios', runtimeId: uuid(811), processLaunchId: uuid(812), bundleIdentifier: 'com.still.voiceassistant' };
+    const { engine, store } = setup(owner);
+    store.state = validatePrivacyControlState({
+      ...store.state,
+      ownedNamespaces: ['state_database'],
+      writerLeases: [{ id: uuid(813), epoch: store.state.epoch, owner, kind: 'app_state', namespace: 'state_database', createdAt: '2026-10-13T00:00:00.000Z' }],
+    });
+    const beforeUnknown = structuredClone(store.state);
+    await expect(engine.reconcileStartupWriters()).resolves.toMatchObject({ phase: 'writer_active' });
+    expect(store.state).toEqual(beforeUnknown);
+
+    const active = setup();
+    const plan = await active.engine.prepareErase();
+    await active.engine.commitErase({ sessionId: plan.sessionId, planHash: plan.planHash });
+    const activeState = structuredClone(active.store.state);
+    const activeSaves = active.store.saves;
+    await active.engine.reconcileStartupWriters();
+    expect(active.store.state).toEqual(activeState);
+    expect(active.store.saves).toBe(activeSaves);
+
+    await active.engine.runCleanupPass();
+    const completeState = structuredClone(active.store.state);
+    const completeSaves = active.store.saves;
+    await active.engine.reconcileStartupWriters();
+    expect(active.store.state).toEqual(completeState);
+    expect(active.store.saves).toBe(completeSaves);
+  });
+
+  it('reconciles a crashed old-process writer after a completed erase is reused by a fresh workspace', async () => {
+    const oldOwner: PrivacyOwner = { platform: 'ios', runtimeId: uuid(821), processLaunchId: uuid(822), bundleIdentifier: 'com.still.voiceassistant' };
+    const { engine, store } = setup(oldOwner);
+    const plan = await engine.prepareErase();
+    await engine.commitErase({ sessionId: plan.sessionId, planHash: plan.planHash });
+    await expect(engine.runCleanupPass()).resolves.toMatchObject({ phase: 'complete' });
+
+    // A completed privacy epoch is reusable by the next workspace.
+    await engine.registerNamespace(store.state.epoch, 'state_database');
+    const previous = new TestLocks();
+    previous.owner = oldOwner;
+    const oldProcessEngine = new PrivacyEngine({ controlStore: store, arbitration: previous as PrivacyWriterArbitration,
+      adapter: new TestEraseAdapter(), uuid: () => uuid(830) });
+    await expect(oldProcessEngine.withWriter(store.state.epoch, { kind: 'app_state', namespace: 'state_database' }, async () => { store.failNext = true; }))
+      .rejects.toThrow(/durable write failed/i);
+    expect(store.state.writerLeases).toHaveLength(1);
+
+    const cleanupJournal = structuredClone(store.state.cleanup);
+    const epoch = store.state.epoch;
+    const ownedNamespaces = [...store.state.ownedNamespaces];
+    const currentLocks = new TestLocks();
+    currentLocks.owner = { platform: 'ios', runtimeId: uuid(831), processLaunchId: uuid(832), bundleIdentifier: 'com.still.voiceassistant' };
+    const reopenedEngine = new PrivacyEngine({ controlStore: store, arbitration: currentLocks as PrivacyWriterArbitration,
+      adapter: new TestEraseAdapter(), uuid: () => uuid(833) });
+
+    await expect(reopenedEngine.reconcileStartupWriters()).resolves.toMatchObject({ phase: 'ready' });
+    expect(store.state.cleanup).toEqual(cleanupJournal);
+    expect(store.state.epoch).toBe(epoch);
+    expect(store.state.ownedNamespaces).toEqual(ownedNamespaces);
+    expect(store.state.writerLeases).toEqual([]);
+  });
+
+  it('returns the existing fixed blocked status when startup arbitration is unavailable', async () => {
+    const { store } = setup();
+    const leaseOwner: PrivacyOwner = { platform: 'web', runtimeId: uuid(900) };
+    store.state = validatePrivacyControlState({
+      ...store.state, ownedNamespaces: ['state_database'],
+      writerLeases: [{ id: uuid(899), epoch: store.state.epoch, owner: leaseOwner, kind: 'app_state', namespace: 'state_database', createdAt: '2026-10-13T00:00:00.000Z' }],
+    });
+    const before = structuredClone(store.state);
+    const arbitration: PrivacyWriterArbitration = {
+      withWriterLock: async <T>(work: () => Promise<T>) => work(),
+      withCleanupLock: async () => { throw new Error('lock timeout details must not escape'); },
+      getRuntimeOwner: async () => ({ platform: 'web', runtimeId: uuid(901) }),
+    };
+    const blockedEngine = new PrivacyEngine({
+      controlStore: store, arbitration, adapter: new TestEraseAdapter(), uuid: () => uuid(900),
+    });
+    await expect(blockedEngine.reconcileStartupWriters()).resolves.toMatchObject({ phase: 'blocked' });
+    expect(store.state).toEqual(before);
   });
 
   it('reports only fixed summary data and blocks erase when runtime ownership is unsupported', async () => {

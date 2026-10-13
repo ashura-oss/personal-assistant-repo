@@ -497,7 +497,7 @@ export default function App() {
 
         const privacyModule = await import("./src/privacy/service");
         const privacy = await privacyModule.getDefaultPrivacyService();
-        const status = await privacy.getStatus();
+        const status = await privacy.reconcileStartupWriters();
         if (!alive) return;
         if (status.phase === "writer_active") {
           setBootstrap({ kind: "unavailable", reason: "active_work", privacy, status });

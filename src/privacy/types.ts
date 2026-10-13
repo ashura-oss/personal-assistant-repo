@@ -49,6 +49,12 @@ export interface PrivacyWriterLease {
   createdAt: string;
 }
 
+declare const privacyWriterScopeBrand: unique symbol;
+/** Opaque process-local capability issued only during an active writer callback. */
+export interface PrivacyWriterScope {
+  readonly [privacyWriterScopeBrand]: true;
+}
+
 export type PrivacyCleanupTarget =
   | { kind: 'namespace'; namespace: PrivacyNamespace }
   | { kind: 'oauth_token'; tokenRef: string }

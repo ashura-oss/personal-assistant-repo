@@ -11,6 +11,7 @@ import type {
   PrivacyPublicStatus,
   PrivacyWriterDescriptor,
   PrivacyWriterLease,
+  PrivacyWriterScope,
 } from './types';
 import { PRIVACY_NAMESPACES } from './types';
 
@@ -59,11 +60,20 @@ interface PreparedGrant {
   readonly ownerRuntimeId: string;
 }
 
+interface WriterScopeState {
+  readonly lease: PrivacyWriterLease;
+  readonly epoch: string;
+  sealed: boolean;
+  active: boolean;
+  readonly pending: Set<Promise<unknown>>;
+}
+
 const SESSION_MS = 5 * 60 * 1_000;
 const MAX_CAS_ATTEMPTS = 4;
 
 export class PrivacyEngine {
   private readonly grants = new Map<string, PreparedGrant>();
+  private readonly writerScopes = new WeakMap<object, WriterScopeState>();
   /** Process-local proof that a callback settled before its durable lease release failed. */
   private readonly settledLeaseProofs = new Map<string, PrivacyWriterLease>();
   private cleanupJob?: Promise<PrivacyCleanupPassResult>;
@@ -97,6 +107,32 @@ export class PrivacyEngine {
       coverage: 'tracked_with_legacy_limits',
       ...(state.cleanup ? { categoryStates: categoryStatesFor(state.cleanup), ...(state.cleanup.status === 'complete' && state.cleanup.completedAt ? { completedAt: state.cleanup.completedAt } : {}) } : {}),
     };
+  }
+
+  /**
+   * One-shot startup reconciliation. The exclusive platform lock proves that web
+   * callbacks protected by the writer lock have ended; native retirement still
+   * requires the existing process-identity or settled-callback proof.
+   */
+  async reconcileStartupWriters(): Promise<PrivacyPublicStatus> {
+    try {
+      return await this.dependencies.arbitration.withCleanupLock(async () => {
+        const state = await this.read();
+        if (state.cleanup && state.cleanup.status !== 'complete') return this.getStatus();
+        try {
+          await this.retireProvenAbandonedLeases();
+        } catch (error) {
+          if (error instanceof PrivacyEngineError && (error.code === 'blocked' || error.code === 'unsupported_owner')) return this.getStatus();
+          throw error;
+        }
+        return this.getStatus();
+      });
+    } catch (error) {
+      if (error instanceof PrivacyEngineError) throw error;
+      // Keep the startup gate closed on an arbiter timeout/availability failure.
+      const status = await this.getStatus();
+      return { ...status, phase: 'blocked' };
+    }
   }
 
   async registerNamespace(expectedEpoch: string, namespace: PrivacyNamespace): Promise<void> {
@@ -137,6 +173,7 @@ export class PrivacyEngine {
       if (state.epoch !== expectedEpoch) throw new PrivacyEngineError('stale_epoch');
       this.assertWritable(state);
       if (state.writerLeases.length >= PRIVACY_CONTROL_LIMITS.writerLeases) throw new PrivacyEngineError('capacity');
+      validateDescriptorIntent(descriptor);
       created = {
         id: this.uuid(),
         epoch: state.epoch,
@@ -145,20 +182,8 @@ export class PrivacyEngine {
         ...(descriptor.namespace ? { namespace: descriptor.namespace } : {}),
         createdAt: this.now().toISOString(),
       };
-      const ownedNamespaces = descriptor.namespace && !state.ownedNamespaces.includes(descriptor.namespace)
-        ? [...state.ownedNamespaces, descriptor.namespace]
-        : state.ownedNamespaces;
-      if (ownedNamespaces.length > PRIVACY_CONTROL_LIMITS.namespaces) throw new PrivacyEngineError('capacity');
-      const oauthTokenRefs = descriptor.oauthTokenRef && !state.oauthTokenRefs.includes(descriptor.oauthTokenRef)
-        ? [...state.oauthTokenRefs, descriptor.oauthTokenRef]
-        : state.oauthTokenRefs;
-      if (oauthTokenRefs.length > PRIVACY_CONTROL_LIMITS.oauthTokenRefs) throw new PrivacyEngineError('capacity');
-      const legacyMarkdownPaths = descriptor.legacyMarkdownPath && !state.legacyMarkdownPaths.includes(descriptor.legacyMarkdownPath)
-        ? [...state.legacyMarkdownPaths, descriptor.legacyMarkdownPath]
-        : state.legacyMarkdownPaths;
-      if (legacyMarkdownPaths.length > PRIVACY_CONTROL_LIMITS.legacyMarkdownPaths) throw new PrivacyEngineError('capacity');
-      validateDescriptorIntent(descriptor);
-      return { ...state, ownedNamespaces, oauthTokenRefs, legacyMarkdownPaths, writerLeases: [...state.writerLeases, created] };
+      const registered = registerDescriptor(state, descriptor);
+      return { ...registered, writerLeases: [...registered.writerLeases, created] };
     });
     if (!created) throw new PrivacyEngineError('writer_missing');
     return created;
@@ -173,28 +198,94 @@ export class PrivacyEngine {
   }
 
   /** Holds platform arbitration until the writer callback actually settles. */
-  async withWriter<T>(expectedEpoch: string, descriptor: PrivacyWriterDescriptor, work: (lease: PrivacyWriterLease) => Promise<T>): Promise<T> {
+  async withWriter<T>(
+    expectedEpoch: string,
+    descriptor: PrivacyWriterDescriptor,
+    work: (lease: PrivacyWriterLease, scope: PrivacyWriterScope) => Promise<T>,
+  ): Promise<T> {
+    const descriptorSnapshot = snapshotDescriptor(descriptor);
     return this.dependencies.arbitration.withWriterLock(async () => {
-      const lease = await this.acquireWriter(expectedEpoch, descriptor);
+      const lease = await this.acquireWriter(expectedEpoch, descriptorSnapshot);
+      const privateLease = cloneLease(lease);
+      const scope = Object.freeze(Object.create(null)) as PrivacyWriterScope;
+      const scopeState: WriterScopeState = {
+        lease: privateLease,
+        epoch: expectedEpoch,
+        sealed: false,
+        active: true,
+        pending: new Set(),
+      };
+      this.writerScopes.set(scope as object, scopeState);
+      const callbackLease = Object.freeze({ ...cloneLease(privateLease), owner: Object.freeze({ ...privateLease.owner }) }) as PrivacyWriterLease;
       let value!: T;
       let workError: unknown;
       let failed = false;
       try {
-        value = await work(lease);
+        value = await work(callbackLease, scope);
       } catch (error) {
         failed = true;
         workError = error;
+      } finally {
+        scopeState.sealed = true;
+        await Promise.allSettled([...scopeState.pending]);
+        scopeState.active = false;
+        this.writerScopes.delete(scope as object);
       }
-      const leaseProof = { ...lease, owner: { ...lease.owner } };
+      const leaseProof = cloneLease(privateLease);
       try {
-        await this.releaseWriter(lease.id);
-        this.settledLeaseProofs.delete(lease.id);
+        await this.releaseWriter(privateLease.id);
+        this.settledLeaseProofs.delete(privateLease.id);
       } catch (error) {
-        this.settledLeaseProofs.set(lease.id, leaseProof);
+        this.settledLeaseProofs.set(privateLease.id, leaseProof);
         if (!failed) throw error;
       }
       if (failed) throw workError;
       return value;
+    });
+  }
+
+  /** Runs a child I/O operation under the already-held parent writer arbitration. */
+  withExistingWriter<T>(
+    scope: PrivacyWriterScope,
+    expectedEpoch: string,
+    descriptor: PrivacyWriterDescriptor,
+    actualIO: () => Promise<T>,
+  ): Promise<T> {
+    const descriptorSnapshot = Object.freeze({ ...descriptor });
+    const scopeState = scope && typeof scope === 'object' ? this.writerScopes.get(scope as object) : undefined;
+    if (!scopeState || !scopeState.active || scopeState.sealed) {
+      return Promise.reject(new PrivacyEngineError('writer_missing'));
+    }
+    if (expectedEpoch !== scopeState.epoch) return Promise.reject(new PrivacyEngineError('stale_epoch'));
+
+    // Admission is synchronous: the parent cannot settle and seal between the
+    // capability check and the child becoming visible to the drain loop.
+    let operation!: Promise<T>;
+    operation = (async () => {
+      try {
+        await this.registerExistingWriterIntent(scopeState, descriptorSnapshot);
+        return await actualIO();
+      } finally {
+        scopeState.pending.delete(operation);
+      }
+    })();
+    scopeState.pending.add(operation);
+    // A caller may intentionally fire-and-forget. Observe rejection here so it
+    // cannot become unhandled; an awaited caller still receives the rejection.
+    void operation.catch(() => undefined);
+    return operation;
+  }
+
+  private async registerExistingWriterIntent(scope: WriterScopeState, descriptor: PrivacyWriterDescriptor): Promise<void> {
+    validateDescriptorIntent(descriptor);
+    await this.update((state) => {
+      if (state.epoch !== scope.epoch) throw new PrivacyEngineError('stale_epoch');
+      this.assertWritable(state);
+      const liveLease = state.writerLeases.find((lease) => lease.id === scope.lease.id);
+      if (!liveLease || !sameLease(liveLease, scope.lease) || liveLease.epoch !== scope.epoch) {
+        throw new PrivacyEngineError('writer_missing');
+      }
+      return registerDescriptor(state, descriptor);
     });
   }
 
@@ -436,6 +527,37 @@ export class PrivacyEngine {
 
   private now(): Date { return (this.dependencies.now ?? (() => new Date()))(); }
   private uuid(): string { return (this.dependencies.uuid ?? randomUuid)().toLowerCase(); }
+}
+
+function registerDescriptor(state: PrivacyControlState, descriptor: PrivacyWriterDescriptor): PrivacyControlState {
+  const ownedNamespaces = descriptor.namespace && !state.ownedNamespaces.includes(descriptor.namespace)
+    ? [...state.ownedNamespaces, descriptor.namespace]
+    : state.ownedNamespaces;
+  if (ownedNamespaces.length > PRIVACY_CONTROL_LIMITS.namespaces) throw new PrivacyEngineError('capacity');
+  const oauthTokenRefs = descriptor.oauthTokenRef && !state.oauthTokenRefs.includes(descriptor.oauthTokenRef)
+    ? [...state.oauthTokenRefs, descriptor.oauthTokenRef]
+    : state.oauthTokenRefs;
+  if (oauthTokenRefs.length > PRIVACY_CONTROL_LIMITS.oauthTokenRefs) throw new PrivacyEngineError('capacity');
+  const legacyMarkdownPaths = descriptor.legacyMarkdownPath && !state.legacyMarkdownPaths.includes(descriptor.legacyMarkdownPath)
+    ? [...state.legacyMarkdownPaths, descriptor.legacyMarkdownPath]
+    : state.legacyMarkdownPaths;
+  if (legacyMarkdownPaths.length > PRIVACY_CONTROL_LIMITS.legacyMarkdownPaths) throw new PrivacyEngineError('capacity');
+  if (ownedNamespaces === state.ownedNamespaces && oauthTokenRefs === state.oauthTokenRefs && legacyMarkdownPaths === state.legacyMarkdownPaths) return state;
+  return { ...state, ownedNamespaces, oauthTokenRefs, legacyMarkdownPaths };
+}
+
+function cloneLease(lease: PrivacyWriterLease): PrivacyWriterLease {
+  return { ...lease, owner: { ...lease.owner } };
+}
+
+function snapshotDescriptor(descriptor: PrivacyWriterDescriptor): PrivacyWriterDescriptor {
+  return Object.freeze({ ...descriptor });
+}
+
+function sameLease(left: PrivacyWriterLease, right: PrivacyWriterLease): boolean {
+  return left.id === right.id && left.epoch === right.epoch && left.kind === right.kind && left.namespace === right.namespace &&
+    left.createdAt === right.createdAt && left.owner.platform === right.owner.platform && left.owner.runtimeId === right.owner.runtimeId &&
+    left.owner.processLaunchId === right.owner.processLaunchId && left.owner.bundleIdentifier === right.owner.bundleIdentifier;
 }
 
 function isConflict(error: unknown): boolean {
