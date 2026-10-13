@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import * as Crypto from 'expo-crypto';
+import { assistantResponseSchema } from '../src/assistant';
 import { AppControllerImpl } from '../src/services/controller';
 import { OpenRouterBatchClient, OPENROUTER_BATCH_BODY_MODEL, OPENROUTER_CHAT_COMPLETIONS_PATH, type OpenRouterBatchInspection } from '../src/services/openRouter';
 import type { AppState } from '../src/core';
@@ -190,9 +191,11 @@ describe('OpenRouter Batch controller lifecycle', () => {
 
   it('applies one valid completed result and makes repeated checks idempotent', async () => {
     let inspectCalls = 0;
+    const longSummary = 's'.repeat(3001);
+    const longAnswer = 'a'.repeat(6001);
     const fakeClient = {
       submit: (input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => fakeSubmit('batch_completed_fixture', input, before, assert),
-      inspect: async (_batchId: string, customId: string) => { inspectCalls += 1; return completedInspection(customId); },
+      inspect: async (_batchId: string, customId: string) => { inspectCalls += 1; return completedInspection(customId, JSON.stringify({ summary: longSummary, answer: longAnswer, decisions: [], citations: [], clarifications: [], proposals: [], memorySuggestions: [] })); },
     } as unknown as OpenRouterBatchClient;
     const store = new MemoryStore();
     const app = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient });
@@ -205,13 +208,93 @@ describe('OpenRouter Batch controller lifecycle', () => {
     const firstSaved = structuredClone(store.value!) as AppState & { openRouterBatchLedger: { jobs: Record<string, unknown>[] } };
     const appliedNote = firstSaved.notes.find((row) => row.id === note.id)!;
     expect(first).toMatchObject({ status: 'completed', providerReportedCostUsd: 0.001, promptTokens: 12, completionTokens: 5 });
-    expect(appliedNote.analysis?.summary).toBe('A concise summary.');
+    expect(appliedNote.analysis?.summary).toBe(longSummary);
+    expect(appliedNote.analysis?.answer).toBe(longAnswer);
     expect(firstSaved.openRouterBatchLedger.jobs[0]).toMatchObject({ status: 'completed', appliedNoteRevision: appliedNote.revision, accounting: { providerReportedCostUsd: 0.001 } });
 
     const second = await app.refreshAssistantBatch(job.id);
     expect(second).toEqual(first);
     expect(inspectCalls).toBe(1);
     expect((store.value as (AppState & { openRouterBatchLedger: { jobs: unknown[] } })).openRouterBatchLedger.jobs).toHaveLength(1);
+  });
+
+  it.each([
+    ['incomplete JSON', '{"summary":'],
+    ['finish reason length', JSON.stringify({ summary: 'partial', answer: 'partial', decisions: [], citations: [], clarifications: [], proposals: [], memorySuggestions: [] })],
+  ])('does not apply %s from a completed provider row', async (caseName, content) => {
+    const fakeClient = {
+      submit: (input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => fakeSubmit(`batch_invalid_${caseName.replace(/\W/g, '')}`, input, before, assert),
+      inspect: async (_batchId: string, customId: string) => {
+        const result = completedInspection(customId, content);
+        return caseName === 'finish reason length' ? {
+          ...result, result: { ...result.result!, finishReason: 'length', responseBody: { model: OPENROUTER_BATCH_BODY_MODEL,
+            choices: [{ index: 0, finish_reason: 'length', message: { role: 'assistant', content } }] } },
+        } : result;
+      },
+    } as unknown as OpenRouterBatchClient;
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient });
+    await app.load();
+    await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
+    const note = await app.saveNote({ transcript: `one two three four five six seven ${caseName}` });
+    const job = await app.submitNoteBatch(note.id);
+    expect((await app.refreshAssistantBatch(job.id)).status).toBe('result_invalid');
+    expect(store.value?.notes.find((row) => row.id === note.id)?.analysis).toBeUndefined();
+  });
+
+  it('restores and applies a saved profile-1 request using its original bounded schema', async () => {
+    const fakeClient = {
+      submit: (input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => fakeSubmit('batch_v1_restore', input, before, assert),
+      inspect: async (_batchId: string, customId: string) => ({ ...completedInspection(customId), batchId: 'batch_v1_restore' }),
+    } as unknown as OpenRouterBatchClient;
+    const store = new MemoryStore();
+    const first = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient });
+    await first.load();
+    await first.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
+    const note = await first.saveNote({ transcript: 'one two three four five six seven restore legacy profile' });
+    const queued = await first.submitNoteBatch(note.id);
+    const persisted = store.value as AppState & { openRouterBatchLedger: { version: 1; jobs: Record<string, unknown>[] } };
+    const job = persisted.openRouterBatchLedger.jobs[0]!;
+    const legacyBody = JSON.parse(String(job.requestBody)) as { response_format: { json_schema: { schema: unknown } } };
+    legacyBody.response_format.json_schema.schema = assistantResponseSchema;
+    const requestBody = JSON.stringify(legacyBody);
+    Object.assign(job, {
+      requestProfileVersion: 1, requestBody, requestBytes: new TextEncoder().encode(requestBody).byteLength,
+      requestSha256: await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, requestBody, { encoding: Crypto.CryptoEncoding.HEX }),
+    });
+
+    const restored = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient });
+    await restored.load();
+    expect(restored.getSnapshot().assistantBatchJobs?.[0]).toMatchObject({ id: queued.id, status: 'queued' });
+    expect((await restored.refreshAssistantBatch(queued.id)).status).toBe('completed');
+    expect(store.value?.notes.find((item) => item.id === note.id)?.analysis?.summary).toBe('A concise summary.');
+  });
+
+  it('keeps only the paid accounting receipt when the complete applied snapshot would exceed 16 MiB', async () => {
+    let inspectCalls = 0;
+    const fakeClient = {
+      submit: (input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => fakeSubmit('batch_oversized_reply', input, before, assert),
+      inspect: async (_batchId: string, customId: string) => {
+        inspectCalls += 1;
+        const content = JSON.stringify({ summary: 's'.repeat(3001), answer: 'a'.repeat(16_770_000), decisions: [], citations: [], clarifications: [], proposals: [], memorySuggestions: [] });
+        return { ...completedInspection(customId, content), batchId: 'batch_oversized_reply' };
+      },
+    } as unknown as OpenRouterBatchClient;
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient });
+    await app.load();
+    await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
+    const note = await app.saveNote({ transcript: 'one two three four five six seven paid oversized result' });
+    const job = await app.submitNoteBatch(note.id);
+
+    const result = await app.refreshAssistantBatch(job.id);
+    const saved = store.value as AppState & { openRouterBatchLedger: { jobs: Record<string, unknown>[] } };
+    expect(result).toMatchObject({ status: 'result_not_retained', failureCode: 'result_not_retained', providerReportedCostUsd: 0.001, unknownCharge: false, canCheck: false });
+    expect(saved.notes.find((row) => row.id === note.id)?.analysis).toBeUndefined();
+    expect(saved.openRouterBatchLedger.jobs[0]).toMatchObject({ status: 'result_not_retained', failureCode: 'result_not_retained', accounting: { providerReportedCostUsd: 0.001 } });
+    expect(JSON.stringify(saved)).not.toContain('a'.repeat(4096));
+    expect(await app.refreshAssistantBatch(job.id)).toEqual(result);
+    expect(inspectCalls).toBe(1);
   });
 
   it('does not settle or apply a completed result after the workspace changes during source hashing', async () => {
@@ -399,7 +482,7 @@ describe('OpenRouter Batch controller lifecycle', () => {
     await app.savePerson({ id: person.id, expectedRevision: savedPerson.revision, expectedDocumentRevision: narrative.revision,
       name: 'Maya', aliases: [], narrative: 'Updated local narrative.' });
     const saved = store.value as (AppState & { openRouterBatchLedger: { jobs: Record<string, unknown>[] } });
-    expect(saved.openRouterBatchLedger.jobs[0]).toMatchObject({ id: queued.id, status: 'source_removed', requestProfileVersion: 1 });
+    expect(saved.openRouterBatchLedger.jobs[0]).toMatchObject({ id: queued.id, status: 'source_removed', requestProfileVersion: 2 });
     expect(JSON.stringify(saved)).not.toContain('PRIVATE_KNOWLEDGE_NARRATIVE');
   });
 
@@ -417,7 +500,7 @@ describe('OpenRouter Batch controller lifecycle', () => {
 
     await app.saveDocument(document.path, 'Project Phoenix identifier was removed.', { expectedRevision: document.revision });
     const saved = store.value as (AppState & { openRouterBatchLedger: { jobs: Record<string, unknown>[] } });
-    expect(saved.openRouterBatchLedger.jobs[0]).toMatchObject({ id: queued.id, status: 'source_removed', requestProfileVersion: 1 });
+    expect(saved.openRouterBatchLedger.jobs[0]).toMatchObject({ id: queued.id, status: 'source_removed', requestProfileVersion: 2 });
     expect(JSON.stringify(saved)).not.toContain('PRIVATE_DOCUMENT_CANARY');
   });
 
@@ -435,7 +518,7 @@ describe('OpenRouter Batch controller lifecycle', () => {
 
     await app.reviewKnowledgeSuggestion(suggestion.id, { expectedRevision: suggestion.revision, decision: 'accept', targetRevision: person.revision });
     const saved = store.value as (AppState & { openRouterBatchLedger: { jobs: Record<string, unknown>[] } });
-    expect(saved.openRouterBatchLedger.jobs[0]).toMatchObject({ id: job.id, status: 'source_removed', requestProfileVersion: 1 });
+    expect(saved.openRouterBatchLedger.jobs[0]).toMatchObject({ id: job.id, status: 'source_removed', requestProfileVersion: 2 });
     expect(saved.openRouterBatchLedger.jobs[0]).not.toHaveProperty('requestBody');
     expect(JSON.stringify(saved.openRouterBatchLedger)).not.toContain('PRIVATE_KNOWLEDGE_BEFORE_REVIEW');
   });

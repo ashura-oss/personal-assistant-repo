@@ -81,6 +81,12 @@ describe('queued chat section', () => {
     const onSend = vi.fn(() => pending);
     const ui = props(onSend);
     ui.conversations = [{ id: 'conversation-1', title: 'One', createdAt: '2026-01-01T00:00:00.000Z' }];
+    ui.selectedConversationId = 'conversation-1';
+    const onDeleteConversation = vi.fn(async () => undefined);
+    const onOpenActions = vi.fn();
+    ui.onDeleteConversation = onDeleteConversation;
+    ui.onOpenActions = onOpenActions;
+    ui.turns = [{ id: 'turn-1', userText: 'Review this', createdAt: '2026-10-13T12:00:00.000Z', noteId: 'note-1' }];
     act(() => root.render(React.createElement(ChatSection, ui)));
     const input = host.querySelector('textarea')!;
     act(() => {
@@ -93,14 +99,61 @@ describe('queued chat section', () => {
     await act(async () => { send.click(); await Promise.resolve(); });
     const newConversation = [...host.querySelectorAll('button')].find((button) => button.textContent === 'New conversation')!;
     const selectConversation = [...host.querySelectorAll('button')].find((button) => button.getAttribute('aria-label') === 'Open conversation One')!;
+    const deleteConversation = [...host.querySelectorAll('button')].find((button) => button.textContent === 'Delete conversation')!;
+    const reviewActions = [...host.querySelectorAll('button')].find((button) => button.textContent === 'Review suggested actions')!;
     expect(newConversation.disabled).toBe(true);
     expect(selectConversation.disabled).toBe(true);
-    act(() => { newConversation.click(); selectConversation.click(); });
+    expect(deleteConversation.disabled).toBe(true);
+    expect(reviewActions.disabled).toBe(true);
+    act(() => { newConversation.click(); selectConversation.click(); deleteConversation.click(); reviewActions.click(); });
     expect(ui.onCreateConversation).not.toHaveBeenCalled();
     expect(ui.onSelectConversation).not.toHaveBeenCalled();
+    expect(onDeleteConversation).not.toHaveBeenCalled();
+    expect(onOpenActions).not.toHaveBeenCalled();
     await act(async () => { resolveSend(); await pending; });
     expect(newConversation.disabled).toBe(false);
     act(() => selectConversation.click());
     expect(ui.onSelectConversation).toHaveBeenCalledWith('conversation-1');
+    act(() => reviewActions.click());
+    expect(onOpenActions).toHaveBeenCalledWith('note-1');
+  });
+
+  it('blocks sending while recovery is required even if sending is otherwise enabled', async () => {
+    const onSend = vi.fn(async () => undefined);
+    const ui = { ...props(onSend), recoveryMessage: 'Refresh saved data before continuing.' };
+    const onOpenActions = vi.fn();
+    ui.turns = [{ id: 'turn-1', userText: 'Review this', createdAt: '2026-10-13T12:00:00.000Z', noteId: 'note-1' }];
+    ui.onOpenActions = onOpenActions;
+    act(() => root.render(React.createElement(ChatSection, ui)));
+    const input = host.querySelector('textarea')!;
+    act(() => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+      setter?.call(input, 'Do not send while recovery is required');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    const send = [...host.querySelectorAll('button')].find((button) => button.textContent === 'Send Batch request')!;
+    expect(send.disabled).toBe(true);
+    const reviewActions = [...host.querySelectorAll('button')].find((button) => button.textContent === 'Review suggested actions')!;
+    expect(reviewActions.disabled).toBe(true);
+    await act(async () => { send.click(); await Promise.resolve(); });
+    expect(onSend).not.toHaveBeenCalled();
+    act(() => reviewActions.click());
+    expect(onOpenActions).not.toHaveBeenCalled();
+  });
+
+  it('single-flights repeated Delete conversation presses', async () => {
+    let resolveDelete!: () => void;
+    const pending = new Promise<void>((resolve) => { resolveDelete = resolve; });
+    const onDeleteConversation = vi.fn(() => pending);
+    const ui = { ...props(vi.fn(async () => undefined)), onDeleteConversation };
+    ui.conversations = [{ id: 'conversation-1', title: 'One', createdAt: '2026-01-01T00:00:00.000Z' }];
+    ui.selectedConversationId = 'conversation-1';
+    act(() => root.render(React.createElement(ChatSection, ui)));
+    const remove = [...host.querySelectorAll('button')].find((button) => button.textContent === 'Delete conversation')!;
+    act(() => { remove.click(); remove.click(); });
+    expect(onDeleteConversation).toHaveBeenCalledTimes(1);
+    expect(onDeleteConversation).toHaveBeenCalledWith('conversation-1');
+    await act(async () => { resolveDelete(); await pending; });
   });
 });

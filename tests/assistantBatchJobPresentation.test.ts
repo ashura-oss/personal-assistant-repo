@@ -56,6 +56,7 @@ describe('assistant Batch job presentation', () => {
     expect(canRetryBatchJobCleanup(job({ status: 'queued' }))).toBe(false);
     expect(assistantBatchStatusLabel('submission_unknown')).toBe('Submission status uncertain');
     expect(assistantBatchStatusLabel('result_stale')).toContain('not applied');
+    expect(assistantBatchStatusLabel('result_not_retained')).toBe('Reply could not be saved');
     expect(assistantBatchStatusLabel('source_removed')).toBe('Request content removed');
   });
 });

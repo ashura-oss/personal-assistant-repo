@@ -389,6 +389,16 @@ export const assistantResponseSchema = {
   },
 } as const;
 
+/** OpenRouter profile 2 keeps the legacy response shape but leaves the two prose fields uncapped. */
+export const assistantResponseSchemaV2 = {
+  ...assistantResponseSchema,
+  properties: {
+    ...assistantResponseSchema.properties,
+    summary: { type: 'string' },
+    answer: { type: 'string' },
+  },
+} as const;
+
 function requireString(value: unknown, label: string, maxLength: number, allowEmpty = true): string {
   if (typeof value !== 'string' || value.length > maxLength || (!allowEmpty && !value.trim())) throw new Error(`Assistant response ${label} is invalid.`);
   return value;
@@ -410,13 +420,13 @@ function validateCitation(value: unknown, catalog: SourceCatalog, selection?: Co
 }
 
 /** Rejects fabricated, stale, omitted-context, or approximate evidence without asking the provider to repair it. */
-export function validateAssistantResponse(value: unknown, catalog: SourceCatalog, selection?: ContextSelection, transcriptSourceId = 'transcript'): AssistantResponse {
+function validateAssistantResponseWithLimits(value: unknown, catalog: SourceCatalog, selection: ContextSelection | undefined, transcriptSourceId: string, summaryLimit: number, answerLimit: number): AssistantResponse {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Assistant response must be an object.');
   const raw = value as Record<string, unknown>;
   const allowed = ['summary', 'answer', 'decisions', 'citations', 'clarifications', 'proposals', 'memorySuggestions'];
   if (Object.keys(raw).some((key) => !allowed.includes(key)) || allowed.some((key) => !(key in raw))) throw new Error('Assistant response does not match the required schema.');
-  const summary = requireString(raw.summary, 'summary', 3000);
-  const answer = requireString(raw.answer, 'answer', 6000);
+  const summary = requireString(raw.summary, 'summary', summaryLimit);
+  const answer = requireString(raw.answer, 'answer', answerLimit);
   if (!Array.isArray(raw.citations) || raw.citations.length > 30 || !Array.isArray(raw.decisions) || raw.decisions.length > 20 || !Array.isArray(raw.clarifications) || raw.clarifications.length > 10 || !Array.isArray(raw.proposals) || raw.proposals.length > 20 || !Array.isArray(raw.memorySuggestions) || raw.memorySuggestions.length > 4) throw new Error('Assistant response contains too many structured items.');
   const citations = raw.citations.map((citation) => validateCitation(citation, catalog, selection));
   const decisions: AssistantDecision[] = raw.decisions.map((decision) => {
@@ -469,6 +479,16 @@ export function validateAssistantResponse(value: unknown, catalog: SourceCatalog
     return { targetSourceId, targetRevision: item.targetRevision as number, type: type as AssistantMemorySuggestion['type'], statement, address, label, relatedSourceId, role, evidence };
   });
   return { summary, answer, decisions, citations, clarifications, proposals, memorySuggestions };
+}
+
+/** Legacy/Azure profile 1 validator. Its limits and behavior remain unchanged. */
+export function validateAssistantResponse(value: unknown, catalog: SourceCatalog, selection?: ContextSelection, transcriptSourceId = 'transcript'): AssistantResponse {
+  return validateAssistantResponseWithLimits(value, catalog, selection, transcriptSourceId, 3000, 6000);
+}
+
+/** OpenRouter profile 2 validator. All structural and provenance checks match profile 1. */
+export function validateAssistantResponseV2(value: unknown, catalog: SourceCatalog, selection?: ContextSelection, transcriptSourceId = 'transcript'): AssistantResponse {
+  return validateAssistantResponseWithLimits(value, catalog, selection, transcriptSourceId, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER);
 }
 
 function firstSentence(transcript: string): string {

@@ -1,19 +1,19 @@
 import type { AssistIntent, KnowledgeSelection } from '../core';
-import type { OpenRouterBatchInspection } from './openRouter';
-import { OPENROUTER_BATCH_MODEL } from './openRouter';
+import type { OpenRouterBatchInspection, OpenRouterBatchRequestProfileVersion } from './openRouter';
+import { isOpenRouterBatchRequestProfile, OPENROUTER_BATCH_MODEL } from './openRouter';
 
 export const OPENROUTER_BATCH_LEDGER_VERSION = 1 as const;
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 const STATUSES = new Set([
   'preparing', 'submitting', 'submission_unknown', 'queued', 'processing', 'completed',
-  'failed', 'expired', 'cancelled', 'result_stale', 'result_invalid', 'cleanup_pending', 'source_removed',
+  'failed', 'expired', 'cancelled', 'result_stale', 'result_invalid', 'result_not_retained', 'cleanup_pending', 'source_removed',
 ]);
 
 export type AssistantBatchKind = 'note_assistance' | 'mail_reply';
 export type AssistantBatchStatus =
   | 'preparing' | 'submitting' | 'submission_unknown' | 'queued' | 'processing' | 'completed'
-  | 'failed' | 'expired' | 'cancelled' | 'result_stale' | 'result_invalid' | 'cleanup_pending' | 'source_removed';
+  | 'failed' | 'expired' | 'cancelled' | 'result_stale' | 'result_invalid' | 'result_not_retained' | 'cleanup_pending' | 'source_removed';
 
 export interface OpenRouterBatchAccounting {
   readonly providerReportedCostUsd?: number;
@@ -38,7 +38,7 @@ export interface OpenRouterBatchJob {
   readonly batchId?: string;
   readonly unknownCharge: boolean;
   readonly accounting?: OpenRouterBatchAccounting;
-  readonly failureCode?: 'not_submitted' | 'provider_failed' | 'expired' | 'invalid_result' | 'stale_result';
+  readonly failureCode?: 'not_submitted' | 'provider_failed' | 'expired' | 'invalid_result' | 'stale_result' | 'result_not_retained';
   readonly noteId?: string;
   readonly noteRevision?: number;
   readonly intent?: AssistIntent;
@@ -49,7 +49,7 @@ export interface OpenRouterBatchJob {
   readonly answeredAsOf?: string;
   readonly settingsFingerprint?: string;
   readonly sourceFingerprint?: string;
-  readonly requestProfileVersion?: 1;
+  readonly requestProfileVersion?: OpenRouterBatchRequestProfileVersion;
   readonly requestBytes?: number;
   readonly omittedSourceCount?: number;
   readonly requestBody?: string;
@@ -62,7 +62,7 @@ export type OpenRouterBatchContentJob = OpenRouterBatchJob & {
   readonly status: Exclude<AssistantBatchStatus, 'source_removed'>;
   readonly settingsFingerprint: string;
   readonly sourceFingerprint: string;
-  readonly requestProfileVersion: 1;
+  readonly requestProfileVersion: OpenRouterBatchRequestProfileVersion;
   readonly requestBytes: number;
   readonly omittedSourceCount: number;
   readonly requestBody: string;
@@ -147,9 +147,10 @@ function validJob(value: unknown): value is OpenRouterBatchJob {
       typeof row.requestSha256 !== 'string' || row.requestSha256.length !== 64 || !SHA256.test(row.requestSha256) || typeof row.unknownCharge !== 'boolean') return false;
   if (row.batchId !== undefined && (typeof row.batchId !== 'string' || row.batchId.length < 1 || row.batchId.length > 256 || /[^A-Za-z0-9_-]/.test(row.batchId))) return false;
   if (row.accounting !== undefined && !validAccounting(row.accounting)) return false;
-  if (row.failureCode !== undefined && (typeof row.failureCode !== 'string' || !['not_submitted', 'provider_failed', 'expired', 'invalid_result', 'stale_result'].includes(row.failureCode))) return false;
+  if (row.failureCode !== undefined && (typeof row.failureCode !== 'string' || !['not_submitted', 'provider_failed', 'expired', 'invalid_result', 'stale_result', 'result_not_retained'].includes(row.failureCode))) return false;
+  if ((row.status === 'result_not_retained') !== (row.failureCode === 'result_not_retained')) return false;
   if (row.sourceRemoved === true) {
-    return row.status === 'source_removed' && row.requestProfileVersion === 1 &&
+    return row.status === 'source_removed' && (row.requestProfileVersion === 1 || row.requestProfileVersion === 2) &&
       exactKeys(row, [...commonRequired, 'sourceRemoved', 'requestProfileVersion'], commonOptional);
   }
   if (row.sourceRemoved !== undefined || row.status === 'source_removed' || !exactKeys(row,
@@ -157,11 +158,14 @@ function validJob(value: unknown): value is OpenRouterBatchJob {
     [...commonOptional, 'noteId', 'noteRevision', 'intent', 'question', 'knowledgeSelection', 'capturedAt', 'captureTimeZone', 'answeredAsOf', 'appliedNoteRevision'])) return false;
   if (typeof row.settingsFingerprint !== 'string' || row.settingsFingerprint.length !== 64 || !SHA256.test(row.settingsFingerprint) ||
       typeof row.sourceFingerprint !== 'string' || row.sourceFingerprint.length !== 64 || !SHA256.test(row.sourceFingerprint) ||
-      row.requestProfileVersion !== 1 ||
+      (row.requestProfileVersion !== 1 && row.requestProfileVersion !== 2) ||
       !Number.isSafeInteger(row.requestBytes) || (row.requestBytes as number) < 1 || (row.requestBytes as number) > 1024 * 1024 ||
       !Number.isSafeInteger(row.omittedSourceCount) || (row.omittedSourceCount as number) < 0 ||
       typeof row.requestBody !== 'string' || new TextEncoder().encode(row.requestBody).byteLength > 1024 * 1024 ||
       new TextEncoder().encode(row.requestBody).byteLength !== row.requestBytes) return false;
+  try {
+    if (!isOpenRouterBatchRequestProfile(JSON.parse(row.requestBody), row.requestProfileVersion)) return false;
+  } catch { return false; }
   if (row.kind === 'note_assistance') {
     if (typeof row.noteId !== 'string' || !row.noteId || row.noteId.length > 512 || !Number.isSafeInteger(row.noteRevision) || (row.noteRevision as number) < 1 ||
         typeof row.intent !== 'string' || !['assist', 'summarize', 'answer', 'extract'].includes(row.intent) || !canonicalIso(row.capturedAt) ||
@@ -173,7 +177,7 @@ function validJob(value: unknown): value is OpenRouterBatchJob {
   const versions = record(row.sourceVersions);
   if (!versions || Object.entries(versions).some(([key, version]) => !key || key.length > 512 || typeof version !== 'string' || version.length > 320)) return false;
   if (row.appliedNoteRevision !== undefined && (!Number.isSafeInteger(row.appliedNoteRevision) || (row.appliedNoteRevision as number) < 1)) return false;
-  if ((row.status === 'queued' || row.status === 'processing' || row.status === 'completed' || row.status === 'expired' || row.status === 'cancelled' || row.status === 'result_stale' || row.status === 'result_invalid') && !row.batchId) return false;
+  if ((row.status === 'queued' || row.status === 'processing' || row.status === 'completed' || row.status === 'expired' || row.status === 'cancelled' || row.status === 'result_stale' || row.status === 'result_invalid' || row.status === 'result_not_retained') && !row.batchId) return false;
   if (row.status === 'failed' && !row.batchId && !(row.failureCode === 'not_submitted' && row.unknownCharge === false)) return false;
   return true;
 }
@@ -219,7 +223,7 @@ export function assistantBatchJobDTO(job: OpenRouterBatchJob, cleanupPending = f
     ...(job.sourceRemoved ? { sourceRemoved: true as const } : {}),
     canCheck: Boolean(!cleanupPending && job.batchId && (
       job.status === 'queued' || job.status === 'processing' ||
-      ((job.sourceRemoved || ['completed', 'failed', 'expired', 'cancelled', 'result_stale', 'result_invalid'].includes(job.status)) &&
+      ((job.sourceRemoved || ['completed', 'failed', 'expired', 'cancelled', 'result_stale', 'result_invalid', 'result_not_retained'].includes(job.status)) &&
         job.accounting?.providerReportedCostUsd === undefined))),
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
@@ -231,7 +235,7 @@ export function assistantBatchJobDTO(job: OpenRouterBatchJob, cleanupPending = f
     ...(job.omittedSourceCount !== undefined ? { omittedSourceCount: job.omittedSourceCount } : {}),
     unknownCharge: job.unknownCharge,
     costStatus: job.accounting?.providerReportedCostUsd !== undefined ? 'reported' :
-      ['completed', 'failed', 'expired', 'cancelled', 'result_invalid', 'result_stale'].includes(job.status) ? 'unavailable' : 'waiting',
+      ['completed', 'failed', 'expired', 'cancelled', 'result_invalid', 'result_stale', 'result_not_retained'].includes(job.status) ? 'unavailable' : 'waiting',
     billingScope: job.accounting?.byok ? 'byok_fee_only' : 'openrouter_reported',
     ...(job.accounting?.providerReportedCostUsd !== undefined ? { providerReportedCostUsd: job.accounting.providerReportedCostUsd } : {}),
     ...(job.accounting?.byok !== undefined ? { byok: job.accounting.byok } : {}),
@@ -245,7 +249,7 @@ export function assistantBatchJobDTO(job: OpenRouterBatchJob, cleanupPending = f
 export function isOpenRouterBatchContentJob(job: OpenRouterBatchJob): job is OpenRouterBatchContentJob {
   return job.sourceRemoved !== true && job.status !== 'source_removed' && typeof job.requestBody === 'string' &&
     typeof job.requestBytes === 'number' && typeof job.settingsFingerprint === 'string' &&
-    typeof job.sourceFingerprint === 'string' && job.requestProfileVersion === 1 && !!job.sourceVersions;
+    typeof job.sourceFingerprint === 'string' && (job.requestProfileVersion === 1 || job.requestProfileVersion === 2) && !!job.sourceVersions;
 }
 
 export function tombstoneOpenRouterBatchJob(job: OpenRouterBatchJob, updatedAt: string): OpenRouterBatchTombstone {
@@ -253,7 +257,7 @@ export function tombstoneOpenRouterBatchJob(job: OpenRouterBatchJob, updatedAt: 
   return Object.freeze({
     id: job.id, customId: job.customId, kind: job.kind, sourceRemoved: true,
     status: 'source_removed', createdAt: job.createdAt, updatedAt,
-    model: job.model, effort: job.effort, requestProfileVersion: 1, requestSha256: job.requestSha256,
+    model: job.model, effort: job.effort, requestProfileVersion: job.requestProfileVersion ?? 1, requestSha256: job.requestSha256,
     ...(job.batchId ? { batchId: job.batchId } : {}),
     unknownCharge: job.unknownCharge,
     ...(job.accounting ? { accounting: job.accounting } : {}),

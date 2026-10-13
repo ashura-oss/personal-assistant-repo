@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  assistantResponseSchema, buildLocalSourceInputs, buildLocalSourceSet, buildOfflinePreview, createSourceCatalog, selectContext, validateAssistantResponse,
+  assistantResponseSchema, assistantResponseSchemaV2, buildLocalSourceInputs, buildLocalSourceSet, buildOfflinePreview, createSourceCatalog, selectContext, validateAssistantResponse, validateAssistantResponseV2,
 } from '../src/assistant';
 import type { AssistantSourceInput } from '../src/assistant/types';
 
@@ -138,6 +138,9 @@ describe('local assistant context and response validation', () => {
       memorySuggestions: [],
     };
     expect(validateAssistantResponse(good, catalog, selection).citations[0].source).toBe('Current transcript');
+    expect(() => validateAssistantResponse({ ...good, summary: 's'.repeat(3001) }, catalog, selection)).toThrow(/summary is invalid/i);
+    expect(() => validateAssistantResponse({ ...good, answer: 'a'.repeat(6001) }, catalog, selection)).toThrow(/answer is invalid/i);
+    expect(validateAssistantResponseV2({ ...good, summary: 's'.repeat(3001), answer: 'a'.repeat(6001) }, catalog, selection).answer).toHaveLength(6001);
     expect(() => validateAssistantResponse({ ...good, citations: [{ ...good.citations[0], revision: 2 }] }, catalog, selection)).toThrow(/stale source revision/i);
     expect(() => validateAssistantResponse({ ...good, citations: [{ ...good.citations[0], sourceVersion: `3:${'b'.repeat(64)}` }] }, catalog, selection)).toThrow(/different source version/i);
     expect(() => validateAssistantResponse({ ...good, citations: [{ ...good.citations[0], quote: 'The draft is nearly ready.' }] }, catalog, selection)).toThrow(/exact quote/i);
@@ -165,6 +168,10 @@ describe('local assistant context and response validation', () => {
 
   it('emits strict one-response schema and safe deterministic offline answers', () => {
     expect(assistantResponseSchema.required).toEqual(['summary', 'answer', 'decisions', 'citations', 'clarifications', 'proposals', 'memorySuggestions']);
+    expect(assistantResponseSchema.properties.summary.maxLength).toBe(3000);
+    expect(assistantResponseSchema.properties.answer.maxLength).toBe(6000);
+    expect(assistantResponseSchemaV2.properties.summary).toEqual({ type: 'string' });
+    expect(assistantResponseSchemaV2.properties.answer).toEqual({ type: 'string' });
     const empty = buildOfflinePreview({ intent: 'assist', transcript: '', timeZone: 'Asia/Singapore', now: '2026-10-12T00:00:00Z' });
     expect(empty.summary).toContain('No transcript text');
     expect(empty.answer).toContain('AI is not connected');

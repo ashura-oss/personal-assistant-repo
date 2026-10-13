@@ -33,6 +33,7 @@ export type ChatSectionProps = {
   enabled: boolean;
   recoveryMessage?: string;
   onSelectConversation: (conversationId: string) => void;
+  onDeleteConversation?: (conversationId: string) => Promise<unknown> | unknown;
   onCreateConversation: () => void;
   onSend: (text: string) => Promise<unknown>;
   onOpenActions: (noteId: string) => void;
@@ -52,12 +53,14 @@ function ConversationButton({
   selected,
   disabled,
   sendLock,
+  deleteLock,
   onSelect,
 }: {
   conversation: ChatConversation;
   selected: boolean;
   disabled: boolean;
   sendLock: React.RefObject<boolean>;
+  deleteLock: React.RefObject<boolean>;
   onSelect: (conversationId: string) => void;
 }) {
   return (
@@ -66,12 +69,35 @@ function ConversationButton({
       accessibilityState={{ selected }}
       accessibilityLabel={`Open conversation ${conversation.title}`}
       disabled={disabled}
-      onPress={() => { if (!disabled && !sendLock.current) onSelect(conversation.id); }}
+      onPress={() => { if (!disabled && !sendLock.current && !deleteLock.current) onSelect(conversation.id); }}
       style={[styles.conversation, selected && styles.conversationSelected]}
     >
       <Text numberOfLines={2} style={styles.conversationTitle}>{conversation.title}</Text>
       <Text style={styles.meta}>{dateLabel(conversation.createdAt)}</Text>
     </Pressable>
+  );
+}
+
+function SuggestedActionsButton({
+  noteId,
+  disabled,
+  sendLock,
+  deleteLock,
+  onOpenActions,
+}: {
+  noteId: string;
+  disabled: boolean;
+  sendLock: React.RefObject<boolean>;
+  deleteLock: React.RefObject<boolean>;
+  onOpenActions: (noteId: string) => void;
+}) {
+  return (
+    <Button
+      label="Review suggested actions"
+      tone="quiet"
+      disabled={disabled}
+      onPress={() => { if (!disabled && !sendLock.current && !deleteLock.current) onOpenActions(noteId); }}
+    />
   );
 }
 
@@ -83,6 +109,7 @@ export function ChatSection({
   enabled,
   recoveryMessage,
   onSelectConversation,
+  onDeleteConversation,
   onCreateConversation,
   onSend,
   onOpenActions,
@@ -91,13 +118,16 @@ export function ChatSection({
 }: ChatSectionProps) {
   const [draft, setDraft] = useState('');
   const [sending, setSending] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const [sendError, setSendError] = useState<string>();
   const sendLock = useRef(false);
+  const deleteLock = useRef(false);
   const trimmedDraft = draft.trim();
-  const navigationBlocked = busy || sending || Boolean(recoveryMessage);
+  const navigationBlocked = busy || sending || deleting || Boolean(recoveryMessage);
+  const selectedConversation = conversations.find((conversation) => conversation.id === selectedConversationId);
 
   const send = async () => {
-    if (!enabled || busy || sendLock.current || !trimmedDraft) return;
+    if (!enabled || busy || Boolean(recoveryMessage) || sendLock.current || deleteLock.current || !trimmedDraft) return;
     sendLock.current = true;
     setSending(true);
     setSendError(undefined);
@@ -112,6 +142,21 @@ export function ChatSection({
     }
   };
 
+  const deleteSelectedConversation = async () => {
+    if (!selectedConversation || !onDeleteConversation || busy || Boolean(recoveryMessage) || sendLock.current || deleteLock.current) return;
+    deleteLock.current = true;
+    setDeleting(true);
+    setSendError(undefined);
+    try {
+      await onDeleteConversation(selectedConversation.id);
+    } catch {
+      setSendError('Could not confirm conversation removal. Check saved messages and request status.');
+    } finally {
+      deleteLock.current = false;
+      setDeleting(false);
+    }
+  };
+
   return (
     <KeyboardAvoidingView style={styles.container} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
       <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
@@ -121,7 +166,7 @@ export function ChatSection({
             <Text style={s.h1Small}>Queued chat</Text>
             <Text style={styles.copy}>Messages are submitted as Batch requests. Replies may be delayed; nothing checks or resubmits in the background.</Text>
           </View>
-          <Button label="New conversation" tone="quiet" disabled={navigationBlocked} onPress={() => { if (!busy && !sending && !recoveryMessage && !sendLock.current) onCreateConversation(); }} />
+          <Button label="New conversation" tone="quiet" disabled={navigationBlocked} onPress={() => { if (!busy && !sending && !deleting && !recoveryMessage && !sendLock.current && !deleteLock.current) onCreateConversation(); }} />
         </View>
 
         {!enabled ? <Text style={styles.notice}>Enable OpenRouter analysis in Settings to send a message.</Text> : null}
@@ -136,6 +181,7 @@ export function ChatSection({
                 selected={conversation.id === selectedConversationId}
                 disabled={navigationBlocked}
                 sendLock={sendLock}
+                deleteLock={deleteLock}
                 onSelect={onSelectConversation}
               />
             ))}
@@ -143,6 +189,14 @@ export function ChatSection({
         ) : (
           <Text style={styles.notice}>Start a conversation with a question or request.</Text>
         )}
+        {selectedConversation && onDeleteConversation ? (
+          <Button
+            label={deleting ? 'Deleting conversation…' : 'Delete conversation'}
+            tone="quiet"
+            disabled={busy || sending || deleting || Boolean(recoveryMessage)}
+            onPress={() => { void deleteSelectedConversation(); }}
+          />
+        ) : null}
 
         <View style={styles.turnList} accessibilityLabel="Conversation messages">
           {turns.map((turn) => (
@@ -176,7 +230,13 @@ export function ChatSection({
                 />
               ) : null}
               {turn.noteId ? (
-                <Button label="Review suggested actions" tone="quiet" onPress={() => onOpenActions(turn.noteId!)} />
+                <SuggestedActionsButton
+                  noteId={turn.noteId}
+                  disabled={navigationBlocked}
+                  sendLock={sendLock}
+                  deleteLock={deleteLock}
+                  onOpenActions={onOpenActions}
+                />
               ) : null}
             </View>
           ))}
@@ -192,14 +252,14 @@ export function ChatSection({
             placeholder="Ask a question or describe what you need…"
             placeholderTextColor={C.muted}
             multiline
-            editable={!busy && !sending}
+            editable={!busy && !sending && !deleting && !recoveryMessage}
             textAlignVertical="top"
             style={styles.input}
           />
           {sendError ? <Text accessibilityRole="alert" style={styles.warning}>{sendError}</Text> : null}
           <Button
             label={sending ? 'Submitting…' : 'Send Batch request'}
-            disabled={!enabled || busy || sending || !trimmedDraft}
+            disabled={!enabled || busy || sending || deleting || Boolean(recoveryMessage) || !trimmedDraft}
             onPress={() => { void send(); }}
           />
         </View>

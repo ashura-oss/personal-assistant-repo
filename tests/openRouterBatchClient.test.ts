@@ -6,8 +6,10 @@ import {
   OPENROUTER_CHAT_COMPLETIONS_PATH,
   OpenRouterBatchClient,
   OpenRouterBatchDispatchError,
+  OpenRouterBatchRequestBuilder,
 } from '../src/services/openRouter';
 import type { PrivacyControlState, PrivacyControlStore, PrivacyEraseAdapter, PrivacyOwner } from '../src/privacy/types';
+import type { AppSettings, Note } from '../src/core';
 
 vi.mock('expo', () => ({ requireOptionalNativeModule: () => null }));
 
@@ -70,6 +72,65 @@ describe('OpenRouter Batch client', () => {
     expect(envelope.completion_window).toBe('24h');
     expect(envelope.requests).toEqual([{ custom_id: operationId, body: JSON.parse(requestBody) }]);
     expect(result).toEqual({ batchId: 'batch_fixture_1', status: 'validating', endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH, model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h', total: 1, completed: 0, failed: 0 });
+  });
+
+  it('accepts a profile-2 note body through the actual client and sends one fixed POST', async () => {
+    const settings: AppSettings = {
+      mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch',
+      openRouterReasoningEffort: 'low', llmRequestContractVersion: 1,
+      timezone: 'Asia/Singapore', openAiEndpoint: undefined, openAiDeployment: undefined,
+      maxContextTokens: 4096, maxRequestBytes: 1024, maxOutputTokens: 64, monthlyBudgetUsd: 3,
+      reasoningEffort: 'none', maxAttempts: 1, maxCallsPerDay: 2, maxAudioSeconds: 600, audioRetention: 'keep',
+    };
+    const note: Note = {
+      id: 'note-profile-2', title: 'Profile test', transcript: 'A fictional note for the v2 integration test.',
+      durationSeconds: 3.25, createdAt: '2026-10-13T10:00:00.000Z', capturedAt: '2026-10-13T10:00:00.000Z',
+      captureTimeZone: 'Asia/Singapore', status: 'recorded', revision: 1,
+    };
+    const prepared = await new OpenRouterBatchRequestBuilder().prepareAnalysis(note, [], settings, { intent: 'answer', question: 'What should happen next?' });
+    expect(prepared.requestProfileVersion).toBe(2);
+    const fetcher = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => acceptedBatch('batch_profile_2'));
+    const { client } = makeClient(fetcher as unknown as typeof fetch);
+    await expect(client.submit({ operationId, requestBody: prepared.body, requestProfileVersion: prepared.requestProfileVersion }, async () => undefined))
+      .resolves.toMatchObject({ batchId: 'batch_profile_2' });
+    expect(fetcher).toHaveBeenCalledOnce();
+    const body = JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body)) as { requests: { body: { response_format: { json_schema: { schema: unknown } } } }[] };
+    expect(body.requests[0]?.body.response_format.json_schema.schema).toEqual(JSON.parse(prepared.body).response_format.json_schema.schema);
+  });
+
+  it('rejects an unsupported forged profile version before credential reads, reservation, or POST', async () => {
+    const settings: AppSettings = {
+      mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch',
+      openRouterReasoningEffort: 'low', llmRequestContractVersion: 1,
+      timezone: 'Asia/Singapore', openAiEndpoint: undefined, openAiDeployment: undefined,
+      maxContextTokens: 4096, maxRequestBytes: 1024, maxOutputTokens: 64, monthlyBudgetUsd: 3,
+      reasoningEffort: 'none', maxAttempts: 1, maxCallsPerDay: 2, maxAudioSeconds: 600, audioRetention: 'keep',
+    };
+    const note: Note = {
+      id: 'note-invalid-profile', title: 'Profile test', transcript: 'A fictional note for the invalid-profile test.',
+      durationSeconds: 3.25, createdAt: '2026-10-13T10:00:00.000Z', capturedAt: '2026-10-13T10:00:00.000Z',
+      captureTimeZone: 'Asia/Singapore', status: 'recorded', revision: 1,
+    };
+    const prepared = await new OpenRouterBatchRequestBuilder().prepareAnalysis(note, [], settings, { intent: 'answer', question: 'What should happen next?' });
+    const fetcher = vi.fn(async () => acceptedBatch());
+    const readCredentialSnapshot = vi.fn(async () => ({ key: 'fictional-key', generation: 3 }));
+    const reservation = vi.fn(async () => undefined);
+    const client = new OpenRouterBatchClient({
+      fetcher: fetcher as unknown as typeof fetch,
+      withRequestOwnership: async (work) => work(),
+      readCredentialSnapshot,
+      assertCredentialGeneration: () => undefined,
+      assertBeforeStart: () => undefined,
+    });
+
+    await expect(client.submit({
+      operationId,
+      requestBody: prepared.body,
+      requestProfileVersion: 999 as unknown as 2,
+    }, reservation)).rejects.toMatchObject<Partial<OpenRouterBatchDispatchError>>({ phase: 'pre_dispatch' });
+    expect(readCredentialSnapshot).not.toHaveBeenCalled();
+    expect(reservation).not.toHaveBeenCalled();
+    expect(fetcher).not.toHaveBeenCalled();
   });
 
   it('finishes credential reads and durable reservation before acquiring provider request ownership', async () => {

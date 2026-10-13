@@ -76,6 +76,9 @@ export function AssistantBatchJobCard({ job, busy = false, blocked = false, onCh
       {job.status === 'completed' ? (
         <Text style={styles.helper}>The validated reply was saved to this note.</Text>
       ) : null}
+      {job.status === 'result_not_retained' ? (
+        <Text style={styles.helper}>The reply did not fit in local saved data. Reported usage is still shown.</Text>
+      ) : null}
       {job.status === 'cleanup_pending' ? (
         <Text style={styles.helper}>Finish closing this local request. This does not submit another request.</Text>
       ) : null}

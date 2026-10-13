@@ -4,19 +4,25 @@ import {
   validateOpenRouterBatchLedger, type OpenRouterBatchJob,
 } from '../src/services/openRouterBatchJobs';
 import { OPENROUTER_BATCH_MODEL } from '../src/services/openRouter';
+import { assistantResponseSchema, assistantResponseSchemaV2 } from '../src/assistant';
 
 const operationId = '20000000-0000-4000-8000-000000000001';
-const body = JSON.stringify({ prompt: 'CANARY PRIVATE TRANSCRIPT', question: 'CANARY PRIVATE QUESTION' });
+function bodyFor(version: 1 | 2): string {
+  return JSON.stringify({ model: 'openai/gpt-6-luna', messages: [{ role: 'system', content: 'SYSTEM' }, { role: 'user', content: 'CANARY PRIVATE TRANSCRIPT' }],
+    reasoning: { effort: 'low', exclude: true }, response_format: { type: 'json_schema', json_schema: { name: 'note_assistance', strict: true, schema: version === 1 ? assistantResponseSchema : assistantResponseSchemaV2 } }, stream: false });
+}
 const at = '2026-10-13T10:00:00.000Z';
 
 function contentJob(overrides: Partial<OpenRouterBatchJob> = {}): OpenRouterBatchJob {
+  const requestProfileVersion = overrides.requestProfileVersion ?? 1;
+  const requestBody = overrides.requestBody ?? bodyFor(requestProfileVersion);
   return {
     id: operationId, customId: operationId, kind: 'note_assistance', status: 'queued', createdAt: at, updatedAt: at,
     noteId: 'local-note-id', noteRevision: 2, intent: 'answer', question: 'CANARY PRIVATE QUESTION', knowledgeSelection: [],
     capturedAt: at, captureTimeZone: 'Asia/Singapore', answeredAsOf: at,
-    settingsFingerprint: 'a'.repeat(64), sourceFingerprint: 'b'.repeat(64), requestProfileVersion: 1,
-    model: OPENROUTER_BATCH_MODEL, effort: 'low', requestBytes: new TextEncoder().encode(body).byteLength,
-    omittedSourceCount: 0, requestBody: body, requestSha256: 'c'.repeat(64), sourceVersions: { transcript: 'd'.repeat(64) },
+    settingsFingerprint: 'a'.repeat(64), sourceFingerprint: 'b'.repeat(64), requestProfileVersion,
+    model: OPENROUTER_BATCH_MODEL, effort: 'low', requestBytes: new TextEncoder().encode(requestBody).byteLength,
+    omittedSourceCount: 0, requestBody, requestSha256: 'c'.repeat(64), sourceVersions: { transcript: 'd'.repeat(64) },
     batchId: 'batch_fixture_1', unknownCharge: true, ...overrides,
   };
 }
@@ -52,5 +58,14 @@ describe('private OpenRouter Batch ledger receipts', () => {
     expect(() => validateOpenRouterBatchLedger({ version: 1, jobs: [contentJob({ id: `${operationId}\n`, customId: `${operationId}\n` })] })).toThrow(/integrity validation/i);
     expect(() => validateOpenRouterBatchLedger({ version: 1, jobs: [contentJob({ batchId: 'batch_fixture_1\n' })] })).toThrow(/integrity validation/i);
     expect(() => validateOpenRouterBatchLedger({ version: 1, jobs: [contentJob({ requestSha256: `${'c'.repeat(63)}\n` })] })).toThrow(/integrity validation/i);
+  });
+
+  it('retains v1 and v2 wire profiles immutably and rejects a claimed-version/schema mismatch', () => {
+    const legacy = validateOpenRouterBatchLedger({ version: 1, jobs: [contentJob({ requestProfileVersion: 1 })] });
+    const current = validateOpenRouterBatchLedger({ version: 1, jobs: [contentJob({ requestProfileVersion: 2 })] });
+    expect(legacy.jobs[0]?.requestProfileVersion).toBe(1);
+    expect(current.jobs[0]?.requestProfileVersion).toBe(2);
+    expect(tombstoneOpenRouterBatchJob(current.jobs[0]!, at).requestProfileVersion).toBe(2);
+    expect(() => validateOpenRouterBatchLedger({ version: 1, jobs: [contentJob({ requestProfileVersion: 2, requestBody: bodyFor(1) })] })).toThrow(/integrity validation/i);
   });
 });

@@ -47,7 +47,7 @@ import { ConnectorClient, ProviderWriteRejectedError, describeMessageWindowQuery
 import { scopeGrantsCapability } from '../connectors/oauth';
 import { oauthTokenStore, deleteOAuthToken } from '../auth/tokenStore';
 import { Platform } from 'react-native';
-import { buildLocalSourceSet, buildOfflinePreview, createSourceCatalog, validateAssistantResponse, type AssistantSourceInput, type AssistantResponse } from '../assistant';
+import { buildLocalSourceSet, buildOfflinePreview, createSourceCatalog, validateAssistantResponse, validateAssistantResponseV2, type AssistantSourceInput, type AssistantResponse } from '../assistant';
 import { isMailTextFresh, normalizeMailText, utf8Bytes, validSelectedMailTextSnapshot, MAX_SELECTED_MAIL_TEXT_BYTES, MAIL_TEXT_FRESHNESS_MS } from '../mailText';
 import { appendDispatchReconciliation, createDispatchRecord, recordDispatchOutcome, validateDispatchRecord } from '../dispatch';
 import type { DispatchOutcome, DispatchRecord, DispatchReconciliation } from '../dispatch';
@@ -90,7 +90,7 @@ import { createProviderCredentialService, type ProviderCredentialService } from 
 import { credentialStore } from '../storage/credentials';
 import type { BackgroundTaskBackend } from '../background/backend.types';
 import {
-  OPENROUTER_BATCH_MODEL, OPENROUTER_BATCH_BODY_MODEL, OpenRouterBatchClient, OpenRouterBatchDispatchError,
+  OPENROUTER_BATCH_MODEL, OPENROUTER_BATCH_BODY_MODEL, OPENROUTER_BATCH_RESPONSE_MAX_BYTES, OpenRouterBatchClient, OpenRouterBatchDispatchError,
   OpenRouterBatchRequestBuilder, isOpenRouterBatchRequestProfile, type OpenRouterBatchInspection, type PreparedOpenRouterAnalysis,
 } from './openRouter';
 import { OpenRouterSpeechClient } from './openRouterSpeech';
@@ -709,13 +709,18 @@ function parseBatchAssistantResult(inspection: OpenRouterBatchInspection, prepar
   const choices = body.choices;
   if (!Array.isArray(choices) || choices.length !== 1 || !isRecord(choices[0]) || choices[0].index !== 0 ||
       choices[0].finish_reason !== 'stop' || !isRecord(choices[0].message) || choices[0].message.role !== 'assistant' ||
-      choices[0].message.refusal !== undefined || typeof choices[0].message.content !== 'string' || choices[0].message.content.length > 128 * 1024) {
+      choices[0].message.refusal !== undefined || typeof choices[0].message.content !== 'string' ||
+      (prepared.requestProfileVersion === 1
+        ? choices[0].message.content.length > 128 * 1024
+        : new TextEncoder().encode(choices[0].message.content).byteLength > OPENROUTER_BATCH_RESPONSE_MAX_BYTES)) {
     throw new Error('The Batch result did not contain one complete structured analysis.');
   }
   let parsed: unknown;
   try { parsed = JSON.parse(choices[0].message.content); }
   catch { throw new Error('The Batch result was not valid structured analysis.'); }
-  const response = validateAssistantResponse(parsed, prepared.catalog, prepared.selection);
+  const response = prepared.requestProfileVersion === 1
+    ? validateAssistantResponse(parsed, prepared.catalog, prepared.selection)
+    : validateAssistantResponseV2(parsed, prepared.catalog, prepared.selection);
   const accounting = accountingFromInspection(inspection);
   const generated: DraftAnalysis = {
     summary: response.summary,
@@ -2194,15 +2199,41 @@ export class AppControllerImpl implements AppController {
       await this.assertPrivacySessionCurrent();
       if (capturedBootstrapGeneration !== this.bootstrapGeneration || this.startupRecoveryPhase !== 'ready') throw new Error('App startup changed while this action was waiting. Review the current state and try again.');
       const before = clone(this.state);
-      const draft = clone(before);
+      let draft = clone(before);
       const result = await operation(draft);
       await this.assertPrivacySessionCurrent();
       this.revokeStaleMailAlertConsent(draft);
-      const newCancellationIntents = this.newlyRequestedMailAlertCancellations(before, draft);
+      let newCancellationIntents = this.newlyRequestedMailAlertCancellations(before, draft);
       await this.evaluateProactiveDraft(draft);
       draft.reminders = validateReminderState(draft.reminders);
       draft.transcription = clone(validateTranscriptionState(draft.transcription));
-      const batchLedger = batchLedgerForCommit?.(draft, result);
+      let batchLedger = batchLedgerForCommit?.(draft, result);
+      if (batchLedger) {
+        const serializedCandidate = JSON.stringify(this.persistedStateWithBatchLedger(draft, batchLedger));
+        if (typeof serializedCandidate !== 'string' || recoveryUtf8Bytes(serializedCandidate, STATE_SNAPSHOT_READ_MAX_BYTES) > STATE_SNAPSHOT_READ_MAX_BYTES) {
+          const oldById = new Map(this.assistantBatchLedger.jobs.map((job) => [job.id, job]));
+          const eligible = batchLedger.jobs.filter((job) => {
+            const prior = oldById.get(job.id);
+            return (job.status === 'completed' || job.status === 'result_stale') && (prior?.status === 'queued' || prior?.status === 'processing');
+          });
+          if (eligible.length !== 1) throw new Error('The completed Batch reply could not be retained within the saved-data limit.');
+          const targetId = eligible[0].id;
+          batchLedger = validateOpenRouterBatchLedger({
+            version: batchLedger.version,
+            jobs: batchLedger.jobs.map((job) => {
+              if (job.id !== targetId) return job;
+              const { appliedNoteRevision: _appliedNoteRevision, ...receipt } = job;
+              return { ...receipt, status: 'result_not_retained' as const, failureCode: 'result_not_retained' as const };
+            }),
+          });
+          draft = before;
+          newCancellationIntents = [];
+          const receiptCandidate = JSON.stringify(this.persistedStateWithBatchLedger(draft, batchLedger));
+          if (typeof receiptCandidate !== 'string' || recoveryUtf8Bytes(receiptCandidate, STATE_SNAPSHOT_READ_MAX_BYTES) > STATE_SNAPSHOT_READ_MAX_BYTES) {
+            throw new Error('The Batch billing receipt could not fit within the saved-data limit. Refresh local data before continuing.');
+          }
+        }
+      }
       await this.assertPrivacySessionCurrent();
       try {
         await this.store.save(this.persistedStateWithBatchLedger(draft, batchLedger), saveOptions?.(draft, result));
@@ -3248,7 +3279,7 @@ export class AppControllerImpl implements AppController {
           const bodyBytes = new TextEncoder().encode(job.requestBody).byteLength;
           const digest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, job.requestBody, { encoding: Crypto.CryptoEncoding.HEX });
           const parsedBody = JSON.parse(job.requestBody) as unknown;
-          if (bodyBytes !== job.requestBytes || digest !== job.requestSha256 || !isOpenRouterBatchRequestProfile(parsedBody) ||
+          if (bodyBytes !== job.requestBytes || digest !== job.requestSha256 || !isOpenRouterBatchRequestProfile(parsedBody, job.requestProfileVersion!) ||
               (parsedBody as { reasoning: { effort: string } }).reasoning.effort !== job.effort ||
               (parsedBody as { response_format: { json_schema: { name: string } } }).response_format.json_schema.name !== 'note_assistance') {
             throw new Error('Invalid saved Batch request binding.');
@@ -4010,7 +4041,7 @@ export class AppControllerImpl implements AppController {
         ...(answeredAsOf ? { answeredAsOf } : {}),
         settingsFingerprint: await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, stableJson(openRouterSettingsBinding(draft.settings)), { encoding: Crypto.CryptoEncoding.HEX }),
         sourceFingerprint: await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, stableJson(prepared.sourceVersions), { encoding: Crypto.CryptoEncoding.HEX }),
-        requestProfileVersion: 1, model: OPENROUTER_BATCH_MODEL, effort: body.reasoning.effort,
+        requestProfileVersion: prepared.requestProfileVersion, model: OPENROUTER_BATCH_MODEL, effort: body.reasoning.effort,
         requestBytes: new TextEncoder().encode(prepared.body).byteLength, omittedSourceCount: prepared.omittedSourceCount,
         requestBody: prepared.body,
         requestSha256: await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, prepared.body, { encoding: Crypto.CryptoEncoding.HEX }),
@@ -4027,7 +4058,7 @@ export class AppControllerImpl implements AppController {
     const submittedContextIsCurrent = () => this.loaded && this.bootstrapGeneration === capturedBootstrapGeneration &&
       this.state === (submittingState ?? preparedState) && this.startupRecoveryPhase === 'ready' && !this.mailAlertRefreshRequired;
     try {
-      const ack = await this.openRouterBatchClient.submit({ operationId: staged.id, requestBody: staged.requestBody }, async () => {
+      const ack = await this.openRouterBatchClient.submit({ operationId: staged.id, requestBody: staged.requestBody, requestProfileVersion: staged.requestProfileVersion }, async () => {
         if (!this.loaded || this.bootstrapGeneration !== capturedBootstrapGeneration || this.state !== preparedState || this.mailAlertRefreshRequired || this.assistantBatchLedgerMalformed) throw new Error('The saved note changed before Batch submission.');
         await this.updateOpenRouterBatchJob(staged.id, (job) => ({ ...job, status: 'submitting', unknownCharge: true, updatedAt: now() }), { state: preparedState, generation: capturedBootstrapGeneration });
         submittingState = this.state;
@@ -4091,7 +4122,7 @@ export class AppControllerImpl implements AppController {
         updatedAt: now(),
       }), { state: capturedState, generation: capturedGeneration });
     }
-    const accountingOnly = ['failed', 'expired', 'cancelled', 'result_stale', 'result_invalid'].includes(job.status);
+    const accountingOnly = ['failed', 'expired', 'cancelled', 'result_stale', 'result_invalid', 'result_not_retained'].includes(job.status);
     if (!job.batchId || (!accountingOnly && !['queued', 'processing', 'completed'].includes(job.status)) ||
         (job.status === 'completed' && job.accounting?.providerReportedCostUsd !== undefined) ||
         (accountingOnly && job.accounting?.providerReportedCostUsd !== undefined)) return this.batchDTO(job.id);
@@ -4161,7 +4192,7 @@ export class AppControllerImpl implements AppController {
         ...(job.answeredAsOf ? { queryTimeAnchor: job.answeredAsOf, queryTimeZone: fresh.settings.timezone } : {}),
         additionalSources: context.additionalSources,
         preselection: { omittedSourceCount: context.omittedSourceCount, omittedSourceIds: context.omittedSourceIds },
-      });
+      }, job.requestProfileVersion);
       requireInspectionContext();
       const digest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, prepared.body, { encoding: Crypto.CryptoEncoding.HEX });
       const sourceDigest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, stableJson(prepared.sourceVersions), { encoding: Crypto.CryptoEncoding.HEX });
@@ -4185,6 +4216,7 @@ export class AppControllerImpl implements AppController {
     }, new Date(job.answeredAsOf ?? job.createdAt), {
       prepared, generated,
       capturedState, capturedGeneration,
+      jobId: job.id,
       nextLedger: (applied) => this.updatedBatchLedger(job.id, (current) => ({
         ...current,
         status: applied.stale ? 'result_stale' : 'completed',
@@ -4266,7 +4298,7 @@ export class AppControllerImpl implements AppController {
     id: string,
     options: { intent?: AssistIntent; question?: string; forceRefresh?: boolean; knowledgeSelection?: KnowledgeSelection } = {},
     requestedAt = new Date(),
-    batch?: { prepared: PreparedOpenRouterAnalysis; generated: DraftAnalysis; capturedState: AppState; capturedGeneration: number; nextLedger: (analysis: NoteAssistResult) => OpenRouterBatchLedger },
+    batch?: { prepared: PreparedOpenRouterAnalysis; generated: DraftAnalysis; capturedState: AppState; capturedGeneration: number; jobId: string; nextLedger: (analysis: NoteAssistResult) => OpenRouterBatchLedger },
   ): Promise<NoteAssistResult> {
     const requireBatchContext = () => {
       if (batch && (!this.loaded || this.state !== batch.capturedState || this.bootstrapGeneration !== batch.capturedGeneration ||
@@ -4476,7 +4508,8 @@ export class AppControllerImpl implements AppController {
       if (memorySuggestionIds.length) this.validateKnowledgeAndBackup(draft);
       return { proposals: selected, analysis, docs: [...new Map(docs.map((document) => [document.path, document])).values()] };
     }, undefined, batch ? (_draft, applied) => batch.nextLedger(applied.analysis) : undefined);
-    await Promise.all(result.docs.map((document) => this.mirrorDocument(document)));
+    const resultNotRetained = batch && this.assistantBatchLedger.jobs.some((job) => job.id === batch.jobId && job.status === 'result_not_retained');
+    if (!resultNotRetained) await Promise.all(result.docs.map((document) => this.mirrorDocument(document)));
     return result.analysis;
   }
 

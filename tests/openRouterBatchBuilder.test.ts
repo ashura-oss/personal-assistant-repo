@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { AppSettings, Note } from '../src/core';
 import { OpenRouterBatchRequestBuilder, OPENROUTER_BATCH_BODY_MODEL, OPENROUTER_BATCH_MODEL } from '../src/services/openRouter';
+import { assistantResponseSchema, assistantResponseSchemaV2 } from '../src/assistant';
 
 const settings: AppSettings = {
   mode: 'provider', llmProvider: 'openrouter', openRouterModel: OPENROUTER_BATCH_MODEL,
@@ -26,6 +27,10 @@ describe('OpenRouter Batch local request builder', () => {
     expect(body).not.toHaveProperty('usage');
     expect(body.reasoning).toEqual({ effort: 'low', exclude: true });
     expect(body.response_format).toMatchObject({ type: 'json_schema', json_schema: { name: 'note_assistance', strict: true } });
+    expect(prepared.requestProfileVersion).toBe(2);
+    expect((body.response_format as { json_schema: { schema: typeof assistantResponseSchemaV2 } }).json_schema.schema).toEqual(assistantResponseSchemaV2);
+    expect(assistantResponseSchemaV2.properties.summary).not.toHaveProperty('maxLength');
+    expect(assistantResponseSchemaV2.properties.answer).not.toHaveProperty('maxLength');
     const messages = body.messages as { role: string; content: string }[];
     expect(messages.map((message) => message.role)).toEqual(['system', 'user']);
     expect(messages[0]?.content).toContain('recording start 2026-10-13T10:00:00.000Z in IANA timezone Asia/Singapore');
@@ -33,6 +38,13 @@ describe('OpenRouter Batch local request builder', () => {
     expect(new TextEncoder().encode(prepared.body).length).toBeLessThan(1024 * 1024);
     expect(Object.isFrozen(prepared)).toBe(true);
     expect(Object.isFrozen(prepared.includedSourceIds)).toBe(true);
+  });
+
+  it('rebuilds the exact legacy v1 response schema when an existing job names profile 1', async () => {
+    const prepared = await new OpenRouterBatchRequestBuilder().prepareAnalysis(note, [], settings, {}, 1);
+    const body = JSON.parse(prepared.body) as { response_format: { json_schema: { schema: unknown } } };
+    expect(prepared.requestProfileVersion).toBe(1);
+    expect(body.response_format.json_schema.schema).toEqual(assistantResponseSchema);
   });
 
   it('builds a separate strict reply request with locked metadata and no artificial output cap', () => {

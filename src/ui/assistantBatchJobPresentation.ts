@@ -13,6 +13,7 @@ export function assistantBatchStatusLabel(status: AssistantBatchJobDTO['status']
     case 'cancelled': return 'Request cancelled';
     case 'result_stale': return 'Reply was not applied because the note or sources changed';
     case 'result_invalid': return 'Reply could not be validated';
+    case 'result_not_retained': return 'Reply could not be saved';
     case 'cleanup_pending': return 'Local cleanup needs attention';
     case 'source_removed': return 'Request content removed';
     default: return 'Batch job status unavailable';
