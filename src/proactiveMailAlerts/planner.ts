@@ -141,6 +141,24 @@ export function revokeProactiveMailAlertConsent(stateInput: ProactiveMailAlertSt
   return validateProactiveMailAlertState({ ...state, revision: changed ? state.revision + 1 : state.revision, consents, receipts });
 }
 
+/** Recovery revokes all extant rule consent and preserves every receipt while requesting cancellation once. */
+export function revokeAllProactiveMailAlertConsentsForRecovery(stateInput: ProactiveMailAlertState, atValue: string): ProactiveMailAlertState {
+  const state = validateProactiveMailAlertState(stateInput);
+  const at = new Date(parseCanonicalUtc(atValue, 'Mail alert recovery time')).toISOString();
+  let changed = false;
+  const consents = state.consents.map((item) => {
+    if (item.status === 'revoked') return item;
+    changed = true;
+    return { ...item, status: 'revoked' as const, revokedAt: at, revocationReason: 'user_revoked' as const };
+  });
+  const receipts = state.receipts.map((receipt) => {
+    if (receipt.desired === 'cancel' || receipt.observed === 'cancelled') return receipt;
+    changed = true;
+    return cancellationRequested(receipt, at);
+  });
+  return validateProactiveMailAlertState({ ...state, revision: changed ? state.revision + 1 : state.revision, consents, receipts });
+}
+
 /**
  * Builds a bounded deterministic plan from one fresh mail-head snapshot. It performs no IO;
  * the caller persists `nextState` before dispatching any `newAttempts`.

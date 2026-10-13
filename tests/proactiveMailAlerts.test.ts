@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { evaluateProactive, proactiveSourceId, type ProactiveMailSource } from '../src/proactive';
 import {
   createProactiveMailAlertConsent, emptyProactiveMailAlertState, planProactiveMailAlerts, replaceProactiveMailAlertConsent, revokeProactiveMailAlertConsent,
+  revokeAllProactiveMailAlertConsentsForRecovery,
   validateProactiveMailAlertState,
   type CommittedMailAlertPage, type MailAlertRule, type MailAlertVerifiedAccount, type ProactiveMailAlertState,
 } from '../src/proactiveMailAlerts';
@@ -133,6 +134,18 @@ describe('proactive mail alert domain', () => {
     const replaced = replaceProactiveMailAlertConsent(orphaned, { id: '99999999-9999-4999-8999-999999999999', rule: rule(), timeZone: 'UTC', activatedAt: now, accounts: [account] });
     expect(replaced.receipts[0]).toMatchObject({ desired: 'cancel', cancellation: { result: 'requested' } });
     expect(replaced.receipts).toHaveLength(1);
+  });
+
+  it('recovery revokes old consent and requests cancellation for orphaned uncertain receipts without changing prior cancellation intent', () => {
+    const planned = plan().newAttempts[0];
+    const orphanUnknown = { ...planned, id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', observed: 'delivery_unknown' as const };
+    const priorCancellation = { ...planned, id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', providerMessageId: 'another-message', desired: 'cancel' as const, observed: 'cancellation_pending' as const, cancellation: { result: 'requested' as const, requestedAt: now } };
+    const input = validateProactiveMailAlertState({ ...emptyProactiveMailAlertState(installationId), revision: 2, receipts: [orphanUnknown, priorCancellation] });
+    const recovered = revokeAllProactiveMailAlertConsentsForRecovery(input, now);
+    expect(recovered.receipts).toHaveLength(2);
+    expect(recovered.receipts[0]).toMatchObject({ desired: 'cancel', observed: 'cancellation_pending', cancellation: { result: 'requested', requestedAt: now } });
+    expect(recovered.receipts[1]).toEqual(priorCancellation);
+    expect(recovered.consents).toEqual([]);
   });
 
   it('honors exact candidate dismissals and source/rule snoozes', () => {

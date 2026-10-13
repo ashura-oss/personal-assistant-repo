@@ -7,6 +7,7 @@ import type { StartupRecoveryInspection, StartupRecoveryPlan, StartupRecoveryRec
 import type { PendingCaptureReceipt, PendingCaptureSafeStatus } from '../audio/pendingCaptureService.types';
 import type { ProactiveMailAlertState } from '../proactiveMailAlerts/types';
 import type { MailAlertTapKey, MailAlertTapResolution } from '../proactiveMailAlerts/taps';
+import type { ProactiveRecoveryPlan, ProactiveRecoveryReceiptInspection, ProactiveRecoveryResult, ProactiveRecoveryStatus } from '../proactive/recovery';
 
 export type NoteStatus = 'recorded' | 'processed' | 'error';
 export type ProposalKind = 'task' | 'reminder' | 'email' | 'event' | 'memory';
@@ -879,6 +880,11 @@ export interface AppController {
   revokeProactiveMailAlerts(ruleId: string): Promise<void>;
   reconcileProactiveMailAlerts(): Promise<void>;
   resolveProactiveMailAlertTap(key: MailAlertTapKey): Promise<MailAlertTapResolution>;
+  getProactiveRecoveryStatus(): ProactiveRecoveryStatus;
+  prepareProactiveRecovery(): Promise<ProactiveRecoveryPlan>;
+  cancelProactiveRecovery(operationId: string): Promise<void>;
+  confirmProactiveRecovery(input: { operationId: string; confirmation: 'RESET RULES' }): Promise<ProactiveRecoveryResult>;
+  inspectProactiveRecoveryReceipt(operationId: string): Promise<ProactiveRecoveryReceiptInspection>;
   saveProactiveRule(input: {
     id?: string; expectedVersion?: number; name: string; enabled: boolean; accountIds: string[];
     trigger: import('../proactive').ProactiveTrigger; quietHours?: import('../proactive').QuietHours;

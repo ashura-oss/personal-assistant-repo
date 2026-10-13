@@ -44,6 +44,10 @@ import type {
   EditKnowledgeSuggestionInput,
   StartupRecoveryStatus,
 } from "./src/core";
+import type {
+  ProactiveRecoveryPlan,
+  ProactiveRecoveryStatus,
+} from "./src/proactive/recovery";
 import type { StartupRecoveryPlan } from "./src/storage/startupRecovery";
 import type { KnowledgeEntityKind, KnowledgeReference, KnowledgeSuggestion } from "./src/knowledge/types";
 import { SpeechTranscriptionError } from "./src/transcription/types";
@@ -61,6 +65,7 @@ import { MailReplyComposer } from "./src/ui/MailReplyComposer";
 import { ProactiveCandidatesSection } from "./src/ui/ProactiveCandidatesSection";
 import { ProactiveRulesSection } from "./src/ui/ProactiveRulesSection";
 import { ProactiveMailAlertsSection, type EnableProactiveMailAlertsInput } from "./src/ui/ProactiveMailAlertsSection";
+import { ProactiveRecoverySheet, shouldShowProactiveRecoverySection } from "./src/ui/ProactiveRecoverySheet";
 import { useProactiveClock } from "./src/ui/useProactiveClock";
 import { ReviewSheet } from "./src/ui/ReviewSheet";
 import { NoteDetail as NoteDetailView } from "./src/ui/NoteDetail";
@@ -81,6 +86,7 @@ import { PendingRecordingRecoveryPanel } from "./src/components/PendingRecording
 import { BackgroundRefreshSection, type BackgroundRefreshActionResult } from "./src/components/BackgroundRefreshSection";
 import { MailAlertPreview } from "./src/dev/mailAlertPreview";
 import { MailAlertTapPreview } from "./src/dev/mailAlertTapPreview";
+import { ProactiveRecoveryPreview } from "./src/dev/proactiveRecoveryPreview";
 import { MailAlertTapReviewSheet, MailAlertTapStatusCard, type MailAlertTapStatus } from "./src/ui/MailAlertTapReviewSheet";
 import { createMailAlertTapCoordinator } from "./src/proactiveMailAlerts/taps";
 import type { MailAlertTapBackend, MailAlertTapKey, MailAlertTapResolution, MailAlertTapCoordinator } from "./src/proactiveMailAlerts/taps";
@@ -119,7 +125,8 @@ const isPendingRecoveryDemo = previewScenario === "pending-recovery";
 const isBackgroundRefreshDemo = previewScenario === "background-refresh" && Platform.OS === "web";
 const isMailAlertDemo = previewScenario === "mail-alerts" && Platform.OS === "web";
 const isMailAlertTapsDemo = previewScenario === "mail-alert-taps" && Platform.OS === "web";
-const isIsolatedDemo = isDispatchHistoryDemo || isMailSyncDemo || isBackupImportDemo || isKnowledgeDemo || isReminderDemo || isDeviceCalendarsDemo || isTranscriptionDemo || isStartupRecoveryDemo || isPrivacyCleanupDemo || isPendingRecoveryDemo || isBackgroundRefreshDemo || isMailAlertDemo || isMailAlertTapsDemo;
+const isProactiveRecoveryDemo = previewScenario === "proactive-recovery" && Platform.OS === "web";
+const isIsolatedDemo = isDispatchHistoryDemo || isMailSyncDemo || isBackupImportDemo || isKnowledgeDemo || isReminderDemo || isDeviceCalendarsDemo || isTranscriptionDemo || isStartupRecoveryDemo || isPrivacyCleanupDemo || isPendingRecoveryDemo || isBackgroundRefreshDemo || isMailAlertDemo || isMailAlertTapsDemo || isProactiveRecoveryDemo;
 
 function useAppState(appController: AppController) {
   return useSyncExternalStore(
@@ -426,6 +433,7 @@ type BootstrapState =
   | { kind: "background_refresh_preview" }
   | { kind: "mail_alert_preview" }
   | { kind: "mail_alert_taps_preview" }
+  | { kind: "proactive_recovery_preview" }
   | { kind: "workspace"; bindings: WorkspaceBindings }
   | { kind: "cleanup"; privacy: PrivacyService; status: PrivacyPublicStatus; reason?: "dedicated_ios_build_required" | "secure_context_and_web_locks_required"; failure?: "storage_unavailable" | "lease_lost" | "verification_incomplete"; samplePreview?: boolean }
   | { kind: "unavailable"; reason: "dedicated_ios_build_required" | "secure_context_and_web_locks_required" | "active_work" | "full_restart_required" | "storage_unavailable"; privacy?: PrivacyService; status?: PrivacyPublicStatus }
@@ -483,6 +491,10 @@ export default function App() {
           }
           if (isMailAlertTapsDemo) {
             if (alive) setBootstrap({ kind: "mail_alert_taps_preview" });
+            return;
+          }
+          if (isProactiveRecoveryDemo) {
+            if (alive) setBootstrap({ kind: "proactive_recovery_preview" });
             return;
           }
           if (isBackgroundRefreshDemo) {
@@ -748,6 +760,7 @@ export default function App() {
   if (bootstrap.kind === "background_refresh_preview") return <BackgroundRefreshPreview />;
   if (bootstrap.kind === "mail_alert_preview") return <MailAlertPreview />;
   if (bootstrap.kind === "mail_alert_taps_preview") return <MailAlertTapPreview />;
+  if (bootstrap.kind === "proactive_recovery_preview") return <ProactiveRecoveryPreview />;
   if (bootstrap.kind === "preview_error") return (
     <SafeAreaProvider><SafeAreaView style={s.safe}><View style={s.viewport}><Text style={s.kicker}>ISOLATED PREVIEW</Text><Text style={s.h1}>Sample preview could not load.</Text><Text accessibilityRole="alert" style={s.analysisText}>The sample remained isolated. Reload to try again.</Text><Button label="Reload preview" onPress={() => { if (Platform.OS === "web" && typeof window !== "undefined") window.location.reload(); }} /></View></SafeAreaView></SafeAreaProvider>
   );
@@ -840,6 +853,13 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
   const [mailAlertTapResolution, setMailAlertTapResolution] = useState<MailAlertTapResolution | null>(null);
   const [mailAlertTapStatus, setMailAlertTapStatus] = useState<MailAlertTapStatus | undefined>();
   const [mailAlertTapReviewRequested, setMailAlertTapReviewRequested] = useState(false);
+  const [proactiveRecoveryPlan, setProactiveRecoveryPlan] = useState<ProactiveRecoveryPlan | undefined>();
+  const [proactiveRecoveryBusy, setProactiveRecoveryBusy] = useState(false);
+  const [proactiveRecoveryError, setProactiveRecoveryError] = useState("");
+  const [proactiveRecoveryRequiresRefresh, setProactiveRecoveryRequiresRefresh] = useState(false);
+  const [proactiveRecoveryUnknownId, setProactiveRecoveryUnknownId] = useState<string | undefined>();
+  const [proactiveRecoveryRefreshedId, setProactiveRecoveryRefreshedId] = useState<string | undefined>();
+  const [proactiveRecoverySheetOpen, setProactiveRecoverySheetOpen] = useState(false);
   const [foregroundResumeRefreshing, setForegroundResumeRefreshing] = useState(false);
   const [foregroundCatchupComplete, setForegroundCatchupComplete] = useState(isIsolatedDemo);
   const reminderReviewRecord = reminderReviewId
@@ -929,7 +949,7 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
   const checkedReviewFreshnessKey = useRef("");
   const mailAlertTapOverlaysOpen = settingsOpen || Boolean(detail) || manualOpen || Boolean(review) ||
     Boolean(replyMessageId) || Boolean(reminderReviewId) || Boolean(doc) || Boolean(recordingAttachmentNoteId) ||
-    Boolean(mailAlertTapResolution) || privacyReviewOpen || privacyOutcomeUnknown;
+    Boolean(mailAlertTapResolution) || proactiveRecoverySheetOpen || privacyReviewOpen || privacyOutcomeUnknown;
   const mailAlertTapCaptureBlocked = audio.status !== "idle" || Boolean(captureJournal &&
     (pendingCaptureLoading || pendingCaptureStatus?.kind !== "empty"));
   const mailAlertTapAutoReady = !isIsolatedDemo && !privacyReviewOpen && !privacyOutcomeUnknown &&
@@ -1377,6 +1397,82 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
     },
     [onPrivacyInvalidated, privacyOutcomeUnknown, startupReady],
   );
+  const proactiveRecoveryBlocked = !startupReady || loading || privacyReviewOpen || privacyOutcomeUnknown ||
+    isolatedPreviewFailed || isIsolatedDemo || busy ||
+    Boolean(state.mailAlertRefreshRequired) || proactiveRecoveryRequiresRefresh ||
+    audio.status !== "idle" || pendingCaptureLoading || foregroundResumeRefreshing || !foregroundCatchupComplete ||
+    Boolean(captureJournal && pendingCaptureStatus?.kind !== "empty") ||
+    Boolean(review || replyMessageId || reminderReviewId || detail || doc || recordingAttachmentNoteId || manualOpen);
+  const runProactiveRecovery = useCallback(async <T,>(fallback: string, action: () => Promise<T>): Promise<T | undefined> => {
+    if (proactiveRecoveryBlocked || busyLock.current) return undefined;
+    busyLock.current = true;
+    setBusy(true);
+    setProactiveRecoveryBusy(true);
+    setProactiveRecoveryError("");
+    try {
+      return await action();
+    } catch (error) {
+      if (isPrivacyBootstrapError(error)) onPrivacyInvalidated();
+      else setProactiveRecoveryError(fallback);
+      return undefined;
+    } finally {
+      busyLock.current = false;
+      setBusy(false);
+      setProactiveRecoveryBusy(false);
+    }
+  }, [onPrivacyInvalidated, proactiveRecoveryBlocked]);
+  const onPrepareProactiveRecovery = useCallback(async () => {
+    const plan = await runProactiveRecovery("Could not prepare a recovery review. No changes were made.", () => controller.prepareProactiveRecovery());
+    if (plan) setProactiveRecoveryPlan(plan);
+  }, [controller, runProactiveRecovery]);
+  const onCancelProactiveRecovery = useCallback(async (operationId?: string): Promise<boolean> => {
+    if (operationId) {
+      try {
+        await controller.cancelProactiveRecovery(operationId);
+      } catch {
+        setProactiveRecoveryError("The recovery review could not be closed. Try again.");
+        return false;
+      }
+    }
+    setProactiveRecoveryPlan(undefined);
+    setProactiveRecoveryError("");
+    setProactiveRecoverySheetOpen(false);
+    return true;
+  }, [controller]);
+  const closeSettings = useCallback(async () => {
+    if (proactiveRecoverySheetOpen) {
+      const operationId = proactiveRecoveryPlan?.operationId ?? controller.getProactiveRecoveryStatus().plan?.operationId;
+      const cancelled = await onCancelProactiveRecovery(operationId);
+      if (!cancelled) return;
+    }
+    setSettingsOpen(false);
+  }, [controller, onCancelProactiveRecovery, proactiveRecoveryPlan?.operationId, proactiveRecoverySheetOpen]);
+  const onConfirmProactiveRecovery = useCallback(async (operationId: string) => {
+    if (proactiveRecoveryBlocked || busyLock.current) return;
+    busyLock.current = true; setBusy(true); setProactiveRecoveryBusy(true); setProactiveRecoveryError("");
+    try {
+      const result = await controller.confirmProactiveRecovery({ operationId, confirmation: "RESET RULES" });
+      setProactiveRecoveryPlan(undefined);
+      setProactiveRecoverySheetOpen(false);
+      if (result.status === "applied") {
+        setProactiveRecoveryUnknownId(undefined);
+        setProactiveRecoveryRefreshedId(undefined);
+        setNotice("Attention rules and local attention state were reset. The private recovery copy was retained.");
+      } else {
+        setProactiveRecoveryUnknownId(result.operationId);
+        setProactiveRecoveryRefreshedId(undefined);
+      }
+    } catch (error) {
+      if (isPrivacyBootstrapError(error)) onPrivacyInvalidated();
+      else {
+        setProactiveRecoveryPlan(undefined);
+        setProactiveRecoveryRequiresRefresh(true);
+        setProactiveRecoveryError("This review is no longer current. Prepare a new recovery review before continuing.");
+      }
+    } finally {
+      busyLock.current = false; setBusy(false); setProactiveRecoveryBusy(false);
+    }
+  }, [controller, onPrivacyInvalidated, proactiveRecoveryBlocked]);
   const openSettings = useCallback(() => {
     if (audio.status === "recording" || audio.status === "paused") {
       setNotice("Stop the recording before changing background checks.");
@@ -1483,6 +1579,8 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
   const refreshOnForegroundResume = useCallback(async () => {
     if (isIsolatedDemo || privacyReviewOpen || !startupReady || loading || backgroundActionBlockedReason || busyLock.current ||
         foregroundResumeBusy.current || foregroundMailBusy.current || reminderReconcileBusy.current) return;
+    const recoveryStatus = controller.getProactiveRecoveryStatus();
+    if (controller.getSnapshot().mailAlertRefreshRequired || proactiveRecoveryUnknownId || proactiveRecoverySheetOpen || proactiveRecoveryPlan || recoveryStatus.status === "prepared") return;
     foregroundResumeBusy.current = true;
     setForegroundResumeRefreshing(true);
     mailAlertTapCoordinatorRef.current?.setReady(false);
@@ -1508,7 +1606,7 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
       foregroundResumeBusy.current = false;
       setForegroundResumeRefreshing(false);
     }
-  }, [backgroundActionBlockedReason, controller, isIsolatedDemo, loading, onPrivacyInvalidated, privacyReviewOpen, reconcileReminderAlerts, refreshForegroundMail, startupReady]);
+  }, [backgroundActionBlockedReason, controller, isIsolatedDemo, loading, onPrivacyInvalidated, proactiveRecoveryPlan, proactiveRecoverySheetOpen, proactiveRecoveryUnknownId, privacyReviewOpen, reconcileReminderAlerts, refreshForegroundMail, startupReady]);
 
   useEffect(() => {
     if (!startupReady || loading || isIsolatedDemo || privacyReviewOpen) return;
@@ -1994,6 +2092,30 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
       return false;
     }
   }), [controller, run]);
+  const onRefreshProactiveRecovery = useCallback(async () => {
+    const operationId = proactiveRecoveryUnknownId;
+    if (operationId) setProactiveRecoveryRefreshedId(undefined);
+    const refreshed = await refreshLocalData();
+    if (refreshed === true) {
+      if (operationId) setProactiveRecoveryRefreshedId(operationId);
+      setProactiveRecoveryRequiresRefresh(false);
+      setProactiveRecoveryError("");
+    }
+  }, [proactiveRecoveryUnknownId, refreshLocalData]);
+  const onInspectProactiveRecovery = useCallback(async () => {
+    const operationId = proactiveRecoveryUnknownId;
+    if (!operationId || proactiveRecoveryRefreshedId !== operationId || proactiveRecoveryBlocked) return;
+    const receipt = await runProactiveRecovery("The recovery receipt could not be checked. Refresh local data and try again.", () =>
+      controller.inspectProactiveRecoveryReceipt(operationId));
+    if (!receipt) return;
+    if (receipt.status === "applied") {
+      setProactiveRecoveryUnknownId(undefined);
+      setProactiveRecoveryRefreshedId(undefined);
+      setNotice("The saved recovery receipt confirms the reset was applied. The private copy remains available on this device.");
+    } else {
+      setProactiveRecoveryError("The receipt is not verified. No second reset was sent.");
+    }
+  }, [controller, proactiveRecoveryBlocked, proactiveRecoveryRefreshedId, proactiveRecoveryUnknownId, runProactiveRecovery]);
 
   const mailAlertCaptureAdmissionBlocked = audio.status === "recording" || audio.status === "paused" ||
     Boolean(captureJournal && (pendingCaptureLoading || pendingCaptureStatus?.kind !== "empty"));
@@ -2022,6 +2144,7 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
   }, [canRefreshMailAlertWorkspace]);
   const mailAlertRefreshAdmissionBlocked = Boolean(backgroundActionBlockedReason || isIsolatedDemo || privacyOutcomeUnknown ||
     privacyReviewOpen || isolatedPreviewFailed || !startupReady || loading);
+  const proactiveRecoveryStatus = startupReady ? controller.getProactiveRecoveryStatus() : undefined;
   const onEnableMailAlerts = useCallback(async (input: EnableProactiveMailAlertsInput) => {
     requireMailAlertActionAllowed();
     const result = await run(async () => {
@@ -2603,7 +2726,7 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
         <Modal
           visible={settingsOpen}
           animationType="slide"
-          onRequestClose={() => setSettingsOpen(false)}
+          onRequestClose={() => { void closeSettings(); }}
         >
           <SafeAreaView style={s.modalSafe}>
             <SettingsScreen
@@ -2616,7 +2739,22 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
               onSetBackgroundRefresh={applyBackgroundRefresh}
               onRetryBackgroundRefresh={retryBackgroundRefresh}
               onRefreshLocalData={refreshLocalData}
-              onClose={() => setSettingsOpen(false)}
+              proactiveRecoveryStatus={proactiveRecoveryStatus}
+              proactiveRecoveryPlan={proactiveRecoveryPlan}
+              proactiveRecoveryBusy={proactiveRecoveryBusy}
+              proactiveRecoveryError={proactiveRecoveryError}
+              proactiveRecoveryRequiresRefresh={proactiveRecoveryRequiresRefresh}
+              proactiveRecoveryUnknown={Boolean(proactiveRecoveryUnknownId)}
+              proactiveRecoveryRefreshed={Boolean(proactiveRecoveryUnknownId && proactiveRecoveryRefreshedId === proactiveRecoveryUnknownId)}
+              onOpenProactiveRecovery={() => { setProactiveRecoveryError(""); setProactiveRecoverySheetOpen(true); }}
+              onPrepareProactiveRecovery={onPrepareProactiveRecovery}
+              onConfirmProactiveRecovery={onConfirmProactiveRecovery}
+              onCancelProactiveRecovery={onCancelProactiveRecovery}
+              onRefreshProactiveRecovery={onRefreshProactiveRecovery}
+              onInspectProactiveRecovery={onInspectProactiveRecovery}
+              proactiveRecoverySheetOpen={proactiveRecoverySheetOpen}
+              proactiveRecoveryActionBlocked={proactiveRecoveryBlocked}
+              onClose={() => { void closeSettings(); }}
               onSave={(patch) => run(() => controller.saveSettings(patch))}
               onSaveAccount={(c) => run(() => controller.saveAccount(c))}
               onSaveCalendar={(c) => run(() => controller.saveCalendar(c))}
@@ -3833,6 +3971,21 @@ function SettingsScreen({
   onSetBackgroundRefresh,
   onRetryBackgroundRefresh,
   onRefreshLocalData,
+  proactiveRecoveryStatus,
+  proactiveRecoveryPlan,
+  proactiveRecoveryBusy,
+  proactiveRecoveryError,
+  proactiveRecoveryRequiresRefresh,
+  proactiveRecoveryUnknown,
+  proactiveRecoveryRefreshed,
+  onOpenProactiveRecovery,
+  onPrepareProactiveRecovery,
+  onConfirmProactiveRecovery,
+  onCancelProactiveRecovery,
+  onRefreshProactiveRecovery,
+  onInspectProactiveRecovery,
+  proactiveRecoverySheetOpen,
+  proactiveRecoveryActionBlocked,
   demoMode,
   onClose,
   onSave,
@@ -3872,6 +4025,21 @@ function SettingsScreen({
   onSetBackgroundRefresh: (enabled: boolean) => Promise<BackgroundRefreshActionResult | undefined>;
   onRetryBackgroundRefresh: () => Promise<BackgroundRefreshActionResult | undefined>;
   onRefreshLocalData: () => Promise<boolean | undefined>;
+  proactiveRecoveryStatus?: ProactiveRecoveryStatus;
+  proactiveRecoveryPlan?: ProactiveRecoveryPlan;
+  proactiveRecoveryBusy: boolean;
+  proactiveRecoveryError: string;
+  proactiveRecoveryRequiresRefresh: boolean;
+  proactiveRecoveryUnknown: boolean;
+  proactiveRecoveryRefreshed: boolean;
+  onOpenProactiveRecovery: () => void;
+  onPrepareProactiveRecovery: () => Promise<void>;
+  onConfirmProactiveRecovery: (operationId: string) => Promise<void>;
+  onCancelProactiveRecovery: (operationId?: string) => Promise<boolean>;
+  onRefreshProactiveRecovery: () => Promise<void>;
+  onInspectProactiveRecovery: () => Promise<void>;
+  proactiveRecoverySheetOpen: boolean;
+  proactiveRecoveryActionBlocked: boolean;
   onClose: () => void;
   busy: boolean;
   demoMode: boolean;
@@ -3924,6 +4092,24 @@ function SettingsScreen({
   onDeleteLocalData: () => void;
   onNotice: (v: string) => void;
 }) {
+  const recoveryPlan = proactiveRecoveryPlan ?? proactiveRecoveryStatus?.plan;
+  const recoveryReason = proactiveRecoveryStatus?.reason === "archive_invalid"
+    ? "The private recovery archive could not be validated. Existing saved data has not been reset."
+    : proactiveRecoveryStatus?.reason === "archive_full"
+      ? "The private recovery archive is full. Existing saved data has not been reset."
+      : proactiveRecoveryStatus?.reason === "evidence_too_large"
+        ? "The saved recovery evidence is larger than this recovery flow supports. Existing saved data has not been reset."
+        : proactiveRecoveryStatus?.reason === "unsupported_storage"
+          ? "This storage does not support a safe recovery review. Existing saved data has not been reset."
+          : proactiveRecoveryStatus?.reason === "privacy_unavailable"
+            ? "Privacy protection is unavailable. Existing saved data has not been reset."
+            : proactiveRecoveryStatus?.reason === "startup_unavailable"
+              ? "Local startup is not ready for recovery. Existing saved data has not been reset."
+              : proactiveRecoveryStatus?.status === "busy"
+                ? "Recovery is waiting for another local operation to finish. No reset was made."
+                : proactiveRecoveryStatus?.status === "unavailable"
+                  ? "Recovery is unavailable. Existing saved data has not been reset."
+                  : "";
   const [endpoint, setEndpoint] = useState(state.settings.openAiEndpoint ?? "");
   const [deployment, setDeployment] = useState(
     state.settings.openAiDeployment ?? "",
@@ -4313,6 +4499,54 @@ function SettingsScreen({
           label="Recorded requests this month"
           value={String(state.usage.requests)}
         />
+        {shouldShowProactiveRecoverySection({
+          mailAlertRecovery: Boolean(state.proactiveMailAlertRecoveryStatus),
+          proactiveIntegrityError: Boolean(state.proactive.integrityError),
+          recoveryUnknown: proactiveRecoveryUnknown,
+          requiresRefresh: proactiveRecoveryRequiresRefresh,
+          status: proactiveRecoveryStatus?.status,
+        }) ? (
+          <View style={{ borderWidth: 1, borderColor: C.border, backgroundColor: C.card, borderRadius: 14, padding: 14, gap: 9 }}>
+            <Text style={s.sectionTitle}>Attention settings need recovery</Text>
+            {state.proactive.integrityError ? <Text style={s.disclaimer}>Some saved attention settings could not be validated and are held privately.</Text> : null}
+            {state.proactiveMailAlertRecoveryStatus?.message ? <Text style={s.disclaimer}>{state.proactiveMailAlertRecoveryStatus.message}</Text> : null}
+            {proactiveRecoveryUnknown ? (
+              <>
+                <Text style={s.disclaimer}>Reset outcome is not verified. Refresh local data, then check the recovery receipt.</Text>
+                <Button label="Refresh local data" tone="quiet" disabled={busy || demoMode} onPress={() => void onRefreshProactiveRecovery()} />
+                <Button label="Check recovery receipt" disabled={busy || demoMode || !proactiveRecoveryRefreshed} onPress={() => void onInspectProactiveRecovery()} />
+                {proactiveRecoveryError ? <Text accessibilityRole="alert" style={{ color: C.red, fontSize: 13 }}>{proactiveRecoveryError}</Text> : null}
+              </>
+            ) : proactiveRecoveryRequiresRefresh || proactiveRecoveryStatus?.status === "refresh_required" ? (
+              <>
+                <Text style={s.disclaimer}>Saved data changed. Refresh local data before continuing.</Text>
+                <Button label="Refresh local data" tone="quiet" disabled={busy || demoMode} onPress={() => void onRefreshProactiveRecovery()} />
+                {proactiveRecoveryError ? <Text accessibilityRole="alert" style={{ color: C.red, fontSize: 13 }}>{proactiveRecoveryError}</Text> : null}
+              </>
+            ) : (
+              <>
+                {recoveryReason ? <Text accessibilityRole="alert" style={{ color: C.red, fontSize: 13, lineHeight: 19 }}>{recoveryReason}</Text> : null}
+                {proactiveRecoveryStatus?.status === "available" || proactiveRecoveryStatus?.status === "prepared" ? (
+                  <Button label="Review recovery" disabled={proactiveRecoveryActionBlocked || proactiveRecoveryBusy || Boolean(backgroundActionBlockedReason)} onPress={onOpenProactiveRecovery} />
+                ) : null}
+                {proactiveRecoveryError ? <Text accessibilityRole="alert" style={{ color: C.red, fontSize: 13 }}>{proactiveRecoveryError}</Text> : null}
+              </>
+            )}
+          </View>
+        ) : null}
+        <ProactiveRecoverySheet
+          key={`${proactiveRecoverySheetOpen ? "open" : "closed"}:${recoveryPlan?.operationId ?? "new"}`}
+          visible={proactiveRecoverySheetOpen}
+          plan={recoveryPlan}
+          busy={proactiveRecoveryBusy}
+          actionsBlocked={proactiveRecoveryActionBlocked}
+          previewOnly={demoMode}
+          error={proactiveRecoveryError}
+          onPrepare={onPrepareProactiveRecovery}
+          onConfirm={onConfirmProactiveRecovery}
+          onCancel={onCancelProactiveRecovery}
+          onClose={() => void onCancelProactiveRecovery(recoveryPlan?.operationId)}
+        />
         <BackgroundRefreshSection
           open={open}
           desiredEnabled={state.settings.backgroundMailRefreshEnabled === true}
@@ -4482,6 +4716,7 @@ function SettingsScreen({
     </View>
   );
 }
+
 
 function LimitRow({ label, value }: { label: string; value: string }) {
   return (

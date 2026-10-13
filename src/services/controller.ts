@@ -14,7 +14,8 @@ import type {
 } from '../core';
 import { createPlatformStateStore, stateStore } from '../storage/platformStorage';
 import type { StateStore } from '../storage/contracts';
-import { STARTUP_RECOVERY_SESSION_MS, validateRecoveryId, validateRecoveryIso, validateRecoveryReceipt, validateReplacementSnapshot, type StartupRecoveryInspection, type StartupRecoveryPlan, type StartupRecoveryReceipt, type StartupRecoveryCommitInput } from '../storage/startupRecovery';
+import { STATE_SNAPSHOT_READ_MAX_BYTES } from '../storage/contracts';
+import { recoveryUtf8Bytes, STARTUP_RECOVERY_SESSION_MS, validateRecoveryId, validateRecoveryIso, validateRecoveryReceipt, validateReplacementSnapshot, type StartupRecoveryInspection, type StartupRecoveryPlan, type StartupRecoveryReceipt, type StartupRecoveryCommitInput } from '../storage/startupRecovery';
 import { writePrivateDocument } from '../storage/documents';
 import { AzureOpenAIClient, AzureSpeechClient, ReplyGenerationError, ReplyGenerationPreDispatchError, validateAzureEndpoint, type DraftAnalysis, type ReplyGenerationUsage } from './azure';
 import {
@@ -53,10 +54,16 @@ import { evaluateProactive, type ProactiveMailSource, type ProactiveTrigger, typ
 import { computeProactiveNextCheckAt } from '../proactive/boundaries';
 import { buildProactiveMailSources, buildProactiveSources, proactiveStableValue, type ProactiveSourceHashMemo } from '../proactive/adapters';
 import { emptyProactiveState, normalizeProactiveData, PROACTIVE_INTEGRITY_ERROR, uncertainOnLoad, validateProactiveState, type ProactiveQuarantine } from '../proactive/state';
+import {
+  PROACTIVE_RECOVERY_MAX_ARCHIVES, PROACTIVE_RECOVERY_MAX_SOURCE_BYTES, PROACTIVE_RECOVERY_TTL_MS,
+  emptyProactiveRecoveryArchiveState, proactiveRecoveryArchiveBytes, proactiveRecoveryEvidenceJson,
+  validateProactiveRecoveryArchiveState,
+} from '../proactive/recovery';
+import type { ProactiveRecoveryArchiveEntry, ProactiveRecoveryArchiveState, ProactiveRecoveryPlan, ProactiveRecoveryReceiptInspection, ProactiveRecoveryResult, ProactiveRecoveryStatus } from '../proactive/recovery';
 import { emptyProactiveMailAlertState, validateProactiveMailAlertState } from '../proactiveMailAlerts/state';
-import { createProactiveMailAlertConsent, planProactiveMailAlerts, replaceProactiveMailAlertConsent, revokeProactiveMailAlertConsent } from '../proactiveMailAlerts/planner';
+import { createProactiveMailAlertConsent, planProactiveMailAlerts, replaceProactiveMailAlertConsent, revokeAllProactiveMailAlertConsentsForRecovery, revokeProactiveMailAlertConsent } from '../proactiveMailAlerts/planner';
 import { executeRequestedMailAlertCancellations, executeReservedMailAlertAttempts, type ProactiveMailAlertEngineDependencies } from '../proactiveMailAlerts/engine';
-import type { CommittedMailAlertPage, ProactiveMailAlertReceipt } from '../proactiveMailAlerts/types';
+import type { CommittedMailAlertPage, ProactiveMailAlertReceipt, ProactiveMailAlertState } from '../proactiveMailAlerts/types';
 import type { MailAlertTapKey, MailAlertTapResolution, MailAlertTapBackend } from '../proactiveMailAlerts/taps';
 import { committedMailAlertPageForWorkspace, isMailAlertAttemptCurrentForWorkspace, mailAlertAccountsForWorkspace } from '../proactiveMailAlerts/workspace';
 import { createMailAlertNotificationBackend, isMatchingProactiveMailAlertNotification, type MailAlertNotificationBackend } from './mailAlertNotificationBackend';
@@ -1198,6 +1205,27 @@ export class AppControllerImpl implements AppController {
   private credentialCleanupJob?: Promise<void>;
   private installingTokenRefs = new Set<string>();
   private proactiveQuarantine?: ProactiveQuarantine;
+  private proactiveRecoveryArchivesRaw?: unknown;
+  private proactiveRecoveryArchivesValidated?: ProactiveRecoveryArchiveState;
+  private proactiveRecoveryArchivesMalformed = false;
+  private proactiveRecoveryUnavailableReason?: { readonly reason: 'evidence_too_large'; readonly state: AppState; readonly bootstrapGeneration: number };
+  private proactiveRecoveryPlan?: {
+    readonly publicPlan: ProactiveRecoveryPlan;
+    readonly preparedAtMs: number;
+    readonly capturedBootstrapGeneration: number;
+    readonly capturedState: AppState;
+    readonly raw: string;
+    readonly schemaVersion: number;
+    readonly rawSha256: string;
+    readonly evidenceJson: string;
+    readonly evidenceSha256: string;
+    readonly archiveState: ProactiveRecoveryArchiveState;
+    readonly archivedAt: string;
+  };
+  private proactiveRecoveryBusy = false;
+  private proactiveRecoveryInspectionOperationId?: string;
+  private proactiveRecoveryExpectedReceipt?: ProactiveRecoveryArchiveEntry;
+  private proactiveRecoveryReceiptReadAfterRefresh = false;
   private proactiveMailAlertQuarantine: unknown[] = [];
   private backupImportQuarantine: unknown[] = [];
   private knowledgeQuarantine: unknown[] = [];
@@ -1287,6 +1315,14 @@ export class AppControllerImpl implements AppController {
     this.loadPromise = undefined;
     this.transactionQueue = Promise.resolve();
     this.proactiveQuarantine = undefined;
+    this.proactiveRecoveryPlan = undefined;
+    this.proactiveRecoveryArchivesRaw = undefined;
+    this.proactiveRecoveryArchivesValidated = undefined;
+    this.proactiveRecoveryArchivesMalformed = false;
+    this.proactiveRecoveryUnavailableReason = undefined;
+    this.proactiveRecoveryInspectionOperationId = undefined;
+    this.proactiveRecoveryExpectedReceipt = undefined;
+    this.proactiveRecoveryReceiptReadAfterRefresh = false;
     this.proactiveMailAlertQuarantine = [];
     this.backupImportQuarantine = [];
     this.knowledgeQuarantine = [];
@@ -1804,7 +1840,7 @@ export class AppControllerImpl implements AppController {
   }
 
   private persistedState(state: AppState): AppState {
-    const result = { ...state } as AppState & { dispatchRecordQuarantine?: DispatchRecordQuarantineEntry[]; proactiveQuarantine?: unknown; proactiveMailAlertQuarantine?: unknown[]; backupImportQuarantine?: unknown[]; knowledgeQuarantine?: unknown[]; reminderQuarantine?: unknown[]; deviceCalendarQuarantine?: unknown[]; transcriptionQuarantine?: unknown[] };
+    const result = { ...state } as AppState & { dispatchRecordQuarantine?: DispatchRecordQuarantineEntry[]; proactiveQuarantine?: unknown; proactiveRecoveryArchives?: unknown; proactiveMailAlertQuarantine?: unknown[]; backupImportQuarantine?: unknown[]; knowledgeQuarantine?: unknown[]; reminderQuarantine?: unknown[]; deviceCalendarQuarantine?: unknown[]; transcriptionQuarantine?: unknown[] };
     if (this.dispatchRecordQuarantine.length) result.dispatchRecordQuarantine = clone(this.dispatchRecordQuarantine);
     else delete result.dispatchRecordQuarantine;
     if (this.dispatchRecordQuarantine.length) result.dispatchRecoveryStatus = {
@@ -1813,6 +1849,8 @@ export class AppControllerImpl implements AppController {
     };
     else delete result.dispatchRecoveryStatus;
     if (this.proactiveQuarantine) result.proactiveQuarantine = clone(this.proactiveQuarantine);
+    if (this.proactiveRecoveryArchivesRaw !== undefined) result.proactiveRecoveryArchives = clone(this.proactiveRecoveryArchivesRaw);
+    else delete result.proactiveRecoveryArchives;
     if (this.proactiveMailAlertQuarantine.length) result.proactiveMailAlertQuarantine = clone(this.proactiveMailAlertQuarantine);
     else delete result.proactiveMailAlertQuarantine;
     if (this.proactiveMailAlertQuarantine.length) result.proactiveMailAlertRecoveryStatus = {
@@ -1830,7 +1868,7 @@ export class AppControllerImpl implements AppController {
   }
 
   private publicState(state: AppState): AppState {
-    const result = clone(state) as AppState & { dispatchRecordQuarantine?: unknown; proactiveQuarantine?: unknown; proactiveMailAlertQuarantine?: unknown; backupImportQuarantine?: unknown; knowledgeQuarantine?: unknown; reminderQuarantine?: unknown; deviceCalendarQuarantine?: unknown; transcriptionQuarantine?: unknown };
+    const result = clone(state) as AppState & { dispatchRecordQuarantine?: unknown; proactiveQuarantine?: unknown; proactiveRecoveryArchives?: unknown; proactiveMailAlertQuarantine?: unknown; backupImportQuarantine?: unknown; knowledgeQuarantine?: unknown; reminderQuarantine?: unknown; deviceCalendarQuarantine?: unknown; transcriptionQuarantine?: unknown };
     delete result.dispatchRecordQuarantine;
     if (this.dispatchRecordQuarantine.length) result.dispatchRecoveryStatus = {
       quarantinedCount: this.dispatchRecordQuarantine.length,
@@ -1838,6 +1876,7 @@ export class AppControllerImpl implements AppController {
     };
     else delete result.dispatchRecoveryStatus;
     delete result.proactiveQuarantine;
+    delete result.proactiveRecoveryArchives;
     delete result.proactiveMailAlertQuarantine;
     if (this.proactiveMailAlertQuarantine.length) result.proactiveMailAlertRecoveryStatus = {
       quarantined: true,
@@ -2382,9 +2421,417 @@ export class AppControllerImpl implements AppController {
       this.loadPromise = undefined;
       await this.openStartupData(true);
       this.clearMailAlertRefreshRequired();
+      this.proactiveRecoveryReceiptReadAfterRefresh = true;
     });
     this.transactionQueue = refresh.then(() => undefined, () => undefined);
     await refresh;
+  }
+
+  private proactiveRecoveryHasLiveWork(): boolean {
+    return Boolean(this.loadPromise || this.processJobs.size || this.assistJobs.size || this.activeSyncCount || this.syncJobs.size ||
+      this.mailLaneJobs.size || this.foregroundMailJob || this.syncAbortControllers.size || this.credentialCleanupJob ||
+      this.installingTokenRefs.size || this.mailReplyGenerations.size || this.backupImportSessions.size || this.knowledgeActivationSessions.size ||
+      this.transcriptionJobs.size || this.transcriptionCleanupJob ||
+      this.transcriptionCleanupPromises.size || this.deviceCalendarJob || this.deviceEventJobs.size || this.deviceEventLateResults.size ||
+      this.deviceEventCreateTimers.size || this.reminderJobs.size || this.reminderLegacyJobs.size || this.reminderReconcileJob ||
+      this.recordingAttachmentJobs.size || this.recordingAttachmentSessions.size);
+  }
+
+  private currentProactiveRecoveryArchives(): ProactiveRecoveryArchiveState {
+    if (this.proactiveRecoveryArchivesMalformed) throw new Error('archive_invalid');
+    if (this.proactiveRecoveryArchivesValidated) return this.proactiveRecoveryArchivesValidated;
+    try {
+      this.proactiveRecoveryArchivesValidated = validateProactiveRecoveryArchiveState(this.proactiveRecoveryArchivesRaw ?? emptyProactiveRecoveryArchiveState());
+      return this.proactiveRecoveryArchivesValidated;
+    } catch { this.proactiveRecoveryArchivesMalformed = true; throw new Error('archive_invalid'); }
+  }
+
+  private proactiveRecoveryPersistenceProjection(value: unknown): string {
+    const serialized = typeof value === 'string' ? value : JSON.stringify(value);
+    if (typeof serialized !== 'string') throw new Error('Workspace snapshot cannot be serialized.');
+    const parsed = JSON.parse(serialized) as Record<string, unknown>;
+    delete parsed.proactive;
+    delete parsed.proactiveQuarantine;
+    return stableJson(parsed);
+  }
+
+  private async assertProactiveRecoveryPrivacyIdle(): Promise<void> {
+    const privacy = this.integration.privacySession;
+    if (!privacy?.getStatus) throw new Error('privacy_unavailable');
+    await privacy.assertCurrent();
+    const status = await privacy.getStatus();
+    await privacy.assertCurrent();
+    if (status.epoch !== privacy.epoch) throw new Error('privacy_unavailable');
+    if (status.phase !== 'ready' || status.activeWriterCount !== 0 || status.pendingCleanupCount !== 0 || status.failedCleanupCount !== 0) {
+      throw new Error('busy');
+    }
+  }
+
+  private async verifyProactiveRecoveryArchiveDigests(archives: ProactiveRecoveryArchiveState): Promise<void> {
+    const capturedState = this.state;
+    const generation = this.bootstrapGeneration;
+    for (const entry of archives.entries) {
+      const digest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, entry.sourceJson, { encoding: Crypto.CryptoEncoding.HEX });
+      await this.assertPrivacySessionCurrent();
+      if (this.state !== capturedState || this.bootstrapGeneration !== generation || !this.loaded || this.startupRecoveryPhase !== 'ready') {
+        throw new Error('refresh_required');
+      }
+      if (digest.toLowerCase() !== entry.sourceSha256) {
+        this.proactiveRecoveryArchivesMalformed = true;
+        this.proactiveRecoveryArchivesValidated = undefined;
+        throw new Error('archive_invalid');
+      }
+    }
+  }
+
+  private strictProactiveRecoveryAlertState(raw: Record<string, unknown>): ProactiveMailAlertState | undefined {
+    const quarantine = raw.proactiveMailAlertQuarantine;
+    if (quarantine !== undefined && (!Array.isArray(quarantine) || quarantine.length !== 0)) return undefined;
+    if (!Object.prototype.hasOwnProperty.call(raw, 'proactiveMailAlerts')) return undefined;
+    try {
+      const alerts = validateProactiveMailAlertState(raw.proactiveMailAlerts);
+      const persistedRaw = JSON.stringify(raw.proactiveMailAlerts);
+      if (typeof persistedRaw !== 'string' || stableJson(JSON.parse(persistedRaw)) !== stableJson(alerts)) return undefined;
+      return alerts;
+    } catch { return undefined; }
+  }
+
+  private proactiveRecoveryStatusFromRaw(raw: Record<string, unknown>, at: string): ProactiveRecoveryPlan['effects'] {
+    const quarantine = raw.proactiveMailAlertQuarantine;
+    if (quarantine !== undefined && (!Array.isArray(quarantine) || quarantine.length !== 0)) {
+      return { resetsRules: true, resetsAttention: true, resetsDismissalsAndSnoozes: true, mailConsentsToRevoke: null, mailReceiptsPreserved: null, mailCleanup: 'unavailable' };
+    }
+    if (!Object.prototype.hasOwnProperty.call(raw, 'proactiveMailAlerts')) {
+      return { resetsRules: true, resetsAttention: true, resetsDismissalsAndSnoozes: true, mailConsentsToRevoke: null, mailReceiptsPreserved: null, mailCleanup: 'unavailable' };
+    }
+    try {
+      const alerts = this.strictProactiveRecoveryAlertState(raw);
+      if (!alerts) throw new Error('noncanonical_alert_ledger');
+      const activeCount = alerts.consents.filter((item) => item.status === 'active').length;
+      const revoked = revokeAllProactiveMailAlertConsentsForRecovery(alerts, at);
+      const pending = revoked.receipts.some((item) => item.desired === 'cancel' && item.observed !== 'cancelled');
+      return {
+        resetsRules: true, resetsAttention: true, resetsDismissalsAndSnoozes: true,
+        mailConsentsToRevoke: activeCount, mailReceiptsPreserved: alerts.receipts.length,
+        mailCleanup: pending ? 'pending' : 'none',
+      };
+    } catch {
+      return { resetsRules: true, resetsAttention: true, resetsDismissalsAndSnoozes: true, mailConsentsToRevoke: null, mailReceiptsPreserved: null, mailCleanup: 'unavailable' };
+    }
+  }
+
+  getProactiveRecoveryStatus(): ProactiveRecoveryStatus {
+    let archives: ProactiveRecoveryArchiveState;
+    try { archives = this.currentProactiveRecoveryArchives(); }
+    catch { return { status: 'unavailable', reason: 'archive_invalid', archiveCount: null, archiveBytes: null }; }
+    const archiveCount = archives.entries.length;
+    const archiveBytes = proactiveRecoveryArchiveBytes(archives);
+    if (this.startupRecoveryPhase !== 'ready' || !this.loaded) return { status: 'unavailable', reason: 'startup_unavailable', archiveCount, archiveBytes };
+    if (this.mailAlertRefreshRequired) return { status: 'refresh_required', archiveCount, archiveBytes };
+    if (!this.store.readCurrentSnapshot) return { status: 'unavailable', reason: 'unsupported_storage', archiveCount, archiveBytes };
+    if (!this.integration.privacySession?.getStatus) return { status: 'unavailable', reason: 'privacy_unavailable', archiveCount, archiveBytes };
+    if (this.proactiveRecoveryBusy || this.proactiveRecoveryHasLiveWork()) return { status: 'busy', archiveCount, archiveBytes };
+    if (!this.proactiveQuarantine) return { status: 'not_needed', archiveCount, archiveBytes };
+    const unavailableReason = this.proactiveRecoveryUnavailableReason;
+    if (unavailableReason) {
+      if (unavailableReason.bootstrapGeneration === this.bootstrapGeneration && unavailableReason.state === this.state) {
+        return { status: 'unavailable', reason: unavailableReason.reason, archiveCount, archiveBytes };
+      }
+      this.proactiveRecoveryUnavailableReason = undefined;
+    }
+    const plan = this.proactiveRecoveryPlan;
+    if (plan) {
+      const now = Date.now();
+      if (now < plan.preparedAtMs || now >= Date.parse(plan.publicPlan.expiresAt)) this.proactiveRecoveryPlan = undefined;
+      else if (plan.capturedBootstrapGeneration !== this.bootstrapGeneration || plan.capturedState !== this.state) this.proactiveRecoveryPlan = undefined;
+      else return { status: 'prepared', archiveCount, archiveBytes, plan: plan.publicPlan };
+    }
+    if (archives.entries.length >= PROACTIVE_RECOVERY_MAX_ARCHIVES || archiveBytes >= PROACTIVE_RECOVERY_MAX_SOURCE_BYTES * PROACTIVE_RECOVERY_MAX_ARCHIVES) {
+      return { status: 'unavailable', reason: 'archive_full', archiveCount, archiveBytes };
+    }
+    return { status: 'available', archiveCount, archiveBytes };
+  }
+
+  private async withProactiveRecoverySlot<T>(work: (capturedBootstrapGeneration: number, capturedState: AppState) => Promise<T>): Promise<T> {
+    const capturedBootstrapGeneration = this.bootstrapGeneration;
+    const run = this.transactionQueue.then(async () => {
+      await this.assertPrivacySessionCurrent();
+      if (capturedBootstrapGeneration !== this.bootstrapGeneration || !this.loaded || this.startupRecoveryPhase !== 'ready') throw new Error('startup_unavailable');
+      if (this.mailAlertRefreshRequired) throw new Error('refresh_required');
+      if (this.proactiveRecoveryHasLiveWork()) throw new Error('busy');
+      const capturedState = this.state;
+      await this.assertProactiveRecoveryPrivacyIdle();
+      if (capturedBootstrapGeneration !== this.bootstrapGeneration || capturedState !== this.state || !this.loaded || this.startupRecoveryPhase !== 'ready') throw new Error('startup_unavailable');
+      return await work(capturedBootstrapGeneration, capturedState);
+    });
+    this.transactionQueue = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  async prepareProactiveRecovery(): Promise<ProactiveRecoveryPlan> {
+    if (this.proactiveRecoveryBusy) throw new Error('A proactive recovery operation is already in progress.');
+    this.proactiveRecoveryBusy = true;
+    this.proactiveRecoveryPlan = undefined;
+    try {
+      return await this.withProactiveRecoverySlot(async (capturedBootstrapGeneration, capturedState) => {
+        if (!this.proactiveQuarantine) throw new Error('not_needed');
+        if (!this.store.readCurrentSnapshot || !this.store.assertCurrent) throw new Error('unsupported_storage');
+        const snapshot = await this.readProactiveRecoverySnapshot(capturedBootstrapGeneration, capturedState);
+        await this.assertPrivacySessionCurrent();
+        if (capturedBootstrapGeneration !== this.bootstrapGeneration || capturedState !== this.state || !snapshot || snapshot.schemaVersion !== 1) throw new Error('refresh_required');
+        await this.assertProactiveRecoveryStorageCurrent(capturedBootstrapGeneration, capturedState);
+        const privacyAfterRead = await this.integration.privacySession?.getStatus?.();
+        await this.assertPrivacySessionCurrent();
+        if (privacyAfterRead && (privacyAfterRead.phase !== 'ready' || privacyAfterRead.activeWriterCount !== 0 || privacyAfterRead.pendingCleanupCount !== 0 || privacyAfterRead.failedCleanupCount !== 0)) throw new Error('busy');
+
+        const parsed: unknown = JSON.parse(snapshot.raw);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('refresh_required');
+        const raw = parsed as Record<string, unknown>;
+        const currentProjection = this.proactiveRecoveryPersistenceProjection(snapshot.raw);
+        const expectedProjection = this.proactiveRecoveryPersistenceProjection(this.persistedState(capturedState));
+        if (currentProjection !== expectedProjection) {
+          if (capturedBootstrapGeneration === this.bootstrapGeneration && capturedState === this.state) this.setMailAlertRefreshRequired();
+          throw new Error('refresh_required');
+        }
+        const evidenceJson = proactiveRecoveryEvidenceJson(raw);
+        const hasEvidence = Object.prototype.hasOwnProperty.call(raw, 'proactiveQuarantine') ||
+          (() => { try { validateProactiveState(raw.proactive); return false; } catch { return true; } })();
+        if (!evidenceJson || !hasEvidence) throw new Error('not_needed');
+        const sourceBytes = recoveryUtf8Bytes(evidenceJson, PROACTIVE_RECOVERY_MAX_SOURCE_BYTES);
+        if (sourceBytes > PROACTIVE_RECOVERY_MAX_SOURCE_BYTES) {
+          this.proactiveRecoveryUnavailableReason = { reason: 'evidence_too_large', state: capturedState, bootstrapGeneration: capturedBootstrapGeneration };
+          throw new Error('evidence_too_large');
+        }
+        const archives = this.currentProactiveRecoveryArchives();
+        if (archives.entries.length >= PROACTIVE_RECOVERY_MAX_ARCHIVES || proactiveRecoveryArchiveBytes(archives) + sourceBytes > 1024 * 1024) throw new Error('archive_full');
+        await this.verifyProactiveRecoveryArchiveDigests(archives);
+        const preparedAtMs = Date.now();
+        const archivedAt = new Date(preparedAtMs).toISOString();
+        const [rawSha256, evidenceSha256] = await Promise.all([
+          Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, snapshot.raw, { encoding: Crypto.CryptoEncoding.HEX }),
+          Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, evidenceJson, { encoding: Crypto.CryptoEncoding.HEX }),
+        ]);
+        await this.assertProactiveRecoveryStorageCurrent(capturedBootstrapGeneration, capturedState);
+        await this.assertProactiveRecoveryPrivacyIdle();
+        if (capturedBootstrapGeneration !== this.bootstrapGeneration || capturedState !== this.state || this.mailAlertRefreshRequired || this.proactiveRecoveryHasLiveWork()) throw new Error('refresh_required');
+        const operationId = newId();
+        if (archives.entries.some((entry) => entry.operationId === operationId)) throw new Error('A proactive recovery operation ID collision occurred. Prepare again later.');
+        const effects = this.proactiveRecoveryStatusFromRaw(raw, archivedAt);
+        const publicPlan: ProactiveRecoveryPlan = Object.freeze({
+          operationId, expiresAt: new Date(preparedAtMs + PROACTIVE_RECOVERY_TTL_MS).toISOString(),
+          evidenceBytes: sourceBytes, archiveCount: archives.entries.length + 1, effects: Object.freeze(effects),
+        });
+        this.proactiveRecoveryPlan = Object.freeze({
+          publicPlan, preparedAtMs, capturedBootstrapGeneration, capturedState, raw: snapshot.raw, schemaVersion: snapshot.schemaVersion,
+          rawSha256: rawSha256.toLowerCase(), evidenceJson, evidenceSha256: evidenceSha256.toLowerCase(), archiveState: archives, archivedAt,
+        });
+        return publicPlan;
+      });
+    } finally { this.proactiveRecoveryBusy = false; }
+  }
+
+  async cancelProactiveRecovery(operationId: string): Promise<void> {
+    if (this.proactiveRecoveryBusy) throw new Error('Proactive recovery is already being confirmed.');
+    if (!this.proactiveRecoveryPlan || this.proactiveRecoveryPlan.publicPlan.operationId !== operationId) return;
+    this.proactiveRecoveryPlan = undefined;
+  }
+
+  private async markProactiveRecoveryRefreshIfCurrent(
+    plan: NonNullable<AppControllerImpl['proactiveRecoveryPlan']>, expectedNextState?: AppState,
+  ): Promise<void> {
+    await this.markProactiveRecoveryRefreshForContext(plan.capturedBootstrapGeneration, plan.capturedState, expectedNextState);
+  }
+
+  private async markProactiveRecoveryRefreshForContext(
+    capturedBootstrapGeneration: number, capturedState: AppState, expectedNextState?: AppState,
+  ): Promise<void> {
+    const stateMatches = () => this.state === capturedState || (expectedNextState !== undefined && this.state === expectedNextState);
+    if (this.bootstrapGeneration !== capturedBootstrapGeneration || !stateMatches() || !this.loaded || this.startupRecoveryPhase !== 'ready') return;
+    try { await this.integration.privacySession?.assertCurrent(); } catch { return; }
+    if (this.bootstrapGeneration === capturedBootstrapGeneration && stateMatches() && this.loaded && this.startupRecoveryPhase === 'ready') this.setMailAlertRefreshRequired();
+  }
+
+  private async readProactiveRecoverySnapshot(capturedBootstrapGeneration: number, capturedState: AppState): Promise<{ raw: string; schemaVersion: number } | undefined> {
+    if (!this.store.readCurrentSnapshot || !this.store.assertCurrent) throw new Error('unsupported_storage');
+    try {
+      await this.store.assertCurrent();
+      return await this.store.readCurrentSnapshot();
+    } catch {
+      await this.markProactiveRecoveryRefreshForContext(capturedBootstrapGeneration, capturedState);
+      throw new Error('refresh_required');
+    }
+  }
+
+  private async assertProactiveRecoveryStorageCurrent(capturedBootstrapGeneration: number, capturedState: AppState): Promise<void> {
+    if (!this.store.assertCurrent) throw new Error('unsupported_storage');
+    try {
+      await this.store.assertCurrent();
+    } catch {
+      await this.markProactiveRecoveryRefreshForContext(capturedBootstrapGeneration, capturedState);
+      throw new Error('refresh_required');
+    }
+  }
+
+  async confirmProactiveRecovery(input: { operationId: string; confirmation: 'RESET RULES' }): Promise<ProactiveRecoveryResult> {
+    if (input?.confirmation !== 'RESET RULES') throw new Error('Type RESET RULES exactly to confirm this recovery.');
+    const plan = this.proactiveRecoveryPlan;
+    if (!plan || input.operationId !== plan.publicPlan.operationId) throw new Error('The proactive recovery plan is no longer current. Prepare it again.');
+    const now = Date.now();
+    if (now < plan.preparedAtMs || now >= Date.parse(plan.publicPlan.expiresAt)) {
+      this.proactiveRecoveryPlan = undefined;
+      throw new Error('The proactive recovery plan expired. Prepare it again.');
+    }
+    if (this.proactiveRecoveryBusy) throw new Error('Another proactive recovery operation is in progress.');
+    this.proactiveRecoveryBusy = true;
+    try {
+      return await this.withProactiveRecoverySlot(async (capturedBootstrapGeneration, capturedState) => {
+        if (capturedBootstrapGeneration !== plan.capturedBootstrapGeneration || capturedState !== plan.capturedState ||
+            capturedBootstrapGeneration !== this.bootstrapGeneration || capturedState !== this.state) throw new Error('refresh_required');
+        if (!this.store.readCurrentSnapshot || !this.store.assertCurrent) throw new Error('unsupported_storage');
+        const snapshot = await this.readProactiveRecoverySnapshot(capturedBootstrapGeneration, capturedState).catch((error: unknown) => {
+          if (this.proactiveRecoveryPlan === plan) this.proactiveRecoveryPlan = undefined;
+          throw error;
+        });
+        const assertCurrent = async () => this.assertProactiveRecoveryStorageCurrent(capturedBootstrapGeneration, capturedState).catch((error: unknown) => {
+          if (this.proactiveRecoveryPlan === plan) this.proactiveRecoveryPlan = undefined;
+          throw error;
+        });
+        await this.assertPrivacySessionCurrent();
+        if (!snapshot || snapshot.schemaVersion !== plan.schemaVersion || snapshot.raw !== plan.raw) {
+          await this.markProactiveRecoveryRefreshIfCurrent(plan);
+          this.proactiveRecoveryPlan = undefined;
+          throw new Error('refresh_required');
+        }
+        const [rawHash, currentProjection] = await Promise.all([
+          Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, snapshot.raw, { encoding: Crypto.CryptoEncoding.HEX }),
+          Promise.resolve(this.proactiveRecoveryPersistenceProjection(snapshot.raw)),
+        ]);
+        const expectedProjection = this.proactiveRecoveryPersistenceProjection(this.persistedState(capturedState));
+        await assertCurrent();
+        await this.assertProactiveRecoveryPrivacyIdle();
+        if (rawHash.toLowerCase() !== plan.rawSha256 || currentProjection !== expectedProjection ||
+            capturedBootstrapGeneration !== this.bootstrapGeneration || capturedState !== this.state || this.mailAlertRefreshRequired) {
+          await this.markProactiveRecoveryRefreshIfCurrent(plan);
+          this.proactiveRecoveryPlan = undefined;
+          throw new Error('refresh_required');
+        }
+        const parsed: unknown = JSON.parse(snapshot.raw);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('refresh_required');
+        const raw = parsed as Record<string, unknown>;
+        const evidenceJson = proactiveRecoveryEvidenceJson(raw);
+        if (!evidenceJson || evidenceJson !== plan.evidenceJson) throw new Error('refresh_required');
+        const evidenceSha = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, evidenceJson, { encoding: Crypto.CryptoEncoding.HEX });
+        if (evidenceSha.toLowerCase() !== plan.evidenceSha256) throw new Error('refresh_required');
+        const archives = Object.prototype.hasOwnProperty.call(raw, 'proactiveRecoveryArchives')
+          ? validateProactiveRecoveryArchiveState(raw.proactiveRecoveryArchives)
+          : emptyProactiveRecoveryArchiveState();
+        if (stableJson(archives) !== stableJson(plan.archiveState)) throw new Error('archive_invalid');
+        await this.verifyProactiveRecoveryArchiveDigests(archives);
+        const archivedAt = plan.archivedAt;
+        const entry = Object.freeze({ operationId: plan.publicPlan.operationId, archivedAt, sourceJson: evidenceJson,
+          sourceSha256: evidenceSha.toLowerCase(), sourceBytes: recoveryUtf8Bytes(evidenceJson) });
+        const nextArchives = validateProactiveRecoveryArchiveState({ version: 1, entries: [...archives.entries, entry] });
+        const replacement = { ...raw, proactive: emptyProactiveState(), proactiveRecoveryArchives: nextArchives } as Record<string, unknown>;
+        delete replacement.proactiveQuarantine;
+        const alertState = this.strictProactiveRecoveryAlertState(raw);
+        const alertStateChanged = alertState !== undefined;
+        if (alertState) replacement.proactiveMailAlerts = revokeAllProactiveMailAlertConsentsForRecovery(alertState, archivedAt);
+        const replacementJson = JSON.stringify(replacement);
+        if (typeof replacementJson !== 'string' || recoveryUtf8Bytes(replacementJson, STATE_SNAPSHOT_READ_MAX_BYTES) > STATE_SNAPSHOT_READ_MAX_BYTES) {
+          this.proactiveRecoveryUnavailableReason = { reason: 'evidence_too_large', state: capturedState, bootstrapGeneration: capturedBootstrapGeneration };
+          this.proactiveRecoveryPlan = undefined;
+          throw new Error('Saved data is too large for selective recovery. Nothing was reset.');
+        }
+        const nextCached = clone(capturedState);
+        nextCached.proactive = emptyProactiveState();
+        delete (nextCached as AppState & { proactiveQuarantine?: unknown; proactiveRecoveryArchives?: unknown }).proactiveQuarantine;
+        delete (nextCached as AppState & { proactiveRecoveryArchives?: unknown }).proactiveRecoveryArchives;
+        if (alertStateChanged && replacement.proactiveMailAlerts) nextCached.proactiveMailAlerts = validateProactiveMailAlertState(replacement.proactiveMailAlerts);
+        const nextSnapshot = deepFreeze(this.publicState(nextCached));
+        await assertCurrent();
+        await this.assertPrivacySessionCurrent();
+        await this.assertProactiveRecoveryPrivacyIdle();
+        if (capturedBootstrapGeneration !== this.bootstrapGeneration || capturedState !== this.state || this.proactiveRecoveryHasLiveWork() ||
+            Date.now() < plan.preparedAtMs || Date.now() >= Date.parse(plan.publicPlan.expiresAt)) throw new Error('refresh_required');
+        this.proactiveRecoveryPlan = undefined;
+        this.proactiveRecoveryInspectionOperationId = plan.publicPlan.operationId;
+        this.proactiveRecoveryExpectedReceipt = Object.freeze({ ...entry });
+        this.proactiveRecoveryReceiptReadAfterRefresh = false;
+        try {
+          await this.store.save(replacement as unknown as AppState);
+          await this.store.assertCurrent();
+          await this.assertPrivacySessionCurrent();
+          const privacyAfterSave = await this.integration.privacySession?.getStatus?.();
+          await this.assertPrivacySessionCurrent();
+          if (privacyAfterSave && (privacyAfterSave.epoch !== this.integration.privacySession?.epoch || privacyAfterSave.phase !== 'ready' ||
+              privacyAfterSave.activeWriterCount !== 0 || privacyAfterSave.pendingCleanupCount !== 0 || privacyAfterSave.failedCleanupCount !== 0)) throw new Error('busy');
+          if (capturedBootstrapGeneration !== this.bootstrapGeneration || capturedState !== this.state || this.mailAlertRefreshRequired) throw new Error('refresh_required');
+          this.state = nextCached;
+          this.proactiveQuarantine = undefined;
+          this.proactiveRecoveryArchivesRaw = nextArchives;
+          this.proactiveRecoveryArchivesValidated = nextArchives;
+          this.proactiveRecoveryArchivesMalformed = false;
+          this.proactiveRecoveryUnavailableReason = undefined;
+          this.snapshot = nextSnapshot;
+          this.emit();
+        } catch {
+          await this.markProactiveRecoveryRefreshIfCurrent(plan, nextCached).catch(() => undefined);
+          return { status: 'unknown', operationId: plan.publicPlan.operationId };
+        }
+        return { status: 'applied', operationId: plan.publicPlan.operationId, archivedAt, evidenceBytes: entry.sourceBytes, archiveCount: nextArchives.entries.length };
+      });
+    } finally { this.proactiveRecoveryBusy = false; }
+  }
+
+  async inspectProactiveRecoveryReceipt(operationIdInput: string): Promise<ProactiveRecoveryReceiptInspection> {
+    let operationId: string;
+    try { operationId = validateRecoveryId(operationIdInput, 'Proactive recovery operation'); }
+    catch { return { status: 'not_verified', operationId: '' }; }
+    if (!this.proactiveRecoveryReceiptReadAfterRefresh || operationId !== this.proactiveRecoveryInspectionOperationId ||
+        !this.loaded || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired || this.proactiveRecoveryArchivesMalformed) {
+      return { status: 'not_verified', operationId };
+    }
+    if (!this.store.readCurrentSnapshot || !this.store.assertCurrent) return { status: 'unavailable', operationId };
+    try {
+      return await this.withProactiveRecoverySlot(async (capturedBootstrapGeneration, capturedState) => {
+        if (!this.proactiveRecoveryReceiptReadAfterRefresh || operationId !== this.proactiveRecoveryInspectionOperationId) return { status: 'not_verified', operationId };
+        const snapshot = await this.readProactiveRecoverySnapshot(capturedBootstrapGeneration, capturedState);
+        await this.assertPrivacySessionCurrent();
+        if (!snapshot || snapshot.schemaVersion !== 1) return { status: 'unavailable', operationId };
+        const raw: unknown = JSON.parse(snapshot.raw);
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { status: 'unavailable', operationId };
+        const record = raw as Record<string, unknown>;
+        let archives: ProactiveRecoveryArchiveState;
+        try {
+          archives = Object.prototype.hasOwnProperty.call(record, 'proactiveRecoveryArchives')
+            ? validateProactiveRecoveryArchiveState(record.proactiveRecoveryArchives)
+            : emptyProactiveRecoveryArchiveState();
+        } catch {
+          if (capturedBootstrapGeneration === this.bootstrapGeneration && capturedState === this.state) {
+            this.proactiveRecoveryArchivesMalformed = true;
+            this.proactiveRecoveryArchivesValidated = undefined;
+          }
+          return { status: 'unavailable', operationId };
+        }
+        const entry = archives.entries.find((item) => item.operationId === operationId);
+        if (!entry) return { status: 'not_verified', operationId };
+        await this.verifyProactiveRecoveryArchiveDigests(archives);
+        const expectedReceipt = this.proactiveRecoveryExpectedReceipt;
+        if (!expectedReceipt || expectedReceipt.operationId !== operationId || entry.archivedAt !== expectedReceipt.archivedAt ||
+            entry.sourceJson !== expectedReceipt.sourceJson || entry.sourceSha256 !== expectedReceipt.sourceSha256 ||
+            entry.sourceBytes !== expectedReceipt.sourceBytes) return { status: 'not_verified', operationId };
+        const currentProjection = this.proactiveRecoveryPersistenceProjection(snapshot.raw);
+        const expectedProjection = this.proactiveRecoveryPersistenceProjection(this.persistedState(capturedState));
+        if (currentProjection !== expectedProjection) {
+          if (capturedBootstrapGeneration === this.bootstrapGeneration && capturedState === this.state) this.setMailAlertRefreshRequired();
+          return { status: 'unavailable', operationId };
+        }
+        await this.assertProactiveRecoveryStorageCurrent(capturedBootstrapGeneration, capturedState);
+        await this.assertProactiveRecoveryPrivacyIdle();
+        if (capturedBootstrapGeneration !== this.bootstrapGeneration || capturedState !== this.state || !this.loaded || this.mailAlertRefreshRequired) return { status: 'unavailable', operationId };
+        return { status: 'applied', operationId, archivedAt: entry.archivedAt, evidenceBytes: entry.sourceBytes, archiveCount: archives.entries.length };
+      });
+    } catch { return { status: 'unavailable', operationId }; }
   }
 
   private async openStartupData(allowMailAlertRefresh = false): Promise<void> {
@@ -2570,6 +3017,14 @@ export class AppControllerImpl implements AppController {
     this.loaded = false;
     this.loadPromise = undefined;
     this.proactiveQuarantine = undefined;
+    this.proactiveRecoveryPlan = undefined;
+    this.proactiveRecoveryArchivesRaw = undefined;
+    this.proactiveRecoveryArchivesValidated = undefined;
+    this.proactiveRecoveryArchivesMalformed = false;
+    this.proactiveRecoveryUnavailableReason = undefined;
+    this.proactiveRecoveryInspectionOperationId = undefined;
+    this.proactiveRecoveryExpectedReceipt = undefined;
+    this.proactiveRecoveryReceiptReadAfterRefresh = false;
     this.backupImportQuarantine = [];
     this.knowledgeQuarantine = [];
     this.reminderQuarantine = [];
@@ -2586,13 +3041,25 @@ export class AppControllerImpl implements AppController {
 
   private async loadInternal(allowMailAlertRefresh = false): Promise<void> {
     const capturedBootstrapGeneration = this.bootstrapGeneration;
+    this.proactiveRecoveryPlan = undefined;
+    this.proactiveRecoveryReceiptReadAfterRefresh = false;
     await this.assertPrivacySessionCurrent(allowMailAlertRefresh);
     this.verifiedReminderForeground.clear();
     this.verifiedDeviceCalendarGeneration = undefined;
     const loaded = await this.store.load();
     await this.assertPrivacySessionCurrent(allowMailAlertRefresh);
     if (capturedBootstrapGeneration !== this.bootstrapGeneration) throw new Error('The app workspace changed while startup was loading. Reopen the app before continuing.');
+    this.proactiveRecoveryArchivesRaw = undefined;
+    this.proactiveRecoveryArchivesValidated = undefined;
+    this.proactiveRecoveryArchivesMalformed = false;
+    this.proactiveRecoveryUnavailableReason = undefined;
+    if (loaded && Object.prototype.hasOwnProperty.call(loaded, 'proactiveRecoveryArchives')) {
+      this.proactiveRecoveryArchivesRaw = clone((loaded as AppState & { proactiveRecoveryArchives?: unknown }).proactiveRecoveryArchives);
+      try { this.proactiveRecoveryArchivesValidated = validateProactiveRecoveryArchiveState(this.proactiveRecoveryArchivesRaw); }
+      catch { this.proactiveRecoveryArchivesMalformed = true; }
+    }
     const normalized: NormalizedLoadedState = loaded ? normalizeLoadedState(loaded) : initialState();
+    delete (normalized as AppState & { proactiveRecoveryArchives?: unknown }).proactiveRecoveryArchives;
     this.dispatchRecordQuarantine = clone(normalized.dispatchRecordQuarantine ?? []);
     delete normalized.dispatchRecordQuarantine;
     this.backupImportQuarantine = clone((normalized as AppState & { backupImportQuarantine?: unknown[] }).backupImportQuarantine ?? []);
