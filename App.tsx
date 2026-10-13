@@ -80,6 +80,10 @@ import { PrivacyEraseReview } from "./src/ui/PrivacyEraseReview";
 import { PendingRecordingRecoveryPanel } from "./src/components/PendingRecordingRecoveryPanel";
 import { BackgroundRefreshSection, type BackgroundRefreshActionResult } from "./src/components/BackgroundRefreshSection";
 import { MailAlertPreview } from "./src/dev/mailAlertPreview";
+import { MailAlertTapPreview } from "./src/dev/mailAlertTapPreview";
+import { MailAlertTapReviewSheet, MailAlertTapStatusCard, type MailAlertTapStatus } from "./src/ui/MailAlertTapReviewSheet";
+import { createMailAlertTapCoordinator } from "./src/proactiveMailAlerts/taps";
+import type { MailAlertTapBackend, MailAlertTapKey, MailAlertTapResolution, MailAlertTapCoordinator } from "./src/proactiveMailAlerts/taps";
 import type { BackgroundTaskBackend, BackgroundTaskStatus } from "./src/background/backend.types";
 import { TasksSection } from "./src/ui/TasksSection";
 import { IconButton, Button, Field } from "./src/ui/primitives";
@@ -114,7 +118,8 @@ const isPrivacyCleanupDemo = previewScenario === "privacy-cleanup";
 const isPendingRecoveryDemo = previewScenario === "pending-recovery";
 const isBackgroundRefreshDemo = previewScenario === "background-refresh" && Platform.OS === "web";
 const isMailAlertDemo = previewScenario === "mail-alerts" && Platform.OS === "web";
-const isIsolatedDemo = isDispatchHistoryDemo || isMailSyncDemo || isBackupImportDemo || isKnowledgeDemo || isReminderDemo || isDeviceCalendarsDemo || isTranscriptionDemo || isStartupRecoveryDemo || isPrivacyCleanupDemo || isPendingRecoveryDemo || isBackgroundRefreshDemo || isMailAlertDemo;
+const isMailAlertTapsDemo = previewScenario === "mail-alert-taps" && Platform.OS === "web";
+const isIsolatedDemo = isDispatchHistoryDemo || isMailSyncDemo || isBackupImportDemo || isKnowledgeDemo || isReminderDemo || isDeviceCalendarsDemo || isTranscriptionDemo || isStartupRecoveryDemo || isPrivacyCleanupDemo || isPendingRecoveryDemo || isBackgroundRefreshDemo || isMailAlertDemo || isMailAlertTapsDemo;
 
 function useAppState(appController: AppController) {
   return useSyncExternalStore(
@@ -410,6 +415,7 @@ type WorkspaceBindings = {
   privacy?: PrivacyService;
   session?: PrivacyWorkspaceSession;
   resources?: PrivacyResourceBoundary;
+  mailAlertTaps?: MailAlertTapBackend;
   privacyPreview?: boolean;
   isolated: boolean;
 };
@@ -419,6 +425,7 @@ type BootstrapState =
   | { kind: "pending_capture_preview" }
   | { kind: "background_refresh_preview" }
   | { kind: "mail_alert_preview" }
+  | { kind: "mail_alert_taps_preview" }
   | { kind: "workspace"; bindings: WorkspaceBindings }
   | { kind: "cleanup"; privacy: PrivacyService; status: PrivacyPublicStatus; reason?: "dedicated_ios_build_required" | "secure_context_and_web_locks_required"; failure?: "storage_unavailable" | "lease_lost" | "verification_incomplete"; samplePreview?: boolean }
   | { kind: "unavailable"; reason: "dedicated_ios_build_required" | "secure_context_and_web_locks_required" | "active_work" | "full_restart_required" | "storage_unavailable"; privacy?: PrivacyService; status?: PrivacyPublicStatus }
@@ -472,6 +479,10 @@ export default function App() {
         if (isIsolatedDemo) {
           if (isMailAlertDemo) {
             if (alive) setBootstrap({ kind: "mail_alert_preview" });
+            return;
+          }
+          if (isMailAlertTapsDemo) {
+            if (alive) setBootstrap({ kind: "mail_alert_taps_preview" });
             return;
           }
           if (isBackgroundRefreshDemo) {
@@ -572,7 +583,7 @@ export default function App() {
         const credentials = credentialModule.createProviderCredentialService(resources.credentialStore(credentialStore));
         const recordingRecovery = await recoveryModule.getRecordingRecoveryService();
         const { createProductionWorkspace } = await import("./src/services/controller");
-        const { controller, captureJournal, backgroundTasks } = await createProductionWorkspace({
+        const { controller, captureJournal, backgroundTasks, mailAlertTaps } = await createProductionWorkspace({
           privacy,
           session,
           resources,
@@ -582,7 +593,7 @@ export default function App() {
         });
         if (alive) setBootstrap({
           kind: "workspace",
-          bindings: { controller, captureJournal, backgroundTasks, privacy, session, resources, audioBoundary, credentials, isolated: false },
+          bindings: { controller, captureJournal, backgroundTasks, mailAlertTaps, privacy, session, resources, audioBoundary, credentials, isolated: false },
         });
       } catch {
         if (!alive) return;
@@ -736,6 +747,7 @@ export default function App() {
   if (bootstrap.kind === "pending_capture_preview") return <PendingCapturePreview />;
   if (bootstrap.kind === "background_refresh_preview") return <BackgroundRefreshPreview />;
   if (bootstrap.kind === "mail_alert_preview") return <MailAlertPreview />;
+  if (bootstrap.kind === "mail_alert_taps_preview") return <MailAlertTapPreview />;
   if (bootstrap.kind === "preview_error") return (
     <SafeAreaProvider><SafeAreaView style={s.safe}><View style={s.viewport}><Text style={s.kicker}>ISOLATED PREVIEW</Text><Text style={s.h1}>Sample preview could not load.</Text><Text accessibilityRole="alert" style={s.analysisText}>The sample remained isolated. Reload to try again.</Text><Button label="Reload preview" onPress={() => { if (Platform.OS === "web" && typeof window !== "undefined") window.location.reload(); }} /></View></SafeAreaView></SafeAreaProvider>
   );
@@ -797,7 +809,7 @@ type WorkspaceProps = WorkspaceBindings & {
   onPrivacyInvalidated: () => void;
 };
 
-function Workspace({ controller, captureJournal, backgroundTasks, credentials, audioBoundary, privacy, session, isolated: isIsolatedDemo, privacyReviewOpen, privacyOutcomeUnknown = false, onPrivacyReview, onPrivacyInvalidated }: WorkspaceProps) {
+function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps, credentials, audioBoundary, privacy, session, isolated: isIsolatedDemo, privacyReviewOpen, privacyOutcomeUnknown = false, onPrivacyReview, onPrivacyInvalidated }: WorkspaceProps) {
   const state = useAppState(controller);
   const [tab, setTab] = useState<Tab>(isBackupImportDemo || isKnowledgeDemo || isReminderDemo || isTranscriptionDemo ? "library" : isIsolatedDemo ? "inbox" : "record");
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -823,6 +835,13 @@ function Workspace({ controller, captureJournal, backgroundTasks, credentials, a
   const [pendingCaptureLoading, setPendingCaptureLoading] = useState(Boolean(captureJournal));
   const [pendingCaptureBusy, setPendingCaptureBusy] = useState(false);
   const [pendingCaptureError, setPendingCaptureError] = useState("");
+  const mailAlertTapCoordinatorRef = useRef<MailAlertTapCoordinator | null>(null);
+  const [mailAlertTapPending, setMailAlertTapPending] = useState(false);
+  const [mailAlertTapResolution, setMailAlertTapResolution] = useState<MailAlertTapResolution | null>(null);
+  const [mailAlertTapStatus, setMailAlertTapStatus] = useState<MailAlertTapStatus | undefined>();
+  const [mailAlertTapReviewRequested, setMailAlertTapReviewRequested] = useState(false);
+  const [foregroundResumeRefreshing, setForegroundResumeRefreshing] = useState(false);
+  const [foregroundCatchupComplete, setForegroundCatchupComplete] = useState(isIsolatedDemo);
   const reminderReviewRecord = reminderReviewId
     ? state.reminders.records.find((item) => item.id === reminderReviewId)
     : undefined;
@@ -908,6 +927,62 @@ function Workspace({ controller, captureJournal, backgroundTasks, credentials, a
   const busyLock = useRef(false);
   const checkedAnalysisKey = useRef("");
   const checkedReviewFreshnessKey = useRef("");
+  const mailAlertTapOverlaysOpen = settingsOpen || Boolean(detail) || manualOpen || Boolean(review) ||
+    Boolean(replyMessageId) || Boolean(reminderReviewId) || Boolean(doc) || Boolean(recordingAttachmentNoteId) ||
+    Boolean(mailAlertTapResolution) || privacyReviewOpen || privacyOutcomeUnknown;
+  const mailAlertTapCaptureBlocked = audio.status !== "idle" || Boolean(captureJournal &&
+    (pendingCaptureLoading || pendingCaptureStatus?.kind !== "empty"));
+  const mailAlertTapAutoReady = !isIsolatedDemo && !privacyReviewOpen && !privacyOutcomeUnknown &&
+    startupReady && !loading && foregroundCatchupComplete && !busy && !foregroundResumeRefreshing &&
+    !mailAlertTapCaptureBlocked && !mailAlertTapOverlaysOpen && (tab === "record" || tab === "inbox");
+  const mailAlertTapExplicitReady = !isIsolatedDemo && !privacyReviewOpen && !privacyOutcomeUnknown &&
+    startupReady && !loading && foregroundCatchupComplete && !busy && !foregroundResumeRefreshing &&
+    !mailAlertTapCaptureBlocked && !mailAlertTapOverlaysOpen;
+  const mailAlertTapReady = mailAlertTapAutoReady || (mailAlertTapReviewRequested && mailAlertTapExplicitReady);
+  const mailAlertTapReadyRef = useRef(mailAlertTapReady);
+  useEffect(() => { mailAlertTapReadyRef.current = mailAlertTapReady; }, [mailAlertTapReady]);
+
+  useEffect(() => {
+    if (isIsolatedDemo || Platform.OS === "web" || !mailAlertTaps || !startupReady || loading) return;
+    const coordinator = createMailAlertTapCoordinator(mailAlertTaps);
+    mailAlertTapCoordinatorRef.current = coordinator;
+    void coordinator.start({
+      installationId: state.proactiveMailAlerts.installationId,
+      isReady: mailAlertTapReadyRef.current,
+      resolve: (key: MailAlertTapKey) => controller.resolveProactiveMailAlertTap(key),
+      onPendingChange: setMailAlertTapPending,
+      onResolution: (_key, resolution) => {
+        if (resolution.kind === "mail") {
+          setMailAlertTapStatus(undefined);
+          setMailAlertTapResolution(resolution);
+        } else if (resolution.kind === "status") {
+          setMailAlertTapResolution(null);
+          setMailAlertTapStatus(resolution);
+          setNotice("A mail alert needs review in Settings.");
+          setSettingsOpen(true);
+        }
+        if (resolution.kind !== "blocked") setMailAlertTapReviewRequested(false);
+      },
+    });
+    return () => {
+      coordinator.dispose();
+      if (mailAlertTapCoordinatorRef.current === coordinator) mailAlertTapCoordinatorRef.current = null;
+      setMailAlertTapPending(false);
+    };
+  }, [controller, isIsolatedDemo, loading, mailAlertTaps, startupReady, state.proactiveMailAlerts.installationId]);
+
+  useEffect(() => {
+    mailAlertTapCoordinatorRef.current?.setReady(mailAlertTapReady);
+  }, [mailAlertTapReady]);
+
+  const reviewPendingMailAlertTap = useCallback(() => {
+    if (!mailAlertTapPending || !mailAlertTapExplicitReady || busyLock.current) return;
+    setMailAlertTapReviewRequested(true);
+    mailAlertTapCoordinatorRef.current?.setReady(true);
+    mailAlertTapCoordinatorRef.current?.retryPending();
+  }, [mailAlertTapExplicitReady, mailAlertTapPending]);
+
+  const dismissMailAlertTapStatus = useCallback(() => setMailAlertTapStatus(undefined), []);
 
   useEffect(() => {
     let mounted = true;
@@ -1409,6 +1484,8 @@ function Workspace({ controller, captureJournal, backgroundTasks, credentials, a
     if (isIsolatedDemo || privacyReviewOpen || !startupReady || loading || backgroundActionBlockedReason || busyLock.current ||
         foregroundResumeBusy.current || foregroundMailBusy.current || reminderReconcileBusy.current) return;
     foregroundResumeBusy.current = true;
+    setForegroundResumeRefreshing(true);
+    mailAlertTapCoordinatorRef.current?.setReady(false);
     try {
       await controller.refreshPersistedWorkspace();
       if (privacyReviewOpen || backgroundActionBlockedReason || busyLock.current) return;
@@ -1429,6 +1506,7 @@ function Workspace({ controller, captureJournal, backgroundTasks, credentials, a
       else setNotice("Local data could not be refreshed after returning. Open Settings to retry when other work has finished.");
     } finally {
       foregroundResumeBusy.current = false;
+      setForegroundResumeRefreshing(false);
     }
   }, [backgroundActionBlockedReason, controller, isIsolatedDemo, loading, onPrivacyInvalidated, privacyReviewOpen, reconcileReminderAlerts, refreshForegroundMail, startupReady]);
 
@@ -1438,8 +1516,15 @@ function Workspace({ controller, captureJournal, backgroundTasks, credentials, a
       if (initialForegroundRefreshStarted.current) return;
       initialForegroundRefreshStarted.current = true;
       void (async () => {
-        const reconciled = await reconcileReminderAlerts();
-        if (reconciled) await refreshForegroundMail();
+        setForegroundResumeRefreshing(true);
+        mailAlertTapCoordinatorRef.current?.setReady(false);
+        try {
+          const reconciled = await reconcileReminderAlerts();
+          if (reconciled) await refreshForegroundMail();
+        } finally {
+          setForegroundResumeRefreshing(false);
+          setForegroundCatchupComplete(true);
+        }
       })();
     }, 0);
     if (Platform.OS === "web" && typeof document !== "undefined") {
@@ -2056,6 +2141,21 @@ function Workspace({ controller, captureJournal, backgroundTasks, credentials, a
               </Text>
             </View>
           ) : null}
+          {mailAlertTapPending && !mailAlertTapResolution ? (
+            <View style={s.notice}>
+              <Text style={[s.noticeText, { flex: 1 }]}>A mail alert is waiting for a safe review point.</Text>
+              <Button label="Review alert" tone="quiet" disabled={!mailAlertTapExplicitReady} onPress={reviewPendingMailAlertTap} />
+            </View>
+          ) : null}
+          {mailAlertTapStatus ? (
+            <View style={s.notice}>
+              <Text style={[s.noticeText, { flex: 1 }]}>A mail alert needs review in Settings.</Text>
+              <Button label="Open Settings" tone="quiet" onPress={openSettings} />
+              <Pressable accessibilityRole="button" accessibilityLabel="Dismiss mail alert status notice" onPress={dismissMailAlertTapStatus} hitSlop={8}>
+                <Ionicons accessible={false} name="close" size={17} color={C.muted} />
+              </Pressable>
+            </View>
+          ) : null}
           {notice || audio.error || state.pendingCredentialCleanup.length ? (
             <View style={s.notice}>
               <Ionicons
@@ -2539,6 +2639,7 @@ function Workspace({ controller, captureJournal, backgroundTasks, credentials, a
               onRevokeMailAlerts={onRevokeMailAlerts}
               onReconcileMailAlerts={onReconcileMailAlerts}
               onRefreshMailAlertWorkspace={onRefreshMailAlertWorkspace}
+              mailAlertTapStatus={mailAlertTapStatus}
               mailAlertCaptureAdmissionBlocked={mailAlertCaptureAdmissionBlocked}
               mailAlertRefreshAdmissionBlocked={mailAlertRefreshAdmissionBlocked}
               onSaveProactiveRule={(input) =>
@@ -2721,6 +2822,15 @@ function Workspace({ controller, captureJournal, backgroundTasks, credentials, a
           documents={state.documents}
           onClose={() => setReplyMessageId(null)}
           onSave={saveMailReply}
+        />
+        <MailAlertTapReviewSheet
+          visible={mailAlertTapResolution?.kind === "mail"}
+          result={mailAlertTapResolution}
+          onClose={() => setMailAlertTapResolution(null)}
+          onOpenInbox={() => {
+            setMailAlertTapResolution(null);
+            setTab("inbox");
+          }}
         />
         {recordingAttachmentNote ? (
           <RecordingAttachmentSheet
@@ -3745,6 +3855,7 @@ function SettingsScreen({
   onRevokeMailAlerts,
   onReconcileMailAlerts,
   onRefreshMailAlertWorkspace,
+  mailAlertTapStatus,
   mailAlertCaptureAdmissionBlocked,
   mailAlertRefreshAdmissionBlocked,
   onConnectDeviceCalendars,
@@ -3784,6 +3895,7 @@ function SettingsScreen({
   onRevokeMailAlerts: (ruleId: string) => Promise<void>;
   onReconcileMailAlerts: () => Promise<void>;
   onRefreshMailAlertWorkspace: () => Promise<void>;
+  mailAlertTapStatus?: MailAlertTapStatus;
   mailAlertCaptureAdmissionBlocked: boolean;
   mailAlertRefreshAdmissionBlocked: boolean;
   onConnectDeviceCalendars: () => Promise<unknown>;
@@ -3985,6 +4097,9 @@ function SettingsScreen({
               {state.dispatchRecoveryStatus.message}
             </Text>
           </View>
+        ) : null}
+        {mailAlertTapStatus ? (
+          <MailAlertTapStatusCard status={mailAlertTapStatus} />
         ) : null}
         <View style={s.providerToggle}>
           <View style={{ flex: 1 }}>

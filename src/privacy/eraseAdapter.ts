@@ -31,19 +31,22 @@ export interface NativePrivacyEraseAdapterOptions {
 type NotificationReadBridge = {
   getAllScheduledNotificationsAsync(): Promise<unknown>;
   getPresentedNotificationsAsync(): Promise<unknown>;
+  getLastNotificationResponseAsync(): Promise<unknown>;
 };
 
-/** Wait for both native reads before releasing the cleanup writer, even if one fails early. */
+/** Wait for all native reads before releasing the cleanup writer, even if one fails early. */
 export async function notificationsRemainFromBridge(bridge: NotificationReadBridge): Promise<boolean> {
-  const [scheduled, presented] = await Promise.allSettled([
+  const [scheduled, presented, lastResponse] = await Promise.allSettled([
     Promise.resolve().then(() => bridge.getAllScheduledNotificationsAsync()),
     Promise.resolve().then(() => bridge.getPresentedNotificationsAsync()),
+    Promise.resolve().then(() => bridge.getLastNotificationResponseAsync()),
   ]);
   if (scheduled.status !== 'fulfilled' || presented.status !== 'fulfilled' ||
-      !Array.isArray(scheduled.value) || !Array.isArray(presented.value)) {
+      lastResponse.status !== 'fulfilled' || !Array.isArray(scheduled.value) || !Array.isArray(presented.value) ||
+      lastResponse.value === undefined) {
     throw new PrivacyEraseAdapterError('target_unavailable');
   }
-  return scheduled.value.length > 0 || presented.value.length > 0;
+  return scheduled.value.length > 0 || presented.value.length > 0 || lastResponse.value !== null;
 }
 
 function supportedOwner(owner: PrivacyOwner): boolean {
@@ -109,6 +112,8 @@ async function createDefaultIO(): Promise<NativePrivacyEraseIO> {
         await beforeMutation();
         await Notifications.dismissNotificationAsync(notification.request.identifier);
       }
+      await beforeMutation();
+      Notifications.clearLastNotificationResponse();
     },
     async notificationsRemain() {
       const Notifications = await import('expo-notifications');

@@ -6,6 +6,7 @@ import type { ReminderRecord, ReminderState, ReminderPayload } from '../reminder
 import type { StartupRecoveryInspection, StartupRecoveryPlan, StartupRecoveryReceipt, StartupRecoveryCommitInput } from '../storage/startupRecovery';
 import type { PendingCaptureReceipt, PendingCaptureSafeStatus } from '../audio/pendingCaptureService.types';
 import type { ProactiveMailAlertState } from '../proactiveMailAlerts/types';
+import type { MailAlertTapKey, MailAlertTapResolution } from '../proactiveMailAlerts/taps';
 
 export type NoteStatus = 'recorded' | 'processed' | 'error';
 export type ProposalKind = 'task' | 'reminder' | 'email' | 'event' | 'memory';
@@ -877,6 +878,7 @@ export interface AppController {
   enableProactiveMailAlerts(input: { ruleId: string; expectedRuleVersion: number; expectedRuleRevision: number; timeZone: string; accountIds: string[] }): Promise<void>;
   revokeProactiveMailAlerts(ruleId: string): Promise<void>;
   reconcileProactiveMailAlerts(): Promise<void>;
+  resolveProactiveMailAlertTap(key: MailAlertTapKey): Promise<MailAlertTapResolution>;
   saveProactiveRule(input: {
     id?: string; expectedVersion?: number; name: string; enabled: boolean; accountIds: string[];
     trigger: import('../proactive').ProactiveTrigger; quietHours?: import('../proactive').QuietHours;

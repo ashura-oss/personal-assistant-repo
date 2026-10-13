@@ -49,16 +49,18 @@ import { buildLocalSourceSet, buildOfflinePreview, createSourceCatalog, type Ass
 import { isMailTextFresh, normalizeMailText, utf8Bytes, validSelectedMailTextSnapshot, MAX_SELECTED_MAIL_TEXT_BYTES, MAIL_TEXT_FRESHNESS_MS } from '../mailText';
 import { appendDispatchReconciliation, createDispatchRecord, recordDispatchOutcome, validateDispatchRecord } from '../dispatch';
 import type { DispatchOutcome, DispatchRecord, DispatchReconciliation } from '../dispatch';
-import { evaluateProactive, type ProactiveTrigger, type QuietHours } from '../proactive';
+import { evaluateProactive, type ProactiveMailSource, type ProactiveTrigger, type QuietHours } from '../proactive';
 import { computeProactiveNextCheckAt } from '../proactive/boundaries';
-import { buildProactiveSources, proactiveStableValue, type ProactiveSourceHashMemo } from '../proactive/adapters';
-import { emptyProactiveState, normalizeProactiveData, PROACTIVE_INTEGRITY_ERROR, uncertainOnLoad, type ProactiveQuarantine } from '../proactive/state';
+import { buildProactiveMailSources, buildProactiveSources, proactiveStableValue, type ProactiveSourceHashMemo } from '../proactive/adapters';
+import { emptyProactiveState, normalizeProactiveData, PROACTIVE_INTEGRITY_ERROR, uncertainOnLoad, validateProactiveState, type ProactiveQuarantine } from '../proactive/state';
 import { emptyProactiveMailAlertState, validateProactiveMailAlertState } from '../proactiveMailAlerts/state';
 import { createProactiveMailAlertConsent, planProactiveMailAlerts, replaceProactiveMailAlertConsent, revokeProactiveMailAlertConsent } from '../proactiveMailAlerts/planner';
 import { executeRequestedMailAlertCancellations, executeReservedMailAlertAttempts, type ProactiveMailAlertEngineDependencies } from '../proactiveMailAlerts/engine';
 import type { CommittedMailAlertPage, ProactiveMailAlertReceipt } from '../proactiveMailAlerts/types';
+import type { MailAlertTapKey, MailAlertTapResolution, MailAlertTapBackend } from '../proactiveMailAlerts/taps';
 import { committedMailAlertPageForWorkspace, isMailAlertAttemptCurrentForWorkspace, mailAlertAccountsForWorkspace } from '../proactiveMailAlerts/workspace';
 import { createMailAlertNotificationBackend, isMatchingProactiveMailAlertNotification, type MailAlertNotificationBackend } from './mailAlertNotificationBackend';
+import { createMailAlertTapBackend } from './mailAlertTapBackend';
 import { canonicalMailReplySource, createMailReplySource, defaultReplyRecipients, replyReferences, validateMailReplySource, validateReplyBinding } from '../mailReply';
 import { emptyKnowledgeState, getKnowledgeEntity, knowledgeContextSources, validateKnowledgeState, validateKnowledgeSuggestion } from '../knowledge';
 import type { ContactClaim, KnowledgeChange, KnowledgeEntityKind, KnowledgeEvidence, KnowledgeFact, KnowledgeReference, KnowledgeSourceLink, KnowledgeSuggestion, Person, Project, ProjectMember } from '../knowledge';
@@ -1114,6 +1116,7 @@ export interface ControllerIntegrationDependencies {
   deviceCalendarBackend?: DeviceCalendarBackend;
   backgroundTasks?: BackgroundTaskBackend;
   mailAlertBackend?: MailAlertNotificationBackend;
+  mailAlertTapBackend?: MailAlertTapBackend;
   withMailAlertNotificationWriter?: <T>(actual: (scope: PrivacyWriterScope, store: ExistingWorkspaceWriterStore) => Promise<T>) => Promise<T>;
 }
 
@@ -1475,6 +1478,151 @@ export class AppControllerImpl implements AppController {
   private mailAlertPolicyOptions() {
     return { now: () => new Date(), digest: (value: string) => Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, value, { encoding: Crypto.CryptoEncoding.HEX }) };
   }
+
+  async resolveProactiveMailAlertTap(key: MailAlertTapKey): Promise<MailAlertTapResolution> {
+    const validUuid = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+    if (!key || !validUuid(key.installationId) || !validUuid(key.receiptId)) return { kind: 'ignored' };
+    const tapped = Object.freeze({ installationId: key.installationId.toLowerCase(), receiptId: key.receiptId.toLowerCase() });
+    try { await this.integration.privacySession?.assertCurrent(); }
+    catch { return { kind: 'ignored' }; }
+    if (!this.loaded || this.startupRecoveryPhase !== 'ready') return { kind: 'blocked' };
+
+    const capturedBootstrapGeneration = this.bootstrapGeneration;
+    const run = this.transactionQueue.then(async (): Promise<MailAlertTapResolution> => {
+      if (!this.loaded || this.startupRecoveryPhase !== 'ready' || capturedBootstrapGeneration !== this.bootstrapGeneration) return { kind: 'blocked' };
+      try { await this.integration.privacySession?.assertCurrent(); }
+      catch { return { kind: 'ignored' }; }
+      const capturedState = this.state;
+      const statusForKnownReceipt = (receipt: ProactiveMailAlertReceipt, reason: 'revoked' | 'changed' | 'source_unavailable' | 'refresh_required' = 'refresh_required'): MailAlertTapResolution => {
+        const currentInstallationId: unknown = this.state?.proactiveMailAlerts?.installationId;
+        if (typeof currentInstallationId !== 'string' || tapped.installationId !== currentInstallationId.toLowerCase()) return { kind: 'ignored' };
+        return { kind: 'status', receiptId: tapped.receiptId, ...(receipt ? { ruleId: receipt.ruleId, observed: receipt.observed } : {}), reason };
+      };
+      const statusOnlyIfWorkspaceCurrent = async (receipt: ProactiveMailAlertReceipt, reason: 'revoked' | 'changed' | 'source_unavailable' | 'refresh_required' = 'refresh_required'): Promise<MailAlertTapResolution> => {
+        try { await this.integration.privacySession?.assertCurrent(); }
+        catch { return { kind: 'ignored' }; }
+        if (this.state !== capturedState || capturedBootstrapGeneration !== this.bootstrapGeneration || !this.loaded || this.startupRecoveryPhase !== 'ready') return { kind: 'blocked' };
+        return statusForKnownReceipt(receipt, reason);
+      };
+      const refreshRequiredOnlyIfWorkspaceCurrent = async (receipt: ProactiveMailAlertReceipt): Promise<MailAlertTapResolution> => {
+        const guarded = await statusOnlyIfWorkspaceCurrent(receipt, 'refresh_required');
+        if (guarded.kind !== 'status') return guarded;
+        if (this.state !== capturedState || capturedBootstrapGeneration !== this.bootstrapGeneration || !this.loaded || this.startupRecoveryPhase !== 'ready') return { kind: 'blocked' };
+        this.setMailAlertRefreshRequired();
+        return guarded;
+      };
+      if (this.proactiveMailAlertQuarantine.length) return { kind: 'ignored' };
+
+      let alertState;
+      let proactiveState;
+      try { alertState = validateProactiveMailAlertState(this.state.proactiveMailAlerts); }
+      catch { return { kind: 'ignored' }; }
+      if (tapped.installationId !== alertState.installationId.toLowerCase()) return { kind: 'ignored' };
+      const receipt = alertState.receipts.find((item) => item.id.toLowerCase() === tapped.receiptId);
+      if (!receipt) return { kind: 'ignored' };
+      const busy = Boolean(this.loadPromise || this.processJobs.size || this.assistJobs.size || this.activeSyncCount || this.syncJobs.size ||
+        this.mailLaneJobs.size || this.foregroundMailJob || this.syncAbortControllers.size || this.credentialCleanupJob ||
+        this.installingTokenRefs.size || this.mailReplyGenerations.size || this.transcriptionJobs.size || this.transcriptionCleanupJob ||
+        this.transcriptionCleanupPromises.size || this.deviceCalendarJob || this.deviceEventJobs.size || this.deviceEventLateResults.size ||
+        this.deviceEventCreateTimers.size || this.reminderJobs.size || this.reminderLegacyJobs.size || this.reminderReconcileJob ||
+        this.recordingAttachmentJobs.size || this.recordingAttachmentSessions.size);
+      if (busy) return { kind: 'blocked' };
+      try {
+        const privacyStatus = await this.integration.privacySession?.getStatus?.();
+        await this.integration.privacySession?.assertCurrent();
+        if (this.state !== capturedState || capturedBootstrapGeneration !== this.bootstrapGeneration) return { kind: 'blocked' };
+        if (privacyStatus && (privacyStatus.phase !== 'ready' || privacyStatus.activeWriterCount !== 0 ||
+            privacyStatus.pendingCleanupCount !== 0 || privacyStatus.failedCleanupCount !== 0)) return { kind: 'blocked' };
+      } catch { return { kind: 'blocked' }; }
+      if (this.mailAlertRefreshRequired) return statusForKnownReceipt(receipt, 'refresh_required');
+      if (this.proactiveQuarantine) return statusForKnownReceipt(receipt, 'refresh_required');
+      try { proactiveState = validateProactiveState(this.state.proactive); }
+      catch { return statusForKnownReceipt(receipt, 'refresh_required'); }
+      if (proactiveState.integrityError) return statusForKnownReceipt(receipt, 'refresh_required');
+      const consent = alertState.consents.find((item) => item.id === receipt.consentId);
+      if (receipt.desired === 'cancel' || ['cancellation_pending', 'cancelled', 'cancellation_unknown'].includes(receipt.observed) || !consent || consent.status !== 'active') {
+        return statusForKnownReceipt(receipt, 'revoked');
+      }
+      const rule = proactiveState.rules.find((item) => item.id === receipt.ruleId);
+      const account = mailAlertAccountsForWorkspace(this.state).find((item) => item.accountId === receipt.accountId);
+      if (!rule || !rule.enabled || rule.version !== receipt.ruleVersion || rule.revision !== receipt.ruleRevision ||
+          rule.accountIds.length > 0 && !rule.accountIds.includes(receipt.accountId) ||
+          consent.ruleId !== receipt.ruleId || consent.ruleVersion !== receipt.ruleVersion || consent.ruleRevision !== receipt.ruleRevision ||
+          consent.activatedAt !== receipt.consentActivatedAt || consent.timeZone !== receipt.timeZone || this.state.settings.timezone !== receipt.timeZone ||
+          !account || !account.connected || account.authStatus !== 'connected' || !account.canReadMail || account.identityKey !== receipt.identityKey ||
+          account.connectionGeneration !== receipt.connectionGeneration ||
+          !consent.accounts.some((binding) => binding.accountId === receipt.accountId && binding.identityKey === receipt.identityKey && binding.connectionGeneration === receipt.connectionGeneration)) {
+        return statusForKnownReceipt(receipt, 'changed');
+      }
+      const accountRows = this.state.accounts.filter((item) => item.id === receipt.accountId);
+      const rows = this.state.mailbox.filter((item) => item.accountId === receipt.accountId && item.providerMessageId === receipt.providerMessageId &&
+        item.verifiedIdentityKey === receipt.identityKey && item.connectionGeneration === receipt.connectionGeneration && !item.providerDeletedAt);
+      if (accountRows.length !== 1 || rows.length !== 1) return statusForKnownReceipt(receipt, 'source_unavailable');
+      const observedAt = rows[0].observedAt;
+      const observedMs = typeof observedAt === 'string' ? Date.parse(observedAt) : NaN;
+      const beforeHashMs = Date.now();
+      if (!Number.isFinite(observedMs) || observedMs > beforeHashMs || beforeHashMs - observedMs > 15 * 60_000) return statusForKnownReceipt(receipt, 'refresh_required');
+      try { await this.integration.privacySession?.assertCurrent(); }
+      catch { return { kind: 'ignored' }; }
+      try {
+        if (!this.store.assertCurrent) throw new Error('Workspace generation cannot be verified.');
+        await this.store.assertCurrent();
+      } catch {
+        return refreshRequiredOnlyIfWorkspaceCurrent(receipt);
+      }
+      let source: ProactiveMailSource | undefined;
+      try {
+        const built = await buildProactiveMailSources(accountRows, rows, Date.now(), new Map(), this.mailAlertPolicyOptions().digest);
+        source = built.find((item): item is ProactiveMailSource => item.kind === 'mail' && item.accountId === receipt.accountId && item.providerId === receipt.providerMessageId);
+      } catch {
+        try {
+          if (!this.store.assertCurrent) throw new Error('Workspace generation cannot be verified.');
+          await this.store.assertCurrent();
+        } catch {
+          return refreshRequiredOnlyIfWorkspaceCurrent(receipt);
+        }
+        try { await this.integration.privacySession?.assertCurrent(); }
+        catch { return { kind: 'ignored' }; }
+        if (this.state !== capturedState || capturedBootstrapGeneration !== this.bootstrapGeneration) return { kind: 'blocked' };
+        return statusForKnownReceipt(receipt, 'source_unavailable');
+      }
+      try {
+        if (!this.store.assertCurrent) throw new Error('Workspace generation cannot be verified.');
+        await this.store.assertCurrent();
+      } catch {
+        return refreshRequiredOnlyIfWorkspaceCurrent(receipt);
+      }
+      try { await this.integration.privacySession?.assertCurrent(); }
+      catch { return { kind: 'ignored' }; }
+      if (capturedBootstrapGeneration !== this.bootstrapGeneration || this.state !== capturedState || !this.loaded ||
+          this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired || this.proactiveMailAlertQuarantine.length ||
+          this.proactiveQuarantine || this.state.proactiveMailAlerts.installationId !== tapped.installationId) {
+        return statusForKnownReceipt(receipt, 'refresh_required');
+      }
+      if (!source || source.availability !== 'available' || source.freshness !== 'fresh' || source.sourceVersion !== receipt.sourceVersion ||
+          typeof source.receivedAt !== 'string' || Date.parse(source.receivedAt) !== Date.parse(receipt.receivedAt)) return statusForKnownReceipt(receipt, 'changed');
+      const finalObserved = Date.parse(rows[0].observedAt ?? '');
+      const nowMs = Date.now();
+      if (!Number.isFinite(finalObserved) || finalObserved > nowMs || nowMs - finalObserved > 15 * 60_000) return statusForKnownReceipt(receipt, 'refresh_required');
+      const bounded = (value: unknown, max: number): string | undefined => typeof value === 'string'
+        ? value.replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max) || undefined : undefined;
+      const received = new Date(Date.parse(source.receivedAt)).toISOString();
+      const checkedAt = new Date(finalObserved).toISOString();
+      const accountRow = accountRows[0];
+      return {
+        kind: 'mail', receiptId: receipt.id, ruleId: receipt.ruleId, messageId: rows[0].id,
+        sourceVersion: receipt.sourceVersion, subject: bounded(source.subject, 200) ?? 'Saved mail alert',
+        ...(bounded(source.senderEmail, 160) ? { senderLabel: bounded(source.senderEmail, 160) } : {}),
+        ...(bounded(source.snippet, 280) ? { snippet: bounded(source.snippet, 280) } : {}),
+        accountLabel: bounded(accountRow.verifiedEmail ?? accountRow.email ?? accountRow.displayName, 100) ?? 'Connected account',
+        receivedAt: received, checkedAt,
+      };
+    });
+    this.transactionQueue = run.then(() => undefined, () => undefined);
+    try { return await run; }
+    catch { return { kind: 'blocked' }; }
+  }
+
   private async commitMailAlertPlan(pages: readonly CommittedMailAlertPage[]): Promise<void> {
     if (this.proactiveMailAlertQuarantine.length) return;
     const draft = clone(this.state);
@@ -7429,7 +7577,7 @@ export interface ProductionWorkspaceOptions {
   pendingCaptureNativeIO?: PendingCaptureNativeIO;
 }
 
-export async function createProductionWorkspace(options: ProductionWorkspaceOptions = {}): Promise<{ controller: AppController; backgroundTasks: BackgroundTaskBackend; captureJournal?: PendingCaptureJournalPort }> {
+export async function createProductionWorkspace(options: ProductionWorkspaceOptions = {}): Promise<{ controller: AppController; backgroundTasks: BackgroundTaskBackend; mailAlertTaps: MailAlertTapBackend; captureJournal?: PendingCaptureJournalPort }> {
   const privacy = options.privacy ?? options.resources?.privacy ?? await getDefaultPrivacyService();
   if (options.resources && options.resources.privacy !== privacy) throw new Error('Privacy resource boundary belongs to a different control service.');
   const requestedSession = options.session ?? options.resources?.session;
@@ -7477,6 +7625,9 @@ export async function createProductionWorkspace(options: ProductionWorkspaceOpti
   const boundDeviceCalendars = resources.deviceCalendarBackend(options.integration?.deviceCalendarBackend ?? getDeviceCalendarBackend());
   const rawBackgroundTasks = options.integration?.backgroundTasks ?? (await import('../background/backend')).backgroundTaskBackend;
   const boundBackgroundTasks = resources.backgroundTaskBackend(rawBackgroundTasks);
+  const mailAlertTaps = options.integration?.mailAlertTapBackend ?? createMailAlertTapBackend({
+    withNotificationOwnership: (actual) => resources.withMailAlertNotificationWriter(() => actual()),
+  });
   const integration: ControllerIntegrationDependencies = {
     ...defaultIntegration,
     ...options.integration,
@@ -7534,7 +7685,7 @@ export async function createProductionWorkspace(options: ProductionWorkspaceOpti
     openAi: options.providers?.openAi ?? new AzureOpenAIClient(fetch, () => providerCredentials.readProviderCredential('openai'), resources.withProviderOwnership),
   };
   implementation = new AppControllerImpl(boundStore, providers, integration, pendingCaptureController);
-  return { controller: createPrivacyBoundController(implementation, privacy, session), backgroundTasks: boundBackgroundTasks.backend, ...(captureJournal ? { captureJournal } : {}) };
+  return { controller: createPrivacyBoundController(implementation, privacy, session), backgroundTasks: boundBackgroundTasks.backend, mailAlertTaps, ...(captureJournal ? { captureJournal } : {}) };
 }
 
 export async function createProductionController(options: ProductionWorkspaceOptions = {}): Promise<AppController> {

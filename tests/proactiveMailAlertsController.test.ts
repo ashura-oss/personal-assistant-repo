@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { createHash } from 'node:crypto';
 import type { AppState } from '../src/core';
 import { createProactiveMailAlertConsent, planProactiveMailAlerts } from '../src/proactiveMailAlerts/planner';
 import { committedMailAlertPageForWorkspace, isMailAlertAttemptCurrentForWorkspace } from '../src/proactiveMailAlerts/workspace';
@@ -8,12 +9,15 @@ import type { ControllerIntegrationDependencies } from '../src/services/controll
 import type { PrivacyWriterScope } from '../src/privacy/types';
 import type { ExistingWorkspaceWriterStore } from '../src/privacy/workspaceStorage';
 import type { StateStore } from '../src/storage/contracts';
+import { buildProactiveMailSources } from '../src/proactive/adapters';
 
 class MemoryStore implements StateStore {
   value?: AppState;
   failLoad = false;
+  loadCount = 0;
   afterSave?: () => void;
   async load() {
+    this.loadCount += 1;
     if (this.failLoad) throw new Error('read failed');
     return this.value ? structuredClone(this.value) : undefined;
   }
@@ -46,10 +50,10 @@ const alertRule = {
   createdAt: '2026-10-13T10:00:00.000Z', updatedAt: '2026-10-13T10:00:00.000Z',
 };
 
-async function createCancellationFixture() {
+async function createCancellationFixture(options: { store?: MemoryStore; privacySession?: ControllerIntegrationDependencies['privacySession'] } = {}) {
   const receiptAt = new Date(Date.now() - 30_000).toISOString();
   const consentAt = new Date(Date.now() - 60_000).toISOString();
-  const store = new MemoryStore();
+  const store = options.store ?? new MemoryStore();
   let cancelCalls = 0;
   let cancellationOutcome: 'absent' | 'cancelled' | 'not_admitted' | 'cancellation_unknown' = 'absent';
   let writerActive = true;
@@ -67,7 +71,7 @@ async function createCancellationFixture() {
   };
   const integration: ControllerIntegrationDependencies = {
     mailAlertBackend: backend,
-    privacySession: {
+    privacySession: options.privacySession ?? {
       epoch: 'test-epoch',
       async assertCurrent() {},
       async getStatus() { return { phase: writerActive ? 'writer_active' as const : 'ready' as const, epoch: 'test-epoch', activeWriterCount: writerActive ? 1 : 0,
@@ -107,6 +111,95 @@ async function createCancellationFixture() {
 }
 
 describe('proactive mail-alert controller state', () => {
+  it('resolves a tap from current local metadata only and never loads or exposes selected text', async () => {
+    const fixture = await createCancellationFixture();
+    fixture.writerActive = false;
+    const state = structuredClone(fixture.store.value!);
+    const receivedAt = state.proactiveMailAlerts.receipts[0].receivedAt;
+    const row = {
+      id: 'local-mail-row', accountId: alertAccount.id, providerMessageId: 'provider-message-1', identityKey: alertIdentityKey,
+      verifiedIdentityKey: alertIdentityKey, connectionGeneration: 4, subject: 'Project status', senderEmail: 'owner@example.test',
+      receivedAt, snippet: 'A bounded local snippet.', observedAt: receivedAt,
+    };
+    state.mailbox = [row];
+    state.selectedMailTexts = [{ accountId: alertAccount.id, messageId: row.providerMessageId, sourceDigest: 'private-body-digest', text: 'SECRET FULL BODY' } as never];
+    const sources = await buildProactiveMailSources([alertAccount], [row], Date.now(), new Map(), async (text) =>
+      createHash('sha256').update(text).digest('hex'));
+    state.proactiveMailAlerts.receipts[0].sourceVersion = sources[0].sourceVersion;
+    fixture.store.value = structuredClone(state);
+    (fixture.app as unknown as { state: AppState }).state = structuredClone(state);
+    const loadsBefore = fixture.store.loadCount;
+    const result = await fixture.app.resolveProactiveMailAlertTap({
+      installationId: state.proactiveMailAlerts.installationId, receiptId: state.proactiveMailAlerts.receipts[0].id,
+    });
+    expect(result).toMatchObject({ kind: 'mail', messageId: 'local-mail-row', subject: 'Project status', senderLabel: 'owner@example.test', snippet: 'A bounded local snippet.' });
+    expect(JSON.stringify(result)).not.toContain('SECRET FULL BODY');
+    expect(fixture.store.loadCount).toBe(loadsBefore);
+  });
+
+  it('ignores forged or malformed receipt keys even while a refresh gate is active', async () => {
+    const fixture = await createCancellationFixture();
+    fixture.writerActive = false;
+    (fixture.app as unknown as { setMailAlertRefreshRequired(): void }).setMailAlertRefreshRequired();
+    const installationId = fixture.store.value!.proactiveMailAlerts.installationId;
+    await expect(fixture.app.resolveProactiveMailAlertTap({ installationId, receiptId: '123e4567-e89b-42d3-a456-426614174299' })).resolves.toEqual({ kind: 'ignored' });
+
+    const state = structuredClone(fixture.store.value!);
+    (state.proactiveMailAlerts as unknown as Record<string, unknown>).unexpected = 'raw ledger metadata';
+    (fixture.app as unknown as { state: AppState }).state = state;
+    await expect(fixture.app.resolveProactiveMailAlertTap({ installationId, receiptId: state.proactiveMailAlerts.receipts[0].id })).resolves.toEqual({ kind: 'ignored' });
+  });
+
+  it('does not publish stale status or raise the new-session refresh gate after a delayed store fence fails', async () => {
+    let failPrivacyCheck = false;
+    let rejectStoreFence!: (error: Error) => void;
+    let signalStoreFence!: () => void;
+    const storeFenceEntered = new Promise<void>((resolve) => { signalStoreFence = resolve; });
+    const storeFence = new Promise<void>((_resolve, reject) => { rejectStoreFence = reject; });
+    class DeferredAssertStore extends MemoryStore {
+      holdNextAssertion = false;
+      override async assertCurrent() {
+        if (!this.holdNextAssertion) return;
+        this.holdNextAssertion = false;
+        signalStoreFence();
+        await storeFence;
+      }
+    }
+    const store = new DeferredAssertStore();
+    const privacySession: NonNullable<ControllerIntegrationDependencies['privacySession']> = {
+      epoch: 'test-epoch',
+      async assertCurrent() { if (failPrivacyCheck) throw new Error('workspace epoch changed'); },
+      async getStatus() { return { phase: 'ready', epoch: 'test-epoch', activeWriterCount: 0,
+        pendingCleanupCount: 0, failedCleanupCount: 0, limits: { namespaces: 10, oauthTokenRefs: 10,
+          legacyMarkdownPaths: 10, writerLeases: 10, cleanupTargets: 100, cleanupBatch: 16 }, coverage: 'tracked_with_legacy_limits' }; },
+    };
+    const fixture = await createCancellationFixture({ store, privacySession });
+    const state = structuredClone(store.value!);
+    const receivedAt = state.proactiveMailAlerts.receipts[0].receivedAt;
+    const row = {
+      id: 'local-mail-row', accountId: alertAccount.id, providerMessageId: 'provider-message-1', identityKey: alertIdentityKey,
+      verifiedIdentityKey: alertIdentityKey, connectionGeneration: 4, subject: 'Project status', senderEmail: 'owner@example.test',
+      receivedAt, snippet: 'A bounded local snippet.', observedAt: receivedAt,
+    };
+    const sources = await buildProactiveMailSources([alertAccount], [row], Date.now(), new Map(), async (text) =>
+      createHash('sha256').update(text).digest('hex'));
+    state.mailbox = [row];
+    state.proactiveMailAlerts.receipts[0].sourceVersion = sources[0].sourceVersion;
+    store.value = structuredClone(state);
+    (fixture.app as unknown as { state: AppState }).state = structuredClone(state);
+
+    store.holdNextAssertion = true;
+    const resolution = fixture.app.resolveProactiveMailAlertTap({
+      installationId: state.proactiveMailAlerts.installationId, receiptId: state.proactiveMailAlerts.receipts[0].id,
+    });
+    await storeFenceEntered;
+    failPrivacyCheck = true;
+    rejectStoreFence(new Error('storage generation changed'));
+
+    await expect(resolution).resolves.toEqual({ kind: 'ignored' });
+    expect(fixture.app.getSnapshot().mailAlertRefreshRequired).toBeUndefined();
+  });
+
   it.each([
     ['rule rename', async (app: AppControllerImpl) => app.saveProactiveRule({ ...alertRule, id: alertRule.id,
       expectedVersion: alertRule.version, name: 'Renamed project updates' })],

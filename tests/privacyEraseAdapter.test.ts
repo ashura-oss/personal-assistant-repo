@@ -24,6 +24,7 @@ describe('native notification absence verification', () => {
     const verification = notificationsRemainFromBridge({
       getAllScheduledNotificationsAsync: async () => { throw new Error('native read failed'); },
       getPresentedNotificationsAsync: () => { presentedStarted(); return presented; },
+      getLastNotificationResponseAsync: async () => null,
     }).finally(() => { settled = true; });
 
     await started;
@@ -42,6 +43,7 @@ describe('native notification absence verification', () => {
     const verification = notificationsRemainFromBridge({
       getAllScheduledNotificationsAsync: () => { throw new Error('synchronous bridge failure'); },
       getPresentedNotificationsAsync: () => { presentedStarted(); return presented; },
+      getLastNotificationResponseAsync: async () => null,
     });
 
     await started;
@@ -50,7 +52,17 @@ describe('native notification absence verification', () => {
     await expect(notificationsRemainFromBridge({
       getAllScheduledNotificationsAsync: async () => ({ length: 0 }),
       getPresentedNotificationsAsync: async () => [],
+      getLastNotificationResponseAsync: async () => null,
     })).rejects.toMatchObject({ code: 'target_unavailable' });
+  });
+
+  it('requires the exact cached-response null before declaring notifications absent', async () => {
+    const emptyLists = {
+      getAllScheduledNotificationsAsync: async () => [],
+      getPresentedNotificationsAsync: async () => [],
+    };
+    await expect(notificationsRemainFromBridge({ ...emptyLists, getLastNotificationResponseAsync: async () => ({ response: true }) })).resolves.toBe(true);
+    await expect(notificationsRemainFromBridge({ ...emptyLists, getLastNotificationResponseAsync: async () => undefined })).rejects.toMatchObject({ code: 'target_unavailable' });
   });
 });
 
