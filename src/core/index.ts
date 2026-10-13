@@ -3,6 +3,7 @@ import type { AssistantCitation, AssistantDecision } from '../assistant';
 import type { AudioRecoveryMetadata } from '../audio/recovery.types';
 import type { KnowledgeState, KnowledgeEntityKind, KnowledgeFact, ContactClaim, KnowledgeSourceLink, ProjectMember, KnowledgeSuggestion, KnowledgeChange, KnowledgeEvidence } from '../knowledge/types';
 import type { ReminderRecord, ReminderState, ReminderPayload } from '../reminders';
+import type { StartupRecoveryInspection, StartupRecoveryPlan, StartupRecoveryReceipt, StartupRecoveryCommitInput } from '../storage/startupRecovery';
 
 export type NoteStatus = 'recorded' | 'processed' | 'error';
 export type ProposalKind = 'task' | 'reminder' | 'email' | 'event' | 'memory';
@@ -631,11 +632,11 @@ export interface AppState {
   pendingCredentialCleanup: { tokenRef: string; reason: 'replaced' | 'disconnected' | 'orphan'; createdAt: string; lastError?: string }[];
   /** Immutable credential-free audit records for external writes. */
   dispatchRecords: import('../dispatch').DispatchRecord[];
-  /**
-   * Private recovery data. Never display `raw` or include it in portable export/model context.
-   * Any entry blocks new external writes until receipt history is repaired.
-   */
-  dispatchRecordQuarantine: { reason: 'invalid_persisted_receipt'; quarantinedAt: string; raw: unknown }[];
+  /** Fixed, display-safe recovery summary; malformed receipt data is retained privately by the controller. */
+  dispatchRecoveryStatus?: {
+    quarantinedCount: number;
+    message: 'Some saved dispatch receipts could not be validated and are held privately. New external writes are disabled until recovery.';
+  };
   /** Versioned current mailbox metadata cache; this is independent of immutable dispatch history. */
   mailboxSchemaVersion: 2;
   proactive: ProactiveState;
@@ -794,6 +795,11 @@ export interface AppController {
   getSnapshot(): AppState;
   subscribe(listener: (state: AppState) => void): () => void;
   load(): Promise<void>;
+  getStartupRecoveryStatus(): Promise<StartupRecoveryStatus>;
+  prepareStartupRecovery(): Promise<StartupRecoveryPlan>;
+  commitStartupRecovery(input: StartupRecoveryCommitInput): Promise<StartupRecoveryReceipt>;
+  cancelStartupRecovery(): Promise<void>;
+  retryStartup(): Promise<void>;
   saveNote(input: SaveNoteInput): Promise<Note>;
   confirmImportedNoteTimeZone(noteId: string, input: { timeZone: string; expectedRevision: number }): Promise<Note>;
   prepareRecordingAttachment(noteId: string, input: { expectedRevision: number }): Promise<RecordingAttachmentPreview | null>;
@@ -879,4 +885,10 @@ export interface AppController {
   loadMailReplyText(input: { messageId: string; sourceDigest: string }): Promise<MailReplyTextLoadResult>;
   getMailReplyText(messageId: string): Promise<MailReplyTextCacheResult>;
   generateMailReplyText(input: MailReplyTextGenerationInput): Promise<MailReplyTextGenerationResult>;
+}
+
+export type StartupRecoveryPhase = 'ready' | 'failed' | 'prepared' | 'committing' | 'committed_opening' | 'unavailable';
+export interface StartupRecoveryStatus {
+  phase: StartupRecoveryPhase;
+  inspection?: StartupRecoveryInspection;
 }

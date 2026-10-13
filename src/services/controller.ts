@@ -8,12 +8,13 @@ import type {
   SelectedMailTextSnapshot, MailReplyTextLoadResult, MailReplyTextCacheResult, MailReplyTextGenerationInput, MailReplyTextGenerationResult,
   ProactiveCandidateEntry, ProactiveCandidateSourceResult,
   ProactiveState, SavedProactiveRule, RecordingAttachmentPreview,
-  DeviceCalendarAccessState,
+  DeviceCalendarAccessState, StartupRecoveryStatus,
   SavePersonInput, SaveProjectInput, KnowledgeItemCommand, SaveKnowledgeFactInput, SaveKnowledgeContactInput,
   SaveKnowledgeSourceLinkInput, SaveKnowledgeMemberInput, ReviewKnowledgeSuggestionInput, EditKnowledgeSuggestionInput, KnowledgeSelection,
 } from '../core';
 import { stateStore } from '../storage/platformStorage';
 import type { StateStore } from '../storage/contracts';
+import { STARTUP_RECOVERY_SESSION_MS, validateRecoveryId, validateRecoveryIso, validateRecoveryReceipt, validateReplacementSnapshot, type StartupRecoveryInspection, type StartupRecoveryPlan, type StartupRecoveryReceipt, type StartupRecoveryCommitInput } from '../storage/startupRecovery';
 import { writePrivateDocument } from '../storage/documents';
 import { AzureOpenAIClient, AzureSpeechClient, ReplyGenerationError, ReplyGenerationPreDispatchError, validateAzureEndpoint, type DraftAnalysis, type ReplyGenerationUsage } from './azure';
 import {
@@ -239,7 +240,7 @@ function initialState(): AppState {
     settings: { ...DEFAULT_SETTINGS },
     usage: { month: day.slice(0, 7), day, requests: 0, attemptsToday: 0, inputTokens: 0, outputTokens: 0, transcriptionSeconds: 0, attempts: 0, unknownCharges: 0, reservedUsd: 0, priceKnown: false, estimatedCostUsd: 0 },
     transcription: { schemaVersion: 1, installationUUID: newId(), attempts: [], cleanupLeases: [] },
-    mailbox: [], selectedMailTexts: [], calendarEvents: [], syncStates: {}, pendingCredentialCleanup: [], dispatchRecords: [], dispatchRecordQuarantine: [], mailboxSchemaVersion: 2,
+    mailbox: [], selectedMailTexts: [], calendarEvents: [], syncStates: {}, pendingCredentialCleanup: [], dispatchRecords: [], mailboxSchemaVersion: 2,
     deviceCalendars: emptyDeviceCalendarState(), deviceCalendarAccess: { status: 'needs_check' },
     proactive: emptyProactiveState(), importedBackups: [], knowledge: emptyKnowledgeState(), reminders: emptyReminderState(newId()),
   };
@@ -752,10 +753,20 @@ function createProposalProvenance(input: {
   };
 }
 
-function normalizeLoadedState(value: unknown): AppState & { backupImportQuarantine?: unknown[]; knowledgeQuarantine?: unknown[]; reminderQuarantine?: unknown[]; deviceCalendarQuarantine?: unknown[]; transcriptionQuarantine?: unknown[] } {
+type DispatchRecordQuarantineEntry = { reason: 'invalid_persisted_receipt'; quarantinedAt: string; raw: unknown };
+type NormalizedLoadedState = AppState & {
+  dispatchRecordQuarantine?: DispatchRecordQuarantineEntry[];
+  backupImportQuarantine?: unknown[];
+  knowledgeQuarantine?: unknown[];
+  reminderQuarantine?: unknown[];
+  deviceCalendarQuarantine?: unknown[];
+  transcriptionQuarantine?: unknown[];
+};
+
+function normalizeLoadedState(value: unknown): NormalizedLoadedState {
   const defaults = initialState();
   if (!value || typeof value !== 'object') throw new Error('Saved app data is not a valid state snapshot. It was preserved for recovery.');
-  const raw = value as Partial<AppState>;
+  const raw = value as Partial<AppState> & { dispatchRecordQuarantine?: unknown };
   if (!Array.isArray(raw.notes) || !Array.isArray(raw.proposals) || !Array.isArray(raw.accounts) ||
       !Array.isArray(raw.calendars) || !Array.isArray(raw.documents) || !Array.isArray(raw.activity)) {
     throw new Error('Saved app data is incomplete. It was preserved for recovery.');
@@ -924,11 +935,12 @@ function normalizeLoadedState(value: unknown): AppState & { backupImportQuaranti
     catch { deviceCalendars = defaults.deviceCalendars; deviceCalendarQuarantine.push(raw.deviceCalendars); }
   }
   const dispatchRecords: DispatchRecord[] = [];
-  const dispatchRecordQuarantine: AppState['dispatchRecordQuarantine'] = Array.isArray(raw.dispatchRecordQuarantine)
-    ? raw.dispatchRecordQuarantine.map((item) => item && typeof item === 'object' && 'raw' in item && 'quarantinedAt' in item
+  const persistedDispatchQuarantine = raw.dispatchRecordQuarantine;
+  const dispatchRecordQuarantine: DispatchRecordQuarantineEntry[] = Array.isArray(persistedDispatchQuarantine)
+    ? persistedDispatchQuarantine.map((item) => item && typeof item === 'object' && 'raw' in item && 'quarantinedAt' in item
       ? { reason: 'invalid_persisted_receipt' as const, quarantinedAt: typeof item.quarantinedAt === 'string' ? item.quarantinedAt : now(), raw: item.raw }
       : { reason: 'invalid_persisted_receipt' as const, quarantinedAt: now(), raw: item })
-    : [];
+    : persistedDispatchQuarantine === undefined ? [] : [{ reason: 'invalid_persisted_receipt', quarantinedAt: now(), raw: persistedDispatchQuarantine }];
   if (Array.isArray(raw.dispatchRecords)) {
     for (const value of raw.dispatchRecords) {
       try { dispatchRecords.push(validateDispatchRecord(value)); }
@@ -974,7 +986,12 @@ function normalizeLoadedState(value: unknown): AppState & { backupImportQuaranti
       ? raw.selectedMailTexts.filter(validSelectedMailTextSnapshot).slice(0, 20)
       : [],
     proactive: emptyProactiveState(),
-    dispatchRecords, dispatchRecordQuarantine,
+    dispatchRecords,
+    dispatchRecordQuarantine,
+    ...(dispatchRecordQuarantine.length ? { dispatchRecoveryStatus: {
+      quarantinedCount: dispatchRecordQuarantine.length,
+      message: 'Some saved dispatch receipts could not be validated and are held privately. New external writes are disabled until recovery.' as const,
+    } } : { dispatchRecoveryStatus: undefined }),
     pendingCredentialCleanup: Array.isArray(raw.pendingCredentialCleanup) ? raw.pendingCredentialCleanup.filter((item) =>
       item && typeof item.tokenRef === 'string' && item.tokenRef.length > 0 && ['replaced', 'disconnected', 'orphan'].includes(item.reason) && typeof item.createdAt === 'string') : [],
     // Account configuration is not authentication and cannot restore an OAuth connection.
@@ -1105,6 +1122,12 @@ export class AppControllerImpl implements AppController {
   private transactionQueue = Promise.resolve();
   private loadPromise?: Promise<void>;
   private loaded = false;
+  private bootstrapGeneration = 0;
+  private startupRecoveryPhase: StartupRecoveryStatus['phase'] = 'ready';
+  private startupRecoveryPlan?: StartupRecoveryPlan;
+  private startupRecoveryReceipt?: StartupRecoveryReceipt;
+  private startupRecoveryInspection?: StartupRecoveryInspection;
+  private startupRecoveryBusy = false;
   private processJobs = new Map<string, Promise<Proposal[]>>();
   private assistJobs = new Map<string, Promise<NoteAssistResult>>();
   private analysisCache = new Map<string, DraftAnalysis>();
@@ -1147,6 +1170,7 @@ export class AppControllerImpl implements AppController {
   private reminderLegacyJobs = new Map<string, Promise<void>>();
   private draftAllocatedIds = new WeakMap<AppState, Set<string>>();
   private deviceEventQuarantine: unknown[] = [];
+  private dispatchRecordQuarantine: DispatchRecordQuarantineEntry[] = [];
   private verifiedDeviceCalendarGeneration?: number;
   private deviceCalendarJob?: Promise<DeviceCalendarState>;
   private deviceEventJobs = new Map<string, Promise<Proposal>>();
@@ -1242,7 +1266,14 @@ export class AppControllerImpl implements AppController {
   }
 
   private persistedState(state: AppState): AppState {
-    const result = { ...state } as AppState & { proactiveQuarantine?: unknown; backupImportQuarantine?: unknown[]; knowledgeQuarantine?: unknown[]; reminderQuarantine?: unknown[]; deviceCalendarQuarantine?: unknown[]; transcriptionQuarantine?: unknown[] };
+    const result = { ...state } as AppState & { dispatchRecordQuarantine?: DispatchRecordQuarantineEntry[]; proactiveQuarantine?: unknown; backupImportQuarantine?: unknown[]; knowledgeQuarantine?: unknown[]; reminderQuarantine?: unknown[]; deviceCalendarQuarantine?: unknown[]; transcriptionQuarantine?: unknown[] };
+    if (this.dispatchRecordQuarantine.length) result.dispatchRecordQuarantine = clone(this.dispatchRecordQuarantine);
+    else delete result.dispatchRecordQuarantine;
+    if (this.dispatchRecordQuarantine.length) result.dispatchRecoveryStatus = {
+      quarantinedCount: this.dispatchRecordQuarantine.length,
+      message: 'Some saved dispatch receipts could not be validated and are held privately. New external writes are disabled until recovery.',
+    };
+    else delete result.dispatchRecoveryStatus;
     if (this.proactiveQuarantine) result.proactiveQuarantine = clone(this.proactiveQuarantine);
     if (this.backupImportQuarantine.length) result.backupImportQuarantine = clone(this.backupImportQuarantine);
     if (this.knowledgeQuarantine.length) result.knowledgeQuarantine = clone(this.knowledgeQuarantine);
@@ -1253,7 +1284,13 @@ export class AppControllerImpl implements AppController {
   }
 
   private publicState(state: AppState): AppState {
-    const result = clone(state) as AppState & { proactiveQuarantine?: unknown; backupImportQuarantine?: unknown; knowledgeQuarantine?: unknown; reminderQuarantine?: unknown; deviceCalendarQuarantine?: unknown; transcriptionQuarantine?: unknown };
+    const result = clone(state) as AppState & { dispatchRecordQuarantine?: unknown; proactiveQuarantine?: unknown; backupImportQuarantine?: unknown; knowledgeQuarantine?: unknown; reminderQuarantine?: unknown; deviceCalendarQuarantine?: unknown; transcriptionQuarantine?: unknown };
+    delete result.dispatchRecordQuarantine;
+    if (this.dispatchRecordQuarantine.length) result.dispatchRecoveryStatus = {
+      quarantinedCount: this.dispatchRecordQuarantine.length,
+      message: 'Some saved dispatch receipts could not be validated and are held privately. New external writes are disabled until recovery.',
+    };
+    else delete result.dispatchRecoveryStatus;
     delete result.proactiveQuarantine;
     delete result.backupImportQuarantine;
     delete result.knowledgeQuarantine;
@@ -1377,9 +1414,13 @@ export class AppControllerImpl implements AppController {
 
   /** Serialize the complete read-modify-write operation; failed writes never mutate committed state. */
   private mutate<T>(operation: (draft: AppState) => T | Promise<T>): Promise<T> {
+    const capturedBootstrapGeneration = this.bootstrapGeneration;
     const run = this.transactionQueue.then(async () => {
+      if (capturedBootstrapGeneration !== this.bootstrapGeneration) throw new Error('The app restarted while this action was waiting. Review the current state and try again.');
+      if (this.startupRecoveryPhase !== 'ready') throw new Error('App startup is not ready. Retry startup or complete the recovery flow first.');
       if (!this.loaded) await this.load();
       if (this.loadPromise) await this.loadPromise;
+      if (capturedBootstrapGeneration !== this.bootstrapGeneration || this.startupRecoveryPhase !== 'ready') throw new Error('App startup changed while this action was waiting. Review the current state and try again.');
       const draft = clone(this.state);
       const result = await operation(draft);
       await this.evaluateProactiveDraft(draft);
@@ -1397,9 +1438,13 @@ export class AppControllerImpl implements AppController {
 
   /** A serialized local read/check that only commits when it actually changes state. */
   private mutateIfChanged<T>(operation: (draft: AppState) => Promise<{ changed: boolean; result: T }> | { changed: boolean; result: T }): Promise<T> {
+    const capturedBootstrapGeneration = this.bootstrapGeneration;
     const run = this.transactionQueue.then(async () => {
+      if (capturedBootstrapGeneration !== this.bootstrapGeneration) throw new Error('The app restarted while this action was waiting. Review the current state and try again.');
+      if (this.startupRecoveryPhase !== 'ready') throw new Error('App startup is not ready. Retry startup or complete the recovery flow first.');
       if (!this.loaded) await this.load();
       if (this.loadPromise) await this.loadPromise;
+      if (capturedBootstrapGeneration !== this.bootstrapGeneration || this.startupRecoveryPhase !== 'ready') throw new Error('App startup changed while this action was waiting. Review the current state and try again.');
       const draft = clone(this.state);
       const { changed, result } = await operation(draft);
       if (changed) {
@@ -1695,19 +1740,218 @@ export class AppControllerImpl implements AppController {
   }
 
   async load(): Promise<void> {
+    if (['failed', 'prepared', 'committing', 'committed_opening', 'unavailable'].includes(this.startupRecoveryPhase)) {
+      throw new Error(this.startupRecoveryPhase === 'committed_opening'
+        ? 'Fresh app data is committed. Retry startup to finish opening it.'
+        : 'App startup failed. Use the explicit retry or recovery flow before continuing.');
+    }
+    return this.openStartupData();
+  }
+
+  private async openStartupData(): Promise<void> {
     if (this.loaded) return;
     if (this.loadPromise) return this.loadPromise;
     this.loadPromise = this.loadInternal();
-    try { await this.loadPromise; }
-    finally { this.loadPromise = undefined; }
+    try {
+      await this.loadPromise;
+      await this.discoverPendingStartupReceipt();
+      if (this.startupRecoveryReceipt) await this.acknowledgeStartupRecoveryReceipt();
+      else this.startupRecoveryPhase = 'ready';
+    } catch (error) {
+      await this.discoverPendingStartupReceipt();
+      this.startupRecoveryPhase = this.startupRecoveryReceipt ? 'committed_opening' : 'failed';
+      throw error;
+    } finally { this.loadPromise = undefined; }
     if (this.state.pendingCredentialCleanup.length) void this.retryCredentialCleanup().catch(() => undefined);
+  }
+
+  private async discoverPendingStartupReceipt(): Promise<void> {
+    if (this.startupRecoveryReceipt || !this.store.recovery) return;
+    try {
+      const inspection = await this.store.recovery.inspect();
+      this.startupRecoveryInspection = inspection;
+      if (inspection.pendingReceipt) this.startupRecoveryReceipt = validateRecoveryReceipt(inspection.pendingReceipt);
+    } catch { /* Recovery inspection is optional and never changes ordinary startup data. */ }
+  }
+
+  private async acknowledgeStartupRecoveryReceipt(): Promise<void> {
+    const receipt = this.startupRecoveryReceipt;
+    if (!receipt) { this.startupRecoveryPhase = 'ready'; return; }
+    const backend = this.store.recovery;
+    if (!backend) { this.startupRecoveryPhase = 'committed_opening'; return; }
+    try {
+      await backend.acknowledgeOpened(receipt.operationId);
+      this.startupRecoveryReceipt = undefined;
+      this.startupRecoveryPlan = undefined;
+      if (this.startupRecoveryInspection?.pendingReceipt?.operationId === receipt.operationId) {
+        const inspection = { ...this.startupRecoveryInspection };
+        delete inspection.pendingReceipt;
+        this.startupRecoveryInspection = inspection;
+      }
+      this.startupRecoveryPhase = 'ready';
+    } catch { this.startupRecoveryPhase = 'committed_opening'; }
+  }
+
+  async getStartupRecoveryStatus(): Promise<StartupRecoveryStatus> {
+    if (this.startupRecoveryPhase !== 'failed') return { phase: this.startupRecoveryPhase, ...(this.startupRecoveryInspection ? { inspection: this.startupRecoveryInspection } : {}) };
+    const backend = this.store.recovery;
+    if (!backend) return { phase: 'unavailable' };
+    const generation = this.bootstrapGeneration;
+    try {
+      const inspection = await backend.inspect();
+      if (generation !== this.bootstrapGeneration || this.startupRecoveryPhase !== 'failed' || this.loaded) {
+        return { phase: this.startupRecoveryPhase, ...(this.startupRecoveryInspection ? { inspection: this.startupRecoveryInspection } : {}) };
+      }
+      this.startupRecoveryInspection = inspection;
+      if (inspection.pendingReceipt) {
+        this.startupRecoveryReceipt = validateRecoveryReceipt(inspection.pendingReceipt);
+        this.startupRecoveryPhase = 'committed_opening';
+        return { phase: 'committed_opening', inspection };
+      }
+      return { phase: inspection.status === 'available' ? 'failed' : 'unavailable', inspection };
+    } catch { return { phase: 'unavailable' }; }
+  }
+
+  async prepareStartupRecovery(): Promise<StartupRecoveryPlan> {
+    if (this.startupRecoveryBusy) throw new Error('Another startup recovery action is already in progress.');
+    if (this.loaded || this.startupRecoveryPhase !== 'failed') throw new Error('Recovery is available only after core startup fails.');
+    const backend = this.store.recovery;
+    if (!backend) { this.startupRecoveryPhase = 'unavailable'; throw new Error('This storage platform does not support startup recovery.'); }
+    const generation = this.bootstrapGeneration;
+    this.startupRecoveryBusy = true;
+    try {
+      const inspection = await backend.inspect();
+      this.startupRecoveryInspection = inspection;
+      if (generation !== this.bootstrapGeneration || this.startupRecoveryPhase !== 'failed' || this.loaded) throw new Error('Startup changed while recovery was being checked. Retry the status check.');
+      if (inspection.status !== 'available' || inspection.pendingReceipt) throw new Error('Saved data is not eligible for archive-and-start-fresh recovery.');
+      const plan = await backend.prepare();
+      const expiresAt = validateRecoveryIso(plan.expiresAt, 'Recovery plan expiry');
+      validateRecoveryId(plan.sessionId, 'Recovery session');
+      validateRecoveryId(plan.planHash, 'Recovery plan');
+      if (plan.operation !== 'archive_and_start_fresh' || Date.parse(expiresAt) <= Date.now() ||
+          Date.parse(expiresAt) > Date.now() + STARTUP_RECOVERY_SESSION_MS + 5_000 || !Number.isSafeInteger(plan.evidenceBytes) || plan.evidenceBytes < 0 ||
+          !Number.isSafeInteger(plan.archiveCount) || plan.archiveCount < 0 || generation !== this.bootstrapGeneration || this.startupRecoveryPhase !== 'failed' || this.loaded) {
+        throw new Error('The startup recovery plan is invalid or expired. Check recovery status and prepare again.');
+      }
+      this.startupRecoveryPlan = Object.freeze({ ...plan });
+      this.startupRecoveryPhase = 'prepared';
+      return this.startupRecoveryPlan;
+    } finally { this.startupRecoveryBusy = false; }
+  }
+
+  async cancelStartupRecovery(): Promise<void> {
+    if (this.startupRecoveryBusy || this.startupRecoveryPhase === 'committing') throw new Error('Startup recovery is already committing and cannot be cancelled.');
+    if (this.startupRecoveryPhase !== 'prepared') return;
+    this.startupRecoveryPlan = undefined;
+    this.startupRecoveryPhase = 'failed';
+  }
+
+  async commitStartupRecovery(input: StartupRecoveryCommitInput): Promise<StartupRecoveryReceipt> {
+    if (this.startupRecoveryBusy) throw new Error('Another startup recovery action is already in progress.');
+    const plan = this.startupRecoveryPlan;
+    const backend = this.store.recovery;
+    if (!backend || this.loaded || this.startupRecoveryPhase !== 'prepared' || !plan || input.sessionId !== plan.sessionId || input.planHash !== plan.planHash) {
+      throw new Error('The startup recovery plan is not current. Prepare a new recovery plan.');
+    }
+    if (Date.parse(plan.expiresAt) <= Date.now()) { this.startupRecoveryPhase = 'failed'; this.startupRecoveryPlan = undefined; throw new Error('The startup recovery plan expired. Prepare a new one.'); }
+    this.startupRecoveryBusy = true;
+    this.startupRecoveryPhase = 'committing';
+    this.bootstrapGeneration += 1;
+    try {
+      const replacement = initialState();
+      validateReplacementSnapshot(replacement);
+      let receipt: StartupRecoveryReceipt;
+      try {
+        receipt = validateRecoveryReceipt(await backend.commit(input, replacement));
+        if (receipt.operationId !== input.sessionId) throw new Error('The recovery receipt does not match this confirmation session.');
+      }
+      catch (error) {
+        // A backend may have durably committed before its response was lost.
+        // Inspect its receipt before allowing another archive operation.
+        let pending: StartupRecoveryReceipt | undefined;
+        try {
+          const inspection = await backend.inspect();
+          this.startupRecoveryInspection = inspection;
+          if (inspection.pendingReceipt) pending = validateRecoveryReceipt(inspection.pendingReceipt);
+        }
+        catch { /* Preserve the prepared plan if receipt status cannot yet be read. */ }
+        if (pending) {
+          if (pending.operationId !== input.sessionId) {
+            this.startupRecoveryReceipt = pending;
+            this.startupRecoveryPhase = 'committed_opening';
+            throw new Error('A different recovery already committed and needs startup confirmation. Retry startup before continuing.');
+          }
+          receipt = pending;
+        } else {
+          this.startupRecoveryPhase = 'prepared';
+          throw error;
+        }
+      }
+      this.startupRecoveryReceipt = receipt;
+      this.startupRecoveryInspection = {
+        status: 'available', evidenceBytes: receipt.evidenceBytes,
+        archiveCount: plan.archiveCount + (receipt.alreadyCommitted ? 0 : 1),
+        pendingReceipt: { ...receipt, alreadyCommitted: true },
+      };
+      this.startupRecoveryPhase = 'committed_opening';
+      this.resetRuntimeForFreshStartup();
+      try { await this.openStartupData(); }
+      catch { /* The archive-and-replace is durable; leave the receipt for an explicit startup retry. */ }
+      return receipt;
+    } finally { this.startupRecoveryBusy = false; }
+  }
+
+  async retryStartup(): Promise<void> {
+    if (this.startupRecoveryBusy) throw new Error('Another startup recovery action is already in progress.');
+    if (!['failed', 'prepared', 'unavailable', 'committed_opening'].includes(this.startupRecoveryPhase)) throw new Error('There is no failed startup to retry.');
+    this.startupRecoveryBusy = true;
+    this.bootstrapGeneration += 1;
+    try {
+      if (this.startupRecoveryPhase === 'committed_opening' && this.loaded && this.startupRecoveryReceipt) {
+        await this.acknowledgeStartupRecoveryReceipt();
+        if (this.startupRecoveryPhase === 'committed_opening') throw new Error('Fresh app data is open, but its recovery receipt could not be acknowledged. Retry startup again.');
+        return;
+      }
+      this.startupRecoveryPlan = undefined;
+      if (this.startupRecoveryPhase !== 'committed_opening') this.startupRecoveryPhase = 'failed';
+      this.loaded = false;
+      this.loadPromise = undefined;
+      await this.openStartupData();
+      if (this.startupRecoveryPhase === 'committed_opening') {
+        await this.acknowledgeStartupRecoveryReceipt();
+        if (this.startupRecoveryPhase === 'committed_opening') throw new Error('Fresh app data opened, but its recovery receipt could not be acknowledged. Retry startup again.');
+      }
+    } finally {
+      this.startupRecoveryBusy = false;
+    }
+  }
+
+  private resetRuntimeForFreshStartup(): void {
+    this.state = initialState();
+    this.loaded = false;
+    this.loadPromise = undefined;
+    this.proactiveQuarantine = undefined;
+    this.backupImportQuarantine = [];
+    this.knowledgeQuarantine = [];
+    this.reminderQuarantine = [];
+    this.deviceEventQuarantine = [];
+    this.transcriptionQuarantine = [];
+    this.dispatchRecordQuarantine = [];
+    this.proactiveSourceHashMemo = new Map();
+    this.analysisCache.clear();
+    this.verifiedReminderForeground.clear();
+    this.verifiedDeviceCalendarGeneration = undefined;
+    this.snapshot = deepFreeze(this.publicState(this.state));
+    this.emit();
   }
 
   private async loadInternal(): Promise<void> {
     this.verifiedReminderForeground.clear();
     this.verifiedDeviceCalendarGeneration = undefined;
     const loaded = await this.store.load();
-    const normalized = loaded ? normalizeLoadedState(loaded) : initialState();
+    const normalized: NormalizedLoadedState = loaded ? normalizeLoadedState(loaded) : initialState();
+    this.dispatchRecordQuarantine = clone(normalized.dispatchRecordQuarantine ?? []);
+    delete normalized.dispatchRecordQuarantine;
     this.backupImportQuarantine = clone((normalized as AppState & { backupImportQuarantine?: unknown[] }).backupImportQuarantine ?? []);
     delete (normalized as AppState & { backupImportQuarantine?: unknown[] }).backupImportQuarantine;
     this.knowledgeQuarantine = clone((normalized as AppState & { knowledgeQuarantine?: unknown[] }).knowledgeQuarantine ?? []);
@@ -1808,6 +2052,7 @@ export class AppControllerImpl implements AppController {
     await this.evaluateProactiveDraft(this.state);
     const stateToSave = this.persistedState(this.state);
     if (!loaded || JSON.stringify(stateToSave) !== JSON.stringify(loaded)) await this.store.save(stateToSave);
+    await this.store.assertCurrent?.();
     this.snapshot = deepFreeze(this.publicState(this.state));
     this.loaded = true;
     this.emit();
@@ -1819,13 +2064,17 @@ export class AppControllerImpl implements AppController {
   async saveNote(input: SaveNoteInput): Promise<Note> {
     const transcript = input.transcript.trim();
     if (!transcript && !input.audioUri) throw new Error('Add a transcript or an audio recording first.');
+    const durationSeconds = input.durationSeconds ?? 0;
+    if (!Number.isFinite(durationSeconds) || durationSeconds < 0 || durationSeconds > MAX_DURATION_SECONDS) {
+      throw new Error(`Recording duration must be between zero and ${MAX_DURATION_SECONDS} seconds.`);
+    }
     const result = await this.mutate(async (state) => {
       const capturedDate = input.capturedAt ? new Date(input.capturedAt) : new Date();
       if (!Number.isFinite(capturedDate.getTime())) throw new Error('Recording start time is invalid.');
       const note: Note = {
         id: newId(), title: transcript ? transcript.split(/\s+/).slice(0, 7).join(' ').slice(0, 72) : 'Audio note',
         transcript, ...(input.audioUri ? { audioUri: input.audioUri } : {}),
-        durationSeconds: Math.max(0, Math.round(input.durationSeconds ?? 0)), createdAt: now(), capturedAt: capturedDate.toISOString(), captureTimeZone: validTimezone(input.captureTimeZone ?? state.settings.timezone), status: 'recorded', revision: 1,
+        durationSeconds, createdAt: now(), capturedAt: capturedDate.toISOString(), captureTimeZone: validTimezone(input.captureTimeZone ?? state.settings.timezone), status: 'recorded', revision: 1,
       };
       state.notes.unshift(note);
       addActivity(state, 'note_saved', transcript ? 'Transcript saved on this device.' : 'Audio saved. No transcript has been created yet.', { noteId: note.id });
@@ -3173,7 +3422,7 @@ export class AppControllerImpl implements AppController {
       proposal.status = 'dispatching';
       let dispatchRecord: DispatchRecord | undefined;
       if (canDispatch && account) {
-        if (state.dispatchRecordQuarantine.length) throw new Error('Dispatch history failed integrity validation. External writes are disabled until the receipt history is repaired.');
+        if (this.dispatchRecordQuarantine.length) throw new Error('Dispatch history failed integrity validation. External writes are disabled until the receipt history is repaired.');
         dispatchRecord = createDispatchRecord({ id: newId(), dispatchStartedAt: now(), proposal, account, calendar });
         assertNoDuplicateDispatch(state, dispatchRecord);
         state.dispatchRecords.unshift(dispatchRecord);
@@ -5990,7 +6239,7 @@ export class AppControllerImpl implements AppController {
       this.assertKnowledgeWritable();
       const queuedAge = Date.now() - session.preparedAtMs;
       if (queuedAge < 0 || queuedAge > 15 * 60_000) throw new Error('This activation preview expired while waiting to save. Prepare it again.');
-      if (stableJson(state) !== session.stateJson) throw new Error('App data changed after this preview. Prepare a fresh activation preview.');
+      if (stableJson(this.publicState(state)) !== session.stateJson) throw new Error('App data changed after this preview. Prepare a fresh activation preview.');
       const archive = state.importedBackups.find((item) => item.id === session.archiveId);
       const cohort = archive?.archivedKnowledge?.find((item) => item.id === session.cohortId);
       if (!archive || !cohort) throw new Error('Imported knowledge archive is no longer available.');

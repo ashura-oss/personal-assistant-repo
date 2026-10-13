@@ -54,10 +54,10 @@ function speechClient(run: (args: {
 async function readyApp(store = new MemoryStore(), speech = speechClient(async () => ({
   transcript: 'Remember the blue folder.', durationMilliseconds: 2_100, durationSeconds: 2.1, billedEstimateSeconds: 3,
   attempts: 1 as const, cleanupPromise: Promise.resolve(),
-}))) {
+})), durationSeconds = 7) {
   const app = new AppControllerImpl(store, { speech });
   await app.load();
-  const note = await app.saveNote({ transcript: 'Captured locally.', audioUri: 'file:///private/voice.m4a', durationSeconds: 7 });
+  const note = await app.saveNote({ transcript: 'Captured locally.', audioUri: 'file:///private/voice.m4a', durationSeconds });
   await app.saveSettings({ speechEnabled: true, speechEndpoint: endpoint });
   return { app, store, note };
 }
@@ -93,25 +93,28 @@ describe('explicit transcription controller lifecycle', () => {
   it('runs one bounded Azure request through the controller and releases the matching upload lease', async () => {
     const audio: SpeechAudioService = {
       prepare: vi.fn(async (_note, options): Promise<PreparedSpeechAudio> => ({
-        ...makePrepared(options.leaseId),
+        ...makePrepared(options.leaseId, _note.durationSeconds),
         platform: 'web',
         upload: { blob: new Blob(['voice']), fileName: 'note.wav' },
       })),
       verify: vi.fn(async () => undefined),
       release: vi.fn(async () => undefined),
     };
-    const fetcher = vi.fn(async () => new Response(JSON.stringify({ durationMilliseconds: 2_100, combinedPhrases: [{ text: 'Azure heard this.' }] }), {
+    const fetcher = vi.fn(async () => new Response(JSON.stringify({ durationMilliseconds: 3_760, combinedPhrases: [{ text: 'Azure heard this.' }] }), {
       status: 200, headers: { 'Content-Type': 'application/json' },
     }));
     const speech = new AzureSpeechClient({ audio, fetcher: fetcher as unknown as typeof fetch,
       readKeySnapshot: async () => ({ key: 'fictional-test-key', generation: 4 }), currentCredentialGeneration: () => 4, assertCredentialGeneration: (value) => { if (value !== 4) throw new Error('stale'); } });
-    const { app, note } = await readyApp(new MemoryStore(), speech);
+    const { app, note } = await readyApp(new MemoryStore(), speech, 4.125);
     await expect(app.transcribeNote(note.id, { expectedRevision: note.revision })).resolves.toMatchObject({ transcript: 'Azure heard this.' });
     expect(fetcher).toHaveBeenCalledTimes(1);
     expect(audio.prepare).toHaveBeenCalledTimes(1);
     await vi.waitFor(() => expect(audio.release).toHaveBeenCalledTimes(2));
     await vi.waitFor(() => expect(app.getSnapshot().transcription.cleanupLeases.at(-1)).toMatchObject({ outcome: 'released' }));
-    expect(app.getSnapshot().transcription.attempts.at(-1)).toMatchObject({ outcome: 'completed', durationMilliseconds: 2_100, billedEstimateSeconds: 3 });
+    expect(app.getSnapshot().transcription.attempts.at(-1)).toMatchObject({ outcome: 'completed', durationMilliseconds: 3_760, billedEstimateSeconds: 4 });
+    expect(app.getSnapshot().notes.find((item) => item.id === note.id)?.durationSeconds).toBe(4.125);
+    const backup = createPortableBackup(app.getSnapshot(), { exportId: 'fractional-duration-test', exportedAt: new Date().toISOString() });
+    expect(backup.notes.find((item) => item.sourceId === note.id)?.durationSeconds).toBe(4.125);
   });
 
   it('rolls back only its own reservation when a typed failure proves no POST was dispatched', async () => {

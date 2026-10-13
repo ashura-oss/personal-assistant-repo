@@ -67,7 +67,7 @@ async function answer(app: AppControllerImpl, question: string) {
 function proactiveState(overrides: Partial<DeviceEventSnapshot>[] = []): AppState {
   const state = {
     notes: [], proposals: [], tasks: [], accounts: [], calendars: [], documents: [], activity: [], settings: {} as AppState['settings'], usage: {} as AppState['usage'],
-    mailbox: [], selectedMailTexts: [], calendarEvents: [], transcription: { schemaVersion: 1, installationUUID: '22222222-2222-4222-8222-222222222223', attempts: [], cleanupLeases: [] }, syncStates: {}, pendingCredentialCleanup: [], dispatchRecords: [], dispatchRecordQuarantine: [], mailboxSchemaVersion: 2,
+    mailbox: [], selectedMailTexts: [], calendarEvents: [], transcription: { schemaVersion: 1, installationUUID: '22222222-2222-4222-8222-222222222223', attempts: [], cleanupLeases: [] }, syncStates: {}, pendingCredentialCleanup: [], dispatchRecords: [], mailboxSchemaVersion: 2,
     deviceCalendars: {
       schemaVersion: 1 as const, installationId: '22222222-2222-4222-8222-222222222222', generation: 2, selectionRevision: 3, enabled: true,
       selectedCalendarIds: [calendarId], calendars: [calendarRow()], events: overrides.map((row) => nativeEvent(row)),

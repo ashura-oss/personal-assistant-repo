@@ -532,13 +532,94 @@ describe('application state controller', () => {
     await first.load();
     await first.saveNote({ transcript: 'Keep the appointment notes.' });
     store.value!.dispatchRecords = [{ id: 'invalid-receipt', secret: 'private-corrupt-data' }] as never;
+    Object.assign(store.value!, { dispatchRecordQuarantine: [{ reason: 'invalid_persisted_receipt', quarantinedAt: new Date().toISOString(), raw: { detail: 'legacy-private-sentinel' } }] });
     const recovered = new AppControllerImpl(store);
+    const observedSnapshots: string[] = [];
+    recovered.subscribe((state) => observedSnapshots.push(JSON.stringify(state)));
     await recovered.load();
     expect(recovered.getSnapshot().dispatchRecords).toEqual([]);
-    expect(recovered.getSnapshot().dispatchRecordQuarantine).toMatchObject([{ reason: 'invalid_persisted_receipt', raw: { id: 'invalid-receipt' } }]);
+    expect(recovered.getSnapshot().dispatchRecoveryStatus).toMatchObject({ quarantinedCount: 2 });
+    expect(JSON.stringify(recovered.getSnapshot())).not.toContain('private-corrupt-data');
+    expect(JSON.stringify(recovered.getSnapshot())).not.toContain('legacy-private-sentinel');
+    expect(observedSnapshots.join('\n')).not.toContain('legacy-private-sentinel');
+    const persistedQuarantine = (store.value as unknown as { dispatchRecordQuarantine?: unknown[] }).dispatchRecordQuarantine;
+    expect(persistedQuarantine).toHaveLength(2);
+    expect(JSON.stringify(persistedQuarantine)).toContain('legacy-private-sentinel');
+    await recovered.saveNote({ transcript: 'An unrelated ordinary mutation.' });
+    expect(JSON.stringify((store.value as unknown as { dispatchRecordQuarantine?: unknown[] }).dispatchRecordQuarantine)).toContain('legacy-private-sentinel');
+    const reloaded = new AppControllerImpl(store);
+    await reloaded.load();
+    expect(reloaded.getSnapshot().dispatchRecoveryStatus).toMatchObject({ quarantinedCount: 2 });
+    expect(JSON.stringify(reloaded.getSnapshot())).not.toContain('legacy-private-sentinel');
     const exported = await recovered.exportData();
     expect(exported).not.toContain('dispatchRecordQuarantine');
     expect(exported).not.toContain('private-corrupt-data');
+    expect(exported).not.toContain('legacy-private-sentinel');
+  });
+
+  it('blocks a real provider dispatch while corrupt receipts remain privately quarantined', async () => {
+    const store = new MemoryStore();
+    const identity = { providerNamespace: 'google' as const, clientId: 'quarantine-client', subject: 'quarantine-subject' };
+    const token = { accessToken: 'quarantine-access', expiresAt: Date.now() + 600_000, identity };
+    const tokenStore = { async get() { return structuredClone(token); }, async set() {} };
+    const oauth: OAuthBridgeResult = {
+      provider: 'google', accessToken: token.accessToken, expiresAt: token.expiresAt,
+      grantedScopes: ['openid', 'https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/gmail.compose'],
+      requestedCapabilities: ['mail.read', 'mail.draft'], capabilities: ['mail.read', 'mail.draft'], identity,
+      displayName: 'Quarantine test', email: 'me@example.test',
+    };
+    const providerWrite = vi.fn(async () => ({ status: 'accepted' as const, id: 'must-not-write' }));
+    const integration = {
+      tokenStore, deleteToken: async () => undefined, clientIds: { google: identity.clientId },
+      verifyOAuthResult: async () => true,
+      connectorFactory: () => ({ createDraft: providerWrite, verifyOAuthIdentity: async () => true }) as never,
+    };
+    const seed = new AppControllerImpl(store, {}, integration);
+    await seed.load();
+    const account = await seed.installVerifiedAccount({ provider: 'google', displayName: '', email: '' }, oauth);
+    const observedAt = new Date().toISOString();
+    const message = {
+      id: 'quarantine-mail', accountId: account.id, providerMessageId: 'provider-quarantine-mail', identityKey: 'google:quarantine-client:quarantine-subject:',
+      verifiedIdentityKey: 'google:quarantine-client:quarantine-subject:', connectionGeneration: account.connectionGeneration, idFormat: 'gmail' as const,
+      threadId: 'quarantine-thread', subject: 'Receipt quarantine fence', from: 'Sam <sam@example.test>', senderEmail: 'sam@example.test',
+      internetMessageId: '<quarantine@example.test>', replyTo: ['sam@example.test'], to: ['me@example.test'], cc: [],
+      replyMetadataComplete: true, observedAt,
+    };
+    store.value!.mailbox.push(message);
+    await store.save(store.value!);
+    const ready = new AppControllerImpl(store, {}, integration);
+    await ready.load();
+    await ready.saveSettings({ mode: 'provider' });
+    const source = await ready.getMailReplySource(message.id);
+    const proposal = await ready.createMailReplyProposal({ messageId: message.id, mode: 'reply', sourceDigest: source.source!.sourceDigest, text: 'Thanks.' });
+    await ready.approveProposal(proposal.id);
+
+    store.value!.dispatchRecords = [{ id: 'invalid-private-receipt', secret: 'dispatch-quarantine-write-sentinel' }] as never;
+    const blocked = new AppControllerImpl(store, {}, integration);
+    await blocked.load();
+    expect(blocked.getSnapshot().dispatchRecoveryStatus).toMatchObject({ quarantinedCount: 1 });
+    await expect(blocked.executeProposal(proposal.id)).rejects.toThrow(/Dispatch history failed integrity validation/i);
+    expect(providerWrite).not.toHaveBeenCalled();
+    expect(blocked.getSnapshot().dispatchRecords).toEqual([]);
+    expect(JSON.stringify(blocked.getSnapshot())).not.toContain('dispatch-quarantine-write-sentinel');
+  });
+
+  it('retains a non-array legacy dispatch quarantine envelope privately across mutation and reload', async () => {
+    const store = new MemoryStore();
+    const first = new AppControllerImpl(store);
+    await first.load();
+    const privateRaw = { marker: 'scalar-envelope-sentinel', nested: ['do-not-expose'] };
+    Object.assign(store.value!, { dispatchRecordQuarantine: privateRaw });
+    const recovered = new AppControllerImpl(store);
+    await recovered.load();
+    expect(recovered.getSnapshot().dispatchRecoveryStatus).toMatchObject({ quarantinedCount: 1 });
+    expect(JSON.stringify(recovered.getSnapshot())).not.toContain('scalar-envelope-sentinel');
+    await recovered.saveSettings({ timezone: 'Asia/Singapore' });
+    expect(JSON.stringify((store.value as unknown as { dispatchRecordQuarantine?: unknown }).dispatchRecordQuarantine)).toContain('scalar-envelope-sentinel');
+    const reloaded = new AppControllerImpl(store);
+    await reloaded.load();
+    expect(reloaded.getSnapshot().dispatchRecoveryStatus).toMatchObject({ quarantinedCount: 1 });
+    expect(JSON.stringify(reloaded.getSnapshot())).not.toContain('scalar-envelope-sentinel');
   });
 
   it('uses the dedicated mailbox head and backfill lanes with hydrated metadata and persisted cursors', async () => {

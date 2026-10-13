@@ -17,7 +17,7 @@ function emptyState(): AppState {
     transcription: { schemaVersion: 1, installationUUID: '123e4567-e89b-42d3-a456-426614174101', attempts: [], cleanupLeases: [] },
     deviceCalendars: { schemaVersion: 1, installationId: '123e4567-e89b-42d3-a456-426614174098', generation: 1, selectionRevision: 1, enabled: false, selectedCalendarIds: [], calendars: [], events: [], dispatchRecords: [] },
     deviceCalendarAccess: { status: 'needs_check' },
-    syncStates: {}, pendingCredentialCleanup: [], dispatchRecords: [], dispatchRecordQuarantine: [], mailboxSchemaVersion: 2,
+    syncStates: {}, pendingCredentialCleanup: [], dispatchRecords: [], mailboxSchemaVersion: 2,
     proactive: { schemaVersion: 1, rules: [], candidates: [], dismissals: [], snoozes: [] },
     importedBackups: [],
     knowledge: emptyKnowledgeState(),

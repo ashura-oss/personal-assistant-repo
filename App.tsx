@@ -41,7 +41,9 @@ import type {
   KnowledgeItemCommand,
   ReviewKnowledgeSuggestionInput,
   EditKnowledgeSuggestionInput,
+  StartupRecoveryStatus,
 } from "./src/core";
+import type { StartupRecoveryPlan } from "./src/storage/startupRecovery";
 import type { KnowledgeEntityKind, KnowledgeReference, KnowledgeSuggestion } from "./src/knowledge/types";
 import { controller as productionController } from "./src/services/controller";
 import { createDispatchHistoryScenario } from "./src/dev/receiptScenario";
@@ -51,6 +53,7 @@ import { createKnowledgeScenario } from "./src/dev/knowledgeScenario";
 import { createReminderPreview } from "./src/dev/reminderPreview";
 import { createDeviceCalendarPreview } from "./src/dev/deviceCalendarPreview";
 import { createTranscriptionPreview } from "./src/dev/transcriptionPreview";
+import { createStartupRecoveryPreview } from "./src/dev/startupRecoveryPreview";
 import { SpeechTranscriptionError } from "./src/transcription/types";
 import { useAudioCapture } from "./src/audio/useAudioCapture";
 import type { AudioCapture } from "./src/audio/types";
@@ -80,6 +83,7 @@ import { ImportedKnowledgeReview } from "./src/ui/ImportedKnowledgeReview";
 import { ReminderReview } from "./src/ui/ReminderReview";
 import { RemindersSection } from "./src/ui/RemindersSection";
 import { DeviceCalendarsSection } from "./src/ui/DeviceCalendarsSection";
+import { StartupRecoveryScreen } from "./src/ui/StartupRecoveryScreen";
 import { TasksSection } from "./src/ui/TasksSection";
 import { IconButton, Button, Field } from "./src/ui/primitives";
 import { C, s } from "./src/ui/theme";
@@ -104,7 +108,8 @@ const isKnowledgeDemo = previewScenario === "knowledge";
 const isReminderDemo = previewScenario === "reminders";
 const isDeviceCalendarsDemo = previewScenario === "device-calendars";
 const isTranscriptionDemo = previewScenario === "transcription";
-const isIsolatedDemo = isDispatchHistoryDemo || isMailSyncDemo || isBackupImportDemo || isKnowledgeDemo || isReminderDemo || isDeviceCalendarsDemo || isTranscriptionDemo;
+const isStartupRecoveryDemo = previewScenario === "startup-recovery";
+const isIsolatedDemo = isDispatchHistoryDemo || isMailSyncDemo || isBackupImportDemo || isKnowledgeDemo || isReminderDemo || isDeviceCalendarsDemo || isTranscriptionDemo || isStartupRecoveryDemo;
 
 function useAppState(appController: AppController) {
   return useSyncExternalStore(
@@ -411,12 +416,17 @@ export default function App() {
   const [isolatedPreviewFailed, setIsolatedPreviewFailed] = useState(false);
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [startupReady, setStartupReady] = useState(false);
+  const [startupRecoveryStatus, setStartupRecoveryStatus] = useState<StartupRecoveryStatus | undefined>();
+  const [startupRecoveryPlan, setStartupRecoveryPlan] = useState<StartupRecoveryPlan | undefined>();
+  const [startupRecoveryBusy, setStartupRecoveryBusy] = useState(false);
+  const [startupRecoveryError, setStartupRecoveryError] = useState("");
   const reminderReviewRecord = reminderReviewId
     ? state.reminders.records.find((item) => item.id === reminderReviewId)
     : undefined;
   useProactiveClock(
     controller,
-    loading || isIsolatedDemo,
+    loading || !startupReady || isIsolatedDemo,
     state.proactive.lastEvaluation?.nextCheckAt,
   );
   const foregroundMailBusy = useRef(false);
@@ -456,8 +466,10 @@ export default function App() {
   useEffect(() => {
     let mounted = true;
     void (async () => {
+      let selected: AppController = productionController;
+      let loadStarted = false;
       try {
-        const selected = isDispatchHistoryDemo
+        selected = isDispatchHistoryDemo
           ? await createDispatchHistoryScenario()
           : isMailSyncDemo
             ? await createMailSyncScenario({ mockGeneration: true })
@@ -471,14 +483,31 @@ export default function App() {
                     ? await createDeviceCalendarPreview()
                     : isTranscriptionDemo
                       ? await createTranscriptionPreview()
+                    : isStartupRecoveryDemo
+                      ? createStartupRecoveryPreview()
             : productionController;
         if (!mounted) return;
         setController(selected);
+        loadStarted = true;
         await selected.load();
+        if (mounted) {
+          const recoveryStatus = await selected.getStartupRecoveryStatus();
+          setStartupRecoveryStatus(recoveryStatus);
+          setStartupReady(recoveryStatus.phase === "ready");
+        }
       } catch (e) {
         if (mounted) {
-          setNotice(messageOf(e));
-          if (isIsolatedDemo) setIsolatedPreviewFailed(true);
+          if (loadStarted && (!isIsolatedDemo || isStartupRecoveryDemo)) {
+            try {
+              const recoveryStatus = await selected.getStartupRecoveryStatus();
+              if (mounted) setStartupRecoveryStatus(recoveryStatus);
+            } catch {
+              if (mounted) setStartupRecoveryStatus({ phase: "unavailable" });
+            }
+          } else {
+            setNotice(messageOf(e));
+            if (isIsolatedDemo) setIsolatedPreviewFailed(true);
+          }
         }
       } finally {
         if (mounted) setLoading(false);
@@ -488,6 +517,89 @@ export default function App() {
       mounted = false;
     };
   }, []);
+
+  const refreshStartupRecoveryStatus = useCallback(async () => {
+    try {
+      const status = await controller.getStartupRecoveryStatus();
+      setStartupRecoveryStatus(status);
+      if (status.phase === "ready") {
+        setStartupReady(true);
+        setStartupRecoveryPlan(undefined);
+      }
+      return status;
+    } catch {
+      const status: StartupRecoveryStatus = { phase: "unavailable" };
+      setStartupRecoveryStatus(status);
+      return status;
+    }
+  }, [controller]);
+
+  const retryStartup = useCallback(async () => {
+    if (startupRecoveryBusy) return;
+    setStartupRecoveryBusy(true);
+    setStartupRecoveryError("");
+    try {
+      await controller.retryStartup();
+      await refreshStartupRecoveryStatus();
+    } catch {
+      await refreshStartupRecoveryStatus();
+      setStartupRecoveryError("Still could not open the saved data. You can try again.");
+    } finally {
+      setStartupRecoveryBusy(false);
+    }
+  }, [controller, refreshStartupRecoveryStatus, startupRecoveryBusy]);
+
+  const prepareStartupRecovery = useCallback(async () => {
+    if (startupRecoveryBusy) return;
+    setStartupRecoveryBusy(true);
+    setStartupRecoveryError("");
+    try {
+      const plan = await controller.prepareStartupRecovery();
+      setStartupRecoveryPlan(plan);
+      const status = await controller.getStartupRecoveryStatus();
+      setStartupRecoveryStatus(status);
+    } catch {
+      setStartupRecoveryPlan(undefined);
+      await refreshStartupRecoveryStatus();
+      setStartupRecoveryError("Could not prepare a recovery plan. No replacement was requested.");
+    } finally {
+      setStartupRecoveryBusy(false);
+    }
+  }, [controller, refreshStartupRecoveryStatus, startupRecoveryBusy]);
+
+  const commitStartupRecovery = useCallback(async () => {
+    if (startupRecoveryBusy || !startupRecoveryPlan) return;
+    setStartupRecoveryBusy(true);
+    setStartupRecoveryError("");
+    setStartupRecoveryStatus({ phase: "committing", inspection: startupRecoveryStatus?.inspection });
+    try {
+      await controller.commitStartupRecovery({ sessionId: startupRecoveryPlan.sessionId, planHash: startupRecoveryPlan.planHash });
+      setStartupRecoveryPlan(undefined);
+      await refreshStartupRecoveryStatus();
+    } catch {
+      const status = await refreshStartupRecoveryStatus();
+      if (status.phase !== "prepared") setStartupRecoveryPlan(undefined);
+      setStartupRecoveryError("Recovery could not be confirmed. Retry or cancel this review.");
+    } finally {
+      setStartupRecoveryBusy(false);
+    }
+  }, [controller, refreshStartupRecoveryStatus, startupRecoveryBusy, startupRecoveryPlan, startupRecoveryStatus?.inspection]);
+
+  const cancelStartupRecovery = useCallback(async () => {
+    if (startupRecoveryBusy) return;
+    setStartupRecoveryBusy(true);
+    setStartupRecoveryError("");
+    try {
+      await controller.cancelStartupRecovery();
+      setStartupRecoveryPlan(undefined);
+      await refreshStartupRecoveryStatus();
+    } catch {
+      await refreshStartupRecoveryStatus();
+      setStartupRecoveryError("The review could not be closed. Your saved data is unchanged.");
+    } finally {
+      setStartupRecoveryBusy(false);
+    }
+  }, [controller, refreshStartupRecoveryStatus, startupRecoveryBusy]);
 
   const notes = [...state.notes].sort((a, b) =>
     b.createdAt.localeCompare(a.createdAt),
@@ -615,6 +727,7 @@ export default function App() {
 
   useEffect(() => {
     if (
+      !startupReady ||
       !activeDetailNoteId ||
       !activeAnalysisFingerprint ||
       !analysisFreshnessKey
@@ -650,10 +763,12 @@ export default function App() {
     analysisFreshnessKey,
     analysisStatusRetry,
     controller,
+    startupReady,
   ]);
 
   useEffect(() => {
     if (
+      !startupReady ||
       !reviewProposalId ||
       !reviewProposalStatus ||
       reviewProposalRevision === undefined ||
@@ -707,6 +822,7 @@ export default function App() {
     reviewProposalStatus,
     reviewFreshnessRetry,
     controller,
+    startupReady,
   ]);
 
   useEffect(() => {
@@ -742,6 +858,7 @@ export default function App() {
 
   const run = useCallback(
     async <T,>(fn: () => Promise<T>): Promise<T | undefined> => {
+      if (!startupReady) return undefined;
       if (busyLock.current) return undefined;
       busyLock.current = true;
       setBusy(true);
@@ -755,7 +872,7 @@ export default function App() {
         setBusy(false);
       }
     },
-    [],
+    [startupReady],
   );
   const openReminder = (record: ReminderRecord) => {
     if (record.origin.kind === "proactive" && record.origin.deviceBinding) {
@@ -788,7 +905,7 @@ export default function App() {
   };
 
   useEffect(() => {
-    if (loading || isolatedPreviewFailed || (isIsolatedDemo && !isReminderDemo)) return;
+    if (!startupReady || loading || isolatedPreviewFailed || (isIsolatedDemo && !isReminderDemo)) return;
     const reconcile = () => { void controller.reconcileReminderAlerts().catch(() => undefined); };
     const initial = setTimeout(reconcile, 0);
     let wasActive = NativeAppState.currentState === "active";
@@ -809,9 +926,9 @@ export default function App() {
       removeWeb = () => document.removeEventListener("visibilitychange", onVisibility);
     }
     return () => { clearTimeout(initial); native.remove(); removeWeb?.(); };
-  }, [controller, isolatedPreviewFailed, loading]);
+  }, [controller, isolatedPreviewFailed, loading, startupReady]);
   const refreshForegroundMail = useCallback(async () => {
-    if (isIsolatedDemo || loading || foregroundMailBusy.current) return;
+    if (isIsolatedDemo || !startupReady || loading || foregroundMailBusy.current) return;
     foregroundMailBusy.current = true;
     try {
       await controller.refreshForegroundMail();
@@ -820,10 +937,10 @@ export default function App() {
     } finally {
       foregroundMailBusy.current = false;
     }
-  }, [controller, loading]);
+  }, [controller, loading, startupReady]);
 
   useEffect(() => {
-    if (loading || isIsolatedDemo) return;
+    if (!startupReady || loading || isIsolatedDemo) return;
     const initialRefresh = setTimeout(() => {
       void refreshForegroundMail();
     }, 0);
@@ -857,9 +974,9 @@ export default function App() {
       nativeSubscription.remove();
       removeWebListener?.();
     };
-  }, [loading, refreshForegroundMail]);
+  }, [loading, refreshForegroundMail, startupReady]);
   useEffect(() => {
-    if (loading || isIsolatedDemo) return;
+    if (!startupReady || loading || isIsolatedDemo) return;
     const checkPermission = () => {
       if (controller.getSnapshot().deviceCalendars.enabled) {
         void controller.checkDeviceCalendarAccess().catch(() => undefined);
@@ -887,7 +1004,7 @@ export default function App() {
       removeNative = () => native.remove();
     }
     return () => { clearTimeout(initial); removeNative?.(); removeWeb?.(); };
-  }, [controller, loading]);
+  }, [controller, loading, startupReady]);
   const openNote = (note: Note) => {
     setDetail(note);
     setTab("record");
@@ -938,6 +1055,7 @@ export default function App() {
   }, [audio, controller]);
   useEffect(() => {
     if (
+      !startupReady ||
       audio.status === "recording" &&
       audio.durationSeconds >= state.settings.maxAudioSeconds
     ) {
@@ -957,6 +1075,7 @@ export default function App() {
     state.settings.maxAudioSeconds,
     run,
     saveRecording,
+    startupReady,
   ]);
   const confirmCancel = () =>
     confirmAction(
@@ -1096,6 +1215,37 @@ export default function App() {
     );
   }
 
+  if (loading) {
+    return (
+      <SafeAreaProvider>
+        <SafeAreaView style={s.safe}>
+          <View style={[s.viewport, { alignItems: "center", justifyContent: "center", gap: 12 }]}>
+            <ActivityIndicator color={C.sage} />
+            <Text style={s.accountSub}>Opening your saved data…</Text>
+          </View>
+        </SafeAreaView>
+      </SafeAreaProvider>
+    );
+  }
+
+  if (!startupReady) {
+    return (
+      <StartupRecoveryScreen
+        phase={startupRecoveryStatus?.phase === "ready" ? "failed" : startupRecoveryStatus?.phase ?? "failed"}
+        inspection={startupRecoveryStatus?.inspection}
+        receipt={startupRecoveryStatus?.inspection?.pendingReceipt}
+        message={startupRecoveryError}
+        plan={startupRecoveryPlan}
+        busy={startupRecoveryBusy}
+        samplePreview={isStartupRecoveryDemo}
+        onRetry={() => void retryStartup()}
+        onPrepare={() => void prepareStartupRecovery()}
+        onCommit={() => void commitStartupRecovery()}
+        onCancel={cancelStartupRecovery}
+      />
+    );
+  }
+
   return (
     <SafeAreaProvider>
       <SafeAreaView style={s.safe}>
@@ -1126,6 +1276,8 @@ export default function App() {
                       ? "Sample device calendars · in-memory only · simulated native calls"
                       : isTranscriptionDemo
                         ? "Sample transcription · in-memory only · no API used"
+                      : isStartupRecoveryDemo
+                        ? "Sample recovery · in-memory only · no external access"
                         : "Sample knowledge · in-memory only · no external actions"}
               </Text>
             </View>
@@ -2480,8 +2632,11 @@ function LibraryScreen({
         label="Import a backup"
         tone="quiet"
         icon="cloud-download-outline"
-        disabled={busy || previewMode}
-        onPress={() => setImportOpen(true)}
+        disabled={busy || (previewMode && !sampleBackupMode)}
+        onPress={() => {
+          if (previewMode && !sampleBackupMode) return;
+          setImportOpen(true);
+        }}
       />
       <ImportedBackupsSection
         archives={importedBackups}
@@ -2803,10 +2958,10 @@ function SettingsScreen({
             </Text>
           </View>
         ) : null}
-        {state.dispatchRecordQuarantine.length ? (
+        {state.dispatchRecoveryStatus ? (
           <View style={s.analysisStale}>
             <Text style={s.analysisText}>
-              Action history needs recovery before sending.
+              {state.dispatchRecoveryStatus.message}
             </Text>
           </View>
         ) : null}
