@@ -3,8 +3,11 @@ import * as Crypto from 'expo-crypto';
 import { ConnectorClient, describeMessageWindowQuery, type MessageSummary, type OAuthTokenStore } from '../connectors';
 import { scopeGrantsCapability } from '../connectors/oauth';
 import type { PrivacyWorkspaceSession } from '../privacy/service';
+import type { CommittedMailAlertPage } from '../proactiveMailAlerts/types';
+import { committedMailAlertPageForWorkspace } from '../proactiveMailAlerts/workspace';
 import { MAIL_REFRESH_RUN_BUDGET_MS } from './backend.types';
 import type { BackgroundMailConnector, BackgroundMailRefreshEngineDependencies, BackgroundMailRefreshOutcome } from './mailRefresh.types';
+import { runBackgroundMailAlertPhase } from './mailAlerts';
 
 const STATE_WRITER = { kind: 'app_state' as const, namespace: 'state_database' as const };
 const PAGE_SIZE = 5 as const;
@@ -24,6 +27,17 @@ function record(value: unknown): value is Record<string, unknown> {
 function cloneState(value: AppState): AppState {
   return JSON.parse(JSON.stringify(value)) as AppState;
 }
+
+function cloneJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+type AlertPageSeed = Readonly<{
+  snapshot: Pick<AppState, 'accounts' | 'mailbox'>;
+  account: Account;
+  returnedIds: readonly string[];
+  checkedAt: string;
+}>;
 
 function validMailboxSnapshot(value: unknown): value is MailboxSnapshotMessage[] {
   if (!Array.isArray(value) || value.length > MAX_TOTAL_MAILBOX) return false;
@@ -122,6 +136,18 @@ export function createBackgroundMailRefreshEngine(dependencies: BackgroundMailRe
         if (!enabled) return fixedOutcome('skipped', 0, 0, 0, 0, 'disabled');
         if (raw.accounts.length > 200) return fixedOutcome('skipped', 0, 0, 0, 0, 'state_unavailable');
         if (!validMailboxSnapshot(raw.mailbox)) return fixedOutcome('skipped', 0, 0, 0, 0, 'state_unavailable');
+        const capturedBackgroundGeneration = Number(generation);
+        const committedAlertPages: CommittedMailAlertPage[] = [];
+        const alertPageSeeds: AlertPageSeed[] = [];
+        const runMailAlerts = async () => {
+          if (!dependencies.mailAlerts) return;
+          await runBackgroundMailAlertPhase({
+            store, privacy: dependencies.privacy, session, backend: dependencies.mailAlerts.backend,
+            notificationWriter: dependencies.mailAlerts.notificationWriter, pages: committedAlertPages,
+            capturedBackgroundGeneration, now, uuid: dependencies.uuid ?? defaultUuid, assertActive,
+            withStateOwnership, digest: dependencies.mailAlerts.digest, isHeadlessAccountEligible: verifiedAccount,
+          });
+        };
         const currentDate = now(); const currentMs = currentDate.getTime();
         if (!Number.isFinite(currentMs)) return fixedOutcome('skipped', 0, 0, 0, 0, 'state_unavailable');
         const timeMax = currentDate.toISOString(); const timeMin = new Date(currentMs - WINDOW_MS).toISOString();
@@ -147,7 +173,12 @@ export function createBackgroundMailRefreshEngine(dependencies: BackgroundMailRe
           } catch { skipped++; }
         }
         candidates.sort((left, right) => left.lastAttempt - right.lastAttempt || left.account.id.localeCompare(right.account.id));
-        if (!candidates.length) return fixedOutcome('skipped', 0, 0, 0, skipped, connectedReadAccounts > 0 && cooldownSkipped > 0 ? 'cooldown' : 'no_eligible_accounts');
+        if (!candidates.length) {
+          const outcome = fixedOutcome('skipped', 0, 0, 0, skipped,
+            connectedReadAccounts > 0 && cooldownSkipped > 0 ? 'cooldown' : 'no_eligible_accounts');
+          await runMailAlerts();
+          return outcome;
+        }
         const selected = candidates.slice(0, MAX_ACCOUNTS);
         skipped += candidates.length - selected.length;
         const reservation = cloneState(raw as AppState);
@@ -202,10 +233,18 @@ export function createBackgroundMailRefreshEngine(dependencies: BackgroundMailRe
               }
               returnedIds.add(id);
             }
+            // Freeze provider output before any further await. Neither a later SDK mutation nor
+            // a shared test adapter can widen the committed-page proof after validation.
+            const capturedItems = cloneJson(page.items);
+            const capturedReturnedIds = Object.freeze(capturedItems.map((item) => item.id));
+            const capturedUnavailableIds = cloneJson(page.unavailableIds);
+            const capturedPage = { ...page, items: capturedItems, unavailableIds: capturedUnavailableIds,
+              window: cloneJson(page.window) };
             await withStateOwnership(() => store.assertCurrent!());
             assertActive();
             const next = cloneState(reservation);
-            applyPage(next, candidate.account, page.items, page.unavailableIds, page, now().toISOString(), dependencies.uuid ?? defaultUuid);
+            const checkedAt = now().toISOString();
+            applyPage(next, candidate.account, capturedItems, capturedUnavailableIds, capturedPage, checkedAt, dependencies.uuid ?? defaultUuid);
             try {
               await withStateOwnership(async () => {
                 assertActive();
@@ -216,6 +255,27 @@ export function createBackgroundMailRefreshEngine(dependencies: BackgroundMailRe
             }
             Object.assign(reservation, next);
             completed++;
+            if (dependencies.mailAlerts && capturedReturnedIds.length > 0) {
+              try {
+                // Capture only the exact rows acknowledged by this page save. Hashing and policy
+                // evaluation are deferred until after the provider loop and mail outcome freeze.
+                const ids = new Set(capturedReturnedIds);
+                const accountKey = identityKey(candidate.account);
+                const exactRows = next.mailbox.filter((row) => row.accountId === candidate.account.id &&
+                  ids.has(row.providerMessageId) && row.connectionGeneration === (candidate.account.connectionGeneration ?? 0) &&
+                  row.verifiedIdentityKey === accountKey && !row.providerDeletedAt);
+                const proofAccounts = cloneJson(next.accounts);
+                const proofAccount = proofAccounts.find((row) => row.id === candidate.account.id);
+                if (proofAccount && exactRows.length > 0) {
+                  alertPageSeeds.push(Object.freeze({
+                    snapshot: Object.freeze({ accounts: proofAccounts, mailbox: cloneJson(exactRows) }),
+                    account: proofAccount,
+                    returnedIds: Object.freeze([...capturedReturnedIds]),
+                    checkedAt,
+                  }));
+                }
+              } catch { /* Optional proof capture cannot downgrade an acknowledged mail save. */ }
+            }
           } catch (error) {
             if (controller.signal.aborted || deadlineReached) {
               failed += 1;
@@ -228,16 +288,35 @@ export function createBackgroundMailRefreshEngine(dependencies: BackgroundMailRe
             failed++;
           }
         }
-        if (deadlineReached) return fixedOutcome('failed', attempted, completed, failed, skipped, 'deadline');
-        if (completed === selected.length) {
+        let mailOutcome: BackgroundMailRefreshOutcome;
+        if (deadlineReached) mailOutcome = fixedOutcome('failed', attempted, completed, failed, skipped, 'deadline');
+        else if (completed === selected.length) {
           const partial = selected.some((candidate) => {
             const head = reservation.syncStates[candidate.account.id]?.mailHead;
             return head?.status === 'partial';
           });
-          return fixedOutcome(partial ? 'partial' : 'refreshed', attempted, completed, failed, skipped);
+          mailOutcome = fixedOutcome(partial ? 'partial' : 'refreshed', attempted, completed, failed, skipped);
+        } else if (completed > 0) mailOutcome = fixedOutcome('partial', attempted, completed, failed, skipped);
+        else mailOutcome = fixedOutcome('failed', attempted, completed, failed || attempted, skipped, 'provider_unavailable');
+        if (dependencies.mailAlerts) {
+          for (const seed of alertPageSeeds) {
+            try {
+              assertActive();
+              const proof = await committedMailAlertPageForWorkspace(seed.snapshot, seed.account,
+                seed.returnedIds, seed.checkedAt, { now, digest: dependencies.mailAlerts.digest ?? ((text) => Crypto.digestStringAsync(
+                  Crypto.CryptoDigestAlgorithm.SHA256, text, { encoding: Crypto.CryptoEncoding.HEX })) });
+              assertActive();
+              if (proof) committedAlertPages.push(Object.freeze({ ...proof,
+                sources: Object.freeze(proof.sources.map((source) => Object.freeze({ ...source }))) }));
+            } catch {
+              if (controller.signal.aborted || deadlineReached) break;
+              // A page remains a successful mail refresh if optional alert proof fails.
+            }
+          }
         }
-        if (completed > 0) return fixedOutcome('partial', attempted, completed, failed, skipped);
-        return fixedOutcome('failed', attempted, completed, failed || attempted, skipped, 'provider_unavailable');
+        // Optional alert drainage does not alter the independently committed mail result.
+        await runMailAlerts();
+        return mailOutcome;
       } catch {
         if (deadlineReached || controller.signal.aborted) return fixedOutcome('failed', attempted, completed, failed, skipped, 'deadline');
         return fixedOutcome('failed', attempted, completed, failed, skipped, 'state_unavailable');

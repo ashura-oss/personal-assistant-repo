@@ -1,6 +1,8 @@
 import type { OAuthTokenStore } from '../connectors';
 import { type PrivacyService, type PrivacyWorkspaceSession } from '../privacy/service';
 import { createPrivacyResourceBoundary } from '../privacy/resourceBoundary';
+import { bindExistingWorkspaceWriter } from '../privacy/workspaceStorage';
+import type { MailAlertNotificationBackend } from '../services/mailAlertNotificationBackend';
 import type { StateStore } from '../storage/contracts';
 import { createBackgroundMailRefreshEngine } from './mailRefresh';
 import type { BackgroundMailRefreshEngineDependencies, BackgroundMailRefreshOutcome } from './mailRefresh.types';
@@ -9,6 +11,7 @@ export type BackgroundMailRefreshRuntimeDependencies = Readonly<{
   privacy: PrivacyService;
   createStateStore: () => StateStore;
   tokenStore: OAuthTokenStore;
+  mailAlertBackend?: MailAlertNotificationBackend;
   createEngine?: (dependencies: BackgroundMailRefreshEngineDependencies) => { run(signal?: AbortSignal): Promise<BackgroundMailRefreshOutcome> };
 }>;
 
@@ -31,12 +34,24 @@ export function createBackgroundMailRefreshRuntime(dependencies: BackgroundMailR
       if (current.epoch !== session.epoch || current.phase !== 'ready' || current.activeWriterCount !== 0 ||
           current.pendingCleanupCount !== 0 || current.failedCleanupCount !== 0) return false;
       const resources = createPrivacyResourceBoundary({ privacy: dependencies.privacy, session });
+      let mailAlertBackend = dependencies.mailAlertBackend;
+      if (!mailAlertBackend) {
+        const alerts = await import('../services/mailAlertNotificationBackend');
+        mailAlertBackend = alerts.createMailAlertNotificationBackend();
+      }
       const engine = createEngine({
         privacy: dependencies.privacy,
         session,
         createStateStore: dependencies.createStateStore,
         tokenStore: resources.oauthTokenStore(dependencies.tokenStore),
         withProviderOwnership: resources.withProviderOwnership,
+        mailAlerts: {
+          backend: mailAlertBackend,
+          notificationWriter: {
+            withNotificationWriter: (store, work) => resources.withMailAlertNotificationWriter((scope) =>
+              work(scope, bindExistingWorkspaceWriter(store, dependencies.privacy, session, scope))),
+          },
+        },
       });
       const outcome = await engine.run(signal);
       // Safe skips (disabled, cooldown, no eligible accounts) complete without inviting retries.

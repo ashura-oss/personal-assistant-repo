@@ -64,7 +64,7 @@ function candidateValid(value: unknown, rules: Map<string, SavedProactiveRule>):
   return true;
 }
 
-function validateProactive(value: unknown): ProactiveState {
+export function validateProactiveState(value: unknown): ProactiveState {
   if (!object(value) || value.schemaVersion !== 1 || !Array.isArray(value.rules) || value.rules.length > MAX_RULES ||
       !Array.isArray(value.candidates) || value.candidates.length > MAX_CANDIDATES ||
       !Array.isArray(value.dismissals) || value.dismissals.length > MAX_SUPPRESSIONS ||
@@ -145,7 +145,7 @@ export function normalizeProactiveData(
     return { state: { ...emptyProactiveState(), integrityError: PROACTIVE_INTEGRITY_ERROR }, quarantine };
   }
   if (raw === undefined) return { state: emptyProactiveState() };
-  try { return { state: validateProactive(raw) }; }
+  try { return { state: validateProactiveState(raw) }; }
   catch {
     return {
       state: { ...emptyProactiveState(), integrityError: PROACTIVE_INTEGRITY_ERROR },

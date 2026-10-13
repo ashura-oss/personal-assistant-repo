@@ -49,14 +49,15 @@ import { buildLocalSourceSet, buildOfflinePreview, createSourceCatalog, type Ass
 import { isMailTextFresh, normalizeMailText, utf8Bytes, validSelectedMailTextSnapshot, MAX_SELECTED_MAIL_TEXT_BYTES, MAIL_TEXT_FRESHNESS_MS } from '../mailText';
 import { appendDispatchReconciliation, createDispatchRecord, recordDispatchOutcome, validateDispatchRecord } from '../dispatch';
 import type { DispatchOutcome, DispatchRecord, DispatchReconciliation } from '../dispatch';
-import { evaluateProactive, normalizeProactiveOffsetTimestamp, type ProactiveTrigger, type QuietHours } from '../proactive';
+import { evaluateProactive, type ProactiveTrigger, type QuietHours } from '../proactive';
 import { computeProactiveNextCheckAt } from '../proactive/boundaries';
-import { buildProactiveMailSources, buildProactiveSources, proactiveStableValue, type ProactiveSourceHashMemo } from '../proactive/adapters';
+import { buildProactiveSources, proactiveStableValue, type ProactiveSourceHashMemo } from '../proactive/adapters';
 import { emptyProactiveState, normalizeProactiveData, PROACTIVE_INTEGRITY_ERROR, uncertainOnLoad, type ProactiveQuarantine } from '../proactive/state';
 import { emptyProactiveMailAlertState, validateProactiveMailAlertState } from '../proactiveMailAlerts/state';
 import { createProactiveMailAlertConsent, planProactiveMailAlerts, replaceProactiveMailAlertConsent, revokeProactiveMailAlertConsent } from '../proactiveMailAlerts/planner';
 import { executeRequestedMailAlertCancellations, executeReservedMailAlertAttempts, type ProactiveMailAlertEngineDependencies } from '../proactiveMailAlerts/engine';
-import type { CommittedMailAlertPage, MailAlertVerifiedAccount, ProactiveMailAlertReceipt, ProactiveMailSource } from '../proactiveMailAlerts/types';
+import type { CommittedMailAlertPage, ProactiveMailAlertReceipt } from '../proactiveMailAlerts/types';
+import { committedMailAlertPageForWorkspace, isMailAlertAttemptCurrentForWorkspace, mailAlertAccountsForWorkspace } from '../proactiveMailAlerts/workspace';
 import { createMailAlertNotificationBackend, isMatchingProactiveMailAlertNotification, type MailAlertNotificationBackend } from './mailAlertNotificationBackend';
 import { canonicalMailReplySource, createMailReplySource, defaultReplyRecipients, replyReferences, validateMailReplySource, validateReplyBinding } from '../mailReply';
 import { emptyKnowledgeState, getKnowledgeEntity, knowledgeContextSources, validateKnowledgeState, validateKnowledgeSuggestion } from '../knowledge';
@@ -452,12 +453,6 @@ function identityKey(account: Account): string {
   if (!identity?.providerNamespace || !identity.clientId || !identity.subject ||
       (account.provider === 'microsoft' && !identity.resourceUserId)) throw new Error('Verified account identity is incomplete.');
   return [identity.providerNamespace, identity.clientId, identity.subject, identity.resourceUserId ?? ''].join(':');
-}
-
-function sourceReceivedAtForAlert(source: { receivedAt?: string }): number {
-  if (typeof source.receivedAt !== 'string') return Number.NaN;
-  try { return Date.parse(normalizeProactiveOffsetTimestamp(source.receivedAt)); }
-  catch { return Number.NaN; }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -1430,22 +1425,6 @@ export class AppControllerImpl implements AppController {
     });
   }
 
-  private mailAlertAccounts(state: AppState): MailAlertVerifiedAccount[] {
-    return state.accounts.flatMap((account) => {
-      const namespace = account.identity?.providerNamespace;
-      if ((namespace !== 'google' && namespace !== 'microsoft') || account.provider !== namespace) return [];
-      return [{
-        accountId: account.id,
-        providerNamespace: namespace,
-        identityKey: identityKey(account),
-        connectionGeneration: account.connectionGeneration ?? 0,
-        connected: account.connected,
-        authStatus: account.authStatus,
-        canReadMail: Boolean(account.capabilities?.includes('mail.read')),
-      }];
-    });
-  }
-
   private revokeStaleMailAlertConsent(state: AppState): boolean {
     if (this.proactiveMailAlertQuarantine.length) return false;
     const before = stableJson(state.proactiveMailAlerts);
@@ -1453,7 +1432,7 @@ export class AppControllerImpl implements AppController {
       const plan = planProactiveMailAlerts({
         state: state.proactiveMailAlerts,
         rules: state.proactive.rules,
-        accounts: this.mailAlertAccounts(state),
+        accounts: mailAlertAccountsForWorkspace(state),
         pages: [],
         previousCandidates: state.proactive.candidates.map((entry) => entry.candidate),
         dismissedCandidateIds: state.proactive.dismissals.map((item) => item.candidateId),
@@ -1493,73 +1472,16 @@ export class AppControllerImpl implements AppController {
     }
   }
 
-  private async alertProjectionForWorkspace(state: AppState, pages: readonly CommittedMailAlertPage[], receipt: ProactiveMailAlertReceipt): Promise<boolean> {
-    try {
-      const alertState = validateProactiveMailAlertState(state.proactiveMailAlerts);
-      const consent = alertState.consents.find((item) => item.id === receipt.consentId);
-      const rule = state.proactive.rules.find((item) => item.id === receipt.ruleId);
-      const account = this.mailAlertAccounts(state).find((item) => item.accountId === receipt.accountId);
-      const page = pages.find((item) => item.accountId === receipt.accountId);
-      if (!consent || consent.status !== 'active' || consent.ruleId !== receipt.ruleId || consent.ruleVersion !== receipt.ruleVersion ||
-          consent.ruleRevision !== receipt.ruleRevision || consent.timeZone !== receipt.timeZone || !rule || !rule.enabled ||
-          state.settings.timezone !== receipt.timeZone || consent.activatedAt !== receipt.consentActivatedAt ||
-          rule.version !== receipt.ruleVersion || rule.revision !== receipt.ruleRevision || !account || !account.connected ||
-          account.authStatus !== 'connected' || !account.canReadMail || account.identityKey !== receipt.identityKey ||
-          account.connectionGeneration !== receipt.connectionGeneration || !page || page.identityKey !== receipt.identityKey ||
-          (rule.accountIds.length > 0 && !rule.accountIds.includes(receipt.accountId)) ||
-          !consent.accounts.some((binding) => binding.accountId === receipt.accountId && binding.identityKey === receipt.identityKey &&
-            binding.connectionGeneration === receipt.connectionGeneration) ||
-          page.connectionGeneration !== receipt.connectionGeneration || Date.parse(page.checkedAt) > Date.now() ||
-          Date.now() - Date.parse(page.checkedAt) > 15 * 60_000) return false;
-      const source = page.sources.find((item) => item.kind === 'mail' && item.accountId === receipt.accountId &&
-        item.providerId === receipt.providerMessageId && item.sourceVersion === receipt.sourceVersion && item.availability === 'available' && item.freshness === 'fresh');
-      if (!source || source.kind !== 'mail' || sourceReceivedAtForAlert(source) <= Date.parse(consent.activatedAt)) return false;
-      const currentRows = state.mailbox.filter((row) => row.accountId === account.accountId &&
-        row.providerMessageId === receipt.providerMessageId && row.verifiedIdentityKey === account.identityKey &&
-        row.connectionGeneration === account.connectionGeneration && !row.providerDeletedAt);
-      const currentSources = await buildProactiveMailSources(state.accounts.filter((item) => item.id === account.accountId),
-        currentRows, Date.now(), new Map(),
-        (value) => Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, value, { encoding: Crypto.CryptoEncoding.HEX }));
-      const currentSource = currentSources.find((item): item is ProactiveMailSource => item.kind === 'mail' &&
-        item.accountId === receipt.accountId && item.providerId === receipt.providerMessageId);
-      if (!currentSource || currentSource.availability !== 'available' || currentSource.freshness !== 'fresh' ||
-          currentSource.sourceVersion !== receipt.sourceVersion || sourceReceivedAtForAlert(currentSource) !== Date.parse(receipt.receivedAt)) return false;
-      const evaluation = evaluateProactive({
-        nowUtc: now(), timeZone: consent.timeZone, rules: [rule], sources: [currentSource],
-        previousCandidates: state.proactive.candidates.map((entry) => entry.candidate),
-        dismissedCandidateIds: state.proactive.dismissals.map((item) => item.candidateId),
-        snoozes: state.proactive.snoozes,
-        sourceSnapshotComplete: false,
-      });
-      return evaluation.activeCandidates.some((candidate) => candidate.ruleId === rule.id && candidate.sourceId === currentSource.sourceId && candidate.sourceVersion === currentSource.sourceVersion);
-    } catch { return false; }
+  private mailAlertPolicyOptions() {
+    return { now: () => new Date(), digest: (value: string) => Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, value, { encoding: Crypto.CryptoEncoding.HEX }) };
   }
-
-  private async committedMailAlertPage(account: Account, items: readonly MessageSummary[], checkedAt: string): Promise<CommittedMailAlertPage | undefined> {
-    const ids = new Set(items.flatMap((item) => typeof item.id === 'string' && item.id ? [item.id] : []));
-    if (!ids.size || !account.identity?.providerNamespace || !Number.isFinite(Date.parse(checkedAt))) return undefined;
-    const currentAccount = this.state.accounts.find((item) => item.id === account.id);
-    if (!currentAccount || identityKey(currentAccount) !== identityKey(account) ||
-        (currentAccount.connectionGeneration ?? 0) !== (account.connectionGeneration ?? 0)) return undefined;
-    const exactRows = this.state.mailbox.filter((row) => row.accountId === account.id && ids.has(row.providerMessageId) &&
-      row.connectionGeneration === (account.connectionGeneration ?? 0) && row.verifiedIdentityKey === identityKey(account) && !row.providerDeletedAt);
-    const sources = await buildProactiveMailSources([currentAccount], exactRows, Date.now(), this.proactiveSourceHashMemo,
-      (value) => Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, value, { encoding: Crypto.CryptoEncoding.HEX }));
-    const mailSources = sources.filter((source): source is ProactiveMailSource => source.kind === 'mail' && source.accountId === account.id && ids.has(source.providerId));
-    return {
-      accountId: account.id, providerNamespace: account.identity.providerNamespace,
-      identityKey: identityKey(account), connectionGeneration: account.connectionGeneration ?? 0,
-      checkedAt, sources: mailSources,
-    };
-  }
-
   private async commitMailAlertPlan(pages: readonly CommittedMailAlertPage[]): Promise<void> {
     if (this.proactiveMailAlertQuarantine.length) return;
     const draft = clone(this.state);
     const plan = planProactiveMailAlerts({
       state: draft.proactiveMailAlerts,
       rules: draft.proactive.rules,
-      accounts: this.mailAlertAccounts(draft),
+      accounts: mailAlertAccountsForWorkspace(draft),
       pages,
       previousCandidates: draft.proactive.candidates.map((entry) => entry.candidate),
       dismissedCandidateIds: draft.proactive.dismissals.map((item) => item.candidateId),
@@ -1596,7 +1518,7 @@ export class AppControllerImpl implements AppController {
           return writer((scope, store) => work(scope, this.mailAlertScopedStore(scope, store)));
         },
       },
-      isAttemptCurrent: (state, receipt) => this.alertProjectionForWorkspace(state, pages, receipt),
+      isAttemptCurrent: (state, receipt) => isMailAlertAttemptCurrentForWorkspace(state, pages, receipt, this.mailAlertPolicyOptions()),
     };
   }
 
@@ -1609,7 +1531,7 @@ export class AppControllerImpl implements AppController {
       const rule = this.state.proactive.rules.find((item) => item.id === input.ruleId);
       if (!rule || rule.version !== input.expectedRuleVersion || rule.revision !== input.expectedRuleRevision) throw new Error('This saved rule changed. Review it again before enabling alerts.');
       if (input.timeZone !== this.state.settings.timezone) throw new Error('The selected time zone changed. Review the current settings before enabling alerts.');
-      const verified = this.mailAlertAccounts(this.state);
+      const verified = mailAlertAccountsForWorkspace(this.state);
       const selected = input.accountIds.map((id) => {
         const account = verified.find((item) => item.accountId === id);
         if (!account || !account.connected || account.authStatus !== 'connected' || !account.canReadMail) throw new Error('Every selected account must be currently connected with verified mailbox access.');
@@ -1627,7 +1549,7 @@ export class AppControllerImpl implements AppController {
         id: consent.id, rule, timeZone: consent.timeZone, activatedAt, accounts: selected,
       });
       await this.commitMailAlertDraft(draft);
-      const plan = planProactiveMailAlerts({ state: draft.proactiveMailAlerts, rules: draft.proactive.rules, accounts: this.mailAlertAccounts(draft), pages: [],
+      const plan = planProactiveMailAlerts({ state: draft.proactiveMailAlerts, rules: draft.proactive.rules, accounts: mailAlertAccountsForWorkspace(draft), pages: [],
         previousCandidates: draft.proactive.candidates.map((entry) => entry.candidate), dismissedCandidateIds: draft.proactive.dismissals.map((item) => item.candidateId),
         snoozes: draft.proactive.snoozes, now: activatedAt, currentTimeZone: draft.settings.timezone, uuid: newId });
       if (plan.cancellationReceipts.length) {
@@ -1643,7 +1565,7 @@ export class AppControllerImpl implements AppController {
       const draft = clone(this.state);
       draft.proactiveMailAlerts = revokeProactiveMailAlertConsent(draft.proactiveMailAlerts, ruleId, now());
       await this.commitMailAlertDraft(draft);
-      const plan = planProactiveMailAlerts({ state: draft.proactiveMailAlerts, rules: draft.proactive.rules, accounts: this.mailAlertAccounts(draft), pages: [],
+      const plan = planProactiveMailAlerts({ state: draft.proactiveMailAlerts, rules: draft.proactive.rules, accounts: mailAlertAccountsForWorkspace(draft), pages: [],
         previousCandidates: draft.proactive.candidates.map((entry) => entry.candidate), dismissedCandidateIds: draft.proactive.dismissals.map((item) => item.candidateId),
         snoozes: draft.proactive.snoozes, now: now(), currentTimeZone: draft.settings.timezone, uuid: newId });
       if (plan.cancellationReceipts.length) await executeRequestedMailAlertCancellations(this.mailAlertEngineDependencies([]),
@@ -5237,7 +5159,7 @@ export class AppControllerImpl implements AppController {
           !['attempting', 'submitted'].includes(receipt.observed)) return false;
       const consent = this.state.proactiveMailAlerts.consents.find((item) => item.id === receipt.consentId);
       const rule = this.state.proactive.rules.find((item) => item.id === receipt.ruleId);
-      const account = this.mailAlertAccounts(this.state).find((item) => item.accountId === receipt.accountId);
+      const account = mailAlertAccountsForWorkspace(this.state).find((item) => item.accountId === receipt.accountId);
       return Boolean(consent && consent.status === 'active' && consent.ruleId === receipt.ruleId &&
         consent.ruleVersion === receipt.ruleVersion && consent.ruleRevision === receipt.ruleRevision &&
         consent.activatedAt === receipt.consentActivatedAt && consent.timeZone === receipt.timeZone &&
@@ -6778,7 +6700,8 @@ export class AppControllerImpl implements AppController {
         onPage: async (items, cursor, _pagesRead, metadata) => {
           const checkedAt = await persistPage(items, cursor, metadata);
           if (lane !== 'head' || !committedPages || !account) return;
-          const pageProof = await this.committedMailAlertPage(immutableAccount, items, checkedAt);
+          const pageProof = await committedMailAlertPageForWorkspace(this.state, immutableAccount,
+            items.flatMap((item) => typeof item.id === 'string' ? [item.id] : []), checkedAt, this.mailAlertPolicyOptions());
           if (!pageProof) return;
           const prior = committedPages.get(accountId);
           committedPages.set(accountId, prior ? {

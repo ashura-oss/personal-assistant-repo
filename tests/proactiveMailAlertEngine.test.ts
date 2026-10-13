@@ -230,6 +230,86 @@ describe('proactive mail alert engine', () => {
     expect(env.queueSlot.publishScoped).not.toHaveBeenCalled();
   });
 
+  it('rechecks a headless cancellation gate after asynchronous privacy and fresh-state reads', async () => {
+    const events: string[] = [];
+    const env = environment(workspace(receipt('cancel')), events);
+    let releasePrivacy!: () => void;
+    let signalPrivacy!: () => void;
+    const privacyStarted = new Promise<void>((resolve) => { signalPrivacy = resolve; });
+    const privacyGate = new Promise<void>((resolve) => { releasePrivacy = resolve; });
+    let releaseLoad!: () => void;
+    let signalLoad!: () => void;
+    const loadStarted = new Promise<void>((resolve) => { signalLoad = resolve; });
+    const loadGate = new Promise<void>((resolve) => { releaseLoad = resolve; });
+    env.dependencies.getPrivacyStatus = vi.fn(async () => {
+      signalPrivacy();
+      await privacyGate;
+      return privacyStatus();
+    });
+    env.store.load = vi.fn(async () => {
+      signalLoad();
+      await loadGate;
+      return env.read();
+    });
+    let gateOpen = true;
+    env.dependencies.isCancellationGateOpen = vi.fn(() => gateOpen);
+
+    const pending = executeRequestedMailAlertCancellations(env.dependencies, env.queueSlot, [receipt('cancel')]);
+    await privacyStarted;
+    releasePrivacy();
+    await loadStarted;
+    gateOpen = false;
+    releaseLoad();
+
+    const result = await pending;
+    expect(result.cancellationPending).toBe(1);
+    expect(env.dependencies.isCancellationGateOpen).toHaveBeenCalledOnce();
+    expect(env.backend.cancel).toHaveBeenCalledOnce();
+    expect(events).not.toContain('native-list');
+    expect(env.store.save).not.toHaveBeenCalled();
+    expect(env.read().proactiveMailAlerts.receipts[0]).toMatchObject({
+      desired: 'cancel', observed: 'cancellation_pending', cancellation: { result: 'requested' },
+    });
+  });
+
+  it('keeps late-revoke compensation pending when the final cancellation gate closes', async () => {
+    const events: string[] = [];
+    const env = environment(workspace(), events);
+    let releaseNative!: () => void;
+    let signalStarted!: () => void;
+    const nativeStarted = new Promise<void>((resolve) => { signalStarted = resolve; });
+    const nativeGate = new Promise<void>((resolve) => { releaseNative = resolve; });
+    env.backend.present = vi.fn(async (_input, before) => {
+      if (!await before()) return 'not_admitted';
+      signalStarted();
+      await nativeGate;
+      return 'submitted';
+    });
+    env.backend.cancel = vi.fn(async (_input, before) => {
+      events.push('native-cancel-admission');
+      if (!await before()) return 'not_admitted';
+      events.push('native-cancel-list');
+      return 'absent';
+    });
+    env.dependencies.isCancellationGateOpen = vi.fn(() => false);
+
+    const pending = executeReservedMailAlertAttempts(env.dependencies, env.queueSlot, [receipt()]);
+    await nativeStarted;
+    const revoked = { ...receipt('cancel'), observed: 'cancellation_pending' as const,
+      cancellation: { requestedAt: '2026-10-13T18:00:30.000Z', result: 'requested' as const } };
+    env.setCurrent(workspace(revoked));
+    releaseNative();
+
+    const result = await pending;
+    expect(result.submitted).toBe(1);
+    expect(result.cleanupPending).toBe(1);
+    expect(env.dependencies.isCancellationGateOpen).toHaveBeenCalledOnce();
+    expect(events).not.toContain('native-cancel-list');
+    expect(env.read().proactiveMailAlerts.receipts[0]).toMatchObject({
+      desired: 'cancel', observed: 'cancellation_pending', cancellation: { result: 'requested' },
+    });
+  });
+
   it('leaves the durable reservation conservative if scoped postflight CAS fails', async () => {
     const events: string[] = [];
     const env = environment(workspace(), events, { saveFails: true });

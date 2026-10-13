@@ -40,6 +40,8 @@ export interface ProactiveMailAlertEngineDependencies<State extends MailAlertWor
   isAttemptCurrent(state: State, receipt: ProactiveMailAlertReceipt): boolean | Promise<boolean>;
   /** Synchronous final gate for quarantine/disposal/refresh-required state after all async checks. */
   isDispatchGateOpen(): boolean;
+  /** Optional synchronous headless-run gate, evaluated after fresh cancellation reads and before native list access. */
+  isCancellationGateOpen?: () => boolean;
   now?: () => Date;
 }
 
@@ -137,6 +139,11 @@ function solePrivacyWriter(status: PrivacyPublicStatus, sessionEpoch: string): b
   return ownedPrivacyWriter(status, sessionEpoch) && status.activeWriterCount === 1;
 }
 
+function cancellationGateOpen<State extends MailAlertWorkspaceState>(dependencies: ProactiveMailAlertEngineDependencies<State>): boolean {
+  try { return dependencies.isCancellationGateOpen?.() ?? true; }
+  catch { return false; }
+}
+
 /**
  * Executes only the newly reserved `attempting` receipts from the just-committed plan. This
  * method must be called inside the controller's already-held transactionQueue slot.
@@ -199,8 +206,10 @@ export async function executeReservedMailAlertAttempts<State extends MailAlertWo
                   if (!solePrivacyWriter(await dependencies.getPrivacyStatus(), dependencies.sessionEpoch)) return false;
                   const cancellationState = await readFresh(store);
                   const currentReceipt = cancellationState && findReceipt(cancellationState.proactiveMailAlerts, planned.id);
-                  return Boolean(currentReceipt?.desired === 'cancel' && currentReceipt.cancellation?.requestedAt === latest.cancellation?.requestedAt &&
-                    receiptIdentityMatch(currentReceipt, latest));
+                  if (!currentReceipt || currentReceipt.desired !== 'cancel' || currentReceipt.cancellation?.requestedAt !== latest.cancellation?.requestedAt ||
+                      !receiptIdentityMatch(currentReceipt, latest)) return false;
+                  await store.assertCurrent();
+                  return cancellationGateOpen(dependencies);
                 } catch { return false; }
               },
             ); } catch { compensatedCancellation = 'cancellation_unknown'; }
@@ -274,7 +283,9 @@ export async function executeRequestedMailAlertCancellations<State extends MailA
             if (!solePrivacyWriter(await dependencies.getPrivacyStatus(), dependencies.sessionEpoch)) return false;
             const fresh = await readFresh(store);
             const current = fresh && findReceipt(fresh.proactiveMailAlerts, planned.id);
-            return Boolean(current && current.desired === 'cancel' && canonicalReceiptMatch(current, planned));
+            if (!current || current.desired !== 'cancel' || !canonicalReceiptMatch(current, planned)) return false;
+            await store.assertCurrent();
+            return cancellationGateOpen(dependencies);
           } catch { return false; }
         };
         const cancellationOutcome = await dependencies.backend.cancel({ installationId: planned.installationId, receiptId: planned.id }, beforeCancel);

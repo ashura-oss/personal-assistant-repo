@@ -2,13 +2,17 @@ import { DatabaseSync } from 'node:sqlite';
 import { describe, expect, it, vi } from 'vitest';
 import type { Account, AppState } from '../src/core';
 import { createBackgroundMailRefreshEngine } from '../src/background/mailRefresh';
-import type { BackgroundMailConnector } from '../src/background/mailRefresh.types';
+import type { BackgroundMailAlertWriter, BackgroundMailConnector } from '../src/background/mailRefresh.types';
 import { ConnectorClient } from '../src/connectors';
 import type { OAuthTokenStore } from '../src/connectors';
 import type { PrivacyService, PrivacyWorkspaceSession } from '../src/privacy/service';
 import type { SQLiteExecutor, SQLiteTransactionDatabase } from '../src/storage/platformStorage';
 import { SQLiteStateStore } from '../src/storage/platformStorage';
 import type { StateStore } from '../src/storage/contracts';
+import { emptyProactiveMailAlertState, createProactiveMailAlertConsent, validateProactiveMailAlertState } from '../src/proactiveMailAlerts';
+import type { MailAlertNotificationBackend } from '../src/services/mailAlertNotificationBackend';
+import type { ExistingWorkspaceWriterStore } from '../src/privacy/workspaceStorage';
+import type { PrivacyWriterScope } from '../src/privacy/types';
 
 const session: PrivacyWorkspaceSession = Object.freeze({ epoch: '00000000-0000-4000-8000-000000000001', runtimeId: '00000000-0000-4000-8000-000000000002' });
 const tokenRef = '00000000-0000-4000-8000-000000000003';
@@ -65,9 +69,12 @@ function sqliteMemory() {
 
 function privacy(phase: 'ready' | 'writer_active' | 'erasing' | 'complete' = 'ready') {
   let active = phase === 'writer_active' ? 1 : 0;
-  const withWriter = vi.fn(async (_epoch: string, _descriptor: unknown, work: (lease: unknown) => Promise<unknown>) => work({ id: randomUuid() }));
+  const withWriter = vi.fn(async (_epoch: string, _descriptor: unknown, work: (lease: unknown) => Promise<unknown>) => {
+    active++;
+    try { return await work({ id: randomUuid() }); } finally { active--; }
+  });
   const service = {
-    async getStatus() { return { phase, epoch: session.epoch, activeWriterCount: active, pendingCleanupCount: 0, failedCleanupCount: 0, limits: {}, coverage: 'tracked_with_legacy_limits' }; },
+    async getStatus() { return { phase: active > 0 ? 'writer_active' : phase, epoch: session.epoch, activeWriterCount: active, pendingCleanupCount: 0, failedCleanupCount: 0, limits: {}, coverage: 'tracked_with_legacy_limits' }; },
     async assertWorkspaceEpoch(epoch: string) { if (epoch !== session.epoch) throw new Error('stale_epoch'); },
     withWriter,
     setActive(value: number) { active = value; },
@@ -75,9 +82,40 @@ function privacy(phase: 'ready' | 'writer_active' | 'erasing' | 'complete' = 're
   return service;
 }
 
-function page(accountValue: Account) {
+function stateWithMailAlerts(): AppState {
+  const initial = appState();
+  const accountValue = initial.accounts[0];
+  const binding = { accountId: accountValue.id, providerNamespace: 'google' as const,
+    identityKey: 'google:google-client:stable-subject:', connectionGeneration: accountValue.connectionGeneration ?? 0,
+    connected: true, authStatus: 'connected' as const, canReadMail: true };
+  const rule = { id: 'background-alert-rule', name: 'Build updates', createdAt: '2026-10-01T00:00:00.000Z', updatedAt: '2026-10-01T00:00:00.000Z',
+    version: 1, revision: 1, enabled: true, accountIds: [accountValue.id],
+    trigger: { type: 'keyword' as const, keywords: ['build'] } };
+  const consent = createProactiveMailAlertConsent({ id: '30000000-0000-4000-8000-000000000001', rule,
+    timeZone: 'UTC', activatedAt: '2026-10-12T00:00:00.000Z', accounts: [binding] });
+  return { ...initial,
+    proactive: { schemaVersion: 1, rules: [rule], candidates: [], dismissals: [], snoozes: [] },
+    proactiveMailAlerts: validateProactiveMailAlertState({ ...emptyProactiveMailAlertState('30000000-0000-4000-8000-000000000002'),
+      revision: 1, consents: [consent] }),
+  } as unknown as AppState;
+}
+
+function alertBackend(onPresent?: () => Promise<void>): MailAlertNotificationBackend {
+  return {
+    platform: 'mock',
+    async getPermission() { return 'authorized'; },
+    async requestPermission() { throw new Error('automatic flow must not request permission'); },
+    async present(_input, beforePresent) {
+      if (!(await beforePresent())) return 'not_admitted';
+      await onPresent?.();
+      return 'submitted';
+    },
+    async cancel(_input, beforeCancel) { return (await beforeCancel()) ? 'absent' : 'not_admitted'; },
+  };
+}
+
+function page(accountValue: Account, window = { from: '2026-09-29T00:00:00.000Z', to: '2026-10-13T00:00:00.000Z' }) {
   const identity = accountValue.identity!;
-  const window = { from: '2026-09-29T00:00:00.000Z', to: '2026-10-13T00:00:00.000Z' };
   const queryFingerprint = JSON.stringify(['mail-window-v1', accountValue.provider, identity.providerNamespace, identity.clientId, identity.subject, '', window.from, window.to, 5]);
   return { items: [{ id: 'provider-message-1', idFormat: 'gmail' as const, subject: 'Hello', receivedAt: '2026-10-12T12:00:00.000Z', isRead: false }],
     nextCursor: undefined, partial: false, window, queryFingerprint, unavailableIds: [] };
@@ -90,6 +128,412 @@ function deferred<T>() {
 }
 
 describe('background mail refresh engine', () => {
+  it('uses only a durably committed exact page and reserves before presenting one privacy-minimal alert', async () => {
+    const db = sqliteMemory();
+    try {
+      const initial = stateWithMailAlerts();
+      const seed = new SQLiteStateStore({ database: Promise.resolve(db), randomId: randomUuid });
+      await seed.load(); await seed.save(initial);
+      const reader = new SQLiteStateStore({ database: Promise.resolve(db), randomId: randomUuid });
+      const privacyService = privacy();
+      let presentCount = 0;
+      const backend = alertBackend(async () => {
+        presentCount++;
+        const current = await reader.load();
+        expect(current?.proactiveMailAlerts.receipts).toHaveLength(1);
+        expect(current?.proactiveMailAlerts.receipts[0]).toMatchObject({ desired: 'notify', observed: 'attempting' });
+      });
+      const notificationWriter: BackgroundMailAlertWriter = {
+        async withNotificationWriter<T>(store: StateStore, work: (scope: PrivacyWriterScope, scopedStore: ExistingWorkspaceWriterStore) => Promise<T>): Promise<T> {
+          return await privacyService.withWriter(session.epoch,
+            { kind: 'notification', namespace: 'notifications' }, async () => work({} as never, {
+              load: () => store.load(), save: (value, options) => store.save(value, options),
+              assertCurrent: () => store.assertCurrent?.() ?? Promise.reject(new Error('no store generation fence')),
+            })) as T;
+        },
+      };
+      const engine = createBackgroundMailRefreshEngine({
+        privacy: privacyService, session,
+        createStateStore: () => new SQLiteStateStore({ database: Promise.resolve(db), randomId: randomUuid }),
+        tokenStore: { async get() { return null; }, async set() {} },
+        withProviderOwnership: async (actual) => actual(),
+        mailAlerts: { backend, notificationWriter },
+        connectorFactory: () => ({ async syncMessageWindow(selected) {
+          return { ...page(selected), items: [{ id: 'provider-message-1', idFormat: 'gmail', subject: 'Build status',
+            receivedAt: '2026-10-12T12:00:00.000Z', isRead: false }] };
+        } }),
+        now: () => new Date('2026-10-13T00:00:00.000Z'), uuid: randomUuid,
+      });
+      await expect(engine.run()).resolves.toMatchObject({ status: 'refreshed', completed: 1 });
+      expect(presentCount).toBe(1);
+      const final = await reader.load();
+      expect(final?.proactiveMailAlerts.receipts[0]).toMatchObject({ observed: 'submitted', providerMessageId: 'provider-message-1' });
+    } finally { db.close(); }
+  });
+
+  it('applies the two-attempt alert limit across all committed account pages in one run', async () => {
+    const db = sqliteMemory();
+    try {
+      const initial = stateWithMailAlerts();
+      const second = account('google-2');
+      initial.accounts.push(second);
+      const rule = initial.proactive.rules[0] as AppState['proactive']['rules'][number] & { version: number };
+      rule.accountIds = [];
+      const bindings = initial.accounts.map((value) => ({ accountId: value.id, providerNamespace: 'google' as const,
+        identityKey: 'google:google-client:stable-subject:', connectionGeneration: value.connectionGeneration ?? 0,
+        connected: true, authStatus: 'connected' as const, canReadMail: true }));
+      const consent = createProactiveMailAlertConsent({ id: '30000000-0000-4000-8000-000000000004', rule,
+        timeZone: 'UTC', activatedAt: '2026-10-12T00:00:00.000Z', accounts: bindings });
+      initial.proactiveMailAlerts = validateProactiveMailAlertState({ ...emptyProactiveMailAlertState('30000000-0000-4000-8000-000000000002'),
+        revision: 1, consents: [consent] });
+      const seed = new SQLiteStateStore({ database: Promise.resolve(db), randomId: randomUuid }); await seed.load(); await seed.save(initial);
+      let presentations = 0; let permissionRequests = 0; let pages = 0;
+      const backend: MailAlertNotificationBackend = {
+        platform: 'mock', async getPermission() { return 'authorized'; },
+        async requestPermission() { permissionRequests++; throw new Error('background must not prompt'); },
+        async present(_input, beforePresent) { if (!(await beforePresent())) return 'not_admitted'; presentations++; return 'submitted'; },
+        async cancel(_input, beforeCancel) { return (await beforeCancel()) ? 'absent' : 'not_admitted'; },
+      };
+      const privacyService = privacy();
+      const notificationWriter: BackgroundMailAlertWriter = {
+        async withNotificationWriter<T>(store: StateStore, work: (scope: PrivacyWriterScope, scopedStore: ExistingWorkspaceWriterStore) => Promise<T>): Promise<T> {
+          return await privacyService.withWriter(session.epoch, { kind: 'notification', namespace: 'notifications' }, async () => work({} as never, {
+            load: () => store.load(), save: (value, options) => store.save(value, options),
+            assertCurrent: () => store.assertCurrent?.() ?? Promise.reject(new Error('no store generation fence')),
+          })) as T;
+        },
+      };
+      const engine = createBackgroundMailRefreshEngine({ privacy: privacyService, session,
+        createStateStore: () => new SQLiteStateStore({ database: Promise.resolve(db), randomId: randomUuid }),
+        tokenStore: { async get() { return null; }, async set() {} }, withProviderOwnership: async (actual) => actual(),
+        mailAlerts: { backend, notificationWriter },
+        connectorFactory: () => ({ async syncMessageWindow(selected, options) {
+          pages++;
+          return { ...page(selected, { from: options.timeMin, to: options.timeMax }), items: [1, 2, 3].map((n) => ({
+            id: `${selected.id}-message-${n}`, idFormat: 'gmail' as const, subject: 'Build project update',
+            receivedAt: `2026-10-12T${String(10 + n).padStart(2, '0')}:00:00.000Z`, isRead: false,
+          })) };
+        } }), now: () => new Date('2026-10-13T00:00:00.000Z'), uuid: randomUuid,
+      });
+      await expect(engine.run()).resolves.toMatchObject({ status: 'refreshed', attempted: 2, completed: 2 });
+      expect(pages).toBe(2);
+      expect(presentations).toBe(2);
+      expect(permissionRequests).toBe(0);
+      const final = await new SQLiteStateStore({ database: Promise.resolve(db), randomId: randomUuid }).load();
+      expect(final?.proactiveMailAlerts.receipts).toHaveLength(2);
+      expect(final?.proactiveMailAlerts.receipts.every((receipt) => receipt.observed === 'submitted')).toBe(true);
+    } finally { db.close(); }
+  });
+
+  it('keeps a lost-ack alert reservation consumed and never resends it on a later run', async () => {
+    const db = sqliteMemory();
+    try {
+      const seed = new SQLiteStateStore({ database: Promise.resolve(db), randomId: randomUuid }); await seed.load(); await seed.save(stateWithMailAlerts());
+      let loseReservationAck = true; let presentations = 0; let permissionRequests = 0;
+      const createStateStore = () => {
+        const store = new SQLiteStateStore({ database: Promise.resolve(db), randomId: randomUuid });
+        const save = store.save.bind(store);
+        store.save = async (state, options) => {
+          const alert = (state as AppState).proactiveMailAlerts;
+          const isReservation = alert?.receipts.some((receipt) => receipt.observed === 'attempting');
+          await save(state, options);
+          if (loseReservationAck && isReservation) {
+            loseReservationAck = false;
+            throw new Error('lost acknowledgement after reservation commit');
+          }
+        };
+        return store;
+      };
+      const privacyService = privacy();
+      const backend: MailAlertNotificationBackend = {
+        platform: 'mock', async getPermission() { return 'authorized'; },
+        async requestPermission() { permissionRequests++; throw new Error('background must not prompt'); },
+        async present(_input, beforePresent) { if (!(await beforePresent())) return 'not_admitted'; presentations++; return 'submitted'; },
+        async cancel(_input, beforeCancel) { return (await beforeCancel()) ? 'absent' : 'not_admitted'; },
+      };
+      const notificationWriter: BackgroundMailAlertWriter = {
+        async withNotificationWriter<T>(store: StateStore, work: (scope: PrivacyWriterScope, scopedStore: ExistingWorkspaceWriterStore) => Promise<T>): Promise<T> {
+          return await privacyService.withWriter(session.epoch, { kind: 'notification', namespace: 'notifications' }, async () => work({} as never, {
+            load: () => store.load(), save: (value, options) => store.save(value, options),
+            assertCurrent: () => store.assertCurrent?.() ?? Promise.reject(new Error('no store generation fence')),
+          })) as T;
+        },
+      };
+      let nowMs = Date.parse('2026-10-13T00:00:00.000Z');
+      const engine = createBackgroundMailRefreshEngine({ privacy: privacyService, session, createStateStore,
+        tokenStore: { async get() { return null; }, async set() {} }, withProviderOwnership: async (actual) => actual(),
+        mailAlerts: { backend, notificationWriter },
+        connectorFactory: () => ({ async syncMessageWindow(selected, options) {
+          return { ...page(selected, { from: options.timeMin, to: options.timeMax }), items: [{ id: 'provider-message-1', idFormat: 'gmail',
+            subject: 'Build status', receivedAt: '2026-10-12T12:00:00.000Z', isRead: false }] };
+        } }), now: () => new Date(nowMs), uuid: randomUuid,
+      });
+      await expect(engine.run()).resolves.toMatchObject({ status: 'refreshed', completed: 1 });
+      expect(loseReservationAck).toBe(false);
+      expect(presentations).toBe(0);
+      let final = await new SQLiteStateStore({ database: Promise.resolve(db), randomId: randomUuid }).load();
+      expect(final?.proactiveMailAlerts.receipts).toHaveLength(1);
+      expect(final?.proactiveMailAlerts.receipts[0]).toMatchObject({ desired: 'notify', observed: 'attempting', providerMessageId: 'provider-message-1' });
+
+      nowMs += 16 * 60_000;
+      await expect(engine.run()).resolves.toMatchObject({ status: 'refreshed', completed: 1 });
+      expect(presentations).toBe(0);
+      expect(permissionRequests).toBe(0);
+      final = await new SQLiteStateStore({ database: Promise.resolve(db), randomId: randomUuid }).load();
+      expect(final?.proactiveMailAlerts.receipts).toHaveLength(1);
+      expect(final?.proactiveMailAlerts.receipts[0]).toMatchObject({ desired: 'notify', observed: 'attempting', providerMessageId: 'provider-message-1' });
+    } finally { db.close(); }
+  });
+
+  it('rechecks the run gate after a queued notification writer is granted', async () => {
+    const db = sqliteMemory();
+    try {
+      const seed = new SQLiteStateStore({ database: Promise.resolve(db), randomId: randomUuid });
+      await seed.load(); await seed.save(stateWithMailAlerts());
+      const enteredWriter = deferred<void>(); const releaseWriter = deferred<void>();
+      let presentations = 0;
+      const notificationWriter: BackgroundMailAlertWriter = {
+        async withNotificationWriter<T>(store: StateStore, work: (scope: PrivacyWriterScope, scopedStore: ExistingWorkspaceWriterStore) => Promise<T>): Promise<T> {
+          enteredWriter.resolve();
+          await releaseWriter.promise;
+          return await work({} as never, {
+            load: () => store.load(), save: (value, options) => store.save(value, options),
+            assertCurrent: () => store.assertCurrent?.() ?? Promise.reject(new Error('no store generation fence')),
+          });
+        },
+      };
+      const engine = createBackgroundMailRefreshEngine({ privacy: privacy(), session,
+        createStateStore: () => new SQLiteStateStore({ database: Promise.resolve(db), randomId: randomUuid }),
+        tokenStore: { async get() { return null; }, async set() {} }, withProviderOwnership: async (actual) => actual(), deadlineMs: 1_000,
+        mailAlerts: { backend: alertBackend(async () => { presentations++; }), notificationWriter },
+        connectorFactory: () => ({ async syncMessageWindow(selected) { return { ...page(selected), items: [{ id: 'provider-message-1',
+          idFormat: 'gmail', subject: 'Build status', receivedAt: '2026-10-12T12:00:00.000Z', isRead: false }] }; } }),
+        now: () => new Date('2026-10-13T00:00:00.000Z'), uuid: randomUuid,
+      });
+      const run = engine.run();
+      await enteredWriter.promise;
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
+      releaseWriter.resolve();
+      await expect(run).resolves.toMatchObject({ status: 'refreshed', completed: 1 });
+      expect(presentations).toBe(0);
+      const final = await new SQLiteStateStore({ database: Promise.resolve(db), randomId: randomUuid }).load();
+      expect(final?.proactiveMailAlerts.receipts).toHaveLength(1);
+      expect(final?.proactiveMailAlerts.receipts[0].observed).toBe('attempting');
+    } finally { db.close(); }
+  });
+
+  it('rejects final admission when opt-out changes during asynchronous source verification', async () => {
+    const db = sqliteMemory();
+    try {
+      const seed = new SQLiteStateStore({ database: Promise.resolve(db), randomId: randomUuid });
+      await seed.load(); await seed.save(stateWithMailAlerts());
+      const privacyService = privacy();
+      const verifying = deferred<void>(); const continueDigest = deferred<string>();
+      let digestCalls = 0; let nativeSchedules = 0;
+      const backend: MailAlertNotificationBackend = {
+        platform: 'mock', async getPermission() { return 'authorized'; }, async requestPermission() { throw new Error('no prompt'); },
+        async present(_input, beforePresent) {
+          if (!(await beforePresent())) return 'not_admitted';
+          nativeSchedules++;
+          return 'submitted';
+        }, async cancel(_input, beforeCancel) { return (await beforeCancel()) ? 'absent' : 'not_admitted'; },
+      };
+      const notificationWriter: BackgroundMailAlertWriter = {
+        async withNotificationWriter<T>(store: StateStore, work: (scope: PrivacyWriterScope, scopedStore: ExistingWorkspaceWriterStore) => Promise<T>): Promise<T> {
+          return await privacyService.withWriter(session.epoch, { kind: 'notification', namespace: 'notifications' }, async () => work({} as never, {
+            load: () => store.load(), save: (value, options) => store.save(value, options),
+            assertCurrent: () => store.assertCurrent?.() ?? Promise.reject(new Error('no store generation fence')),
+          })) as T;
+        },
+      };
+      const engine = createBackgroundMailRefreshEngine({ privacy: privacyService, session,
+        createStateStore: () => new SQLiteStateStore({ database: Promise.resolve(db), randomId: randomUuid }),
+        tokenStore: { async get() { return null; }, async set() {} }, withProviderOwnership: async (actual) => actual(),
+        mailAlerts: { backend, notificationWriter, digest: async (text) => {
+          digestCalls++;
+          if (digestCalls === 2) { verifying.resolve(); return continueDigest.promise; }
+          return `digest-${digestCalls}-${text.length}`;
+        } },
+        connectorFactory: () => ({ async syncMessageWindow(selected) { return { ...page(selected), items: [{ id: 'provider-message-1',
+          idFormat: 'gmail', subject: 'Build status', receivedAt: '2026-10-12T12:00:00.000Z', isRead: false }] }; } }),
+        now: () => new Date('2026-10-13T00:00:00.000Z'), uuid: randomUuid,
+      });
+      const run = engine.run();
+      await verifying.promise;
+      const uiStore = new SQLiteStateStore({ database: Promise.resolve(db), randomId: randomUuid });
+      const current = await uiStore.load() as AppState;
+      current.settings.backgroundMailRefreshEnabled = false;
+      current.settings.backgroundRefreshGeneration = 4;
+      await uiStore.save(current);
+      continueDigest.resolve('verified-but-stale');
+      await expect(run).resolves.toMatchObject({ status: 'refreshed', completed: 1 });
+      expect(nativeSchedules).toBe(0);
+      const final = await new SQLiteStateStore({ database: Promise.resolve(db), randomId: randomUuid }).load();
+      expect(final?.settings.backgroundMailRefreshEnabled).toBe(false);
+      expect(final?.proactiveMailAlerts.receipts).toHaveLength(1);
+      expect(final?.proactiveMailAlerts.receipts[0].observed).toBe('attempting');
+    } finally { db.close(); }
+  });
+
+  it('keeps the successful mail result when optional page hashing finishes after the run deadline', async () => {
+    const db = sqliteMemory();
+    try {
+      const seed = new SQLiteStateStore({ database: Promise.resolve(db), randomId: randomUuid });
+      await seed.load(); await seed.save(stateWithMailAlerts());
+      const hashing = deferred<void>(); const finishHash = deferred<string>();
+      let providerCalls = 0; let writerCalls = 0;
+      const privacyService = privacy();
+      const backend = alertBackend();
+      const notificationWriter: BackgroundMailAlertWriter = {
+        async withNotificationWriter<T>(store: StateStore, work: (scope: PrivacyWriterScope, scopedStore: ExistingWorkspaceWriterStore) => Promise<T>): Promise<T> {
+          writerCalls++;
+          return await privacyService.withWriter(session.epoch, { kind: 'notification', namespace: 'notifications' }, async () => work({} as never, {
+            load: () => store.load(), save: (value, options) => store.save(value, options),
+            assertCurrent: () => store.assertCurrent?.() ?? Promise.reject(new Error('no store generation fence')),
+          })) as T;
+        },
+      };
+      const engine = createBackgroundMailRefreshEngine({ privacy: privacyService, session,
+        createStateStore: () => new SQLiteStateStore({ database: Promise.resolve(db), randomId: randomUuid }),
+        tokenStore: { async get() { return null; }, async set() {} }, withProviderOwnership: async (actual) => actual(), deadlineMs: 1_000,
+        mailAlerts: { backend, notificationWriter, digest: async () => { hashing.resolve(); return finishHash.promise; } },
+        connectorFactory: () => ({ async syncMessageWindow(selected) {
+          providerCalls++;
+          return { ...page(selected), items: [{ id: 'provider-message-1', idFormat: 'gmail', subject: 'Build status',
+            receivedAt: '2026-10-12T12:00:00.000Z', isRead: false }] };
+        } }), now: () => new Date('2026-10-13T00:00:00.000Z'), uuid: randomUuid,
+      });
+      const run = engine.run();
+      await hashing.promise;
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
+      finishHash.resolve('late-but-unused');
+      await expect(run).resolves.toMatchObject({ status: 'refreshed', completed: 1 });
+      expect(providerCalls).toBe(1);
+      expect(writerCalls).toBe(0);
+      const final = await new SQLiteStateStore({ database: Promise.resolve(db), randomId: randomUuid }).load();
+      expect(final?.mailbox.map((row) => row.providerMessageId)).toEqual(['provider-message-1']);
+      expect(final?.proactiveMailAlerts.receipts).toEqual([]);
+    } finally { db.close(); }
+  });
+
+  it('does not widen a committed-page proof when provider-owned page data mutates during save', async () => {
+    const db = sqliteMemory();
+    try {
+      const initial = stateWithMailAlerts();
+      initial.mailbox = [{ id: 'cached-build', accountId: initial.accounts[0].id, providerMessageId: 'cached-build',
+        identityKey: 'google:google-client:stable-subject::cached-build', verifiedIdentityKey: 'google:google-client:stable-subject:',
+        connectionGeneration: 4, idFormat: 'gmail', subject: 'Build status from cache', receivedAt: '2026-10-12T11:00:00.000Z',
+        isRead: false, observedAt: '2026-10-12T12:00:00.000Z' }];
+      const seed = new SQLiteStateStore({ database: Promise.resolve(db), randomId: randomUuid }); await seed.load(); await seed.save(initial);
+      const rawPage = page(initial.accounts[0]);
+      rawPage.items = [{ id: 'unrelated-provider-message', idFormat: 'gmail', subject: 'General note',
+        receivedAt: '2026-10-12T12:00:00.000Z', isRead: false }];
+      let mutated = false; let presentations = 0;
+      const privacyService = privacy();
+      const storeFactory = () => {
+        const store = new SQLiteStateStore({ database: Promise.resolve(db), randomId: randomUuid });
+        const save = store.save.bind(store);
+        store.save = async (state, options) => {
+          if ((state as AppState).mailbox.some((row) => row.providerMessageId === 'unrelated-provider-message') && !mutated) {
+            mutated = true;
+            rawPage.items.push({ id: 'cached-build', idFormat: 'gmail', subject: 'Build status from cache',
+              receivedAt: '2026-10-12T11:00:00.000Z', isRead: false });
+          }
+          await save(state, options);
+        };
+        return store;
+      };
+      const notificationWriter: BackgroundMailAlertWriter = {
+        async withNotificationWriter<T>(store: StateStore, work: (scope: PrivacyWriterScope, scopedStore: ExistingWorkspaceWriterStore) => Promise<T>): Promise<T> {
+          return await privacyService.withWriter(session.epoch, { kind: 'notification', namespace: 'notifications' }, async () => work({} as never, {
+            load: () => store.load(), save: (value, options) => store.save(value, options),
+            assertCurrent: () => store.assertCurrent?.() ?? Promise.reject(new Error('no store generation fence')),
+          })) as T;
+        },
+      };
+      const engine = createBackgroundMailRefreshEngine({ privacy: privacyService, session, createStateStore: storeFactory,
+        tokenStore: { async get() { return null; }, async set() {} }, withProviderOwnership: async (actual) => actual(),
+        mailAlerts: { backend: alertBackend(async () => { presentations++; }), notificationWriter },
+        connectorFactory: () => ({ async syncMessageWindow() { return rawPage; } }),
+        now: () => new Date('2026-10-13T00:00:00.000Z'), uuid: randomUuid,
+      });
+      await expect(engine.run()).resolves.toMatchObject({ status: 'refreshed', completed: 1 });
+      expect(mutated).toBe(true);
+      expect(presentations).toBe(0);
+      const final = await new SQLiteStateStore({ database: Promise.resolve(db), randomId: randomUuid }).load();
+      expect(final?.proactiveMailAlerts.receipts).toEqual([]);
+    } finally { db.close(); }
+  });
+
+  it.each(['missing-token-ref', 'missing-read-scope', 'malformed-capabilities', 'duplicate-id'] as const)(
+    'does not use an ineligible persisted account for a mail alert (%s)', async (failure) => {
+      const db = sqliteMemory();
+      try {
+        const initial = stateWithMailAlerts();
+        if (failure === 'missing-token-ref') initial.accounts[0].tokenRef = undefined as never;
+        if (failure === 'missing-read-scope') initial.accounts[0].grantedScopes = ['openid'];
+        if (failure === 'malformed-capabilities') initial.accounts[0].capabilities = 'mail.read' as never;
+        if (failure === 'duplicate-id') initial.accounts.push({ ...account(initial.accounts[0].id),
+          identity: { providerNamespace: 'google', clientId: 'other-client', subject: 'other-subject' } });
+        const seed = new SQLiteStateStore({ database: Promise.resolve(db), randomId: randomUuid }); await seed.load(); await seed.save(initial);
+        let requests = 0; let presentations = 0;
+        const engine = createBackgroundMailRefreshEngine({ privacy: privacy(), session,
+          createStateStore: () => new SQLiteStateStore({ database: Promise.resolve(db), randomId: randomUuid }),
+          tokenStore: { async get() { return null; }, async set() {} }, withProviderOwnership: async (actual) => actual(),
+          mailAlerts: { backend: alertBackend(async () => { presentations++; }), notificationWriter: {
+            async withNotificationWriter<T>(store: StateStore, work: (scope: PrivacyWriterScope, scopedStore: ExistingWorkspaceWriterStore) => Promise<T>): Promise<T> {
+              return await privacy().withWriter(session.epoch, { kind: 'notification', namespace: 'notifications' }, async () => work({} as never, {
+                load: () => store.load(), save: (value, options) => store.save(value, options),
+                assertCurrent: () => store.assertCurrent?.() ?? Promise.reject(new Error('no store generation fence')),
+              })) as T;
+            },
+          } },
+          connectorFactory: () => ({ async syncMessageWindow(selected) { requests++; return { ...page(selected), items: [{ id: 'provider-message-1',
+            idFormat: 'gmail', subject: 'Build status', receivedAt: '2026-10-12T12:00:00.000Z', isRead: false }] }; } }),
+          now: () => new Date('2026-10-13T00:00:00.000Z'), uuid: randomUuid,
+        });
+        await engine.run();
+        expect(requests).toBe(0);
+        expect(presentations).toBe(0);
+        const final = await new SQLiteStateStore({ database: Promise.resolve(db), randomId: randomUuid }).load();
+        expect(final?.proactiveMailAlerts.receipts).toEqual([]);
+        expect(final?.accounts).toEqual(initial.accounts);
+      } finally { db.close(); }
+    });
+
+  it('preserves and rejects unknown nested __proto__ ledger metadata without presenting', async () => {
+    const db = sqliteMemory();
+    try {
+      const initial = stateWithMailAlerts();
+      const rawLedger = JSON.parse(JSON.stringify(initial.proactiveMailAlerts)) as Record<string, unknown>;
+      rawLedger.extension = JSON.parse('{"__proto__":{"marker":"must-stay-private"}}');
+      initial.proactiveMailAlerts = rawLedger as never;
+      const seed = new SQLiteStateStore({ database: Promise.resolve(db), randomId: randomUuid }); await seed.load(); await seed.save(initial);
+      let presentations = 0;
+      const engine = createBackgroundMailRefreshEngine({ privacy: privacy(), session,
+        createStateStore: () => new SQLiteStateStore({ database: Promise.resolve(db), randomId: randomUuid }),
+        tokenStore: { async get() { return null; }, async set() {} }, withProviderOwnership: async (actual) => actual(),
+        mailAlerts: { backend: alertBackend(async () => { presentations++; }), notificationWriter: {
+          async withNotificationWriter<T>(store: StateStore, work: (scope: PrivacyWriterScope, scopedStore: ExistingWorkspaceWriterStore) => Promise<T>): Promise<T> {
+            return await privacy().withWriter(session.epoch, { kind: 'notification', namespace: 'notifications' }, async () => work({} as never, {
+              load: () => store.load(), save: (value, options) => store.save(value, options),
+              assertCurrent: () => store.assertCurrent?.() ?? Promise.reject(new Error('no store generation fence')),
+            })) as T;
+          },
+        } },
+        connectorFactory: () => ({ async syncMessageWindow(selected) { return { ...page(selected), items: [{ id: 'provider-message-1',
+          idFormat: 'gmail', subject: 'Build status', receivedAt: '2026-10-12T12:00:00.000Z', isRead: false }] }; } }),
+        now: () => new Date('2026-10-13T00:00:00.000Z'), uuid: randomUuid,
+      });
+      await engine.run();
+      expect(presentations).toBe(0);
+      const persisted = await new SQLiteStateStore({ database: Promise.resolve(db), randomId: randomUuid }).load();
+      const serialized = JSON.stringify(persisted?.proactiveMailAlerts);
+      expect(serialized).toContain('"__proto__"');
+      expect(serialized).toContain('must-stay-private');
+    } finally { db.close(); }
+  });
+
   it('persists the attempt before a single metadata page and preserves unrelated raw fields', async () => {
     const db = sqliteMemory();
     try {

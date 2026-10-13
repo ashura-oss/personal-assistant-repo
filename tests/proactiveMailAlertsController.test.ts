@@ -1,8 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { AppState } from '../src/core';
 import { createProactiveMailAlertConsent, planProactiveMailAlerts } from '../src/proactiveMailAlerts/planner';
-import { buildProactiveMailSources } from '../src/proactive/adapters';
-import type { CommittedMailAlertPage } from '../src/proactiveMailAlerts/types';
+import { committedMailAlertPageForWorkspace, isMailAlertAttemptCurrentForWorkspace } from '../src/proactiveMailAlerts/workspace';
 import { isMatchingProactiveMailAlertNotification, proactiveMailAlertNotificationContent } from '../src/services/mailAlertNotificationBackend';
 import { AppControllerImpl } from '../src/services/controller';
 import type { ControllerIntegrationDependencies } from '../src/services/controller';
@@ -345,6 +344,11 @@ describe('proactive mail-alert controller state', () => {
       verifiedIdentityKey: accountIdentityKey, connectionGeneration: 4, idFormat: 'gmail', subject: 'Project update',
       senderEmail: 'sam@example.test', receivedAt, isRead: false, observedAt: checkedAt,
     });
+    state.mailbox.push({
+      id: 'mail-local-2', accountId: account.id, providerMessageId: 'not-in-returned-page', identityKey: accountIdentityKey,
+      verifiedIdentityKey: accountIdentityKey, connectionGeneration: 4, idFormat: 'gmail', subject: 'Cached but not returned',
+      senderEmail: 'other@example.test', receivedAt, isRead: false, observedAt: checkedAt,
+    });
     const rule = {
       id: 'project-alert-rule', version: 1, revision: 1, name: 'Project updates', enabled: true,
       accountIds: [], trigger: { type: 'keyword' as const, keywords: ['project'] },
@@ -364,11 +368,15 @@ describe('proactive mail-alert controller state', () => {
       const hash = await crypto.subtle.digest('SHA-256', bytes);
       return [...new Uint8Array(hash)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
     };
-    const sources = await buildProactiveMailSources([account], [state.mailbox[0]], now, new Map(), digest);
-    const page: CommittedMailAlertPage = {
-      accountId: account.id, providerNamespace: 'google', identityKey: accountIdentityKey,
-      connectionGeneration: 4, checkedAt, sources: sources.filter((source): source is import('../src/proactive').ProactiveMailSource => source.kind === 'mail'),
-    };
+    const page = await committedMailAlertPageForWorkspace(state, account, ['provider-message-1'], checkedAt, {
+      now: () => new Date(), digest,
+    });
+    expect(page).toBeDefined();
+    if (!page) throw new Error('Expected exact committed mail page proof.');
+    expect(page.sources.map((source) => source.providerId)).toEqual(['provider-message-1']);
+    await expect(committedMailAlertPageForWorkspace(state, account, ['bad\nprovider-id'], checkedAt, {
+      now: () => new Date(), digest,
+    })).resolves.toBeUndefined();
     const plan = planProactiveMailAlerts({
       state: state.proactiveMailAlerts, rules: [rule], accounts: [{ accountId: account.id,
         identityKey: accountIdentityKey, connectionGeneration: 4, providerNamespace: 'google', connected: true,
@@ -378,22 +386,38 @@ describe('proactive mail-alert controller state', () => {
     });
     expect(plan.newAttempts).toHaveLength(1);
     state.proactiveMailAlerts = plan.nextState;
-    const check = (app as unknown as { alertProjectionForWorkspace(state: AppState, pages: readonly CommittedMailAlertPage[], receipt: typeof plan.newAttempts[number]): Promise<boolean> })
-      .alertProjectionForWorkspace.bind(app);
+    const check = (candidate: AppState) => isMailAlertAttemptCurrentForWorkspace(candidate, [page], plan.newAttempts[0], {
+      now: () => new Date(), digest,
+    });
 
-    expect(await check(state, [page], plan.newAttempts[0])).toBe(true);
+    expect(await check(state)).toBe(true);
+    let admissionClock = now;
+    const clockAdvancingDigest = async (value: string) => {
+      const result = await digest(value);
+      admissionClock = now + 16 * 60_000;
+      return result;
+    };
+    expect(await isMailAlertAttemptCurrentForWorkspace(state, [page], plan.newAttempts[0], {
+      now: () => new Date(admissionClock), digest: clockAdvancingDigest,
+    })).toBe(false);
     const changedState = structuredClone(state);
     changedState.mailbox[0].subject = 'A different project subject';
-    expect(await check(changedState, [page], plan.newAttempts[0])).toBe(false);
+    expect(await check(changedState)).toBe(false);
     const changedZone = structuredClone(state);
     changedZone.settings.timezone = state.settings.timezone === 'UTC' ? 'Europe/Paris' : 'UTC';
-    expect(await check(changedZone, [page], plan.newAttempts[0])).toBe(false);
+    expect(await check(changedZone)).toBe(false);
     const changedConsentBinding = structuredClone(state);
     changedConsentBinding.proactiveMailAlerts.consents[0].accounts = [];
-    expect(await check(changedConsentBinding, [page], plan.newAttempts[0])).toBe(false);
+    expect(await check(changedConsentBinding)).toBe(false);
     const changedRuleScope = structuredClone(state);
     changedRuleScope.proactive.rules[0].accountIds = ['another-account'];
-    expect(await check(changedRuleScope, [page], plan.newAttempts[0])).toBe(false);
+    expect(await check(changedRuleScope)).toBe(false);
+    const quarantinedProactive = structuredClone(state);
+    quarantinedProactive.proactive.integrityError = 'Saved proactive data failed validation. Local candidate generation is paused.';
+    expect(await check(quarantinedProactive)).toBe(false);
+    const quarantinedMailAlert = structuredClone(state) as AppState & { proactiveMailAlertQuarantine?: unknown[] };
+    quarantinedMailAlert.proactiveMailAlertQuarantine = [{ held: true }];
+    expect(await check(quarantinedMailAlert)).toBe(false);
 
     (app as unknown as { state: AppState }).state = state;
     const content = proactiveMailAlertNotificationContent({ installationId: plan.newAttempts[0].installationId, receiptId: plan.newAttempts[0].id });

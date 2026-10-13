@@ -1,6 +1,9 @@
 import type { OAuthTokenStore, MessageWindowSyncResult } from '../connectors';
 import type { PrivacyService, PrivacyWorkspaceSession } from '../privacy/service';
 import type { StateStore } from '../storage/contracts';
+import type { PrivacyWriterScope } from '../privacy/types';
+import type { MailAlertNotificationBackend } from '../services/mailAlertNotificationBackend';
+import type { ExistingWorkspaceWriterStore } from '../privacy/workspaceStorage';
 
 export type BackgroundMailRefreshOutcome = Readonly<{
   status: 'refreshed' | 'partial' | 'skipped' | 'failed';
@@ -22,6 +25,13 @@ export interface BackgroundMailConnector {
   }): Promise<MessageWindowSyncResult>;
 }
 
+export interface BackgroundMailAlertWriter {
+  withNotificationWriter<T>(
+    store: StateStore,
+    work: (scope: PrivacyWriterScope, scopedStore: ExistingWorkspaceWriterStore) => Promise<T>,
+  ): Promise<T>;
+}
+
 export type BackgroundMailRefreshEngineDependencies = Readonly<{
   privacy: Pick<PrivacyService, 'getStatus' | 'assertWorkspaceEpoch' | 'withWriter'>;
   session: PrivacyWorkspaceSession;
@@ -29,6 +39,13 @@ export type BackgroundMailRefreshEngineDependencies = Readonly<{
   createStateStore: () => StateStore;
   tokenStore: OAuthTokenStore;
   withProviderOwnership: <T>(actual: () => Promise<T>) => Promise<T>;
+  /** Optional headless alert execution; automatic runs never request permission. */
+  mailAlerts?: Readonly<{
+    backend: MailAlertNotificationBackend;
+    notificationWriter: BackgroundMailAlertWriter;
+    /** Closed deterministic test seam; production leaves this as the platform SHA-256 digest. */
+    digest?: (text: string) => Promise<string>;
+  }>;
   connectorFactory?: (tokenStore: OAuthTokenStore, withProviderOwnership: <T>(actual: () => Promise<T>) => Promise<T>) => BackgroundMailConnector;
   now?: () => Date;
   uuid?: () => string;
