@@ -4,6 +4,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import type { AppController, BackupImportPreview } from "../core";
 import type { ImportedBackupArchive } from "../backup";
 import { pickPortableBackup } from "../backupFiles";
+import type { PrivacyAudioBoundary } from "../privacy/audioBoundary";
 import { Button, IconButton } from "./primitives";
 import { C, s } from "./theme";
 
@@ -12,6 +13,7 @@ export function BackupImportSheet({
   controller,
   busy,
   sampleMode = false,
+  privacyAudioBoundary,
   onClose,
   onImported,
 }: {
@@ -19,6 +21,7 @@ export function BackupImportSheet({
   controller: AppController;
   busy: boolean;
   sampleMode?: boolean;
+  privacyAudioBoundary?: PrivacyAudioBoundary;
   onClose: () => void;
   onImported?: (archive: ImportedBackupArchive) => void;
 }) {
@@ -63,7 +66,7 @@ export function BackupImportSheet({
     setFileName("");
     setComplete(null);
     try {
-      const file = await pickPortableBackup();
+      const file = await pickPortableBackup(privacyAudioBoundary);
       if (!file || request !== sequence.current || !visibleRef.current) return;
       const nextPreview = await controller.prepareBackupImport(file.bytes);
       if (request !== sequence.current || !visibleRef.current) return;

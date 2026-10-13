@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { Note } from '../src/core';
 import { createNativeSpeechAudioService } from '../src/audio/speechUpload.native';
-import { createWebSpeechAudioService } from '../src/audio/speechUpload.web';
+import { clearSpeechStagingMemory, createWebSpeechAudioService, speechStagingMemoryCount } from '../src/audio/speechUpload.web';
 import type { NativeSpeechAudioIO } from '../src/audio/speechUpload.types';
 import { convertFormDataAsync } from 'expo/src/winter/fetch/convertFormData';
 
@@ -150,5 +150,48 @@ describe('speech upload snapshots', () => {
     for (let i = 0; i < 8; i += 1) await Promise.resolve();
     expect(mock.files.has(`${io.cacheDirectory}speech-upload/${lease}.stage`)).toBe(false);
     expect(mock.files.has(note.audioUri!)).toBe(true);
+  });
+
+  it('privacy-disposes native memory without claiming or removing an in-flight staged file', async () => {
+    const mock = nativeIO();
+    let finishHash!: (digest: string) => void;
+    let hashStarted!: () => void;
+    const started = new Promise<void>((resolve) => { hashStarted = resolve; });
+    const service = createNativeSpeechAudioService({
+      io: mock.io,
+      crypto: { sha256: async () => { hashStarted(); return new Promise<string>((resolve) => { finishHash = resolve; }); } },
+    });
+    const preparing = service.prepare(note, { leaseId: lease, maxDurationSeconds: 30 });
+    await started;
+    service.disposeMemory?.();
+    finishHash('a'.repeat(64));
+    await expect(preparing).rejects.toThrow(/no longer available/i);
+    expect(mock.files.has(note.audioUri!)).toBe(true);
+    await expect(service.verify({ leaseId: lease, platform: 'native', format: 'm4a', mimeType: 'audio/mp4', byteLength: bytes.length, sha256: 'a'.repeat(64), durationSeconds: 7, upload: { uri: `file:///app/cache/speech-upload/${lease}.m4a`, part: { name: 'recording.m4a', type: 'audio/mp4', async bytes() { return bytes; } } } })).rejects.toThrow(/no longer available/i);
+  });
+
+  it('clears and disposes every instance-local web blob map and blocks a late hash from repopulating it', async () => {
+    const first = createWebSpeechAudioService({ get: async () => new Blob([bytes], { type: 'audio/mp4' }), crypto: { sha256: async () => 'a'.repeat(64) } });
+    const second = createWebSpeechAudioService({ get: async () => new Blob([bytes], { type: 'audio/mp4' }), crypto: { sha256: async () => 'a'.repeat(64) } });
+    const webNote = { ...note, audioUri: 'indexeddb-audio:test', audioAttachment: undefined } as Note;
+    await first.prepare(webNote, { leaseId: lease, maxDurationSeconds: 30 });
+    const otherLease = '33333333-3333-4333-8333-333333333333';
+    await second.prepare(webNote, { leaseId: otherLease, maxDurationSeconds: 30 });
+    expect(speechStagingMemoryCount()).toBe(2);
+    expect(clearSpeechStagingMemory()).toBe(2);
+    expect(speechStagingMemoryCount()).toBe(0);
+    await expect(first.prepare(webNote, { leaseId: '44444444-4444-4444-8444-444444444444', maxDurationSeconds: 30 })).rejects.toThrow(/no longer available/i);
+
+    let finishHash!: (digest: string) => void;
+    let hashStarted!: () => void;
+    const started = new Promise<void>((resolve) => { hashStarted = resolve; });
+    const late = createWebSpeechAudioService({ get: async () => new Blob([bytes], { type: 'audio/mp4' }), crypto: { sha256: async () => { hashStarted(); return new Promise<string>((resolve) => { finishHash = resolve; }); } } });
+    const lateLease = '55555555-5555-4555-8555-555555555555';
+    const preparing = late.prepare(webNote, { leaseId: lateLease, maxDurationSeconds: 30 });
+    await started;
+    clearSpeechStagingMemory();
+    finishHash('a'.repeat(64));
+    await expect(preparing).rejects.toThrow(/no longer available/i);
+    expect(speechStagingMemoryCount()).toBe(0);
   });
 });

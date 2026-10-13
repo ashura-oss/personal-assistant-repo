@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useAudioPlayer, useAudioRecorder, useAudioRecorderState, RecordingPresets, requestRecordingPermissionsAsync, setAudioModeAsync } from 'expo-audio';
 import * as FileSystem from 'expo-file-system/legacy';
+import { CaptureStillActiveError } from '../privacy/audioBoundary';
+import type { PrivacyAudioBoundary, PrivacyCaptureSession } from '../privacy/audioBoundary';
 import type { AudioCapture } from './types';
+import { stopNativeRecorderWithProof } from './nativeStopProof';
 
-export function useAudioCapture(): AudioCapture {
+export function useAudioCapture(boundary?: PrivacyAudioBoundary): AudioCapture {
   const recorder = useAudioRecorder({ ...RecordingPresets.HIGH_QUALITY, directory: 'document', isMeteringEnabled: true });
   const recording = useAudioRecorderState(recorder, 250);
   const player = useAudioPlayer(null);
@@ -13,6 +16,8 @@ export function useAudioCapture(): AudioCapture {
   const [meter, setMeter] = useState<number[]>(Array.from({ length: 37 }, () => 0.08));
   const [hasPending, setHasPending] = useState(false);
   const activeCapture = useRef(false);
+  const captureSession = useRef<PrivacyCaptureSession | null>(null);
+  const stopOnUnmount = useRef<() => Promise<unknown>>(async () => null);
   const pending = useRef<{ uri: string; durationSeconds: number; capturedAt: string; captureTimeZone: string } | null>(null);
   const captureAnchor = useRef<{ capturedAt: string; captureTimeZone: string } | null>(null);
 
@@ -25,71 +30,225 @@ export function useAudioCapture(): AudioCapture {
     return () => clearInterval(timer);
   }, [recording.metering, status]);
 
-  const start = useCallback(async () => {
+  const startActual = useCallback(async () => {
     setError('');
-    if (pending.current) throw new Error('A recording is waiting to be saved. Save it or discard it before starting another.');
+    const permission = await requestRecordingPermissionsAsync();
+    if (!permission.granted) throw new Error('Microphone permission was denied. Allow microphone access in device Settings to record.');
     try {
-      const permission = await requestRecordingPermissionsAsync();
-      if (!permission.granted) throw new Error('Microphone permission was denied. Allow microphone access in device Settings to record.');
       await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true, shouldPlayInBackground: false });
       await recorder.prepareToRecordAsync();
       recorder.record();
       captureAnchor.current = { capturedAt: new Date().toISOString(), captureTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC' };
       activeCapture.current = true;
       setElapsed(0); setStatus('recording');
-    } catch (e) {
-      setStatus('idle');
-      setError(e instanceof Error ? e.message : 'Could not start recording. Check microphone access and try again.');
-      throw e;
+    } catch (error) {
+      try {
+        await stopNativeRecorderWithProof({
+          stop: () => recorder.stop(),
+          disableRecording: () => setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true }),
+          readRecordingFlag: () => recorder.isRecording,
+          readStatus: () => recorder.getStatus(),
+          wasPaused: false,
+          message: 'Recording setup failed while the device recorder may still be active. Stop or discard it before leaving.',
+        });
+      } catch (stopError) {
+        if (stopError instanceof CaptureStillActiveError) {
+          activeCapture.current = true;
+          setStatus('paused');
+          throw stopError;
+        }
+      }
+      await setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true }).catch(() => undefined);
+      throw error;
     }
   }, [recorder]);
-  const pause = useCallback(async () => { recorder.pause(); setStatus('paused'); }, [recorder]);
-  const resume = useCallback(async () => { recorder.record(); setStatus('recording'); }, [recorder]);
-  const stop = useCallback(async () => {
-    if (pending.current) return pending.current;
-    if (status === 'idle') return null;
-    const durationSeconds = Math.max(0, recording.durationMillis / 1000 || elapsed);
+
+  const start = useCallback(async () => {
+    if (pending.current) throw new Error('A recording is waiting to be saved. Save it or discard it before starting another.');
+    if (captureSession.current || activeCapture.current) throw new Error('A recording is already in progress.');
     try {
-      await recorder.stop();
-      const uri = recorder.getStatus().url;
-      if (!uri) throw new Error('The device did not finish writing the recording. Your saved notes were not changed.');
-      pending.current = { uri, durationSeconds, ...(captureAnchor.current ?? { capturedAt: new Date().toISOString(), captureTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC' }) };
+      if (boundary) {
+        const session = boundary.beginCapture(startActual);
+        captureSession.current = session;
+        await session.ready;
+      } else {
+        await startActual();
+      }
+    } catch (error) {
+      if (!(error instanceof CaptureStillActiveError)) {
+        captureSession.current = null;
+        setStatus('idle');
+      }
+      setError(error instanceof Error ? error.message : 'Could not start recording. Check microphone access and try again.');
+      throw error;
+    }
+  }, [boundary, startActual]);
+
+  const pauseActual = useCallback(async () => {
+    recorder.pause();
+    setStatus('paused');
+  }, [recorder]);
+  const pause = useCallback(async () => {
+    if (!activeCapture.current || status !== 'recording') return;
+    const session = captureSession.current;
+    if (session) await session.runAction(pauseActual);
+    else if (boundary) await boundary.withAudioWrite(pauseActual);
+    else await pauseActual();
+  }, [boundary, pauseActual, status]);
+
+  const resumeActual = useCallback(async () => {
+    recorder.record();
+    setStatus('recording');
+  }, [recorder]);
+  const resume = useCallback(async () => {
+    if (!activeCapture.current || status !== 'paused') return;
+    const session = captureSession.current;
+    if (session) await session.runAction(resumeActual);
+    else if (boundary) await boundary.withAudioWrite(resumeActual);
+    else await resumeActual();
+  }, [boundary, resumeActual, status]);
+
+  const stopActual = useCallback(async () => {
+    if (pending.current) return pending.current;
+    if (!activeCapture.current) return null;
+    const durationSeconds = Math.max(0, recording.durationMillis / 1000 || elapsed);
+    let stopError: unknown;
+    stopError = await stopNativeRecorderWithProof({
+      stop: () => recorder.stop(),
+      disableRecording: () => setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true }),
+      readRecordingFlag: () => recorder.isRecording,
+      readStatus: () => recorder.getStatus(),
+      wasPaused: status === 'paused',
+      message: 'The device recorder may still be active. Retry Stop or discard before leaving.',
+    });
+    const uri = recorder.getStatus().url;
+    activeCapture.current = false;
+    setStatus('idle');
+    try {
+      await setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true });
+    } catch {
+      setError(uri ? 'The recording was saved, but audio mode could not be reset. Restart playback if needed.' : 'The device audio mode could not be reset after recording.');
+    }
+    if (uri) {
+      pending.current = {
+        uri,
+        durationSeconds,
+        ...(captureAnchor.current ?? { capturedAt: new Date().toISOString(), captureTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC' }),
+      };
       setHasPending(true);
-      activeCapture.current = false;
-      setStatus('idle');
-      try { await setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true }); } catch { setError('The recording was saved, but audio mode could not be reset. Restart playback if needed.'); }
+      if (stopError) setError('The recorder stopped with a recoverable file. Save it again to keep the audio.');
       return pending.current;
-    } catch (e) {
-      const partialUri = recorder.getStatus().url;
-      if (partialUri) {
-        pending.current = { uri: partialUri, durationSeconds, ...(captureAnchor.current ?? { capturedAt: new Date().toISOString(), captureTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC' }) };
-        setHasPending(true);
+    }
+    setError(stopError instanceof Error ? stopError.message : 'Could not save the recording. The device did not provide a recoverable audio file.');
+    if (stopError) throw stopError;
+    throw new Error('The device did not finish writing the recording. Your saved notes were not changed.');
+  }, [elapsed, recorder, recording.durationMillis, status]);
+
+  const stop = useCallback(async () => {
+    const session = captureSession.current;
+    if (!boundary) return stopActual();
+    if (!session) return boundary.withAudioWrite(stopActual);
+    try {
+      const result = await session.stop(stopActual);
+      if (captureSession.current === session) captureSession.current = null;
+      return result;
+    } catch (error) {
+      if (!(error instanceof CaptureStillActiveError) && captureSession.current === session) captureSession.current = null;
+      throw error;
+    }
+  }, [boundary, stopActual]);
+
+  const cancelActual = useCallback(async () => {
+    let uri = pending.current?.uri;
+    let stopFailure: unknown;
+    if (activeCapture.current) {
+      stopFailure = await stopNativeRecorderWithProof({
+        stop: () => recorder.stop(),
+        disableRecording: () => setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true }),
+        readRecordingFlag: () => recorder.isRecording,
+        readStatus: () => recorder.getStatus(),
+        wasPaused: status === 'paused',
+        message: 'The device recorder may still be active. Retry discard before leaving.',
+      });
+      try { uri = recorder.getStatus().url ?? uri; }
+      catch {
         activeCapture.current = false;
         setStatus('idle');
-        setError('The recorder stopped with a recoverable file. Save it again to keep the audio.');
-        await setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true }).catch(() => undefined);
-        return pending.current;
+        throw new Error('The recorder stopped, but its saved file could not be inspected. Keep the app open and retry from the recording screen.');
       }
-      setError(e instanceof Error ? e.message : 'Could not save the recording. The device did not provide a recoverable audio file.');
-      throw e;
+      activeCapture.current = false;
     }
+    let deleteFailure: unknown;
+    try {
+      if (uri) await FileSystem.deleteAsync(uri, { idempotent: true });
+      pending.current = null; captureAnchor.current = null; setHasPending(false);
+      setElapsed(0); setStatus('idle'); setError('');
+    } catch (error) {
+      deleteFailure = error;
+      if (uri && !pending.current) {
+        pending.current = {
+          uri,
+          durationSeconds: Math.max(0, recording.durationMillis / 1000 || elapsed),
+          ...(captureAnchor.current ?? { capturedAt: new Date().toISOString(), captureTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC' }),
+        };
+        setHasPending(true);
+      }
+      setError('The unsaved recording could not be removed. Try discarding it again.');
+    } finally {
+      await setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true }).catch(() => undefined);
+    }
+    if (deleteFailure) throw deleteFailure;
+    if (stopFailure) throw stopFailure;
   }, [elapsed, recorder, recording.durationMillis, status]);
   const cancel = useCallback(async () => {
-    let uri = pending.current?.uri;
-    if (activeCapture.current) {
-      await recorder.stop();
-      uri = recorder.getStatus().url ?? undefined;
+    const session = captureSession.current;
+    if (session) {
+      try {
+        await session.stop(cancelActual);
+        if (captureSession.current === session) captureSession.current = null;
+      } catch (error) {
+        if (!(error instanceof CaptureStillActiveError) && captureSession.current === session) captureSession.current = null;
+        throw error;
+      }
+      return;
     }
-    if (uri) await FileSystem.deleteAsync(uri, { idempotent: true });
-    pending.current = null; captureAnchor.current = null; setHasPending(false); activeCapture.current = false;
-    await setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true }).catch(() => undefined);
-    setElapsed(0); setStatus('idle'); setError('');
-  }, [recorder]);
-  const commit = useCallback((uri: string) => { if (pending.current?.uri === uri) { pending.current = null; captureAnchor.current = null; setHasPending(false); } }, []);
-  const play = useCallback(async (uri: string) => {
-    player.replace(uri); player.play();
-  }, [player]);
+    if (boundary) await boundary.withAudioWrite(cancelActual);
+    else await cancelActual();
+  }, [boundary, cancelActual]);
 
-  const visibleError = recording.mediaServicesDidReset ? 'Recording was interrupted by the device audio service. Stop to save any recoverable audio.' : error;
-  return { status: recording.mediaServicesDidReset && status !== 'idle' ? 'paused' : status, durationSeconds: Math.max(0, recording.durationMillis / 1000 || elapsed), meter, error: visibleError, hasPending, start, pause, resume, stop, cancel, commit, play };
+  const commit = useCallback((uri: string) => {
+    if (pending.current?.uri === uri) { pending.current = null; captureAnchor.current = null; setHasPending(false); }
+  }, []);
+  const play = useCallback(async (uri: string) => {
+    const playActual = async () => { player.replace(uri); player.play(); };
+    if (boundary) await boundary.withAudioRead(playActual);
+    else await playActual();
+  }, [boundary, player]);
+
+  useEffect(() => {
+    if (status !== 'recording') return;
+    const timer = setInterval(() => setElapsed(Math.max(0, recording.durationMillis / 1000 || elapsed)), 250);
+    return () => clearInterval(timer);
+  }, [elapsed, recording.durationMillis, status]);
+
+  useEffect(() => { stopOnUnmount.current = stop; }, [stop]);
+  useEffect(() => () => { void stopOnUnmount.current().catch(() => undefined); }, []);
+
+  const visibleError = recording.mediaServicesDidReset && status !== 'idle'
+    ? 'Recording was interrupted by the device audio service. Stop to save any recoverable audio.'
+    : error;
+  return {
+    status: recording.mediaServicesDidReset && status !== 'idle' ? 'paused' : status,
+    durationSeconds: Math.max(0, recording.durationMillis / 1000 || elapsed),
+    meter,
+    error: visibleError,
+    hasPending,
+    start,
+    pause,
+    resume,
+    stop,
+    cancel,
+    commit,
+    play,
+  };
 }

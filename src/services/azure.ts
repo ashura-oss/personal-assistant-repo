@@ -86,6 +86,8 @@ export interface AzureSpeechClientOptions {
   currentCredentialGeneration?: () => number;
   assertCredentialGeneration?: (generation: number) => void;
   audio?: SpeechAudioService;
+  /** Holds the actual upload/response promise, not the UI deadline race. */
+  withRequestOwnership?: <T>(actualRequest: () => Promise<T>) => Promise<T>;
   randomUUID?: () => string;
   deadlineMs?: number;
 }
@@ -96,6 +98,7 @@ export class AzureSpeechClient {
   private rawPostInFlight = false;
   private activeRawLeaseId?: string;
   private readonly leaseReleasePromises = new Map<string, Promise<void>>();
+  private disposed = false;
   constructor(private readonly options: AzureSpeechClientOptions) {
     this.fetcher = options.fetcher ?? fetch;
     this.audio = options.audio ?? speechAudioService;
@@ -114,6 +117,12 @@ export class AzureSpeechClient {
     return operation;
   }
 
+  /** Discards private staged bytes synchronously; in-flight native promises retain their own leases. */
+  disposeMemory(): void {
+    this.disposed = true;
+    this.audio.disposeMemory?.();
+  }
+
   /** One bounded request. A sent request is never automatically retried. */
   async transcribe(
     note: Note,
@@ -125,6 +134,7 @@ export class AzureSpeechClient {
     suppliedLeaseId?: string,
   ): Promise<SpeechTranscriptionResult> {
     const fail = (message: string, code: ConstructorParameters<typeof SpeechTranscriptionError>[1] = 'pre_dispatch'): never => { throw new SpeechTranscriptionError(message, code, false); };
+    if (this.disposed) fail('Speech upload staging is no longer available in this workspace.', 'pre_dispatch');
     if (this.rawPostInFlight) fail('A previous speech upload is still settling. Wait before starting another upload.', 'pre_dispatch');
     if (signal?.aborted) fail('Speech transcription was cancelled before upload.', 'cancelled');
     if (!note.audioUri) fail('This note has no recorded audio to transcribe.', 'invalid_audio');
@@ -186,35 +196,42 @@ export class AzureSpeechClient {
       const onSignalAbort = () => { abort(); rejectAbort?.(signal?.reason ?? new Error('Speech transcription was cancelled.')); };
       const aborted = signal ? new Promise<never>((_, reject) => { rejectAbort = reject; }) : new Promise<never>(() => undefined);
       const deadline = new Promise<never>((_, reject) => { rejectDeadline = reject; });
-      // Final synchronous fence. No async work occurs between this check and invoking fetch.
-      if (signal?.aborted) fail('Speech transcription was cancelled before upload.', 'cancelled');
-      try { beforeDispatch?.(prepared); }
-      catch (error) { throw new SpeechTranscriptionError('The note, audio, settings, or claim changed before upload. No audio was sent.', 'pre_dispatch', false, undefined, { cause: error }); }
-      try { (this.options.assertCredentialGeneration ?? assertSpeechCredentialGeneration)(credentialSnapshot.generation); }
-      catch { fail('The Azure Speech credential changed before upload.', 'stale_credential'); }
-      if (this.rawPostInFlight) fail('Another speech upload started before this request could be dispatched.', 'pre_dispatch');
-      this.rawPostInFlight = true;
-      this.activeRawLeaseId = leaseId;
-      signal?.addEventListener('abort', onSignalAbort, { once: true });
-      if (signal?.aborted) onSignalAbort();
-      timer = setTimeout(() => { controller.abort(new Error('Speech transcription timed out.')); rejectDeadline?.(new SpeechDeadlineError()); }, deadlineMs);
-      const rawPromise = (async () => {
-        let response: Response;
+      const rawPromise = (this.options.withRequestOwnership ?? (async (actual: () => Promise<{ transcript: string; durationMilliseconds: number | null }>) => actual()))(async () => {
+        // Final synchronous fence runs after ownership is acquired and immediately before fetch.
+        if (signal?.aborted) fail('Speech transcription was cancelled before upload.', 'cancelled');
+        try { beforeDispatch?.(prepared!); }
+        catch (error) { throw new SpeechTranscriptionError('The note, audio, settings, or claim changed before upload. No audio was sent.', 'pre_dispatch', false, undefined, { cause: error }); }
+        try { (this.options.assertCredentialGeneration ?? assertSpeechCredentialGeneration)(credentialSnapshot.generation); }
+        catch { fail('The Azure Speech credential changed before upload.', 'stale_credential'); }
+        if (this.rawPostInFlight) fail('Another speech upload started before this request could be dispatched.', 'pre_dispatch');
+        this.rawPostInFlight = true;
+        this.activeRawLeaseId = leaseId;
+        signal?.addEventListener('abort', onSignalAbort, { once: true });
+        if (signal?.aborted) onSignalAbort();
+        timer = setTimeout(() => { controller.abort(new Error('Speech transcription timed out.')); rejectDeadline?.(new SpeechDeadlineError()); }, deadlineMs);
         try {
-          response = await this.fetcher(`${endpoint}/speechtotext/transcriptions:transcribe?api-version=${SPEECH_API_VERSION}`, {
-            method: 'POST', headers: { 'Ocp-Apim-Subscription-Key': credentialSnapshot.key! }, body: form, signal: controller.signal, redirect: 'error',
-          });
-        } catch { throw new SpeechNetworkError('Speech request could not be completed.'); }
-        if (!response.ok) throw new SpeechHttpResponseError(response.status);
-        try { return await readSpeechResponse(response); }
-        catch (error) { if (error instanceof SpeechResponseError) throw error; throw new SpeechResponseError('Speech response could not be parsed.', undefined, { cause: error }); }
-      })();
-      dispatched = true;
+          let response: Response;
+          try {
+            // Calling fetch is the dispatch boundary. Ownership stays held through body parsing.
+            dispatched = true;
+            response = await this.fetcher(`${endpoint}/speechtotext/transcriptions:transcribe?api-version=${SPEECH_API_VERSION}`, {
+              method: 'POST', headers: { 'Ocp-Apim-Subscription-Key': credentialSnapshot.key! }, body: form, signal: controller.signal, redirect: 'error',
+            });
+          } catch { throw new SpeechNetworkError('Speech request could not be completed.'); }
+          if (!response.ok) {
+            try { await response.body?.cancel(); } catch { /* The actual request still settles before ownership is released. */ }
+            throw new SpeechHttpResponseError(response.status);
+          }
+          try { return await readSpeechResponse(response); }
+          catch (error) { if (error instanceof SpeechResponseError) throw error; throw new SpeechResponseError('Speech response could not be parsed.', undefined, { cause: error }); }
+        } finally {
+          if (timer !== undefined) clearTimeout(timer);
+          signal?.removeEventListener('abort', onSignalAbort);
+          this.rawPostInFlight = false;
+          if (this.activeRawLeaseId === leaseId) this.activeRawLeaseId = undefined;
+        }
+      });
       const cleanupPromise = rawPromise.then(() => undefined, () => undefined).then(async () => {
-        if (timer !== undefined) clearTimeout(timer);
-        signal?.removeEventListener('abort', onSignalAbort);
-        this.rawPostInFlight = false;
-        if (this.activeRawLeaseId === leaseId) this.activeRawLeaseId = undefined;
         await release();
       });
       dispatchCleanup = cleanupPromise;
@@ -228,6 +245,8 @@ export class AzureSpeechClient {
         throw new SpeechTranscriptionError('Speech provider request failed; its charge status is unknown.', 'provider_unknown', true, undefined, { cause: error }, cleanupPromise);
       }
       if (outcome.kind === 'error') {
+        if (outcome.error instanceof SpeechTranscriptionError) throw outcome.error;
+        if (!dispatched) throw new SpeechTranscriptionError('The upload could not start inside the local writer boundary. No audio was sent.', 'pre_dispatch', false, undefined, { cause: outcome.error }, cleanupPromise);
         if (outcome.error instanceof SpeechHttpResponseError) {
           const definite = outcome.error.status >= 400 && outcome.error.status < 500 && outcome.error.status !== 429;
           throw new SpeechTranscriptionError(`Azure Speech returned HTTP ${outcome.error.status}.`, definite ? 'provider_rejected' : 'provider_unknown', true, undefined, { cause: outcome.error }, cleanupPromise);
@@ -272,7 +291,10 @@ class SpeechResponseError extends Error { constructor(message: string, readonly 
 
 async function readSpeechResponse(response: Response): Promise<{ transcript: string; durationMilliseconds: number | null }> {
   const contentLength = response.headers.get('content-length');
-  if (contentLength && /^\d+$/.test(contentLength) && Number(contentLength) > SPEECH_MAX_RESPONSE_BYTES) throw new Error('Speech response exceeds the 1 MiB response limit.');
+  if (contentLength && /^\d+$/.test(contentLength) && Number(contentLength) > SPEECH_MAX_RESPONSE_BYTES) {
+    try { await response.body?.cancel(); } catch { /* Keep the fixed response-size failure. */ }
+    throw new Error('Speech response exceeds the 1 MiB response limit.');
+  }
   const chunks: Uint8Array[] = [];
   let total = 0;
   if (response.body) {
@@ -282,7 +304,10 @@ async function readSpeechResponse(response: Response): Promise<{ transcript: str
         const part = await reader.read();
         if (part.done) break;
         total += part.value.byteLength;
-        if (total > SPEECH_MAX_RESPONSE_BYTES) { void reader.cancel().catch(() => undefined); throw new Error('Speech response exceeds the 1 MiB response limit.'); }
+        if (total > SPEECH_MAX_RESPONSE_BYTES) {
+          try { await reader.cancel(); } catch { /* Keep the fixed response-size failure. */ }
+          throw new Error('Speech response exceeds the 1 MiB response limit.');
+        }
         chunks.push(part.value);
       }
     } finally { reader.releaseLock(); }
@@ -392,7 +417,11 @@ const replyTextSchema = {
 
 export class AzureOpenAIClient {
   private readonly fetcher: FetchLike;
-  constructor(fetcher: FetchLike = fetch, private readonly readKey: () => Promise<string | null> = () => readProviderCredential('openai')) { this.fetcher = fetcher; }
+  constructor(
+    fetcher: FetchLike = fetch,
+    private readonly readKey: () => Promise<string | null> = () => readProviderCredential('openai'),
+    private readonly withRequestOwnership: <T>(actualRequest: () => Promise<T>) => Promise<T> = async (actualRequest) => actualRequest(),
+  ) { this.fetcher = fetcher; }
 
   /** One explicit Generate call. It preflights the whole request before reading credentials or reserving usage. */
   async generateReply(input: ReplyGenerationInput, settings: AppSettings, onAttempt?: () => Promise<void>, beforeDispatch?: () => void): Promise<ReplyGenerationResult> {
@@ -427,17 +456,26 @@ export class AzureOpenAIClient {
     const key = await this.readKey();
     if (!key) throw new Error('Add an Azure OpenAI key in Settings before generating a reply.');
     await onAttempt?.();
-    try { beforeDispatch?.(); }
-    catch (error) { throw new ReplyGenerationPreDispatchError(error instanceof Error ? error.message : 'The selected context changed before sending.'); }
     let responseData: { response: Response; result?: unknown; parseError?: boolean };
+    let fetchStarted = false;
     try {
-      responseData = await withTimeout(60_000, undefined, async (signal) => {
+      responseData = await this.withRequestOwnership(() => withTimeout(60_000, undefined, async (signal) => {
+        try { beforeDispatch?.(); }
+        catch (error) { throw new ReplyGenerationPreDispatchError(error instanceof Error ? error.message : 'The selected context changed before sending.'); }
+        fetchStarted = true;
         const response = await this.fetcher(`${endpoint}/openai/v1/responses?api-version=v1`, {
+          // Fetch invocation is the provider dispatch boundary; ownership remains held through body parsing.
           method: 'POST', headers: { 'api-key': key, 'Content-Type': 'application/json' }, body, signal, redirect: 'error',
         });
-        if (!response.ok) return { response };
+        if (!response.ok) {
+          try { await response.body?.cancel(); } catch { /* Hold request ownership through the cancellation attempt. */ }
+          return { response };
+        }
         const contentLength = Number(response.headers.get('content-length'));
-        if (Number.isFinite(contentLength) && contentLength > 256 * 1024) return { response, parseError: true };
+        if (Number.isFinite(contentLength) && contentLength > 256 * 1024) {
+          try { await response.body?.cancel(); } catch { /* Keep the fixed response-size result. */ }
+          return { response, parseError: true };
+        }
         const chunks: Uint8Array[] = [];
         let totalBytes = 0;
         if (response.body) {
@@ -467,8 +505,10 @@ export class AzureOpenAIClient {
           const decoded = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
           return { response, result: JSON.parse(decoded) as unknown };
         } catch { return { response, parseError: true }; }
-      });
+      }));
     } catch (error) {
+      if (error instanceof ReplyGenerationPreDispatchError) throw error;
+      if (!fetchStarted) throw new ReplyGenerationPreDispatchError('The request could not acquire local request ownership. No provider request was sent.');
       if (error instanceof Error && /timed out/i.test(error.message)) throw error;
       throw new Error('Azure OpenAI reply request failed; its charge status is unknown.');
     }
@@ -562,8 +602,9 @@ export class AzureOpenAIClient {
     const key = await this.readKey();
     if (!key) throw new Error('Add an Azure OpenAI key in Settings before processing.');
     let attempts = 0;
-    const result = await retry(settings.maxAttempts, signal, onAttempt, async (requestSignal) => {
+    const result = await retry(settings.maxAttempts, signal, onAttempt, async (requestSignal) => this.withRequestOwnership(async () => {
       attempts += 1;
+      if (requestSignal.aborted) throw requestSignal.reason ?? new Error('Provider request cancelled.');
       let response: Response;
       try {
         response = await this.fetcher(`${endpoint}/openai/v1/responses?api-version=v1`, {
@@ -573,9 +614,12 @@ export class AzureOpenAIClient {
         if (requestSignal.aborted) throw error;
         throw new HttpProviderError('Azure OpenAI network request failed; its charge status is unknown.', true);
       }
-      if (!response.ok) throw new HttpProviderError(`Azure OpenAI returned HTTP ${response.status}.`, response.status === 429 || response.status >= 500, retryDelay(response.headers.get('retry-after')));
+      if (!response.ok) {
+        try { await response.body?.cancel(); } catch { /* Keep the provider status while owning the cancellation attempt. */ }
+        throw new HttpProviderError(`Azure OpenAI returned HTTP ${response.status}.`, response.status === 429 || response.status >= 500, retryDelay(response.headers.get('retry-after')));
+      }
       return await response.json() as { output?: { type?: string; content?: { type?: string; text?: string }[] }[]; usage?: { input_tokens?: number; output_tokens?: number } };
-    });
+    }));
     const responseText = result.output?.flatMap((item) => item.content ?? []).find((part) => part.type === 'output_text')?.text;
     if (!responseText) throw new Error('Azure OpenAI returned no structured analysis.');
     let parsed: unknown;

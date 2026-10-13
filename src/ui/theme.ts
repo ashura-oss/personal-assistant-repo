@@ -618,4 +618,6 @@ export const s = StyleSheet.create({
   knowledgeClaim: { flexDirection: "row", alignItems: "center", gap: 9, borderBottomWidth: 1, borderColor: C.border, paddingVertical: 8 },
   knowledgeError: { color: C.red, fontSize: 13, lineHeight: 19 },
   knowledgeDivider: { borderTopWidth: 1, borderColor: C.border, marginVertical: 10 },
+  privacyUnknownScrim: { flex: 1, backgroundColor: "rgba(0,0,0,0.76)", justifyContent: "center", padding: 22 },
+  privacyUnknownCard: { width: "100%", maxWidth: 520, alignSelf: "center", gap: 14, borderRadius: 20, borderWidth: 1, borderColor: C.border, backgroundColor: C.bg, padding: 22 },
 });

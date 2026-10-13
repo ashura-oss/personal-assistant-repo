@@ -24,6 +24,7 @@ import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import type {
   Note,
   Proposal,
+  AppState,
   AppSettings,
   AppController,
   ContextDocument,
@@ -45,23 +46,11 @@ import type {
 } from "./src/core";
 import type { StartupRecoveryPlan } from "./src/storage/startupRecovery";
 import type { KnowledgeEntityKind, KnowledgeReference, KnowledgeSuggestion } from "./src/knowledge/types";
-import { controller as productionController } from "./src/services/controller";
-import { createDispatchHistoryScenario } from "./src/dev/receiptScenario";
-import { createMailSyncScenario } from "./src/dev/mailSyncScenario";
-import { createBackupScenario } from "./src/dev/backupScenario";
-import { createKnowledgeScenario } from "./src/dev/knowledgeScenario";
-import { createReminderPreview } from "./src/dev/reminderPreview";
-import { createDeviceCalendarPreview } from "./src/dev/deviceCalendarPreview";
-import { createTranscriptionPreview } from "./src/dev/transcriptionPreview";
-import { createStartupRecoveryPreview } from "./src/dev/startupRecoveryPreview";
 import { SpeechTranscriptionError } from "./src/transcription/types";
 import { useAudioCapture } from "./src/audio/useAudioCapture";
+import { RecordingAutoStopGate } from "./src/audio/autoStop";
 import type { AudioCapture } from "./src/audio/types";
-import {
-  deleteCredentials,
-  getCredentials,
-  setCredentials,
-} from "./src/services/credentials";
+import type { ProviderCredentialService } from "./src/services/credentials";
 import * as FileSystem from "expo-file-system/legacy";
 import * as Sharing from "expo-sharing";
 import { loadAudioForUpload } from "./src/audio/readAudio";
@@ -84,6 +73,8 @@ import { ReminderReview } from "./src/ui/ReminderReview";
 import { RemindersSection } from "./src/ui/RemindersSection";
 import { DeviceCalendarsSection } from "./src/ui/DeviceCalendarsSection";
 import { StartupRecoveryScreen } from "./src/ui/StartupRecoveryScreen";
+import { PrivacyCleanupScreen } from "./src/ui/PrivacyCleanupScreen";
+import { PrivacyEraseReview } from "./src/ui/PrivacyEraseReview";
 import { TasksSection } from "./src/ui/TasksSection";
 import { IconButton, Button, Field } from "./src/ui/primitives";
 import { C, s } from "./src/ui/theme";
@@ -94,6 +85,10 @@ import {
 } from "./src/auth/browser";
 import { exchangeAuthorizationCode } from "./src/connectors/oauth";
 import type { ReminderIntent, ReminderRecord } from "./src/reminders";
+import type { PrivacyService, PrivacyWorkspaceSession } from "./src/privacy/service";
+import type { PrivacyResourceBoundary } from "./src/privacy/resourceBoundary";
+import type { PrivacyAudioBoundary } from "./src/privacy/audioBoundary";
+import type { PrivacyPublicStatus, PrivacyErasePlan } from "./src/privacy/types";
 
 type Tab = "inbox" | "record" | "library";
 
@@ -109,7 +104,8 @@ const isReminderDemo = previewScenario === "reminders";
 const isDeviceCalendarsDemo = previewScenario === "device-calendars";
 const isTranscriptionDemo = previewScenario === "transcription";
 const isStartupRecoveryDemo = previewScenario === "startup-recovery";
-const isIsolatedDemo = isDispatchHistoryDemo || isMailSyncDemo || isBackupImportDemo || isKnowledgeDemo || isReminderDemo || isDeviceCalendarsDemo || isTranscriptionDemo || isStartupRecoveryDemo;
+const isPrivacyCleanupDemo = previewScenario === "privacy-cleanup";
+const isIsolatedDemo = isDispatchHistoryDemo || isMailSyncDemo || isBackupImportDemo || isKnowledgeDemo || isReminderDemo || isDeviceCalendarsDemo || isTranscriptionDemo || isStartupRecoveryDemo || isPrivacyCleanupDemo;
 
 function useAppState(appController: AppController) {
   return useSyncExternalStore(
@@ -119,9 +115,7 @@ function useAppState(appController: AppController) {
   );
 }
 
-function freshnessAccountState(
-  state: ReturnType<typeof productionController.getSnapshot>,
-) {
+function freshnessAccountState(state: AppState) {
   return {
     accounts: state.accounts.map((account) => ({
       id: account.id,
@@ -163,7 +157,7 @@ function freshnessAccountState(
   };
 }
 
-function knowledgeAccountIdentityKey(account: ReturnType<typeof productionController.getSnapshot>['accounts'][number]) {
+function knowledgeAccountIdentityKey(account: AppState['accounts'][number]) {
   const identity = account.identity;
   if (!account.connected || account.authStatus !== 'connected' || account.provider === 'local' ||
       !identity?.providerNamespace || identity.providerNamespace !== account.provider ||
@@ -172,7 +166,7 @@ function knowledgeAccountIdentityKey(account: ReturnType<typeof productionContro
   return [identity.providerNamespace, identity.clientId, identity.subject, identity.resourceUserId ?? ''].join(':');
 }
 
-function knowledgeReferenceOptions(state: ReturnType<typeof productionController.getSnapshot>) {
+function knowledgeReferenceOptions(state: AppState) {
   const structuredNarrativePaths = new Set([
     ...state.knowledge.people.map((entity) => entity.narrativePath),
     ...state.knowledge.projects.map((entity) => entity.narrativePath),
@@ -220,7 +214,7 @@ function knowledgeReferenceOptions(state: ReturnType<typeof productionController
   return references;
 }
 
-function knowledgeEvidenceLabels(state: ReturnType<typeof productionController.getSnapshot>) {
+function knowledgeEvidenceLabels(state: AppState) {
   const labels: Record<string, string> = Object.create(null) as Record<string, string>;
   labels.transcript = 'Saved note transcript';
   for (const note of state.notes) {
@@ -344,7 +338,7 @@ function ProposalCard({
   onPress,
 }: {
   proposal: Proposal;
-  accounts: ReturnType<typeof productionController.getSnapshot>["accounts"];
+  accounts: AppState["accounts"];
   onPress: () => void;
 }) {
   const provider = accounts.find(
@@ -398,9 +392,383 @@ function ProposalCard({
   );
 }
 
+type WorkspaceBindings = {
+  controller: AppController;
+  credentials: ProviderCredentialService;
+  audioBoundary?: PrivacyAudioBoundary;
+  privacy?: PrivacyService;
+  session?: PrivacyWorkspaceSession;
+  resources?: PrivacyResourceBoundary;
+  privacyPreview?: boolean;
+  isolated: boolean;
+};
+
+type BootstrapState =
+  | { kind: "opening" }
+  | { kind: "workspace"; bindings: WorkspaceBindings }
+  | { kind: "cleanup"; privacy: PrivacyService; status: PrivacyPublicStatus; reason?: "dedicated_ios_build_required" | "secure_context_and_web_locks_required"; failure?: "storage_unavailable" | "lease_lost" | "verification_incomplete"; samplePreview?: boolean }
+  | { kind: "unavailable"; reason: "dedicated_ios_build_required" | "secure_context_and_web_locks_required" | "active_work" | "full_restart_required" | "storage_unavailable"; privacy?: PrivacyService; status?: PrivacyPublicStatus }
+  | { kind: "preview_error" };
+
+const previewCredentialService: ProviderCredentialService = {
+  currentSpeechCredentialGeneration: () => 0,
+  assertSpeechCredentialGeneration: () => { throw new Error("Provider credentials are unavailable in sample previews."); },
+  readSpeechCredentialSnapshot: async () => ({ key: null, generation: 0 }),
+  getCredentials: async () => ({ speechConfigured: false, openAiConfigured: false }),
+  readProviderCredential: async () => null,
+  setCredentials: async () => { throw new Error("Provider credentials are unavailable in sample previews."); },
+  deleteCredentials: async () => ({ speechConfigured: false, openAiConfigured: false }),
+};
+
+function isPrivacyBootstrapError(error: unknown): boolean {
+  return !!error && typeof error === "object" &&
+    ["stale_epoch", "cleanup_in_progress", "unsupported_runtime", "control_unavailable"].includes(String((error as { code?: unknown }).code));
+}
+
+function unavailableReason(): "dedicated_ios_build_required" | "secure_context_and_web_locks_required" {
+  return Platform.OS === "web" ? "secure_context_and_web_locks_required" : "dedicated_ios_build_required";
+}
+
+function toCleanupPhase(status: PrivacyPublicStatus): "running" | "paused" | "failed" | "complete" {
+  if (status.phase === "complete") return "complete";
+  if (status.phase === "erasing" || status.phase === "writer_active") return "running";
+  if (status.phase === "paused") return "paused";
+  return "failed";
+}
+
 export default function App() {
-  const [controller, setController] =
-    useState<AppController>(productionController);
+  const [bootstrap, setBootstrap] = useState<BootstrapState>({ kind: "opening" });
+  const [attempt, setAttempt] = useState(0);
+  const [eraseReviewOpen, setEraseReviewOpen] = useState(false);
+  const [erasePlan, setErasePlan] = useState<PrivacyErasePlan | undefined>();
+  const [erasePhase, setErasePhase] = useState<"prepare" | "preparing" | "ready" | "error" | "unavailable" | "committing">("prepare");
+  const [eraseErrorKind, setEraseErrorKind] = useState<"prepare_failed" | "review_expired" | "confirm_failed" | "runtime_unavailable" | undefined>();
+  const [eraseBusy, setEraseBusy] = useState(false);
+  const [eraseOutcomeUnknown, setEraseOutcomeUnknown] = useState(false);
+  const [eraseStatusBusy, setEraseStatusBusy] = useState(false);
+  const [cleanupBusy, setCleanupBusy] = useState(false);
+  const cleanupRunning = useRef(false);
+  const freshAllowed = useRef(false);
+  const privacyPreviewRef = useRef<import("./src/dev/privacyPreview").PrivacyCleanupPreview | undefined>(undefined);
+
+  useEffect(() => {
+    let alive = true;
+    void (async () => {
+      try {
+        if (isIsolatedDemo) {
+          if (isPrivacyCleanupDemo) {
+            const preview = await import("./src/dev/privacyPreview");
+            const selected = privacyPreviewRef.current ?? await preview.createPrivacyCleanupPreview();
+            privacyPreviewRef.current = selected;
+            const status = await selected.privacy.getStatus();
+            if (!alive) return;
+            if (["erasing", "paused", "complete"].includes(status.phase)) {
+              setBootstrap({ kind: "cleanup", privacy: selected.privacy, status, samplePreview: true });
+              return;
+            }
+            setBootstrap({ kind: "workspace", bindings: {
+              controller: selected.controller,
+              credentials: previewCredentialService,
+              privacy: selected.privacy,
+              session: selected.session,
+              isolated: true,
+              privacyPreview: true,
+            } });
+            return;
+          }
+          const selected = isDispatchHistoryDemo
+            ? await (await import("./src/dev/receiptScenario")).createDispatchHistoryScenario()
+            : isMailSyncDemo
+              ? await (await import("./src/dev/mailSyncScenario")).createMailSyncScenario({ mockGeneration: true })
+              : isBackupImportDemo
+                ? await (await import("./src/dev/backupScenario")).createBackupScenario()
+                : isKnowledgeDemo
+                  ? await (await import("./src/dev/knowledgeScenario")).createKnowledgeScenario()
+                  : isReminderDemo
+                    ? await (await import("./src/dev/reminderPreview")).createReminderPreview()
+                    : isDeviceCalendarsDemo
+                      ? await (await import("./src/dev/deviceCalendarPreview")).createDeviceCalendarPreview()
+                      : isTranscriptionDemo
+                        ? await (await import("./src/dev/transcriptionPreview")).createTranscriptionPreview()
+                        : await (await import("./src/dev/startupRecoveryPreview")).createStartupRecoveryPreview();
+          if (alive) setBootstrap({ kind: "workspace", bindings: { controller: selected, credentials: previewCredentialService, isolated: true } });
+          return;
+        }
+
+        const privacyModule = await import("./src/privacy/service");
+        const privacy = await privacyModule.getDefaultPrivacyService();
+        const status = await privacy.getStatus();
+        if (!alive) return;
+        if (status.phase === "writer_active") {
+          setBootstrap({ kind: "unavailable", reason: "active_work", privacy, status });
+          return;
+        }
+        if (status.phase === "blocked") {
+          setBootstrap({ kind: "unavailable", reason: unavailableReason(), privacy, status });
+          return;
+        }
+        if (["erasing", "paused", "complete"].includes(status.phase) && !(status.phase === "complete" && freshAllowed.current)) {
+          setBootstrap({ kind: "cleanup", privacy, status });
+          return;
+        }
+
+        let session: PrivacyWorkspaceSession;
+        try {
+          session = await privacy.openWorkspace();
+        } catch (error) {
+          if (isPrivacyBootstrapError(error)) {
+            const code = String((error as { code?: unknown }).code ?? "");
+            const reason = code === "control_unavailable"
+              ? "storage_unavailable"
+              : code === "cleanup_in_progress"
+                ? "active_work"
+                : code === "unsupported_runtime"
+                  ? unavailableReason()
+                  : "storage_unavailable";
+            setBootstrap({ kind: "unavailable", reason, privacy, status });
+            return;
+          }
+          throw error;
+        }
+        const [{ createPrivacyResourceBoundary }, { createPrivacyAudioBoundary }, credentialModule, recoveryModule] = await Promise.all([
+          import("./src/privacy/resourceBoundary"),
+          import("./src/privacy/audioBoundary"),
+          import("./src/services/credentials"),
+          import("./src/audio/recovery"),
+        ]);
+        const resources = createPrivacyResourceBoundary({ privacy, session });
+        const audioBoundary = createPrivacyAudioBoundary({
+          privacy,
+          session,
+          captureNamespace: Platform.OS === "web" ? "browser_audio" : "native_recordings",
+        });
+        const { credentialStore } = await import("./src/storage/credentials");
+        const credentials = credentialModule.createProviderCredentialService(resources.credentialStore(credentialStore));
+        const recordingRecovery = await recoveryModule.getRecordingRecoveryService();
+        const { createProductionController } = await import("./src/services/controller");
+        const controller = await createProductionController({
+          privacy,
+          session,
+          resources,
+          credentials,
+          audioBoundary,
+          integration: { recordingRecovery },
+        });
+        if (alive) setBootstrap({
+          kind: "workspace",
+          bindings: { controller, privacy, session, resources, audioBoundary, credentials, isolated: false },
+        });
+      } catch {
+        if (!alive) return;
+        if (isIsolatedDemo) {
+          setBootstrap({ kind: "preview_error" });
+          return;
+        }
+        setBootstrap({ kind: "unavailable", reason: "storage_unavailable" });
+      }
+    })();
+    return () => { alive = false; };
+  }, [attempt]);
+
+  const runCleanup = useCallback(async (privacy: PrivacyService, explicit: boolean) => {
+    if (cleanupRunning.current) return;
+    cleanupRunning.current = true;
+    setCleanupBusy(true);
+    try {
+      if (explicit) {
+        setBootstrap((current) => current.kind === "cleanup" ? { ...current, status: { ...current.status, phase: "erasing" } } : current);
+      }
+      for (let pass = 0; pass < 321; pass += 1) {
+        const foreground = Platform.OS === "web"
+          ? typeof document !== "undefined" && document.visibilityState === "visible"
+          : NativeAppState.currentState === "active";
+        if (!foreground) return;
+        const result = await privacy.runCleanupPass();
+        const status = await privacy.getStatus();
+        setBootstrap((current) => current.kind === "cleanup" ? { ...current, status } : current);
+        if (status.phase === "complete" || result.phase !== "erasing" || result.attempted === 0 || result.completed === 0) return;
+      }
+    } catch {
+      const status = await privacy.getStatus().catch(() => undefined);
+      if (status) setBootstrap({ kind: "cleanup", privacy, status, failure: "storage_unavailable" });
+      else setBootstrap({ kind: "unavailable", reason: unavailableReason(), privacy });
+    } finally {
+      cleanupRunning.current = false;
+      setCleanupBusy(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (bootstrap.kind === "cleanup" && bootstrap.status.phase === "erasing") {
+      const timer = setTimeout(() => { void runCleanup(bootstrap.privacy, false); }, 0);
+      return () => clearTimeout(timer);
+    }
+    return undefined;
+  }, [bootstrap, runCleanup]);
+
+  const requestFreshWorkspace = () => {
+    if (bootstrap.kind === "cleanup" && bootstrap.samplePreview && privacyPreviewRef.current) {
+      setBootstrap({ kind: "opening" });
+      void privacyPreviewRef.current.openFreshWorkspace().then(({ controller, session }) => {
+        if (privacyPreviewRef.current) {
+          setBootstrap({ kind: "workspace", bindings: {
+            controller, credentials: previewCredentialService,
+            privacy: privacyPreviewRef.current.privacy, session, isolated: true, privacyPreview: true,
+          } });
+        }
+      }).catch(() => setBootstrap({ kind: "preview_error" }));
+      return;
+    }
+    freshAllowed.current = true;
+    setAttempt((value) => value + 1);
+  };
+
+  const requestDelete = () => {
+    if (bootstrap.kind !== "workspace" || (bootstrap.bindings.isolated && !bootstrap.bindings.privacyPreview)) return;
+    setErasePlan(undefined);
+    setErasePhase("prepare");
+    setEraseErrorKind(undefined);
+    setEraseReviewOpen(true);
+  };
+
+  const prepareErase = async () => {
+    if (bootstrap.kind !== "workspace" || !bootstrap.bindings.privacy || eraseBusy) return;
+    setEraseBusy(true); setErasePhase("preparing"); setEraseErrorKind(undefined);
+    try {
+      const plan = await bootstrap.bindings.privacy.prepareErase();
+      setErasePlan(plan); setErasePhase("ready");
+    } catch (error) {
+      const code = String((error as { code?: unknown })?.code ?? "");
+      if (code === "unsupported_owner") { setErasePhase("unavailable"); setEraseErrorKind("runtime_unavailable"); }
+      else { setErasePhase("error"); setEraseErrorKind("prepare_failed"); }
+    } finally { setEraseBusy(false); }
+  };
+
+  const cancelErase = async () => {
+    if (eraseBusy) return;
+    setEraseBusy(true);
+    try {
+      if (erasePlan && bootstrap.kind === "workspace") await bootstrap.bindings.privacy?.cancelErase(erasePlan.sessionId);
+      setErasePlan(undefined); setErasePhase("prepare"); setEraseReviewOpen(false); setEraseErrorKind(undefined);
+    } catch { setErasePhase("error"); setEraseErrorKind("confirm_failed"); }
+    finally { setEraseBusy(false); }
+  };
+
+  const confirmErase = async () => {
+    if (!erasePlan || bootstrap.kind !== "workspace" || !bootstrap.bindings.privacy || eraseBusy) return;
+    const { privacy, controller } = bootstrap.bindings;
+    setEraseBusy(true); setErasePhase("committing"); setEraseErrorKind(undefined);
+    try {
+      await privacy.commitErase({ sessionId: erasePlan.sessionId, planHash: erasePlan.planHash });
+      await controller.disposeForPrivacy?.().catch(() => undefined);
+      const status = await privacy.getStatus();
+      setEraseOutcomeUnknown(false);
+      setEraseReviewOpen(false); setErasePlan(undefined);
+      setBootstrap({ kind: "cleanup", privacy, status, samplePreview: bootstrap.bindings.privacyPreview });
+    } catch {
+      const status = await privacy.getStatus().catch(() => undefined);
+      if (status && ["erasing", "paused", "complete"].includes(status.phase)) {
+        await controller.disposeForPrivacy?.().catch(() => undefined);
+        setEraseOutcomeUnknown(false);
+        setEraseReviewOpen(false); setErasePlan(undefined);
+        setBootstrap({ kind: "cleanup", privacy, status, samplePreview: bootstrap.bindings.privacyPreview });
+      } else if (!status || status.epoch !== bootstrap.bindings.session?.epoch) {
+        // The commit response or status read may have been lost. Keep the
+        // workspace mounted under a blocking screen until status is known.
+        setEraseReviewOpen(false);
+        setEraseOutcomeUnknown(true);
+      } else {
+        setErasePhase("error"); setEraseErrorKind("confirm_failed");
+      }
+    } finally { setEraseBusy(false); }
+  };
+
+  const retryEraseStatus = async () => {
+    if (eraseStatusBusy || bootstrap.kind !== "workspace" || !bootstrap.bindings.privacy) return;
+    setEraseStatusBusy(true);
+    try {
+      const status = await bootstrap.bindings.privacy.getStatus();
+      if (["erasing", "paused", "complete"].includes(status.phase) || status.epoch !== bootstrap.bindings.session?.epoch) {
+        await bootstrap.bindings.controller.disposeForPrivacy?.().catch(() => undefined);
+        setEraseOutcomeUnknown(false);
+        setErasePlan(undefined);
+        setBootstrap({ kind: "cleanup", privacy: bootstrap.bindings.privacy, status, samplePreview: bootstrap.bindings.privacyPreview });
+      } else {
+        setEraseOutcomeUnknown(false);
+        setErasePhase("error");
+        setEraseErrorKind("confirm_failed");
+        setEraseReviewOpen(true);
+      }
+    } catch {
+      // Keep the blocking status-only screen. In particular, never recommit.
+    } finally { setEraseStatusBusy(false); }
+  };
+
+  if (bootstrap.kind === "opening") return (
+    <SafeAreaProvider><SafeAreaView style={s.safe}><View style={[s.viewport, { alignItems: "center", justifyContent: "center", gap: 12 }]}><ActivityIndicator color={C.sage} /><Text style={s.accountSub}>Checking local privacy controls…</Text></View></SafeAreaView></SafeAreaProvider>
+  );
+  if (bootstrap.kind === "preview_error") return (
+    <SafeAreaProvider><SafeAreaView style={s.safe}><View style={s.viewport}><Text style={s.kicker}>ISOLATED PREVIEW</Text><Text style={s.h1}>Sample preview could not load.</Text><Text accessibilityRole="alert" style={s.analysisText}>The sample remained isolated. Reload to try again.</Text><Button label="Reload preview" onPress={() => { if (Platform.OS === "web" && typeof window !== "undefined") window.location.reload(); }} /></View></SafeAreaView></SafeAreaProvider>
+  );
+  if (bootstrap.kind === "unavailable") return (
+    <PrivacyCleanupScreen phase="unavailable" unavailableReason={bootstrap.reason} onRetry={() => setAttempt((value) => value + 1)} onOpenFreshWorkspace={() => setAttempt((value) => value + 1)} />
+  );
+  if (bootstrap.kind === "cleanup") return (
+    <PrivacyCleanupScreen
+      phase={toCleanupPhase(bootstrap.status)}
+      steps={bootstrap.status.categoryStates}
+      failureKind={bootstrap.failure}
+      unavailableReason={bootstrap.reason}
+      busy={cleanupBusy}
+      completedAt={bootstrap.status.completedAt}
+      samplePreview={bootstrap.samplePreview}
+      onRetry={() => void runCleanup(bootstrap.privacy, true)}
+      onOpenFreshWorkspace={requestFreshWorkspace}
+    />
+  );
+
+  return <>
+    <Workspace
+      key={attempt}
+      {...bootstrap.bindings}
+      privacyReviewOpen={eraseReviewOpen || eraseOutcomeUnknown}
+      privacyOutcomeUnknown={eraseOutcomeUnknown}
+      onPrivacyReview={requestDelete}
+      onPrivacyInvalidated={() => { setEraseReviewOpen(false); setBootstrap({ kind: "opening" }); setAttempt((value) => value + 1); }}
+    />
+    {(!bootstrap.bindings.isolated || bootstrap.bindings.privacyPreview) && bootstrap.bindings.privacy ? <PrivacyEraseReview
+      open={eraseReviewOpen}
+      phase={erasePhase}
+      planKey={erasePlan?.sessionId}
+      reviewExpiresAt={erasePlan?.expiresAt}
+      errorKind={eraseErrorKind}
+      samplePreview={bootstrap.bindings.privacyPreview}
+      onPrepare={() => void prepareErase()}
+      onConfirm={() => void confirmErase()}
+      onCancelReview={() => void cancelErase()}
+      onClose={() => setEraseReviewOpen(false)}
+    /> : null}
+    {eraseOutcomeUnknown ? <Modal visible transparent animationType="fade" onRequestClose={() => undefined}>
+      <View style={s.privacyUnknownScrim}>
+        <View style={s.privacyUnknownCard}>
+          <Text style={s.kicker}>STILL · PRIVACY</Text>
+          <Text style={s.h1}>Deletion status needs checking.</Text>
+          <Text style={s.analysisText}>The confirmation result could not be verified. Your workspace is paused. Check the local deletion status before continuing; this will not submit deletion again.</Text>
+          <Button label={eraseStatusBusy ? "Checking deletion status…" : "Retry deletion status"} onPress={() => void retryEraseStatus()} disabled={eraseStatusBusy} />
+        </View>
+      </View>
+    </Modal> : null}
+  </>;
+}
+
+type WorkspaceProps = WorkspaceBindings & {
+  privacyReviewOpen: boolean;
+  privacyOutcomeUnknown?: boolean;
+  onPrivacyReview: () => void;
+  onPrivacyInvalidated: () => void;
+};
+
+function Workspace({ controller, credentials, audioBoundary, privacy, session, isolated: isIsolatedDemo, privacyReviewOpen, privacyOutcomeUnknown = false, onPrivacyReview, onPrivacyInvalidated }: WorkspaceProps) {
   const state = useAppState(controller);
   const [tab, setTab] = useState<Tab>(isBackupImportDemo || isKnowledgeDemo || isReminderDemo || isTranscriptionDemo ? "library" : isIsolatedDemo ? "inbox" : "record");
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -426,11 +794,19 @@ export default function App() {
     : undefined;
   useProactiveClock(
     controller,
-    loading || !startupReady || isIsolatedDemo,
+    loading || !startupReady || isIsolatedDemo || privacyReviewOpen,
     state.proactive.lastEvaluation?.nextCheckAt,
   );
   const foregroundMailBusy = useRef(false);
-  const audio = useAudioCapture();
+  const audio = useAudioCapture(audioBoundary);
+  const openPrivacyReview = useCallback(() => {
+    if (privacyOutcomeUnknown) return;
+    if (busy || audio.status === "recording" || audio.status === "paused") {
+      setNotice("Finish or stop active work before reviewing local deletion.");
+      return;
+    }
+    onPrivacyReview();
+  }, [audio.status, busy, onPrivacyReview, privacyOutcomeUnknown]);
   const [inboxFilter, setInboxFilter] = useState<"pending" | "done">(
     isDispatchHistoryDemo ? "done" : "pending",
   );
@@ -466,57 +842,35 @@ export default function App() {
   useEffect(() => {
     let mounted = true;
     void (async () => {
-      let selected: AppController = productionController;
       let loadStarted = false;
       try {
-        selected = isDispatchHistoryDemo
-          ? await createDispatchHistoryScenario()
-          : isMailSyncDemo
-            ? await createMailSyncScenario({ mockGeneration: true })
-            : isBackupImportDemo
-              ? await createBackupScenario()
-              : isKnowledgeDemo
-                ? await createKnowledgeScenario()
-                : isReminderDemo
-                  ? await createReminderPreview()
-                  : isDeviceCalendarsDemo
-                    ? await createDeviceCalendarPreview()
-                    : isTranscriptionDemo
-                      ? await createTranscriptionPreview()
-                    : isStartupRecoveryDemo
-                      ? createStartupRecoveryPreview()
-            : productionController;
-        if (!mounted) return;
-        setController(selected);
         loadStarted = true;
-        await selected.load();
+        await controller.load();
         if (mounted) {
-          const recoveryStatus = await selected.getStartupRecoveryStatus();
+          const recoveryStatus = await controller.getStartupRecoveryStatus();
           setStartupRecoveryStatus(recoveryStatus);
           setStartupReady(recoveryStatus.phase === "ready");
         }
-      } catch (e) {
+      } catch {
         if (mounted) {
-          if (loadStarted && (!isIsolatedDemo || isStartupRecoveryDemo)) {
+          if (loadStarted) {
             try {
-              const recoveryStatus = await selected.getStartupRecoveryStatus();
+              const recoveryStatus = await controller.getStartupRecoveryStatus();
               if (mounted) setStartupRecoveryStatus(recoveryStatus);
             } catch {
               if (mounted) setStartupRecoveryStatus({ phase: "unavailable" });
             }
-          } else {
-            setNotice(messageOf(e));
-            if (isIsolatedDemo) setIsolatedPreviewFailed(true);
+          } else if (isIsolatedDemo) {
+            setNotice("The sample remained isolated. Reload to try again.");
+            setIsolatedPreviewFailed(true);
           }
         }
       } finally {
         if (mounted) setLoading(false);
       }
     })();
-    return () => {
-      mounted = false;
-    };
-  }, []);
+    return () => { mounted = false; };
+  }, [controller, isIsolatedDemo]);
 
   const refreshStartupRecoveryStatus = useCallback(async () => {
     try {
@@ -727,7 +1081,7 @@ export default function App() {
 
   useEffect(() => {
     if (
-      !startupReady ||
+      !startupReady || privacyReviewOpen ||
       !activeDetailNoteId ||
       !activeAnalysisFingerprint ||
       !analysisFreshnessKey
@@ -764,11 +1118,12 @@ export default function App() {
     analysisStatusRetry,
     controller,
     startupReady,
+    privacyReviewOpen,
   ]);
 
   useEffect(() => {
     if (
-      !startupReady ||
+      !startupReady || privacyReviewOpen ||
       !reviewProposalId ||
       !reviewProposalStatus ||
       reviewProposalRevision === undefined ||
@@ -823,6 +1178,7 @@ export default function App() {
     reviewFreshnessRetry,
     controller,
     startupReady,
+    privacyReviewOpen,
   ]);
 
   useEffect(() => {
@@ -858,6 +1214,7 @@ export default function App() {
 
   const run = useCallback(
     async <T,>(fn: () => Promise<T>): Promise<T | undefined> => {
+      if (privacyOutcomeUnknown) return undefined;
       if (!startupReady) return undefined;
       if (busyLock.current) return undefined;
       busyLock.current = true;
@@ -866,13 +1223,14 @@ export default function App() {
       try {
         return await fn();
       } catch (e) {
-        setNotice(messageOf(e));
+        if (isPrivacyBootstrapError(e)) onPrivacyInvalidated();
+        else setNotice(messageOf(e));
       } finally {
         busyLock.current = false;
         setBusy(false);
       }
     },
-    [startupReady],
+    [onPrivacyInvalidated, privacyOutcomeUnknown, startupReady],
   );
   const openReminder = (record: ReminderRecord) => {
     if (record.origin.kind === "proactive" && record.origin.deviceBinding) {
@@ -905,7 +1263,7 @@ export default function App() {
   };
 
   useEffect(() => {
-    if (!startupReady || loading || isolatedPreviewFailed || (isIsolatedDemo && !isReminderDemo)) return;
+    if (!startupReady || loading || privacyReviewOpen || isolatedPreviewFailed || (isIsolatedDemo && !isReminderDemo)) return;
     const reconcile = () => { void controller.reconcileReminderAlerts().catch(() => undefined); };
     const initial = setTimeout(reconcile, 0);
     let wasActive = NativeAppState.currentState === "active";
@@ -926,9 +1284,9 @@ export default function App() {
       removeWeb = () => document.removeEventListener("visibilitychange", onVisibility);
     }
     return () => { clearTimeout(initial); native.remove(); removeWeb?.(); };
-  }, [controller, isolatedPreviewFailed, loading, startupReady]);
+  }, [controller, isolatedPreviewFailed, isIsolatedDemo, loading, privacyReviewOpen, startupReady]);
   const refreshForegroundMail = useCallback(async () => {
-    if (isIsolatedDemo || !startupReady || loading || foregroundMailBusy.current) return;
+    if (isIsolatedDemo || privacyReviewOpen || !startupReady || loading || foregroundMailBusy.current) return;
     foregroundMailBusy.current = true;
     try {
       await controller.refreshForegroundMail();
@@ -937,10 +1295,10 @@ export default function App() {
     } finally {
       foregroundMailBusy.current = false;
     }
-  }, [controller, loading, startupReady]);
+  }, [controller, isIsolatedDemo, loading, privacyReviewOpen, startupReady]);
 
   useEffect(() => {
-    if (!startupReady || loading || isIsolatedDemo) return;
+    if (!startupReady || loading || isIsolatedDemo || privacyReviewOpen) return;
     const initialRefresh = setTimeout(() => {
       void refreshForegroundMail();
     }, 0);
@@ -974,9 +1332,9 @@ export default function App() {
       nativeSubscription.remove();
       removeWebListener?.();
     };
-  }, [loading, refreshForegroundMail, startupReady]);
+  }, [isIsolatedDemo, loading, privacyReviewOpen, refreshForegroundMail, startupReady]);
   useEffect(() => {
-    if (!startupReady || loading || isIsolatedDemo) return;
+    if (!startupReady || loading || isIsolatedDemo || privacyReviewOpen) return;
     const checkPermission = () => {
       if (controller.getSnapshot().deviceCalendars.enabled) {
         void controller.checkDeviceCalendarAccess().catch(() => undefined);
@@ -1004,7 +1362,31 @@ export default function App() {
       removeNative = () => native.remove();
     }
     return () => { clearTimeout(initial); removeNative?.(); removeWeb?.(); };
-  }, [controller, loading, startupReady]);
+  }, [controller, isIsolatedDemo, loading, privacyReviewOpen, startupReady]);
+
+  useEffect(() => {
+    if (!privacy || !session || isIsolatedDemo || !startupReady || loading) return;
+    const verifySession = () => {
+      void privacy.assertWorkspaceEpoch(session.epoch).catch(() => onPrivacyInvalidated());
+    };
+    let removeWeb: (() => void) | undefined;
+    let previousNativeState = NativeAppState.currentState;
+    const native = NativeAppState.addEventListener("change", (next) => {
+      if (previousNativeState !== "active" && next === "active") verifySession();
+      previousNativeState = next;
+    });
+    if (Platform.OS === "web" && typeof document !== "undefined") {
+      let visible = document.visibilityState === "visible";
+      const onVisibility = () => {
+        const next = document.visibilityState === "visible";
+        if (!visible && next) verifySession();
+        visible = next;
+      };
+      document.addEventListener("visibilitychange", onVisibility);
+      removeWeb = () => document.removeEventListener("visibilitychange", onVisibility);
+    }
+    return () => { native.remove(); removeWeb?.(); };
+  }, [isIsolatedDemo, loading, onPrivacyInvalidated, privacy, session, startupReady]);
   const openNote = (note: Note) => {
     setDetail(note);
     setTab("record");
@@ -1037,9 +1419,9 @@ export default function App() {
       setBusy(false);
     }
   };
-  const saveRecording = useCallback(async () => {
+  const saveRecording = useCallback(async (): Promise<boolean> => {
     const result = await audio.stop();
-    if (!result) return;
+    if (!result) return false;
     const note = await controller.saveNote({
       transcript: "",
       audioUri: result.uri,
@@ -1052,29 +1434,46 @@ export default function App() {
     setNotice(
       "Recording saved on this device. Add a transcript to create a reviewable proposal.",
     );
+    return true;
   }, [audio, controller]);
+  const autoStopGate = useRef(new RecordingAutoStopGate());
   useEffect(() => {
-    if (
-      !startupReady ||
-      audio.status === "recording" &&
-      audio.durationSeconds >= state.settings.maxAudioSeconds
-    ) {
-      const timer = setTimeout(() => {
-        void run(async () => {
-          await saveRecording();
-          setNotice(
-            "Recording reached the configured length limit and was saved.",
-          );
-        });
-      }, 0);
-      return () => clearTimeout(timer);
-    }
+    const gate = autoStopGate.current;
+    const eligible = gate.claim({
+      startupReady,
+      isolatedPreview: isIsolatedDemo,
+      outcomeUnknown: privacyOutcomeUnknown,
+      busy,
+      status: audio.status,
+      durationSeconds: audio.durationSeconds,
+      maxAudioSeconds: state.settings.maxAudioSeconds,
+    });
+    if (!eligible) return;
+    let fired = false;
+    const timer = setTimeout(() => {
+      fired = true;
+      if (busyLock.current) {
+        gate.defer();
+        return;
+      }
+      void run(async () => {
+        const saved = await saveRecording();
+        if (saved) setNotice("Recording reached the configured length limit and was saved.");
+      });
+    }, 0);
+    return () => {
+      clearTimeout(timer);
+      if (!fired) gate.defer();
+    };
   }, [
     audio.durationSeconds,
     audio.status,
     state.settings.maxAudioSeconds,
     run,
     saveRecording,
+    busy,
+    isIsolatedDemo,
+    privacyOutcomeUnknown,
     startupReady,
   ]);
   const confirmCancel = () =>
@@ -1137,7 +1536,7 @@ export default function App() {
         );
       });
     },
-    [run, controller],
+    [run, controller, isIsolatedDemo],
   );
 
   const disconnectAccount = useCallback(
@@ -1278,7 +1677,9 @@ export default function App() {
                         ? "Sample transcription · in-memory only · no API used"
                       : isStartupRecoveryDemo
                         ? "Sample recovery · in-memory only · no external access"
-                        : "Sample knowledge · in-memory only · no external actions"}
+                        : isPrivacyCleanupDemo
+                          ? "Sample privacy cleanup · in-memory only · no external access"
+                          : "Sample knowledge · in-memory only · no external actions"}
               </Text>
             </View>
           ) : null}
@@ -1523,7 +1924,7 @@ export default function App() {
                 onExportAudio={() =>
                   run(async () => {
                     if (!detail.audioUri) return;
-                    const file = await loadAudioForUpload(detail.audioUri);
+                    const file = await loadAudioForUpload(detail.audioUri, audioBoundary);
                     if (file.platform === "web")
                       downloadBlob(file.blob, file.fileName);
                     else
@@ -1609,6 +2010,7 @@ export default function App() {
                 tasks={state.tasks}
                 busy={busy}
                 controller={controller}
+                audioBoundary={audioBoundary}
                 importedBackups={state.importedBackups}
                 knowledge={state.knowledge}
                 knowledgeRecoveryStatus={state.knowledgeRecoveryStatus}
@@ -1665,20 +2067,18 @@ export default function App() {
                   if (isIsolatedDemo && !isBackupImportDemo) return;
                   void run(async () => {
                     const data = await controller.exportData();
-                    if (Platform.OS === "web")
-                      downloadText(
-                        data,
-                        "still-export.json",
-                        "application/json",
-                      );
-                    else {
-                      const path = `${FileSystem.documentDirectory}still-export.json`;
-                      await FileSystem.writeAsStringAsync(path, data);
-                      await Sharing.shareAsync(path, {
-                        mimeType: "application/json",
-                        dialogTitle: "Export Still data",
-                      });
-                    }
+                    const exportAndShare = async () => {
+                      if (Platform.OS === "web") {
+                        downloadText(data, "still-export.json", "application/json");
+                      } else {
+                        const path = `${FileSystem.documentDirectory}still-export.json`;
+                        await FileSystem.writeAsStringAsync(path, data);
+                        await Sharing.shareAsync(path, { mimeType: "application/json", dialogTitle: "Export Still data" });
+                      }
+                    };
+                    if (privacy && session && !isIsolatedDemo) {
+                      await privacy.withWriter(session.epoch, { kind: "internal_export", namespace: "internal_export" }, exportAndShare);
+                    } else await exportAndShare();
                   });
                 }}
               />
@@ -1729,8 +2129,15 @@ export default function App() {
               onSave={(patch) => run(() => controller.saveSettings(patch))}
               onSaveAccount={(c) => run(() => controller.saveAccount(c))}
               onSaveCalendar={(c) => run(() => controller.saveCalendar(c))}
-              onSaveCredentials={(c) => run(() => setCredentials(c))}
-              onDeleteCredentials={(kind) => run(() => deleteCredentials(kind))}
+              credentialService={credentials}
+              privacyEraseAvailable={isPrivacyCleanupDemo}
+              onSaveCredentials={(c) => isIsolatedDemo
+                ? Promise.resolve(undefined)
+                : run(() => credentials.setCredentials(c))}
+              onDeleteCredentials={(kind) => isIsolatedDemo
+                ? Promise.resolve(undefined)
+                : run(() => credentials.deleteCredentials(kind))}
+              onDeleteLocalData={openPrivacyReview}
               onNotice={setNotice}
               onConnect={connectAccount}
               onDisconnect={disconnectAccount}
@@ -2311,10 +2718,10 @@ function InboxScreen({
   onGetCandidateSource,
 }: {
   proposals: Proposal[];
-  accounts: ReturnType<typeof productionController.getSnapshot>["accounts"];
+  accounts: AppState["accounts"];
   mailbox: MailboxSnapshotMessage[];
-  deviceCalendars: ReturnType<typeof productionController.getSnapshot>["deviceCalendars"];
-  deviceCalendarAccess: ReturnType<typeof productionController.getSnapshot>["deviceCalendarAccess"]["status"];
+  deviceCalendars: AppState["deviceCalendars"];
+  deviceCalendarAccess: AppState["deviceCalendarAccess"]["status"];
   onReplyMessage: (messageId: string) => void;
   proactive: ProactiveState;
   filter: "pending" | "done";
@@ -2423,6 +2830,7 @@ function LibraryScreen({
   tasks,
   busy,
   controller,
+  audioBoundary,
   importedBackups,
   knowledge,
   knowledgeRecoveryStatus,
@@ -2468,9 +2876,10 @@ function LibraryScreen({
   tasks: LocalTask[];
   busy: boolean;
   controller: AppController;
-  importedBackups: ReturnType<typeof productionController.getSnapshot>["importedBackups"];
-  knowledge: ReturnType<typeof productionController.getSnapshot>["knowledge"];
-  knowledgeRecoveryStatus?: ReturnType<typeof productionController.getSnapshot>["knowledgeRecoveryStatus"];
+  audioBoundary?: PrivacyAudioBoundary;
+  importedBackups: AppState["importedBackups"];
+  knowledge: AppState["knowledge"];
+  knowledgeRecoveryStatus?: AppState["knowledgeRecoveryStatus"];
   references: { reference: KnowledgeReference; label: string }[];
   evidenceLabels: Record<string, string>;
   previewMode: boolean;
@@ -2478,7 +2887,7 @@ function LibraryScreen({
   knowledgeDemoMode: boolean;
   reminderRecords: ReminderRecord[];
   reminderIntents: ReminderIntent[];
-  reminderRecoveryStatus?: ReturnType<typeof productionController.getSnapshot>["reminderRecoveryStatus"];
+  reminderRecoveryStatus?: AppState["reminderRecoveryStatus"];
   reminderDemoMode: boolean;
   onCreateReminder: () => void;
   onOpenReminder: (record: ReminderRecord) => void;
@@ -2698,6 +3107,7 @@ function LibraryScreen({
         controller={controller}
         busy={busy}
         sampleMode={sampleBackupMode}
+        privacyAudioBoundary={audioBoundary}
         onClose={() => setImportOpen(false)}
       />
       <KnowledgeEntitySheet
@@ -2735,6 +3145,9 @@ function SettingsScreen({
   onSaveCalendar,
   onSaveCredentials,
   onDeleteCredentials,
+  credentialService,
+  privacyEraseAvailable = false,
+  onDeleteLocalData,
   onNotice,
   onConnect,
   onDisconnect,
@@ -2749,7 +3162,7 @@ function SettingsScreen({
   onSelectDeviceCalendars,
   onRefreshDeviceCalendars,
 }: {
-  state: ReturnType<typeof productionController.getSnapshot>;
+  state: AppState;
   onClose: () => void;
   busy: boolean;
   demoMode: boolean;
@@ -2790,6 +3203,9 @@ function SettingsScreen({
     openAiApiKey?: string;
   }) => Promise<unknown>;
   onDeleteCredentials: (kind?: "speech" | "openai") => Promise<unknown>;
+  credentialService: ProviderCredentialService;
+  privacyEraseAvailable?: boolean;
+  onDeleteLocalData: () => void;
   onNotice: (v: string) => void;
 }) {
   const [endpoint, setEndpoint] = useState(state.settings.openAiEndpoint ?? "");
@@ -2841,10 +3257,10 @@ function SettingsScreen({
   );
   useEffect(() => {
     if (demoMode) return;
-    getCredentials()
+    credentialService.getCredentials()
       .then(setCredentialStatus)
       .catch((e) => onNotice(messageOf(e)));
-  }, [demoMode, onNotice]);
+  }, [credentialService, demoMode, onNotice]);
   const saveSettings = async () => {
     const requestKb = Number(maxRequestKb);
     if (!Number.isFinite(requestKb) || requestKb < 4 || requestKb > 96) {
@@ -3307,8 +3723,10 @@ function SettingsScreen({
         <Text style={s.disclaimer}>
           App database and documents use private app storage, which is not
           automatically encrypted and may be included in device backups. Exports
-          are user initiated. Delete a note from its detail screen.
+          are user initiated. Delete a note from its detail screen. Full deletion
+          reviews tracked local data and requires a separate typed confirmation.
         </Text>
+        {!demoMode || privacyEraseAvailable ? <Button label="Delete local app data" tone="danger" disabled={busy} onPress={onDeleteLocalData} /> : null}
         <View style={{ height: 32 }} />
       </ScrollView>
     </View>

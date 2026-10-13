@@ -794,6 +794,8 @@ export interface EditKnowledgeSuggestionInput {
 export interface AppController {
   getSnapshot(): AppState;
   subscribe(listener: (state: AppState) => void): () => void;
+  /** Called only after local privacy cleanup is durably complete. */
+  disposeForPrivacy?(): Promise<void>;
   load(): Promise<void>;
   getStartupRecoveryStatus(): Promise<StartupRecoveryStatus>;
   prepareStartupRecovery(): Promise<StartupRecoveryPlan>;
@@ -886,6 +888,8 @@ export interface AppController {
   getMailReplyText(messageId: string): Promise<MailReplyTextCacheResult>;
   generateMailReplyText(input: MailReplyTextGenerationInput): Promise<MailReplyTextGenerationResult>;
 }
+
+export type { PrivacyWorkspaceSession } from '../privacy/service';
 
 export type StartupRecoveryPhase = 'ready' | 'failed' | 'prepared' | 'committing' | 'committed_opening' | 'unavailable';
 export interface StartupRecoveryStatus {

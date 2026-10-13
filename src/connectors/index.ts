@@ -39,6 +39,8 @@ export interface OAuthBridgeResult {
 export interface OAuthTokenStore {
   get(tokenRef: string): Promise<StoredOAuthToken | null>;
   set(tokenRef: string, token: StoredOAuthToken): Promise<void>;
+  /** Optional for callers that own account disconnect; token erasure must use this actual store operation. */
+  delete?(tokenRef: string): Promise<void>;
 }
 
 export interface ConnectorDependencies {
@@ -54,6 +56,8 @@ export interface ConnectorDependencies {
   sha256?: (bytes: Uint8Array) => Promise<string>;
   loadAttachment?: (id: string) => Promise<Uint8Array>;
   isConnectionCurrent?: (account: Account) => boolean;
+  /** Holds the independent privacy writer lease through the raw provider request and full response read. */
+  withProviderOwnership?: <T>(actual: () => Promise<T>) => Promise<T>;
 }
 
 export interface ApprovedDispatch {
@@ -551,9 +555,14 @@ export class ConnectorClient {
   }
 
   private async boundedFetch(input: RequestInfo | URL, init: RequestInit, guard?: RequestGuard, onDispatched?: () => void, beforeDispatch?: () => void, outerSignal?: AbortSignal, responseByteLimit?: number): Promise<Response> {
+    const actualRequest = () => this.performBoundedFetch(input, init, guard, onDispatched, beforeDispatch, outerSignal, responseByteLimit);
+    return this.deps.withProviderOwnership ? this.deps.withProviderOwnership(actualRequest) : actualRequest();
+  }
+
+  private async performBoundedFetch(input: RequestInfo | URL, init: RequestInit, guard?: RequestGuard, onDispatched?: () => void, beforeDispatch?: () => void, outerSignal?: AbortSignal, responseByteLimit?: number): Promise<Response> {
     const controller = new AbortController();
     const timeout = Math.max(1_000, Math.min(30_000, this.deps.requestTimeoutMs ?? 15_000));
-    const timer = setTimeout(() => controller.abort(), timeout);
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const forwardAbort = () => controller.abort(outerSignal?.reason);
     try {
       if (outerSignal?.aborted) throw new Error('Provider request was cancelled.');
@@ -561,15 +570,21 @@ export class ConnectorClient {
       guard?.();
       beforeDispatch?.();
       onDispatched?.();
+      if (outerSignal?.aborted) throw new Error('Provider request was cancelled.');
+      timer = setTimeout(() => controller.abort(), timeout);
       const response = await this.fetcher(input, { ...init, signal: controller.signal });
       const declaredLength = response.headers.get('content-length');
-      if (responseByteLimit && declaredLength && /^\d+$/.test(declaredLength) && Number(declaredLength) > responseByteLimit) throw new ProviderResponseTooLargeError();
+      if (responseByteLimit && declaredLength && /^\d+$/.test(declaredLength) && Number(declaredLength) > responseByteLimit) {
+        // Keep provider ownership until the response stream has actually settled its cancellation.
+        try { await response.body?.cancel(); } catch { /* Cancellation rejection is still a bounded oversized response. */ }
+        throw new ProviderResponseTooLargeError();
+      }
       // Fetch has already buffered native response bytes when arrayBuffer resolves; this is an application parsing bound, not a network-memory cap.
       const bytes = await response.arrayBuffer();
       if (responseByteLimit && bytes.byteLength > responseByteLimit) throw new ProviderResponseTooLargeError();
       return new Response(response.status === 204 || response.status === 205 || response.status === 304 ? null : bytes, { status: response.status, statusText: response.statusText, headers: response.headers });
     }
-    finally { clearTimeout(timer); outerSignal?.removeEventListener('abort', forwardAbort); }
+    finally { if (timer) clearTimeout(timer); outerSignal?.removeEventListener('abort', forwardAbort); }
   }
 
   private async token(account: Account, guard?: RequestGuard, signal?: AbortSignal): Promise<StoredOAuthToken> {

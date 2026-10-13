@@ -12,6 +12,8 @@ export type SpeechAudioService = {
   prepare(note: Note, options: { leaseId: string; maxDurationSeconds: number; signal?: AbortSignal }): Promise<PreparedSpeechAudio>;
   verify(prepared: PreparedSpeechAudio, signal?: AbortSignal): Promise<void>;
   release(leaseId: string): Promise<void>;
+  /** Drops private in-memory staging state synchronously without claiming raw I/O settled. */
+  disposeMemory?(): void;
 };
 
 export type SpeechAudioCrypto = {

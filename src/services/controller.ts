@@ -12,7 +12,7 @@ import type {
   SavePersonInput, SaveProjectInput, KnowledgeItemCommand, SaveKnowledgeFactInput, SaveKnowledgeContactInput,
   SaveKnowledgeSourceLinkInput, SaveKnowledgeMemberInput, ReviewKnowledgeSuggestionInput, EditKnowledgeSuggestionInput, KnowledgeSelection,
 } from '../core';
-import { stateStore } from '../storage/platformStorage';
+import { createPlatformStateStore, stateStore } from '../storage/platformStorage';
 import type { StateStore } from '../storage/contracts';
 import { STARTUP_RECOVERY_SESSION_MS, validateRecoveryId, validateRecoveryIso, validateRecoveryReceipt, validateReplacementSnapshot, type StartupRecoveryInspection, type StartupRecoveryPlan, type StartupRecoveryReceipt, type StartupRecoveryCommitInput } from '../storage/startupRecovery';
 import { writePrivateDocument } from '../storage/documents';
@@ -61,6 +61,13 @@ import type { ImportedBackupArchive, PortableBackupV3, PortableKnowledgeCohort }
 import { SpeechTranscriptionError, validateTranscriptionState, validateSpeechAudioSnapshot } from '../transcription';
 import type { SpeechAudioSnapshot, SpeechAttemptCode, SpeechTranscriptionResult, TranscriptionAttempt, TranscriptionState } from '../transcription';
 import type { PreparedSpeechAudio, SpeechAudioService } from '../audio/speechUpload.types';
+import { getDefaultPrivacyService, type PrivacyService, type PrivacyWorkspaceSession } from '../privacy/service';
+import { createPrivacyBoundController } from '../privacy/controllerBoundary';
+import { bindWorkspaceStorage } from '../privacy/workspaceStorage';
+import { createPrivacyResourceBoundary, type PrivacyResourceBoundary } from '../privacy/resourceBoundary';
+import { createPrivacyAudioBoundary, createPrivacyBoundRecordingRecoveryService, createPrivacyBoundSpeechAudioService, type PrivacyAudioBoundary } from '../privacy/audioBoundary';
+import { createProviderCredentialService, type ProviderCredentialService } from './credentials';
+import { credentialStore } from '../storage/credentials';
 
 const now = () => new Date().toISOString();
 const ASSIST_CONTRACT_VERSION = 'assist-v3';
@@ -1054,6 +1061,8 @@ function normalizeLoadedState(value: unknown): NormalizedLoadedState {
 }
 
 export interface ControllerIntegrationDependencies {
+  privacySession?: { epoch: string; assertCurrent(): Promise<void> };
+  credentials?: ProviderCredentialService;
   writeDocument?: (path: string, content: string) => Promise<void>;
   tokenStore?: OAuthTokenStore;
   deleteToken?: (tokenRef: string) => Promise<void>;
@@ -1062,9 +1071,13 @@ export interface ControllerIntegrationDependencies {
   connectorFactory?: (
     tokenStore: OAuthTokenStore,
     onAuthStatus: (accountId: string, status: Account['authStatus']) => Promise<void>,
+    withProviderOwnership?: <T>(actual: () => Promise<T>) => Promise<T>,
   ) => ConnectorClient;
   recordingRecovery?: RecordingRecoveryService;
   speechAudioService?: SpeechAudioService;
+  audioBoundary?: PrivacyAudioBoundary;
+  removeAudio?: (uri: string) => Promise<void>;
+  disposePrivacyResources?: () => void;
   reminderBackend?: NotificationBackend;
   deviceCalendarBackend?: DeviceCalendarBackend;
 }
@@ -1183,8 +1196,16 @@ export class AppControllerImpl implements AppController {
     providers: { speech?: AzureSpeechClient; openAi?: AzureOpenAIClient } = {},
     private readonly integration: ControllerIntegrationDependencies = {},
   ) {
-    this.speechClient = providers.speech ?? new AzureSpeechClient({ audio: integration.speechAudioService });
-    this.openAiClient = providers.openAi ?? new AzureOpenAIClient();
+    const credentials = integration.credentials;
+    this.speechClient = providers.speech ?? new AzureSpeechClient({
+      audio: integration.speechAudioService,
+      ...(credentials ? {
+        readKeySnapshot: () => credentials.readSpeechCredentialSnapshot(),
+        currentCredentialGeneration: () => credentials.currentSpeechCredentialGeneration(),
+        assertCredentialGeneration: (generation: number) => credentials.assertSpeechCredentialGeneration(generation),
+      } : {}),
+    });
+    this.openAiClient = providers.openAi ?? new AzureOpenAIClient(fetch, credentials ? () => credentials.readProviderCredential('openai') : undefined);
     this.connector = integration.tokenStore && integration.connectorFactory
       ? integration.connectorFactory(integration.tokenStore, (accountId, status) => this.handleConnectorAuthStatus(accountId, status))
       : undefined;
@@ -1192,9 +1213,62 @@ export class AppControllerImpl implements AppController {
     this.deviceCalendarBackend = integration.deviceCalendarBackend ?? getDeviceCalendarBackend();
   }
 
+  async disposeForPrivacy(): Promise<void> {
+    this.bootstrapGeneration += 1;
+    this.speechClient.disposeMemory();
+    for (const controller of this.syncAbortControllers.values()) controller.abort();
+    for (const job of this.transcriptionJobs.values()) job.controller.abort();
+    for (const timer of this.deviceEventCreateTimers.values()) clearTimeout(timer);
+    this.deviceEventCreateTimers.clear();
+    this.syncAbortControllers.clear();
+    this.processJobs.clear();
+    this.assistJobs.clear();
+    this.syncJobs.clear();
+    this.mailLaneJobs.clear();
+    this.mailReplyGenerations.clear();
+    this.mailReplyGenerationCache.clear();
+    this.backupImportSessions.clear();
+    this.knowledgeActivationSessions.clear();
+    this.recordingAttachmentSessions.clear();
+    this.recordingAttachmentJobs.clear();
+    this.recordingAttachmentReceipts.clear();
+    this.transcriptionJobs.clear();
+    this.deviceEventJobs.clear();
+    this.deviceEventLateResults.clear();
+    this.reminderJobs.clear();
+    this.reminderLegacyJobs.clear();
+    this.listeners.clear();
+    this.state = initialState();
+    this.snapshot = deepFreeze(this.publicState(this.state));
+    this.loaded = false;
+    this.loadPromise = undefined;
+    this.transactionQueue = Promise.resolve();
+    this.proactiveQuarantine = undefined;
+    this.backupImportQuarantine = [];
+    this.knowledgeQuarantine = [];
+    this.reminderQuarantine = [];
+    this.deviceEventQuarantine = [];
+    this.dispatchRecordQuarantine = [];
+    this.transcriptionQuarantine = [];
+    this.analysisCache.clear();
+    this.proactiveSourceHashMemo.clear();
+    this.verifiedReminderForeground.clear();
+    this.verifiedDeviceCalendarGeneration = undefined;
+    this.integration.disposePrivacyResources?.();
+  }
+
+  private async assertPrivacySessionCurrent(): Promise<void> {
+    await this.integration.privacySession?.assertCurrent();
+  }
+
   private async getRecordingRecoveryService(): Promise<RecordingRecoveryService> {
-    if (this.integration.recordingRecovery) return this.integration.recordingRecovery;
-    this.recordingRecoveryPromise ??= import('../audio/recovery').then((module) => module.recordingRecoveryService)
+    if (this.integration.recordingRecovery && !this.integration.audioBoundary) return this.integration.recordingRecovery;
+    this.recordingRecoveryPromise ??= (this.integration.recordingRecovery
+      ? Promise.resolve(this.integration.recordingRecovery)
+      : import('../audio/recovery').then((module) => module.recordingRecoveryService))
+      .then((service) => this.integration.audioBoundary
+        ? createPrivacyBoundRecordingRecoveryService(service, this.integration.audioBoundary)
+        : service)
       .catch((error) => { this.recordingRecoveryPromise = undefined; throw error; });
     return this.recordingRecoveryPromise;
   }
@@ -1413,20 +1487,28 @@ export class AppControllerImpl implements AppController {
   }
 
   /** Serialize the complete read-modify-write operation; failed writes never mutate committed state. */
-  private mutate<T>(operation: (draft: AppState) => T | Promise<T>): Promise<T> {
+  private async mutate<T>(operation: (draft: AppState) => T | Promise<T>): Promise<T> {
+    await this.assertPrivacySessionCurrent();
     const capturedBootstrapGeneration = this.bootstrapGeneration;
     const run = this.transactionQueue.then(async () => {
       if (capturedBootstrapGeneration !== this.bootstrapGeneration) throw new Error('The app restarted while this action was waiting. Review the current state and try again.');
       if (this.startupRecoveryPhase !== 'ready') throw new Error('App startup is not ready. Retry startup or complete the recovery flow first.');
       if (!this.loaded) await this.load();
       if (this.loadPromise) await this.loadPromise;
+      await this.assertPrivacySessionCurrent();
       if (capturedBootstrapGeneration !== this.bootstrapGeneration || this.startupRecoveryPhase !== 'ready') throw new Error('App startup changed while this action was waiting. Review the current state and try again.');
       const draft = clone(this.state);
       const result = await operation(draft);
+      await this.assertPrivacySessionCurrent();
       await this.evaluateProactiveDraft(draft);
       draft.reminders = validateReminderState(draft.reminders);
       draft.transcription = clone(validateTranscriptionState(draft.transcription));
+      await this.assertPrivacySessionCurrent();
       await this.store.save(this.persistedState(draft));
+      await this.assertPrivacySessionCurrent();
+      if (capturedBootstrapGeneration !== this.bootstrapGeneration || this.startupRecoveryPhase !== 'ready') {
+        throw new Error('The app workspace changed while the update was being saved. Reopen the app before continuing.');
+      }
       this.state = draft;
       this.snapshot = deepFreeze(this.publicState(draft));
       this.emit();
@@ -1437,21 +1519,29 @@ export class AppControllerImpl implements AppController {
   }
 
   /** A serialized local read/check that only commits when it actually changes state. */
-  private mutateIfChanged<T>(operation: (draft: AppState) => Promise<{ changed: boolean; result: T }> | { changed: boolean; result: T }): Promise<T> {
+  private async mutateIfChanged<T>(operation: (draft: AppState) => Promise<{ changed: boolean; result: T }> | { changed: boolean; result: T }): Promise<T> {
+    await this.assertPrivacySessionCurrent();
     const capturedBootstrapGeneration = this.bootstrapGeneration;
     const run = this.transactionQueue.then(async () => {
       if (capturedBootstrapGeneration !== this.bootstrapGeneration) throw new Error('The app restarted while this action was waiting. Review the current state and try again.');
       if (this.startupRecoveryPhase !== 'ready') throw new Error('App startup is not ready. Retry startup or complete the recovery flow first.');
       if (!this.loaded) await this.load();
       if (this.loadPromise) await this.loadPromise;
+      await this.assertPrivacySessionCurrent();
       if (capturedBootstrapGeneration !== this.bootstrapGeneration || this.startupRecoveryPhase !== 'ready') throw new Error('App startup changed while this action was waiting. Review the current state and try again.');
       const draft = clone(this.state);
       const { changed, result } = await operation(draft);
+      await this.assertPrivacySessionCurrent();
       if (changed) {
         await this.evaluateProactiveDraft(draft);
         draft.reminders = validateReminderState(draft.reminders);
         draft.transcription = clone(validateTranscriptionState(draft.transcription));
+        await this.assertPrivacySessionCurrent();
         await this.store.save(this.persistedState(draft));
+        await this.assertPrivacySessionCurrent();
+        if (capturedBootstrapGeneration !== this.bootstrapGeneration || this.startupRecoveryPhase !== 'ready') {
+          throw new Error('The app workspace changed while the update was being saved. Reopen the app before continuing.');
+        }
         this.state = draft;
         this.snapshot = deepFreeze(this.publicState(draft));
         this.emit();
@@ -1740,6 +1830,7 @@ export class AppControllerImpl implements AppController {
   }
 
   async load(): Promise<void> {
+    await this.assertPrivacySessionCurrent();
     if (['failed', 'prepared', 'committing', 'committed_opening', 'unavailable'].includes(this.startupRecoveryPhase)) {
       throw new Error(this.startupRecoveryPhase === 'committed_opening'
         ? 'Fresh app data is committed. Retry startup to finish opening it.'
@@ -1946,9 +2037,13 @@ export class AppControllerImpl implements AppController {
   }
 
   private async loadInternal(): Promise<void> {
+    const capturedBootstrapGeneration = this.bootstrapGeneration;
+    await this.assertPrivacySessionCurrent();
     this.verifiedReminderForeground.clear();
     this.verifiedDeviceCalendarGeneration = undefined;
     const loaded = await this.store.load();
+    await this.assertPrivacySessionCurrent();
+    if (capturedBootstrapGeneration !== this.bootstrapGeneration) throw new Error('The app workspace changed while startup was loading. Reopen the app before continuing.');
     const normalized: NormalizedLoadedState = loaded ? normalizeLoadedState(loaded) : initialState();
     this.dispatchRecordQuarantine = clone(normalized.dispatchRecordQuarantine ?? []);
     delete normalized.dispatchRecordQuarantine;
@@ -1975,6 +2070,8 @@ export class AppControllerImpl implements AppController {
       let token: StoredOAuthToken | null = null;
       try { token = account.tokenRef ? await this.integration.tokenStore?.get(account.tokenRef) ?? null : null; }
       catch { token = null; }
+      await this.assertPrivacySessionCurrent();
+      if (capturedBootstrapGeneration !== this.bootstrapGeneration) throw new Error('The app workspace changed while startup was loading. Reopen the app before continuing.');
       if (!token || !sameAccountIdentity(token.identity, account.identity)) {
         account.authStatus = 'reauth_required';
         account.connected = false;
@@ -2051,8 +2148,11 @@ export class AppControllerImpl implements AppController {
     ensurePeriodDocuments(this.state);
     await this.evaluateProactiveDraft(this.state);
     const stateToSave = this.persistedState(this.state);
+    await this.assertPrivacySessionCurrent();
     if (!loaded || JSON.stringify(stateToSave) !== JSON.stringify(loaded)) await this.store.save(stateToSave);
     await this.store.assertCurrent?.();
+    await this.assertPrivacySessionCurrent();
+    if (capturedBootstrapGeneration !== this.bootstrapGeneration) throw new Error('The app workspace changed while startup was loading. Reopen the app before continuing.');
     this.snapshot = deepFreeze(this.publicState(this.state));
     this.loaded = true;
     this.emit();
@@ -2908,7 +3008,7 @@ export class AppControllerImpl implements AppController {
             addActivity(draft, 'local_action', 'Original recording detached after transcription, as configured.', { noteId: id });
             return { note: current, detached: true };
           });
-          if (detach.detached && detach.note) { try { await removeAudio(retentionUri); } catch { /* The note no longer references this private clip. */ } updated = clone(detach.note); }
+          if (detach.detached && detach.note) { try { await (this.integration.removeAudio?.(retentionUri) ?? removeAudio(retentionUri, this.integration.audioBoundary)); } catch { /* The note no longer references this private clip. */ } updated = clone(detach.note); }
         } catch { /* Durable transcript stays committed if clip cleanup fails. */ }
       }
       this.markTranscriptionCleanupPending(leaseId);
@@ -6636,7 +6736,7 @@ export class AppControllerImpl implements AppController {
     });
     await this.reconcileReminderAlerts();
     if (audioUri) {
-      try { await removeAudio(audioUri); }
+      try { await (this.integration.removeAudio?.(audioUri) ?? removeAudio(audioUri, this.integration.audioBoundary)); }
       catch { /* Note deletion is canonical; a broken or missing clip is harmless. */ }
     }
   }
@@ -6675,3 +6775,106 @@ const defaultIntegration: ControllerIntegrationDependencies = {
 defaultController = new AppControllerImpl(undefined, {}, defaultIntegration);
 export const controller: AppController = defaultController;
 export default controller;
+
+/**
+ * Constructs the production workspace only after the independent privacy journal
+ * confirms that no erase is active. Callers should use this factory at the app
+ * bootstrap boundary before rendering or invoking data-bearing controller APIs.
+ */
+export async function createProductionController(options: {
+  privacy?: PrivacyService;
+  session?: PrivacyWorkspaceSession;
+  resources?: PrivacyResourceBoundary;
+  audioBoundary?: PrivacyAudioBoundary;
+  credentials?: ProviderCredentialService;
+  store?: StateStore;
+  providers?: { speech?: AzureSpeechClient; openAi?: AzureOpenAIClient };
+  integration?: ControllerIntegrationDependencies;
+} = {}): Promise<AppController> {
+  const privacy = options.privacy ?? options.resources?.privacy ?? await getDefaultPrivacyService();
+  if (options.resources && options.resources.privacy !== privacy) throw new Error('Privacy resource boundary belongs to a different control service.');
+  const requestedSession = options.session ?? options.resources?.session;
+  const capturedRequestedSession = requestedSession
+    ? Object.freeze({ epoch: requestedSession.epoch, runtimeId: requestedSession.runtimeId })
+    : undefined;
+  const openedSession = await privacy.openWorkspace();
+  const session: PrivacyWorkspaceSession = capturedRequestedSession ?? Object.freeze({ epoch: openedSession.epoch, runtimeId: openedSession.runtimeId });
+  if (session.epoch !== openedSession.epoch || session.runtimeId !== openedSession.runtimeId) {
+    throw new Error('The supplied privacy workspace session is no longer current.');
+  }
+  if (options.resources && (options.resources.session.epoch !== session.epoch || options.resources.session.runtimeId !== session.runtimeId)) {
+    throw new Error('Privacy resource boundary belongs to a different workspace session.');
+  }
+  if (options.audioBoundary && (options.audioBoundary.binding.privacy !== privacy ||
+      options.audioBoundary.binding.session.epoch !== session.epoch || options.audioBoundary.binding.session.runtimeId !== session.runtimeId)) {
+    throw new Error('Privacy audio boundary belongs to a different workspace session.');
+  }
+  const audioBoundary = options.audioBoundary ?? createPrivacyAudioBoundary({
+    privacy, session, captureNamespace: Platform.OS === 'web' ? 'browser_audio' : 'native_recordings',
+  });
+  const resources = options.resources ?? createPrivacyResourceBoundary({ privacy, session });
+  let implementation: AppControllerImpl | undefined;
+  const boundStore = bindWorkspaceStorage(options.store ?? createPlatformStateStore(), privacy, session);
+  const rawTokenStore = options.integration?.tokenStore ?? oauthTokenStore;
+  const tokenStore = resources.oauthTokenStore(rawTokenStore);
+  const providerCredentials = options.credentials ?? options.integration?.credentials ?? createProviderCredentialService(resources.credentialStore(credentialStore));
+  const rawWriteDocument = options.integration?.writeDocument ?? writePrivateDocument;
+  const configuredConnectorFactory = options.integration?.connectorFactory;
+  let factoryConnector: ConnectorClient | undefined;
+  const boundNotifications = resources.notificationBackend(options.integration?.reminderBackend ?? createNotificationBackend());
+  const boundDeviceCalendars = resources.deviceCalendarBackend(options.integration?.deviceCalendarBackend ?? getDeviceCalendarBackend());
+  const integration: ControllerIntegrationDependencies = {
+    ...defaultIntegration,
+    ...options.integration,
+    credentials: providerCredentials,
+    audioBoundary,
+    speechAudioService: options.integration?.speechAudioService ?? createPrivacyBoundSpeechAudioService(audioBoundary),
+    removeAudio: async (uri) => audioBoundary.withAudioWrite(() => options.integration?.removeAudio
+      ? options.integration.removeAudio(uri)
+      : removeAudio(uri)),
+    reminderBackend: boundNotifications.backend,
+    deviceCalendarBackend: boundDeviceCalendars.backend,
+    disposePrivacyResources: () => { boundNotifications.dispose(); boundDeviceCalendars.dispose(); },
+    privacySession: {
+      epoch: session.epoch,
+      assertCurrent: () => privacy.assertWorkspaceEpoch(session.epoch),
+    },
+    writeDocument: async (path, content) => {
+      await privacy.withWriter(session.epoch, { kind: 'markdown_mirror', namespace: 'markdown_mirrors', legacyMarkdownPath: path }, () => rawWriteDocument(path, content));
+    },
+    tokenStore,
+    deleteToken: tokenStore.delete,
+    connectorFactory: (store, onAuthStatus) => {
+      const connector = configuredConnectorFactory?.(store, onAuthStatus, resources.withProviderOwnership) ?? new ConnectorClient({
+        tokenStore: store, googleClientId, microsoftClientId, microsoftAuthority, onAuthStatus,
+        withProviderOwnership: resources.withProviderOwnership,
+        isConnectionCurrent: (account) => {
+          const current = implementation?.getSnapshot().accounts.find((item) => item.id === account.id);
+          return Boolean(current && current.connected && current.authStatus === 'connected' && current.tokenRef === account.tokenRef &&
+            current.connectionGeneration === account.connectionGeneration && sameAccountIdentity(current.identity, account.identity));
+        },
+      });
+      if (connector instanceof ConnectorClient) factoryConnector = connector;
+      return connector;
+    },
+    verifyOAuthResult: options.integration?.verifyOAuthResult ?? (async (result, stored) => {
+      if (!factoryConnector || !await factoryConnector.verifyOAuthIdentity(result, stored)) return false;
+      const known: AccountCapability[] = ['mail.read', 'mail.draft', 'mail.send', 'calendar.read', 'calendar.write'];
+      if (result.requestedCapabilities.some((item) => !known.includes(item)) || result.capabilities.some((item) => !result.requestedCapabilities.includes(item))) return false;
+      if (result.requestedCapabilities.includes('calendar.write') && !result.requestedCapabilities.includes('calendar.read')) return false;
+      return result.capabilities.every((item) => scopeGrantsCapability(result.provider, result.grantedScopes, item));
+    }),
+  };
+  const providers = {
+    speech: options.providers?.speech ?? new AzureSpeechClient({
+      audio: integration.speechAudioService,
+      readKeySnapshot: () => providerCredentials.readSpeechCredentialSnapshot(),
+      currentCredentialGeneration: () => providerCredentials.currentSpeechCredentialGeneration(),
+      assertCredentialGeneration: (generation) => providerCredentials.assertSpeechCredentialGeneration(generation),
+      withRequestOwnership: (actualRequest) => privacy.withWriter(session.epoch, { kind: 'speech_upload', namespace: 'speech_staging' }, actualRequest),
+    }),
+    openAi: options.providers?.openAi ?? new AzureOpenAIClient(fetch, () => providerCredentials.readProviderCredential('openai'), resources.withProviderOwnership),
+  };
+  implementation = new AppControllerImpl(boundStore, providers, integration);
+  return createPrivacyBoundController(implementation, privacy, session);
+}

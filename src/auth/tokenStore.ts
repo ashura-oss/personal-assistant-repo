@@ -37,6 +37,7 @@ export const oauthTokenStore: OAuthTokenStore = {
       else await SecureStore.setItemAsync(`${prefix}${tokenRef}`, value, { keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY });
     });
   },
+  delete(tokenRef) { return deleteOAuthToken(tokenRef); },
 };
 
 export async function storeVerifiedOAuthResult(result: OAuthBridgeResult): Promise<{ tokenRef: string; token: StoredOAuthToken }> {

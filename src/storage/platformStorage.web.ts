@@ -1,5 +1,6 @@
 import type { AppState } from '../core';
 import { STORAGE_KEY, type StateStore } from './contracts';
+import { closeBrowserDatabaseConnections, registerBrowserDatabase } from './browserDatabaseRegistry';
 import {
   createStartupRecoveryBackend, recoveryUtf8Bytes, validateRecoveryId, validateRecoveryIso,
   validateRecoveryReceiptRecord,
@@ -18,14 +19,27 @@ const ARCHIVE_DATA_PREFIX = '__still.recovery.archive-data.v1:';
 const RECEIPT_PREFIX = '__still.recovery.receipt.v1:';
 const OPERATION_PREFIX = '__still.recovery.operation.v1:';
 const PENDING_PREFIX = '__still.recovery.pending.v1:';
+const trackedConnections = new WeakMap<IDBDatabase, () => void>();
+let appStorageLifecycleGeneration = 0;
+let privacyDeletingAppStorage = false;
 
-function openDb(factory: IDBFactory = indexedDB): Promise<IDBDatabase> {
+function openDb(factory: IDBFactory = indexedDB, expectedGeneration = appStorageLifecycleGeneration): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
+    if (privacyDeletingAppStorage || expectedGeneration !== appStorageLifecycleGeneration) { reject(new Error('This local browser storage handle has been closed for privacy cleanup.')); return; }
+    if (factory === globalThis.indexedDB) stateDatabaseDeleteConfirmed = false;
     const request = factory.open(DB_NAME, 1);
     request.onupgradeneeded = () => request.result.createObjectStore(STORE_NAME);
-    request.onsuccess = () => resolve(request.result);
+    request.onsuccess = () => {
+      const database = request.result;
+      trackedConnections.set(database, registerBrowserDatabase(DB_NAME, database));
+      resolve(database);
+    };
     request.onerror = () => reject(request.error ?? new Error('Could not open local browser storage.'));
   });
+}
+
+function closeTracked(database: IDBDatabase): void {
+  try { database.close(); } finally { trackedConnections.get(database)?.(); trackedConnections.delete(database); }
 }
 
 function requestResult<T>(request: IDBRequest<T>): Promise<T> {
@@ -146,9 +160,9 @@ async function validateJournal(store: IDBObjectStore): Promise<{ records: Startu
   return { records, archives: metadata.map(({ evidenceBytes }) => ({ evidenceBytes })) };
 }
 
-function persistenceFor(factory: IDBFactory, randomId: () => string): StartupRecoveryPersistence {
+function persistenceFor(factory: IDBFactory, randomId: () => string, expectedGeneration: number): StartupRecoveryPersistence {
   const withTransaction = async <T>(work: (transaction: StartupRecoveryTransaction) => Promise<T>): Promise<T> => {
-    const db = await openDb(factory);
+    const db = await openDb(factory, expectedGeneration);
     const tx = db.transaction(STORE_NAME, 'readwrite');
     const done = transactionComplete(tx);
     const store = tx.objectStore(STORE_NAME);
@@ -241,7 +255,7 @@ function persistenceFor(factory: IDBFactory, randomId: () => string): StartupRec
       try { tx.abort(); } catch { /* transaction may already have finished */ }
       await done.catch(() => undefined);
       throw error;
-    } finally { db.close(); }
+    } finally { closeTracked(db); }
   };
   return { withTransaction };
 }
@@ -259,6 +273,7 @@ export class IndexedDbStateStore implements StateStore {
   readonly recovery;
   private readonly factory: IDBFactory;
   private readonly randomId: () => string;
+  private readonly lifecycleGeneration = appStorageLifecycleGeneration;
   private generationBaseline = false;
   private originGeneration?: string;
   private currentGeneration?: string;
@@ -266,13 +281,18 @@ export class IndexedDbStateStore implements StateStore {
     this.factory = options.factory ?? deferredDefaultFactory();
     this.randomId = options.randomId ?? (() => crypto.randomUUID());
     this.recovery = createStartupRecoveryBackend({
-      persistence: persistenceFor(this.factory, this.randomId), randomId: this.randomId, now: options.now, sha256: options.sha256,
+      persistence: persistenceFor(this.factory, this.randomId, this.lifecycleGeneration), randomId: this.randomId, now: options.now, sha256: options.sha256,
       getOpenedGeneration: async () => this.generationBaseline ? { originGeneration: this.originGeneration, currentGeneration: this.currentGeneration } : undefined,
     });
   }
 
+  private assertActive(): void {
+    if (privacyDeletingAppStorage || this.lifecycleGeneration !== appStorageLifecycleGeneration) throw new Error('This local browser storage handle has been closed for privacy cleanup.');
+  }
+
   async load(): Promise<AppState | undefined> {
-    const db = await openDb(this.factory);
+    this.assertActive();
+    const db = await openDb(this.factory, this.lifecycleGeneration);
     try {
       const tx = db.transaction(STORE_NAME, 'readonly');
       const done = transactionComplete(tx);
@@ -292,14 +312,15 @@ export class IndexedDbStateStore implements StateStore {
       this.currentGeneration = this.originGeneration;
       this.generationBaseline = true;
       return state;
-    } finally { db.close(); }
+    } finally { closeTracked(db); }
   }
 
   async save(state: AppState): Promise<void> {
+    this.assertActive();
     const raw = JSON.stringify(state);
     const bytes = recoveryUtf8Bytes(raw);
     const generation = validateRecoveryId(this.randomId(), 'Storage generation');
-    const db = await openDb(this.factory);
+    const db = await openDb(this.factory, this.lifecycleGeneration);
     let tx: IDBTransaction | undefined;
     let done: Promise<void> | undefined;
     try {
@@ -324,12 +345,13 @@ export class IndexedDbStateStore implements StateStore {
       try { tx?.abort(); } catch { /* transaction may already have finished */ }
       await done?.catch(() => undefined);
       throw error;
-    } finally { db.close(); }
+    } finally { closeTracked(db); }
   }
 
   async clear(): Promise<void> {
+    this.assertActive();
     const generation = validateRecoveryId(this.randomId(), 'Storage generation');
-    const db = await openDb(this.factory);
+    const db = await openDb(this.factory, this.lifecycleGeneration);
     let tx: IDBTransaction | undefined;
     let done: Promise<void> | undefined;
     try {
@@ -354,12 +376,13 @@ export class IndexedDbStateStore implements StateStore {
       try { tx?.abort(); } catch { /* transaction may already have finished */ }
       await done?.catch(() => undefined);
       throw error;
-    } finally { db.close(); }
+    } finally { closeTracked(db); }
   }
 
   async assertCurrent(): Promise<void> {
+    this.assertActive();
     if (!this.generationBaseline) throw new Error('The current workspace has not been loaded.');
-    const db = await openDb(this.factory);
+    const db = await openDb(this.factory, this.lifecycleGeneration);
     try {
       const tx = db.transaction(STORE_NAME, 'readonly');
       const done = transactionComplete(tx);
@@ -367,8 +390,33 @@ export class IndexedDbStateStore implements StateStore {
       await done;
       const normalized = generation === 'legacy' ? undefined : generation;
       if (normalized !== this.currentGeneration) throw new Error('Saved data changed in another workspace. Reload before continuing.');
-    } finally { db.close(); }
+    } finally { closeTracked(db); }
   }
 }
 
 export const stateStore: StateStore = new IndexedDbStateStore();
+
+/** Construct a new adapter after privacy cleanup terminally closes old handles. */
+export function createPlatformStateStore(): StateStore {
+  return new IndexedDbStateStore();
+}
+
+let stateDatabaseDeleteConfirmed = false;
+
+/** Internal privacy-only hook. The IDB delete request remains pending while blocked so cleanup keeps its lock. */
+export async function eraseStateDatabaseForPrivacy(beforeMutation: () => Promise<void>): Promise<void> {
+  await beforeMutation();
+  stateDatabaseDeleteConfirmed = false;
+  privacyDeletingAppStorage = true;
+  closeBrowserDatabaseConnections(DB_NAME);
+  await new Promise<void>((resolve, reject) => {
+    const request = indexedDB.deleteDatabase(DB_NAME);
+    request.onsuccess = () => { stateDatabaseDeleteConfirmed = true; appStorageLifecycleGeneration += 1; privacyDeletingAppStorage = false; resolve(); };
+    request.onerror = () => reject(new Error('The local browser database could not be deleted.'));
+    request.onblocked = () => { /* Keep awaiting the original request until it settles. */ };
+  });
+}
+
+export function privacyStateDatabaseGone(): boolean {
+  return stateDatabaseDeleteConfirmed;
+}

@@ -11,6 +11,50 @@ import {
 const DB_NAME = 'voice-assistant.db';
 const SCHEMA_VERSION = 1;
 const GENERATION_KEY = 'snapshot_generation';
+const liveStateHandles = new Set<LiveStateDatabaseHandle>();
+let privacyStateDatabaseDeleting = false;
+let stateDatabaseLifecycleGeneration = 0;
+let openingStateDatabases = 0;
+const stateOpenWaiters: (() => void)[] = [];
+
+type ClosableSqlite = SQLiteTransactionDatabase & { closeAsync?: () => Promise<void> };
+type LiveStateDatabaseHandle = {
+  database: ClosableSqlite;
+  activeTransactions: number;
+  closing: boolean;
+  closed: boolean;
+  idleWaiters: (() => void)[];
+};
+
+function trackStateDatabase(database: SQLiteTransactionDatabase, track: boolean): SQLiteTransactionDatabase {
+  if (!track) return database;
+  const handle: LiveStateDatabaseHandle = {
+    database: database as ClosableSqlite, activeTransactions: 0, closing: false, closed: false, idleWaiters: [],
+  };
+  liveStateHandles.add(handle);
+  return new Proxy(database, {
+    get(target, property, receiver) {
+      if (property === 'withExclusiveTransactionAsync') {
+        return async (work: (tx: SQLiteExecutor) => Promise<void>) => {
+          if (privacyStateDatabaseDeleting || handle.closing || handle.closed) throw new Error('Local storage is being securely cleared.');
+          handle.activeTransactions += 1;
+          try { await target.withExclusiveTransactionAsync(work); }
+          finally {
+            handle.activeTransactions -= 1;
+            if (handle.activeTransactions === 0) handle.idleWaiters.splice(0).forEach((resolve) => resolve());
+          }
+        };
+      }
+      const value = Reflect.get(target, property, receiver) as unknown;
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+}
+
+async function waitForStateHandleIdle(handle: LiveStateDatabaseHandle): Promise<void> {
+  if (handle.activeTransactions === 0) return;
+  await new Promise<void>((resolve) => handle.idleWaiters.push(resolve));
+}
 
 export interface SQLiteExecutor {
   execAsync(sql: string): Promise<void>;
@@ -144,15 +188,18 @@ function persistenceFor(db: SQLiteTransactionDatabase): StartupRecoveryPersisten
 export class SQLiteStateStore implements StateStore {
   private readonly openDatabase: () => Promise<SQLiteTransactionDatabase>;
   private readonly fixedDatabase?: Promise<SQLiteTransactionDatabase>;
+  private readonly tracksProductionHandle: boolean;
   private initialized?: Promise<SQLiteTransactionDatabase>;
   private generationBaseline = false;
   private originGeneration?: string;
   private currentGeneration?: string;
   readonly recovery;
   private readonly randomId: () => string;
+  private readonly lifecycleGeneration = stateDatabaseLifecycleGeneration;
 
   constructor(options: SQLiteStateStoreOptions = {}) {
     this.fixedDatabase = options.database;
+    this.tracksProductionHandle = options.database === undefined && options.openDatabase === undefined;
     this.openDatabase = options.openDatabase ?? (() => SQLite.openDatabaseAsync(DB_NAME) as Promise<SQLiteTransactionDatabase>);
     this.randomId = options.randomId ?? Crypto.randomUUID;
     const owner = this;
@@ -167,7 +214,11 @@ export class SQLiteStateStore implements StateStore {
   }
 
   private async initialize(): Promise<SQLiteTransactionDatabase> {
-    if (!this.initialized) this.initialized = (this.fixedDatabase ?? this.openDatabase()).then(async (database) => {
+    if (privacyStateDatabaseDeleting || this.lifecycleGeneration !== stateDatabaseLifecycleGeneration) throw new Error('This local storage handle has been closed for privacy cleanup.');
+    if (!this.initialized) {
+      openingStateDatabases += 1;
+      this.initialized = Promise.resolve().then(() => this.fixedDatabase ?? this.openDatabase()).then(async (opened) => {
+      const database = trackStateDatabase(opened, this.tracksProductionHandle);
       await database.execAsync(`PRAGMA journal_mode = WAL;
         CREATE TABLE IF NOT EXISTS app_state (key TEXT PRIMARY KEY NOT NULL,value TEXT NOT NULL,schema_version INTEGER NOT NULL,updated_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS storage_meta (key TEXT PRIMARY KEY NOT NULL,value TEXT NOT NULL);
@@ -175,10 +226,14 @@ export class SQLiteStateStore implements StateStore {
         CREATE TABLE IF NOT EXISTS recovery_receipts (session_id TEXT PRIMARY KEY NOT NULL,plan_hash TEXT NOT NULL,source_generation TEXT NOT NULL,source_sha256 TEXT NOT NULL,replacement_generation TEXT NOT NULL,replacement_sha256 TEXT NOT NULL,operation_id TEXT UNIQUE NOT NULL,archive_id TEXT NOT NULL,archived_at TEXT NOT NULL,evidence_bytes INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS recovery_pending_open (operation_id TEXT PRIMARY KEY NOT NULL,opened INTEGER NOT NULL DEFAULT 0);`);
       return database;
-    }).catch((error) => {
-      this.initialized = undefined;
-      throw error;
-    });
+      }).catch((error) => {
+        this.initialized = undefined;
+        throw error;
+      }).finally(() => {
+        openingStateDatabases -= 1;
+        if (openingStateDatabases === 0) stateOpenWaiters.splice(0).forEach((resolve) => resolve());
+      });
+    }
     return this.initialized;
   }
 
@@ -254,3 +309,56 @@ export class SQLiteStateStore implements StateStore {
 }
 
 export const stateStore: StateStore = new SQLiteStateStore();
+
+/** Construct a fresh platform store after a completed privacy database deletion. */
+export function createPlatformStateStore(): StateStore {
+  return new SQLiteStateStore();
+}
+
+/** Internal privacy-only deletion hook. It is intentionally absent from StateStore/UI. */
+export async function eraseStateDatabaseForPrivacy(beforeMutation: () => Promise<void>): Promise<void> {
+  await beforeMutation();
+  privacyStateDatabaseDeleting = true;
+  if (openingStateDatabases > 0) await new Promise<void>((resolve) => stateOpenWaiters.push(resolve));
+  const handles = [...liveStateHandles];
+  for (const handle of handles) handle.closing = true;
+  await Promise.all(handles.map(waitForStateHandleIdle));
+  for (const handle of handles) {
+    if (handle.closed) continue;
+    if (typeof handle.database.closeAsync !== 'function') throw new Error('Local database handles cannot be drained in this runtime.');
+    await handle.database.closeAsync();
+    handle.closed = true;
+  }
+
+  await beforeMutation();
+  await SQLite.deleteDatabaseAsync(DB_NAME);
+  const fileSystem = await import('expo-file-system/legacy');
+  const directory = SQLite.defaultDatabaseDirectory;
+  if (!directory || !directory.startsWith('file://') || directory.includes('..')) throw new Error('The app database directory is unavailable.');
+  const databasePath = `${directory.endsWith('/') ? directory : `${directory}/`}${DB_NAME}`;
+  for (const suffix of ['-wal', '-shm']) {
+    const path = `${databasePath}${suffix}`;
+    const info = await fileSystem.getInfoAsync(path);
+    if (info.exists) {
+      if ('isDirectory' in info && info.isDirectory) throw new Error('A database sidecar path is invalid.');
+      await beforeMutation();
+      await fileSystem.deleteAsync(path);
+    }
+  }
+  stateDatabaseLifecycleGeneration += 1;
+  privacyStateDatabaseDeleting = false;
+  for (const handle of handles) liveStateHandles.delete(handle);
+}
+
+/** Confirms the app DB and its exact SQLite sidecars are absent after SDK deletion succeeds. */
+export async function privacyStateDatabaseGone(): Promise<boolean> {
+  const fileSystem = await import('expo-file-system/legacy');
+  const directory = SQLite.defaultDatabaseDirectory;
+  if (!directory || !directory.startsWith('file://') || directory.includes('..')) throw new Error('The app database directory is unavailable.');
+  const base = `${directory.endsWith('/') ? directory : `${directory}/`}${DB_NAME}`;
+  for (const path of [base, `${base}-wal`, `${base}-shm`]) {
+    const info = await fileSystem.getInfoAsync(path);
+    if (info.exists) return false;
+  }
+  return true;
+}

@@ -1,35 +1,11 @@
-import { credentialStore } from '../storage/credentials';
+import { credentialStore, type CredentialStore } from '../storage/credentials';
 
 const SPEECH_KEY = 'azure.speech.subscription-key';
 const OPENAI_KEY = 'azure.openai.api-key';
 
-let speechCredentialGeneration = 0;
-let speechMutationQueue: Promise<void> = Promise.resolve();
-
-function enqueueSpeechMutation(operation: () => Promise<void>): Promise<void> {
-  const queued = speechMutationQueue.then(operation, operation);
-  speechMutationQueue = queued.catch(() => undefined);
-  return queued;
-}
-
 export class SpeechCredentialChangedError extends Error {
   readonly name = 'SpeechCredentialChangedError';
   constructor() { super('The Azure Speech credential changed while the request was being prepared.'); }
-}
-
-export function currentSpeechCredentialGeneration(): number { return speechCredentialGeneration; }
-
-export function assertSpeechCredentialGeneration(expected: number): void {
-  if (!Number.isSafeInteger(expected) || expected !== speechCredentialGeneration) throw new SpeechCredentialChangedError();
-}
-
-/** Read a secret and capture the ephemeral generation that fences its later use. */
-export async function readSpeechCredentialSnapshot(): Promise<{ key: string | null; generation: number }> {
-  const generation = speechCredentialGeneration;
-  await speechMutationQueue;
-  const key = await credentialStore.get(SPEECH_KEY);
-  assertSpeechCredentialGeneration(generation);
-  return Object.freeze({ key, generation });
 }
 
 export interface ProviderCredentialStatus {
@@ -42,38 +18,87 @@ export interface ProviderCredentialInput {
   openAiApiKey?: string;
 }
 
-/** Provider credentials never enter app state, exports, or browser persistent storage. */
-export async function getCredentials(): Promise<ProviderCredentialStatus> {
-  const [speech, openAi] = await Promise.all([credentialStore.get(SPEECH_KEY), credentialStore.get(OPENAI_KEY)]);
-  return { speechConfigured: Boolean(speech), openAiConfigured: Boolean(openAi) };
+export interface SpeechCredentialSnapshot {
+  readonly key: string | null;
+  readonly generation: number;
 }
 
-export async function readProviderCredential(kind: 'speech' | 'openai'): Promise<string | null> {
-  if (kind === 'speech') return (await readSpeechCredentialSnapshot()).key;
-  return credentialStore.get(OPENAI_KEY);
+export interface ProviderCredentialService {
+  currentSpeechCredentialGeneration(): number;
+  assertSpeechCredentialGeneration(expected: number): void;
+  readSpeechCredentialSnapshot(): Promise<SpeechCredentialSnapshot>;
+  getCredentials(): Promise<ProviderCredentialStatus>;
+  readProviderCredential(kind: 'speech' | 'openai'): Promise<string | null>;
+  setCredentials(input: ProviderCredentialInput): Promise<ProviderCredentialStatus>;
+  deleteCredentials(kind?: 'speech' | 'openai'): Promise<ProviderCredentialStatus>;
 }
 
-export async function setCredentials(input: ProviderCredentialInput): Promise<ProviderCredentialStatus> {
-  if (input.speechSubscriptionKey !== undefined && input.speechSubscriptionKey.trim().length > 512) throw new Error('Speech key is too long.');
-  if (input.openAiApiKey !== undefined && input.openAiApiKey.trim().length > 512) throw new Error('OpenAI key is too long.');
-  const operations: Promise<void>[] = [];
-  if (input.speechSubscriptionKey !== undefined) {
-    speechCredentialGeneration += 1;
-    const value = input.speechSubscriptionKey.trim();
-    operations.push(enqueueSpeechMutation(() => value ? credentialStore.set(SPEECH_KEY, value) : credentialStore.delete(SPEECH_KEY)));
-  }
-  if (input.openAiApiKey !== undefined) {
-    const value = input.openAiApiKey.trim();
-    operations.push(value ? credentialStore.set(OPENAI_KEY, value) : credentialStore.delete(OPENAI_KEY));
-  }
-  await Promise.all(operations);
-  return getCredentials();
+/** Creates an isolated credential service; callers should pass an epoch-bound store in production. */
+export function createProviderCredentialService(store: CredentialStore): ProviderCredentialService {
+  let speechGeneration = 0;
+  let speechMutationQueue: Promise<void> = Promise.resolve();
+  const enqueueSpeechMutation = (operation: () => Promise<void>): Promise<void> => {
+    const queued = speechMutationQueue.then(operation, operation);
+    speechMutationQueue = queued.catch(() => undefined);
+    return queued;
+  };
+  const assertGeneration = (expected: number) => {
+    if (!Number.isSafeInteger(expected) || expected !== speechGeneration) throw new SpeechCredentialChangedError();
+  };
+  const readSpeech = async (): Promise<SpeechCredentialSnapshot> => {
+    const generation = speechGeneration;
+    await speechMutationQueue;
+    const key = await store.get(SPEECH_KEY);
+    assertGeneration(generation);
+    return Object.freeze({ key, generation });
+  };
+  const status = async (): Promise<ProviderCredentialStatus> => {
+    const [speech, openAi] = await Promise.all([readSpeech(), store.get(OPENAI_KEY)]);
+    return { speechConfigured: Boolean(speech.key), openAiConfigured: Boolean(openAi) };
+  };
+  return Object.freeze({
+    currentSpeechCredentialGeneration: () => speechGeneration,
+    assertSpeechCredentialGeneration: assertGeneration,
+    readSpeechCredentialSnapshot: readSpeech,
+    getCredentials: status,
+    async readProviderCredential(kind: 'speech' | 'openai') {
+      return kind === 'speech' ? (await readSpeech()).key : store.get(OPENAI_KEY);
+    },
+    async setCredentials(input: ProviderCredentialInput) {
+      if (input.speechSubscriptionKey !== undefined && input.speechSubscriptionKey.trim().length > 512) throw new Error('Speech key is too long.');
+      if (input.openAiApiKey !== undefined && input.openAiApiKey.trim().length > 512) throw new Error('OpenAI key is too long.');
+      const operations: Promise<void>[] = [];
+      if (input.speechSubscriptionKey !== undefined) {
+        speechGeneration += 1;
+        const value = input.speechSubscriptionKey.trim();
+        operations.push(enqueueSpeechMutation(() => value ? store.set(SPEECH_KEY, value) : store.delete(SPEECH_KEY)));
+      }
+      if (input.openAiApiKey !== undefined) {
+        const value = input.openAiApiKey.trim();
+        operations.push(value ? store.set(OPENAI_KEY, value) : store.delete(OPENAI_KEY));
+      }
+      await Promise.all(operations);
+      return status();
+    },
+    async deleteCredentials(kind?: 'speech' | 'openai') {
+      const operations: Promise<void>[] = [];
+      if (!kind || kind === 'speech') {
+        speechGeneration += 1;
+        operations.push(enqueueSpeechMutation(() => store.delete(SPEECH_KEY)));
+      }
+      if (!kind || kind === 'openai') operations.push(store.delete(OPENAI_KEY));
+      await Promise.all(operations);
+      return status();
+    },
+  });
 }
 
-export async function deleteCredentials(kind?: 'speech' | 'openai'): Promise<ProviderCredentialStatus> {
-  const operations: Promise<void>[] = [];
-  if (!kind || kind === 'speech') { speechCredentialGeneration += 1; operations.push(enqueueSpeechMutation(() => credentialStore.delete(SPEECH_KEY))); }
-  if (!kind || kind === 'openai') operations.push(credentialStore.delete(OPENAI_KEY));
-  await Promise.all(operations);
-  return getCredentials();
-}
+// Module-level helpers are retained for tests and the privileged erasure adapter only.
+const rawCredentialService = createProviderCredentialService(credentialStore);
+export const currentSpeechCredentialGeneration = rawCredentialService.currentSpeechCredentialGeneration;
+export const assertSpeechCredentialGeneration = rawCredentialService.assertSpeechCredentialGeneration;
+export const readSpeechCredentialSnapshot = rawCredentialService.readSpeechCredentialSnapshot;
+export const getCredentials = rawCredentialService.getCredentials;
+export const readProviderCredential = rawCredentialService.readProviderCredential;
+export const setCredentials = rawCredentialService.setCredentials;
+export const deleteCredentials = rawCredentialService.deleteCredentials;

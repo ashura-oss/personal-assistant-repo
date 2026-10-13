@@ -1,11 +1,11 @@
 import * as FileSystem from 'expo-file-system/legacy';
+import { safeRelativeMarkdownPath } from '../privacy/eraseAdapter.shared';
 
 function safeRelativePath(path: string): string {
-  const normalized = path.replace(/\\/g, '/').replace(/^\/+/, '');
-  if (!normalized || normalized.split('/').some((part) => part === '..' || part === '.')) {
+  if (!safeRelativeMarkdownPath(path)) {
     throw new Error('Document path must stay inside the app documents folder.');
   }
-  return normalized;
+  return path;
 }
 
 /** App documents are written only beneath Expo's private documents directory. */
@@ -15,7 +15,9 @@ export async function writePrivateDocument(path: string, content: string): Promi
   const relative = safeRelativePath(path);
   const parts = relative.split('/');
   const filename = parts.pop()!;
-  let directory = root;
+  let directory = `${root}StillDocuments-v1/`;
+  const rootInfo = await FileSystem.getInfoAsync(directory);
+  if (!rootInfo.exists) await FileSystem.makeDirectoryAsync(directory, { intermediates: true });
   for (const part of parts) {
     directory = `${directory}${part}/`;
     const info = await FileSystem.getInfoAsync(directory);

@@ -1,0 +1,6 @@
+{
+  "name": "still-privacy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Process-scoped native runtime identity for Still privacy arbitration"
+}

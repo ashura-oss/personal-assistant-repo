@@ -93,6 +93,71 @@ describe('provider connector clients', () => {
     expect(result.window).toEqual(descriptor.window);
   });
 
+  it('holds provider ownership through response-body buffering and releases only after parsing completes', async () => {
+    let active = 0;
+    let releaseBody!: (bytes: ArrayBuffer) => void;
+    const body = new Promise<ArrayBuffer>((resolve) => { releaseBody = resolve; });
+    const fetcher = vi.fn(async () => {
+      expect(active).toBe(1);
+      const pending = new Response(null, { status: 200 });
+      pending.arrayBuffer = () => body;
+      return pending;
+    }) as typeof fetch;
+    const client = new ConnectorClient({
+      tokenStore: { get: vi.fn(async () => token()), set: vi.fn(async () => undefined) },
+      fetcher, googleClientId: 'test-google-client',
+      async withProviderOwnership(actual) {
+        active += 1;
+        try { return await actual(); } finally { active -= 1; }
+      },
+    });
+    let completed = false;
+    const operation = client.listCalendars(account).then(() => { completed = true; });
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledTimes(1));
+    await Promise.resolve();
+    expect(completed).toBe(false);
+    expect(active).toBe(1);
+    releaseBody(new TextEncoder().encode('{"items":[]}').buffer);
+    await operation;
+    expect(completed).toBe(true);
+    expect(active).toBe(0);
+  });
+
+  it('keeps provider ownership until an oversized declared response body cancellation settles', async () => {
+    let active = 0;
+    let finishCancel!: () => void;
+    let cancelStarted!: () => void;
+    let cancelSettled = false;
+    let fetchCount = 0;
+    const started = new Promise<void>((resolve) => { cancelStarted = resolve; });
+    const responseStream = new ReadableStream<Uint8Array>({
+      start(controller) { controller.enqueue(new Uint8Array([1])); },
+      cancel() {
+        cancelStarted();
+        return new Promise<void>((resolve) => { finishCancel = () => { cancelSettled = true; resolve(); }; });
+      },
+    });
+    const client = new ConnectorClient({
+      tokenStore: { get: vi.fn(async () => token()), set: vi.fn(async () => undefined) },
+      fetcher: vi.fn(async () => { fetchCount += 1; return new Response(responseStream, { headers: { 'content-length': '100' } }); }) as typeof fetch,
+      withProviderOwnership: async (actual) => { active += 1; try { return await actual(); } finally { active -= 1; } },
+    });
+    const bounded = (client as unknown as { boundedFetch(input: string, init: RequestInit, guard?: undefined, onDispatched?: undefined, beforeDispatch?: undefined, signal?: undefined, byteLimit?: number): Promise<Response> }).boundedFetch;
+    let settled = false;
+    const request = bounded.call(client, 'https://example.test/resource', { method: 'GET' }, undefined, undefined, undefined, undefined, 1)
+      .then(() => { settled = true; }, () => { settled = true; });
+    await started;
+    await Promise.resolve();
+    expect(cancelSettled).toBe(false);
+    expect(settled).toBe(false);
+    expect(active).toBe(1);
+    finishCancel();
+    await request;
+    expect(cancelSettled).toBe(true);
+    expect(fetchCount).toBe(1);
+    expect(active).toBe(0);
+  });
+
   it('refreshes once for concurrent calls and preserves an omitted refresh token', async () => {
     let refreshCount = 0;
     const fetcher = vi.fn(async (input: RequestInfo | URL) => {

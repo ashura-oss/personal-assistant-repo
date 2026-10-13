@@ -6,7 +6,29 @@ import { validateSpeechAudioSnapshot } from '../transcription/types';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const STEP_TIMEOUT_MS = 10_000;
-const blobs = new Map<string, Blob>();
+type SpeechStagingMemory = { blobs: Map<string, Blob>; dispose(): number };
+const speechStagingMemories = new Set<WeakRef<SpeechStagingMemory>>();
+
+/** Clears and fences every live instance-owned web staging map during privacy erasure. */
+export function clearSpeechStagingMemory(): number {
+  let cleared = 0;
+  for (const reference of [...speechStagingMemories]) {
+    const memory = reference.deref();
+    if (!memory) { speechStagingMemories.delete(reference); continue; }
+    cleared += memory.dispose();
+  }
+  return cleared;
+}
+
+export function speechStagingMemoryCount(): number {
+  let count = 0;
+  for (const reference of [...speechStagingMemories]) {
+    const memory = reference.deref();
+    if (!memory) speechStagingMemories.delete(reference);
+    else count += memory.blobs.size;
+  }
+  return count;
+}
 
 async function sha256(bytes: Uint8Array): Promise<string> {
   const result = await crypto.subtle.digest('SHA-256', bytes.slice().buffer as ArrayBuffer);
@@ -41,15 +63,40 @@ function duration(note: Note, max: number): number {
   return value;
 }
 
-export function createWebSpeechAudioService(deps: { get?: (uri: string) => Promise<Blob>; crypto?: SpeechAudioCrypto } = {}): SpeechAudioService {
+export function createWebSpeechAudioService(deps: {
+  get?: (uri: string) => Promise<Blob>;
+  crypto?: SpeechAudioCrypto;
+  withSourceRead?: <T>(actual: () => Promise<T>) => Promise<T>;
+  withStageWrite?: <T>(actual: () => Promise<T>) => Promise<T>;
+  withStageCleanup?: <T>(actual: () => Promise<T>) => Promise<T>;
+} = {}): SpeechAudioService {
+  if (typeof WeakRef === 'undefined') throw new Error('The web speech staging registry cannot safely track private in-memory uploads.');
   const get = deps.get ?? getAudio;
   const hash = deps.crypto?.sha256 ?? sha256;
+  const blobs = new Map<string, Blob>();
+  let disposed = false;
+  let registration: WeakRef<SpeechStagingMemory>;
+  const memory: SpeechStagingMemory = {
+    blobs,
+    dispose() {
+      if (disposed) return 0;
+      disposed = true;
+      const count = blobs.size;
+      blobs.clear();
+      speechStagingMemories.delete(registration);
+      return count;
+    },
+  };
+  registration = new WeakRef(memory);
+  speechStagingMemories.add(registration);
+  const assertActive = () => { if (disposed) throw new Error('Speech upload staging is no longer available in this workspace.'); };
   return {
     async prepare(note, { leaseId, maxDurationSeconds, signal }) {
+      assertActive();
       if (!UUID.test(leaseId)) throw new Error('Speech upload lease is invalid.');
       if (!note.audioUri) throw new Error('The note does not have an available recording.');
       const durationSeconds = duration(note, maxDurationSeconds);
-      const source = await boundedStep(() => get(note.audioUri!), signal);
+      const source = await boundedStep(() => (deps.withSourceRead ?? (async (actual: () => Promise<Blob>) => actual()))(() => get(note.audioUri!)), signal);
       if (!(source instanceof Blob) || !Number.isSafeInteger(source.size) || source.size <= 0 || source.size > MAX_RECOVERY_BYTES) throw new Error('Audio file is empty, unavailable, or exceeds the 40 MiB upload limit.');
       const header = new Uint8Array(await boundedStep(() => source.slice(0, 16).arrayBuffer(), signal));
       checkAbort(signal);
@@ -66,10 +113,15 @@ export function createWebSpeechAudioService(deps: { get?: (uri: string) => Promi
       if (note.audioAttachment && (note.audioAttachment.byteLength !== bytes.byteLength || note.audioAttachment.sha256.toLowerCase() !== digest.toLowerCase())) throw new Error('The selected recording changed since it was attached.');
       checkAbort(signal);
       const snapshot = validateSpeechAudioSnapshot({ leaseId, platform: 'web', format, mimeType, byteLength: bytes.byteLength, sha256: digest, durationSeconds });
-      blobs.set(leaseId, blob);
+      assertActive();
+      await (deps.withStageWrite ?? (async (actual: () => Promise<void>) => actual()))(async () => {
+        assertActive();
+        blobs.set(leaseId, blob);
+      });
       return Object.freeze({ ...snapshot, platform: 'web' as const, upload: Object.freeze({ blob, fileName: `still-recording.${format}` }) });
     },
     async verify(prepared, signal) {
+      assertActive();
       checkAbort(signal);
       if (prepared.platform !== 'web') throw new Error('Prepared audio platform does not match this adapter.');
       const blob = blobs.get(prepared.leaseId);
@@ -78,7 +130,10 @@ export function createWebSpeechAudioService(deps: { get?: (uri: string) => Promi
       checkAbort(signal);
       if (bytes.byteLength !== prepared.byteLength || (await boundedStep(() => hash(bytes), signal)).toLowerCase() !== prepared.sha256.toLowerCase()) throw new Error('The private upload copy changed before dispatch.');
     },
-    async release(leaseId) { if (UUID.test(leaseId)) blobs.delete(leaseId); },
+    async release(leaseId) {
+      if (UUID.test(leaseId)) await (deps.withStageCleanup ?? (async (actual: () => Promise<void>) => actual()))(async () => { blobs.delete(leaseId); });
+    },
+    disposeMemory() { memory.dispose(); },
   };
 }
 

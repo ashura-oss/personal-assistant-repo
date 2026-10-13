@@ -1,11 +1,18 @@
+import { registerBrowserDatabase } from '../storage/browserDatabaseRegistry';
+
 const DB = 'still-audio-v1';
 const STORE = 'recordings';
+const trackedConnections = new WeakMap<IDBDatabase, () => void>();
 
 function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(DB, 1);
     request.onupgradeneeded = () => request.result.createObjectStore(STORE);
-    request.onsuccess = () => resolve(request.result);
+    request.onsuccess = () => {
+      const database = request.result;
+      trackedConnections.set(database, registerBrowserDatabase(DB, database));
+      resolve(database);
+    };
     request.onerror = () => reject(request.error ?? new Error('Could not open browser audio storage.'));
   });
 }
@@ -26,7 +33,7 @@ async function request<T>(key: string, mode: IDBTransactionMode, value?: Blob): 
       tx.onabort = () => reject(tx.error ?? new Error('Browser audio transaction was interrupted.'));
     });
     return result;
-  } finally { db.close(); }
+  } finally { try { db.close(); } finally { trackedConnections.get(db)?.(); trackedConnections.delete(db); } }
 }
 
 export async function putAudio(id: string, blob: Blob): Promise<string> {

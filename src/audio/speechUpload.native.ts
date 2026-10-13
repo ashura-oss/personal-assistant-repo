@@ -8,7 +8,6 @@ import { validateSpeechAudioSnapshot } from '../transcription/types';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const FOLDER = 'speech-upload/';
 const STEP_TIMEOUT_MS = 10_000;
-const owned = new Set<string>();
 
 function hashBytes(bytes: Uint8Array): Promise<string> {
   return Crypto.digest(Crypto.CryptoDigestAlgorithm.SHA256, bytes.slice().buffer as ArrayBuffer)
@@ -45,6 +44,9 @@ const defaultIO: NativeSpeechAudioIO = {
   },
   async readBytes(uri) { const FileApi = await import('expo-file-system'); return new FileApi.File(uri).bytes(); },
 };
+
+/** Exposes only the platform IO seam so a workspace can lease each true filesystem promise. */
+export function getNativeSpeechAudioIO(): NativeSpeechAudioIO { return defaultIO; }
 
 function boundedStep<T>(start: () => Promise<T>, signal?: AbortSignal, late?: () => void | Promise<void>): Promise<T> {
   if (signal?.aborted) return Promise.reject(signal.reason ?? new Error('Audio preparation was cancelled.'));
@@ -91,14 +93,21 @@ function validateDuration(note: Note, maxDurationSeconds: number): number {
   return duration;
 }
 
-export function createNativeSpeechAudioService(deps: { io?: NativeSpeechAudioIO; crypto?: SpeechAudioCrypto } = {}): SpeechAudioService {
+export function createNativeSpeechAudioService(deps: {
+  io?: NativeSpeechAudioIO;
+  crypto?: SpeechAudioCrypto;
+  withMemoryMutation?: <T>(mutation: () => T) => Promise<T>;
+} = {}): SpeechAudioService {
   const io = deps.io ?? defaultIO;
   const crypto = deps.crypto ?? { sha256: hashBytes };
   const leases = new Map<string, string>();
+  const owned = new Set<string>();
   const uploadBytesByLease = new Map<string, Uint8Array>();
   const activeWrites = new Map<string, number>();
   const cleanupAfterWrite = new Set<string>();
   const cleanupOperations = new Map<string, Promise<void>>();
+  let disposed = false;
+  const assertActive = () => { if (disposed) throw new Error('Speech upload staging is no longer available in this workspace.'); };
   const trackWrite = (leaseId: string, start: () => Promise<void>): Promise<void> => {
     activeWrites.set(leaseId, (activeWrites.get(leaseId) ?? 0) + 1);
     let operation: Promise<void>;
@@ -146,6 +155,7 @@ export function createNativeSpeechAudioService(deps: { io?: NativeSpeechAudioIO;
   };
   return {
     async prepare(note, { leaseId, maxDurationSeconds, signal }) {
+      assertActive();
       if (!UUID.test(leaseId)) throw new Error('Speech upload lease is invalid.');
       if (!note.audioUri || !safePrivateSource(note.audioUri, io)) throw new Error('The note does not have an available private app audio file.');
       const durationSeconds = validateDuration(note, maxDurationSeconds);
@@ -167,6 +177,7 @@ export function createNativeSpeechAudioService(deps: { io?: NativeSpeechAudioIO;
         const format = validateRecoveryFormat(note.audioAttachment?.fileName ?? note.audioUri.split('/').pop() ?? 'recording', note.audioAttachment?.mimeType, read);
         const mimeType = RECOVERY_FORMATS[format].mimeType;
         const sha256 = await boundedStep(() => crypto.sha256(read), signal, () => cleanup(leaseId));
+        assertActive();
         if (!/^[a-f0-9]{64}$/i.test(sha256)) throw new Error('The recording fingerprint could not be verified.');
         if (note.audioAttachment && (note.audioAttachment.byteLength !== read.byteLength || note.audioAttachment.sha256.toLowerCase() !== sha256.toLowerCase())) throw new Error('The selected recording changed since it was attached.');
         const finalUri = privateUri(io, leaseId, format);
@@ -174,8 +185,13 @@ export function createNativeSpeechAudioService(deps: { io?: NativeSpeechAudioIO;
         const finalInfo = await boundedStep(() => io.exists(finalUri), signal);
         if (!finalInfo.exists || finalInfo.size !== read.byteLength) throw new Error('The private upload copy changed before it was ready.');
         const snapshot = validateSpeechAudioSnapshot({ leaseId, platform: 'native', format, mimeType, byteLength: read.byteLength, sha256, durationSeconds });
-        leases.set(leaseId, finalUri);
-        uploadBytesByLease.set(leaseId, read);
+        const commitMemory = () => {
+          assertActive();
+          leases.set(leaseId, finalUri);
+          uploadBytesByLease.set(leaseId, read);
+        };
+        if (deps.withMemoryMutation) await deps.withMemoryMutation(commitMemory);
+        else commitMemory();
         const part = Object.freeze({ name: `still-recording.${format}`, type: mimeType, async bytes() {
           const stored = uploadBytesByLease.get(leaseId);
           if (!stored) throw new Error('The prepared upload bytes have been released.');
@@ -189,6 +205,7 @@ export function createNativeSpeechAudioService(deps: { io?: NativeSpeechAudioIO;
       }
     },
     async verify(prepared, signal) {
+      assertActive();
       if (prepared.platform !== 'native') throw new Error('Prepared audio platform does not match this adapter.');
       if (!owned.has(prepared.leaseId) || leases.get(prepared.leaseId) !== prepared.upload.uri) throw new Error('The prepared audio lease is no longer owned.');
       const info = await boundedStep(() => io.exists(prepared.upload.uri), signal);
@@ -197,6 +214,13 @@ export function createNativeSpeechAudioService(deps: { io?: NativeSpeechAudioIO;
       if (bytes.byteLength !== prepared.byteLength || (await boundedStep(() => crypto.sha256(bytes), signal)).toLowerCase() !== prepared.sha256.toLowerCase()) throw new Error('The private upload copy changed before dispatch.');
     },
     async release(leaseId) { await cleanup(leaseId); },
+    disposeMemory() {
+      disposed = true;
+      owned.clear();
+      leases.clear();
+      uploadBytesByLease.clear();
+      cleanupAfterWrite.clear();
+    },
   };
 }
 
