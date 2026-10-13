@@ -9,9 +9,11 @@ import {
 } from "react-native";
 import type { AssistIntent, Note, NoteAssistResult, Proposal } from "../core";
 import type { TranscriptionAttempt } from "../transcription";
+import type { AssistantBatchJobDTO } from "../services/openRouterBatchJobs";
 import type { KnowledgeChange, KnowledgeEntityKind, Person, Project } from "../knowledge/types";
 import { Button, Field, IconButton } from "./primitives";
 import { TranscriptionPanel } from "./TranscriptionPanel";
+import { AssistantBatchJobCard } from "./AssistantBatchJobCard";
 import { C, s } from "./theme";
 
 function validTimeZone(value: string) {
@@ -32,11 +34,16 @@ type Props = {
   preview: boolean;
   demoMode: boolean;
   transcriptionDemoMode?: boolean;
+  speechProvider?: "azure" | "openrouter";
   providerReady: boolean;
   speechEnabled: boolean;
   transcriptionAttempts: readonly TranscriptionAttempt[];
+  assistantBatchJobs?: readonly AssistantBatchJobDTO[];
+  assistantBatchActionsBlocked?: boolean;
   cancelingTranscriptionId?: string;
   transcriptionRequestRunning?: boolean;
+  transcriptionRequestCleanupAttemptIds?: readonly string[];
+  retryingTranscriptionCleanupId?: string;
   analysisStatusError?: string;
   analysisStatusChecking?: boolean;
   people?: Person[];
@@ -55,6 +62,9 @@ type Props = {
   onOpenProposals: () => void;
   onTranscribe: (expectedRevision: number) => void;
   onCancelTranscription: (attemptId: string) => void;
+  onRetryTranscriptionRequestCleanup?: (attemptId: string) => Promise<void>;
+  onCheckAssistantBatch?: (jobId: string) => Promise<unknown> | unknown;
+  onRetryAssistantBatchCleanup?: (jobId: string) => Promise<unknown> | unknown;
   onOpenSpeechSettings: () => void;
   onAttachRecording: () => void;
   onPlay: () => void;
@@ -78,11 +88,16 @@ export function NoteDetail({
   preview,
   demoMode,
   transcriptionDemoMode = false,
+  speechProvider = "azure",
   providerReady,
   speechEnabled,
   transcriptionAttempts,
+  assistantBatchJobs = [],
+  assistantBatchActionsBlocked = false,
   cancelingTranscriptionId,
   transcriptionRequestRunning = false,
+  transcriptionRequestCleanupAttemptIds = [],
+  retryingTranscriptionCleanupId,
   analysisStatusError,
   analysisStatusChecking,
   people = [],
@@ -96,6 +111,9 @@ export function NoteDetail({
   onOpenProposals,
   onTranscribe,
   onCancelTranscription,
+  onRetryTranscriptionRequestCleanup,
+  onCheckAssistantBatch,
+  onRetryAssistantBatchCleanup,
   onOpenSpeechSettings,
   onAttachRecording,
   onPlay,
@@ -295,17 +313,36 @@ export function NoteDetail({
           <TranscriptionPanel
             note={note}
             attempts={transcriptionAttempts}
+            speechProvider={speechProvider}
             enabled={speechEnabled}
             configured={providerReady}
             busy={busy || dirty}
             requestRunning={transcriptionRequestRunning}
             demoMode={transcriptionDemoMode}
             cancelingAttemptId={cancelingTranscriptionId}
+            requestCleanupAttemptIds={transcriptionRequestCleanupAttemptIds}
+            retryingCleanupAttemptId={retryingTranscriptionCleanupId}
             onTranscribe={onTranscribe}
             onCancel={onCancelTranscription}
+            onRetryRequestCleanup={onRetryTranscriptionRequestCleanup}
             onOpenSettings={onOpenSpeechSettings}
           />
         ) : null}
+
+        {assistantBatchJobs
+          .filter((job) => job.kind === 'note_assistance' && job.noteId === note.id)
+          .slice()
+          .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+          .map((job) => (
+            <AssistantBatchJobCard
+              key={job.id}
+              job={job}
+              busy={busy}
+              blocked={assistantBatchActionsBlocked}
+              onCheck={onCheckAssistantBatch}
+              onRetryCleanup={onRetryAssistantBatchCleanup}
+            />
+          ))}
 
         {text.trim() ? (
           <View style={s.assistCard}>

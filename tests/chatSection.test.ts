@@ -74,4 +74,33 @@ describe('queued chat section', () => {
     await act(async () => { resolveSend(); await pending; });
     expect(input.value).toBe('');
   });
+
+  it('blocks conversation navigation while sending without blocking idle queued navigation', async () => {
+    let resolveSend!: () => void;
+    const pending = new Promise<void>((resolve) => { resolveSend = resolve; });
+    const onSend = vi.fn(() => pending);
+    const ui = props(onSend);
+    ui.conversations = [{ id: 'conversation-1', title: 'One', createdAt: '2026-01-01T00:00:00.000Z' }];
+    act(() => root.render(React.createElement(ChatSection, ui)));
+    const input = host.querySelector('textarea')!;
+    act(() => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+      setter?.call(input, 'Question');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    const send = [...host.querySelectorAll('button')].find((button) => button.textContent === 'Send Batch request')!;
+    await act(async () => { send.click(); await Promise.resolve(); });
+    const newConversation = [...host.querySelectorAll('button')].find((button) => button.textContent === 'New conversation')!;
+    const selectConversation = [...host.querySelectorAll('button')].find((button) => button.getAttribute('aria-label') === 'Open conversation One')!;
+    expect(newConversation.disabled).toBe(true);
+    expect(selectConversation.disabled).toBe(true);
+    act(() => { newConversation.click(); selectConversation.click(); });
+    expect(ui.onCreateConversation).not.toHaveBeenCalled();
+    expect(ui.onSelectConversation).not.toHaveBeenCalled();
+    await act(async () => { resolveSend(); await pending; });
+    expect(newConversation.disabled).toBe(false);
+    act(() => selectConversation.click());
+    expect(ui.onSelectConversation).toHaveBeenCalledWith('conversation-1');
+  });
 });

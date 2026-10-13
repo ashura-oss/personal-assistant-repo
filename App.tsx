@@ -84,6 +84,9 @@ import { PrivacyCleanupScreen } from "./src/ui/PrivacyCleanupScreen";
 import { PrivacyEraseReview } from "./src/ui/PrivacyEraseReview";
 import { PendingRecordingRecoveryPanel } from "./src/components/PendingRecordingRecoveryPanel";
 import { BackgroundRefreshSection, type BackgroundRefreshActionResult } from "./src/components/BackgroundRefreshSection";
+import { AssistantBatchHistorySection } from "./src/ui/AssistantBatchHistorySection";
+import { createSpeechTranscriptionAdmission, runExplicitSpeechTranscriptionAction } from "./src/ui/speechTranscriptionAction";
+import type { AssistantBatchJobDTO } from "./src/services/openRouterBatchJobs";
 import { MailAlertPreview } from "./src/dev/mailAlertPreview";
 import { MailAlertTapPreview } from "./src/dev/mailAlertTapPreview";
 import { ProactiveRecoveryPreview } from "./src/dev/proactiveRecoveryPreview";
@@ -126,7 +129,8 @@ const isBackgroundRefreshDemo = previewScenario === "background-refresh" && Plat
 const isMailAlertDemo = previewScenario === "mail-alerts" && Platform.OS === "web";
 const isMailAlertTapsDemo = previewScenario === "mail-alert-taps" && Platform.OS === "web";
 const isProactiveRecoveryDemo = previewScenario === "proactive-recovery" && Platform.OS === "web";
-const isIsolatedDemo = isDispatchHistoryDemo || isMailSyncDemo || isBackupImportDemo || isKnowledgeDemo || isReminderDemo || isDeviceCalendarsDemo || isTranscriptionDemo || isStartupRecoveryDemo || isPrivacyCleanupDemo || isPendingRecoveryDemo || isBackgroundRefreshDemo || isMailAlertDemo || isMailAlertTapsDemo || isProactiveRecoveryDemo;
+const isOpenRouterBatchDemo = previewScenario === "openrouter-batch" && Platform.OS === "web";
+const isIsolatedDemo = isDispatchHistoryDemo || isMailSyncDemo || isBackupImportDemo || isKnowledgeDemo || isReminderDemo || isDeviceCalendarsDemo || isTranscriptionDemo || isStartupRecoveryDemo || isPrivacyCleanupDemo || isPendingRecoveryDemo || isBackgroundRefreshDemo || isMailAlertDemo || isMailAlertTapsDemo || isProactiveRecoveryDemo || isOpenRouterBatchDemo;
 
 type LlmProviderChoice = "azure" | "openrouter";
 
@@ -166,18 +170,23 @@ export function buildLlmProviderSettingsPatch(
   };
 }
 
+export function buildSpeechProviderSettingsPatch(provider: "azure" | "openrouter"): Partial<AppSettings> {
+  return { speechProvider: provider };
+}
+
 export function buildProviderCredentialInput(
   provider: LlmProviderChoice,
   speechSubscriptionKey: string,
   openAiApiKey: string,
   openRouterApiKey: string,
+  openRouterSelectedForSpeech = false,
 ): { speechSubscriptionKey?: string; openAiApiKey?: string; openRouterApiKey?: string } {
   const speech = speechSubscriptionKey.trim();
-  const llmKey = (provider === "azure" ? openAiApiKey : openRouterApiKey).trim();
   return {
     ...(speech ? { speechSubscriptionKey: speech } : {}),
-    ...(llmKey
-      ? provider === "azure" ? { openAiApiKey: llmKey } : { openRouterApiKey: llmKey }
+    ...(provider === "azure" && openAiApiKey.trim() ? { openAiApiKey: openAiApiKey.trim() } : {}),
+    ...((provider === "openrouter" || openRouterSelectedForSpeech) && openRouterApiKey.trim()
+      ? { openRouterApiKey: openRouterApiKey.trim() }
       : {}),
   };
 }
@@ -478,6 +487,7 @@ type WorkspaceBindings = {
   resources?: PrivacyResourceBoundary;
   mailAlertTaps?: MailAlertTapBackend;
   privacyPreview?: boolean;
+  batchPreviewMetrics?: () => { postCount: number; getCount: number };
   isolated: boolean;
 };
 
@@ -552,6 +562,12 @@ export default function App() {
           }
           if (isProactiveRecoveryDemo) {
             if (alive) setBootstrap({ kind: "proactive_recovery_preview" });
+            return;
+          }
+          if (isOpenRouterBatchDemo) {
+            const { createOpenRouterBatchPreview } = await import("./src/dev/openRouterBatchPreview");
+            const selected = await createOpenRouterBatchPreview();
+            if (alive) setBootstrap({ kind: "workspace", bindings: { controller: selected.controller, credentials: previewCredentialService, batchPreviewMetrics: selected.getMetrics, isolated: true } });
             return;
           }
           if (isBackgroundRefreshDemo) {
@@ -879,7 +895,7 @@ type WorkspaceProps = WorkspaceBindings & {
   onPrivacyInvalidated: () => void;
 };
 
-function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps, credentials, audioBoundary, privacy, session, isolated: isIsolatedDemo, privacyReviewOpen, privacyOutcomeUnknown = false, onPrivacyReview, onPrivacyInvalidated }: WorkspaceProps) {
+function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps, credentials, audioBoundary, privacy, session, batchPreviewMetrics, isolated: isIsolatedDemo, privacyReviewOpen, privacyOutcomeUnknown = false, onPrivacyReview, onPrivacyInvalidated }: WorkspaceProps) {
   const state = useAppState(controller);
   const [tab, setTab] = useState<Tab>(isBackupImportDemo || isKnowledgeDemo || isReminderDemo || isTranscriptionDemo ? "library" : isIsolatedDemo ? "inbox" : "record");
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -887,6 +903,8 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
   const [detail, setDetail] = useState<Note | null>(null);
   const [recordingAttachmentNoteId, setRecordingAttachmentNoteId] = useState<string | null>(null);
   const [cancelingTranscriptionId, setCancelingTranscriptionId] = useState<string | undefined>();
+  const [retryingTranscriptionCleanupId, setRetryingTranscriptionCleanupId] = useState<string | undefined>();
+  const transcriptionCleanupActionRef = useRef<string | undefined>(undefined);
   const [transcribingNoteId, setTranscribingNoteId] = useState<string | undefined>();
   const [review, setReview] = useState<Proposal | null>(null);
   const [replyMessageId, setReplyMessageId] = useState<string | null>(null);
@@ -1002,6 +1020,8 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
   const [reviewFreshnessRetry, setReviewFreshnessRetry] = useState(0);
   const [answerWindowTick, setAnswerWindowTick] = useState(0);
   const busyLock = useRef(false);
+  const speechTranscriptionAdmission = useRef<ReturnType<typeof createSpeechTranscriptionAdmission> | null>(null);
+  if (speechTranscriptionAdmission.current == null) speechTranscriptionAdmission.current = createSpeechTranscriptionAdmission();
   const checkedAnalysisKey = useRef("");
   const checkedReviewFreshnessKey = useRef("");
   const mailAlertTapOverlaysOpen = settingsOpen || Boolean(detail) || manualOpen || Boolean(review) ||
@@ -2301,7 +2321,9 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
           {isIsolatedDemo ? (
             <View style={s.notice}>
               <Text style={s.noticeText}>
-                {isDispatchHistoryDemo
+                {isOpenRouterBatchDemo
+                  ? "Sample OpenRouter Batch · in-memory only · no external access"
+                  : isDispatchHistoryDemo
                   ? "Sample history · no external actions"
                   : isMailSyncDemo
                     ? "Sample mail · no external actions"
@@ -2319,6 +2341,11 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
                           ? "Sample privacy cleanup · in-memory only · no external access"
                           : "Sample knowledge · in-memory only · no external actions"}
               </Text>
+              {isOpenRouterBatchDemo && batchPreviewMetrics ? (
+                <Text style={s.noticeText}>
+                  Simulated requests: {batchPreviewMetrics().postCount} submissions · {batchPreviewMetrics().getCount} explicit checks
+                </Text>
+              ) : null}
             </View>
           ) : null}
           {mailAlertTapPending && !mailAlertTapResolution ? (
@@ -2445,9 +2472,14 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
                 demoMode={isIsolatedDemo}
                 transcriptionDemoMode={isTranscriptionDemo}
                 speechEnabled={state.settings.speechEnabled === true}
+                speechProvider={state.settings.speechProvider ?? "azure"}
                 transcriptionAttempts={state.transcription.attempts.filter((attempt) => attempt.noteId === detail.id)}
+                assistantBatchJobs={state.assistantBatchJobs ?? []}
+                assistantBatchActionsBlocked={Boolean(state.assistantBatchRecoveryStatus)}
                 cancelingTranscriptionId={cancelingTranscriptionId}
                 transcriptionRequestRunning={transcribingNoteId === detail.id}
+                transcriptionRequestCleanupAttemptIds={(state.transcriptionRequestCleanupPending ?? []).map(({ attemptId }) => attemptId)}
+                retryingTranscriptionCleanupId={retryingTranscriptionCleanupId}
                 analysisStatusError={
                   analysisStatusError?.key === analysisFreshnessKey
                     ? analysisStatusError.message
@@ -2491,6 +2523,30 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
                 }}
                 onAssist={(options) => {
                   void run(async () => {
+                    const useOpenRouterBatch = (!isIsolatedDemo || isOpenRouterBatchDemo) &&
+                      state.settings.mode === "provider" &&
+                      state.settings.llmProvider === "openrouter";
+                    if (useOpenRouterBatch) {
+                      const configured = isOpenRouterBatchDemo
+                        ? true
+                        : (await credentials.getCredentials()).openRouterConfigured === true;
+                      if (!configured) {
+                        openSettings();
+                        setNotice("Save an OpenRouter API key in Settings before queuing this request.");
+                        return;
+                      }
+                      const job = await controller.submitNoteBatch(detail.id, {
+                        intent: options.intent,
+                        question: options.question,
+                        knowledgeSelection: options.knowledgeSelection,
+                      });
+                      setNotice(isOpenRouterBatchDemo
+                        ? "SAMPLE · Simulated Batch request queued. No network or provider was contacted."
+                        : job.status === "submission_unknown"
+                        ? "Submission status is uncertain. Check Batch history; this will not submit the request again."
+                        : "Request queued with OpenRouter Batch. Check for a reply when you choose.");
+                      return;
+                    }
                     const result = await controller.assistNote(
                       detail.id,
                       options,
@@ -2506,6 +2562,15 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
                     );
                   });
                 }}
+                onCheckAssistantBatch={(jobId) => run(async () => {
+                  const updated = await controller.refreshAssistantBatch(jobId);
+                  setNotice(updated.status === "completed"
+                    ? "A validated Batch reply was saved to the note."
+                    : "Batch status checked.");
+                  return updated;
+                })}
+                onRetryAssistantBatchCleanup={isIsolatedDemo ? undefined : (jobId) =>
+                  controller.retryAssistantBatchCleanup(jobId)}
                 onCreateMemorySuggestion={(input) => run(async () => {
                   const suggestion = await controller.createKnowledgeSuggestionFromNote(input);
                   setNotice("Memory suggestion saved for review.");
@@ -2517,33 +2582,49 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
                   setDetail(null);
                 }}
                 onTranscribe={(expectedRevision) => {
-                  if (isIsolatedDemo && !isTranscriptionDemo) {
-                    setNotice("Transcription is disabled in this sample preview.");
-                    return;
-                  }
-                  if (!state.settings.speechEnabled || !state.settings.speechEndpoint) {
-                    openSettings();
-                    return;
-                  }
-                  void run(async () => {
-                    setTranscribingNoteId(detail.id);
-                    try {
-                      const updated = await controller.transcribeNote(
-                        detail.id,
-                        { expectedRevision },
-                      );
-                      setDetail(updated);
-                      setNotice(
-                        isTranscriptionDemo
-                          ? "Sample transcript saved — Azure was not contacted."
-                          : "Azure Speech transcript saved. Review it before asking about this note.",
-                      );
-                    } catch (error) {
-                      if (!isTranscriptionDemo) throw error;
-                      setNotice(sampleTranscriptionErrorNotice(error));
-                    } finally {
-                      setTranscribingNoteId(undefined);
-                    }
+                  const selectedSpeechProvider = state.settings.speechProvider ?? "azure";
+                  void speechTranscriptionAdmission.current!.run(async () => run(async () => {
+                    return runExplicitSpeechTranscriptionAction({
+                      provider: selectedSpeechProvider,
+                      enabled: state.settings.speechEnabled === true,
+                      hasAzureEndpoint: Boolean(state.settings.speechEndpoint),
+                      isolatedPreview: isIsolatedDemo,
+                      transcriptionSample: isTranscriptionDemo,
+                      readOpenRouterConfigured: async () => (await credentials.getCredentials()).openRouterConfigured === true,
+                    }, {
+                      openSettings: () => {
+                        if (selectedSpeechProvider === "openrouter" && state.settings.speechEnabled) {
+                          setNotice("Save an OpenRouter API key in Settings before transcribing this recording.");
+                        }
+                        openSettings();
+                      },
+                      onPreviewBlocked: () => setNotice(isTranscriptionDemo
+                        ? "OpenRouter Speech uploads are disabled in this sample preview."
+                        : "Transcription is disabled in this sample preview."),
+                      onCredentialStatusUnavailable: () => {
+                        setNotice("OpenRouter key status could not be checked. Review Settings before trying again.");
+                        openSettings();
+                      },
+                      onReady: async () => {
+                        setTranscribingNoteId(detail.id);
+                        try {
+                          const updated = await controller.transcribeNote(detail.id, { expectedRevision });
+                          setDetail(updated);
+                          setNotice(isTranscriptionDemo
+                            ? "Sample transcript saved — Azure was not contacted."
+                            : selectedSpeechProvider === "openrouter"
+                              ? "OpenRouter Speech transcript saved. Review reported usage if available."
+                              : "Azure Speech transcript saved. Review it before asking about this note.");
+                        } catch (error) {
+                          if (!isTranscriptionDemo) throw error;
+                          setNotice(sampleTranscriptionErrorNotice(error));
+                        } finally {
+                          setTranscribingNoteId(undefined);
+                        }
+                      },
+                    });
+                  })).then((result) => {
+                    if (result.status === "failed") setNotice("Transcription could not be confirmed. Review its saved status before trying again.");
                   });
                 }}
                 onCancelTranscription={(attemptId) => {
@@ -2562,6 +2643,21 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
                     .catch((error) => setNotice(messageOf(error)))
                     .finally(() => setCancelingTranscriptionId(undefined));
                 }}
+                onRetryTranscriptionRequestCleanup={async (attemptId) => {
+                  if (transcriptionCleanupActionRef.current) throw new Error("A cleanup action is already running.");
+                  transcriptionCleanupActionRef.current = attemptId;
+                  setRetryingTranscriptionCleanupId(attemptId);
+                  try {
+                    await controller.retryTranscriptionRequestCleanup(attemptId);
+                    setNotice("Local transcription request cleanup finished.");
+                  } catch {
+                    setNotice("Local transcription request cleanup could not be confirmed. Try again.");
+                    throw new Error("Local request cleanup could not be confirmed.");
+                  } finally {
+                    transcriptionCleanupActionRef.current = undefined;
+                    setRetryingTranscriptionCleanupId(undefined);
+                  }
+                }}
                 onOpenSpeechSettings={() => {
                   if (isIsolatedDemo) {
                     setNotice("Speech settings are disabled in this sample preview.");
@@ -2572,7 +2668,7 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
                 onAttachRecording={() =>
                   setRecordingAttachmentNoteId(detail.id)
                 }
-                providerReady={Boolean(state.settings.speechEndpoint)}
+                providerReady={(state.settings.speechProvider ?? "azure") === "openrouter" || Boolean(state.settings.speechEndpoint)}
                 onPlay={() => run(() => audio.play(detail.audioUri!))}
                 onExportAudio={() =>
                   run(async () => {
@@ -2825,6 +2921,17 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
                 : run(() => credentials.deleteCredentials(kind))}
               onDeleteLocalData={openPrivacyReview}
               onNotice={setNotice}
+              assistantBatchJobs={state.assistantBatchJobs ?? []}
+              assistantBatchRecoveryMessage={state.assistantBatchRecoveryStatus?.message}
+              onCheckAssistantBatch={(jobId) => run(async () => {
+                const updated = await controller.refreshAssistantBatch(jobId);
+                setNotice(updated.status === "completed"
+                  ? "A validated Batch reply was saved to its note."
+                  : "Batch status checked.");
+                return updated;
+              })}
+              onRetryAssistantBatchCleanup={isIsolatedDemo ? undefined : (jobId) =>
+                controller.retryAssistantBatchCleanup(jobId)}
               onConnect={connectAccount}
               onDisconnect={disconnectAccount}
               onSync={syncAccount}
@@ -4028,6 +4135,10 @@ function SettingsScreen({
   onSetBackgroundRefresh,
   onRetryBackgroundRefresh,
   onRefreshLocalData,
+  assistantBatchJobs,
+  assistantBatchRecoveryMessage,
+  onCheckAssistantBatch,
+  onRetryAssistantBatchCleanup,
   proactiveRecoveryStatus,
   proactiveRecoveryPlan,
   proactiveRecoveryBusy,
@@ -4082,6 +4193,10 @@ function SettingsScreen({
   onSetBackgroundRefresh: (enabled: boolean) => Promise<BackgroundRefreshActionResult | undefined>;
   onRetryBackgroundRefresh: () => Promise<BackgroundRefreshActionResult | undefined>;
   onRefreshLocalData: () => Promise<boolean | undefined>;
+  assistantBatchJobs: readonly AssistantBatchJobDTO[];
+  assistantBatchRecoveryMessage?: string;
+  onCheckAssistantBatch: (jobId: string) => Promise<unknown> | unknown;
+  onRetryAssistantBatchCleanup?: (jobId: string) => Promise<unknown> | unknown;
   proactiveRecoveryStatus?: ProactiveRecoveryStatus;
   proactiveRecoveryPlan?: ProactiveRecoveryPlan;
   proactiveRecoveryBusy: boolean;
@@ -4178,6 +4293,9 @@ function SettingsScreen({
   const [speechEndpoint, setSpeechEndpoint] = useState(
     state.settings.speechEndpoint ?? "",
   );
+  const [speechProvider, setSpeechProvider] = useState<"azure" | "openrouter">(
+    state.settings.speechProvider ?? "azure",
+  );
   const [model, setModel] = useState(state.settings.model ?? "gpt-6-luna");
   const [effort, setEffort] = useState<"none" | "low">(
     state.settings.llmProvider === "openrouter"
@@ -4260,7 +4378,8 @@ function SettingsScreen({
         maxCallsPerDay: Number(dailyLimit),
       }),
       speechEnabled,
-      speechEndpoint,
+      ...buildSpeechProviderSettingsPatch(speechProvider),
+      ...(speechProvider === "azure" ? { speechEndpoint } : {}),
       maxAudioSeconds: Number(maxAudioSeconds),
       audioRetention: retention,
     });
@@ -4273,7 +4392,7 @@ function SettingsScreen({
   };
   const saveKeys = async () => {
     const result = await onSaveCredentials(
-      buildProviderCredentialInput(llmProvider, speechKey, openAiKey, openRouterKey),
+      buildProviderCredentialInput(llmProvider, speechKey, openAiKey, openRouterKey, speechProvider === "openrouter"),
     );
     if (result) {
       setSpeechKey("");
@@ -4376,13 +4495,13 @@ function SettingsScreen({
         </View>
         <View style={s.providerToggle}>
           <View style={{ flex: 1 }}>
-            <Text style={s.accountName}>Enable Azure transcription</Text>
+            <Text style={s.accountName}>Enable {speechProvider === "azure" ? "Azure" : "OpenRouter"} transcription</Text>
             <Text style={s.accountSub}>
-              Separate from AI analysis. Still uploads a saved recording only when you choose Transcribe.
+              Separate from AI analysis. A saved recording is uploaded only after you choose Transcribe.
             </Text>
           </View>
           <Switch
-            accessibilityLabel="Enable Azure transcription"
+            accessibilityLabel={`Enable ${speechProvider === "azure" ? "Azure" : "OpenRouter"} transcription`}
             value={speechEnabled}
             onValueChange={setSpeechEnabled}
             disabled={demoMode}
@@ -4390,6 +4509,37 @@ function SettingsScreen({
             thumbColor={C.text}
           />
         </View>
+        <Text style={s.sectionTitle}>Speech provider</Text>
+        <View style={s.pills}>
+          {(["azure", "openrouter"] as const).map((value) => (
+            <Pressable
+              key={value}
+              accessibilityRole="radio"
+              accessibilityState={{ checked: speechProvider === value }}
+              accessibilityLabel={`Use ${value === "azure" ? "Azure Speech" : "OpenRouter Speech"}`}
+              onPress={() => {
+                if (value === "openrouter") setSpeechKey("");
+                setSpeechProvider(value);
+              }}
+              style={[s.pill, speechProvider === value && s.pillActive]}
+            >
+              <Text style={[s.pillText, speechProvider === value && s.pillTextActive]}>
+                {value === "azure" ? "Azure Speech" : "OpenRouter"}
+              </Text>
+            </Pressable>
+          ))}
+        </View>
+        {speechProvider === "openrouter" ? (
+          <View style={s.analysisStale}>
+            <Text style={s.accountName}>OpenRouter transcription model</Text>
+            <Text accessibilityLabel="OpenRouter transcription model openai/gpt-4o-mini-transcribe" style={s.analysisText}>
+              openai/gpt-4o-mini-transcribe
+            </Text>
+            <Text style={s.disclaimer}>
+              Choose Transcribe on a saved recording to upload it to OpenRouter. Usage appears only when reported; no cost is estimated. This does not use Batch.
+            </Text>
+          </View>
+        ) : null}
         <Text style={s.sectionTitle}>AI provider</Text>
         <View style={s.pills}>
           {(["azure", "openrouter"] as const).map((value) => (
@@ -4442,17 +4592,17 @@ function SettingsScreen({
               openai/gpt-6-luna:batch
             </Text>
             <Text style={s.disclaimer}>
-              Batch requests may take up to 24 hours. OpenRouter retains batch inputs and results for 30 days or until the batch is deleted. No running token or cost estimate is shown; cost appears only when the provider reports a final result.
+              Batch requests may take up to 24 hours. OpenRouter retains batch inputs and results for 30 days or until the batch is deleted. No running token or cost estimate is shown; cost appears only when OpenRouter reports it.
             </Text>
           </View>
         )}
-        <Field
+        {speechProvider === "azure" ? <Field
           label="Speech endpoint"
           value={speechEndpoint}
           onChangeText={setSpeechEndpoint}
           placeholder="Speech resource endpoint"
           keyboardType="url"
-        />
+        /> : null}
         <Text style={s.label}>Reasoning effort</Text>
         <View style={s.pills}>
           {(["none", "low"] as const).map((v) => (
@@ -4474,7 +4624,7 @@ function SettingsScreen({
         />
         {demoMode ? null : (
           <>
-            <Field
+            {speechProvider === "azure" ? <Field
               label="Speech subscription key"
               secureTextEntry
               value={speechKey}
@@ -4486,7 +4636,7 @@ function SettingsScreen({
                     : "Saved securely · enter to replace"
                   : "Not configured"
               }
-            />
+            /> : null}
             {llmProvider === "azure" ? (
               <Field
                 label="Azure OpenAI API key"
@@ -4501,7 +4651,8 @@ function SettingsScreen({
                     : "Not configured"
                 }
               />
-            ) : (
+            ) : null}
+            {llmProvider === "openrouter" || speechProvider === "openrouter" ? (
               <Field
                 label="OpenRouter API key"
                 secureTextEntry
@@ -4515,7 +4666,7 @@ function SettingsScreen({
                     : "Not configured"
                 }
               />
-            )}
+            ) : null}
             <Text style={s.disclaimer}>
               Native credentials use platform secure storage. Browser preview
               keeps credentials in memory only. No provider request is made by
@@ -4528,7 +4679,11 @@ function SettingsScreen({
                   : "Save entered keys securely"
               }
               tone="quiet"
-              disabled={!speechKey && (llmProvider === "azure" ? !openAiKey : !openRouterKey)}
+              disabled={
+                !speechKey.trim() &&
+                !(llmProvider === "azure" && openAiKey.trim()) &&
+                !(openRouterKey.trim() && (llmProvider === "openrouter" || speechProvider === "openrouter"))
+              }
               onPress={() => void saveKeys()}
             />
             {credentialStatus.speechConfigured ||
@@ -4620,10 +4775,22 @@ function SettingsScreen({
               : "Unknown · no verified rate card"
           }
         /> : null}
-        <LimitRow
-          label="Recorded requests this month"
-          value={String(state.usage.requests)}
-        />
+        {llmProvider === "azure" ? (
+          <LimitRow
+            label="Recorded requests this month"
+            value={String(state.usage.requests)}
+          />
+        ) : null}
+        {llmProvider === "openrouter" || assistantBatchJobs.length > 0 || assistantBatchRecoveryMessage ? (
+          <AssistantBatchHistorySection
+            jobs={assistantBatchJobs}
+            recoveryMessage={assistantBatchRecoveryMessage}
+            busy={busy}
+            blocked={Boolean(assistantBatchRecoveryMessage)}
+            onCheck={onCheckAssistantBatch}
+            onRetryCleanup={onRetryAssistantBatchCleanup}
+          />
+        ) : null}
         {shouldShowProactiveRecoverySection({
           mailAlertRecovery: Boolean(state.proactiveMailAlertRecoveryStatus),
           proactiveIntegrityError: Boolean(state.proactive.integrityError),

@@ -1,8 +1,8 @@
 # Still
 
-Still is a native-first personal assistant centered on locally saved recordings and notes. Users can request transcription or bounded assistance, review proposed actions, and approve them separately; editing invalidates prior approval. The current assistance flow is note-centered rather than conversational. Queued text chat is planned; live voice conversation is out of scope.
+Still is a native-first personal assistant centered on locally saved recordings and notes. Users can request transcription or bounded assistance, review proposed actions, and approve them separately; editing invalidates prior approval. OpenRouter Batch note-assistance jobs can be submitted and checked explicitly, with a saved usage receipt; queued text chat is still planned, and live voice conversation is out of scope.
 
-The current app includes local notes and tasks, People and Projects, memory review, reminders, mail/calendar views, explicit reply drafting, portable backup, local privacy controls, and an on-device iOS calendar path. Durable interrupted-recording recovery and exact note adoption are wired in source, but native recorder, storage, permission, and device behavior remain unverified. See [the capability ledger](docs/PLAN.md) and [the iteration log](docs/ITERATIONS.md) for implementation boundaries and evidence.
+The current app includes local notes and tasks, People and Projects, memory review, reminders, mail/calendar views, explicit reply drafting, portable backup, local privacy controls, and an on-device iOS calendar path. Saved-recording transcription supports separate Azure Speech and OpenRouter Speech providers; native recorder, storage, permission, and device behavior remain unverified. See [the capability ledger](docs/PLAN.md) and [the iteration log](docs/ITERATIONS.md) for implementation boundaries and evidence.
 
 ## Local development
 
@@ -19,7 +19,7 @@ Useful checks include `npm run typecheck`, `npm test`, `npm run lint`, `npx expo
 
 Notes, app state, documents, and recordings use local platform storage. Do not assume app-private storage is encrypted or excluded from device backups. JSON backup is explicit and excludes audio, settings, credentials, live provider identity, executable approvals, and notification schedules. Treat exported files as sensitive data.
 
-Azure Speech, Azure OpenAI, and OAuth integrations remain unverified and require user-provided configuration. One fictional OpenRouter Batch request was sent and its exact strict-JSON result and reported usage were verified; this proves only that single request, not in-app queued-chat integration or general model availability. The OpenRouter key is stored outside the repository. See [the verification record](docs/IOS_BUILD.md) for the request scope and limits.
+Azure Speech, Azure OpenAI, live OpenRouter Speech, and OAuth integrations remain unverified and require user-provided configuration. The app has an explicit OpenRouter Speech upload path using its separate provider selection and the saved OpenRouter key; it reports usage only when the provider returns it and does not estimate charges. One fictional OpenRouter Batch request was sent and its exact strict-JSON result and reported usage were verified; a separate closed-browser fixture exercises the in-app saved-job flow without provider access. These checks do not prove native behavior or general model availability. The OpenRouter key is stored outside the repository. See [the verification record](docs/IOS_BUILD.md) for the request scope and limits.
 
 OAuth registration requires provider-supported public client IDs and exact redirect URIs. Native redirect changes require a new custom build. Never bundle OAuth client secrets. Real provider registrations have not been tested.
 

@@ -47,6 +47,34 @@ function dateLabel(value: string) {
     : 'Time unavailable';
 }
 
+function ConversationButton({
+  conversation,
+  selected,
+  disabled,
+  sendLock,
+  onSelect,
+}: {
+  conversation: ChatConversation;
+  selected: boolean;
+  disabled: boolean;
+  sendLock: React.RefObject<boolean>;
+  onSelect: (conversationId: string) => void;
+}) {
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityState={{ selected }}
+      accessibilityLabel={`Open conversation ${conversation.title}`}
+      disabled={disabled}
+      onPress={() => { if (!disabled && !sendLock.current) onSelect(conversation.id); }}
+      style={[styles.conversation, selected && styles.conversationSelected]}
+    >
+      <Text numberOfLines={2} style={styles.conversationTitle}>{conversation.title}</Text>
+      <Text style={styles.meta}>{dateLabel(conversation.createdAt)}</Text>
+    </Pressable>
+  );
+}
+
 export function ChatSection({
   conversations,
   selectedConversationId,
@@ -66,6 +94,7 @@ export function ChatSection({
   const [sendError, setSendError] = useState<string>();
   const sendLock = useRef(false);
   const trimmedDraft = draft.trim();
+  const navigationBlocked = busy || sending || Boolean(recoveryMessage);
 
   const send = async () => {
     if (!enabled || busy || sendLock.current || !trimmedDraft) return;
@@ -92,7 +121,7 @@ export function ChatSection({
             <Text style={s.h1Small}>Queued chat</Text>
             <Text style={styles.copy}>Messages are submitted as Batch requests. Replies may be delayed; nothing checks or resubmits in the background.</Text>
           </View>
-          <Button label="New conversation" tone="quiet" onPress={onCreateConversation} />
+          <Button label="New conversation" tone="quiet" disabled={navigationBlocked} onPress={() => { if (!busy && !sending && !recoveryMessage && !sendLock.current) onCreateConversation(); }} />
         </View>
 
         {!enabled ? <Text style={styles.notice}>Enable OpenRouter analysis in Settings to send a message.</Text> : null}
@@ -100,22 +129,16 @@ export function ChatSection({
 
         {conversations.length ? (
           <View style={styles.conversationList} accessibilityLabel="Conversations">
-            {conversations.map((conversation) => {
-              const selected = conversation.id === selectedConversationId;
-              return (
-                <Pressable
-                  key={conversation.id}
-                  accessibilityRole="button"
-                  accessibilityState={{ selected }}
-                  accessibilityLabel={`Open conversation ${conversation.title}`}
-                  onPress={() => onSelectConversation(conversation.id)}
-                  style={[styles.conversation, selected && styles.conversationSelected]}
-                >
-                  <Text numberOfLines={2} style={styles.conversationTitle}>{conversation.title}</Text>
-                  <Text style={styles.meta}>{dateLabel(conversation.createdAt)}</Text>
-                </Pressable>
-              );
-            })}
+            {conversations.map((conversation) => (
+              <ConversationButton
+                key={conversation.id}
+                conversation={conversation}
+                selected={conversation.id === selectedConversationId}
+                disabled={navigationBlocked}
+                sendLock={sendLock}
+                onSelect={onSelectConversation}
+              />
+            ))}
           </View>
         ) : (
           <Text style={styles.notice}>Start a conversation with a question or request.</Text>

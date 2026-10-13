@@ -31,7 +31,7 @@ vi.mock("expo-file-system/legacy", () => ({}));
 vi.mock("expo-file-system", () => ({}));
 vi.mock("expo-sharing", () => ({}));
 vi.mock("react-native-safe-area-context", () => ({ SafeAreaProvider: ({ children }: { children?: unknown }) => children, SafeAreaView: ({ children }: { children?: unknown }) => children }));
-const { buildLlmProviderSettingsPatch, buildProviderCredentialInput } = await import("../App");
+const { buildLlmProviderSettingsPatch, buildSpeechProviderSettingsPatch, buildProviderCredentialInput } = await import("../App");
 
 const values = {
   endpoint: "https://azure.example.test/openai/v1/",
@@ -70,6 +70,11 @@ describe("assistant provider Settings UI contracts", () => {
     });
   });
 
+  it("keeps Speech provider selection independent from the AI provider", () => {
+    expect(buildSpeechProviderSettingsPatch("openrouter")).toEqual({ speechProvider: "openrouter" });
+    expect(buildSpeechProviderSettingsPatch("azure")).toEqual({ speechProvider: "azure" });
+  });
+
   it("saves only the selected provider key while keeping Azure Speech independent", () => {
     expect(buildProviderCredentialInput("openrouter", " speech-test ", "azure-test", " router-test ")).toEqual({
       speechSubscriptionKey: "speech-test",
@@ -78,5 +83,10 @@ describe("assistant provider Settings UI contracts", () => {
     expect(buildProviderCredentialInput("azure", "", " azure-test ", "router-test")).toEqual({
       openAiApiKey: "azure-test",
     });
+    expect(buildProviderCredentialInput("azure", "", " azure-test ", " router-test ", true)).toEqual({
+      openAiApiKey: "azure-test",
+      openRouterApiKey: "router-test",
+    });
   });
+
 });
