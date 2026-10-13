@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { bindPrivacyBackgroundTaskBackend, bindPrivacyDeviceCalendarBackend, bindPrivacyNotificationBackend, createPrivacyBoundCredentialStore, createPrivacyBoundOAuthTokenStore } from '../src/privacy/resourceBoundary';
+import { bindPrivacyBackgroundTaskBackend, bindPrivacyDeviceCalendarBackend, bindPrivacyNotificationBackend, createPrivacyBoundCredentialStore, createPrivacyBoundOAuthTokenStore, createPrivacyResourceBoundary } from '../src/privacy/resourceBoundary';
 import type { PrivacyService } from '../src/privacy/service';
 import type { NotificationBackend } from '../src/services/notificationBackend';
 import type { OAuthTokenStore } from '../src/connectors';
@@ -23,6 +23,21 @@ function privacyMock() {
 }
 
 describe('privacy-bound provider and notification resources', () => {
+  it('exposes one scoped mail-alert writer without rebinding the raw backend', async () => {
+    const { privacy, descriptors } = privacyMock();
+    const input = { privacy, session: { epoch: session.epoch, runtimeId: session.runtimeId } };
+    const boundary = createPrivacyResourceBoundary(input);
+    input.session.epoch = '20000000-0000-4000-8000-000000000099';
+    let observedScope: PrivacyWriterScope | undefined;
+    const result = await boundary.withMailAlertNotificationWriter(async (scope) => {
+      observedScope = scope;
+      return 'settled';
+    });
+    expect(result).toBe('settled');
+    expect(observedScope).toBeDefined();
+    expect(descriptors).toEqual([{ kind: 'notification', namespace: 'notifications' }]);
+  });
+
   it('holds the writer lease through an actual delayed credential write and rejects arbitrary keys', async () => {
     const { privacy, descriptors } = privacyMock();
     let finish!: () => void;

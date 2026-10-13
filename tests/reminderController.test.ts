@@ -105,6 +105,8 @@ describe('reminder controller integrity', () => {
     expect(foregroundGate).toBeDefined();
     expect(foregroundGate!({ identifier: intent.identifier, content: { ...projection } })).toBe(true);
     expect(foregroundGate!({ identifier: intent.identifier, content: { ...projection, body: 'Different reminder' } })).toBe(false);
+    (app as unknown as { proactiveMailAlertQuarantine: unknown[] }).proactiveMailAlertQuarantine.push({ held: true });
+    expect(foregroundGate!({ identifier: intent.identifier, content: { ...projection } })).toBe(true);
   });
 
   it('does not reschedule a replacement while cancellation is still visible natively', async () => {

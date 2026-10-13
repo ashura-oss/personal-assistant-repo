@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 // This test intentionally imports both platform-specific eraser implementations.
 /* eslint-disable import/no-duplicates */
-import { createPrivacyEraseAdapter, type NativePrivacyEraseIO } from '../src/privacy/eraseAdapter';
+import { createPrivacyEraseAdapter, notificationsRemainFromBridge, type NativePrivacyEraseIO } from '../src/privacy/eraseAdapter';
 import { createWebPrivacyEraseAdapter, type WebPrivacyEraseIO } from '../src/privacy/eraseAdapter.web';
 /* eslint-enable import/no-duplicates */
 import { createWebSpeechAudioService, speechStagingMemoryCount } from '../src/audio/speechUpload.web';
@@ -13,6 +13,46 @@ import { PRIVACY_NAMESPACES, type PrivacyCleanupTarget, type PrivacyControlState
 
 const epoch = '30000000-0000-4000-8000-000000000001';
 const tokenRef = '30000000-0000-4000-8000-000000000002';
+
+describe('native notification absence verification', () => {
+  it('waits for the sibling native read after one notification query rejects', async () => {
+    let finishPresented!: (rows: unknown[]) => void;
+    let presentedStarted!: () => void;
+    const started = new Promise<void>((resolve) => { presentedStarted = resolve; });
+    const presented = new Promise<unknown[]>((resolve) => { finishPresented = resolve; });
+    let settled = false;
+    const verification = notificationsRemainFromBridge({
+      getAllScheduledNotificationsAsync: async () => { throw new Error('native read failed'); },
+      getPresentedNotificationsAsync: () => { presentedStarted(); return presented; },
+    }).finally(() => { settled = true; });
+
+    await started;
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    finishPresented([]);
+    await expect(verification).rejects.toMatchObject({ code: 'target_unavailable' });
+    expect(settled).toBe(true);
+  });
+
+  it('waits for a started sibling when a bridge method throws synchronously and rejects malformed lists', async () => {
+    let finishPresented!: (rows: unknown[]) => void;
+    let presentedStarted!: () => void;
+    const started = new Promise<void>((resolve) => { presentedStarted = resolve; });
+    const presented = new Promise<unknown[]>((resolve) => { finishPresented = resolve; });
+    const verification = notificationsRemainFromBridge({
+      getAllScheduledNotificationsAsync: () => { throw new Error('synchronous bridge failure'); },
+      getPresentedNotificationsAsync: () => { presentedStarted(); return presented; },
+    });
+
+    await started;
+    finishPresented([]);
+    await expect(verification).rejects.toMatchObject({ code: 'target_unavailable' });
+    await expect(notificationsRemainFromBridge({
+      getAllScheduledNotificationsAsync: async () => ({ length: 0 }),
+      getPresentedNotificationsAsync: async () => [],
+    })).rejects.toMatchObject({ code: 'target_unavailable' });
+  });
+});
 
 describe('shared erase target path validation', () => {
   it('rejects unpaired surrogate code units while accepting a valid bounded Unicode path', () => {

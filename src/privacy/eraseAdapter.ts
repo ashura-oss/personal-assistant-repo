@@ -28,6 +28,24 @@ export interface NativePrivacyEraseAdapterOptions {
   io?: NativePrivacyEraseIO;
 }
 
+type NotificationReadBridge = {
+  getAllScheduledNotificationsAsync(): Promise<unknown>;
+  getPresentedNotificationsAsync(): Promise<unknown>;
+};
+
+/** Wait for both native reads before releasing the cleanup writer, even if one fails early. */
+export async function notificationsRemainFromBridge(bridge: NotificationReadBridge): Promise<boolean> {
+  const [scheduled, presented] = await Promise.allSettled([
+    Promise.resolve().then(() => bridge.getAllScheduledNotificationsAsync()),
+    Promise.resolve().then(() => bridge.getPresentedNotificationsAsync()),
+  ]);
+  if (scheduled.status !== 'fulfilled' || presented.status !== 'fulfilled' ||
+      !Array.isArray(scheduled.value) || !Array.isArray(presented.value)) {
+    throw new PrivacyEraseAdapterError('target_unavailable');
+  }
+  return scheduled.value.length > 0 || presented.value.length > 0;
+}
+
 function supportedOwner(owner: PrivacyOwner): boolean {
   const uuid = (value: unknown) => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
   return owner.platform === 'ios' && owner.bundleIdentifier === 'com.still.voiceassistant' &&
@@ -94,11 +112,7 @@ async function createDefaultIO(): Promise<NativePrivacyEraseIO> {
     },
     async notificationsRemain() {
       const Notifications = await import('expo-notifications');
-      const [scheduled, presented] = await Promise.all([
-        Notifications.getAllScheduledNotificationsAsync(),
-        Notifications.getPresentedNotificationsAsync(),
-      ]);
-      return scheduled.length > 0 || presented.length > 0;
+      return notificationsRemainFromBridge(Notifications);
     },
     async unregisterBackgroundTask(taskName, beforeMutation) {
       if (taskName !== MAIL_REFRESH_TASK_NAME) throw new PrivacyEraseAdapterError('unsupported_target');

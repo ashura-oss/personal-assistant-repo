@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { AppState } from '../src/core';
 import { SQLiteStateStore, type SQLiteExecutor, type SQLiteTransactionDatabase } from '../src/storage/platformStorage';
 import { IndexedDbStateStore } from '../src/storage/platformStorage.web';
-import { STARTUP_RECOVERY_MAX_ARCHIVES, STARTUP_RECOVERY_MAX_ARCHIVE_BYTES, type StartupRecoveryPlan } from '../src/storage/startupRecovery';
+import { createStartupRecoveryBackend, STARTUP_RECOVERY_MAX_ARCHIVES, STARTUP_RECOVERY_MAX_ARCHIVE_BYTES, type StartupRecoveryPersistence, type StartupRecoveryPlan, type StartupRecoveryTransaction } from '../src/storage/startupRecovery';
 
 vi.stubGlobal('IDBKeyRange', IDBKeyRange);
 
@@ -13,6 +13,43 @@ function ids() {
   let value = 0;
   return () => `00000000-0000-4000-8000-${String(++value).padStart(12, '0')}`;
 }
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+it('keeps the recovery transaction open until sibling reads settle after a synchronous read failure', async () => {
+  const sibling = deferred<{ evidenceBytes: number }[]>();
+  const siblingStarted = deferred<void>();
+  let rollbackStarted = false;
+  let transactionFinished = false;
+  const transaction = {
+    readSnapshotMetadata() { throw new Error('metadata read failed'); },
+    readArchiveMetadata() { siblingStarted.resolve(); return sibling.promise; },
+    readPendingReceipt: async () => undefined,
+  } as unknown as StartupRecoveryTransaction;
+  const persistence: StartupRecoveryPersistence = {
+    async withTransaction<T>(work: (tx: StartupRecoveryTransaction) => Promise<T>) {
+      try { return await work(transaction); }
+      catch (error) { rollbackStarted = true; throw error; }
+      finally { transactionFinished = true; }
+    },
+  };
+  const backend = createStartupRecoveryBackend({ persistence });
+
+  const inspection = backend.inspect();
+  await siblingStarted.promise;
+  await Promise.resolve();
+  expect(rollbackStarted).toBe(false);
+  expect(transactionFinished).toBe(false);
+
+  sibling.resolve([]);
+  await expect(inspection).rejects.toThrow('metadata read failed');
+  expect(rollbackStarted).toBe(true);
+  expect(transactionFinished).toBe(true);
+});
 
 function sqliteMemory(options: { failReplacementWrite?: () => boolean } = {}): SQLiteTransactionDatabase & { close(): void; raw: DatabaseSync } {
   const raw = new DatabaseSync(':memory:');
@@ -198,6 +235,61 @@ describe('SQLite startup recovery', () => {
 });
 
 describe('IndexedDB startup recovery', () => {
+  it('keeps recovery inspection open until the request-error transaction aborts', async () => {
+    let abortRequested!: () => void;
+    const abortRequestedPromise = new Promise<void>((resolve) => { abortRequested = resolve; });
+    let closed = false;
+    const transactionHandlers: { error?: (event: Event) => void; abort?: (event: Event) => void } = {};
+    const cursorRequest = {
+      error: new DOMException('Injected cursor failure', 'UnknownError'),
+      set onerror(handler: (event: Event) => void) {
+        queueMicrotask(() => {
+          transactionHandlers.error?.(new Event('error'));
+          handler.call(cursorRequest, new Event('error'));
+        });
+      },
+      set onsuccess(_handler: ((event: Event) => void) | null) { /* failure is injected */ },
+    } as unknown as IDBRequest<IDBCursorWithValue | null>;
+    const transaction = {
+      durability: 'strict',
+      error: null,
+      objectStore: () => ({ openKeyCursor: () => cursorRequest }),
+      abort() { abortRequested(); },
+      set onerror(handler: ((event: Event) => void) | null) { transactionHandlers.error = handler ?? undefined; },
+      set onabort(handler: ((event: Event) => void) | null) { transactionHandlers.abort = handler ?? undefined; },
+      set oncomplete(_handler: ((event: Event) => void) | null) { /* held until the test emits abort */ },
+    } as unknown as IDBTransaction;
+    const database = {
+      objectStoreNames: { contains: () => true },
+      transaction: () => transaction,
+      close() { closed = true; },
+      set onversionchange(_handler: (() => void) | null) { /* registry bookkeeping */ },
+    } as unknown as IDBDatabase;
+    const factory = {
+      open: () => {
+        const opening = {
+          result: database,
+          set onupgradeneeded(_handler: (() => void) | null) { /* existing app store */ },
+          set onsuccess(handler: (() => void) | null) { if (handler) queueMicrotask(handler); },
+          set onerror(_handler: (() => void) | null) { /* not used */ },
+        };
+        return opening as unknown as IDBOpenDBRequest;
+      },
+    } as unknown as IDBFactory;
+    const store = new IndexedDbStateStore({ factory, randomId: ids() });
+    let settled = false;
+    const inspection = store.recovery!.inspect().finally(() => { settled = true; });
+
+    await abortRequestedPromise;
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(closed).toBe(false);
+    transactionHandlers.abort?.(new Event('abort'));
+    await expect(inspection).rejects.toThrow();
+    expect(settled).toBe(true);
+    expect(closed).toBe(true);
+  });
+
   it('atomically saves schema/generation metadata and recovers with a restart-safe receipt', async () => {
     const factory = new IDBFactory();
     const store = new IndexedDbStateStore({ factory, randomId: ids(), sha256: async () => '2'.repeat(64) });

@@ -5,6 +5,7 @@ import type { KnowledgeState, KnowledgeEntityKind, KnowledgeFact, ContactClaim, 
 import type { ReminderRecord, ReminderState, ReminderPayload } from '../reminders';
 import type { StartupRecoveryInspection, StartupRecoveryPlan, StartupRecoveryReceipt, StartupRecoveryCommitInput } from '../storage/startupRecovery';
 import type { PendingCaptureReceipt, PendingCaptureSafeStatus } from '../audio/pendingCaptureService.types';
+import type { ProactiveMailAlertState } from '../proactiveMailAlerts/types';
 
 export type NoteStatus = 'recorded' | 'processed' | 'error';
 export type ProposalKind = 'task' | 'reminder' | 'email' | 'event' | 'memory';
@@ -645,6 +646,12 @@ export interface AppState {
   /** Versioned current mailbox metadata cache; this is independent of immutable dispatch history. */
   mailboxSchemaVersion: 2;
   proactive: ProactiveState;
+  /** Separate, explicitly consented private notification ledger; never imported as authority. */
+  proactiveMailAlerts: ProactiveMailAlertState;
+  /** Fixed public notice; malformed mail-alert state remains in the controller's private quarantine. */
+  proactiveMailAlertRecoveryStatus?: { quarantined: true; message: 'Some saved mail alert settings could not be validated and are held privately. New mail alerts are disabled until recovery.' };
+  /** Fixed in-memory gate if scoped alert settlement detects unrelated workspace changes. */
+  mailAlertRefreshRequired?: { required: true; message: 'Saved data changed. Refresh local data before continuing.' };
   /** Imported material is inert archive data; it is never assistant context or live authority. */
   importedBackups: import('../backup').ImportedBackupArchive[];
   backupRecoveryStatus?: { quarantinedArchiveCount: number; message: 'Some imported backup archive data could not be validated and is held privately.' };
@@ -867,6 +874,9 @@ export interface AppController {
   refreshMailHead(accountId: string, options?: { reason?: 'manual' | 'foreground' }): Promise<MailLaneResult>;
   continueMailBackfill(accountId: string): Promise<MailLaneResult>;
   refreshForegroundMail(): Promise<ForegroundMailRefreshResult>;
+  enableProactiveMailAlerts(input: { ruleId: string; expectedRuleVersion: number; expectedRuleRevision: number; timeZone: string; accountIds: string[] }): Promise<void>;
+  revokeProactiveMailAlerts(ruleId: string): Promise<void>;
+  reconcileProactiveMailAlerts(): Promise<void>;
   saveProactiveRule(input: {
     id?: string; expectedVersion?: number; name: string; enabled: boolean; accountIds: string[];
     trigger: import('../proactive').ProactiveTrigger; quietHours?: import('../proactive').QuietHours;

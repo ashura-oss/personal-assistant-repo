@@ -174,6 +174,20 @@ describe('injected native reminder notification backend', () => {
     expect(isAllowed).toHaveBeenCalledTimes(2);
   });
 
+  it('preserves normalized visible and sound fields for the shared foreground ledger gate', async () => {
+    let handler: ((notification: ExpoForegroundNotification) => Promise<unknown>) | undefined;
+    const { bridge } = mockBridge({ setNotificationHandler: vi.fn((value) => { handler = value.handleNotification; }) });
+    const check = vi.fn(() => false);
+    await createNotificationBackend('ios', async () => bridge).installForegroundHandler(check);
+    const content = {
+      title: 'New email', body: 'Open Still to view', data: { kind: 'proactive_mail_alert', installationId, receiptId: 'receipt' },
+      sound: null, badge: null, subtitle: null, attachments: [], categoryIdentifier: null, launchImageName: null,
+      threadIdentifier: null, summaryArgument: null, interruptionLevel: 'active', color: null, sticky: false,
+    };
+    await handler!({ request: { identifier: 'still-mail-alert', content }, date: new Date() });
+    expect(check).toHaveBeenCalledWith({ identifier: 'still-mail-alert', content });
+  });
+
   it('keeps web unavailable without loading the native API or asking for permissions', async () => {
     const load = vi.fn(async () => { throw new Error('must not load'); });
     const backend = createNotificationBackend('web', load);

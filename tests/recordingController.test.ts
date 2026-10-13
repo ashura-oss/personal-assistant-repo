@@ -243,8 +243,11 @@ describe('imported recording recovery', () => {
     const before = structuredClone(secondApp.getSnapshot());
     secondStore.failNext = true;
     await expect(secondApp.attachRecording({ sessionId: secondPreview!.sessionId, planHash: secondPreview!.planHash })).rejects.toThrow(/disk full/i);
-    expect(secondApp.getSnapshot()).toEqual(before);
+    expect(secondApp.getSnapshot().notes).toEqual(before.notes);
+    expect(secondApp.getSnapshot().mailAlertRefreshRequired?.required).toBe(true);
     expect(secondRecovery.remove).toHaveBeenCalledWith(staged);
+    await secondApp.refreshPersistedWorkspace();
+    expect(secondApp.getSnapshot().mailAlertRefreshRequired).toBeUndefined();
   });
 
   it('cancels only the staged selection and blocks unknown-duration replacements before key access or reservation', async () => {

@@ -178,6 +178,64 @@ describe('SQLite privacy control store', () => {
 });
 
 describe('IndexedDB privacy control store', () => {
+  it('keeps the operation and database connection open until a request-error transaction aborts', async () => {
+    let requestAbort!: () => void;
+    let abortRequested!: () => void;
+    const abortRequestedPromise = new Promise<void>((resolve) => { abortRequested = resolve; });
+    let closed = false;
+    let transactionError: ((event: Event) => void) | null = null;
+    let transactionAbort: ((event: Event) => void) | null = null;
+    const request = {
+      error: new DOMException('Injected request failure', 'UnknownError'),
+      set onerror(handler: (event: Event) => void) {
+        queueMicrotask(() => {
+          transactionError?.(new Event('error'));
+          handler.call(request, new Event('error'));
+        });
+      },
+    } as unknown as IDBRequest<unknown>;
+    const transaction = {
+      durability: 'strict',
+      error: null,
+      objectStore: () => ({ get: () => request }),
+      abort() { abortRequested(); },
+      set onerror(handler: ((event: Event) => void) | null) { transactionError = handler; },
+      set onabort(handler: ((event: Event) => void) | null) { transactionAbort = handler; },
+      set oncomplete(_handler: ((event: Event) => void) | null) { /* held until the test emits abort */ },
+    } as unknown as IDBTransaction;
+    const database = {
+      objectStoreNames: { contains: () => true },
+      transaction: () => transaction,
+      close() { closed = true; },
+      set onversionchange(_handler: (() => void) | null) { /* registry bookkeeping */ },
+    } as unknown as IDBDatabase;
+    const factory = {
+      open: () => {
+        const opening = {
+          result: database,
+          set onupgradeneeded(_handler: (() => void) | null) { /* existing control store */ },
+          set onsuccess(handler: (() => void) | null) { if (handler) queueMicrotask(handler); },
+          set onerror(_handler: (() => void) | null) { /* not used */ },
+          set onblocked(_handler: (() => void) | null) { /* not used */ },
+        };
+        return opening as unknown as IDBOpenDBRequest;
+      },
+    } as unknown as IDBFactory;
+    const store = new IndexedDbPrivacyControlStore({ factory, randomId: ids() });
+    let settled = false;
+    const operation = store.read().finally(() => { settled = true; });
+
+    await abortRequestedPromise;
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(closed).toBe(false);
+    requestAbort = () => transactionAbort?.(new Event('abort'));
+    requestAbort();
+    await expect(operation).rejects.toMatchObject({ code: 'unavailable' });
+    expect(settled).toBe(true);
+    expect(closed).toBe(true);
+  });
+
   it('serializes initialization and revision CAS, and remains available if app storage is deleted', async () => {
     const factory = new IDBFactory();
     const store = new IndexedDbPrivacyControlStore({ factory, randomId: ids() });

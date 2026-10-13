@@ -68,6 +68,13 @@ function parseTimestamp(value: string | undefined, certifiedUtcNaive: boolean | 
   }
   fail(`${label} must include an offset, or be explicitly certified as UTC.`);
 }
+
+/** Parses a provider timestamp only when it carries an explicit UTC offset, then canonicalizes to UTC. */
+export function normalizeProactiveOffsetTimestamp(value: string): string {
+  const parsed = parseTimestamp(value, false, 'Provider timestamp');
+  if (parsed === undefined) fail('Provider timestamp is missing.');
+  return new Date(parsed).toISOString();
+}
 function canonicalNow(value: string): number {
   if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) fail('nowUtc must be a canonical UTC timestamp.');
   const parsed = Date.parse(value);

@@ -228,10 +228,43 @@ describe('explicit transcription controller lifecycle', () => {
     });
     const store = new MemoryStore();
     const { app, note } = await readyApp(store, client);
-    store.failOutcomes = 2; // The successful-response commit and its fallback terminal receipt both fail.
-    await expect(app.transcribeNote(note.id, { expectedRevision: note.revision })).rejects.toThrow(/disk full/i);
+    store.failOutcomes = 1; // The successful-response commit loses acknowledgement; fallback journal writes are gated.
+    await expect(app.transcribeNote(note.id, { expectedRevision: note.revision })).rejects.toThrow(/refresh local data/i);
     expect(app.getSnapshot().transcription.attempts.at(-1)?.outcome).toBe('pending');
-    await expect(app.transcribeNote(note.id, { expectedRevision: note.revision })).rejects.toThrow(/earlier transcription was recovered/i);
+    expect(app.getSnapshot().mailAlertRefreshRequired?.required).toBe(true);
+    await app.refreshPersistedWorkspace();
+    expect(app.getSnapshot().transcription.attempts.at(-1)).toMatchObject({ outcome: 'unknown', code: 'provider_unknown' });
+    expect(client.transcribe).toHaveBeenCalledTimes(1);
+    expect(client.transcribe).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps refresh blocked until actual provider cleanup settles after an ambiguous terminal save', async () => {
+    const actualCleanup = deferred<void>();
+    const client = speechClient(async ({ onPrepared, onAttempt, beforeDispatch, leaseId }) => {
+      const audio = makePrepared(leaseId!);
+      await onPrepared!(audio); await onAttempt!(audio); beforeDispatch!(audio);
+      return {
+        transcript: 'Provider returned before cleanup finished.', durationMilliseconds: 1_000,
+        durationSeconds: 1, billedEstimateSeconds: 1, attempts: 1 as const, cleanupPromise: actualCleanup.promise,
+      };
+    });
+    const store = new MemoryStore();
+    const { app, note } = await readyApp(store, client);
+    store.failOutcomes = 1; // The terminal save may have committed; fallback writes are gated.
+
+    await expect(app.transcribeNote(note.id, { expectedRevision: note.revision })).rejects.toThrow(/refresh local data/i);
+    expect(app.getSnapshot().mailAlertRefreshRequired?.required).toBe(true);
+    expect(app.getSnapshot().transcription.attempts.at(-1)?.outcome).toBe('pending');
+    await expect(app.refreshPersistedWorkspace()).rejects.toThrow(/busy/i);
+    await expect(app.transcribeNote(note.id, { expectedRevision: note.revision })).rejects.toThrow(/refresh local data/i);
+    expect(client.transcribe).toHaveBeenCalledTimes(1);
+
+    actualCleanup.resolve();
+    await vi.waitFor(() => {
+      const controller = app as unknown as { transcriptionCleanupPromises: Set<string> };
+      expect(controller.transcriptionCleanupPromises.size).toBe(0);
+    });
+    await app.refreshPersistedWorkspace();
     expect(app.getSnapshot().transcription.attempts.at(-1)).toMatchObject({ outcome: 'unknown', code: 'provider_unknown' });
     expect(client.transcribe).toHaveBeenCalledTimes(1);
   });

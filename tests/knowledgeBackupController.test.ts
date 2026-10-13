@@ -225,9 +225,14 @@ describe('controller portable knowledge backup workflow', () => {
     const savesBeforeFailure = store.saves;
     store.failNext = true;
     await expect(app.activateImportedKnowledgeEntity({ sessionId: retry.sessionId, planHash: retry.planHash })).rejects.toThrow(/disk full/i);
-    expect(app.getSnapshot()).toEqual(beforeSaveFailure);
+    expect(app.getSnapshot().notes).toEqual(beforeSaveFailure.notes);
+    expect(app.getSnapshot().knowledge).toEqual(beforeSaveFailure.knowledge);
+    expect(app.getSnapshot().mailAlertRefreshRequired?.required).toBe(true);
     expect(store.saves).toBe(savesBeforeFailure + 1);
-    const committed = await app.activateImportedKnowledgeEntity({ sessionId: retry.sessionId, planHash: retry.planHash });
+    await app.refreshPersistedWorkspace();
+    await expect(app.activateImportedKnowledgeEntity({ sessionId: retry.sessionId, planHash: retry.planHash })).rejects.toThrow(/preview is missing/i);
+    const refreshedRetry = await app.prepareImportedKnowledgeActivation({ archiveId: archive.id, cohortId: cohort.id, kind: 'person', entityId: sourcePersonId });
+    const committed = await app.activateImportedKnowledgeEntity({ sessionId: refreshedRetry.sessionId, planHash: refreshedRetry.planHash });
     expect(committed.entity.importOrigin?.sourceEntityId).toBe(sourcePersonId);
     expect(app.getSnapshot().knowledge.people).toHaveLength(1);
     expect(app.getSnapshot().importedBackups.find((item) => item.id === archive.id)?.archivedKnowledge?.[0].activationLinks).toHaveLength(1);

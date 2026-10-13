@@ -167,7 +167,11 @@ describe('controller portable backup workflow', () => {
     await expect(app.applyBackupImport({ sessionId: fresh.sessionId, planHash: fresh.planHash })).rejects.toThrow(/disk full/i);
     expect(app.getSnapshot().notes).toHaveLength(notesBefore);
     expect(app.getSnapshot().importedBackups).toHaveLength(0);
-    await app.applyBackupImport({ sessionId: fresh.sessionId, planHash: fresh.planHash });
+    expect(app.getSnapshot().mailAlertRefreshRequired?.required).toBe(true);
+    await app.refreshPersistedWorkspace();
+    await expect(app.applyBackupImport({ sessionId: fresh.sessionId, planHash: fresh.planHash })).rejects.toThrow(/preview is missing/i);
+    const retry = await app.prepareBackupImport(JSON.stringify(fixture()));
+    await app.applyBackupImport({ sessionId: retry.sessionId, planHash: retry.planHash });
     expect(app.getSnapshot().importedBackups).toHaveLength(1);
   });
 
@@ -338,8 +342,13 @@ describe('controller portable backup workflow', () => {
     const stateBeforeFailure = structuredClone(app.getSnapshot());
     store.failNext = true;
     await expect(app.applyBackupImport({ sessionId: preview.sessionId, planHash: preview.planHash })).rejects.toThrow(/disk full/i);
-    expect(app.getSnapshot()).toEqual(stateBeforeFailure);
-    const restored = await app.applyBackupImport({ sessionId: preview.sessionId, planHash: preview.planHash });
+    expect(app.getSnapshot().notes).toEqual(stateBeforeFailure.notes);
+    expect(app.getSnapshot().tasks).toEqual(stateBeforeFailure.tasks);
+    expect(app.getSnapshot().mailAlertRefreshRequired?.required).toBe(true);
+    await app.refreshPersistedWorkspace();
+    await expect(app.applyBackupImport({ sessionId: preview.sessionId, planHash: preview.planHash })).rejects.toThrow(/preview is missing/i);
+    const retry = await app.prepareBackupImport(input);
+    const restored = await app.applyBackupImport({ sessionId: retry.sessionId, planHash: retry.planHash });
     expect(restored.id).toBe(archive.id);
     expect(app.getSnapshot().tasks).toHaveLength(3);
     expect(app.getSnapshot().tasks.find((item) => item.id === oldTaskId)).toMatchObject({ title: 'Unrelated occupied task ID', body: 'Do not replace.', status: 'completed' });

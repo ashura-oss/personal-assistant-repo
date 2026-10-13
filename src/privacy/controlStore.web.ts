@@ -49,8 +49,12 @@ function openDb(factory: IDBFactory): Promise<IDBDatabase> {
 
 function complete(tx: IDBTransaction): Promise<void> {
   return new Promise((resolve, reject) => {
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(new PrivacyControlStoreError('unavailable'));
+    let requestFailure = false;
+    tx.oncomplete = () => {
+      if (requestFailure) reject(new PrivacyControlStoreError('unavailable'));
+      else resolve();
+    };
+    tx.onerror = () => { requestFailure = true; };
     tx.onabort = () => reject(new PrivacyControlStoreError('unavailable'));
   });
 }

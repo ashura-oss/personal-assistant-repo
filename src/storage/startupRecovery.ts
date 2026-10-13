@@ -91,6 +91,22 @@ export interface StartupRecoveryFactoryOptions {
 
 const CURRENT_SNAPSHOT_SCHEMA = 1;
 
+type SettledReadTuple<T extends readonly (() => Promise<unknown>)[]> = {
+  [K in keyof T]: T[K] extends () => Promise<infer R> ? Awaited<R> : never;
+};
+
+/** Start every bounded read, then keep its transaction open until every read settles. */
+async function settledReadTuple<T extends readonly (() => Promise<unknown>)[]>(...readers: T): Promise<SettledReadTuple<T>> {
+  const pending = readers.map((read) => {
+    try { return Promise.resolve(read()); }
+    catch (error) { return Promise.reject(error); }
+  });
+  const results = await Promise.allSettled(pending);
+  const failure = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+  if (failure) throw failure.reason;
+  return results.map((result) => (result as PromiseFulfilledResult<unknown>).value) as SettledReadTuple<T>;
+}
+
 /**
  * Create a process-local confirmation session over an atomic persistent adapter.
  * Raw snapshots and their digests remain private to this helper and its adapter.
@@ -113,7 +129,9 @@ export function createStartupRecoveryBackend(options: StartupRecoveryFactoryOpti
     try { return await work(); } finally { finish(); }
   };
   const readInspection = async (): Promise<{ public: StartupRecoveryInspection; metadata?: StartupRecoverySnapshotMetadata }> => options.persistence.withTransaction(async (tx) => {
-    const [metadata, archives, pending] = await Promise.all([tx.readSnapshotMetadata(), tx.readArchiveMetadata(), tx.readPendingReceipt()]);
+    const [metadata, archives, pending] = await settledReadTuple(
+      () => tx.readSnapshotMetadata(), () => tx.readArchiveMetadata(), () => tx.readPendingReceipt(),
+    );
     const archiveCount = archives.length;
     const archiveBytes = archives.reduce((total, item) => total + item.evidenceBytes, 0);
     const evidenceBytes = metadata?.evidenceBytes ?? 0;
@@ -139,7 +157,7 @@ export function createStartupRecoveryBackend(options: StartupRecoveryFactoryOpti
         if (!inspection.metadata) throw new Error('Saved data is not eligible for recovery right now.');
         const snapshot = await options.persistence.withTransaction(async (tx) => {
           const metadata = await tx.readSnapshotMetadata();
-          const [pending, archives] = await Promise.all([tx.readPendingReceipt(), tx.readArchiveMetadata()]);
+          const [pending, archives] = await settledReadTuple(() => tx.readPendingReceipt(), () => tx.readArchiveMetadata());
           if (pending || archives.length !== inspection.public.archiveCount || !sameMetadata(inspection.metadata, metadata)) throw new Error('Saved data changed while recovery was being prepared. Inspect and prepare again.');
           if (!metadata || metadata.evidenceBytes > STARTUP_RECOVERY_MAX_EVIDENCE_BYTES) throw new Error('Saved data is not eligible for recovery right now.');
           const row = await tx.readSnapshot(STARTUP_RECOVERY_MAX_EVIDENCE_BYTES);
@@ -154,7 +172,10 @@ export function createStartupRecoveryBackend(options: StartupRecoveryFactoryOpti
         const plan = Object.freeze({ operation: 'archive_and_start_fresh' as const, sessionId, planHash, expiresAt, evidenceBytes: inspection.public.evidenceBytes, archiveCount: inspection.public.archiveCount });
         // Recheck the private CAS material after the asynchronous digest before exposing a plan.
         const current = await options.persistence.withTransaction(async (tx) => {
-          const [metadata, snapshot, generation, archives, pending] = await Promise.all([tx.readSnapshotMetadata(), tx.readSnapshot(STARTUP_RECOVERY_MAX_EVIDENCE_BYTES), tx.readGeneration(), tx.readArchiveMetadata(), tx.readPendingReceipt()]);
+          const [metadata, snapshot, generation, archives, pending] = await settledReadTuple(
+            () => tx.readSnapshotMetadata(), () => tx.readSnapshot(STARTUP_RECOVERY_MAX_EVIDENCE_BYTES), () => tx.readGeneration(),
+            () => tx.readArchiveMetadata(), () => tx.readPendingReceipt(),
+          );
           return { metadata, snapshot, generation, archiveCount: archives.length, pending };
         });
         if (current.pending || current.archiveCount !== inspection.public.archiveCount || !sameMetadata(inspection.metadata, current.metadata) || !sameSnapshot(snapshot, current.snapshot, current.generation)) throw new Error('Saved data changed while recovery was being prepared. Inspect and prepare again.');
@@ -177,7 +198,9 @@ export function createStartupRecoveryBackend(options: StartupRecoveryFactoryOpti
         const session = active;
         if (!session || session.plan.sessionId !== sessionId || session.plan.planHash !== planHash) throw new Error('Recovery confirmation is unavailable. Prepare a fresh recovery plan.');
         if (Date.parse(session.plan.expiresAt) <= now()) throw new Error('Recovery confirmation expired. Prepare a fresh recovery plan.');
-        const [metadata, generation, archives, pending] = await Promise.all([tx.readSnapshotMetadata(), tx.readGeneration(), tx.readArchiveMetadata(), tx.readPendingReceipt()]);
+        const [metadata, generation, archives, pending] = await settledReadTuple(
+          () => tx.readSnapshotMetadata(), () => tx.readGeneration(), () => tx.readArchiveMetadata(), () => tx.readPendingReceipt(),
+        );
         if (pending) throw new Error('A recovered workspace must be opened before another recovery can commit.');
         if (!metadata || metadata.evidenceBytes > STARTUP_RECOVERY_MAX_EVIDENCE_BYTES) throw new Error('Saved data is no longer eligible for recovery. Nothing was replaced.');
         if (!sameMetadata({ schemaVersion: session.snapshot.schemaVersion, generation: session.snapshot.generation, evidenceBytes: session.plan.evidenceBytes }, metadata) || archives.length !== session.plan.archiveCount) throw new Error('Saved data changed after recovery confirmation. Nothing was replaced.');

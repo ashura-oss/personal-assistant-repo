@@ -227,8 +227,10 @@ export function ProactiveRulesSection({
     <View style={styles.sectionCard}>
       <Text style={s.sectionTitle}>Attention rules</Text>
       <Text style={s.disclaimer}>
-        Local checks over saved mail, calendar details, and open tasks. No
-        messages are sent and no notifications are pushed.
+        Local checks over saved mail, calendar details, and open tasks. Quiet
+        hours defer in-app attention. Private mail alerts are separate and
+        require opt-in for each eligible mail rule and account; enabled alerts
+        follow that rule’s quiet hours. No messages are sent.
       </Text>
       {rules.length ? (
         rules.map((rule) => (

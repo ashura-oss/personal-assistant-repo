@@ -20,7 +20,12 @@ export interface PendingNotificationRequest {
 
 export interface ForegroundNotificationProjection {
   identifier?: string;
-  content: { title?: unknown; body?: unknown; data?: unknown };
+  content: {
+    title?: unknown; body?: unknown; data?: unknown;
+    sound?: unknown; badge?: unknown; subtitle?: unknown; attachments?: unknown;
+    categoryIdentifier?: unknown; launchImageName?: unknown; threadIdentifier?: unknown;
+    summaryArgument?: unknown; interruptionLevel?: unknown; color?: unknown; sticky?: unknown;
+  };
 }
 
 export interface ExpoNotificationBridge {
@@ -236,7 +241,14 @@ export function createNotificationBackend(
           if (request && content) {
             const projection: ForegroundNotificationProjection = {
               ...(typeof request.identifier === 'string' ? { identifier: request.identifier } : {}),
-              content: { title: content.title, body: content.body, data: content.data },
+              content: {
+                title: content.title, body: content.body, data: content.data,
+                sound: content.sound, badge: content.badge, subtitle: content.subtitle,
+                attachments: content.attachments, categoryIdentifier: content.categoryIdentifier,
+                launchImageName: content.launchImageName, threadIdentifier: content.threadIdentifier,
+                summaryArgument: content.summaryArgument, interruptionLevel: content.interruptionLevel,
+                color: content.color, sticky: content.sticky,
+              },
             };
             allowed = isAllowedByCachedLedger(projection) === true;
           }

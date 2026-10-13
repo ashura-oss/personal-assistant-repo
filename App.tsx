@@ -60,6 +60,7 @@ import { MailboxSection } from "./src/ui/MailboxSection";
 import { MailReplyComposer } from "./src/ui/MailReplyComposer";
 import { ProactiveCandidatesSection } from "./src/ui/ProactiveCandidatesSection";
 import { ProactiveRulesSection } from "./src/ui/ProactiveRulesSection";
+import { ProactiveMailAlertsSection, type EnableProactiveMailAlertsInput } from "./src/ui/ProactiveMailAlertsSection";
 import { useProactiveClock } from "./src/ui/useProactiveClock";
 import { ReviewSheet } from "./src/ui/ReviewSheet";
 import { NoteDetail as NoteDetailView } from "./src/ui/NoteDetail";
@@ -78,6 +79,7 @@ import { PrivacyCleanupScreen } from "./src/ui/PrivacyCleanupScreen";
 import { PrivacyEraseReview } from "./src/ui/PrivacyEraseReview";
 import { PendingRecordingRecoveryPanel } from "./src/components/PendingRecordingRecoveryPanel";
 import { BackgroundRefreshSection, type BackgroundRefreshActionResult } from "./src/components/BackgroundRefreshSection";
+import { MailAlertPreview } from "./src/dev/mailAlertPreview";
 import type { BackgroundTaskBackend, BackgroundTaskStatus } from "./src/background/backend.types";
 import { TasksSection } from "./src/ui/TasksSection";
 import { IconButton, Button, Field } from "./src/ui/primitives";
@@ -111,7 +113,8 @@ const isStartupRecoveryDemo = previewScenario === "startup-recovery";
 const isPrivacyCleanupDemo = previewScenario === "privacy-cleanup";
 const isPendingRecoveryDemo = previewScenario === "pending-recovery";
 const isBackgroundRefreshDemo = previewScenario === "background-refresh" && Platform.OS === "web";
-const isIsolatedDemo = isDispatchHistoryDemo || isMailSyncDemo || isBackupImportDemo || isKnowledgeDemo || isReminderDemo || isDeviceCalendarsDemo || isTranscriptionDemo || isStartupRecoveryDemo || isPrivacyCleanupDemo || isPendingRecoveryDemo || isBackgroundRefreshDemo;
+const isMailAlertDemo = previewScenario === "mail-alerts" && Platform.OS === "web";
+const isIsolatedDemo = isDispatchHistoryDemo || isMailSyncDemo || isBackupImportDemo || isKnowledgeDemo || isReminderDemo || isDeviceCalendarsDemo || isTranscriptionDemo || isStartupRecoveryDemo || isPrivacyCleanupDemo || isPendingRecoveryDemo || isBackgroundRefreshDemo || isMailAlertDemo;
 
 function useAppState(appController: AppController) {
   return useSyncExternalStore(
@@ -415,6 +418,7 @@ type BootstrapState =
   | { kind: "opening" }
   | { kind: "pending_capture_preview" }
   | { kind: "background_refresh_preview" }
+  | { kind: "mail_alert_preview" }
   | { kind: "workspace"; bindings: WorkspaceBindings }
   | { kind: "cleanup"; privacy: PrivacyService; status: PrivacyPublicStatus; reason?: "dedicated_ios_build_required" | "secure_context_and_web_locks_required"; failure?: "storage_unavailable" | "lease_lost" | "verification_incomplete"; samplePreview?: boolean }
   | { kind: "unavailable"; reason: "dedicated_ios_build_required" | "secure_context_and_web_locks_required" | "active_work" | "full_restart_required" | "storage_unavailable"; privacy?: PrivacyService; status?: PrivacyPublicStatus }
@@ -466,6 +470,10 @@ export default function App() {
     void (async () => {
       try {
         if (isIsolatedDemo) {
+          if (isMailAlertDemo) {
+            if (alive) setBootstrap({ kind: "mail_alert_preview" });
+            return;
+          }
           if (isBackgroundRefreshDemo) {
             if (alive) setBootstrap({ kind: "background_refresh_preview" });
             return;
@@ -727,6 +735,7 @@ export default function App() {
   );
   if (bootstrap.kind === "pending_capture_preview") return <PendingCapturePreview />;
   if (bootstrap.kind === "background_refresh_preview") return <BackgroundRefreshPreview />;
+  if (bootstrap.kind === "mail_alert_preview") return <MailAlertPreview />;
   if (bootstrap.kind === "preview_error") return (
     <SafeAreaProvider><SafeAreaView style={s.safe}><View style={s.viewport}><Text style={s.kicker}>ISOLATED PREVIEW</Text><Text style={s.h1}>Sample preview could not load.</Text><Text accessibilityRole="alert" style={s.analysisText}>The sample remained isolated. Reload to try again.</Text><Button label="Reload preview" onPress={() => { if (Platform.OS === "web" && typeof window !== "undefined") window.location.reload(); }} /></View></SafeAreaView></SafeAreaProvider>
   );
@@ -1309,6 +1318,8 @@ function Workspace({ controller, captureJournal, backgroundTasks, credentials, a
         ? pendingCaptureStatus.reason === "cleanup_required"
           ? "Finish pending recording cleanup before changing background checks."
           : "Check the local recording status before changing background checks."
+      : pendingCaptureStatus?.kind === "pending" && pendingCaptureStatus.phase === "discarding"
+        ? "Finish pending recording cleanup before changing background checks."
       : undefined;
   const openReminder = (record: ReminderRecord) => {
     if (record.origin.kind === "proactive" && record.origin.deviceBinding) {
@@ -1403,6 +1414,14 @@ function Workspace({ controller, captureJournal, backgroundTasks, credentials, a
       if (privacyReviewOpen || backgroundActionBlockedReason || busyLock.current) return;
       const reconciled = await reconcileReminderAlerts(true);
       if (!reconciled) return;
+      if (privacyReviewOpen || backgroundActionBlockedReason || busyLock.current) return;
+      if (Platform.OS !== "web") {
+        try {
+          await controller.reconcileProactiveMailAlerts();
+        } catch {
+          // Alert cancellation status remains available in Settings for a manual retry.
+        }
+      }
       if (privacyReviewOpen || backgroundActionBlockedReason || busyLock.current) return;
       await refreshForegroundMail(true);
     } catch (error) {
@@ -1890,6 +1909,66 @@ function Workspace({ controller, captureJournal, backgroundTasks, credentials, a
       return false;
     }
   }), [controller, run]);
+
+  const mailAlertCaptureAdmissionBlocked = audio.status === "recording" || audio.status === "paused" ||
+    Boolean(captureJournal && (pendingCaptureLoading || pendingCaptureStatus?.kind !== "empty"));
+  const canRunMailAlertAction = useCallback(() => {
+    return !isIsolatedDemo && !privacyOutcomeUnknown && !privacyReviewOpen && !isolatedPreviewFailed &&
+      startupReady && !loading && !mailAlertCaptureAdmissionBlocked && !busy && !busyLock.current;
+  }, [busy, isIsolatedDemo, isolatedPreviewFailed, loading, mailAlertCaptureAdmissionBlocked, privacyOutcomeUnknown, privacyReviewOpen, startupReady]);
+  const requireMailAlertActionAllowed = useCallback(() => {
+    if (!canRunMailAlertAction()) {
+      throw new Error("That change could not be confirmed. Review the current status and try again.");
+    }
+  }, [canRunMailAlertAction]);
+  const requireMailAlertActionSuccess = useCallback((result: boolean | undefined) => {
+    if (result !== true) {
+      throw new Error("That change could not be confirmed. Review the current status and try again.");
+    }
+  }, []);
+  const canRefreshMailAlertWorkspace = useCallback(() => {
+    return !isIsolatedDemo && !privacyOutcomeUnknown && !privacyReviewOpen && !isolatedPreviewFailed &&
+      startupReady && !loading && !backgroundActionBlockedReason && !busy && !busyLock.current;
+  }, [backgroundActionBlockedReason, busy, isIsolatedDemo, isolatedPreviewFailed, loading, privacyOutcomeUnknown, privacyReviewOpen, startupReady]);
+  const requireMailAlertRefreshAllowed = useCallback(() => {
+    if (!canRefreshMailAlertWorkspace()) {
+      throw new Error("That change could not be confirmed. Review the current status and try again.");
+    }
+  }, [canRefreshMailAlertWorkspace]);
+  const mailAlertRefreshAdmissionBlocked = Boolean(backgroundActionBlockedReason || isIsolatedDemo || privacyOutcomeUnknown ||
+    privacyReviewOpen || isolatedPreviewFailed || !startupReady || loading);
+  const onEnableMailAlerts = useCallback(async (input: EnableProactiveMailAlertsInput) => {
+    requireMailAlertActionAllowed();
+    const result = await run(async () => {
+      await controller.enableProactiveMailAlerts(input);
+      return true;
+    });
+    requireMailAlertActionSuccess(result);
+  }, [controller, requireMailAlertActionAllowed, requireMailAlertActionSuccess, run]);
+  const onRevokeMailAlerts = useCallback(async (ruleId: string) => {
+    requireMailAlertActionAllowed();
+    const result = await run(async () => {
+      await controller.revokeProactiveMailAlerts(ruleId);
+      return true;
+    });
+    requireMailAlertActionSuccess(result);
+  }, [controller, requireMailAlertActionAllowed, requireMailAlertActionSuccess, run]);
+  const onReconcileMailAlerts = useCallback(async () => {
+    requireMailAlertActionAllowed();
+    const result = await run(async () => {
+      await controller.reconcileProactiveMailAlerts();
+      return true;
+    });
+    requireMailAlertActionSuccess(result);
+  }, [controller, requireMailAlertActionAllowed, requireMailAlertActionSuccess, run]);
+  const onRefreshMailAlertWorkspace = useCallback(async () => {
+    requireMailAlertRefreshAllowed();
+    const result = await run(async () => {
+      await controller.refreshPersistedWorkspace();
+      return true;
+    });
+    requireMailAlertActionSuccess(result);
+  }, [controller, requireMailAlertActionSuccess, requireMailAlertRefreshAllowed, run]);
 
   if (isIsolatedDemo && isolatedPreviewFailed) {
     return (
@@ -2456,6 +2535,12 @@ function Workspace({ controller, captureJournal, backgroundTasks, credentials, a
               onSync={syncAccount}
               onRefreshMail={refreshMailHead}
               onContinueMail={continueMailBackfill}
+              onEnableMailAlerts={onEnableMailAlerts}
+              onRevokeMailAlerts={onRevokeMailAlerts}
+              onReconcileMailAlerts={onReconcileMailAlerts}
+              onRefreshMailAlertWorkspace={onRefreshMailAlertWorkspace}
+              mailAlertCaptureAdmissionBlocked={mailAlertCaptureAdmissionBlocked}
+              mailAlertRefreshAdmissionBlocked={mailAlertRefreshAdmissionBlocked}
               onSaveProactiveRule={(input) =>
                 run(async () => {
                   const rule = await controller.saveProactiveRule(input);
@@ -3656,6 +3741,12 @@ function SettingsScreen({
   onContinueMail,
   onSaveProactiveRule,
   onDeleteProactiveRule,
+  onEnableMailAlerts,
+  onRevokeMailAlerts,
+  onReconcileMailAlerts,
+  onRefreshMailAlertWorkspace,
+  mailAlertCaptureAdmissionBlocked,
+  mailAlertRefreshAdmissionBlocked,
   onConnectDeviceCalendars,
   onDisconnectDeviceCalendars,
   onCheckDeviceCalendarAccess,
@@ -3689,6 +3780,12 @@ function SettingsScreen({
     id: string,
     expectedVersion: number,
   ) => Promise<boolean | undefined>;
+  onEnableMailAlerts: (input: EnableProactiveMailAlertsInput) => Promise<void>;
+  onRevokeMailAlerts: (ruleId: string) => Promise<void>;
+  onReconcileMailAlerts: () => Promise<void>;
+  onRefreshMailAlertWorkspace: () => Promise<void>;
+  mailAlertCaptureAdmissionBlocked: boolean;
+  mailAlertRefreshAdmissionBlocked: boolean;
   onConnectDeviceCalendars: () => Promise<unknown>;
   onDisconnectDeviceCalendars: () => Promise<unknown>;
   onCheckDeviceCalendarAccess: () => Promise<unknown>;
@@ -4131,6 +4228,22 @@ function SettingsScreen({
           busy={busy}
           onSave={onSaveProactiveRule}
           onDelete={onDeleteProactiveRule}
+        />
+        <ProactiveMailAlertsSection
+          rules={state.proactive.rules}
+          accounts={state.accounts}
+          ledger={state.proactiveMailAlerts}
+          timeZone={state.settings.timezone}
+          recoveryStatus={state.proactiveMailAlertRecoveryStatus}
+          refreshRequired={state.mailAlertRefreshRequired}
+          busy={busy}
+          captureAdmissionBlocked={mailAlertCaptureAdmissionBlocked}
+          refreshAdmissionBlocked={mailAlertRefreshAdmissionBlocked}
+          previewOnly={demoMode}
+          onEnable={onEnableMailAlerts}
+          onRevoke={onRevokeMailAlerts}
+          onReconcile={onReconcileMailAlerts}
+          onRefresh={onRefreshMailAlertWorkspace}
         />
         <Text style={s.sectionTitle}>Accounts</Text>
         {state.accounts.length ? (

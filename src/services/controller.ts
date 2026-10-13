@@ -49,10 +49,15 @@ import { buildLocalSourceSet, buildOfflinePreview, createSourceCatalog, type Ass
 import { isMailTextFresh, normalizeMailText, utf8Bytes, validSelectedMailTextSnapshot, MAX_SELECTED_MAIL_TEXT_BYTES, MAIL_TEXT_FRESHNESS_MS } from '../mailText';
 import { appendDispatchReconciliation, createDispatchRecord, recordDispatchOutcome, validateDispatchRecord } from '../dispatch';
 import type { DispatchOutcome, DispatchRecord, DispatchReconciliation } from '../dispatch';
-import { evaluateProactive, type ProactiveTrigger, type QuietHours } from '../proactive';
+import { evaluateProactive, normalizeProactiveOffsetTimestamp, type ProactiveTrigger, type QuietHours } from '../proactive';
 import { computeProactiveNextCheckAt } from '../proactive/boundaries';
-import { buildProactiveSources, proactiveStableValue, type ProactiveSourceHashMemo } from '../proactive/adapters';
+import { buildProactiveMailSources, buildProactiveSources, proactiveStableValue, type ProactiveSourceHashMemo } from '../proactive/adapters';
 import { emptyProactiveState, normalizeProactiveData, PROACTIVE_INTEGRITY_ERROR, uncertainOnLoad, type ProactiveQuarantine } from '../proactive/state';
+import { emptyProactiveMailAlertState, validateProactiveMailAlertState } from '../proactiveMailAlerts/state';
+import { createProactiveMailAlertConsent, planProactiveMailAlerts, replaceProactiveMailAlertConsent, revokeProactiveMailAlertConsent } from '../proactiveMailAlerts/planner';
+import { executeRequestedMailAlertCancellations, executeReservedMailAlertAttempts, type ProactiveMailAlertEngineDependencies } from '../proactiveMailAlerts/engine';
+import type { CommittedMailAlertPage, MailAlertVerifiedAccount, ProactiveMailAlertReceipt, ProactiveMailSource } from '../proactiveMailAlerts/types';
+import { createMailAlertNotificationBackend, isMatchingProactiveMailAlertNotification, type MailAlertNotificationBackend } from './mailAlertNotificationBackend';
 import { canonicalMailReplySource, createMailReplySource, defaultReplyRecipients, replyReferences, validateMailReplySource, validateReplyBinding } from '../mailReply';
 import { emptyKnowledgeState, getKnowledgeEntity, knowledgeContextSources, validateKnowledgeState, validateKnowledgeSuggestion } from '../knowledge';
 import type { ContactClaim, KnowledgeChange, KnowledgeEntityKind, KnowledgeEvidence, KnowledgeFact, KnowledgeReference, KnowledgeSourceLink, KnowledgeSuggestion, Person, Project, ProjectMember } from '../knowledge';
@@ -63,7 +68,8 @@ import type { SpeechAudioSnapshot, SpeechAttemptCode, SpeechTranscriptionResult,
 import type { PreparedSpeechAudio, SpeechAudioService } from '../audio/speechUpload.types';
 import { getDefaultPrivacyService, type PrivacyService, type PrivacyWorkspaceSession } from '../privacy/service';
 import { createPrivacyBoundController } from '../privacy/controllerBoundary';
-import { bindWorkspaceStorage } from '../privacy/workspaceStorage';
+import { bindExistingWorkspaceWriter, bindWorkspaceStorage, type ExistingWorkspaceWriterStore } from '../privacy/workspaceStorage';
+import type { PrivacyWriterScope } from '../privacy/types';
 import { createPendingCaptureService } from '../audio/pendingCaptureService';
 import type { PendingCaptureControllerPort, PendingCaptureJournalPort, PendingCaptureReceipt, PendingCaptureSafeStatus } from '../audio/pendingCaptureService.types';
 import type { PendingCaptureNativeIO } from '../audio/pendingCaptureNativeIO.types';
@@ -253,7 +259,8 @@ function initialState(): AppState {
     transcription: { schemaVersion: 1, installationUUID: newId(), attempts: [], cleanupLeases: [] },
     mailbox: [], selectedMailTexts: [], calendarEvents: [], syncStates: {}, pendingCredentialCleanup: [], dispatchRecords: [], mailboxSchemaVersion: 2,
     deviceCalendars: emptyDeviceCalendarState(), deviceCalendarAccess: { status: 'needs_check' },
-    proactive: emptyProactiveState(), importedBackups: [], knowledge: emptyKnowledgeState(), reminders: emptyReminderState(newId()),
+    proactive: emptyProactiveState(), proactiveMailAlerts: emptyProactiveMailAlertState(newId()),
+    importedBackups: [], knowledge: emptyKnowledgeState(), reminders: emptyReminderState(newId()),
   };
 }
 
@@ -445,6 +452,12 @@ function identityKey(account: Account): string {
   if (!identity?.providerNamespace || !identity.clientId || !identity.subject ||
       (account.provider === 'microsoft' && !identity.resourceUserId)) throw new Error('Verified account identity is incomplete.');
   return [identity.providerNamespace, identity.clientId, identity.subject, identity.resourceUserId ?? ''].join(':');
+}
+
+function sourceReceivedAtForAlert(source: { receivedAt?: string }): number {
+  if (typeof source.receivedAt !== 'string') return Number.NaN;
+  try { return Date.parse(normalizeProactiveOffsetTimestamp(source.receivedAt)); }
+  catch { return Number.NaN; }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -772,12 +785,13 @@ type NormalizedLoadedState = AppState & {
   reminderQuarantine?: unknown[];
   deviceCalendarQuarantine?: unknown[];
   transcriptionQuarantine?: unknown[];
+  proactiveMailAlertQuarantine?: unknown[];
 };
 
 function normalizeLoadedState(value: unknown): NormalizedLoadedState {
   const defaults = initialState();
   if (!value || typeof value !== 'object') throw new Error('Saved app data is not a valid state snapshot. It was preserved for recovery.');
-  const raw = value as Partial<AppState> & { dispatchRecordQuarantine?: unknown };
+  const raw = value as Partial<AppState> & { dispatchRecordQuarantine?: unknown; proactiveMailAlertQuarantine?: unknown };
   if (!Array.isArray(raw.notes) || !Array.isArray(raw.proposals) || !Array.isArray(raw.accounts) ||
       !Array.isArray(raw.calendars) || !Array.isArray(raw.documents) || !Array.isArray(raw.activity)) {
     throw new Error('Saved app data is incomplete. It was preserved for recovery.');
@@ -940,6 +954,16 @@ function normalizeLoadedState(value: unknown): NormalizedLoadedState {
     try { reminders = validateReminderState(raw.reminders); }
     catch { reminders = emptyReminderState(newId()); reminderQuarantine.push(raw.reminders); }
   }
+  const retainedMailAlertQuarantine = raw.proactiveMailAlertQuarantine;
+  const proactiveMailAlertQuarantine: unknown[] = Array.isArray(retainedMailAlertQuarantine)
+    ? clone(retainedMailAlertQuarantine) : retainedMailAlertQuarantine === undefined ? [] : [retainedMailAlertQuarantine];
+  let proactiveMailAlerts = emptyProactiveMailAlertState(newId());
+  if (raw.proactiveMailAlerts !== undefined) {
+    try {
+      proactiveMailAlerts = validateProactiveMailAlertState(raw.proactiveMailAlerts);
+    }
+    catch { proactiveMailAlerts = emptyProactiveMailAlertState(newId()); proactiveMailAlertQuarantine.push(raw.proactiveMailAlerts); }
+  }
   const retainedDeviceCalendarQuarantine = (value as { deviceCalendarQuarantine?: unknown }).deviceCalendarQuarantine;
   const deviceCalendarQuarantine: unknown[] = Array.isArray(retainedDeviceCalendarQuarantine)
     ? clone(retainedDeviceCalendarQuarantine) : retainedDeviceCalendarQuarantine === undefined ? [] : [retainedDeviceCalendarQuarantine];
@@ -980,6 +1004,11 @@ function normalizeLoadedState(value: unknown): NormalizedLoadedState {
     ...(reminderQuarantine.length ? { reminderQuarantine } : {}),
     reminderRecoveryStatus: reminderQuarantine.length
       ? { quarantined: true as const, message: 'Some reminder data could not be validated and is held privately. New reminders are disabled until recovery.' as const }
+      : undefined,
+    proactiveMailAlerts,
+    proactiveMailAlertQuarantine,
+    proactiveMailAlertRecoveryStatus: proactiveMailAlertQuarantine.length
+      ? { quarantined: true as const, message: 'Some saved mail alert settings could not be validated and are held privately. New mail alerts are disabled until recovery.' as const }
       : undefined,
     deviceCalendars,
     transcription,
@@ -1089,6 +1118,8 @@ export interface ControllerIntegrationDependencies {
   reminderBackend?: NotificationBackend;
   deviceCalendarBackend?: DeviceCalendarBackend;
   backgroundTasks?: BackgroundTaskBackend;
+  mailAlertBackend?: MailAlertNotificationBackend;
+  withMailAlertNotificationWriter?: <T>(actual: (scope: PrivacyWriterScope, store: ExistingWorkspaceWriterStore) => Promise<T>) => Promise<T>;
 }
 
 interface BackupImportSession {
@@ -1150,6 +1181,7 @@ export class AppControllerImpl implements AppController {
   private startupRecoveryReceipt?: StartupRecoveryReceipt;
   private startupRecoveryInspection?: StartupRecoveryInspection;
   private startupRecoveryBusy = false;
+  private mailAlertRefreshRequired = false;
   private processJobs = new Map<string, Promise<Proposal[]>>();
   private assistJobs = new Map<string, Promise<NoteAssistResult>>();
   private analysisCache = new Map<string, DraftAnalysis>();
@@ -1168,6 +1200,7 @@ export class AppControllerImpl implements AppController {
   private credentialCleanupJob?: Promise<void>;
   private installingTokenRefs = new Set<string>();
   private proactiveQuarantine?: ProactiveQuarantine;
+  private proactiveMailAlertQuarantine: unknown[] = [];
   private backupImportQuarantine: unknown[] = [];
   private knowledgeQuarantine: unknown[] = [];
   private reminderQuarantine: unknown[] = [];
@@ -1185,6 +1218,7 @@ export class AppControllerImpl implements AppController {
   private transcriptionJobs = new Map<string, { attemptId: string; sourceRevision: number; leaseId: string; controller: AbortController; promise: Promise<Note> }>();
   private transcriptionCleanupJob?: Promise<void>;
   private readonly reminderBackend: NotificationBackend;
+  private readonly mailAlertBackend: MailAlertNotificationBackend;
   private reminderReconcileJob?: Promise<void>;
   private reminderReconcileAgain = false;
   private readonly verifiedReminderForeground = new Map<string, string>();
@@ -1220,6 +1254,7 @@ export class AppControllerImpl implements AppController {
       ? integration.connectorFactory(integration.tokenStore, (accountId, status) => this.handleConnectorAuthStatus(accountId, status))
       : undefined;
     this.reminderBackend = integration.reminderBackend ?? createNotificationBackend();
+    this.mailAlertBackend = integration.mailAlertBackend ?? createMailAlertNotificationBackend();
     this.deviceCalendarBackend = integration.deviceCalendarBackend ?? getDeviceCalendarBackend();
   }
 
@@ -1254,6 +1289,7 @@ export class AppControllerImpl implements AppController {
     this.loadPromise = undefined;
     this.transactionQueue = Promise.resolve();
     this.proactiveQuarantine = undefined;
+    this.proactiveMailAlertQuarantine = [];
     this.backupImportQuarantine = [];
     this.knowledgeQuarantine = [];
     this.reminderQuarantine = [];
@@ -1267,8 +1303,356 @@ export class AppControllerImpl implements AppController {
     this.integration.disposePrivacyResources?.();
   }
 
-  private async assertPrivacySessionCurrent(): Promise<void> {
+  private async assertPrivacySessionCurrent(allowMailAlertRefresh = false): Promise<void> {
+    if (this.mailAlertRefreshRequired && !allowMailAlertRefresh) {
+      throw new Error('Saved data changed. Refresh local data before continuing.');
+    }
     await this.integration.privacySession?.assertCurrent();
+  }
+
+  private setMailAlertRefreshRequired(): void {
+    if (this.mailAlertRefreshRequired) return;
+    this.mailAlertRefreshRequired = true;
+    // These plans are pure previews; none owns an external resource or staged
+    // file. A storage rebase invalidates their captured snapshot, so drop them
+    // to keep an explicit refresh available. Recording attachment sessions
+    // are deliberately retained until their stage owner completes cleanup.
+    this.backupImportSessions.clear();
+    this.knowledgeActivationSessions.clear();
+    // Stop new provider-side admissions while retaining jobs and their leases
+    // until each underlying request actually settles.
+    for (const job of this.transcriptionJobs.values()) job.controller.abort();
+    for (const job of this.syncAbortControllers.values()) job.abort();
+    this.snapshot = deepFreeze(this.publicState(this.state));
+    this.emit();
+  }
+
+  private clearMailAlertRefreshRequired(): void {
+    if (!this.mailAlertRefreshRequired) return;
+    this.mailAlertRefreshRequired = false;
+    this.snapshot = deepFreeze(this.publicState(this.state));
+    this.emit();
+  }
+
+  private withMailAlertTransactionSlot<T>(work: () => Promise<T>): Promise<T> {
+    const capturedBootstrapGeneration = this.bootstrapGeneration;
+    const run = this.transactionQueue.then(async () => {
+      await this.assertPrivacySessionCurrent();
+      if (capturedBootstrapGeneration !== this.bootstrapGeneration) throw new Error('The app workspace changed while this action was waiting.');
+      if (this.startupRecoveryPhase !== 'ready') throw new Error('App startup is not ready.');
+      if (!this.loaded) await this.load();
+      if (this.loadPromise) await this.loadPromise;
+      await this.assertPrivacySessionCurrent();
+      if (capturedBootstrapGeneration !== this.bootstrapGeneration || this.startupRecoveryPhase !== 'ready') throw new Error('The app workspace changed while this action was waiting.');
+      return await work();
+    });
+    this.transactionQueue = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  private async commitMailAlertDraft(draft: AppState): Promise<void> {
+    draft.proactiveMailAlerts = validateProactiveMailAlertState(draft.proactiveMailAlerts);
+    try {
+      await this.assertPrivacySessionCurrent();
+      await this.store.save(this.persistedState(draft));
+      await this.assertPrivacySessionCurrent();
+      this.state = draft;
+      this.snapshot = deepFreeze(this.publicState(draft));
+      this.emit();
+    } catch (error) {
+      // Save may have committed before acknowledgement failed; do not let the
+      // stale controller overwrite it until an explicit reload succeeds.
+      this.setMailAlertRefreshRequired();
+      throw error;
+    }
+  }
+
+  private nonAlertPersistedProjection(state: AppState, alreadyPersisted = false): Record<string, unknown> {
+    const source = alreadyPersisted ? state : this.persistedState(state);
+    // Match production JSON stores: undefined object members are omitted and
+    // undefined array slots become null before canonical key ordering.
+    const serialized = JSON.stringify(source);
+    if (serialized === undefined) throw new Error('Workspace snapshot cannot be serialized.');
+    const persisted = JSON.parse(serialized) as Record<string, unknown>;
+    delete persisted.proactiveMailAlerts;
+    delete persisted.mailAlertRefreshRequired;
+    return persisted;
+  }
+
+  private checkedScopedMailAlertState(value: AppState | undefined): AppState {
+    try {
+      if (!value || stableJson(this.nonAlertPersistedProjection(value, true)) !== stableJson(this.nonAlertPersistedProjection(this.state))) {
+        throw new Error('Workspace state changed during scoped mail alert settlement.');
+      }
+      const alerts = validateProactiveMailAlertState(value.proactiveMailAlerts);
+      return { ...value, proactiveMailAlerts: alerts };
+    } catch {
+      this.setMailAlertRefreshRequired();
+      throw new Error('Saved data changed. Refresh local data before continuing.');
+    }
+  }
+
+  private adoptScopedMailAlertState(value: AppState | undefined): AppState {
+    const checked = this.checkedScopedMailAlertState(value);
+    try {
+      const alerts = validateProactiveMailAlertState(checked.proactiveMailAlerts);
+      this.state = { ...this.state, proactiveMailAlerts: alerts };
+      this.snapshot = deepFreeze(this.publicState(this.state));
+      this.emit();
+      return { ...checked, proactiveMailAlerts: alerts };
+    } catch {
+      this.setMailAlertRefreshRequired();
+      throw new Error('Saved data changed. Refresh local data before continuing.');
+    }
+  }
+
+  private mailAlertScopedStore(_scope: PrivacyWriterScope, store: ExistingWorkspaceWriterStore) {
+    const controller = this;
+    return Object.freeze({
+      async load(): Promise<AppState | undefined> {
+        try { return controller.adoptScopedMailAlertState(await store.load()); }
+        catch (error) { controller.setMailAlertRefreshRequired(); throw error; }
+      },
+      async save(value: AppState): Promise<void> {
+        try {
+          const checked = controller.checkedScopedMailAlertState(value);
+          await store.save(checked);
+          controller.adoptScopedMailAlertState(checked);
+        } catch (error) {
+          controller.setMailAlertRefreshRequired();
+          throw error;
+        }
+      },
+      async assertCurrent(): Promise<void> {
+        try { await store.assertCurrent(); }
+        catch (error) { controller.setMailAlertRefreshRequired(); throw error; }
+      },
+    });
+  }
+
+  private mailAlertAccounts(state: AppState): MailAlertVerifiedAccount[] {
+    return state.accounts.flatMap((account) => {
+      const namespace = account.identity?.providerNamespace;
+      if ((namespace !== 'google' && namespace !== 'microsoft') || account.provider !== namespace) return [];
+      return [{
+        accountId: account.id,
+        providerNamespace: namespace,
+        identityKey: identityKey(account),
+        connectionGeneration: account.connectionGeneration ?? 0,
+        connected: account.connected,
+        authStatus: account.authStatus,
+        canReadMail: Boolean(account.capabilities?.includes('mail.read')),
+      }];
+    });
+  }
+
+  private revokeStaleMailAlertConsent(state: AppState): boolean {
+    if (this.proactiveMailAlertQuarantine.length) return false;
+    const before = stableJson(state.proactiveMailAlerts);
+    try {
+      const plan = planProactiveMailAlerts({
+        state: state.proactiveMailAlerts,
+        rules: state.proactive.rules,
+        accounts: this.mailAlertAccounts(state),
+        pages: [],
+        previousCandidates: state.proactive.candidates.map((entry) => entry.candidate),
+        dismissedCandidateIds: state.proactive.dismissals.map((item) => item.candidateId),
+        snoozes: state.proactive.snoozes,
+        now: now(), currentTimeZone: state.settings.timezone, uuid: newId,
+      });
+      state.proactiveMailAlerts = plan.nextState;
+      return before !== stableJson(state.proactiveMailAlerts);
+    } catch {
+      this.setMailAlertRefreshRequired();
+      throw new Error('Saved mail alert settings could not be safely checked. Refresh the workspace before continuing.');
+    }
+  }
+
+  private newlyRequestedMailAlertCancellations(before: AppState, after: AppState): ProactiveMailAlertReceipt[] {
+    const previous = new Map(before.proactiveMailAlerts.receipts.map((receipt) => [receipt.id, receipt]));
+    return after.proactiveMailAlerts.receipts.filter((receipt) => {
+      if (receipt.desired !== 'cancel' || receipt.observed === 'cancelled' || !receipt.cancellation) return false;
+      const prior = previous.get(receipt.id);
+      return !prior || prior.desired !== 'cancel' || prior.cancellation?.requestedAt !== receipt.cancellation.requestedAt;
+    });
+  }
+
+  /**
+   * Reconcile only cancellation intents created by this committed mutation.
+   * The caller already owns the controller queue slot, so this never re-enters it.
+   */
+  private async cancelNewMailAlertIntents(receipts: readonly ProactiveMailAlertReceipt[]): Promise<void> {
+    if (!receipts.length) return;
+    try {
+      await executeRequestedMailAlertCancellations(this.mailAlertEngineDependencies([]), {
+        publishScoped: (saved) => { this.adoptScopedMailAlertState(saved); },
+      }, receipts);
+    } catch {
+      // The intent is durable already. Keep the successful primary mutation successful;
+      // the local reconcile action can retry this bounded cleanup later.
+    }
+  }
+
+  private async alertProjectionForWorkspace(state: AppState, pages: readonly CommittedMailAlertPage[], receipt: ProactiveMailAlertReceipt): Promise<boolean> {
+    try {
+      const alertState = validateProactiveMailAlertState(state.proactiveMailAlerts);
+      const consent = alertState.consents.find((item) => item.id === receipt.consentId);
+      const rule = state.proactive.rules.find((item) => item.id === receipt.ruleId);
+      const account = this.mailAlertAccounts(state).find((item) => item.accountId === receipt.accountId);
+      const page = pages.find((item) => item.accountId === receipt.accountId);
+      if (!consent || consent.status !== 'active' || consent.ruleId !== receipt.ruleId || consent.ruleVersion !== receipt.ruleVersion ||
+          consent.ruleRevision !== receipt.ruleRevision || consent.timeZone !== receipt.timeZone || !rule || !rule.enabled ||
+          state.settings.timezone !== receipt.timeZone || consent.activatedAt !== receipt.consentActivatedAt ||
+          rule.version !== receipt.ruleVersion || rule.revision !== receipt.ruleRevision || !account || !account.connected ||
+          account.authStatus !== 'connected' || !account.canReadMail || account.identityKey !== receipt.identityKey ||
+          account.connectionGeneration !== receipt.connectionGeneration || !page || page.identityKey !== receipt.identityKey ||
+          (rule.accountIds.length > 0 && !rule.accountIds.includes(receipt.accountId)) ||
+          !consent.accounts.some((binding) => binding.accountId === receipt.accountId && binding.identityKey === receipt.identityKey &&
+            binding.connectionGeneration === receipt.connectionGeneration) ||
+          page.connectionGeneration !== receipt.connectionGeneration || Date.parse(page.checkedAt) > Date.now() ||
+          Date.now() - Date.parse(page.checkedAt) > 15 * 60_000) return false;
+      const source = page.sources.find((item) => item.kind === 'mail' && item.accountId === receipt.accountId &&
+        item.providerId === receipt.providerMessageId && item.sourceVersion === receipt.sourceVersion && item.availability === 'available' && item.freshness === 'fresh');
+      if (!source || source.kind !== 'mail' || sourceReceivedAtForAlert(source) <= Date.parse(consent.activatedAt)) return false;
+      const currentRows = state.mailbox.filter((row) => row.accountId === account.accountId &&
+        row.providerMessageId === receipt.providerMessageId && row.verifiedIdentityKey === account.identityKey &&
+        row.connectionGeneration === account.connectionGeneration && !row.providerDeletedAt);
+      const currentSources = await buildProactiveMailSources(state.accounts.filter((item) => item.id === account.accountId),
+        currentRows, Date.now(), new Map(),
+        (value) => Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, value, { encoding: Crypto.CryptoEncoding.HEX }));
+      const currentSource = currentSources.find((item): item is ProactiveMailSource => item.kind === 'mail' &&
+        item.accountId === receipt.accountId && item.providerId === receipt.providerMessageId);
+      if (!currentSource || currentSource.availability !== 'available' || currentSource.freshness !== 'fresh' ||
+          currentSource.sourceVersion !== receipt.sourceVersion || sourceReceivedAtForAlert(currentSource) !== Date.parse(receipt.receivedAt)) return false;
+      const evaluation = evaluateProactive({
+        nowUtc: now(), timeZone: consent.timeZone, rules: [rule], sources: [currentSource],
+        previousCandidates: state.proactive.candidates.map((entry) => entry.candidate),
+        dismissedCandidateIds: state.proactive.dismissals.map((item) => item.candidateId),
+        snoozes: state.proactive.snoozes,
+        sourceSnapshotComplete: false,
+      });
+      return evaluation.activeCandidates.some((candidate) => candidate.ruleId === rule.id && candidate.sourceId === currentSource.sourceId && candidate.sourceVersion === currentSource.sourceVersion);
+    } catch { return false; }
+  }
+
+  private async committedMailAlertPage(account: Account, items: readonly MessageSummary[], checkedAt: string): Promise<CommittedMailAlertPage | undefined> {
+    const ids = new Set(items.flatMap((item) => typeof item.id === 'string' && item.id ? [item.id] : []));
+    if (!ids.size || !account.identity?.providerNamespace || !Number.isFinite(Date.parse(checkedAt))) return undefined;
+    const currentAccount = this.state.accounts.find((item) => item.id === account.id);
+    if (!currentAccount || identityKey(currentAccount) !== identityKey(account) ||
+        (currentAccount.connectionGeneration ?? 0) !== (account.connectionGeneration ?? 0)) return undefined;
+    const exactRows = this.state.mailbox.filter((row) => row.accountId === account.id && ids.has(row.providerMessageId) &&
+      row.connectionGeneration === (account.connectionGeneration ?? 0) && row.verifiedIdentityKey === identityKey(account) && !row.providerDeletedAt);
+    const sources = await buildProactiveMailSources([currentAccount], exactRows, Date.now(), this.proactiveSourceHashMemo,
+      (value) => Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, value, { encoding: Crypto.CryptoEncoding.HEX }));
+    const mailSources = sources.filter((source): source is ProactiveMailSource => source.kind === 'mail' && source.accountId === account.id && ids.has(source.providerId));
+    return {
+      accountId: account.id, providerNamespace: account.identity.providerNamespace,
+      identityKey: identityKey(account), connectionGeneration: account.connectionGeneration ?? 0,
+      checkedAt, sources: mailSources,
+    };
+  }
+
+  private async commitMailAlertPlan(pages: readonly CommittedMailAlertPage[]): Promise<void> {
+    if (this.proactiveMailAlertQuarantine.length) return;
+    const draft = clone(this.state);
+    const plan = planProactiveMailAlerts({
+      state: draft.proactiveMailAlerts,
+      rules: draft.proactive.rules,
+      accounts: this.mailAlertAccounts(draft),
+      pages,
+      previousCandidates: draft.proactive.candidates.map((entry) => entry.candidate),
+      dismissedCandidateIds: draft.proactive.dismissals.map((item) => item.candidateId),
+      snoozes: draft.proactive.snoozes,
+      now: now(), currentTimeZone: draft.settings.timezone, uuid: newId,
+    });
+    const changed = stableJson(draft.proactiveMailAlerts) !== stableJson(plan.nextState);
+    if (changed) {
+      draft.proactiveMailAlerts = plan.nextState;
+      await this.commitMailAlertDraft(draft);
+    }
+    if (!plan.cancellationReceipts.length && !plan.newAttempts.length) return;
+    const dependencies = this.mailAlertEngineDependencies(pages);
+    const queueSlot = { publishScoped: (saved: AppState) => { this.adoptScopedMailAlertState(saved); } };
+    if (plan.cancellationReceipts.length) await executeRequestedMailAlertCancellations(dependencies, queueSlot, plan.cancellationReceipts);
+    if (plan.newAttempts.length) await executeReservedMailAlertAttempts(dependencies, queueSlot, plan.newAttempts);
+  }
+
+  private mailAlertEngineDependencies(pages: readonly CommittedMailAlertPage[]): ProactiveMailAlertEngineDependencies<AppState> {
+    const writer = this.integration.withMailAlertNotificationWriter;
+    const sessionEpoch = this.integration.privacySession?.epoch ?? '';
+    return {
+      backend: this.mailAlertBackend,
+      sessionEpoch,
+      getPrivacyStatus: async () => {
+        const status = await this.integration.privacySession?.getStatus?.();
+        if (!status) throw new Error('Mail alert privacy ownership is unavailable.');
+        return status;
+      },
+      isDispatchGateOpen: () => !this.mailAlertRefreshRequired && this.loaded && this.startupRecoveryPhase === 'ready' && this.proactiveMailAlertQuarantine.length === 0,
+      notificationWriter: {
+        withNotificationWriter: async <T>(work: (scope: PrivacyWriterScope, store: import('../proactiveMailAlerts/engine').MailAlertScopedStore<AppState>) => Promise<T>) => {
+          if (!writer) throw new Error('Mail alert notification ownership is unavailable.');
+          return writer((scope, store) => work(scope, this.mailAlertScopedStore(scope, store)));
+        },
+      },
+      isAttemptCurrent: (state, receipt) => this.alertProjectionForWorkspace(state, pages, receipt),
+    };
+  }
+
+  async enableProactiveMailAlerts(input: { ruleId: string; expectedRuleVersion: number; expectedRuleRevision: number; timeZone: string; accountIds: string[] }): Promise<void> {
+    await this.withMailAlertTransactionSlot(async () => {
+      if (this.proactiveMailAlertQuarantine.length) throw new Error('Saved mail alert settings are held privately until recovery.');
+      if (!Array.isArray(input.accountIds) || input.accountIds.length < 1 || input.accountIds.length > 64 || new Set(input.accountIds).size !== input.accountIds.length) {
+        throw new Error('Choose between 1 and 64 verified accounts for mail alerts.');
+      }
+      const rule = this.state.proactive.rules.find((item) => item.id === input.ruleId);
+      if (!rule || rule.version !== input.expectedRuleVersion || rule.revision !== input.expectedRuleRevision) throw new Error('This saved rule changed. Review it again before enabling alerts.');
+      if (input.timeZone !== this.state.settings.timezone) throw new Error('The selected time zone changed. Review the current settings before enabling alerts.');
+      const verified = this.mailAlertAccounts(this.state);
+      const selected = input.accountIds.map((id) => {
+        const account = verified.find((item) => item.accountId === id);
+        if (!account || !account.connected || account.authStatus !== 'connected' || !account.canReadMail) throw new Error('Every selected account must be currently connected with verified mailbox access.');
+        return account;
+      });
+      if (rule.accountIds.length && selected.some((account) => !rule.accountIds.includes(account.accountId))) throw new Error('Selected accounts must also be allowed by the saved rule.');
+      const writer = this.integration.withMailAlertNotificationWriter;
+      if (!writer) throw new Error('Mail alert permission is unavailable on this installation.');
+      const permission = await writer(() => this.mailAlertBackend.requestPermission());
+      if (permission !== 'authorized' && permission !== 'provisional') throw new Error('Notification permission was not granted. The saved alert settings were not changed.');
+      const activatedAt = now();
+      const consent = createProactiveMailAlertConsent({ id: newId(), rule, timeZone: input.timeZone, activatedAt, accounts: selected });
+      const draft = clone(this.state);
+      draft.proactiveMailAlerts = replaceProactiveMailAlertConsent(draft.proactiveMailAlerts, {
+        id: consent.id, rule, timeZone: consent.timeZone, activatedAt, accounts: selected,
+      });
+      await this.commitMailAlertDraft(draft);
+      const plan = planProactiveMailAlerts({ state: draft.proactiveMailAlerts, rules: draft.proactive.rules, accounts: this.mailAlertAccounts(draft), pages: [],
+        previousCandidates: draft.proactive.candidates.map((entry) => entry.candidate), dismissedCandidateIds: draft.proactive.dismissals.map((item) => item.candidateId),
+        snoozes: draft.proactive.snoozes, now: activatedAt, currentTimeZone: draft.settings.timezone, uuid: newId });
+      if (plan.cancellationReceipts.length) {
+        await executeRequestedMailAlertCancellations(this.mailAlertEngineDependencies([]),
+          { publishScoped: (saved) => { this.adoptScopedMailAlertState(saved); } }, plan.cancellationReceipts);
+      }
+    });
+  }
+
+  async revokeProactiveMailAlerts(ruleId: string): Promise<void> {
+    await this.withMailAlertTransactionSlot(async () => {
+      if (this.proactiveMailAlertQuarantine.length) throw new Error('Saved mail alert settings are held privately until recovery.');
+      const draft = clone(this.state);
+      draft.proactiveMailAlerts = revokeProactiveMailAlertConsent(draft.proactiveMailAlerts, ruleId, now());
+      await this.commitMailAlertDraft(draft);
+      const plan = planProactiveMailAlerts({ state: draft.proactiveMailAlerts, rules: draft.proactive.rules, accounts: this.mailAlertAccounts(draft), pages: [],
+        previousCandidates: draft.proactive.candidates.map((entry) => entry.candidate), dismissedCandidateIds: draft.proactive.dismissals.map((item) => item.candidateId),
+        snoozes: draft.proactive.snoozes, now: now(), currentTimeZone: draft.settings.timezone, uuid: newId });
+      if (plan.cancellationReceipts.length) await executeRequestedMailAlertCancellations(this.mailAlertEngineDependencies([]),
+        { publishScoped: (saved) => { this.adoptScopedMailAlertState(saved); } }, plan.cancellationReceipts);
+    });
+  }
+
+  async reconcileProactiveMailAlerts(): Promise<void> {
+    await this.withMailAlertTransactionSlot(() => this.commitMailAlertPlan([]));
   }
 
   private async getRecordingRecoveryService(): Promise<RecordingRecoveryService> {
@@ -1350,7 +1734,7 @@ export class AppControllerImpl implements AppController {
   }
 
   private persistedState(state: AppState): AppState {
-    const result = { ...state } as AppState & { dispatchRecordQuarantine?: DispatchRecordQuarantineEntry[]; proactiveQuarantine?: unknown; backupImportQuarantine?: unknown[]; knowledgeQuarantine?: unknown[]; reminderQuarantine?: unknown[]; deviceCalendarQuarantine?: unknown[]; transcriptionQuarantine?: unknown[] };
+    const result = { ...state } as AppState & { dispatchRecordQuarantine?: DispatchRecordQuarantineEntry[]; proactiveQuarantine?: unknown; proactiveMailAlertQuarantine?: unknown[]; backupImportQuarantine?: unknown[]; knowledgeQuarantine?: unknown[]; reminderQuarantine?: unknown[]; deviceCalendarQuarantine?: unknown[]; transcriptionQuarantine?: unknown[] };
     if (this.dispatchRecordQuarantine.length) result.dispatchRecordQuarantine = clone(this.dispatchRecordQuarantine);
     else delete result.dispatchRecordQuarantine;
     if (this.dispatchRecordQuarantine.length) result.dispatchRecoveryStatus = {
@@ -1359,16 +1743,24 @@ export class AppControllerImpl implements AppController {
     };
     else delete result.dispatchRecoveryStatus;
     if (this.proactiveQuarantine) result.proactiveQuarantine = clone(this.proactiveQuarantine);
+    if (this.proactiveMailAlertQuarantine.length) result.proactiveMailAlertQuarantine = clone(this.proactiveMailAlertQuarantine);
+    else delete result.proactiveMailAlertQuarantine;
+    if (this.proactiveMailAlertQuarantine.length) result.proactiveMailAlertRecoveryStatus = {
+      quarantined: true,
+      message: 'Some saved mail alert settings could not be validated and are held privately. New mail alerts are disabled until recovery.',
+    };
+    else delete result.proactiveMailAlertRecoveryStatus;
     if (this.backupImportQuarantine.length) result.backupImportQuarantine = clone(this.backupImportQuarantine);
     if (this.knowledgeQuarantine.length) result.knowledgeQuarantine = clone(this.knowledgeQuarantine);
     if (this.reminderQuarantine.length) result.reminderQuarantine = clone(this.reminderQuarantine);
     if (this.deviceEventQuarantine.length) result.deviceCalendarQuarantine = clone(this.deviceEventQuarantine);
     if (this.transcriptionQuarantine.length) result.transcriptionQuarantine = clone(this.transcriptionQuarantine);
+    delete result.mailAlertRefreshRequired;
     return result;
   }
 
   private publicState(state: AppState): AppState {
-    const result = clone(state) as AppState & { dispatchRecordQuarantine?: unknown; proactiveQuarantine?: unknown; backupImportQuarantine?: unknown; knowledgeQuarantine?: unknown; reminderQuarantine?: unknown; deviceCalendarQuarantine?: unknown; transcriptionQuarantine?: unknown };
+    const result = clone(state) as AppState & { dispatchRecordQuarantine?: unknown; proactiveQuarantine?: unknown; proactiveMailAlertQuarantine?: unknown; backupImportQuarantine?: unknown; knowledgeQuarantine?: unknown; reminderQuarantine?: unknown; deviceCalendarQuarantine?: unknown; transcriptionQuarantine?: unknown };
     delete result.dispatchRecordQuarantine;
     if (this.dispatchRecordQuarantine.length) result.dispatchRecoveryStatus = {
       quarantinedCount: this.dispatchRecordQuarantine.length,
@@ -1376,11 +1768,22 @@ export class AppControllerImpl implements AppController {
     };
     else delete result.dispatchRecoveryStatus;
     delete result.proactiveQuarantine;
+    delete result.proactiveMailAlertQuarantine;
+    if (this.proactiveMailAlertQuarantine.length) result.proactiveMailAlertRecoveryStatus = {
+      quarantined: true,
+      message: 'Some saved mail alert settings could not be validated and are held privately. New mail alerts are disabled until recovery.',
+    };
+    else delete result.proactiveMailAlertRecoveryStatus;
     delete result.backupImportQuarantine;
     delete result.knowledgeQuarantine;
     delete result.reminderQuarantine;
     delete result.deviceCalendarQuarantine;
     delete result.transcriptionQuarantine;
+    if (this.mailAlertRefreshRequired) result.mailAlertRefreshRequired = {
+      required: true,
+      message: 'Saved data changed. Refresh local data before continuing.',
+    };
+    else delete result.mailAlertRefreshRequired;
     return result;
   }
 
@@ -1510,21 +1913,32 @@ export class AppControllerImpl implements AppController {
       if (this.loadPromise) await this.loadPromise;
       await this.assertPrivacySessionCurrent();
       if (capturedBootstrapGeneration !== this.bootstrapGeneration || this.startupRecoveryPhase !== 'ready') throw new Error('App startup changed while this action was waiting. Review the current state and try again.');
-      const draft = clone(this.state);
+      const before = clone(this.state);
+      const draft = clone(before);
       const result = await operation(draft);
       await this.assertPrivacySessionCurrent();
+      this.revokeStaleMailAlertConsent(draft);
+      const newCancellationIntents = this.newlyRequestedMailAlertCancellations(before, draft);
       await this.evaluateProactiveDraft(draft);
       draft.reminders = validateReminderState(draft.reminders);
       draft.transcription = clone(validateTranscriptionState(draft.transcription));
       await this.assertPrivacySessionCurrent();
-      await this.store.save(this.persistedState(draft), saveOptions?.(draft, result));
-      await this.assertPrivacySessionCurrent();
-      if (capturedBootstrapGeneration !== this.bootstrapGeneration || this.startupRecoveryPhase !== 'ready') {
-        throw new Error('The app workspace changed while the update was being saved. Reopen the app before continuing.');
+      try {
+        await this.store.save(this.persistedState(draft), saveOptions?.(draft, result));
+        await this.assertPrivacySessionCurrent();
+        if (capturedBootstrapGeneration !== this.bootstrapGeneration || this.startupRecoveryPhase !== 'ready') {
+          throw new Error('The app workspace changed while the update was being saved. Reopen the app before continuing.');
+        }
+        this.state = draft;
+        this.snapshot = deepFreeze(this.publicState(draft));
+        this.emit();
+      } catch (error) {
+        // A storage write can commit before save/ownership acknowledgement fails.
+        // Require an explicit reload before this instance can write again.
+        this.setMailAlertRefreshRequired();
+        throw error;
       }
-      this.state = draft;
-      this.snapshot = deepFreeze(this.publicState(draft));
-      this.emit();
+      await this.cancelNewMailAlertIntents(newCancellationIntents);
       return clone(result);
     });
     this.transactionQueue = run.then(() => undefined, () => undefined);
@@ -1542,22 +1956,31 @@ export class AppControllerImpl implements AppController {
       if (this.loadPromise) await this.loadPromise;
       await this.assertPrivacySessionCurrent();
       if (capturedBootstrapGeneration !== this.bootstrapGeneration || this.startupRecoveryPhase !== 'ready') throw new Error('App startup changed while this action was waiting. Review the current state and try again.');
-      const draft = clone(this.state);
+      const before = clone(this.state);
+      const draft = clone(before);
       const { changed, result } = await operation(draft);
+      const mailAlertsChanged = this.revokeStaleMailAlertConsent(draft);
+      const newCancellationIntents = this.newlyRequestedMailAlertCancellations(before, draft);
       await this.assertPrivacySessionCurrent();
-      if (changed) {
+      if (changed || mailAlertsChanged) {
         await this.evaluateProactiveDraft(draft);
         draft.reminders = validateReminderState(draft.reminders);
         draft.transcription = clone(validateTranscriptionState(draft.transcription));
         await this.assertPrivacySessionCurrent();
-        await this.store.save(this.persistedState(draft));
-        await this.assertPrivacySessionCurrent();
-        if (capturedBootstrapGeneration !== this.bootstrapGeneration || this.startupRecoveryPhase !== 'ready') {
-          throw new Error('The app workspace changed while the update was being saved. Reopen the app before continuing.');
+        try {
+          await this.store.save(this.persistedState(draft));
+          await this.assertPrivacySessionCurrent();
+          if (capturedBootstrapGeneration !== this.bootstrapGeneration || this.startupRecoveryPhase !== 'ready') {
+            throw new Error('The app workspace changed while the update was being saved. Reopen the app before continuing.');
+          }
+          this.state = draft;
+          this.snapshot = deepFreeze(this.publicState(draft));
+          this.emit();
+        } catch (error) {
+          this.setMailAlertRefreshRequired();
+          throw error;
         }
-        this.state = draft;
-        this.snapshot = deepFreeze(this.publicState(draft));
-        this.emit();
+        await this.cancelNewMailAlertIntents(newCancellationIntents);
       }
       return clone(result);
     });
@@ -1854,11 +2277,12 @@ export class AppControllerImpl implements AppController {
 
   /** Refreshes the UI cache after a headless worker changed the durable workspace. */
   async refreshPersistedWorkspace(): Promise<void> {
-    await this.assertPrivacySessionCurrent();
-    if (!this.loaded || this.startupRecoveryPhase !== 'ready') {
+    await this.assertPrivacySessionCurrent(true);
+    const recoveringMailAlertGate = this.mailAlertRefreshRequired;
+    if ((!this.loaded || this.startupRecoveryPhase !== 'ready') && !recoveringMailAlertGate) {
       throw new Error('Workspace refresh is available only after startup is ready.');
     }
-    const busy = () => Boolean(
+    const busy = () => Boolean(this.loadPromise ||
       this.processJobs.size || this.assistJobs.size || this.activeSyncCount || this.syncJobs.size ||
       this.mailLaneJobs.size || this.foregroundMailJob || this.syncAbortControllers.size ||
       this.credentialCleanupJob || this.installingTokenRefs.size || this.mailReplyGenerations.size ||
@@ -1871,13 +2295,14 @@ export class AppControllerImpl implements AppController {
     if (busy()) throw new Error('The workspace is busy. Try refreshing after current actions finish.');
     const capturedGeneration = this.bootstrapGeneration;
     const refresh = this.transactionQueue.then(async () => {
-      await this.assertPrivacySessionCurrent();
-      if (capturedGeneration !== this.bootstrapGeneration || !this.loaded || this.startupRecoveryPhase !== 'ready') {
+      await this.assertPrivacySessionCurrent(true);
+      if (capturedGeneration !== this.bootstrapGeneration ||
+          ((!this.loaded || this.startupRecoveryPhase !== 'ready') && !this.mailAlertRefreshRequired)) {
         throw new Error('The workspace changed before it could be refreshed. Reopen the app and try again.');
       }
       if (busy()) throw new Error('The workspace is busy. Try refreshing after current actions finish.');
       const privacyStatus = await this.integration.privacySession?.getStatus?.();
-      await this.assertPrivacySessionCurrent();
+      await this.assertPrivacySessionCurrent(true);
       if (privacyStatus && (privacyStatus.phase !== 'ready' || privacyStatus.activeWriterCount !== 0 ||
           privacyStatus.pendingCleanupCount !== 0 || privacyStatus.failedCleanupCount !== 0)) {
         throw new Error('Workspace storage is still in use. Try refreshing after current actions finish.');
@@ -1885,16 +2310,17 @@ export class AppControllerImpl implements AppController {
       this.bootstrapGeneration += 1;
       this.loaded = false;
       this.loadPromise = undefined;
-      await this.openStartupData();
+      await this.openStartupData(true);
+      this.clearMailAlertRefreshRequired();
     });
     this.transactionQueue = refresh.then(() => undefined, () => undefined);
     await refresh;
   }
 
-  private async openStartupData(): Promise<void> {
+  private async openStartupData(allowMailAlertRefresh = false): Promise<void> {
     if (this.loaded) return;
     if (this.loadPromise) return this.loadPromise;
-    this.loadPromise = this.loadInternal();
+    this.loadPromise = this.loadInternal(allowMailAlertRefresh);
     try {
       await this.loadPromise;
       await this.discoverPendingStartupReceipt();
@@ -2088,13 +2514,13 @@ export class AppControllerImpl implements AppController {
     this.emit();
   }
 
-  private async loadInternal(): Promise<void> {
+  private async loadInternal(allowMailAlertRefresh = false): Promise<void> {
     const capturedBootstrapGeneration = this.bootstrapGeneration;
-    await this.assertPrivacySessionCurrent();
+    await this.assertPrivacySessionCurrent(allowMailAlertRefresh);
     this.verifiedReminderForeground.clear();
     this.verifiedDeviceCalendarGeneration = undefined;
     const loaded = await this.store.load();
-    await this.assertPrivacySessionCurrent();
+    await this.assertPrivacySessionCurrent(allowMailAlertRefresh);
     if (capturedBootstrapGeneration !== this.bootstrapGeneration) throw new Error('The app workspace changed while startup was loading. Reopen the app before continuing.');
     const normalized: NormalizedLoadedState = loaded ? normalizeLoadedState(loaded) : initialState();
     this.dispatchRecordQuarantine = clone(normalized.dispatchRecordQuarantine ?? []);
@@ -2116,13 +2542,15 @@ export class AppControllerImpl implements AppController {
     this.proactiveQuarantine = proactive.quarantine;
     this.state.proactive = uncertainOnLoad(proactive.state);
     delete (this.state as AppState & { proactiveQuarantine?: unknown }).proactiveQuarantine;
+    this.proactiveMailAlertQuarantine = clone((normalized as AppState & { proactiveMailAlertQuarantine?: unknown[] }).proactiveMailAlertQuarantine ?? []);
+    delete (this.state as AppState & { proactiveMailAlertQuarantine?: unknown[] }).proactiveMailAlertQuarantine;
     for (const account of this.state.accounts) {
       this.state.syncStates[account.id] ??= emptySyncState(account.id);
       if (account.authStatus !== 'connected' || account.provider === 'local') continue;
       let token: StoredOAuthToken | null = null;
       try { token = account.tokenRef ? await this.integration.tokenStore?.get(account.tokenRef) ?? null : null; }
       catch { token = null; }
-      await this.assertPrivacySessionCurrent();
+      await this.assertPrivacySessionCurrent(allowMailAlertRefresh);
       if (capturedBootstrapGeneration !== this.bootstrapGeneration) throw new Error('The app workspace changed while startup was loading. Reopen the app before continuing.');
       if (!token || !sameAccountIdentity(token.identity, account.identity)) {
         account.authStatus = 'reauth_required';
@@ -2198,12 +2626,13 @@ export class AppControllerImpl implements AppController {
     }
     ensureMemoryDocuments(this.state);
     ensurePeriodDocuments(this.state);
+    this.revokeStaleMailAlertConsent(this.state);
     await this.evaluateProactiveDraft(this.state);
     const stateToSave = this.persistedState(this.state);
-    await this.assertPrivacySessionCurrent();
+    await this.assertPrivacySessionCurrent(allowMailAlertRefresh);
     if (!loaded || JSON.stringify(stateToSave) !== JSON.stringify(loaded)) await this.store.save(stateToSave);
     await this.store.assertCurrent?.();
-    await this.assertPrivacySessionCurrent();
+    await this.assertPrivacySessionCurrent(allowMailAlertRefresh);
     if (capturedBootstrapGeneration !== this.bootstrapGeneration) throw new Error('The app workspace changed while startup was loading. Reopen the app before continuing.');
     this.snapshot = deepFreeze(this.publicState(this.state));
     this.loaded = true;
@@ -2237,46 +2666,85 @@ export class AppControllerImpl implements AppController {
     return result.note;
   }
 
-  async getPendingCaptureStatus(): Promise<PendingCaptureSafeStatus> {
+  private async assertPendingCaptureWorkspaceAvailable(): Promise<void> {
+    if (this.mailAlertRefreshRequired) {
+      await this.assertPrivacySessionCurrent(true);
+      if (!this.loaded || this.startupRecoveryPhase !== 'ready') throw new Error('Pending recording status is unavailable until workspace startup completes.');
+      return;
+    }
     await this.load();
+  }
+
+  async getPendingCaptureStatus(): Promise<PendingCaptureSafeStatus> {
+    await this.assertPendingCaptureWorkspaceAvailable();
     return this.pendingCapture ? await this.pendingCapture.getStatus() : Object.freeze({ kind: 'blocked', reason: 'unsupported' });
   }
 
   async inspectPendingCapture(receipt: PendingCaptureReceipt): Promise<PendingCaptureSafeStatus> {
-    await this.load();
+    await this.assertPendingCaptureWorkspaceAvailable();
     if (!this.pendingCapture) throw new Error('Pending recording recovery is unavailable on this platform.');
     return this.pendingCapture.inspect(Object.freeze({ ...receipt }));
   }
 
   async exportPendingCapture(receipt: PendingCaptureReceipt): Promise<void> {
-    await this.load();
+    await this.assertPendingCaptureWorkspaceAvailable();
     if (!this.pendingCapture) throw new Error('Pending recording export is unavailable on this platform.');
     return this.pendingCapture.export(Object.freeze({ ...receipt }));
   }
 
   async discardPendingCapture(receipt: PendingCaptureReceipt): Promise<PendingCaptureSafeStatus> {
-    await this.load();
+    await this.assertPendingCaptureWorkspaceAvailable();
     if (!this.pendingCapture) throw new Error('Pending recording discard is unavailable on this platform.');
     return this.pendingCapture.discard(Object.freeze({ ...receipt }));
   }
 
   async retryPendingCaptureSourceRelease(): Promise<PendingCaptureSafeStatus> {
-    await this.load();
+    await this.assertPendingCaptureWorkspaceAvailable();
     if (!this.pendingCapture) throw new Error('Pending recording cleanup is unavailable on this platform.');
     return this.pendingCapture.retryPendingCaptureSourceRelease();
   }
 
-  private async refreshAfterPendingCaptureCommit(): Promise<void> {
-    const generation = ++this.bootstrapGeneration;
-    this.startupRecoveryPhase = 'failed';
-    const refresh = this.transactionQueue.then(async () => {
-      if (generation !== this.bootstrapGeneration) throw new Error('The app workspace changed while the pending recording was being checked.');
-      this.loaded = false;
-      this.loadPromise = undefined;
-      await this.openStartupData();
+  private async reconcileConsumedPendingCapture(receipt: PendingCaptureReceipt, expectedDraft: AppState, expectedJson: string): Promise<Note> {
+    const capturedBootstrapGeneration = this.bootstrapGeneration;
+    const reconcile = this.transactionQueue.then(async () => {
+      await this.assertPrivacySessionCurrent(true);
+      if (capturedBootstrapGeneration !== this.bootstrapGeneration || !this.loaded || this.startupRecoveryPhase !== 'ready' || !this.mailAlertRefreshRequired || !this.pendingCapture) {
+        throw new Error('Pending recording recovery is not available. Refresh local data before continuing.');
+      }
+      const raw = await this.store.load();
+      if (capturedBootstrapGeneration !== this.bootstrapGeneration || !this.mailAlertRefreshRequired || !raw || JSON.stringify(raw) !== expectedJson) {
+        throw new Error('The pending recording save could not be verified. Refresh local data before continuing.');
+      }
+      const expectedNote = expectedDraft.notes.find((item) => item.id === receipt.id);
+      const rawNote = raw.notes.find((item) => item.id === receipt.id);
+      if (!expectedNote || !rawNote || !this.validConsumedPendingNote(rawNote, receipt.id) ||
+          stableJson(rawNote) !== stableJson(expectedNote) || !await this.pendingCapture.readConsumedEvidence(receipt.id)) {
+        throw new Error('The pending recording save could not be verified. Refresh local data before continuing.');
+      }
+      if (capturedBootstrapGeneration !== this.bootstrapGeneration || !this.store.assertCurrent) {
+        throw new Error('The pending recording save could not be verified. Refresh local data before continuing.');
+      }
+      await this.store.assertCurrent();
+      await this.assertPrivacySessionCurrent(true);
+      if (capturedBootstrapGeneration !== this.bootstrapGeneration || !this.mailAlertRefreshRequired) {
+        throw new Error('The pending recording save could not be verified. Refresh local data before continuing.');
+      }
+
+      // Only this exact atomic consume transaction may recover its own lost
+      // acknowledgement. No normalization or replacement save is performed.
+      const adoptedState = clone(expectedDraft);
+      this.mailAlertRefreshRequired = false;
+      let nextSnapshot: AppState;
+      try { nextSnapshot = deepFreeze(this.publicState(adoptedState)); }
+      catch (error) { this.mailAlertRefreshRequired = true; throw error; }
+      this.state = adoptedState;
+      this.snapshot = nextSnapshot;
+      this.loaded = true;
+      this.emit();
+      return clone(expectedNote);
     });
-    this.transactionQueue = refresh.then(() => undefined, () => undefined);
-    await refresh;
+    this.transactionQueue = reconcile.then(() => undefined, () => undefined);
+    return reconcile;
   }
 
   private validConsumedPendingNote(note: Note | undefined, captureId: string): note is Note {
@@ -2298,6 +2766,8 @@ export class AppControllerImpl implements AppController {
     if (!this.pendingCapture) throw new Error('Pending recording save is unavailable on this platform.');
     let adoption: Awaited<ReturnType<PendingCaptureControllerPort['readForAdoption']>> | undefined;
     let consumeWriteStarted = false;
+    let consumedDraft: AppState | undefined;
+    let consumedJson: string | undefined;
     try {
       const result = await this.mutate(async (state) => {
         adoption = await this.pendingCapture!.readForAdoption(receipt);
@@ -2314,8 +2784,14 @@ export class AppControllerImpl implements AppController {
         addActivity(state, 'note_saved', 'Audio saved. No transcript has been created yet.', { noteId: note.id });
         const docs = [...ensureMemoryDocuments(state), ...recordJournal(state, `note:${note.id}:r${note.revision}`, `Saved note ${note.title} (note ID ${note.id}, transcript revision ${note.revision}).`), ...ensurePeriodDocuments(state)];
         return { note, docs };
-      }, () => {
+      }, (draft) => {
         consumeWriteStarted = true;
+        // Capture the precise validated candidate before the storage call. The
+        // recovery path below may adopt it only if the consumed slot and the
+        // complete persisted snapshot both prove that exact commit.
+        consumedDraft = clone(draft);
+        consumedJson = JSON.stringify(this.persistedState(draft));
+        if (!consumedJson) throw new Error('The pending recording save could not be verified.');
         return { consumePendingCapture: { id: receipt.id, revision: receipt.revision, noteId: receipt.id } };
       });
       await Promise.all(result.docs.map((document) => this.mirrorDocument(document)));
@@ -2333,16 +2809,8 @@ export class AppControllerImpl implements AppController {
       // A process may lose the acknowledgement after the storage transaction committed.
       // Reload the exact persisted slot/snapshot before deciding whether adoption won.
       try {
-        await this.refreshAfterPendingCaptureCommit();
-        const consumed = await this.pendingCapture.readConsumedEvidence(receipt.id);
-        const note = this.state.notes.find((item) => item.id === receipt.id);
-        const inspected = adoption?.capture.inspection;
-        const expectedDuration = inspected?.outcome === 'known' ? inspected.durationSeconds : undefined;
-        if (consumed && this.validConsumedPendingNote(note, receipt.id)) {
-          if (!adoption || (note.audioUri === adoption.uri && note.capturedAt === adoption.capture.capturedAt &&
-              note.captureTimeZone === adoption.capture.captureTimeZone && note.durationSeconds === expectedDuration)) return clone(note);
-        }
-      } catch { /* Keep the original fixed failure if neither side can be verified. */ }
+        if (consumedDraft && consumedJson) return await this.reconcileConsumedPendingCapture(receipt, consumedDraft, consumedJson);
+      } catch { /* Keep the hard gate unless this exact consumed transaction is proven. */ }
       throw new Error('The pending recording could not be saved. Check its status before trying again.');
     }
   }
@@ -3115,7 +3583,7 @@ export class AppControllerImpl implements AppController {
       const current = this.snapshot;
       const currentNote = current.notes.find((item) => item.id === id);
       const currentAttempt = current.transcription.attempts.find((item) => item.id === attemptId);
-      if (controller.signal.aborted || this.transcriptionQuarantine.length || !current.settings.speechEnabled || speechSettingsProjection(current.settings) !== settingsProjection ||
+      if (controller.signal.aborted || this.mailAlertRefreshRequired || this.transcriptionQuarantine.length || !current.settings.speechEnabled || speechSettingsProjection(current.settings) !== settingsProjection ||
           !currentNote || currentNote.revision !== sourceRevision || stableJson(transcriptionSourceProjection(currentNote, current.settings)) !== stableJson(source) ||
           currentAttempt?.outcome !== 'pending' || !currentAttempt.reservation || stableJson(currentAttempt.prepared) !== stableJson(preparedSnapshot) || stableJson(snapshot) !== stableJson(preparedSnapshot)) {
         throw new Error('The note, audio, settings, or transcription claim changed before upload. No audio was sent.');
@@ -3187,31 +3655,41 @@ export class AppControllerImpl implements AppController {
       return updated;
     } catch (error) {
       const typed = error instanceof SpeechTranscriptionError ? error : undefined;
-      await this.mutate((state) => {
-        const savedAttempt = state.transcription.attempts.find((item) => item.id === attemptId);
-        if (!savedAttempt || ['completed', 'no_speech', 'failed', 'unknown', 'discarded', 'cancelled'].includes(savedAttempt.outcome)) return;
-        const dispatched = typed ? typed.dispatched : savedAttempt.dispatchStarted;
-        if (!dispatched && savedAttempt.reservation) {
-          this.finishTranscriptionReservationDraft(state, savedAttempt.reservation);
-          delete savedAttempt.reservation;
-          savedAttempt.dispatchStarted = false;
-        }
-        const duration = typed?.durationMilliseconds ?? providerResult?.durationMilliseconds;
-        if (dispatched && Number.isSafeInteger(duration) && duration! > 0 && duration! <= 600_000 && savedAttempt.reservation) {
-          const billed = Math.ceil(duration! / 1000);
-          this.settleSpeechUsageDraft(state, billed, settings, savedAttempt.reservation);
-          savedAttempt.durationMilliseconds = duration;
-          savedAttempt.billedEstimateSeconds = billed;
-          savedAttempt.rateEstimated = settings.speechUsdPerMinute === undefined;
-        }
-        const code: SpeechAttemptCode = typed ? speechErrorCode(error) : dispatched ? 'provider_unknown' : speechErrorCode(error);
-        savedAttempt.code = code; savedAttempt.terminalAt = now();
-        savedAttempt.outcome = dispatched ? code === 'no_speech' ? 'no_speech' : code === 'provider_rejected' ? 'failed' : code === 'cancelled' ? 'cancelled' : 'unknown' : code === 'cancelled' ? 'cancelled' : 'failed';
-        const lease = state.transcription.cleanupLeases.find((item) => item.leaseId === leaseId);
-        if (lease) lease.outcome = 'pending_cleanup';
-      });
       const cleanup = typed?.cleanupPromise ?? providerCleanup;
+      // Register actual cleanup before any terminal journal write. If the
+      // journal is hard-gated or its save fails, the provider promise still
+      // remains tracked until its real I/O has settled.
       if (cleanup) this.trackTranscriptionCleanup(leaseId, cleanup);
+      try {
+        await this.mutate((state) => {
+          const savedAttempt = state.transcription.attempts.find((item) => item.id === attemptId);
+          if (!savedAttempt || ['completed', 'no_speech', 'failed', 'unknown', 'discarded', 'cancelled'].includes(savedAttempt.outcome)) return;
+          const dispatched = typed ? typed.dispatched : savedAttempt.dispatchStarted;
+          if (!dispatched && savedAttempt.reservation) {
+            this.finishTranscriptionReservationDraft(state, savedAttempt.reservation);
+            delete savedAttempt.reservation;
+            savedAttempt.dispatchStarted = false;
+          }
+          const duration = typed?.durationMilliseconds ?? providerResult?.durationMilliseconds;
+          if (dispatched && Number.isSafeInteger(duration) && duration! > 0 && duration! <= 600_000 && savedAttempt.reservation) {
+            const billed = Math.ceil(duration! / 1000);
+            this.settleSpeechUsageDraft(state, billed, settings, savedAttempt.reservation);
+            savedAttempt.durationMilliseconds = duration;
+            savedAttempt.billedEstimateSeconds = billed;
+            savedAttempt.rateEstimated = settings.speechUsdPerMinute === undefined;
+          }
+          const code: SpeechAttemptCode = typed ? speechErrorCode(error) : dispatched ? 'provider_unknown' : speechErrorCode(error);
+          savedAttempt.code = code; savedAttempt.terminalAt = now();
+          savedAttempt.outcome = dispatched ? code === 'no_speech' ? 'no_speech' : code === 'provider_rejected' ? 'failed' : code === 'cancelled' ? 'cancelled' : 'unknown' : code === 'cancelled' ? 'cancelled' : 'failed';
+          const lease = state.transcription.cleanupLeases.find((item) => item.leaseId === leaseId);
+          if (lease) lease.outcome = 'pending_cleanup';
+        });
+      } catch (terminalError) {
+        if (this.mailAlertRefreshRequired) {
+          throw new Error('Transcription status could not be saved. Refresh local data and review the attempt before uploading again.');
+        }
+        throw terminalError;
+      }
       throw error;
     }
   }
@@ -3744,6 +4222,7 @@ export class AppControllerImpl implements AppController {
     } else if (frozenDeviceRecord) {
       const createPromise = this.deviceCalendarBackend.createApprovedEvent(frozenDeviceRecord, () => {
         const latest = this.snapshot;
+        if (this.mailAlertRefreshRequired) return false;
         const current = latest.proposals.find((item) => item.id === frozenDeviceRecord.proposalId);
         const record = latest.deviceCalendars.dispatchRecords.find((item) => item.id === frozenDeviceRecord.id);
         const approval = current?.deviceCalendarApproval;
@@ -3825,7 +4304,7 @@ export class AppControllerImpl implements AppController {
           const currentState = this.snapshot;
           const current = currentState.proposals.find((item) => item.id === id);
           const currentAccount = currentState.accounts.find((item) => item.id === record.accountId);
-          if (!current || !currentAccount || !recordIsCurrent(currentState, current) || current.status !== 'dispatching' ||
+          if (this.mailAlertRefreshRequired || !current || !currentAccount || !recordIsCurrent(currentState, current) || current.status !== 'dispatching' ||
               current.revision !== record.approvedRevision || current.approvedRevision !== record.approvedRevision ||
               current.approvedPayloadDigest !== record.payloadDigest || current.sourceRevision !== record.sourceRevision ||
               current.accountId !== record.accountId || !sameAccountIdentity(currentAccount.identity, record.account.identity) ||
@@ -3839,7 +4318,7 @@ export class AppControllerImpl implements AppController {
             ? currentState.notes.find((item) => item.id === current.noteId) : undefined;
           const currentAccount = currentState.accounts.find((item) => item.id === record.accountId);
           const expectedCapability = operation === 'draft' ? 'mail.draft' : operation === 'send' ? 'mail.send' : 'calendar.write';
-          if (!current || (current.provenance?.version === 1 && !currentNote) || !currentAccount || currentState.settings.mode !== 'provider' || !recordIsCurrent(currentState, current) ||
+          if (this.mailAlertRefreshRequired || !current || (current.provenance?.version === 1 && !currentNote) || !currentAccount || currentState.settings.mode !== 'provider' || !recordIsCurrent(currentState, current) ||
               current.status !== 'dispatching' || current.approvedRevision !== record.approvedRevision || current.revision !== record.approvedRevision ||
               current.approvedPayloadDigest !== record.payloadDigest ||
               (current.provenance?.version === 1 && (current.sourceRevision !== currentNote?.revision || current.sourceRevision !== record.sourceRevision)) ||
@@ -4634,6 +5113,7 @@ export class AppControllerImpl implements AppController {
       if (permission === 'denied' || permission === 'undetermined') { await this.observeReminderIntent(current.id, 'blocked', 'permission_denied', 'scheduled'); continue; }
       await this.markReminderAttempt(current.id); operations += 1;
       const guard = () => {
+        if (this.mailAlertRefreshRequired) return false;
         const latest = this.snapshot.reminders.intents.find((intent) => intent.id === current.id);
         const owner = this.snapshot.reminders.records.find((candidate) => candidate.id === current.reminderId);
         return Boolean(latest && latest.payload && latest.payloadDigest === current.payloadDigest && latest.desired === 'scheduled' && latest.epoch === current.epoch && owner?.status === 'saved' &&
@@ -4746,7 +5226,29 @@ export class AppControllerImpl implements AppController {
     }
   }
 
-  private isForegroundReminderAllowed(notification: { identifier?: string; content: { title?: unknown; body?: unknown; data?: unknown } }): boolean {
+  private isForegroundReminderAllowed(notification: { identifier?: string; content: { title?: unknown; body?: unknown; data?: unknown; [key: string]: unknown } }): boolean {
+    if (this.mailAlertRefreshRequired) return false;
+    if (isMatchingProactiveMailAlertNotification({ installationId: this.state.proactiveMailAlerts.installationId,
+      receiptId: this.notificationMailAlertReceiptId(notification) }, { identifier: notification.identifier, content: notification.content })) {
+      if (this.proactiveMailAlertQuarantine.length) return false;
+      const receiptId = this.notificationMailAlertReceiptId(notification);
+      const receipt = this.state.proactiveMailAlerts.receipts.find((item) => item.id === receiptId);
+      if (!receipt || receipt.installationId !== this.state.proactiveMailAlerts.installationId || receipt.desired !== 'notify' ||
+          !['attempting', 'submitted'].includes(receipt.observed)) return false;
+      const consent = this.state.proactiveMailAlerts.consents.find((item) => item.id === receipt.consentId);
+      const rule = this.state.proactive.rules.find((item) => item.id === receipt.ruleId);
+      const account = this.mailAlertAccounts(this.state).find((item) => item.accountId === receipt.accountId);
+      return Boolean(consent && consent.status === 'active' && consent.ruleId === receipt.ruleId &&
+        consent.ruleVersion === receipt.ruleVersion && consent.ruleRevision === receipt.ruleRevision &&
+        consent.activatedAt === receipt.consentActivatedAt && consent.timeZone === receipt.timeZone &&
+        this.state.settings.timezone === receipt.timeZone &&
+        rule && rule.enabled && rule.version === receipt.ruleVersion && rule.revision === receipt.ruleRevision &&
+        (rule.accountIds.length === 0 || rule.accountIds.includes(receipt.accountId)) &&
+        account && account.connected && account.authStatus === 'connected' && account.canReadMail &&
+        account.identityKey === receipt.identityKey && account.connectionGeneration === receipt.connectionGeneration &&
+        consent.accounts.some((binding) => binding.accountId === receipt.accountId && binding.identityKey === receipt.identityKey &&
+          binding.connectionGeneration === receipt.connectionGeneration));
+    }
     if (this.reminderQuarantine.length || !notification.identifier || !notification.content.data || typeof notification.content.data !== 'object') return false;
     const data = notification.content.data as Record<string, unknown>;
     const intent = this.snapshot.reminders.intents.find((item) => item.identifier === notification.identifier && item.desired === 'scheduled' && item.observed === 'pending');
@@ -4761,6 +5263,11 @@ export class AppControllerImpl implements AppController {
     const expected = projection.data;
     return (notification.content.title ?? '') === projection.title && (notification.content.body ?? '') === projection.body &&
       Object.keys(data).length === Object.keys(expected).length && Object.entries(expected).every(([key, value]) => data[key] === value);
+  }
+
+  private notificationMailAlertReceiptId(notification: { content: { data?: unknown } }): string {
+    const data = notification.content.data;
+    return isRecord(data) && data.kind === 'proactive_mail_alert' && typeof data.receiptId === 'string' ? data.receiptId : '';
   }
 
   private reminderForegroundFingerprint(record: ReminderRecord, intent: ReminderIntent): string {
@@ -5923,7 +6430,8 @@ export class AppControllerImpl implements AppController {
       settingsFingerprint, queryBucket: Math.floor(Date.parse(requestAsOf) / (15 * 60_000)),
     };
     const requestFingerprint = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, stableJson(sourceAndText));
-    const currentProjection = () => this.mailReplyGenerationProjection(this.snapshot, input.messageId, input.sourceDigest, input.textDigest, input.noteId, input.noteRevision);
+    const currentProjection = () => this.mailAlertRefreshRequired ? undefined :
+      this.mailReplyGenerationProjection(this.snapshot, input.messageId, input.sourceDigest, input.textDigest, input.noteId, input.noteRevision);
     const disclosure = {
       bytes: cachedBody.snapshot.bytes, representation: cachedBody.snapshot.representation, completeness: cachedBody.snapshot.completeness,
       omissionReasons: [...cachedBody.snapshot.omissionReasons], briefBytes: utf8Bytes(brief) + utf8Bytes(noteContext ?? ''), policyDocuments: policies.map((doc) => doc.path), requestBytes: 0,
@@ -5947,7 +6455,7 @@ export class AppControllerImpl implements AppController {
       let generated: Awaited<ReturnType<AzureOpenAIClient['generateReply']>>;
       let reservation: { month: string; day: string; reserve: number } | undefined;
       const assertProjection = (current: AppState = this.snapshot) => {
-        if (this.mailReplyGenerationProjection(current, input.messageId, input.sourceDigest, input.textDigest, input.noteId, input.noteRevision) !== capturedProjection) {
+        if (this.mailAlertRefreshRequired || this.mailReplyGenerationProjection(current, input.messageId, input.sourceDigest, input.textDigest, input.noteId, input.noteRevision) !== capturedProjection) {
           throw new ReplyGenerationPreDispatchError('Selected message, note, settings, or guidance changed before generation. Review the context and try again.');
         }
       };
@@ -6008,7 +6516,12 @@ export class AppControllerImpl implements AppController {
   }
 
   async refreshMailHead(accountId: string, options: { reason?: 'manual' | 'foreground' } = {}): Promise<MailLaneResult> {
-    return this.startMailLane(accountId, 'head', options.reason ?? 'manual');
+    const pages = new Map<string, CommittedMailAlertPage>();
+    const result = await this.startMailLane(accountId, 'head', options.reason ?? 'manual', false, pages);
+    if (result.status === 'complete' || result.status === 'partial') {
+      await this.withMailAlertTransactionSlot(() => this.commitMailAlertPlan([...pages.values()]));
+    }
+    return result;
   }
 
   async continueMailBackfill(accountId: string): Promise<MailLaneResult> {
@@ -6031,6 +6544,7 @@ export class AppControllerImpl implements AppController {
     const skipped: ForegroundMailRefreshResult['skipped'] = [];
     const results: MailLaneResult[] = [];
     const currentTime = Date.now();
+    const committedPages = new Map<string, CommittedMailAlertPage>();
     for (const account of eligible) {
       if (this.busySyncAccounts.has(account.id)) { skipped.push({ accountId: account.id, reason: 'another sync lane is active for this account' }); continue; }
       const lastAttempt = Date.parse(this.snapshot.syncStates[account.id]?.mailHead.lastAttemptAt ?? '');
@@ -6041,25 +6555,32 @@ export class AppControllerImpl implements AppController {
       const available = this.activeSyncCount < 2;
       if (!available) { skipped.push({ accountId: account.id, reason: 'both sync slots are busy' }); continue; }
       attempted.push(account.id);
-      try { results.push(await this.startMailLane(account.id, 'head', 'foreground', true)); }
+      try { results.push(await this.startMailLane(account.id, 'head', 'foreground', true, committedPages)); }
       catch (error) { skipped.push({ accountId: account.id, reason: error instanceof Error ? error.message : 'mail refresh was skipped' }); }
+    }
+    if (committedPages.size) {
+      try { await this.withMailAlertTransactionSlot(() => this.commitMailAlertPlan([...committedPages.values()])); }
+      catch { /* Mail page commits remain valid even when the separate notification ledger needs repair. */ }
+    } else {
+      try { await this.withMailAlertTransactionSlot(() => this.commitMailAlertPlan([])); }
+      catch { /* A failed alert cleanup never rolls back already completed mailbox work. */ }
     }
     return { attempted, skipped, results };
   }
 
-  private startMailLane(accountId: string, lane: 'head' | 'backfill', reason: 'manual' | 'foreground', doNotQueue = false): Promise<MailLaneResult> {
+  private startMailLane(accountId: string, lane: 'head' | 'backfill', reason: 'manual' | 'foreground', doNotQueue = false, committedPages?: Map<string, CommittedMailAlertPage>): Promise<MailLaneResult> {
     const key = `${accountId}:${lane}`;
     const sameLane = this.mailLaneJobs.get(key);
     if (sameLane) return sameLane;
     if (this.busySyncAccounts.has(accountId)) return Promise.reject(new Error('Another sync lane is already active for this account.'));
     this.busySyncAccounts.add(accountId);
-    const job = this.runMailLane(accountId, lane, reason, doNotQueue)
+    const job = this.runMailLane(accountId, lane, reason, doNotQueue, committedPages)
       .finally(() => { this.mailLaneJobs.delete(key); this.busySyncAccounts.delete(accountId); });
     this.mailLaneJobs.set(key, job);
     return job;
   }
 
-  private async runMailLane(accountId: string, lane: 'head' | 'backfill', reason: 'manual' | 'foreground', doNotQueue: boolean): Promise<MailLaneResult> {
+  private async runMailLane(accountId: string, lane: 'head' | 'backfill', reason: 'manual' | 'foreground', doNotQueue: boolean, committedPages?: Map<string, CommittedMailAlertPage>): Promise<MailLaneResult> {
     if (!this.connector) throw new Error('Provider mail sync is not configured.');
     const release = doNotQueue ? this.tryAcquireSyncSlot() : await this.acquireSyncSlot();
     if (!release) throw new Error('Both sync slots are busy.');
@@ -6249,11 +6770,23 @@ export class AppControllerImpl implements AppController {
           sync.mailBackfill.unavailableCount = (sync.mailBackfill.unavailableCount ?? 0) + unavailableCount;
         }
         state.syncStates[accountId] = sync;
+        return timestamp;
       });
       const page = await this.connector.syncMessageWindow(immutableAccount, {
         timeMin: immutableWindow.from, timeMax: immutableWindow.through, cursor: immutableWindow.cursor,
         pageSize: immutableWindow.pageSize, guard, signal: abortController.signal,
-        onPage: (items, cursor, _pagesRead, metadata) => persistPage(items, cursor, metadata),
+        onPage: async (items, cursor, _pagesRead, metadata) => {
+          const checkedAt = await persistPage(items, cursor, metadata);
+          if (lane !== 'head' || !committedPages || !account) return;
+          const pageProof = await this.committedMailAlertPage(immutableAccount, items, checkedAt);
+          if (!pageProof) return;
+          const prior = committedPages.get(accountId);
+          committedPages.set(accountId, prior ? {
+            ...pageProof,
+            checkedAt: Date.parse(pageProof.checkedAt) >= Date.parse(prior.checkedAt) ? pageProof.checkedAt : prior.checkedAt,
+            sources: [...prior.sources, ...pageProof.sources].filter((source, index, all) => all.findIndex((item) => item.sourceId === source.sourceId) === index),
+          } : pageProof);
+        },
       });
       ensureCurrent();
       if (page.window.from !== immutableWindow.from || page.window.to !== immutableWindow.through || page.queryFingerprint !== immutableWindow.queryFingerprint) {
@@ -6937,7 +7470,7 @@ const defaultIntegration: ControllerIntegrationDependencies = {
     defaultConnector = new ConnectorClient({ tokenStore, googleClientId, microsoftClientId, microsoftAuthority, onAuthStatus,
       isConnectionCurrent: (account) => {
         const current = defaultController?.getSnapshot().accounts.find((item) => item.id === account.id);
-        return Boolean(current && current.connected && current.authStatus === 'connected' && current.tokenRef === account.tokenRef &&
+        return Boolean(!defaultController?.getSnapshot().mailAlertRefreshRequired && current && current.connected && current.authStatus === 'connected' && current.tokenRef === account.tokenRef &&
           current.connectionGeneration === account.connectionGeneration && sameAccountIdentity(current.identity, account.identity));
       },
     });
@@ -7031,6 +7564,9 @@ export async function createProductionWorkspace(options: ProductionWorkspaceOpti
       ? options.integration.removeAudio(uri)
       : removeAudio(uri)),
     reminderBackend: boundNotifications.backend,
+    mailAlertBackend: options.integration?.mailAlertBackend ?? createMailAlertNotificationBackend(),
+    withMailAlertNotificationWriter: options.integration?.withMailAlertNotificationWriter ?? ((actual) => resources.withMailAlertNotificationWriter((scope) =>
+      actual(scope, bindExistingWorkspaceWriter(rawStore, privacy, session, scope)))),
     deviceCalendarBackend: boundDeviceCalendars.backend,
     disposePrivacyResources: () => { boundNotifications.dispose(); boundDeviceCalendars.dispose(); boundBackgroundTasks.dispose(); },
     privacySession: {
@@ -7049,7 +7585,7 @@ export async function createProductionWorkspace(options: ProductionWorkspaceOpti
         withProviderOwnership: resources.withProviderOwnership,
         isConnectionCurrent: (account) => {
           const current = implementation?.getSnapshot().accounts.find((item) => item.id === account.id);
-          return Boolean(current && current.connected && current.authStatus === 'connected' && current.tokenRef === account.tokenRef &&
+          return Boolean(!implementation?.getSnapshot().mailAlertRefreshRequired && current && current.connected && current.authStatus === 'connected' && current.tokenRef === account.tokenRef &&
             current.connectionGeneration === account.connectionGeneration && sameAccountIdentity(current.identity, account.identity));
         },
       });

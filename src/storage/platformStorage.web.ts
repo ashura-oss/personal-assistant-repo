@@ -57,9 +57,18 @@ function requestResult<T>(request: IDBRequest<T>): Promise<T> {
 
 function transactionComplete(tx: IDBTransaction): Promise<void> {
   return new Promise((resolve, reject) => {
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error ?? new Error('Browser storage transaction failed.'));
-    tx.onabort = () => reject(tx.error ?? new Error('Browser storage transaction was cancelled.'));
+    let requestErrorSeen = false;
+    let requestFailure: DOMException | null = null;
+    tx.oncomplete = () => {
+      if (requestErrorSeen) reject(requestFailure ?? new Error('Browser storage transaction failed.'));
+      else resolve();
+    };
+    tx.onerror = (event) => {
+      requestErrorSeen = true;
+      const requestError = (event.target as IDBRequest | null)?.error;
+      requestFailure ??= requestError ?? tx.error;
+    };
+    tx.onabort = () => reject(requestFailure ?? tx.error ?? new Error('Browser storage transaction was cancelled.'));
   });
 }
 

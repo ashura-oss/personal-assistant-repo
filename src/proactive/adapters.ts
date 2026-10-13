@@ -198,6 +198,50 @@ export interface ProactiveSourceBuildResult {
   omittedSourceCount: number;
 }
 
+/**
+ * Projects only the exact mail rows supplied by a committed mailbox page (or a
+ * later authoritative snapshot). This deliberately avoids constructing an
+ * AppState or inspecting calendar, task, or device-calendar sources.
+ */
+export async function buildProactiveMailSources(
+  accounts: readonly AppState['accounts'][number][],
+  mailboxRows: readonly MailboxSnapshotMessage[],
+  now: number,
+  memo: ProactiveSourceHashMemo,
+  digest: (value: string) => Promise<string>,
+): Promise<ProactiveSource[]> {
+  const accountsById = new Map<string, AppState['accounts'][number]>();
+  const ambiguousAccountIds = new Set<string>();
+  for (const account of accounts) {
+    if (!account || typeof account.id !== 'string' || !account.id) continue;
+    if (accountsById.has(account.id)) ambiguousAccountIds.add(account.id);
+    else accountsById.set(account.id, account);
+  }
+
+  const orderedRows = mailboxRows
+    .filter(validMailRow)
+    .slice()
+    .sort((a, b) => String(b.observedAt ?? '').localeCompare(String(a.observedAt ?? '')) ||
+      a.accountId.localeCompare(b.accountId) || a.providerMessageId.localeCompare(b.providerMessageId));
+  const sources = new Map<string, ProactiveSource>();
+  for (const row of orderedRows) {
+    if (ambiguousAccountIds.has(row.accountId)) continue;
+    const account = accountsById.get(row.accountId);
+    if (!account || account.provider === 'local' || !account.identity?.providerNamespace) continue;
+    const namespace = account.identity.providerNamespace;
+    const sourceId = proactiveSourceId({ namespace, accountId: account.id, providerId: row.providerMessageId });
+    if (sources.has(sourceId)) continue;
+    try {
+      const source = await mailSource(row, account, now, memo, digest);
+      if (source) {
+        validateProactiveSource(source);
+        sources.set(source.sourceId, source);
+      }
+    } catch { /* Keep malformed or unhashable rows local to their exact source. */ }
+  }
+  return [...sources.values()].sort((a, b) => a.sourceId.localeCompare(b.sourceId));
+}
+
 export async function buildProactiveSources(
   state: AppState,
   previous: ProactiveCandidate[],

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { AppState } from '../src/core';
 import { AppControllerImpl } from '../src/services/controller';
-import { buildProactiveSources } from '../src/proactive/adapters';
+import { buildProactiveMailSources, buildProactiveSources } from '../src/proactive/adapters';
 import type { StateStore } from '../src/storage/contracts';
 import type { StoredOAuthToken } from '../src/connectors';
 import type { NotificationBackend } from '../src/services/notificationBackend';
@@ -307,6 +307,30 @@ describe('controller-owned proactive state', () => {
     expect(built.omittedSourceCount).toBe(2);
     expect(hashes).toBe(1999);
     expect(built.sources.some((source) => source.providerId === 'mail-0000')).toBe(false);
+  });
+
+  it('projects only exact mail rows through the mail-only mapper and rehashes changed current facts', async () => {
+    const { store } = await configuredController();
+    const state = structuredClone(store.value!);
+    let hashes = 0;
+    const memo = new Map();
+    const first = await buildProactiveMailSources(state.accounts, [state.mailbox[0]], Date.now(), memo, async (value) => {
+      hashes += 1;
+      return String(value.length);
+    });
+    expect(first).toHaveLength(1);
+    expect(first[0]).toMatchObject({ kind: 'mail', providerId: state.mailbox[0].providerMessageId });
+    expect(hashes).toBe(1);
+
+    const changed = { ...state.mailbox[0], subject: 'Changed after committed page' };
+    const current = await buildProactiveMailSources(state.accounts, [changed], Date.now(), memo, async (value) => {
+      hashes += 1;
+      return `changed-${value.length}`;
+    });
+    expect(current).toHaveLength(1);
+    expect(current[0].sourceId).toBe(first[0].sourceId);
+    expect(current[0].sourceVersion).not.toBe(first[0].sourceVersion);
+    expect(hashes).toBe(2);
   });
 
   it('returns stale detail for an expired observation rather than current source facts', async () => {

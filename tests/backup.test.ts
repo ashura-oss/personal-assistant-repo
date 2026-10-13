@@ -7,6 +7,7 @@ import {
 } from '../src/backup';
 import { emptyKnowledgeState } from '../src/knowledge';
 import { emptyReminderState } from '../src/reminders';
+import { emptyProactiveMailAlertState } from '../src/proactiveMailAlerts/state';
 
 const at = '2026-10-12T10:00:00.000Z';
 
@@ -19,6 +20,7 @@ function emptyState(): AppState {
     deviceCalendarAccess: { status: 'needs_check' },
     syncStates: {}, pendingCredentialCleanup: [], dispatchRecords: [], mailboxSchemaVersion: 2,
     proactive: { schemaVersion: 1, rules: [], candidates: [], dismissals: [], snoozes: [] },
+    proactiveMailAlerts: emptyProactiveMailAlertState('123e4567-e89b-42d3-a456-426614174099'),
     importedBackups: [],
     knowledge: emptyKnowledgeState(),
     reminders: emptyReminderState('123e4567-e89b-42d3-a456-426614174099'),

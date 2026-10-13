@@ -6,7 +6,7 @@ import type { DeviceCalendarReadWindow, DeviceCalendarRow, DeviceEventDispatchRe
 import type { BackgroundTaskBackend, BackgroundTaskExpirationSubscription } from '../background/backend.types';
 import type { LegacyReminderCancellation, ReminderIntent } from '../reminders';
 import type { PrivacyService, PrivacyWorkspaceSession } from './service';
-import type { PrivacyWriterDescriptor } from './types';
+import type { PrivacyWriterDescriptor, PrivacyWriterScope } from './types';
 
 const CREDENTIAL_KEYS = new Set(['azure.speech.subscription-key', 'azure.openai.api-key']);
 
@@ -167,6 +167,8 @@ export interface PrivacyResourceBoundary extends PrivacyResourceBinding {
   notificationBackend(raw: NotificationBackend): PrivacyBoundNotificationBackend;
   backgroundTaskBackend(raw: BackgroundTaskBackend): PrivacyBoundBackgroundTaskBackend;
   deviceCalendarBackend(raw: DeviceCalendarBackend): PrivacyBoundDeviceCalendarBackend;
+  /** Holds one notifications writer through the supplied raw mail-alert I/O and its scoped receipt updates. */
+  withMailAlertNotificationWriter<T>(actual: (scope: PrivacyWriterScope) => Promise<T>): Promise<T>;
   withProviderOwnership<T>(actual: () => Promise<T>): Promise<T>;
 }
 
@@ -180,6 +182,13 @@ export function createPrivacyResourceBoundary(input: PrivacyResourceBinding): Pr
     notificationBackend: (raw: NotificationBackend) => bindPrivacyNotificationBackend(raw, binding),
     backgroundTaskBackend: (raw: BackgroundTaskBackend) => bindPrivacyBackgroundTaskBackend(raw, binding),
     deviceCalendarBackend: (raw: DeviceCalendarBackend) => bindPrivacyDeviceCalendarBackend(raw, binding),
+    withMailAlertNotificationWriter: <T>(actual: (scope: PrivacyWriterScope) => Promise<T>) =>
+      binding.privacy.withWriter(binding.session.epoch, { kind: 'notification', namespace: 'notifications' }, async (_lease, scope) => {
+        await binding.privacy.assertWorkspaceEpoch(binding.session.epoch);
+        const result = await actual(scope);
+        await binding.privacy.assertWorkspaceEpoch(binding.session.epoch);
+        return result;
+      }),
     withProviderOwnership: <T>(actual: () => Promise<T>) => underWriter(binding, { kind: 'provider_credential', namespace: 'provider_credentials' }, actual),
   });
 }

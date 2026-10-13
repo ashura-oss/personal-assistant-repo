@@ -6,6 +6,7 @@ import { createDeviceCalendarRow, createDeviceEventDispatchRecord, type DeviceCa
 import { emptyKnowledgeState } from '../src/knowledge';
 import { buildProactiveSources } from '../src/proactive/adapters';
 import { evaluateProactive, validateProactiveSource, type ProactiveRule } from '../src/proactive';
+import { emptyProactiveMailAlertState } from '../src/proactiveMailAlerts/state';
 import { AppControllerImpl } from '../src/services/controller';
 import type { StateStore } from '../src/storage/contracts';
 
@@ -78,6 +79,7 @@ function proactiveState(overrides: Partial<DeviceEventSnapshot>[] = []): AppStat
     },
     deviceCalendarAccess: { status: 'full_access' as const, checkedAt: observedAt },
     proactive: { schemaVersion: 1 as const, rules: [], candidates: [], dismissals: [], snoozes: [] }, importedBackups: [],
+    proactiveMailAlerts: emptyProactiveMailAlertState('44444444-4444-4444-8444-444444444444'),
     knowledge: emptyKnowledgeState(), reminders: { schemaVersion: 1 as const, installationId: '44444444-4444-4444-8444-444444444444', generation: 1, records: [], intents: [], dispatchRecords: [] },
   } as AppState;
   return state;

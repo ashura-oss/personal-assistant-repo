@@ -371,6 +371,7 @@ describe('application state controller', () => {
     store.failNext = true;
     await expect(app.loadMailReplyText({ messageId: message.id, sourceDigest: loaded.snapshot!.sourceDigest })).rejects.toThrow(/disk full/i);
     expect(app.getSnapshot().selectedMailTexts[0].text).toBe(loaded.snapshot!.text);
+    await app.refreshPersistedWorkspace();
     extractionVersion = 'mail-text-v2';
     extractionRepresentation = 'converted_html';
     extractionCompleteness = 'excerpt';
@@ -1404,6 +1405,7 @@ describe('application state controller', () => {
     store.failNext = true;
     await expect(app.saveNote({ transcript: 'This write must fail.' })).rejects.toThrow('disk full');
     expect(app.getSnapshot().notes).toHaveLength(0);
+    await app.refreshPersistedWorkspace();
     const saved = await app.saveNote({ transcript: 'This write succeeds.' });
     expect(store.value?.notes.map((note) => note.id)).toEqual([saved.id]);
   });
