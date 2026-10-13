@@ -558,7 +558,7 @@ describe('privacy cleanup engine', () => {
   it('reconciles only proven old-process leases and preserves the epoch and manifests', async () => {
     const priorOwner: PrivacyOwner = { platform: 'ios', runtimeId: uuid(801), processLaunchId: uuid(802), bundleIdentifier: 'com.still.voiceassistant' };
     const currentOwner: PrivacyOwner = { platform: 'ios', runtimeId: uuid(803), processLaunchId: uuid(804), bundleIdentifier: 'com.still.voiceassistant' };
-    const { engine, store, locks } = setup(currentOwner);
+    const { engine, store } = setup(currentOwner);
     const lease = {
       id: uuid(805), epoch: store.state.epoch, owner: priorOwner, kind: 'app_state' as const,
       namespace: 'state_database' as const, createdAt: '2026-10-13T00:00:00.000Z',
