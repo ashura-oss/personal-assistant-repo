@@ -535,12 +535,8 @@ function deviceReminderSourceProjection(state: AppState, binding: NonNullable<Ex
 }
 
 function assistContext(state: AppState, note: Note, intent: AssistIntent, question?: string, knowledgeSelection: KnowledgeSelection = []): { documents: ContextDocument[]; additionalSources: AssistantSourceInput[]; omittedSourceCount: number; omittedSourceIds: string[] } {
-  const entityNarrativePaths = new Set([
-    ...state.knowledge.people.map((entity) => entity.narrativePath),
-    ...state.knowledge.projects.map((entity) => entity.narrativePath),
-  ]);
   const allDocuments = state.documents.filter(({ path }) => !path.startsWith('logs/') && path !== 'memory/INFERENCES.md' && path !== 'memory/DECISIONS.md' &&
-    !entityNarrativePaths.has(path));
+    !path.startsWith('people/') && !path.startsWith('projects/'));
   const taskQuery = intent === 'answer' && /\b(task|tasks|task count|how many|todo|to-do|action item)\b/i.test(question ?? '');
   const selectedKnowledge = new Set(knowledgeSelection.map((item) => `${item.kind}:${item.id}`));
   const acceptedKnowledge = [

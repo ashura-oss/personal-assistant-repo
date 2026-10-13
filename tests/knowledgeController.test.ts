@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { AppState } from '../src/core';
 import * as Crypto from 'expo-crypto';
 import { AzureOpenAIClient } from '../src/services/azure';
@@ -155,7 +155,7 @@ describe('knowledge controller integration', () => {
     expect(app.getSnapshot().knowledge.people).toEqual([]);
   });
 
-  it('keeps untracked UUID Markdown files as ordinary context documents', async () => {
+  it('excludes untracked UUID Markdown files from generic context documents', async () => {
     const { app } = createController();
     await app.load();
     await enableProvider(app);
@@ -167,7 +167,7 @@ describe('knowledge controller integration', () => {
     });
 
     const analysis = await app.assistNote(note.id, { intent: 'summarize' });
-    expect(Object.keys(analysis.sourceVersions)).toContain(`doc:${legacyPath}`);
+    expect(Object.keys(analysis.sourceVersions)).not.toContain(`doc:${legacyPath}`);
   });
 
   it('reviews exact saved document evidence after a later Assist uses different context', async () => {
@@ -279,5 +279,77 @@ describe('knowledge controller integration', () => {
     expect(recovering.getSnapshot().knowledge.people).toEqual([]);
     expect(JSON.stringify(recovering.getSnapshot())).not.toContain('invalid-row');
     expect(JSON.stringify(store.value)).toContain('invalid-row');
+  });
+
+  it('excludes reserved knowledge document paths from generic Assist context after quarantine', async () => {
+    const { store, app: seed } = createController();
+    await seed.load();
+    await enableProvider(seed);
+    const note = await seed.saveNote({ transcript: 'Summarize GENERIC_RESEARCH_CONTEXT_CANARY from the research notes.' });
+    const person = await seed.savePerson({ name: 'Maya', aliases: [], narrative: 'ORPHAN_PERSON_NARRATIVE_CANARY' });
+    const project = await seed.saveProject({ name: 'Field study', aliases: [], narrative: 'ORPHAN_PROJECT_NARRATIVE_CANARY', status: 'active', goal: 'Observe the site.' });
+    await seed.saveDocument('people/legacy/nested.md', 'ORPHAN_NESTED_PERSON_CANARY');
+    await seed.saveDocument('projects/legacy/nested.md', 'ORPHAN_NESTED_PROJECT_CANARY');
+    await seed.saveDocument('research/SAFE.md', 'GENERIC_RESEARCH_CONTEXT_CANARY');
+
+    const corrupted = structuredClone(store.value!);
+    (corrupted as unknown as { knowledge: unknown }).knowledge = { schemaVersion: 1, people: [{ id: 'invalid-knowledge-row' }], projects: [], suggestions: [] };
+    store.value = corrupted;
+    const recovering = createController(store).app;
+    await recovering.load();
+    expect(recovering.getSnapshot().knowledge.people).toEqual([]);
+    expect(recovering.getSnapshot().knowledge.projects).toEqual([]);
+
+    const client = (recovering as unknown as { openAiClient: AzureOpenAIClient }).openAiClient;
+    const prepare = vi.spyOn(client, 'prepare');
+    await recovering.assistNote(note.id, { intent: 'summarize' });
+    expect(prepare).toHaveBeenCalled();
+    for (const call of prepare.mock.calls) {
+      const [ , documents, , request ] = call;
+      expect(documents.some((document) => document.path.startsWith('people/') || document.path.startsWith('projects/'))).toBe(false);
+      expect(documents.some((document) => document.path === 'research/SAFE.md' && document.content.includes('GENERIC_RESEARCH_CONTEXT_CANARY'))).toBe(true);
+      expect(JSON.stringify(request?.additionalSources ?? [])).not.toContain('ORPHAN_');
+      expect(JSON.stringify(documents)).not.toContain('ORPHAN_');
+    }
+    expect(JSON.stringify(prepare.mock.calls)).not.toContain(person.id);
+    expect(JSON.stringify(prepare.mock.calls)).not.toContain(project.id);
+  });
+
+  it('keeps valid knowledge narratives available as knowledge sources, not generic documents', async () => {
+    const { app } = createController();
+    await app.load();
+    await enableProvider(app);
+    const note = await app.saveNote({ transcript: 'Summarize VALID_KNOWLEDGE_NARRATIVE_CANARY and GENERIC_RESEARCH_CONTEXT_CANARY.' });
+    const person = await app.savePerson({ name: 'Maya', aliases: [], narrative: 'VALID_KNOWLEDGE_NARRATIVE_CANARY' });
+    await app.saveDocument('research/SAFE.md', 'GENERIC_RESEARCH_CONTEXT_CANARY');
+    const client = (app as unknown as { openAiClient: AzureOpenAIClient }).openAiClient;
+    const prepare = vi.spyOn(client, 'prepare');
+
+    await app.assistNote(note.id, { intent: 'summarize', knowledgeSelection: [{ kind: 'person', id: person.id }] });
+    expect(prepare).toHaveBeenCalled();
+    const [, documents, , request] = prepare.mock.calls[0]!;
+    expect(documents.some((document) => document.path === person.narrativePath)).toBe(false);
+    expect(documents.some((document) => document.path === 'research/SAFE.md')).toBe(true);
+    expect(request?.additionalSources).toContainEqual(expect.objectContaining({
+      id: `knowledge:person:${person.id}`, text: expect.stringContaining('VALID_KNOWLEDGE_NARRATIVE_CANARY'),
+    }));
+  });
+
+  it('excludes reserved knowledge namespaces when valid knowledge is empty without quarantine', async () => {
+    const { app } = createController();
+    await app.load();
+    await enableProvider(app);
+    const note = await app.saveNote({ transcript: 'Summarize GENERIC_RESEARCH_CONTEXT_CANARY and the local reference.' });
+    await app.saveDocument('people/orphan/nested.md', 'EMPTY_STATE_ORPHAN_CANARY');
+    await app.saveDocument('projects/orphan/nested.md', 'EMPTY_STATE_PROJECT_CANARY');
+    await app.saveDocument('research/SAFE.md', 'GENERIC_RESEARCH_CONTEXT_CANARY');
+    const client = (app as unknown as { openAiClient: AzureOpenAIClient }).openAiClient;
+    const prepare = vi.spyOn(client, 'prepare');
+
+    await app.assistNote(note.id, { intent: 'summarize' });
+    const [, documents] = prepare.mock.calls[0]!;
+    expect(documents.some((document) => document.path.startsWith('people/') || document.path.startsWith('projects/'))).toBe(false);
+    expect(JSON.stringify(documents)).not.toContain('EMPTY_STATE_');
+    expect(documents.some((document) => document.path === 'research/SAFE.md')).toBe(true);
   });
 });
