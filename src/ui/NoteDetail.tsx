@@ -290,7 +290,8 @@ export function NoteDetail({
           Audio is never transcribed automatically. Your transcript stays
           editable.
         </Text>
-        {note.audioUri || transcriptionAttempts.length > 0 ? (
+        {(!demoMode || transcriptionDemoMode) &&
+        (note.audioUri || transcriptionAttempts.length > 0) ? (
           <TranscriptionPanel
             note={note}
             attempts={transcriptionAttempts}

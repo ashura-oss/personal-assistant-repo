@@ -1311,6 +1311,10 @@ export default function App() {
                   setDetail(null);
                 }}
                 onTranscribe={(expectedRevision) => {
+                  if (isIsolatedDemo && !isTranscriptionDemo) {
+                    setNotice("Transcription is disabled in this sample preview.");
+                    return;
+                  }
                   if (!state.settings.speechEnabled || !state.settings.speechEndpoint) {
                     setSettingsOpen(true);
                     return;
@@ -1352,7 +1356,13 @@ export default function App() {
                     .catch((error) => setNotice(messageOf(error)))
                     .finally(() => setCancelingTranscriptionId(undefined));
                 }}
-                onOpenSpeechSettings={() => setSettingsOpen(true)}
+                onOpenSpeechSettings={() => {
+                  if (isIsolatedDemo) {
+                    setNotice("Speech settings are disabled in this sample preview.");
+                    return;
+                  }
+                  setSettingsOpen(true);
+                }}
                 onAttachRecording={() =>
                   setRecordingAttachmentNoteId(detail.id)
                 }
