@@ -3,8 +3,13 @@ import * as Crypto from 'expo-crypto';
 import type { AppState } from '../src/core';
 import { AppControllerImpl } from '../src/services/controller';
 import type { StateStore } from '../src/storage/contracts';
-import { BACKUP_LIMITS, PORTABLE_BACKUP_FORMAT, PORTABLE_BACKUP_SCHEMA_VERSION, legacyCanonicalPortableContentV2, parsePortableBackup, type PortableBackupV3 } from '../src/backup';
+import { BACKUP_LIMITS, PORTABLE_BACKUP_FORMAT, PORTABLE_BACKUP_SCHEMA_VERSION, legacyCanonicalPortableContentV2, parsePortableBackup, type PortableBackupV4 } from '../src/backup';
 import { emptyKnowledgeState } from '../src/knowledge';
+import { STATE_SNAPSHOT_READ_MAX_BYTES } from '../src/storage/contracts';
+import { createProactiveMailAlertConsent } from '../src/proactiveMailAlerts/planner';
+import type { ControllerIntegrationDependencies } from '../src/services/controller';
+import type { PrivacyWriterScope } from '../src/privacy/types';
+import type { ExistingWorkspaceWriterStore } from '../src/privacy/workspaceStorage';
 
 class MemoryStore implements StateStore {
   value?: AppState;
@@ -21,7 +26,7 @@ class MemoryStore implements StateStore {
 }
 
 const stamp = '2026-10-12T10:00:00.000Z';
-function fixture(): PortableBackupV3 {
+function fixture(): PortableBackupV4 {
   return {
     format: PORTABLE_BACKUP_FORMAT, schemaVersion: PORTABLE_BACKUP_SCHEMA_VERSION, exportId: 'portable-1',
     exportedAt: stamp, audioIncluded: false,
@@ -34,6 +39,7 @@ function fixture(): PortableBackupV3 {
     archivedDocuments: [],
     history: [{ kind: 'analysis', sourceId: 'analysis:same-note-id', sourceNoteId: 'same-note-id', title: 'Old analysis', content: 'Historical only.', status: 'Unverified historical result', occurredAt: stamp }],
     knowledge: { state: emptyKnowledgeState(), narratives: [] }, archivedKnowledge: [],
+    chatHistory: { version: 1, conversations: [] },
   };
 }
 
@@ -51,6 +57,43 @@ describe('controller portable backup workflow', () => {
     expect(digestSpy).not.toHaveBeenCalled();
   });
 
+  it('rejects complete-state overflow before saving or publishing, without poisoning the current writer', async () => {
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store);
+    await app.load();
+    const before = app.getSnapshot();
+    const savesBefore = store.saves;
+    const hugeContent = 'x'.repeat(STATE_SNAPSHOT_READ_MAX_BYTES - 256);
+    const internal = app as unknown as {
+      mutateIfChanged<T>(operation: (draft: AppState) => { changed: boolean; result: T }): Promise<T>;
+      mutate<T>(operation: (draft: AppState) => T, saveOptions?: unknown, batchLedger?: unknown, chatLedger?: () => unknown): Promise<T>;
+      assistantChatLedger: unknown;
+    };
+    const appendOversizedDocument = (draft: AppState) => {
+      draft.documents.push({ path: 'memory/near-limit.md', content: hugeContent, revision: 1, updatedAt: stamp });
+    };
+    await expect(internal.mutateIfChanged((draft) => {
+      appendOversizedDocument(draft);
+      return { changed: true, result: undefined };
+    })).rejects.toThrow(/storage limit/i);
+    expect(store.saves).toBe(savesBefore);
+    expect(app.getSnapshot()).toBe(before);
+    expect(app.getSnapshot().documents.some((document) => document.path === 'memory/near-limit.md')).toBe(false);
+
+    await expect(internal.mutate((draft) => {
+      appendOversizedDocument(draft);
+      return undefined;
+    }, undefined, undefined, () => internal.assistantChatLedger)).rejects.toThrow(/storage limit/i);
+    expect(store.saves).toBe(savesBefore);
+    expect(app.getSnapshot()).toBe(before);
+    expect(app.getSnapshot().documents.some((document) => document.path === 'memory/near-limit.md')).toBe(false);
+
+    const saved = await app.saveNote({ transcript: 'The workspace remains writable.' });
+    expect(saved.transcript).toBe('The workspace remains writable.');
+    expect(store.saves).toBe(savesBefore + 1);
+    expect(app.getSnapshot().documents.some((document) => document.path === 'memory/near-limit.md')).toBe(false);
+  });
+
   it('exports an allowlisted v3 backup without connected-account authority or credentials', async () => {
     const store = new MemoryStore();
     const app = new AppControllerImpl(store);
@@ -65,7 +108,7 @@ describe('controller portable backup workflow', () => {
     const restored = new AppControllerImpl(store);
     await restored.load();
     const backup = JSON.parse(await restored.exportData());
-    expect(backup).toMatchObject({ format: PORTABLE_BACKUP_FORMAT, schemaVersion: 3, audioIncluded: false });
+    expect(backup).toMatchObject({ format: PORTABLE_BACKUP_FORMAT, schemaVersion: PORTABLE_BACKUP_SCHEMA_VERSION, audioIncluded: false });
     expect(JSON.stringify(backup)).not.toContain('secret-token-ref');
     expect(backup).not.toHaveProperty('accounts');
     expect(backup).not.toHaveProperty('settings');
@@ -245,6 +288,7 @@ describe('controller portable backup workflow', () => {
     const app = new AppControllerImpl(store);
     await app.load();
     const v2 = { ...fixture(), format: 'still-backup-v2', schemaVersion: 2 } as Record<string, unknown>;
+    delete v2.chatHistory;
     delete v2.knowledge;
     delete v2.archivedKnowledge;
     const originalInput = JSON.stringify(v2);
@@ -269,6 +313,117 @@ describe('controller portable backup workflow', () => {
     expect(preview).toMatchObject({ alreadyImported: true, missingNoteCount: 1, missingTaskCount: 0 });
     const restored = await reloaded.applyBackupImport({ sessionId: preview.sessionId, planHash: preview.planHash });
     expect(restored).toMatchObject({ id: archive.id, contentHash: originalContentHash, fileHash: originalFileHash, importedAt: oldImportedAt });
+  });
+
+  it('does not dedupe a V4 Chat backup against an existing legacy V2 archive', async () => {
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store);
+    await app.load();
+    const v2 = { ...fixture(), format: 'still-backup-v2', schemaVersion: 2 } as Record<string, unknown>;
+    delete v2.chatHistory;
+    delete v2.knowledge;
+    delete v2.archivedKnowledge;
+    const legacy = await app.prepareBackupImport(JSON.stringify(v2));
+    const legacyArchive = await app.applyBackupImport({ sessionId: legacy.sessionId, planHash: legacy.planHash });
+
+    const withChat = fixture();
+    withChat.chatHistory = { version: 1, conversations: [{ title: 'Imported chat', createdAt: stamp, updatedAt: stamp,
+      turns: [{ userText: 'Keep this Chat history', createdAt: stamp, capturedAt: stamp, captureTimeZone: 'Asia/Singapore' }] }] };
+    const preview = await app.prepareBackupImport(JSON.stringify(withChat));
+    expect(preview.alreadyImported).toBe(false);
+    const imported = await app.applyBackupImport({ sessionId: preview.sessionId, planHash: preview.planHash });
+    expect(imported.id).not.toBe(legacyArchive.id);
+    expect(imported.chatHistory).toHaveLength(1);
+    expect(imported.chatHistory?.[0]?.turns[0]?.userText).toBe('Keep this Chat history');
+  });
+
+  it('keeps a matched legacy V3 archive in its legacy shape when V4 adds no Chat history', async () => {
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store);
+    await app.load();
+    const v3 = { ...fixture(), format: 'still-backup-v3', schemaVersion: 3 } as Record<string, unknown>;
+    delete v3.chatHistory;
+    const first = await app.prepareBackupImport(JSON.stringify(v3));
+    const legacyArchive = await app.applyBackupImport({ sessionId: first.sessionId, planHash: first.planHash });
+    const v4 = await app.prepareBackupImport(JSON.stringify(fixture()));
+    expect(v4).toMatchObject({ alreadyImported: true, chatConversationCount: 0, chatTurnCount: 0 });
+    const matched = await app.applyBackupImport({ sessionId: v4.sessionId, planHash: v4.planHash });
+    expect(matched).toMatchObject({ id: legacyArchive.id, sourceFormat: 'still-backup-v3' });
+    expect(matched.chatHistory).toBeUndefined();
+  });
+
+  it('reserves private live Chat IDs while allocating inert imported Chat IDs', async () => {
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store);
+    await app.load();
+    const liveConversation = await app.createChatConversation('Live conversation');
+    let generated = 0;
+    vi.spyOn(Crypto, 'randomUUID').mockImplementation(() => generated++ === 0
+      ? liveConversation.id
+      : `123e4567-e89b-42d3-a456-${String(700000000000 + generated).slice(-12)}`);
+    const withChat = fixture();
+    withChat.chatHistory = { version: 1, conversations: [{ title: 'Imported conversation', createdAt: stamp, updatedAt: stamp,
+      turns: [{ userText: 'Imported message', createdAt: stamp, capturedAt: stamp, captureTimeZone: 'Asia/Singapore' }] }] };
+    const preview = await app.prepareBackupImport(JSON.stringify(withChat));
+    const archive = await app.applyBackupImport({ sessionId: preview.sessionId, planHash: preview.planHash });
+    expect(archive.noteLinks.every((link) => link.noteId !== liveConversation.id)).toBe(true);
+    expect(archive.chatHistory?.every((conversation) => conversation.id !== liveConversation.id && conversation.turns.every((turn) => turn.id !== liveConversation.id))).toBe(true);
+  });
+
+  it('deletes imported Chat without reconciling stale live mail-alert consent or invoking notifications', async () => {
+    const store = new MemoryStore();
+    let cancelCalls = 0;
+    const integration: ControllerIntegrationDependencies = {
+      mailAlertBackend: { platform: 'mock', async getPermission() { return 'authorized'; }, async requestPermission() { return 'authorized'; },
+        async present() { return 'not_admitted'; }, async cancel(_input, beforeCancel) { cancelCalls += 1; return await beforeCancel() ? 'absent' : 'not_admitted'; } },
+      privacySession: { epoch: 'archive-only-test', async assertCurrent() {}, async getStatus() { return { phase: 'writer_active', epoch: 'archive-only-test', activeWriterCount: 1,
+        pendingCleanupCount: 0, failedCleanupCount: 0, limits: { namespaces: 10, oauthTokenRefs: 10, legacyMarkdownPaths: 10,
+          writerLeases: 10, cleanupTargets: 100, cleanupBatch: 16 }, coverage: 'tracked_with_legacy_limits' }; } },
+      async withMailAlertNotificationWriter<T>(actual: (scope: PrivacyWriterScope, writerStore: ExistingWorkspaceWriterStore) => Promise<T>) {
+        return actual({} as PrivacyWriterScope, store as unknown as ExistingWorkspaceWriterStore);
+      },
+    };
+    const app = new AppControllerImpl(store, {}, integration);
+    await app.load();
+    const input = fixture();
+    input.chatHistory = { version: 1, conversations: [{ title: 'Archived', createdAt: stamp, updatedAt: stamp,
+      turns: [{ userText: 'Keep as inert history', createdAt: stamp, capturedAt: stamp, captureTimeZone: 'Asia/Singapore' }] }] };
+    const plan = await app.prepareBackupImport(JSON.stringify(input));
+    const archive = await app.applyBackupImport({ sessionId: plan.sessionId, planHash: plan.planHash });
+
+    const current = structuredClone(store.value!);
+    const rule = { id: 'stale-alert-rule', version: 1, revision: 1, name: 'Stale', enabled: true, accountIds: [],
+      trigger: { type: 'keyword' as const, keywords: ['project'] }, createdAt: stamp, updatedAt: stamp };
+    const identityKey = 'google:client:subject:';
+    const consent = createProactiveMailAlertConsent({ id: '123e4567-e89b-42d3-a456-426614174201', rule,
+      timeZone: current.settings.timezone, activatedAt: stamp, accounts: [{ accountId: 'missing-account', identityKey,
+        connectionGeneration: 1, providerNamespace: 'google', connected: true, authStatus: 'connected', canReadMail: true }] });
+    current.proactiveMailAlerts.consents = [consent];
+    current.proactiveMailAlerts.receipts = [{ id: '123e4567-e89b-42d3-a456-426614174202', installationId: current.proactiveMailAlerts.installationId,
+      consentId: consent.id, ruleId: rule.id, ruleVersion: 1, ruleRevision: 1, timeZone: consent.timeZone, consentActivatedAt: consent.activatedAt,
+      accountId: 'missing-account', identityKey, connectionGeneration: 1, providerMessageId: 'opaque-message', sourceVersion: 'a'.repeat(64),
+      receivedAt: stamp, desired: 'notify', observed: 'submitted', createdAt: stamp, updatedAt: stamp, attemptedAt: stamp }];
+    current.proactiveMailAlerts.revision += 1;
+    store.value = structuredClone(current);
+    const internals = app as unknown as { state: AppState; snapshot: AppState };
+    internals.state = structuredClone(current);
+    internals.snapshot = structuredClone(current);
+    const alertState = structuredClone(current.proactiveMailAlerts);
+    const beforeSaves = store.saves;
+
+    await app.deleteImportedChatConversation({ archiveId: archive.id, conversationId: archive.chatHistory![0]!.id });
+    const afterDelete = store.value!;
+    expect(afterDelete.proactiveMailAlerts).toEqual(alertState);
+    expect(afterDelete.importedBackups.find((item) => item.id === archive.id)?.chatHistory).toEqual([]);
+    expect({ ...afterDelete, importedBackups: afterDelete.importedBackups.map((item) => ({ ...item, chatHistory: undefined })) })
+      .toEqual({ ...current, importedBackups: current.importedBackups.map((item) => ({ ...item, chatHistory: undefined })) });
+    expect(cancelCalls).toBe(0);
+
+    const savesAfterDelete = store.saves;
+    await app.deleteImportedChatConversation({ archiveId: archive.id, conversationId: '123e4567-e89b-42d3-a456-426614174299' });
+    expect(store.saves).toBe(savesAfterDelete);
+    expect(store.saves).toBe(beforeSaves + 1);
+    expect(cancelCalls).toBe(0);
   });
 
   it('imports and recovers special source IDs such as __proto__ and constructor as ordinary values', async () => {

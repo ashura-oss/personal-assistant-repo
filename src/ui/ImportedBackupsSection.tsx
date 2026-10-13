@@ -5,6 +5,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import type { AppController, ContextDocument } from "../core";
 import type { ImportedBackupArchive } from "../backup";
 import { Button, Field, IconButton } from "./primitives";
+import { ImportedChatHistoryView } from "./ImportedChatHistoryView";
 import { C, s } from "./theme";
 
 export function ImportedBackupsSection({
@@ -12,13 +13,17 @@ export function ImportedBackupsSection({
   currentDocuments,
   controller,
   busy,
+  archiveActionsBlocked = false,
   query,
+  onDeleteImportedChatConversation,
 }: {
   archives: ImportedBackupArchive[];
   currentDocuments: ContextDocument[];
   controller: AppController;
   busy: boolean;
+  archiveActionsBlocked?: boolean;
   query: string;
+  onDeleteImportedChatConversation?: (archiveId: string, conversationId: string) => Promise<boolean>;
 }) {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [selected, setSelected] = useState<{ archiveId: string; documentId: string } | null>(null);
@@ -43,10 +48,14 @@ export function ImportedBackupsSection({
       !filter || [entry.title, entry.status, entry.provider, entry.reference, entry.content]
         .some((value) => value?.toLocaleLowerCase().includes(filter)),
     );
+    const chats = (archive.chatHistory ?? []).filter((conversation) => !filter ||
+      conversation.title.toLocaleLowerCase().includes(filter) || conversation.turns.some((turn) =>
+        turn.userText.toLocaleLowerCase().includes(filter) || turn.reply?.summary.toLocaleLowerCase().includes(filter) ||
+        turn.reply?.answer.toLocaleLowerCase().includes(filter) || turn.reply?.clarifications.some((item) => item.toLocaleLowerCase().includes(filter))));
     const metadataMatches = !filter || [archive.sourceFormat, archive.exportedAt]
       .some((value) => value.toLocaleLowerCase().includes(filter));
-    return !filter || metadataMatches || documents.length > 0 || history.length > 0
-      ? [{ archive, documents: filter ? documents : archive.documents, history: filter ? history : archive.history }]
+    return !filter || metadataMatches || documents.length > 0 || history.length > 0 || chats.length > 0
+      ? [{ archive, documents: filter ? documents : archive.documents, history: filter ? history : archive.history, chats }]
       : [];
   }), [archives, filter]);
   const selectedArchive = selected ? archives.find((archive) => archive.id === selected.archiveId) : undefined;
@@ -166,12 +175,14 @@ export function ImportedBackupsSection({
     <View style={styles.section}>
       <Text style={s.sectionTitle}>Imported backups</Text>
       <Text style={styles.caption}>Imported history is an unverified, read-only record. It cannot approve, send, retry, or execute actions.</Text>
-      {visibleArchives.length ? visibleArchives.map(({ archive, documents, history }) => {
+      {visibleArchives.length ? visibleArchives.map(({ archive, documents, history, chats }) => {
         const isOpen = expanded.has(archive.id);
         const documentLimit = visibleDocumentCounts[archive.id] ?? 25;
         const historyLimit = visibleHistoryCounts[archive.id] ?? 25;
         const shownDocuments = documents.slice(0, documentLimit);
         const shownHistory = history.slice(0, historyLimit);
+        const chatConversationCount = archive.chatHistory?.length ?? 0;
+        const chatTurnCount = archive.chatHistory?.reduce((count, conversation) => count + conversation.turns.length, 0) ?? 0;
         const toggle = () => setExpanded((current) => {
           const next = new Set(current);
           if (next.has(archive.id)) next.delete(archive.id); else next.add(archive.id);
@@ -181,9 +192,9 @@ export function ImportedBackupsSection({
           <View key={archive.id} style={styles.archiveCard}>
             <Pressable accessibilityRole="button" accessibilityLabel={`${isOpen ? "Hide" : "Show"} imported backup from ${new Date(archive.exportedAt).toLocaleDateString()}`} accessibilityState={{ expanded: isOpen }} onPress={toggle} style={styles.archiveHeader}>
               <View style={styles.archiveCopy}>
-                <Text style={styles.archiveTitle}>Imported backup · {archive.sourceFormat === "voice-assistant-export-v1" ? "Legacy v1" : archive.sourceFormat === "still-backup-v2" ? "Still v2" : archive.sourceFormat === "still-backup-v3" ? "Still v3" : "Unknown backup version"}</Text>
+                <Text style={styles.archiveTitle}>Imported backup · {archive.sourceFormat === "voice-assistant-export-v1" ? "Legacy v1" : archive.sourceFormat === "still-backup-v2" ? "Still v2" : archive.sourceFormat === "still-backup-v3" ? "Still v3" : archive.sourceFormat === "still-backup-v4" ? "Still v4" : "Unknown backup version"}</Text>
                 <Text style={styles.caption}>Exported {new Date(archive.exportedAt).toLocaleDateString()} · added {new Date(archive.importedAt).toLocaleDateString()}</Text>
-                <Text style={styles.caption}>{archive.noteLinks.length} notes · {archive.taskLinks.length} tasks · {archive.documents.length} archived documents · {archive.history.length} historical records</Text>
+                <Text style={styles.caption}>{archive.noteLinks.length} notes · {archive.taskLinks.length} tasks · {archive.documents.length} archived documents · {archive.history.length} historical records{chatConversationCount ? ` · ${chatConversationCount} Chat conversations · ${chatTurnCount} messages` : ""}</Text>
               </View>
               <Text style={styles.chevron}>{isOpen ? "−" : "+"}</Text>
             </Pressable>
@@ -225,6 +236,12 @@ export function ImportedBackupsSection({
                     ) : null}
                   </View>
                 ) : <Text style={styles.caption}>No historical records in this backup.</Text>}
+                {chats.length ? <ImportedChatHistoryView
+                  conversations={chats}
+                  onDeleteConversation={onDeleteImportedChatConversation ? (conversationId) => onDeleteImportedChatConversation(archive.id, conversationId) : undefined}
+                  busy={busy}
+                  blocked={archiveActionsBlocked}
+                /> : null}
               </View>
             ) : null}
           </View>

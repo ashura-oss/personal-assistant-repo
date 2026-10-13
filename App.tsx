@@ -2918,6 +2918,10 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
                 controller={controller}
                 audioBoundary={audioBoundary}
                 importedBackups={state.importedBackups}
+                archiveActionsBlocked={!startupReady || loading || isolatedPreviewFailed || privacyReviewOpen || privacyOutcomeUnknown ||
+                  Boolean(state.mailAlertRefreshRequired || state.proactive.integrityError || state.assistantChatRecoveryStatus || state.assistantBatchRecoveryStatus ||
+                    state.knowledgeRecoveryStatus || state.reminderRecoveryStatus) ||
+                  proactiveRecoveryRequiresRefresh}
                 knowledge={state.knowledge}
                 knowledgeRecoveryStatus={state.knowledgeRecoveryStatus}
                 references={knowledgeReferenceOptions(state)}
@@ -3976,6 +3980,7 @@ function LibraryScreen({
   controller,
   audioBoundary,
   importedBackups,
+  archiveActionsBlocked,
   knowledge,
   knowledgeRecoveryStatus,
   references,
@@ -4022,6 +4027,7 @@ function LibraryScreen({
   controller: AppController;
   audioBoundary?: PrivacyAudioBoundary;
   importedBackups: AppState["importedBackups"];
+  archiveActionsBlocked: boolean;
   knowledge: AppState["knowledge"];
   knowledgeRecoveryStatus?: AppState["knowledgeRecoveryStatus"];
   references: { reference: KnowledgeReference; label: string }[];
@@ -4196,7 +4202,15 @@ function LibraryScreen({
         currentDocuments={docs}
         controller={controller}
         busy={busy}
+        archiveActionsBlocked={archiveActionsBlocked}
         query={query}
+        onDeleteImportedChatConversation={async (archiveId, conversationId) => {
+          const removed = await onRun(async () => {
+            await controller.deleteImportedChatConversation({ archiveId, conversationId });
+            return true;
+          });
+          return removed === true;
+        }}
       />
       <View style={{ height: 10 }} />
       <Button

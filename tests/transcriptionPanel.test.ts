@@ -70,6 +70,23 @@ describe('transcription provider history and request cleanup UI', () => {
     expect(host.textContent).not.toContain('billing duration estimate');
   });
 
+  it('preserves exact reported Whisper precision, tiny positive charges, and a distinct reported zero', () => {
+    render({ speechProvider: 'azure', attempts: [openRouterAttempt({
+      actualUsage: { seconds: 5.478, costUsd: 0.00001824174 },
+    })] });
+    expect(host.textContent).toContain('OpenRouter-reported cost · US$0.00001824174');
+
+    render({ speechProvider: 'azure', attempts: [openRouterAttempt({
+      actualUsage: { costUsd: 0.000000001 },
+    })] });
+    expect(host.textContent).toContain('OpenRouter-reported cost · US$1e-9');
+
+    render({ speechProvider: 'azure', attempts: [openRouterAttempt({
+      actualUsage: { costUsd: 0 },
+    })] });
+    expect(host.textContent).toContain('OpenRouter-reported cost · US$0.00000000');
+  });
+
   it('does not invent missing OpenRouter usage and keeps Azure attempt labels historical', () => {
     render({ speechProvider: 'openrouter', attempts: [openRouterAttempt({ actualUsage: undefined })] });
     expect(host.textContent).toContain('OpenRouter did not report usage for this request.');

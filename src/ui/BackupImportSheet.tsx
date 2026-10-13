@@ -134,7 +134,7 @@ export function BackupImportSheet({
           {complete ? (
             <View style={styles.card}>
               <Text style={styles.cardTitle}>{complete.restored ? "Missing content restored" : "Backup added"}</Text>
-              <Text style={styles.body}>{complete.restored ? "Restored" : "Added"} {complete.notes} note{complete.notes === 1 ? "" : "s"} and {complete.tasks} task{complete.tasks === 1 ? "" : "s"}. Existing notes, tasks, documents, archives, and settings were kept. Imported history remains read-only.</Text>
+              <Text style={styles.body}>{complete.restored ? "Restored" : "Added"} {complete.notes} note{complete.notes === 1 ? "" : "s"} and {complete.tasks} task{complete.tasks === 1 ? "" : "s"}. Existing notes, tasks, documents, archives, and settings were kept. Imported Chat history, if present, remains read-only.</Text>
               {complete.taskLinksRepaired ? <Text style={styles.body}>{complete.taskLinksRepaired} imported task source link{complete.taskLinksRepaired === 1 ? " was" : "s were"} repaired.</Text> : null}
               {(complete.archive.archivedKnowledge?.length ?? 0) > 0 ? <Text style={styles.body}>{complete.archive.archivedKnowledge!.length} knowledge cohort{complete.archive.archivedKnowledge!.length === 1 ? " remains" : "s remain"} archived. Review in Library → Memory to activate separate copies.</Text> : null}
               {!complete.restored && complete.archive.documents.length ? <Text style={styles.body}>{complete.archive.documents.length} document{complete.archive.documents.length === 1 ? "" : "s"} are archived. Review each before using it as assistant context.</Text> : null}
@@ -166,7 +166,10 @@ export function BackupImportSheet({
                     <Text style={styles.count}>{preview.projectCount} projects</Text>
                     <Text style={styles.count}>{preview.knowledgeCohortCount} knowledge cohorts</Text>
                     <Text style={styles.count}>{preview.historyCount} history records</Text>
+                    <Text style={styles.count}>{preview.chatConversationCount} Chat conversations</Text>
+                    <Text style={styles.count}>{preview.chatTurnCount} Chat messages</Text>
                   </View>
+                  {preview.chatConversationCount > 0 ? <Text style={styles.warning}>Chat history imports as unverified, read-only messages. It does not restore accounts, approvals, active jobs, or action authority.</Text> : null}
                   {preview.missingAudioCount ? <Text style={styles.warning}>{preview.missingAudioCount} recording{preview.missingAudioCount === 1 ? " is" : "s are"} not included. Imported notes will show audio missing; no local audio path will be opened.</Text> : <Text style={styles.caption}>Audio is not included in this backup.</Text>}
                   {preview.documentConflicts.length ? (
                     <View style={styles.subsection}>

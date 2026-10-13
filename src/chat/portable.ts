@@ -58,6 +58,9 @@ export type InertImportedChatConversation = Readonly<{
   turns: readonly InertImportedChatTurn[];
 }>;
 
+const PORTABLE_TURN_KEYS = ['userText', 'createdAt', 'capturedAt', 'captureTimeZone'] as const;
+const PORTABLE_TURN_OPTIONAL_KEYS = ['reply', 'accounting'] as const;
+
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const CANONICAL_ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/;
@@ -188,6 +191,57 @@ export function validatePortableChatHistory(value: unknown, maxBytes = PORTABLE_
 
 export function serializePortableChatHistory(value: unknown, maxBytes = PORTABLE_CHAT_HISTORY_MAX_BYTES): string {
   return JSON.stringify(validatePortableChatHistory(value, maxBytes));
+}
+
+/** Validates archive-local IDs and strips them when projecting inert imported history for re-export. */
+export function validateInertImportedChatHistory(value: unknown): readonly InertImportedChatConversation[] {
+  const rawConversations = denseArray(value, 'Imported Chat conversations');
+  const portableConversations: unknown[] = [];
+  const ids = new Set<string>();
+  const checkId = (candidate: unknown) => {
+    if (typeof candidate !== 'string' || candidate.length !== 36 || !UUID_V4.test(candidate) || ids.has(candidate)) fail('Imported Chat history IDs are invalid or duplicated.');
+    ids.add(candidate);
+    return candidate;
+  };
+  for (const raw of rawConversations) {
+    if (!object(raw)) fail('Imported Chat conversation is invalid.');
+    exactKeys(raw, ['id', 'origin', 'title', 'createdAt', 'updatedAt', 'turns']);
+    const conversationId = checkId(raw.id);
+    if (raw.origin !== IMPORTED_CHAT_HISTORY_ORIGIN) fail('Imported Chat origin is invalid.');
+    const rawTurns = denseArray(raw.turns, 'Imported Chat turns');
+    const turns: unknown[] = [];
+    for (const rawTurn of rawTurns) {
+      if (!object(rawTurn)) fail('Imported Chat turn is invalid.');
+      exactKeys(rawTurn, [...PORTABLE_TURN_KEYS, 'id', 'origin'], PORTABLE_TURN_OPTIONAL_KEYS);
+      checkId(rawTurn.id);
+      if (rawTurn.origin !== IMPORTED_CHAT_HISTORY_ORIGIN) fail('Imported Chat origin is invalid.');
+      turns.push(Object.fromEntries([...PORTABLE_TURN_KEYS, ...PORTABLE_TURN_OPTIONAL_KEYS]
+        .filter((key) => Object.prototype.hasOwnProperty.call(rawTurn, key)).map((key) => [key, rawTurn[key]])));
+    }
+    portableConversations.push({ title: raw.title, createdAt: raw.createdAt, updatedAt: raw.updatedAt, turns, conversationId });
+  }
+  const payload = validatePortableChatHistory({ version: PORTABLE_CHAT_HISTORY_VERSION,
+    conversations: portableConversations.map((rawConversation) => {
+      const conversation = rawConversation as Record<string, unknown>;
+      return { title: conversation.title, createdAt: conversation.createdAt, updatedAt: conversation.updatedAt, turns: conversation.turns };
+    }) });
+  return Object.freeze(payload.conversations.map((conversation, index) => {
+    const raw = rawConversations[index] as Record<string, unknown>;
+    const rawTurns = raw.turns as unknown[];
+    return Object.freeze({ id: raw.id as string, origin: IMPORTED_CHAT_HISTORY_ORIGIN, ...conversation,
+      turns: Object.freeze(conversation.turns.map((turn, turnIndex) => Object.freeze({ ...turn,
+        id: (rawTurns[turnIndex] as Record<string, unknown>).id as string, origin: IMPORTED_CHAT_HISTORY_ORIGIN }))) });
+  }));
+}
+
+/** Removes archive-local identity before imported Chat is included in another portable backup. */
+export function projectInertImportedChatHistory(value: unknown): PortableChatHistory {
+  const conversations = validateInertImportedChatHistory(value);
+  return validatePortableChatHistory({ version: PORTABLE_CHAT_HISTORY_VERSION, conversations: conversations.map(({ title, createdAt, updatedAt, turns }) => ({
+    title, createdAt, updatedAt, turns: turns.map(({ userText, createdAt: turnCreatedAt, capturedAt, captureTimeZone, reply, accounting }) => ({
+      userText, createdAt: turnCreatedAt, capturedAt, captureTimeZone, ...(reply ? { reply } : {}), ...(accounting ? { accounting } : {}),
+    })),
+  })) });
 }
 
 function projectedAccounting(job: OpenRouterBatchJob): PortableChatAccounting | undefined {

@@ -2,8 +2,8 @@ import { describe, expect, it } from 'vitest';
 import type { AppState } from '../src/core';
 import {
   BACKUP_LIMITS, PORTABLE_BACKUP_FORMAT, canonicalPortableContent, createPortableBackup, createPortableKnowledge,
-  parsePortableBackup, summarizePortableBackup, validateImportedBackupArchive, legacyCanonicalPortableContentV2,
-  validatePortableDocumentPath, type PortableBackupV3,
+  parsePortableBackup, summarizePortableBackup, validateImportedBackupArchive, legacyCanonicalPortableContentV2, legacyCanonicalPortableContentV3,
+  validatePortableDocumentPath, type PortableBackupV4,
 } from '../src/backup';
 import { emptyKnowledgeState } from '../src/knowledge';
 import { emptyReminderState } from '../src/reminders';
@@ -27,15 +27,15 @@ function emptyState(): AppState {
   };
 }
 
-function sampleBackup(): PortableBackupV3 {
+function sampleBackup(): PortableBackupV4 {
   return {
-    format: PORTABLE_BACKUP_FORMAT, schemaVersion: 3, exportId: 'export-1', exportedAt: at, audioIncluded: false,
+    format: PORTABLE_BACKUP_FORMAT, schemaVersion: 4, exportId: 'export-1', exportedAt: at, audioIncluded: false,
     notes: [{ sourceId: 'note-1', title: 'Walk', transcript: 'Remember the route', durationSeconds: 8, createdAt: at, audioMissing: true }],
     tasks: [{ sourceId: 'task-1', title: 'Call', body: 'Call the clinic', status: 'open', createdAt: at, sourceNoteId: 'note-1' }],
     documents: [{ path: 'memory/profile.md', content: 'Preference', revision: 2, updatedAt: at }],
     archivedDocuments: [{ sourceId: 'archived-1', path: 'memory/profile.md', content: 'Older preference', revision: 1, updatedAt: at }],
     history: [{ kind: 'dispatch', sourceId: 'dispatch:ref-' + 'x'.repeat(300), title: 'Action — imported history', content: 'Sent a message', status: 'accepted (unverified imported history)', occurredAt: at, provider: 'google', reference: 'provider-id' }],
-    knowledge: { state: emptyKnowledgeState(), narratives: [] }, archivedKnowledge: [],
+    knowledge: { state: emptyKnowledgeState(), narratives: [] }, archivedKnowledge: [], chatHistory: { version: 1, conversations: [] },
   };
 }
 
@@ -136,13 +136,14 @@ describe('portable backup schema', () => {
     expect(parsed.backup.knowledge.state).toEqual(emptyKnowledgeState());
   });
 
-  it('adapts strict v2 input to v3 with empty knowledge and records the actual source marker', () => {
-    const { knowledge: _knowledge, archivedKnowledge: _archivedKnowledge, format: _format, schemaVersion: _version, ...fields } = sampleBackup();
+  it('adapts strict v2 input to v4 with empty knowledge and Chat history and records the actual source marker', () => {
+    const { knowledge: _knowledge, archivedKnowledge: _archivedKnowledge, chatHistory: _chatHistory, format: _format, schemaVersion: _version, ...fields } = sampleBackup();
     const v2 = { ...fields, format: 'still-backup-v2', schemaVersion: 2 };
     const parsed = parsePortableBackup(JSON.stringify(v2));
     expect(parsed.sourceFormat).toBe('still-backup-v2');
     expect(parsed.backup.format).toBe(PORTABLE_BACKUP_FORMAT);
-    expect(parsed.backup.schemaVersion).toBe(3);
+    expect(parsed.backup.schemaVersion).toBe(4);
+    expect(parsed.backup.chatHistory).toEqual({ version: 1, conversations: [] });
     expect(parsed.backup.knowledge.state).toEqual(emptyKnowledgeState());
     expect(parsed.backup.archivedKnowledge).toEqual([]);
     expect(legacyCanonicalPortableContentV2(parsed.backup)).toContain('"format":"still-backup-v2","schemaVersion":2');
@@ -151,6 +152,30 @@ describe('portable backup schema', () => {
       notes: [], tasks: [], documents: [], archivedDocuments: [], history: [] })).backup;
     expect(legacyCanonicalPortableContentV2(emptyV2)).toBe(JSON.stringify({ format: 'still-backup-v2', schemaVersion: 2, audioIncluded: false,
       notes: [], tasks: [], documents: [], archivedDocuments: [], history: [] }));
+  });
+
+  it('keeps V3 input and canonical dedupe bytes compatible while upgrading it to V4', () => {
+    const { chatHistory: _chatHistory, format: _format, schemaVersion: _version, ...fields } = sampleBackup();
+    const v3 = { ...fields, format: 'still-backup-v3', schemaVersion: 3 };
+    const parsed = parsePortableBackup(JSON.stringify(v3));
+    expect(parsed.sourceFormat).toBe('still-backup-v3');
+    expect(parsed.backup).toMatchObject({ format: PORTABLE_BACKUP_FORMAT, schemaVersion: 4, chatHistory: { version: 1, conversations: [] } });
+    expect(legacyCanonicalPortableContentV3(parsed.backup)).toContain('"format":"still-backup-v3","schemaVersion":3');
+  });
+
+  it('keeps Chat content in V4 identity and refuses legacy hashes once Chat is present', () => {
+    const base = sampleBackup();
+    const first = { ...base, chatHistory: { version: 1 as const, conversations: [{
+      title: 'Conversation', createdAt: at, updatedAt: at, turns: [{
+        userText: 'First message', createdAt: at, capturedAt: at, captureTimeZone: 'Asia/Singapore',
+      }],
+    }] } };
+    const changed = { ...first, chatHistory: { ...first.chatHistory, conversations: [{
+      ...first.chatHistory.conversations[0]!, turns: [{ ...first.chatHistory.conversations[0]!.turns[0]!, userText: 'Different message' }],
+    }] } };
+    expect(canonicalPortableContent(first)).not.toBe(canonicalPortableContent(changed));
+    expect(legacyCanonicalPortableContentV2(first)).toBeUndefined();
+    expect(legacyCanonicalPortableContentV3(first)).toBeUndefined();
   });
 
   it('keeps the combined active and archived knowledge cohort count within 50', () => {
@@ -241,7 +266,7 @@ describe('portable backup schema', () => {
   it('validates persistent inert archive rows and rejects malformed or unknown fields', () => {
     const portableKnowledge = createPortableKnowledge(knowledgeWithProviderReference());
     const archive = {
-      id: 'archive-1', contentHash: 'a'.repeat(64), fileHash: 'b'.repeat(64), sourceFormat: PORTABLE_BACKUP_FORMAT,
+      id: 'archive-1', contentHash: 'a'.repeat(64), fileHash: 'b'.repeat(64), sourceFormat: PORTABLE_BACKUP_FORMAT, chatHistory: [],
       exportedAt: at, importedAt: at, noteLinks: [{ sourceId: 'n1', noteId: 'local-n1' }], taskLinks: [],
       documents: [{ id: 'doc1', path: 'memory/profile.md', content: 'Older content', revision: 1, updatedAt: at }],
       history: [{ id: 'h1', kind: 'dispatch', sourceId: 'dispatch:provider-' + 'x'.repeat(300), title: 'Claim', content: 'Unverified', status: 'unknown' }],

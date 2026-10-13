@@ -1,4 +1,5 @@
 import type { AssistantBatchJobDTO } from '../services/openRouterBatchJobs';
+import { formatProviderReportedCostUsd } from './formatProviderReportedCostUsd';
 
 export function assistantBatchStatusLabel(status: AssistantBatchJobDTO['status']): string {
   switch (status) {
@@ -22,8 +23,7 @@ export function assistantBatchStatusLabel(status: AssistantBatchJobDTO['status']
 
 /** Provider-reported values only; this deliberately does not estimate cost. */
 export function formatReportedBatchCost(value: number | undefined): string | undefined {
-  if (value === undefined || !Number.isFinite(value) || value < 0) return undefined;
-  return `US$${value.toFixed(8)}`;
+  return formatProviderReportedCostUsd(value);
 }
 
 export function batchJobTokenSummary(job: AssistantBatchJobDTO): string | undefined {

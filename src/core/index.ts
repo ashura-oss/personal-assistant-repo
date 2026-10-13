@@ -702,6 +702,8 @@ export interface BackupImportPreview {
   taskCount: number;
   documentCount: number;
   historyCount: number;
+  chatConversationCount: number;
+  chatTurnCount: number;
   personCount: number;
   projectCount: number;
   knowledgeCohortCount: number;
@@ -936,6 +938,7 @@ export interface AppController {
   exportData(): Promise<string>;
   prepareBackupImport(input: string | Uint8Array): Promise<BackupImportPreview>;
   applyBackupImport(input: { sessionId: string; planHash: string }): Promise<import('../backup').ImportedBackupArchive>;
+  deleteImportedChatConversation(input: { archiveId: string; conversationId: string }): Promise<void>;
   activateImportedDocument(input: {
     archiveId: string; documentId: string; destinationPath: string; contentDigest: string;
     expectedCurrentRevision?: number; replaceConfirmed: boolean;

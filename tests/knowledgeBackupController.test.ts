@@ -4,7 +4,7 @@ import { AppControllerImpl } from '../src/services/controller';
 import type { StateStore } from '../src/storage/contracts';
 import { emptyKnowledgeState } from '../src/knowledge';
 import type { Project } from '../src/knowledge/types';
-import { BACKUP_LIMITS, type PortableBackupV3 } from '../src/backup';
+import { BACKUP_LIMITS, type PortableBackupV4 } from '../src/backup';
 
 class MemoryStore implements StateStore {
   value?: AppState;
@@ -43,14 +43,14 @@ async function createPortableKnowledgeBackup() {
     reference: { kind: 'project', id: project.id }, label: 'Coordinates this project' });
   await app.saveKnowledgeSourceLink({ entityKind: 'project', entityId: project.id, expectedEntityRevision: currentProject.revision,
     reference: { kind: 'person', id: person.id }, label: 'Project coordinator' });
-  const backup = JSON.parse(await app.exportData()) as PortableBackupV3;
+  const backup = JSON.parse(await app.exportData()) as PortableBackupV4;
   expect(backup.knowledge.state.people[0].facts.some((fact) => fact.provenance === 'user_authored')).toBe(true);
   expect(backup.knowledge.state.people[0].facts.some((fact) => fact.provenance === 'accepted_inference')).toBe(true);
   expect(backup.knowledge.state.people[0].contacts).toHaveLength(1);
   return { backup, sourceNoteId: note.id, sourcePersonId: person.id, sourceProjectId: project.id, personFact, contact };
 }
 
-async function importBackup(backup: PortableBackupV3, store = new MemoryStore()) {
+async function importBackup(backup: PortableBackupV4, store = new MemoryStore()) {
   const { app } = newApp(store);
   await app.load();
   const preview = await app.prepareBackupImport(JSON.stringify(backup));

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import * as Crypto from 'expo-crypto';
 import type { AudioRecoveryMetadata, RecordingRecoveryService, StagedRecording } from '../src/audio/recovery.types';
-import { PORTABLE_BACKUP_FORMAT, PORTABLE_BACKUP_SCHEMA_VERSION, type PortableBackupV3 } from '../src/backup';
+import { PORTABLE_BACKUP_FORMAT, PORTABLE_BACKUP_SCHEMA_VERSION, type PortableBackupV4 } from '../src/backup';
 import { emptyKnowledgeState } from '../src/knowledge';
 import type { AppState } from '../src/core';
 import { AppControllerImpl } from '../src/services/controller';
@@ -28,13 +28,13 @@ const metadata: AudioRecoveryMetadata = {
 const staged: StagedRecording = { uri: 'file:///private/recording-recovery/picked.wav', metadata };
 const stamp = '2026-10-12T10:00:00.000Z';
 
-function backup(): PortableBackupV3 {
+function backup(): PortableBackupV4 {
   return {
     format: PORTABLE_BACKUP_FORMAT, schemaVersion: PORTABLE_BACKUP_SCHEMA_VERSION, exportId: 'recovery-test',
     exportedAt: stamp, audioIncluded: false,
     notes: [{ sourceId: 'source-note', title: 'Imported note', transcript: 'Keep the launch checklist.', durationSeconds: 0, createdAt: stamp, audioMissing: true, originalTimeZoneUnknown: true }],
     tasks: [], documents: [], archivedDocuments: [], history: [],
-    knowledge: { state: emptyKnowledgeState(), narratives: [] }, archivedKnowledge: [],
+    knowledge: { state: emptyKnowledgeState(), narratives: [] }, archivedKnowledge: [], chatHistory: { version: 1, conversations: [] },
   };
 }
 

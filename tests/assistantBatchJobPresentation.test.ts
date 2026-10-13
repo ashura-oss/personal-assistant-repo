@@ -32,6 +32,7 @@ describe('assistant Batch job presentation', () => {
   it('shows zero and small provider-reported costs without estimating', () => {
     expect(formatReportedBatchCost(0)).toBe('US$0.00000000');
     expect(formatReportedBatchCost(0.00000725)).toBe('US$0.00000725');
+    expect(formatReportedBatchCost(0.000000001)).toBe('US$1e-9');
     expect(formatReportedBatchCost(undefined)).toBeUndefined();
     expect(formatReportedBatchCost(Number.NaN)).toBeUndefined();
   });

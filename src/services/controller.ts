@@ -72,8 +72,9 @@ import { createMailAlertTapBackend } from './mailAlertTapBackend';
 import { canonicalMailReplySource, createMailReplySource, defaultReplyRecipients, replyReferences, validateMailReplySource, validateReplyBinding } from '../mailReply';
 import { emptyKnowledgeState, getKnowledgeEntity, knowledgeContextSources, validateKnowledgeState, validateKnowledgeSuggestion } from '../knowledge';
 import type { ContactClaim, KnowledgeChange, KnowledgeEntityKind, KnowledgeEvidence, KnowledgeFact, KnowledgeReference, KnowledgeSourceLink, KnowledgeSuggestion, Person, Project, ProjectMember } from '../knowledge';
-import { BACKUP_LIMITS, canonicalPortableContent, legacyCanonicalPortableContentV2, createPortableBackup, parsePortableBackup, summarizePortableBackup, validatePortableDocumentPath, validateImportedBackupArchive } from '../backup';
-import type { ImportedBackupArchive, PortableBackupV3, PortableKnowledgeCohort } from '../backup';
+import { BACKUP_LIMITS, PORTABLE_BACKUP_FORMAT, canonicalPortableContent, legacyCanonicalPortableContentV2, legacyCanonicalPortableContentV3, createPortableBackup, parsePortableBackup, summarizePortableBackup, validatePortableDocumentPath, validateImportedBackupArchive } from '../backup';
+import type { ImportedBackupArchive, PortableBackupV4, PortableKnowledgeCohort } from '../backup';
+import { createPortableChatHistory, materializeInertChatHistory } from '../chat/portable';
 import { SpeechTranscriptionError, validateTranscriptionState, validateSpeechAudioSnapshot } from '../transcription';
 import type { AnySpeechTranscriptionResult, OpenRouterSpeechTranscriptionResult, SpeechAudioSnapshot, SpeechAttemptCode, TranscriptionAttempt, TranscriptionState } from '../transcription';
 import { OPENROUTER_SPEECH_DEFAULT_MODEL, OPENROUTER_SPEECH_DEFAULT_PROFILE_VERSION } from '../transcription/openRouterSpeechProfiles';
@@ -155,6 +156,7 @@ function stateEntityIds(state: AppState): Set<string> {
     ...state.dispatchRecords.map((item) => item.id), ...state.importedBackups.flatMap((item) => [
       item.id, ...item.noteLinks.map((link) => link.noteId), ...item.taskLinks.map((link) => link.taskId),
       ...item.documents.map((document) => document.id), ...item.history.map((entry) => entry.id),
+      ...(item.chatHistory ?? []).flatMap((conversation) => [conversation.id, ...conversation.turns.map((turn) => turn.id)]),
     ]),
     ...state.knowledge.people.flatMap((item) => [item.id, ...item.facts.map((row) => row.id), ...item.contacts.map((row) => row.id), ...item.sourceLinks.map((row) => row.id)]),
     ...state.knowledge.projects.flatMap((item) => [item.id, ...item.facts.map((row) => row.id), ...item.members.map((row) => row.id), ...item.sourceLinks.map((row) => row.id)]),
@@ -1224,7 +1226,7 @@ export interface ControllerIntegrationDependencies {
 
 interface BackupImportSession {
   preview: BackupImportPreview;
-  backup: PortableBackupV3;
+  backup: PortableBackupV4;
   capturedState: AppState;
   capturedStateJson: string;
   preparedAtMs: number;
@@ -1239,6 +1241,7 @@ interface BackupImportSession {
   historyIds: Record<string, string>;
   knowledgeCohortIds: Record<string, string>;
   knowledgeCohorts: PortableKnowledgeCohort[];
+  chatHistory: NonNullable<ImportedBackupArchive['chatHistory']>;
   appliedArchiveId?: string;
 }
 
@@ -2443,9 +2446,14 @@ export class AppControllerImpl implements AppController {
           }
         }
       }
+      const persistedCandidate = this.persistedStateWithBatchLedger(draft, batchLedger, chatLedger);
+      const serializedPersistedCandidate = JSON.stringify(persistedCandidate);
+      if (typeof serializedPersistedCandidate !== 'string' || recoveryUtf8Bytes(serializedPersistedCandidate, STATE_SNAPSHOT_READ_MAX_BYTES) > STATE_SNAPSHOT_READ_MAX_BYTES) {
+        throw new Error('The complete saved data would exceed the storage limit. No changes were saved.');
+      }
       await this.assertPrivacySessionCurrent();
       try {
-        await this.store.save(this.persistedStateWithBatchLedger(draft, batchLedger, chatLedger), saveOptions?.(draft, result));
+        await this.store.save(persistedCandidate, saveOptions?.(draft, result));
         await this.assertPrivacySessionCurrent();
         if (capturedBootstrapGeneration !== this.bootstrapGeneration || this.startupRecoveryPhase !== 'ready') {
           throw new Error('The app workspace changed while the update was being saved. Reopen the app before continuing.');
@@ -2500,8 +2508,13 @@ export class AppControllerImpl implements AppController {
         draft.reminders = validateReminderState(draft.reminders);
         draft.transcription = clone(validateTranscriptionState(draft.transcription));
         await this.assertPrivacySessionCurrent();
+        const persistedCandidate = this.persistedState(draft);
+        const serializedPersistedCandidate = JSON.stringify(persistedCandidate);
+        if (typeof serializedPersistedCandidate !== 'string' || recoveryUtf8Bytes(serializedPersistedCandidate, STATE_SNAPSHOT_READ_MAX_BYTES) > STATE_SNAPSHOT_READ_MAX_BYTES) {
+          throw new Error('The complete saved data would exceed the storage limit. No changes were saved.');
+        }
         try {
-          await this.store.save(this.persistedState(draft));
+          await this.store.save(persistedCandidate);
           await this.assertPrivacySessionCurrent();
           if (capturedBootstrapGeneration !== this.bootstrapGeneration || this.startupRecoveryPhase !== 'ready') {
             throw new Error('The app workspace changed while the update was being saved. Reopen the app before continuing.');
@@ -2516,6 +2529,66 @@ export class AppControllerImpl implements AppController {
         await this.cancelNewMailAlertIntents(newCancellationIntents);
       }
       return clone(result);
+    });
+    this.transactionQueue = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  /**
+   * Archive-only local mutation. This intentionally skips proactive/mail-alert
+   * reconciliation because imported inert history cannot change live policy.
+   */
+  private async mutateImportedChatArchiveOnly(archiveId: string, conversationId: string): Promise<void> {
+    await this.assertPrivacySessionCurrent();
+    const capturedBootstrapGeneration = this.bootstrapGeneration;
+    const run = this.transactionQueue.then(async () => {
+      if (capturedBootstrapGeneration !== this.bootstrapGeneration) throw new Error('The app restarted while this action was waiting. Review the current state and try again.');
+      if (this.startupRecoveryPhase !== 'ready') throw new Error('App startup is not ready. Retry startup or complete the recovery flow first.');
+      if (!this.loaded) await this.load();
+      if (this.loadPromise) await this.loadPromise;
+      await this.assertPrivacySessionCurrent();
+      if (capturedBootstrapGeneration !== this.bootstrapGeneration || this.startupRecoveryPhase !== 'ready') throw new Error('App startup changed while this action was waiting. Review the current state and try again.');
+      const before = clone(this.state);
+      const draft = clone(before);
+      const archives = draft.importedBackups.filter((item) => item.id === archiveId);
+      if (archives.length !== 1) throw new Error('The imported backup archive is unavailable.');
+      const archive = archives[0]!;
+      const previous = archive.chatHistory ?? [];
+      const next = previous.filter((conversation) => conversation.id !== conversationId);
+      if (next.length === previous.length) return;
+      archive.chatHistory = next;
+      const verified = validateImportedBackupArchive(archive);
+      if (!verified) throw new Error('Archived Chat history failed integrity validation. No content was deleted.');
+      draft.importedBackups[draft.importedBackups.findIndex((item) => item.id === archiveId)] = verified;
+
+      const projection = (state: AppState): string => {
+        const candidate = clone(state);
+        const matches = candidate.importedBackups.filter((item) => item.id === archiveId);
+        if (matches.length !== 1) throw new Error('The archive-only change was not isolated. No data was deleted.');
+        matches[0]!.chatHistory = { archiveOnlyChatHistoryChange: true } as unknown as NonNullable<ImportedBackupArchive['chatHistory']>;
+        return stableJson(candidate);
+      };
+      if (projection(before) !== projection(draft)) throw new Error('The archive-only change affected other saved data. No data was deleted.');
+      assertPortableBackupFits(draft);
+      const persistedCandidate = this.persistedState(draft);
+      const serializedCandidate = JSON.stringify(persistedCandidate);
+      if (typeof serializedCandidate !== 'string' || recoveryUtf8Bytes(serializedCandidate, STATE_SNAPSHOT_READ_MAX_BYTES) > STATE_SNAPSHOT_READ_MAX_BYTES) {
+        throw new Error('The archive change could not fit within the saved-data limit. No content was deleted.');
+      }
+      await this.assertPrivacySessionCurrent();
+      try {
+        await this.store.save(persistedCandidate);
+        await this.assertPrivacySessionCurrent();
+        if (capturedBootstrapGeneration !== this.bootstrapGeneration || this.startupRecoveryPhase !== 'ready') {
+          throw new Error('The app workspace changed while the archive was being saved. Reopen the app before continuing.');
+        }
+        this.state = draft;
+        this.snapshot = deepFreeze(this.publicState(draft));
+        this.emit();
+      } catch (error) {
+        if (capturedBootstrapGeneration === this.bootstrapGeneration) this.setMailAlertRefreshRequired();
+        throw error;
+      }
     });
     this.transactionQueue = run.then(() => undefined, () => undefined);
     return run;
@@ -8943,7 +9016,23 @@ export class AppControllerImpl implements AppController {
   }
 
   async exportData(): Promise<string> {
-    const backup = createPortableBackup(this.snapshot, { exportId: newId(), exportedAt: now() });
+    await this.load();
+    await this.assertPrivacySessionCurrent();
+    const capturedState = this.state;
+    const capturedBootstrapGeneration = this.bootstrapGeneration;
+    const capturedChat = this.assistantChatLedger;
+    const capturedBatch = this.assistantBatchLedger;
+    if (this.assistantChatLedgerMalformed || this.assistantBatchLedgerMalformed || !this.chatLedgerLinksAreValid(capturedChat, capturedState)) {
+      throw new Error('Saved Chat history could not be validated. Refresh local data before exporting.');
+    }
+    const chatHistory = await createPortableChatHistory(capturedChat, capturedBatch,
+      async (reply, digest) => await this.chatReplyDigest(reply) === digest);
+    await this.assertPrivacySessionCurrent();
+    if (!this.loaded || this.startupRecoveryPhase !== 'ready' || capturedBootstrapGeneration !== this.bootstrapGeneration ||
+        capturedState !== this.state || capturedChat !== this.assistantChatLedger || capturedBatch !== this.assistantBatchLedger) {
+      throw new Error('App data changed while the backup was being prepared. Export again from the current local data.');
+    }
+    const backup = createPortableBackup(capturedState, { exportId: newId(), exportedAt: now() }, chatHistory);
     const serialized = JSON.stringify(backup);
     if (new TextEncoder().encode(serialized).length > BACKUP_LIMITS.maxBytes) throw new Error('The portable backup exceeds the supported file size. No data was exported.');
     return serialized;
@@ -8961,6 +9050,8 @@ export class AppControllerImpl implements AppController {
     await this.load();
     const capturedSnapshot = this.snapshot;
     const capturedStateJson = stableJson(capturedSnapshot);
+    const capturedChatLedger = this.assistantChatLedger;
+    const capturedBatchLedger = this.assistantBatchLedger;
     const backup = parsed.backup;
     const summary = summarizePortableBackup(backup, capturedSnapshot.documents);
     const hash = async (value: string) => Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, value, { encoding: Crypto.CryptoEncoding.HEX });
@@ -8975,11 +9066,22 @@ export class AppControllerImpl implements AppController {
       ...(activeSourceId ? [{ sourceId: activeSourceId, knowledge: backup.knowledge }] : []),
       ...backup.archivedKnowledge,
     ];
+    const legacyV3Content = legacyCanonicalPortableContentV3(backup);
+    const legacyV3Hash = legacyV3Content ? await hash(legacyV3Content) : undefined;
     const legacyV2Content = legacyCanonicalPortableContentV2(backup);
     const legacyV2Hash = legacyV2Content ? await hash(legacyV2Content) : undefined;
     const usedIds = stateEntityIds(capturedSnapshot);
+    if (!this.assistantChatLedgerMalformed) {
+      for (const conversation of capturedChatLedger.conversations) {
+        usedIds.add(conversation.id);
+        for (const turn of conversation.turns) usedIds.add(turn.id);
+      }
+    }
+    if (!this.assistantBatchLedgerMalformed) for (const job of capturedBatchLedger.jobs) usedIds.add(job.id);
     const allocateId = () => allocateFreshId(usedIds);
-    const existingArchive = capturedSnapshot.importedBackups.find((item) => item.contentHash === contentHash || (legacyV2Hash && item.contentHash === legacyV2Hash));
+    const existingArchive = capturedSnapshot.importedBackups.find((item) => item.contentHash === contentHash ||
+      (legacyV3Hash && item.sourceFormat === 'still-backup-v3' && item.contentHash === legacyV3Hash) ||
+      (legacyV2Hash && item.sourceFormat === 'still-backup-v2' && item.contentHash === legacyV2Hash));
     const noteIds = Object.create(null) as Record<string, string>;
     const missingNotes = backup.notes.filter((item) => {
       const link = existingArchive?.noteLinks.find((candidate) => candidate.sourceId === item.sourceId);
@@ -9026,15 +9128,19 @@ export class AppControllerImpl implements AppController {
       const existing = existingArchive?.archivedKnowledge?.find((item) => item.sourceId === cohort.sourceId);
       knowledgeCohortIds[cohort.sourceId] = existing?.id ?? allocateId();
     }
+    const chatHistory = existingArchive?.chatHistory ? existingArchive.chatHistory : materializeInertChatHistory(backup.chatHistory, allocateId, usedIds);
+    for (const conversation of chatHistory) { usedIds.add(conversation.id); for (const turn of conversation.turns) usedIds.add(turn.id); }
     const sessionId = allocateId();
     const planFields = {
       fileHash, contentHash, sourceFormat: parsed.sourceFormat,
       archiveId, existingArchiveId: existingArchive?.id, noteIds, taskIds, taskLinkRepairs, documentIds, historyIds, knowledgeCohortIds, capturedStateJson,
+      chatHistory,
       missingNoteSourceIds: missingNotes.map((item) => item.sourceId), missingTaskSourceIds: missingTasks.map((item) => item.sourceId),
       documentConflicts: summary.documentConflicts,
     };
     const planHash = await hash(stableJson(planFields));
-    if (this.snapshot !== capturedSnapshot || stableJson(this.snapshot) !== capturedStateJson) {
+    if (this.snapshot !== capturedSnapshot || stableJson(this.snapshot) !== capturedStateJson ||
+        capturedChatLedger !== this.assistantChatLedger || capturedBatchLedger !== this.assistantBatchLedger) {
       throw new Error('App data changed while the backup preview was being prepared. Open a fresh preview.');
     }
     const preparedAtMs = Date.now();
@@ -9054,6 +9160,8 @@ export class AppControllerImpl implements AppController {
       missingNoteLabels: missingNotes.map((item) => item.title || 'Untitled note'),
       missingTaskLabels: missingTasks.map((item) => item.title || 'Untitled task'),
       taskLinkRepairCount: taskLinkRepairLabels.length, taskLinkRepairLabels,
+      chatConversationCount: summary.chatConversationCount,
+      chatTurnCount: summary.chatTurnCount,
       alreadyImported: Boolean(existingArchive),
     };
     this.backupImportSessions.set(sessionId, {
@@ -9062,6 +9170,7 @@ export class AppControllerImpl implements AppController {
       missingNoteSourceIds: missingNotes.map((item) => item.sourceId), missingTaskSourceIds: missingTasks.map((item) => item.sourceId),
       documentIds, historyIds,
       knowledgeCohortIds, knowledgeCohorts,
+      chatHistory,
     });
     return clone(preview);
   }
@@ -9088,7 +9197,9 @@ export class AppControllerImpl implements AppController {
         const task = link && state.tasks.find((candidate) => candidate.id === link.taskId);
         return Boolean(task && task.importOrigin?.kind === 'backup_import' && task.importOrigin.archiveId === alreadyImported.id && task.importOrigin.sourceTaskId === item.sourceId);
       }) && session.knowledgeCohorts.every((cohort) => alreadyImported.archivedKnowledge?.some((item) => item.sourceId === cohort.sourceId)));
-      if (complete) return { changed: false, result: alreadyImported! };
+      const chatHistoryAlreadyPresent = Boolean(alreadyImported && stableJson(alreadyImported.chatHistory ?? []) === stableJson(session.chatHistory));
+      const completeWithChat = complete && chatHistoryAlreadyPresent;
+      if (completeWithChat) return { changed: false, result: alreadyImported! };
       if (stableJson(this.publicState(state)) !== session.capturedStateJson) throw new Error('App data changed after the backup preview. Prepare a new preview before restoring.');
       if (this.snapshot !== session.capturedState) throw new Error('App data changed after the backup preview. Prepare a new preview before restoring.');
       if (!alreadyImported && state.importedBackups.length + this.backupImportQuarantine.length >= 50) throw new Error('The imported archive limit is 50. Export your existing backups or resolve the backup recovery issue before importing another.');
@@ -9133,11 +9244,14 @@ export class AppControllerImpl implements AppController {
       const created: ImportedBackupArchive = currentArchive ?? {
         id: session.archiveId, contentHash: session.preview.contentHash, fileHash: session.preview.fileHash,
         sourceFormat: session.preview.sourceFormat, exportedAt: backup.exportedAt, importedAt: now(),
-        noteLinks: [], taskLinks: [], documents: [], history: [],
+        noteLinks: [], taskLinks: [], documents: [], history: [], ...(session.preview.sourceFormat === PORTABLE_BACKUP_FORMAT ? { chatHistory: clone(session.chatHistory) } : {}),
       };
       if (currentArchive) {
         currentArchive.noteLinks = noteLinks;
         currentArchive.taskLinks = taskLinks;
+        if (session.preview.sourceFormat === PORTABLE_BACKUP_FORMAT && currentArchive.sourceFormat === PORTABLE_BACKUP_FORMAT && !currentArchive.chatHistory) {
+          currentArchive.chatHistory = clone(session.chatHistory);
+        }
       } else {
         created.noteLinks = noteLinks;
         created.taskLinks = taskLinks;
@@ -9166,10 +9280,21 @@ export class AppControllerImpl implements AppController {
         addActivity(state, 'local_action', `Restored ${notes.length} note${notes.length === 1 ? '' : 's'} and ${tasks.length} task${tasks.length === 1 ? '' : 's'} from an imported backup; knowledge entries remain in the inert archive until activated.`);
       }
       assertPortableBackupFits(state);
+      const persistedCandidate = JSON.stringify(this.persistedStateWithBatchLedger(state));
+      if (typeof persistedCandidate !== 'string' || recoveryUtf8Bytes(persistedCandidate, STATE_SNAPSHOT_READ_MAX_BYTES) > STATE_SNAPSHOT_READ_MAX_BYTES) {
+        throw new Error('The complete restored data would exceed the saved-data limit. No backup content was imported.');
+      }
       return { changed: true, result: created };
     });
     session.appliedArchiveId = archive.id;
     return archive;
+  }
+
+  async deleteImportedChatConversation(input: { archiveId: string; conversationId: string }): Promise<void> {
+    if (!input || typeof input.archiveId !== 'string' || typeof input.conversationId !== 'string') {
+      throw new Error('Archived Chat selection is invalid.');
+    }
+    await this.mutateImportedChatArchiveOnly(input.archiveId, input.conversationId);
   }
 
   async activateImportedDocument(input: {

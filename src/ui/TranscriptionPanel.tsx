@@ -3,6 +3,7 @@ import { Text, View } from "react-native";
 import type { Note } from "../core";
 import type { TranscriptionAttempt } from "../transcription";
 import { Button } from "./primitives";
+import { formatProviderReportedCostUsd } from "./formatProviderReportedCostUsd";
 import { C, s } from "./theme";
 
 type Props = {
@@ -75,7 +76,7 @@ function openRouterUsageLines(attempt: TranscriptionAttempt) {
     lines.push(<Text key="total" style={styles.meta}>OpenRouter-reported total tokens · {usage.totalTokens.toLocaleString()}</Text>);
   }
   if (usage.costUsd !== undefined && Number.isFinite(usage.costUsd) && usage.costUsd >= 0) {
-    lines.push(<Text key="cost" style={styles.meta}>OpenRouter-reported cost · US${usage.costUsd.toFixed(8)}</Text>);
+    lines.push(<Text key="cost" style={styles.meta}>OpenRouter-reported cost · {formatProviderReportedCostUsd(usage.costUsd)}</Text>);
   }
   return lines.length ? <>{lines}</> : <Text style={styles.meta}>OpenRouter did not report usage for this request.</Text>;
 }
