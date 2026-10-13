@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { AppState, Proposal } from '../src/core';
 import { AppControllerImpl } from '../src/services/controller';
 import type { StateStore } from '../src/storage/contracts';
-import { AzureOpenAIClient } from '../src/services/azure';
+import { AzureOpenAIClient, ReplyGenerationError } from '../src/services/azure';
 import { cancelReminderNotification, reminderNotificationId, requestReminderNotification } from '../src/services/notifications';
 import { ProviderWriteRejectedError, describeMessageWindowQuery, withCredentialLock, type OAuthBridgeResult, type StoredOAuthToken } from '../src/connectors';
 import * as Crypto from 'expo-crypto';
@@ -1570,6 +1570,212 @@ describe('application state controller', () => {
     expect(app.getSnapshot().usage.unknownCharges).toBe(1);
     expect(app.getSnapshot().usage.priceKnown).toBe(false);
     expect(app.getSnapshot().usage.estimatedCostUsd).toBeGreaterThan(0);
+  });
+
+  it('settles overlapping Assist requests only against their own month reservations', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-10-31T23:59:00.000Z'));
+      const transcripts = ['October request transcript.', 'November request transcript.'];
+      const versions = await Promise.all(transcripts.map((text) => Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, text)));
+      const waiters: ((response: Response) => void)[] = [];
+      const started: (() => void)[] = [];
+      let calls = 0;
+      const fetcher = async () => {
+        const index = calls++;
+        const response = new Promise<Response>((resolve) => { waiters[index] = resolve; });
+        started[index]?.();
+        return response;
+      };
+      // The callback must be observable before a response is released.
+      const firstStarted = new Promise<void>((resolve) => { started[0] = resolve; });
+      const secondStarted = new Promise<void>((resolve) => { started[1] = resolve; });
+      const analysisResponse = (index: number) => new Response(JSON.stringify({
+        output: [{ content: [{ type: 'output_text', text: JSON.stringify({
+          summary: 'A local note summary.', answer: '', decisions: [],
+          citations: [{ sourceId: 'transcript', revision: 1, sourceVersion: `1:${versions[index]}`, quote: transcripts[index] }],
+          clarifications: [], proposals: [], memorySuggestions: [],
+        }) }] }], usage: { input_tokens: index + 10, output_tokens: 5 },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+      const store = new MemoryStore();
+      const app = new AppControllerImpl(store, { openAi: new AzureOpenAIClient(fetcher as typeof fetch, async () => 'test-key') });
+      await app.load();
+      await app.saveSettings({ mode: 'provider', timezone: 'UTC', openAiEndpoint: 'https://example.openai.azure.com', openAiDeployment: 'gpt-6-luna', inputUsdPerMillionTokens: 0.15, outputUsdPerMillionTokens: 0.6 });
+      const october = await app.saveNote({ transcript: transcripts[0] });
+      const november = await app.saveNote({ transcript: transcripts[1] });
+
+      const octoberRun = app.assistNote(october.id, { intent: 'summarize', forceRefresh: true });
+      await firstStarted;
+      vi.setSystemTime(new Date('2026-11-01T00:01:00.000Z'));
+      await app.saveSettings({ inputUsdPerMillionTokens: 0.25, outputUsdPerMillionTokens: 1 });
+      const novemberRun = app.assistNote(november.id, { intent: 'summarize', forceRefresh: true });
+      await secondStarted;
+
+      const reservedNovember = app.getSnapshot().usage;
+      expect(reservedNovember.month).toBe('2026-11');
+      expect(reservedNovember.reservedUsd).toBeGreaterThan(0);
+      waiters[0](analysisResponse(0));
+      await octoberRun;
+      expect(app.getSnapshot().usage).toEqual(reservedNovember);
+
+      waiters[1](analysisResponse(1));
+      await novemberRun;
+      expect(app.getSnapshot().usage).toMatchObject({
+        month: '2026-11', requests: 1, inputTokens: 11, outputTokens: 5,
+        reservedUsd: 0, unknownCharges: 0, priceKnown: true,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('settles both concurrent identical Assist cache misses and does not charge a later cache hit', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-10-13T08:00:00.000Z'));
+      const transcript = 'Two identical notes should reuse a settled analysis.';
+      const sourceVersion = `1:${await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, transcript)}`;
+      const resolvers: ((response: Response) => void)[] = [];
+      const started: (() => void)[] = [];
+      let calls = 0;
+      const fetcher = async () => {
+        const index = calls++;
+        const response = new Promise<Response>((resolve) => { resolvers[index] = resolve; });
+        started[index]();
+        return response;
+      };
+      const waitFor = [0, 1].map((index) => new Promise<void>((resolve) => { started[index] = resolve; }));
+      const response = (inputTokens: number, outputTokens: number) => new Response(JSON.stringify({
+        output: [{ content: [{ type: 'output_text', text: JSON.stringify({
+          summary: 'The notes match.', answer: '', decisions: [],
+          citations: [{ sourceId: 'transcript', revision: 1, sourceVersion, quote: transcript }],
+          clarifications: [], proposals: [], memorySuggestions: [],
+        }) }] }], usage: { input_tokens: inputTokens, output_tokens: outputTokens },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+      const app = new AppControllerImpl(new MemoryStore(), { openAi: new AzureOpenAIClient(fetcher as typeof fetch, async () => 'test-key') });
+      await app.load();
+      await app.saveSettings({ mode: 'provider', timezone: 'UTC', openAiEndpoint: 'https://example.openai.azure.com', openAiDeployment: 'gpt-6-luna', inputUsdPerMillionTokens: 0.15, outputUsdPerMillionTokens: 0.6 });
+      const first = await app.saveNote({ transcript });
+      const second = await app.saveNote({ transcript });
+      const firstRun = app.assistNote(first.id, { intent: 'summarize' });
+      const secondRun = app.assistNote(second.id, { intent: 'summarize' });
+      await Promise.all(waitFor);
+      expect(calls).toBe(2);
+      expect(app.getSnapshot().usage).toMatchObject({ requests: 0, attempts: 2, unknownCharges: 2 });
+      expect(app.getSnapshot().usage.reservedUsd).toBeGreaterThan(0);
+
+      resolvers[0](response(9, 4));
+      await firstRun;
+      expect(app.getSnapshot().usage).toMatchObject({ requests: 1, inputTokens: 9, outputTokens: 4, unknownCharges: 1 });
+      expect(app.getSnapshot().usage.reservedUsd).toBeGreaterThan(0);
+
+      resolvers[1](response(13, 6));
+      await secondRun;
+      const afterBoth = app.getSnapshot().usage;
+      expect(afterBoth).toMatchObject({ requests: 2, inputTokens: 22, outputTokens: 10, reservedUsd: 0, unknownCharges: 0, priceKnown: true });
+
+      const third = await app.saveNote({ transcript });
+      await app.assistNote(third.id, { intent: 'summarize' });
+      expect(calls).toBe(2);
+      expect(app.getSnapshot().usage).toEqual(afterBoth);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not settle old-month mail-reply error usage against a new-month Assist reservation', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-10-31T23:59:00.000Z'));
+      const store = new MemoryStore();
+      const identity = { providerNamespace: 'google' as const, clientId: 'rollover-client', subject: 'rollover-subject' };
+      const observedAt = new Date().toISOString();
+      const messageText = 'Please send the updated notes.';
+      const connector = {
+        async verifyOAuthIdentity() { return true; },
+        async readSelectedMessageText(_account: unknown, providerMessageId: string) {
+          return { status: 'available', message: {
+            id: providerMessageId, idFormat: 'gmail' as const, threadId: 'rollover-thread', subject: 'Updated notes',
+            from: 'Sam <sam@example.test>', senderEmail: 'sam@example.test', receivedAt: observedAt, snippet: messageText,
+            replyMetadataComplete: true, internetMessageId: '<rollover@example.test>', providerVersion: 'rollover-v1',
+            replyTo: ['sam@example.test'], to: ['me@example.test'], cc: [],
+          }, text: messageText, bytes: new TextEncoder().encode(messageText).length, representation: 'plain', completeness: 'complete_text', reasons: [], checkedAt: observedAt, extractionVersion: 'mail-text-v1' };
+        },
+      };
+      const tokens = new Map<string, StoredOAuthToken>();
+      const tokenStore = { async get(ref: string) { const value = tokens.get(ref); return value ? structuredClone(value) : null; }, async set(ref: string, value: StoredOAuthToken) { tokens.set(ref, structuredClone(value)); } };
+      const integration = { tokenStore, deleteToken: async () => undefined, clientIds: { google: 'rollover-client' }, verifyOAuthResult: async () => true, connectorFactory: () => connector as never };
+      let dispatchStarted!: () => void;
+      const dispatched = new Promise<void>((resolve) => { dispatchStarted = resolve; });
+      let releaseReply!: () => void;
+      const replyGate = new Promise<void>((resolve) => { releaseReply = resolve; });
+      const assistResolvers: ((response: Response) => void)[] = [];
+      let assistStarted!: () => void;
+      const assistEntered = new Promise<void>((resolve) => { assistStarted = resolve; });
+      const octoberTranscript = 'The October note is ready.';
+      const octoberVersion = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, octoberTranscript);
+      const openAi = new AzureOpenAIClient(async () => {
+        assistStarted();
+        return new Promise<Response>((resolve) => { assistResolvers.push(resolve); });
+      }, async () => 'test-key');
+      vi.spyOn(openAi, 'generateReply').mockImplementation(async (_input, _settings, onAttempt) => {
+        await onAttempt?.();
+        dispatchStarted();
+        await replyGate;
+        throw new ReplyGenerationError('Provider reply could not be parsed.', { inputTokens: 40, outputTokens: 12, usageEstimated: false });
+      });
+      const app = new AppControllerImpl(store, { openAi }, integration);
+      await app.load();
+      await app.saveSettings({ mode: 'provider', timezone: 'UTC', openAiEndpoint: 'https://example.openai.azure.com', openAiDeployment: 'gpt-6-luna', inputUsdPerMillionTokens: 0.15, outputUsdPerMillionTokens: 0.6 });
+      const account = await app.installVerifiedAccount({ provider: 'google', displayName: 'Mail', email: '' }, {
+        provider: 'google', accessToken: 'access', expiresAt: Date.now() + 600_000,
+        grantedScopes: ['openid', 'https://www.googleapis.com/auth/gmail.readonly'], requestedCapabilities: ['mail.read'], capabilities: ['mail.read'], identity,
+        displayName: 'Mail', email: 'me@example.test',
+      });
+      const message = {
+        id: 'rollover-local', accountId: account.id, providerMessageId: 'rollover-provider', identityKey: 'google:rollover-client:rollover-subject:',
+        verifiedIdentityKey: 'google:rollover-client:rollover-subject:', connectionGeneration: account.connectionGeneration, idFormat: 'gmail' as const,
+        threadId: 'rollover-thread', subject: 'Updated notes', from: 'Sam <sam@example.test>', senderEmail: 'sam@example.test', receivedAt: observedAt,
+        snippet: messageText, replyMetadataComplete: true, internetMessageId: '<rollover@example.test>', providerVersion: 'rollover-v1',
+        replyTo: ['sam@example.test'], to: ['me@example.test'], cc: [], observedAt,
+      };
+      store.value!.mailbox.push(message);
+      await store.save(store.value!);
+      const reloaded = new AppControllerImpl(store, { openAi }, integration);
+      await reloaded.load();
+      const source = await reloaded.getMailReplySource(message.id);
+      const body = await reloaded.loadMailReplyText({ messageId: message.id, sourceDigest: source.source!.sourceDigest });
+      const octoberNote = await reloaded.saveNote({ transcript: octoberTranscript });
+      const replyInput = {
+        messageId: message.id, sourceDigest: body.snapshot!.sourceDigest, textDigest: body.snapshot!.textDigest!, mode: 'reply' as const,
+        to: ['sam@example.test'], cc: [], brief: 'Acknowledge the notes.', composerRevision: 1,
+      };
+
+      const octoberReply = reloaded.generateMailReplyText(replyInput);
+      await dispatched;
+      vi.setSystemTime(new Date('2026-11-01T00:01:00.000Z'));
+      await reloaded.saveSettings({ inputUsdPerMillionTokens: 0.25, outputUsdPerMillionTokens: 1 });
+      const novemberAssist = reloaded.assistNote(octoberNote.id, { intent: 'summarize', forceRefresh: true });
+      await assistEntered;
+      const reservedNovember = reloaded.getSnapshot().usage;
+      expect(reservedNovember.month).toBe('2026-11');
+      expect(reservedNovember.reservedUsd).toBeGreaterThan(0);
+
+      releaseReply();
+      await expect(octoberReply).rejects.toThrow(/could not be parsed/i);
+      expect(reloaded.getSnapshot().usage).toEqual(reservedNovember);
+
+      assistResolvers[0](new Response(JSON.stringify({
+        output: [{ content: [{ type: 'output_text', text: JSON.stringify({
+          summary: 'The note is ready.', answer: '', decisions: [], citations: [{ sourceId: 'transcript', revision: 1, sourceVersion: `1:${octoberVersion}`, quote: octoberTranscript }],
+          clarifications: [], proposals: [], memorySuggestions: [],
+        }) }] }], usage: { input_tokens: 20, output_tokens: 7 },
+      }), { status: 200, headers: { 'content-type': 'application/json' } }));
+      await novemberAssist;
+      expect(reloaded.getSnapshot().usage).toMatchObject({ month: '2026-11', requests: 1, inputTokens: 20, outputTokens: 7, reservedUsd: 0, unknownCharges: 0, priceKnown: true });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('reuses persisted provider analysis for unchanged source and context, then refreshes after profile edits', async () => {

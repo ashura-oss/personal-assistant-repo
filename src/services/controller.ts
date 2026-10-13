@@ -2605,9 +2605,13 @@ export class AppControllerImpl implements AppController {
     if (!options.forceRefresh && note.analysis?.fingerprint === processingFingerprint) return clone(note.analysis);
     let generated: DraftAnalysis;
     if (state.settings.mode === 'provider') {
-      generated = (options.forceRefresh ? undefined : this.analysisCache.get(processingFingerprint)) ?? await this.openAiClient.analyze(note, contextDocs, state.settings, undefined, async () => { await this.recordProviderAttempt('model', state.settings); }, request, prepared);
-      if (options.forceRefresh || !this.analysisCache.has(processingFingerprint)) {
-        await this.settleModelUsage(generated, state.settings);
+      const cached = options.forceRefresh ? undefined : this.analysisCache.get(processingFingerprint);
+      if (cached) {
+        generated = cached;
+      } else {
+        let reservation: { month: string; day: string; reserve: number } | undefined;
+        generated = await this.openAiClient.analyze(note, contextDocs, state.settings, undefined, async () => { reservation = await this.recordProviderAttempt('model', state.settings); }, request, prepared);
+        await this.settleModelUsage(generated, state.settings, reservation);
         this.analysisCache.set(processingFingerprint, generated);
       }
       if (this.snapshot.notes.find((item) => item.id === id)?.revision !== sourceRevision) throw new Error('The transcript changed during processing. The provider result was discarded.');
@@ -2786,16 +2790,21 @@ export class AppControllerImpl implements AppController {
     });
   }
 
-  private async settleModelUsage(usage: Pick<ReplyGenerationUsage, 'inputTokens' | 'outputTokens' | 'usageEstimated'>, requestSettings: AppSettings): Promise<void> {
+  private async settleModelUsage(usage: Pick<ReplyGenerationUsage, 'inputTokens' | 'outputTokens' | 'usageEstimated'>, requestSettings: AppSettings, reservation: { month: string; day: string; reserve: number } | undefined): Promise<void> {
+    // Mock providers and cache-only paths can return usage without a real dispatch claim.
+    // They must not manufacture ledger charges.
+    if (!reservation) return;
     await this.mutate((state) => {
-      this.rollUsage(state);
+      // A response belongs to the month in which its own dispatch was reserved.
+      // A rollover since then must not charge or settle a newer month's request.
+      if (state.usage.month !== reservation.month) return;
       state.usage.requests += 1;
       state.usage.inputTokens += usage.inputTokens;
       state.usage.outputTokens += usage.outputTokens;
       state.usage.lastRequestAt = now();
       const ratesKnown = !usage.usageEstimated && requestSettings.inputUsdPerMillionTokens !== undefined && requestSettings.outputUsdPerMillionTokens !== undefined;
       if (ratesKnown) {
-        state.usage.reservedUsd = Math.max(0, state.usage.reservedUsd - this.providerReserve(requestSettings, 'model'));
+        state.usage.reservedUsd = Math.max(0, state.usage.reservedUsd - reservation.reserve);
         state.usage.estimatedCostUsd += usage.inputTokens * requestSettings.inputUsdPerMillionTokens! / 1_000_000 + usage.outputTokens * requestSettings.outputUsdPerMillionTokens! / 1_000_000;
         // Settle only the final successful attempt; earlier retry attempts remain unknown charges.
         state.usage.unknownCharges = Math.max(0, state.usage.unknownCharges - 1);
@@ -5781,14 +5790,14 @@ export class AppControllerImpl implements AppController {
           reservation = await this.recordProviderAttempt('model', capturedSettings, (current) => assertProjection(current));
         }, () => assertProjection());
       } catch (error) {
-        if (error instanceof ReplyGenerationError && error.usage) await this.settleModelUsage(error.usage, capturedSettings);
+        if (error instanceof ReplyGenerationError && error.usage) await this.settleModelUsage(error.usage, capturedSettings, reservation);
         if (error instanceof ReplyGenerationPreDispatchError) {
           if (reservation) await this.rollbackUnsentProviderAttempt(reservation);
           return { status: 'stale', requestFingerprint, composerRevision: input.composerRevision, fromCache: false };
         }
         throw error;
       }
-      await this.settleModelUsage(generated, capturedSettings);
+      await this.settleModelUsage(generated, capturedSettings, reservation);
       if (currentProjection() !== capturedProjection) {
         return { status: 'stale', requestFingerprint, composerRevision: input.composerRevision, fromCache: false, submittedContext: { ...disclosure, requestBytes: generated.requestBytes } };
       }
