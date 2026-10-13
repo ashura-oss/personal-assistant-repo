@@ -63,6 +63,12 @@ function duration(note: Note, max: number): number {
   return value;
 }
 
+function validateAudioByteLimit(maxAudioBytes?: number): number {
+  const limit = maxAudioBytes ?? MAX_RECOVERY_BYTES;
+  if (!Number.isSafeInteger(limit) || limit <= 0 || limit > MAX_RECOVERY_BYTES) throw new Error('The maximum upload size is invalid.');
+  return limit;
+}
+
 export function createWebSpeechAudioService(deps: {
   get?: (uri: string) => Promise<Blob>;
   crypto?: SpeechAudioCrypto;
@@ -91,20 +97,22 @@ export function createWebSpeechAudioService(deps: {
   speechStagingMemories.add(registration);
   const assertActive = () => { if (disposed) throw new Error('Speech upload staging is no longer available in this workspace.'); };
   return {
-    async prepare(note, { leaseId, maxDurationSeconds, signal }) {
+    async prepare(note, { leaseId, maxDurationSeconds, maxAudioBytes, signal }) {
       assertActive();
       if (!UUID.test(leaseId)) throw new Error('Speech upload lease is invalid.');
       if (!note.audioUri) throw new Error('The note does not have an available recording.');
       const durationSeconds = duration(note, maxDurationSeconds);
+      const byteLimit = validateAudioByteLimit(maxAudioBytes);
       const source = await boundedStep(() => (deps.withSourceRead ?? (async (actual: () => Promise<Blob>) => actual()))(() => get(note.audioUri!)), signal);
       if (!(source instanceof Blob) || !Number.isSafeInteger(source.size) || source.size <= 0 || source.size > MAX_RECOVERY_BYTES) throw new Error('Audio file is empty, unavailable, or exceeds the 40 MiB upload limit.');
+      if (source.size > byteLimit) throw new Error('Audio file exceeds the selected upload profile size limit.');
       const header = new Uint8Array(await boundedStep(() => source.slice(0, 16).arrayBuffer(), signal));
       checkAbort(signal);
       const fileName = note.audioAttachment?.fileName ?? 'recording';
       validateRecoveryFormat(fileName, note.audioAttachment?.mimeType ?? source.type, header);
       const bytes = new Uint8Array(await boundedStep(() => source.arrayBuffer(), signal));
       checkAbort(signal);
-      if (bytes.byteLength !== source.size) throw new Error('The recording changed while it was read.');
+      if (bytes.byteLength !== source.size || bytes.byteLength > byteLimit) throw new Error('The recording changed or exceeds the selected upload profile size limit.');
       const format = validateRecoveryFormat(fileName, note.audioAttachment?.mimeType ?? source.type, bytes);
       const mimeType = RECOVERY_FORMATS[format].mimeType;
       const blob = new Blob([bytes], { type: mimeType });

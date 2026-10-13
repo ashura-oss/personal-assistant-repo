@@ -1,4 +1,8 @@
 import type { AudioRecoveryMetadata, RecoveryFormat } from '../audio/recovery.types';
+import {
+  OPENROUTER_SPEECH_LEGACY_MODEL,
+  OPENROUTER_SPEECH_PROFILES,
+} from './openRouterSpeechProfiles';
 
 export const TRANSCRIPTION_SCHEMA_VERSION = 1 as const;
 export const TRANSCRIPTION_MAX_ATTEMPTS = 500;
@@ -8,7 +12,10 @@ export const SPEECH_MAX_AUDIO_BYTES = 40 * 1024 * 1024;
 export const SPEECH_MAX_RESPONSE_BYTES = 1024 * 1024;
 export const SPEECH_MAX_TRANSCRIPT_BYTES = 128 * 1024;
 export const OPENROUTER_SPEECH_ENDPOINT = 'https://openrouter.ai/api/v1/audio/transcriptions' as const;
-export const OPENROUTER_SPEECH_MODEL = 'openai/gpt-4o-mini-transcribe' as const;
+/** Backward-compatible name for the model stored in profile-1 receipts. */
+export const OPENROUTER_SPEECH_MODEL = OPENROUTER_SPEECH_LEGACY_MODEL;
+export { OPENROUTER_SPEECH_DEFAULT_MODEL, OPENROUTER_SPEECH_DEFAULT_PROFILE_VERSION, OPENROUTER_SPEECH_PROFILES } from './openRouterSpeechProfiles';
+export type { OpenRouterSpeechModel, OpenRouterSpeechProfileVersion } from './openRouterSpeechProfiles';
 
 export type SpeechAudioSnapshot = Readonly<{
   leaseId: string;
@@ -40,16 +47,18 @@ export type OpenRouterSpeechActualUsage = Readonly<{
 
 type OpenRouterSpeechResultBase = Readonly<{
   provider: 'openrouter';
-  profileVersion: 1;
   usage?: OpenRouterSpeechActualUsage;
   attempts: 1;
   cleanupPromise?: Promise<void>;
 }>;
 
-export type OpenRouterSpeechTranscriptionResult = OpenRouterSpeechResultBase & (
+type OpenRouterSpeechOutcome =
   | Readonly<{ outcome: 'completed'; transcript: string; unknownCharge: boolean }>
-  | Readonly<{ outcome: 'no_speech' | 'invalid_response'; transcript?: never; unknownCharge: boolean }>
-);
+  | Readonly<{ outcome: 'no_speech' | 'invalid_response'; transcript?: never; unknownCharge: boolean }>;
+
+export type OpenRouterSpeechTranscriptionResult =
+  | (OpenRouterSpeechResultBase & Readonly<{ profileVersion: 1; model: typeof OPENROUTER_SPEECH_PROFILES[1]['model'] }> & OpenRouterSpeechOutcome)
+  | (OpenRouterSpeechResultBase & Readonly<{ profileVersion: 2; model: typeof OPENROUTER_SPEECH_PROFILES[2]['model'] }> & OpenRouterSpeechOutcome);
 
 export type AnySpeechTranscriptionResult = SpeechTranscriptionResult | OpenRouterSpeechTranscriptionResult;
 
@@ -118,10 +127,12 @@ export type AzureTranscriptionAttempt = TranscriptionAttemptBase & {
   unknownCharge?: never;
 };
 
-export type OpenRouterTranscriptionAttempt = TranscriptionAttemptBase & {
+type OpenRouterTranscriptionProfile =
+  | Readonly<{ profileVersion: 1; model: typeof OPENROUTER_SPEECH_PROFILES[1]['model'] }>
+  | Readonly<{ profileVersion: 2; model: typeof OPENROUTER_SPEECH_PROFILES[2]['model'] }>;
+
+export type OpenRouterTranscriptionAttempt = TranscriptionAttemptBase & OpenRouterTranscriptionProfile & {
   provider: 'openrouter';
-  profileVersion: 1;
-  model: typeof OPENROUTER_SPEECH_MODEL;
   endpoint: typeof OPENROUTER_SPEECH_ENDPOINT;
   locale: 'auto';
   reservation?: never;

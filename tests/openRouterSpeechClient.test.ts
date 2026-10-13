@@ -91,6 +91,20 @@ describe('OpenRouterSpeechClient', () => {
     expect(onBeforeDispatch).not.toHaveBeenCalled();
   });
 
+  it('rejects forged or mismatched model-profile pairs before credential reads or dispatch', async () => {
+    const readCredentialSnapshot = vi.fn(async () => ({ key: 'fictional-only', generation: 1 }));
+    const onBeforeDispatch = vi.fn(async () => undefined);
+    const fetcher = vi.fn(async () => new Response('{}', { status: 200 }));
+    const subject = new OpenRouterSpeechClient(dependencies({ readCredentialSnapshot, fetcher }));
+    await expect(subject.transcribe(call({ request: { ...request, profileVersion: 99 as never }, onBeforeDispatch })))
+      .rejects.toMatchObject({ code: 'invalid_request', dispatched: false });
+    await expect(subject.transcribe(call({ request: { ...request, model: 'openai/gpt-4o-mini-transcribe' as never }, onBeforeDispatch })))
+      .rejects.toMatchObject({ code: 'invalid_request', dispatched: false });
+    expect(readCredentialSnapshot).not.toHaveBeenCalled();
+    expect(onBeforeDispatch).not.toHaveBeenCalled();
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
   it('validates a multi-megabyte canonical base64 body without a backtracking regular expression', async () => {
     const large = buildOpenRouterSpeechWireRequest({ bytes: new Uint8Array(12 * 1024 * 1024), format: 'm4a' });
     const client = new OpenRouterSpeechClient(dependencies({ fetcher: vi.fn(async () => new Response('{}', { status: 200 })) }));

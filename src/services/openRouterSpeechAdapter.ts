@@ -8,6 +8,7 @@ import {
 } from '../transcription';
 import { OpenRouterSpeechClient, OpenRouterSpeechError } from './openRouterSpeech';
 import { buildOpenRouterSpeechWireRequest } from './openRouterSpeechWire';
+import { OPENROUTER_SPEECH_DEFAULT_PROFILE_VERSION, getOpenRouterSpeechProfile } from '../transcription/openRouterSpeechProfiles';
 
 export interface OpenRouterSpeechAdapterOptions {
   readonly audio: SpeechAudioService;
@@ -73,12 +74,14 @@ export class OpenRouterSpeechAdapter {
     };
     try {
       prepared = await this.options.audio.prepare(note, {
-        leaseId, maxDurationSeconds: Math.min(settings.maxAudioSeconds, SPEECH_MAX_AUDIO_SECONDS), signal,
+        leaseId, maxDurationSeconds: Math.min(settings.maxAudioSeconds, SPEECH_MAX_AUDIO_SECONDS),
+        maxAudioBytes: getOpenRouterSpeechProfile(OPENROUTER_SPEECH_DEFAULT_PROFILE_VERSION)!.maxAudioBytes, signal,
       });
       this.activeUploadLeases.add(leaseId);
       uploadLeaseActive = true;
       const snapshot = validateSpeechAudioSnapshot(prepared);
-      if (snapshot.leaseId !== leaseId || snapshot.byteLength > SPEECH_MAX_AUDIO_BYTES) fail('Prepared audio does not match the requested lease or upload limit.', 'invalid_audio');
+      const profile = getOpenRouterSpeechProfile(OPENROUTER_SPEECH_DEFAULT_PROFILE_VERSION)!;
+      if (snapshot.leaseId !== leaseId || snapshot.byteLength > SPEECH_MAX_AUDIO_BYTES || snapshot.byteLength > profile.maxAudioBytes) fail('Prepared audio does not match the requested lease or upload limit.', 'invalid_audio');
       await this.options.audio.verify(prepared, signal);
       await onPrepared(prepared);
       if (signal?.aborted) fail('Speech transcription was cancelled before upload.', 'cancelled');
@@ -104,12 +107,12 @@ export class OpenRouterSpeechAdapter {
       const cleanupPromise = releaseAfterSettlement();
       const usage = parsed.usage;
       if (parsed.kind === 'transcript') {
-        return Object.freeze({ provider: 'openrouter', profileVersion: 1, outcome: 'completed', transcript: parsed.transcript, ...(usage ? { usage } : {}), unknownCharge: usage?.costUsd === undefined, attempts: 1, cleanupPromise });
+        return Object.freeze({ provider: 'openrouter', profileVersion: request.profileVersion, model: request.model, outcome: 'completed', transcript: parsed.transcript, ...(usage ? { usage } : {}), unknownCharge: usage?.costUsd === undefined, attempts: 1, cleanupPromise }) as OpenRouterSpeechTranscriptionResult;
       }
       if (parsed.kind === 'no_speech') {
-        return Object.freeze({ provider: 'openrouter', profileVersion: 1, outcome: 'no_speech', ...(usage ? { usage } : {}), unknownCharge: usage?.costUsd === undefined, attempts: 1, cleanupPromise });
+        return Object.freeze({ provider: 'openrouter', profileVersion: request.profileVersion, model: request.model, outcome: 'no_speech', ...(usage ? { usage } : {}), unknownCharge: usage?.costUsd === undefined, attempts: 1, cleanupPromise }) as OpenRouterSpeechTranscriptionResult;
       }
-      return Object.freeze({ provider: 'openrouter', profileVersion: 1, outcome: 'invalid_response', ...(usage ? { usage } : {}), unknownCharge: usage?.costUsd === undefined, attempts: 1, cleanupPromise });
+      return Object.freeze({ provider: 'openrouter', profileVersion: request.profileVersion, model: request.model, outcome: 'invalid_response', ...(usage ? { usage } : {}), unknownCharge: usage?.costUsd === undefined, attempts: 1, cleanupPromise }) as OpenRouterSpeechTranscriptionResult;
     } catch (error) {
       const typed = error instanceof OpenRouterSpeechError ? error : undefined;
       const transcriptionError = error instanceof SpeechTranscriptionError ? error : undefined;

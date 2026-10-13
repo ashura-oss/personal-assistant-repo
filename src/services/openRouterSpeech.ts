@@ -1,12 +1,12 @@
 import { SPEECH_MAX_AUDIO_BYTES, SPEECH_MAX_RESPONSE_BYTES } from '../transcription';
 import {
   OPENROUTER_SPEECH_ENDPOINT,
-  OPENROUTER_SPEECH_MODEL,
   parseOpenRouterSpeechResponse,
   type OpenRouterSpeechParseResult,
   type OpenRouterSpeechUsage,
   type OpenRouterSpeechWireRequest,
 } from './openRouterSpeechWire';
+import { getOpenRouterSpeechProfile, isOpenRouterSpeechModelProfile } from '../transcription/openRouterSpeechProfiles';
 
 export const OPENROUTER_SPEECH_REQUEST_DEADLINE_MS = 120_000;
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -235,13 +235,15 @@ function isUuidV4(value: unknown): value is string {
 function validateWireRequest(value: unknown): value is OpenRouterSpeechWireRequest {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const row = value as Record<string, unknown>;
-  if (Object.keys(row).sort().join(',') !== 'audioBytes,body,endpoint' || row.endpoint !== OPENROUTER_SPEECH_ENDPOINT ||
-      typeof row.body !== 'string' || !Number.isSafeInteger(row.audioBytes) || (row.audioBytes as number) < 1 || (row.audioBytes as number) > SPEECH_MAX_AUDIO_BYTES) return false;
+  const profile = getOpenRouterSpeechProfile(row.profileVersion);
+  if (Object.keys(row).sort().join(',') !== 'audioBytes,body,endpoint,model,profileVersion' || row.endpoint !== OPENROUTER_SPEECH_ENDPOINT ||
+      typeof row.body !== 'string' || !Number.isSafeInteger(row.audioBytes) || (row.audioBytes as number) < 1 || (row.audioBytes as number) > SPEECH_MAX_AUDIO_BYTES ||
+      !profile || !isOpenRouterSpeechModelProfile(row.profileVersion, row.model) || (row.audioBytes as number) > profile.maxAudioBytes) return false;
   try {
     const parsed: unknown = JSON.parse(row.body);
     if (JSON.stringify(parsed) !== row.body || !parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
     const body = parsed as Record<string, unknown>;
-    if (Object.keys(body).sort().join(',') !== 'input_audio,model,provider,response_format' || body.model !== OPENROUTER_SPEECH_MODEL || body.response_format !== 'json') return false;
+    if (Object.keys(body).sort().join(',') !== 'input_audio,model,provider,response_format' || body.model !== row.model || body.response_format !== 'json') return false;
     const audio = body.input_audio;
     const provider = body.provider;
     if (!audio || typeof audio !== 'object' || Array.isArray(audio) || !provider || typeof provider !== 'object' || Array.isArray(provider)) return false;

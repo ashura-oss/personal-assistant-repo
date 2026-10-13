@@ -1,7 +1,16 @@
 import { SPEECH_MAX_AUDIO_BYTES, SPEECH_MAX_TRANSCRIPT_BYTES } from '../transcription';
+import {
+  getOpenRouterSpeechProfile,
+  OPENROUTER_SPEECH_DEFAULT_PROFILE_VERSION,
+  OPENROUTER_SPEECH_LEGACY_MODEL,
+  type OpenRouterSpeechModel,
+  type OpenRouterSpeechProfileVersion,
+} from '../transcription/openRouterSpeechProfiles';
+export { OPENROUTER_SPEECH_DEFAULT_MODEL, OPENROUTER_SPEECH_DEFAULT_PROFILE_VERSION, OPENROUTER_SPEECH_PROFILES } from '../transcription/openRouterSpeechProfiles';
 
 export const OPENROUTER_SPEECH_ENDPOINT = 'https://openrouter.ai/api/v1/audio/transcriptions' as const;
-export const OPENROUTER_SPEECH_MODEL = 'openai/gpt-4o-mini-transcribe' as const;
+/** Backward-compatible profile-1 model name. New requests use profile 2 by default. */
+export const OPENROUTER_SPEECH_MODEL = OPENROUTER_SPEECH_LEGACY_MODEL;
 
 export type OpenRouterSpeechFormat = 'm4a' | 'wav' | 'mp3' | 'webm' | 'ogg';
 
@@ -22,12 +31,15 @@ export interface OpenRouterSpeechWireRequest {
   readonly endpoint: typeof OPENROUTER_SPEECH_ENDPOINT;
   readonly body: string;
   readonly audioBytes: number;
+  readonly profileVersion: OpenRouterSpeechProfileVersion;
+  readonly model: OpenRouterSpeechModel;
 }
 
 /** Builds the exact JSON wire payload from a snapshot copy. It performs no I/O. */
 export function buildOpenRouterSpeechWireRequest(input: {
   bytes: Uint8Array;
   format: OpenRouterSpeechFormat;
+  profileVersion?: OpenRouterSpeechProfileVersion;
 }): OpenRouterSpeechWireRequest {
   if (!input || !(input.bytes instanceof Uint8Array) || input.bytes.byteLength <= 0 || input.bytes.byteLength > SPEECH_MAX_AUDIO_BYTES) {
     throw new Error('Prepared audio is outside the supported upload size.');
@@ -35,16 +47,20 @@ export function buildOpenRouterSpeechWireRequest(input: {
   if (!['m4a', 'wav', 'mp3', 'webm', 'ogg'].includes(input.format)) {
     throw new Error('Prepared audio format is not supported.');
   }
+  const profileVersion = input.profileVersion ?? OPENROUTER_SPEECH_DEFAULT_PROFILE_VERSION;
+  const profile = getOpenRouterSpeechProfile(profileVersion);
+  if (!profile) throw new Error('OpenRouter speech profile is not supported.');
+  if (input.bytes.byteLength > profile.maxAudioBytes) throw new Error('Prepared audio exceeds the selected OpenRouter speech profile size limit.');
 
   // Snapshot synchronously so subsequent mutation of a caller-owned typed array cannot alter the payload.
   const snapshot = new Uint8Array(input.bytes);
   const body = JSON.stringify({
-    model: OPENROUTER_SPEECH_MODEL,
+    model: profile.model,
     input_audio: { data: encodeBase64(snapshot), format: input.format },
     response_format: 'json',
     provider: { zdr: true, data_collection: 'deny' },
   });
-  return Object.freeze({ endpoint: OPENROUTER_SPEECH_ENDPOINT, body, audioBytes: snapshot.byteLength });
+  return Object.freeze({ endpoint: OPENROUTER_SPEECH_ENDPOINT, body, audioBytes: snapshot.byteLength, profileVersion: profile.version, model: profile.model });
 }
 
 /** Parses only transcription text and allowlisted actual usage fields; provider strings/errors never escape. */

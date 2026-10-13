@@ -32,7 +32,7 @@ function openRouterAttempt(overrides: Partial<OpenRouterTranscriptionAttempt> = 
     dispatchStarted: true, outcome: 'completed', provider: 'openrouter', profileVersion: 1, model: OPENROUTER_SPEECH_MODEL,
     locale: 'auto', actualUsage: { seconds: 4.2, inputTokens: 0, outputTokens: 12, totalTokens: 12, costUsd: 0 }, unknownCharge: false,
     ...overrides,
-  };
+  } as OpenRouterTranscriptionAttempt;
 }
 function azureAttempt(): TranscriptionAttempt {
   return {

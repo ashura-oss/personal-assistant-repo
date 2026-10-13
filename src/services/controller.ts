@@ -76,6 +76,7 @@ import { BACKUP_LIMITS, canonicalPortableContent, legacyCanonicalPortableContent
 import type { ImportedBackupArchive, PortableBackupV3, PortableKnowledgeCohort } from '../backup';
 import { SpeechTranscriptionError, validateTranscriptionState, validateSpeechAudioSnapshot } from '../transcription';
 import type { AnySpeechTranscriptionResult, OpenRouterSpeechTranscriptionResult, SpeechAudioSnapshot, SpeechAttemptCode, TranscriptionAttempt, TranscriptionState } from '../transcription';
+import { OPENROUTER_SPEECH_DEFAULT_MODEL, OPENROUTER_SPEECH_DEFAULT_PROFILE_VERSION } from '../transcription/openRouterSpeechProfiles';
 import type { PreparedSpeechAudio, SpeechAudioService } from '../audio/speechUpload.types';
 import { getDefaultPrivacyService, type PrivacyService, type PrivacyWorkspaceSession } from '../privacy/service';
 import { createPrivacyBoundController } from '../privacy/controllerBoundary';
@@ -4670,7 +4671,7 @@ export class AppControllerImpl implements AppController {
     job.sourceRevision = sourceRevision;
     const attempt: TranscriptionAttempt = speechProvider === 'openrouter' ? {
       id: attemptId, leaseId: job.leaseId, noteId: id, sourceRevision, source,
-      provider: 'openrouter', profileVersion: 1, model: 'openai/gpt-4o-mini-transcribe',
+      provider: 'openrouter', profileVersion: OPENROUTER_SPEECH_DEFAULT_PROFILE_VERSION, model: OPENROUTER_SPEECH_DEFAULT_MODEL,
       endpoint: 'https://openrouter.ai/api/v1/audio/transcriptions', locale: 'auto',
       createdAt: now(), dispatchStarted: false, outcome: 'preparing',
     } : {
@@ -4697,7 +4698,8 @@ export class AppControllerImpl implements AppController {
       if (controller.signal.aborted) throw new Error('Transcription was cancelled.');
       if (this.transcriptionQuarantine.length || !state.settings.speechEnabled || speechSettingsProjection(state.settings) !== settingsProjection ||
           !current || current.revision !== sourceRevision || stableJson(transcriptionSourceProjection(current, state.settings)) !== stableJson(source)) throw new Error('The note or transcription settings changed. The transcription request was stopped.');
-      if (!savedAttempt || savedAttempt.sourceRevision !== sourceRevision || savedAttempt.outcome !== outcome) throw new Error('The transcription attempt is no longer active.');
+      if (!savedAttempt || savedAttempt.sourceRevision !== sourceRevision || savedAttempt.outcome !== outcome ||
+          speechProvider === 'openrouter' && (savedAttempt.provider !== 'openrouter' || savedAttempt.profileVersion !== OPENROUTER_SPEECH_DEFAULT_PROFILE_VERSION || savedAttempt.model !== OPENROUTER_SPEECH_DEFAULT_MODEL)) throw new Error('The transcription attempt is no longer active.');
       return savedAttempt;
     };
     const onPrepared = async (prepared: PreparedSpeechAudio) => {
@@ -4726,7 +4728,9 @@ export class AppControllerImpl implements AppController {
       const currentAttempt = current.transcription.attempts.find((item) => item.id === attemptId);
       if (controller.signal.aborted || this.mailAlertRefreshRequired || this.transcriptionQuarantine.length || !current.settings.speechEnabled || speechSettingsProjection(current.settings) !== settingsProjection ||
           !currentNote || currentNote.revision !== sourceRevision || stableJson(transcriptionSourceProjection(currentNote, current.settings)) !== stableJson(source) ||
-          currentAttempt?.outcome !== 'pending' || currentAttempt.provider !== speechProvider || (speechProvider === 'azure' && !currentAttempt.reservation) || stableJson(currentAttempt.prepared) !== stableJson(preparedSnapshot) || stableJson(snapshot) !== stableJson(preparedSnapshot)) {
+          currentAttempt?.outcome !== 'pending' || currentAttempt.provider !== speechProvider ||
+          (speechProvider === 'openrouter' && (currentAttempt.provider !== 'openrouter' || currentAttempt.profileVersion !== OPENROUTER_SPEECH_DEFAULT_PROFILE_VERSION || currentAttempt.model !== OPENROUTER_SPEECH_DEFAULT_MODEL)) ||
+          (speechProvider === 'azure' && !currentAttempt.reservation) || stableJson(currentAttempt.prepared) !== stableJson(preparedSnapshot) || stableJson(snapshot) !== stableJson(preparedSnapshot)) {
         throw new Error('The note, audio, settings, or transcription claim changed before upload. No audio was sent.');
       }
     };
@@ -4742,7 +4746,7 @@ export class AppControllerImpl implements AppController {
       if (isOpenRouterSpeechResult(result) && result.outcome !== 'completed') {
         await this.mutate((state) => {
           const savedAttempt = state.transcription.attempts.find((item) => item.id === attemptId);
-          if (!savedAttempt || savedAttempt.provider !== 'openrouter' || !savedAttempt.dispatchStarted) throw new Error('The dispatched OpenRouter speech receipt was not found.');
+          if (!savedAttempt || savedAttempt.provider !== 'openrouter' || savedAttempt.profileVersion !== result.profileVersion || savedAttempt.model !== result.model || !savedAttempt.dispatchStarted) throw new Error('The dispatched OpenRouter speech receipt was not found.');
           savedAttempt.actualUsage = result.usage;
           savedAttempt.unknownCharge = result.unknownCharge;
           savedAttempt.outcome = result.outcome === 'no_speech' ? 'no_speech' : 'failed';
@@ -4766,7 +4770,7 @@ export class AppControllerImpl implements AppController {
         const savedAttempt = state.transcription.attempts.find((item) => item.id === attemptId);
         if (!savedAttempt?.dispatchStarted || (savedAttempt.provider === 'azure' && !savedAttempt.reservation)) throw new Error('The dispatched transcription receipt was not found.');
         if (isOpenRouterSpeechResult(result)) {
-          if (savedAttempt.provider !== 'openrouter') throw new Error('The speech provider changed after upload.');
+          if (savedAttempt.provider !== 'openrouter' || savedAttempt.profileVersion !== result.profileVersion || savedAttempt.model !== result.model) throw new Error('The speech provider profile changed after upload.');
           savedAttempt.actualUsage = result.usage;
           savedAttempt.unknownCharge = result.unknownCharge;
         } else {

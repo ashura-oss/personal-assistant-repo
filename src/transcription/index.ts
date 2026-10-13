@@ -1,8 +1,9 @@
 import {
   TRANSCRIPTION_MAX_ATTEMPTS, TRANSCRIPTION_MAX_CLEANUP_LEASES, TRANSCRIPTION_SCHEMA_VERSION,
-  OPENROUTER_SPEECH_ENDPOINT, OPENROUTER_SPEECH_MODEL, validateSpeechAudioSnapshot, type TranscriptionAttempt, type TranscriptionCleanupLease,
+  OPENROUTER_SPEECH_ENDPOINT, validateSpeechAudioSnapshot, type TranscriptionAttempt, type TranscriptionCleanupLease,
   type TranscriptionState,
 } from './types';
+import { getOpenRouterSpeechProfile, isOpenRouterSpeechModelProfile } from './openRouterSpeechProfiles';
 export * from './types';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -69,7 +70,7 @@ function validateAttempt(value: unknown): TranscriptionAttempt {
     try { parsedEndpoint = new URL(endpoint); } catch { throw new Error('Speech endpoint is invalid.'); }
     if (parsedEndpoint.protocol !== 'https:' || parsedEndpoint.origin !== endpoint || !/\.(cognitiveservices\.azure\.com|api\.cognitive\.microsoft\.com)$/i.test(parsedEndpoint.hostname)) throw new Error('Speech endpoint is invalid.');
     if (row.locale !== 'en-US' || row.profileVersion !== undefined || row.model !== undefined || row.actualUsage !== undefined || row.unknownCharge !== undefined) throw new Error('Azure speech profile is invalid.');
-  } else if (endpoint !== OPENROUTER_SPEECH_ENDPOINT || row.locale !== 'auto' || row.profileVersion !== 1 || row.model !== OPENROUTER_SPEECH_MODEL) throw new Error('OpenRouter speech profile is invalid.');
+  } else if (endpoint !== OPENROUTER_SPEECH_ENDPOINT || row.locale !== 'auto' || !isOpenRouterSpeechModelProfile(row.profileVersion, row.model)) throw new Error('OpenRouter speech profile is invalid.');
   if (sourceProvider !== provider) throw new Error('Speech provider snapshot does not match the attempt.');
   const createdAt = canonicalTime(row.createdAt, 'Transcription creation time');
   const outcome = row.outcome;
@@ -144,7 +145,8 @@ function validateAttempt(value: unknown): TranscriptionAttempt {
   if (lateObservations?.some((entry) => !terminal || Date.parse(entry.at) < Date.parse(terminal))) throw new Error('Late speech observations must follow the terminal outcome.');
   if (provider === 'openrouter' && dispatchStarted && terminal && unknownCharge !== (actualUsage?.costUsd === undefined)) throw new Error('OpenRouter charge knowledge must match reported actual cost.');
   const frozenSource = Object.freeze({ ...source, ...(source.audioAttachment ? { audioAttachment: Object.freeze({ ...source.audioAttachment }) } : {}) });
-  return Object.freeze({ id: row.id, leaseId: row.leaseId, noteId: row.noteId, sourceRevision, source: frozenSource, endpoint, ...(provider !== 'azure' || row.provider !== undefined ? { provider } : {}), ...(provider === 'openrouter' ? { profileVersion: 1 as const, model: OPENROUTER_SPEECH_MODEL } : {}), locale: provider === 'azure' ? 'en-US' as const : 'auto' as const, createdAt, ...(prepared ? { prepared } : {}), ...(reservation ? { reservation: Object.freeze(reservation) } : {}), dispatchStarted, outcome: outcome as TranscriptionAttempt['outcome'], ...(terminal ? { terminalAt: terminal } : {}), ...(code ? { code } : {}), ...(durationMilliseconds ? { durationMilliseconds } : {}), ...(billedEstimateSeconds ? { billedEstimateSeconds } : {}), ...(rateEstimated !== undefined ? { rateEstimated } : {}), ...(transcriptSha256 ? { transcriptSha256 } : {}), ...(actualUsage ? { actualUsage } : {}), ...(unknownCharge !== undefined ? { unknownCharge } : {}), ...(lateObservations ? { lateObservations: Object.freeze(lateObservations) as unknown as TranscriptionAttempt['lateObservations'] } : {}) } as TranscriptionAttempt);
+  const speechProfile = provider === 'openrouter' ? getOpenRouterSpeechProfile(row.profileVersion) : undefined;
+  return Object.freeze({ id: row.id, leaseId: row.leaseId, noteId: row.noteId, sourceRevision, source: frozenSource, endpoint, ...(provider !== 'azure' || row.provider !== undefined ? { provider } : {}), ...(speechProfile ? { profileVersion: speechProfile.version, model: speechProfile.model } : {}), locale: provider === 'azure' ? 'en-US' as const : 'auto' as const, createdAt, ...(prepared ? { prepared } : {}), ...(reservation ? { reservation: Object.freeze(reservation) } : {}), dispatchStarted, outcome: outcome as TranscriptionAttempt['outcome'], ...(terminal ? { terminalAt: terminal } : {}), ...(code ? { code } : {}), ...(durationMilliseconds ? { durationMilliseconds } : {}), ...(billedEstimateSeconds ? { billedEstimateSeconds } : {}), ...(rateEstimated !== undefined ? { rateEstimated } : {}), ...(transcriptSha256 ? { transcriptSha256 } : {}), ...(actualUsage ? { actualUsage } : {}), ...(unknownCharge !== undefined ? { unknownCharge } : {}), ...(lateObservations ? { lateObservations: Object.freeze(lateObservations) as unknown as TranscriptionAttempt['lateObservations'] } : {}) } as TranscriptionAttempt);
 }
 
 function validateLease(value: unknown): TranscriptionCleanupLease {

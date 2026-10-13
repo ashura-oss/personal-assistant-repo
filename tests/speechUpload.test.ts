@@ -125,6 +125,64 @@ describe('speech upload snapshots', () => {
     expect(copy).not.toHaveBeenCalled();
   });
 
+  it('rejects the profile-2 native source size before private copy or byte reads', async () => {
+    const mock = nativeIO();
+    const exists = vi.spyOn(mock.io, 'exists').mockImplementation(async (uri) => uri === note.audioUri
+      ? { exists: true, size: 25_000_001 }
+      : { exists: false });
+    const copy = vi.spyOn(mock.io, 'copy');
+    const readHeader = vi.spyOn(mock.io, 'readHeader');
+    const readBytes = vi.spyOn(mock.io, 'readBytes');
+    const hash = vi.fn(async () => 'a'.repeat(64));
+    const service = createNativeSpeechAudioService({ io: mock.io, crypto: { sha256: hash } });
+    await expect(service.prepare(note, { leaseId: lease, maxDurationSeconds: 30, maxAudioBytes: 25_000_000 }))
+      .rejects.toThrow(/selected upload profile/i);
+    expect(exists).toHaveBeenCalledOnce();
+    expect(copy).not.toHaveBeenCalled();
+    expect(readHeader).not.toHaveBeenCalled();
+    expect(readBytes).not.toHaveBeenCalled();
+    expect(hash).not.toHaveBeenCalled();
+  });
+
+  it('rechecks native staged metadata against the selected byte limit before header or byte reads', async () => {
+    const mock = nativeIO();
+    let existsCall = 0;
+    vi.spyOn(mock.io, 'exists').mockImplementation(async (uri) => {
+      existsCall += 1;
+      if (uri === note.audioUri) return { exists: true, size: bytes.byteLength };
+      if (existsCall === 3) return { exists: true, size: 25_000_001 };
+      return { exists: false };
+    });
+    const copy = vi.spyOn(mock.io, 'copy').mockImplementation(async () => undefined);
+    const readHeader = vi.spyOn(mock.io, 'readHeader');
+    const readBytes = vi.spyOn(mock.io, 'readBytes');
+    const hash = vi.fn(async () => 'a'.repeat(64));
+    const service = createNativeSpeechAudioService({ io: mock.io, crypto: { sha256: hash } });
+    await expect(service.prepare(note, { leaseId: lease, maxDurationSeconds: 30, maxAudioBytes: 25_000_000 }))
+      .rejects.toThrow(/staged recording exceeds/i);
+    expect(copy).toHaveBeenCalledOnce();
+    expect(readHeader).not.toHaveBeenCalled();
+    expect(readBytes).not.toHaveBeenCalled();
+    expect(hash).not.toHaveBeenCalled();
+  });
+
+  it('rejects the profile-2 web Blob size before reading, hashing, or staging bytes', async () => {
+    const source = new Blob([new Uint8Array(25_000_001)], { type: 'audio/mp4' });
+    const get = vi.fn(async () => source);
+    const arrayBuffer = vi.spyOn(source, 'arrayBuffer');
+    const hash = vi.fn(async () => 'a'.repeat(64));
+    const stageWrite = vi.fn();
+    const withStageWrite = async <T>(actual: () => Promise<T>): Promise<T> => { stageWrite(); return actual(); };
+    const service = createWebSpeechAudioService({ get, crypto: { sha256: hash }, withStageWrite });
+    const webNote = { ...note, audioUri: 'indexeddb-audio:test', audioAttachment: undefined } as Note;
+    await expect(service.prepare(webNote, { leaseId: lease, maxDurationSeconds: 30, maxAudioBytes: 25_000_000 }))
+      .rejects.toThrow(/selected upload profile/i);
+    expect(get).toHaveBeenCalledOnce();
+    expect(arrayBuffer).not.toHaveBeenCalled();
+    expect(hash).not.toHaveBeenCalled();
+    expect(stageWrite).not.toHaveBeenCalled();
+  });
+
   it('keeps a timed-out native copy lease locked until the late write settles, then removes only its staged file', async () => {
     const mock = nativeIO();
     let finishCopy!: () => void;

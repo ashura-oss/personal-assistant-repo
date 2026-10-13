@@ -51,6 +51,7 @@ import type {
 import type { StartupRecoveryPlan } from "./src/storage/startupRecovery";
 import type { KnowledgeEntityKind, KnowledgeReference, KnowledgeSuggestion } from "./src/knowledge/types";
 import { SpeechTranscriptionError } from "./src/transcription/types";
+import { OPENROUTER_SPEECH_DEFAULT_MODEL } from "./src/transcription/openRouterSpeechProfiles";
 import { useAudioCapture } from "./src/audio/useAudioCapture";
 import { RecordingAutoStopGate } from "./src/audio/autoStop";
 import type { AudioCapture } from "./src/audio/types";
@@ -4532,8 +4533,8 @@ function SettingsScreen({
         {speechProvider === "openrouter" ? (
           <View style={s.analysisStale}>
             <Text style={s.accountName}>OpenRouter transcription model</Text>
-            <Text accessibilityLabel="OpenRouter transcription model openai/gpt-4o-mini-transcribe" style={s.analysisText}>
-              openai/gpt-4o-mini-transcribe
+            <Text accessibilityLabel={`OpenRouter transcription model ${OPENROUTER_SPEECH_DEFAULT_MODEL}`} style={s.analysisText}>
+              {OPENROUTER_SPEECH_DEFAULT_MODEL}
             </Text>
             <Text style={s.disclaimer}>
               Choose Transcribe on a saved recording to upload it to OpenRouter. Usage appears only when reported; no cost is estimated. This does not use Batch.

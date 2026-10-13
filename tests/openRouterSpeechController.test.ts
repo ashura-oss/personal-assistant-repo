@@ -61,7 +61,7 @@ describe('OpenRouter speech controller integration', () => {
       .resolves.toMatchObject({ transcript: 'OpenRouter heard this.', revision: note.revision + 1 });
     expect(fetcher).toHaveBeenCalledTimes(1);
     const saved = store.value?.transcription.attempts.at(-1);
-    expect(saved).toMatchObject({ provider: 'openrouter', outcome: 'completed', actualUsage: { costUsd: 0, totalTokens: 7 }, unknownCharge: false });
+    expect(saved).toMatchObject({ provider: 'openrouter', profileVersion: 2, model: 'openai/whisper-large-v3-turbo', outcome: 'completed', actualUsage: { costUsd: 0, totalTokens: 7 }, unknownCharge: false });
     expect(saved).not.toHaveProperty('reservation');
     expect(saved).not.toHaveProperty('durationMilliseconds');
     expect(saved).not.toHaveProperty('billedEstimateSeconds');

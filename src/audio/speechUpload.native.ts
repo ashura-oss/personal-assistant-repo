@@ -93,6 +93,12 @@ function validateDuration(note: Note, maxDurationSeconds: number): number {
   return duration;
 }
 
+function validateAudioByteLimit(maxAudioBytes?: number): number {
+  const limit = maxAudioBytes ?? MAX_RECOVERY_BYTES;
+  if (!Number.isSafeInteger(limit) || limit <= 0 || limit > MAX_RECOVERY_BYTES) throw new Error('The maximum upload size is invalid.');
+  return limit;
+}
+
 export function createNativeSpeechAudioService(deps: {
   io?: NativeSpeechAudioIO;
   crypto?: SpeechAudioCrypto;
@@ -154,26 +160,31 @@ export function createNativeSpeechAudioService(deps: {
     finally { if (cleanupOperations.get(leaseId) === operation) cleanupOperations.delete(leaseId); }
   };
   return {
-    async prepare(note, { leaseId, maxDurationSeconds, signal }) {
+    async prepare(note, { leaseId, maxDurationSeconds, maxAudioBytes, signal }) {
       assertActive();
       if (!UUID.test(leaseId)) throw new Error('Speech upload lease is invalid.');
       if (!note.audioUri || !safePrivateSource(note.audioUri, io)) throw new Error('The note does not have an available private app audio file.');
       const durationSeconds = validateDuration(note, maxDurationSeconds);
+      const byteLimit = validateAudioByteLimit(maxAudioBytes);
       const sourceInfo = await boundedStep(() => io.exists(note.audioUri!), signal);
       if (!sourceInfo.exists || sourceInfo.isDirectory || !Number.isSafeInteger(sourceInfo.size) || sourceInfo.size! <= 0 || sourceInfo.size! > MAX_RECOVERY_BYTES) throw new Error('Audio file is empty, unavailable, or exceeds the 40 MiB upload limit.');
+      if (sourceInfo.size! > byteLimit) throw new Error('Audio file exceeds the selected upload profile size limit.');
       const folder = await ensureFolder(signal);
       owned.add(leaseId);
       const stage = `${folder}${leaseId}.stage`;
       try {
         await boundedStep(() => trackWrite(leaseId, () => io.copy(note.audioUri!, stage)), signal);
         const stageInfo = await boundedStep(() => io.exists(stage), signal);
-        if (!stageInfo.exists || stageInfo.size !== sourceInfo.size || !Number.isSafeInteger(stageInfo.size) || stageInfo.size! <= 0 || stageInfo.size! > MAX_RECOVERY_BYTES) throw new Error('The recording changed while it was copied for upload.');
+        if (!stageInfo.exists || !Number.isSafeInteger(stageInfo.size) || stageInfo.size! <= 0 || stageInfo.size! > MAX_RECOVERY_BYTES) throw new Error('The recording changed while it was copied for upload.');
+        if (stageInfo.size! > byteLimit) throw new Error('The staged recording exceeds the selected upload profile size limit.');
+        if (stageInfo.size !== sourceInfo.size) throw new Error('The recording changed while it was copied for upload.');
         const header = await boundedStep(() => io.readHeader(stage), signal, () => cleanup(leaseId));
         const headerFormat = boundedAudioFormatFromSignature(header);
         if (!headerFormat) throw new Error('The recording header is not a supported cloud audio format.');
         validateRecoveryFormat(note.audioAttachment?.fileName ?? note.audioUri.split('/').pop() ?? 'recording', note.audioAttachment?.mimeType, header);
         const read = await boundedStep(() => io.readBytes(stage), signal, () => cleanup(leaseId));
         if (read.byteLength !== stageInfo.size) throw new Error('The recording changed while it was read.');
+        if (read.byteLength > byteLimit) throw new Error('The staged recording exceeds the selected upload profile size limit.');
         const format = validateRecoveryFormat(note.audioAttachment?.fileName ?? note.audioUri.split('/').pop() ?? 'recording', note.audioAttachment?.mimeType, read);
         const mimeType = RECOVERY_FORMATS[format].mimeType;
         const sha256 = await boundedStep(() => crypto.sha256(read), signal, () => cleanup(leaseId));

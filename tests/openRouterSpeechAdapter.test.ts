@@ -44,9 +44,24 @@ describe('OpenRouterSpeechAdapter ownership and source binding', () => {
 
     await expect(subject.transcribe(note, settings, undefined, onAttempt, () => undefined, () => undefined, leaseId))
       .rejects.toMatchObject({ code: 'audio_changed', dispatched: false });
+    expect(audio.prepare).toHaveBeenCalledWith(note, expect.objectContaining({ maxAudioBytes: 25_000_000 }));
     expect(onAttempt).not.toHaveBeenCalled();
     expect(fetcher).not.toHaveBeenCalled();
     expect(release).toHaveBeenCalledWith(leaseId);
+  });
+
+  it('rejects a profile-2 audio snapshot over 25,000,000 bytes before durable dispatch', async () => {
+    const audio = audioService({ prepare: vi.fn(async () => ({
+      ...prepared, byteLength: 25_000_001,
+    })) });
+    const fetcher = vi.fn(async () => new Response(JSON.stringify({ text: 'must not send' }), { status: 200 }));
+    const subject = new OpenRouterSpeechAdapter({ audio, client: client({ fetcher }), sha256: async () => 'a'.repeat(64) });
+    const onAttempt = vi.fn(async () => undefined);
+
+    await expect(subject.transcribe(note, settings, undefined, onAttempt, () => undefined, () => undefined, leaseId))
+      .rejects.toMatchObject({ code: 'invalid_audio', dispatched: false });
+    expect(onAttempt).not.toHaveBeenCalled();
+    expect(fetcher).not.toHaveBeenCalled();
   });
 
   it('keeps the staged audio lease owned until the actual request promise settles', async () => {

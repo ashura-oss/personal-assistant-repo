@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { validateTranscriptionState, TRANSCRIPTION_SCHEMA_VERSION, type AzureTranscriptionAttempt, type OpenRouterTranscriptionAttempt, type TranscriptionState } from '../src/transcription';
+import { OPENROUTER_SPEECH_DEFAULT_MODEL } from '../src/transcription/openRouterSpeechProfiles';
 
 const attempt = {
   id: '22222222-2222-4222-8222-222222222222', leaseId: '11111111-1111-4111-8111-111111111111', noteId: '33333333-3333-4333-8333-333333333333',
@@ -108,5 +109,25 @@ describe('transcription journal validation', () => {
     const azureDurationInOpenRouter = structuredClone(state);
     Object.assign(azureDurationInOpenRouter.attempts[0], { lateObservations: [{ at: '2026-10-13T04:03:00.000Z', kind: 'provider_duration', durationMilliseconds: 1_000 }] });
     expect(() => validateTranscriptionState(azureDurationInOpenRouter)).toThrow(/Azure duration/i);
+  });
+
+  it('accepts profile 2 while retaining the exact profile-1 model pairing for historical attempts', () => {
+    const state = base();
+    const prepared = { leaseId: attempt.leaseId, platform: 'native' as const, format: 'm4a' as const, mimeType: 'audio/mp4', byteLength: 16, sha256: 'a'.repeat(64), durationSeconds: 7.25 };
+    const v2: OpenRouterTranscriptionAttempt = {
+      id: attempt.id, leaseId: attempt.leaseId, noteId: attempt.noteId, sourceRevision: 4,
+      source: { ...attempt.source, provider: 'openrouter' }, provider: 'openrouter', profileVersion: 2,
+      model: OPENROUTER_SPEECH_DEFAULT_MODEL, endpoint: 'https://openrouter.ai/api/v1/audio/transcriptions', locale: 'auto',
+      createdAt: attempt.createdAt, terminalAt: '2026-10-13T04:02:00.000Z', dispatchStarted: true, outcome: 'completed',
+      prepared, transcriptSha256: 'b'.repeat(64), actualUsage: { costUsd: 0 }, unknownCharge: false,
+    };
+    state.attempts[0] = v2 as unknown as AzureTranscriptionAttempt;
+    expect(validateTranscriptionState(state).attempts[0]).toMatchObject({ profileVersion: 2, model: OPENROUTER_SPEECH_DEFAULT_MODEL });
+    const mismatched = structuredClone(state);
+    (mismatched.attempts[0] as unknown as Record<string, unknown>).model = 'openai/gpt-4o-mini-transcribe';
+    expect(() => validateTranscriptionState(mismatched)).toThrow(/speech profile/i);
+    const oldPair = structuredClone(state);
+    Object.assign(oldPair.attempts[0], { profileVersion: 1, model: 'openai/gpt-4o-mini-transcribe' });
+    expect(validateTranscriptionState(oldPair).attempts[0]).toMatchObject({ profileVersion: 1, model: 'openai/gpt-4o-mini-transcribe' });
   });
 });
