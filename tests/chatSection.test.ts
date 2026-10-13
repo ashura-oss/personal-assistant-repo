@@ -65,6 +65,146 @@ function button(label: string) {
 }
 
 describe('ChatSection review and submission behavior', () => {
+  const completedParentTurn = {
+    id: 'parent-turn', noteId: 'note-parent', userText: 'Summarize the planning notes.',
+    createdAt: conversation.createdAt,
+    reply: { summary: 'Summary', answer: 'A useful saved answer.', clarifications: [], completedAt: conversation.createdAt },
+    job: { id: 'parent-job', kind: 'note_assistance', status: 'completed', canCheck: false, createdAt: conversation.createdAt,
+      updatedAt: conversation.createdAt, model: 'openai/gpt-6-luna:batch', effort: 'low', unknownCharge: false,
+      costStatus: 'reported', billingScope: 'openrouter_reported', providerReportedCostUsd: 0 },
+  } satisfies React.ComponentProps<typeof ChatSection>['turns'][number];
+
+  it('reviews a separate paid refinement with Medium selected, then submits only the chosen effort', async () => {
+    const onRefineTurn = vi.fn(async () => ({ kind: 'accepted', conversationId: conversation.id, turnId: 'child-turn', jobId: 'child-job' }));
+    renderChat({ conversations: [{ ...conversation, turns: [completedParentTurn] }], turns: [completedParentTurn], onRefineTurn });
+    act(() => button('Think more')?.click());
+    expect(host.textContent).toContain('separate paid Batch request');
+    expect(host.textContent).toContain('does not change the original message or its actions');
+    expect(button('Medium · Selected')).not.toBeUndefined();
+    act(() => button('High')?.click());
+    await act(async () => { button('Refine answer')?.click(); await Promise.resolve(); });
+    expect(onRefineTurn).toHaveBeenCalledTimes(1);
+    expect(onRefineTurn).toHaveBeenCalledWith({
+      conversationId: conversation.id, parentTurnId: 'parent-turn', parentJobId: 'parent-job', effort: 'high',
+    });
+    expect(host.querySelector('[role="dialog"]')).toBeNull();
+  });
+
+  it('settles and releases the refinement review after a StrictMode effect replay', async () => {
+    let resolveRefinement!: (value: unknown) => void;
+    const onRefineTurn = vi.fn(() => new Promise((resolve) => { resolveRefinement = resolve; }));
+    const onInteractionLockChange = vi.fn();
+    const props: React.ComponentProps<typeof ChatSection> = {
+      conversations: [{ ...conversation, turns: [completedParentTurn] }],
+      selectedConversationId: conversation.id,
+      turns: [completedParentTurn],
+      busy: false,
+      enabled: true,
+      onSelectConversation: vi.fn(),
+      onCreateConversation: vi.fn(),
+      onSend: vi.fn(),
+      onOpenActions: vi.fn(),
+      onCheckJob: vi.fn(),
+      onRetryJobCleanup: vi.fn(),
+      onRefineTurn,
+      onInteractionLockChange,
+    };
+    act(() => root.render(React.createElement(React.StrictMode, null, React.createElement(ChatSection, props))));
+    act(() => button('Think more')?.click());
+    act(() => button('Refine answer')?.click());
+    expect(onRefineTurn).toHaveBeenCalledTimes(1);
+    expect(button('Cancel')?.disabled).toBe(true);
+    await act(async () => {
+      resolveRefinement({ kind: 'accepted', conversationId: conversation.id, turnId: 'strict-child', jobId: 'strict-job' });
+      await Promise.resolve();
+    });
+    expect(host.querySelector('[role="dialog"]')).toBeNull();
+    expect(button('Think more')?.disabled).toBe(false);
+    expect(onInteractionLockChange).toHaveBeenLastCalledWith(false);
+  });
+
+  it('singleflights review opening and blocks navigation in the same event turn', () => {
+    const onCreateConversation = vi.fn();
+    const onSelectConversation = vi.fn();
+    renderChat({
+      conversations: [{ ...conversation, turns: [completedParentTurn] }, { ...conversation, id: 'conversation-2', title: 'Other' }],
+      selectedConversationId: conversation.id,
+      turns: [completedParentTurn],
+      onRefineTurn: vi.fn(), onCreateConversation, onSelectConversation,
+    });
+    act(() => {
+      button('Think more')?.click();
+      button('Think more')?.click();
+      button('New conversation')?.click();
+      host.querySelector('[aria-label^="Open conversation Other"]')?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+    expect(host.querySelectorAll('[role="dialog"]')).toHaveLength(1);
+    expect(onCreateConversation).not.toHaveBeenCalled();
+    expect(onSelectConversation).not.toHaveBeenCalled();
+  });
+
+  it('keeps the review open after an unconfirmed refinement and never clears the parent answer', async () => {
+    const onRefineTurn = vi.fn(async () => undefined);
+    renderChat({ conversations: [{ ...conversation, turns: [completedParentTurn] }], turns: [completedParentTurn], onRefineTurn });
+    act(() => button('Think more')?.click());
+    await act(async () => { button('Refine answer')?.click(); await Promise.resolve(); });
+    expect(onRefineTurn).toHaveBeenCalledTimes(1);
+    expect(host.querySelector('[role="dialog"]')).not.toBeNull();
+    expect(host.textContent).toContain('Could not confirm refinement');
+    expect(host.textContent).toContain('A useful saved answer.');
+  });
+
+  it('closes a refinement review if its bound parent reply or conversation changes', async () => {
+    const props = renderChat({ conversations: [{ ...conversation, turns: [completedParentTurn] }], turns: [completedParentTurn], onRefineTurn: vi.fn() });
+    act(() => button('Think more')?.click());
+    expect(host.querySelector('[role="dialog"]')).not.toBeNull();
+    await act(async () => {
+      root.render(React.createElement(ChatSection, { ...props, conversations: [{ ...conversation, turns: [{ ...completedParentTurn, reply: undefined }] }], turns: [{ ...completedParentTurn, reply: undefined }] }));
+      await Promise.resolve();
+    });
+    expect(host.querySelector('[role="dialog"]')).toBeNull();
+  });
+
+  it('hides and invalidates a review during a hard blocker, ignoring late completion', async () => {
+    let resolveRefinement!: (value: unknown) => void;
+    const onRefineTurn = vi.fn(() => new Promise((resolve) => { resolveRefinement = resolve; }));
+    const originalConversations = [{ ...conversation, turns: [completedParentTurn] }];
+    renderChat({ conversations: originalConversations, turns: [completedParentTurn], onRefineTurn });
+    act(() => button('Think more')?.click());
+    act(() => button('Refine answer')?.click());
+    expect(onRefineTurn).toHaveBeenCalledTimes(1);
+    expect(button('Cancel')?.disabled).toBe(true);
+    await act(async () => {
+      flushSync(() => root.render(React.createElement(ChatSection, {
+        conversations: originalConversations, selectedConversationId: conversation.id, turns: [completedParentTurn], busy: true, enabled: true,
+        reviewBlocked: true, onSelectConversation: vi.fn(), onCreateConversation: vi.fn(), onSend: vi.fn(), onOpenActions: vi.fn(), onCheckJob: vi.fn(), onRetryJobCleanup: vi.fn(), onRefineTurn,
+      })));
+      expect(host.querySelector('[role="dialog"]')).toBeNull();
+      resolveRefinement({ kind: 'accepted', conversationId: conversation.id, turnId: 'late-turn', jobId: 'late-job' });
+      await Promise.resolve();
+    });
+    expect(host.querySelector('[role="dialog"]')).toBeNull();
+    expect(host.textContent).not.toContain('Refinement request saved.');
+  });
+
+  it('can refine a completed refinement as another distinct answer, with effort labeled', async () => {
+    const childTurn = {
+      ...completedParentTurn, id: 'refined-turn', noteId: 'note-refined', operation: 'chat_refinement' as const,
+      reasoningEffort: 'high' as const, parentTurnId: 'parent-turn', job: { ...completedParentTurn.job, id: 'refined-job' },
+      reply: { ...completedParentTurn.reply, answer: 'Refined saved answer.' },
+    };
+    const onRefineTurn = vi.fn(async () => ({ kind: 'accepted', conversationId: conversation.id, turnId: 'next-turn', jobId: 'next-job' }));
+    renderChat({ conversations: [{ ...conversation, turns: [completedParentTurn, childTurn] }], turns: [completedParentTurn, childTurn], onRefineTurn });
+    expect(host.textContent).toContain('Refined answer · high');
+    expect(host.textContent).toContain('Refinement of an earlier message');
+    expect(host.textContent?.match(/Summarize the planning notes\./g)).toHaveLength(1);
+    act(() => button('Think more · HIGH')?.click());
+    await act(async () => { button('Refine answer')?.click(); await Promise.resolve(); });
+    expect(onRefineTurn).toHaveBeenCalledWith({
+      conversationId: conversation.id, parentTurnId: 'refined-turn', parentJobId: 'refined-job', effort: 'medium',
+    });
+  });
+
   it('requires explicit accepted result before clearing the draft', async () => {
     const props = renderChat({ onSend: vi.fn(async () => undefined) });
     const input = enterDraft('keep my draft');

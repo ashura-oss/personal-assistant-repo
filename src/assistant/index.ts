@@ -399,6 +399,17 @@ export const assistantResponseSchemaV2 = {
   },
 } as const;
 
+/** Profile-2 chat refinement is prose-only; it cannot carry actionable payloads. */
+export const assistantChatRefinementSchemaV2 = {
+  ...assistantResponseSchemaV2,
+  properties: {
+    ...assistantResponseSchemaV2.properties,
+    decisions: { ...assistantResponseSchemaV2.properties.decisions, maxItems: 0 },
+    proposals: { ...assistantResponseSchemaV2.properties.proposals, maxItems: 0 },
+    memorySuggestions: { ...assistantResponseSchemaV2.properties.memorySuggestions, maxItems: 0 },
+  },
+} as const;
+
 function requireString(value: unknown, label: string, maxLength: number, allowEmpty = true): string {
   if (typeof value !== 'string' || value.length > maxLength || (!allowEmpty && !value.trim())) throw new Error(`Assistant response ${label} is invalid.`);
   return value;
@@ -489,6 +500,15 @@ export function validateAssistantResponse(value: unknown, catalog: SourceCatalog
 /** OpenRouter profile 2 validator. All structural and provenance checks match profile 1. */
 export function validateAssistantResponseV2(value: unknown, catalog: SourceCatalog, selection?: ContextSelection, transcriptSourceId = 'transcript'): AssistantResponse {
   return validateAssistantResponseWithLimits(value, catalog, selection, transcriptSourceId, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER);
+}
+
+/** Validates the same provenance rules as profile 2 while refusing every action-bearing field. */
+export function validateChatRefinementResponse(value: unknown, catalog: SourceCatalog, selection?: ContextSelection, transcriptSourceId = 'transcript'): AssistantResponse {
+  const response = validateAssistantResponseWithLimits(value, catalog, selection, transcriptSourceId, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER);
+  if (response.decisions.length || response.proposals.length || response.memorySuggestions.length) {
+    throw new Error('Chat refinement responses cannot include actions or memory changes.');
+  }
+  return response;
 }
 
 function firstSentence(transcript: string): string {

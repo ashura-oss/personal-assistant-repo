@@ -4,12 +4,16 @@ import {
   validateOpenRouterBatchLedger, type OpenRouterBatchJob,
 } from '../src/services/openRouterBatchJobs';
 import { OPENROUTER_BATCH_MODEL } from '../src/services/openRouter';
-import { assistantResponseSchema, assistantResponseSchemaV2 } from '../src/assistant';
+import { assistantChatRefinementSchemaV2, assistantResponseSchema, assistantResponseSchemaV2 } from '../src/assistant';
 
 const operationId = '20000000-0000-4000-8000-000000000001';
 function bodyFor(version: 1 | 2): string {
   return JSON.stringify({ model: 'openai/gpt-6-luna', messages: [{ role: 'system', content: 'SYSTEM' }, { role: 'user', content: 'CANARY PRIVATE TRANSCRIPT' }],
     reasoning: { effort: 'low', exclude: true }, response_format: { type: 'json_schema', json_schema: { name: 'note_assistance', strict: true, schema: version === 1 ? assistantResponseSchema : assistantResponseSchemaV2 } }, stream: false });
+}
+function refinementBody(): string {
+  return JSON.stringify({ model: 'openai/gpt-6-luna', messages: [{ role: 'system', content: 'SYSTEM' }, { role: 'user', content: 'CANARY PRIVATE TRANSCRIPT' }],
+    reasoning: { effort: 'high', exclude: true }, response_format: { type: 'json_schema', json_schema: { name: 'chat_refinement', strict: true, schema: assistantChatRefinementSchemaV2 } }, stream: false });
 }
 const at = '2026-10-13T10:00:00.000Z';
 
@@ -67,6 +71,23 @@ describe('private OpenRouter Batch ledger receipts', () => {
     expect(current.jobs[0]?.requestProfileVersion).toBe(2);
     expect(tombstoneOpenRouterBatchJob(current.jobs[0]!, at).requestProfileVersion).toBe(2);
     expect(() => validateOpenRouterBatchLedger({ version: 1, jobs: [contentJob({ requestProfileVersion: 2, requestBody: bodyFor(1) })] })).toThrow(/integrity validation/i);
+  });
+
+  it('requires chat refinements to retain the exact profile-2 effort pair even after content is tombstoned', () => {
+    const parentId = '20000000-0000-4000-8000-000000000006';
+    const chatBinding = { conversationId: operationId, turnId: '20000000-0000-4000-8000-000000000005', context: [], omittedTurnCount: 0,
+      refinementParent: { turnId: parentId, jobId: '20000000-0000-4000-8000-000000000007', noteId: '20000000-0000-4000-8000-000000000008',
+        noteRevision: 1, replySha256: 'e'.repeat(64), replyProfileVersion: 2 as const } };
+    const body = refinementBody();
+    const refinement = contentJob({ operation: 'chat_refinement', reasoningEffort: 'high', parentTurnId: parentId, effort: 'high',
+      requestProfileVersion: 2, requestBody: body, requestBytes: new TextEncoder().encode(body).byteLength,
+      chatBinding });
+    expect(validateOpenRouterBatchLedger({ version: 1, jobs: [refinement] }).jobs).toHaveLength(1);
+    const stripped = tombstoneOpenRouterBatchJob(refinement, at, true);
+    expect(validateOpenRouterBatchLedger({ version: 1, jobs: [stripped] }).jobs[0]).not.toHaveProperty('parentTurnId');
+    expect(() => validateOpenRouterBatchLedger({ version: 1, jobs: [{ ...stripped, requestProfileVersion: 1 }] })).toThrow(/integrity validation/i);
+    expect(() => validateOpenRouterBatchLedger({ version: 1, jobs: [{ ...refinement, effort: 'low' }] })).toThrow(/integrity validation/i);
+    expect(() => validateOpenRouterBatchLedger({ version: 1, jobs: [{ ...refinement, reasoningEffort: ['high'] }] })).toThrow(/integrity validation/i);
   });
 
   it('requires dense, unique, plain Chat context bindings', () => {

@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
+import * as Crypto from 'expo-crypto';
 import type { AppSettings, Note } from '../src/core';
 import { OpenRouterBatchRequestBuilder, OPENROUTER_BATCH_BODY_MODEL, OPENROUTER_BATCH_MODEL } from '../src/services/openRouter';
-import { assistantResponseSchema, assistantResponseSchemaV2 } from '../src/assistant';
+import { assistantChatRefinementSchemaV2, assistantResponseSchema, assistantResponseSchemaV2 } from '../src/assistant';
 
 const settings: AppSettings = {
   mode: 'provider', llmProvider: 'openrouter', openRouterModel: OPENROUTER_BATCH_MODEL,
@@ -36,6 +37,10 @@ describe('OpenRouter Batch local request builder', () => {
     expect(messages[0]?.content).toContain('recording start 2026-10-13T10:00:00.000Z in IANA timezone Asia/Singapore');
     expect(messages[1]?.content).toContain('When should I call?');
     expect(new TextEncoder().encode(prepared.body).length).toBeLessThan(1024 * 1024);
+    // Golden SHA captured by running this same fixture against the pre-refinement
+    // builder at commit 11f6371; ordinary note requests remain byte-identical.
+    await expect(Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, prepared.body, { encoding: Crypto.CryptoEncoding.HEX }))
+      .resolves.toBe('99963f9ccd1f4ec1e2d7a7d3ca111e422b9fe3b92de062f6df46a9ab99356c14');
     expect(Object.isFrozen(prepared)).toBe(true);
     expect(Object.isFrozen(prepared.includedSourceIds)).toBe(true);
   });
@@ -45,6 +50,29 @@ describe('OpenRouter Batch local request builder', () => {
     const body = JSON.parse(prepared.body) as { response_format: { json_schema: { schema: unknown } } };
     expect(prepared.requestProfileVersion).toBe(1);
     expect(body.response_format.json_schema.schema).toEqual(assistantResponseSchema);
+  });
+
+  it('builds explicit answer-only refinements with strict empty action arrays and request-local effort', async () => {
+    const prepared = await new OpenRouterBatchRequestBuilder().prepareAnalysis(note, [], settings, {
+      intent: 'answer', question: 'Respond to the current user message.', chatMode: true, chatRefinement: true,
+      operation: 'chat_refinement', reasoningEffortOverride: 'high',
+      additionalSources: [{ id: 'chat_refinement_parent:parent', revision: 1, text: 'Frozen parent reply.', required: true, kind: 'note' }],
+    }, 2);
+    const body = JSON.parse(prepared.body) as { reasoning: { effort: string }; response_format: { json_schema: { name: string; schema: typeof assistantChatRefinementSchemaV2 } }; messages: { content: string }[] };
+    expect(body.reasoning.effort).toBe('high');
+    expect(body.response_format.json_schema.name).toBe('chat_refinement');
+    expect(body.response_format.json_schema.schema).toEqual(assistantChatRefinementSchemaV2);
+    expect(assistantChatRefinementSchemaV2.properties.decisions.maxItems).toBe(0);
+    expect(assistantChatRefinementSchemaV2.properties.decisions.items).toEqual(assistantResponseSchemaV2.properties.decisions.items);
+    expect(assistantChatRefinementSchemaV2.properties.proposals.items).toEqual(assistantResponseSchemaV2.properties.proposals.items);
+    expect(body.messages[0]?.content).toContain('Set decisions, proposals, and memorySuggestions to empty arrays');
+    expect(prepared.includedSourceIds).toContain('chat_refinement_parent:parent');
+    await expect(new OpenRouterBatchRequestBuilder().prepareAnalysis(note, [], settings, {
+      intent: 'answer', chatMode: true, operation: 'chat_refinement', chatRefinement: true,
+    }, 2)).rejects.toThrow(/profile-2 request and explicit reasoning effort/i);
+    await expect(new OpenRouterBatchRequestBuilder().prepareAnalysis(note, [], settings, {
+      intent: 'answer', reasoningEffortOverride: 'high',
+    }, 2)).rejects.toThrow(/reserved for explicit chat refinement/i);
   });
 
   it('builds a separate strict reply request with locked metadata and no artificial output cap', () => {

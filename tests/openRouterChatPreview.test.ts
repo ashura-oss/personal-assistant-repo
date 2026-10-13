@@ -46,4 +46,39 @@ describe('closed OpenRouter Chat preview', () => {
     expect(fourthMessages.indexOf('What should I prepare?')).toBeLessThan(fourthMessages.indexOf('What happens next?'));
     expect(fixture.getMetrics()).toEqual({ postCount: 4, getCount: 4 });
   });
+
+  it('runs one simulated Think more Batch request after an explicitly checked completed answer', async () => {
+    process.env.EXPO_PUBLIC_PREVIEW_SCENARIO = 'openrouter-chat';
+    Object.defineProperty(globalThis, '__DEV__', { value: true, configurable: true });
+    const { createOpenRouterChatPreview } = await import('../src/dev/openRouterBatchPreview');
+    const fixture = await createOpenRouterChatPreview();
+    const conversation = await fixture.controller.createChatConversation('Sample refinement');
+    const original = await fixture.controller.submitChatTurn({ conversationId: conversation.id, text: 'Give a fictional concise answer.' });
+    expect((await fixture.controller.refreshAssistantBatch(original.jobId)).status).toBe('processing');
+    expect((await fixture.controller.refreshAssistantBatch(original.jobId)).status).toBe('completed');
+
+    const parent = fixture.controller.getSnapshot().assistantChatConversations?.[0].turns[0];
+    expect(parent?.reply?.answer).toBe('This is a simulated Batch reply.');
+    const refinement = await fixture.controller.refineChatTurn({
+      conversationId: conversation.id,
+      parentTurnId: original.turnId,
+      effort: 'high',
+    });
+    expect(refinement.kind).toBe('accepted');
+    expect((await fixture.controller.refreshAssistantBatch(refinement.jobId)).status).toBe('processing');
+    expect((await fixture.controller.refreshAssistantBatch(refinement.jobId)).status).toBe('completed');
+
+    const turns = fixture.controller.getSnapshot().assistantChatConversations?.[0].turns;
+    expect(turns).toHaveLength(2);
+    expect(turns?.[1]).toMatchObject({
+      operation: 'chat_refinement',
+      reasoningEffort: 'high',
+      parentTurnId: original.turnId,
+      userText: 'Give a fictional concise answer.',
+      reply: { answer: 'This is a simulated Batch reply.' },
+      job: { costStatus: 'reported', providerReportedCostUsd: 0, promptTokens: 41, completionTokens: 12 },
+    });
+    expect(fixture.getMetrics()).toEqual({ postCount: 2, getCount: 4 });
+    expect(fixture.getSubmittedMessages()).toHaveLength(2);
+  });
 });

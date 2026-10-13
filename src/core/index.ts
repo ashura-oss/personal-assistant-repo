@@ -858,6 +858,7 @@ export interface AppController {
   submitNoteBatch(noteId: string, options?: { intent?: AssistIntent; question?: string; knowledgeSelection?: KnowledgeSelection }): Promise<import('../services/openRouterBatchJobs').AssistantBatchJobDTO>;
   createChatConversation(title?: string): Promise<import('../chat/types').ChatConversationDTO>;
   submitChatTurn(input: { conversationId: string; text: string; knowledgeSelection?: KnowledgeSelection }): Promise<{ kind: 'accepted'; conversationId: string; turnId: string; jobId: string }>;
+  refineChatTurn(input: { conversationId: string; parentTurnId: string; effort: 'medium' | 'high' | 'max' }): Promise<{ kind: 'accepted'; conversationId: string; turnId: string; jobId: string }>;
   deleteChatConversation(id: string): Promise<void>;
   refreshAssistantBatch(jobId: string): Promise<import('../services/openRouterBatchJobs').AssistantBatchJobDTO>;
   retryAssistantBatchCleanup(jobId: string): Promise<import('../services/openRouterBatchJobs').AssistantBatchJobDTO>;

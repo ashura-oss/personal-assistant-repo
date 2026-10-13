@@ -15,6 +15,10 @@ export type ChatTurn = Readonly<{
   userText: string;
   createdAt: string;
   captureTimeZone: string;
+  capturedAt?: string;
+  operation?: 'chat_refinement';
+  reasoningEffort?: 'medium' | 'high' | 'max';
+  parentTurnId?: string;
   reply?: ChatReplySnapshot;
   replySha256?: string;
 }>;
@@ -50,6 +54,9 @@ export type ChatTurnDTO = Readonly<{
   noteId: string;
   userText: string;
   createdAt: string;
+  operation?: 'chat_refinement';
+  reasoningEffort?: 'medium' | 'high' | 'max';
+  parentTurnId?: string;
   reply?: Pick<ChatReplySnapshot, 'summary' | 'answer' | 'clarifications' | 'completedAt'>;
   job?: import('../services/openRouterBatchJobs').AssistantBatchJobDTO;
 }>;

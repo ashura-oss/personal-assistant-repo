@@ -1,5 +1,5 @@
 import type { AssistIntent, KnowledgeSelection } from '../core';
-import type { OpenRouterBatchInspection, OpenRouterBatchRequestProfileVersion } from './openRouter';
+import type { OpenRouterBatchInspection, OpenRouterBatchRequestProfileVersion, OpenRouterChatRefinementEffort } from './openRouter';
 import { isOpenRouterBatchRequestProfile, OPENROUTER_BATCH_MODEL } from './openRouter';
 
 export const OPENROUTER_BATCH_LEDGER_VERSION = 1 as const;
@@ -38,6 +38,7 @@ export interface OpenRouterChatBinding {
   readonly turnId: string;
   readonly context: readonly OpenRouterChatContextReference[];
   readonly omittedTurnCount: number;
+  readonly refinementParent?: OpenRouterChatContextReference;
 }
 
 /** Private persisted job record. Raw request text never enters AppState/public projections. */
@@ -45,11 +46,14 @@ export interface OpenRouterBatchJob {
   readonly id: string;
   readonly customId: string;
   readonly kind: AssistantBatchKind;
+  readonly operation?: 'chat_refinement';
+  readonly reasoningEffort?: OpenRouterChatRefinementEffort;
   readonly status: AssistantBatchStatus;
+  readonly parentTurnId?: string;
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly model: typeof OPENROUTER_BATCH_MODEL;
-  readonly effort: 'none' | 'low';
+  readonly effort: 'none' | 'low' | OpenRouterChatRefinementEffort;
   readonly requestSha256: string;
   readonly sourceRemoved?: true;
   readonly batchId?: string;
@@ -107,7 +111,10 @@ export interface AssistantBatchJobDTO {
   readonly noteId?: string;
   readonly noteRevision?: number;
   readonly model: typeof OPENROUTER_BATCH_MODEL;
-  readonly effort: 'none' | 'low';
+  readonly effort: 'none' | 'low' | OpenRouterChatRefinementEffort;
+  readonly operation?: 'chat_refinement';
+  readonly reasoningEffort?: OpenRouterChatRefinementEffort;
+  readonly parentTurnId?: string;
   readonly requestBytes?: number;
   readonly omittedSourceCount?: number;
   readonly unknownCharge: boolean;
@@ -163,7 +170,7 @@ function validChatBinding(value: unknown): value is OpenRouterChatBinding {
       return Boolean(descriptor?.enumerable && Object.prototype.hasOwnProperty.call(descriptor, 'value'));
     });
   };
-  if (!row || !plainDataObject(row) || !exactKeys(row, ['conversationId', 'turnId', 'context', 'omittedTurnCount']) ||
+  if (!row || !plainDataObject(row) || !exactKeys(row, ['conversationId', 'turnId', 'context', 'omittedTurnCount'], ['refinementParent']) ||
       typeof row.conversationId !== 'string' || row.conversationId.length !== 36 || !UUID_V4.test(row.conversationId) ||
       typeof row.turnId !== 'string' || row.turnId.length !== 36 || !UUID_V4.test(row.turnId) ||
       !Number.isSafeInteger(row.omittedTurnCount) || (row.omittedTurnCount as number) < 0 ||
@@ -177,18 +184,24 @@ function validChatBinding(value: unknown): value is OpenRouterChatBinding {
         const descriptor = Object.getOwnPropertyDescriptor(row.context, key);
         return !descriptor?.enumerable || !Object.prototype.hasOwnProperty.call(descriptor, 'value');
       })) return false;
+  const validReference = (candidate: unknown): candidate is OpenRouterChatContextReference => {
+    const item = record(candidate);
+    return Boolean(item && plainDataObject(item) && exactKeys(item, ['turnId', 'jobId', 'noteId', 'noteRevision', 'replySha256', 'replyProfileVersion']) &&
+      typeof item.turnId === 'string' && item.turnId.length === 36 && UUID_V4.test(item.turnId) &&
+      typeof item.jobId === 'string' && item.jobId.length === 36 && UUID_V4.test(item.jobId) &&
+      typeof item.noteId === 'string' && item.noteId.length === 36 && UUID_V4.test(item.noteId) &&
+      Number.isSafeInteger(item.noteRevision) && (item.noteRevision as number) > 0 &&
+      typeof item.replySha256 === 'string' && item.replySha256.length === 64 && SHA256.test(item.replySha256) &&
+      (item.replyProfileVersion === 1 || item.replyProfileVersion === 2));
+  };
+  if (row.refinementParent !== undefined && !validReference(row.refinementParent)) return false;
+  if (row.refinementParent !== undefined && row.context.some((candidate) => record(candidate)?.turnId === record(row.refinementParent)?.turnId)) return false;
   const seenTurnIds = new Set<string>();
   const seenJobIds = new Set<string>();
   const seenNoteIds = new Set<string>();
   return row.context.every((candidate) => {
     const item = record(candidate);
-    if (!item || !plainDataObject(item) || !exactKeys(item, ['turnId', 'jobId', 'noteId', 'noteRevision', 'replySha256', 'replyProfileVersion']) ||
-      typeof item.turnId !== 'string' || item.turnId.length !== 36 || !UUID_V4.test(item.turnId) ||
-      typeof item.jobId !== 'string' || item.jobId.length !== 36 || !UUID_V4.test(item.jobId) ||
-      typeof item.noteId !== 'string' || item.noteId.length !== 36 || !UUID_V4.test(item.noteId) ||
-      Number.isSafeInteger(item.noteRevision) === false || (item.noteRevision as number) <= 0 ||
-      typeof item.replySha256 !== 'string' || item.replySha256.length !== 64 || !SHA256.test(item.replySha256) ||
-      (item.replyProfileVersion !== 1 && item.replyProfileVersion !== 2)) return false;
+    if (!item || !validReference(item)) return false;
     if (seenTurnIds.has(item.turnId) || seenJobIds.has(item.jobId) || seenNoteIds.has(item.noteId)) return false;
     seenTurnIds.add(item.turnId); seenJobIds.add(item.jobId); seenNoteIds.add(item.noteId);
     return true;
@@ -199,12 +212,19 @@ function validJob(value: unknown): value is OpenRouterBatchJob {
   const row = record(value);
   const commonRequired = ['id', 'customId', 'kind', 'status', 'createdAt', 'updatedAt', 'model', 'effort', 'requestSha256', 'unknownCharge'];
   const commonOptional = ['batchId', 'accounting', 'failureCode'];
-  if (!row || !exactKeys(row, commonRequired, [...commonOptional, 'sourceRemoved', 'noteId', 'noteRevision', 'intent', 'question', 'knowledgeSelection', 'capturedAt', 'captureTimeZone', 'answeredAsOf', 'settingsFingerprint', 'sourceFingerprint', 'requestProfileVersion', 'requestBytes', 'omittedSourceCount', 'requestBody', 'sourceVersions', 'appliedNoteRevision', 'chatBinding'])) return false;
+  if (!row || !exactKeys(row, commonRequired, [...commonOptional, 'operation', 'reasoningEffort', 'parentTurnId', 'sourceRemoved', 'noteId', 'noteRevision', 'intent', 'question', 'knowledgeSelection', 'capturedAt', 'captureTimeZone', 'answeredAsOf', 'settingsFingerprint', 'sourceFingerprint', 'requestProfileVersion', 'requestBytes', 'omittedSourceCount', 'requestBody', 'sourceVersions', 'appliedNoteRevision', 'chatBinding'])) return false;
   if (typeof row.id !== 'string' || row.id.length !== 36 || !UUID_V4.test(row.id) || row.customId !== row.id ||
       row.kind !== 'note_assistance' || typeof row.status !== 'string' || !STATUSES.has(row.status) ||
       !canonicalIso(row.createdAt) || !canonicalIso(row.updatedAt) ||
-      row.model !== OPENROUTER_BATCH_MODEL || typeof row.effort !== 'string' || !['none', 'low'].includes(row.effort) ||
+      row.model !== OPENROUTER_BATCH_MODEL || typeof row.effort !== 'string' || !['none', 'low', 'medium', 'high', 'max'].includes(row.effort) ||
       typeof row.requestSha256 !== 'string' || row.requestSha256.length !== 64 || !SHA256.test(row.requestSha256) || typeof row.unknownCharge !== 'boolean') return false;
+  if ((row.operation !== undefined && row.operation !== 'chat_refinement') ||
+      (row.reasoningEffort !== undefined && (typeof row.reasoningEffort !== 'string' || !['medium', 'high', 'max'].includes(row.reasoningEffort))) ||
+      ((row.operation === 'chat_refinement') !== (row.reasoningEffort !== undefined)) ||
+      (row.operation === 'chat_refinement' && (row.effort !== row.reasoningEffort ||
+        (row.sourceRemoved !== true && (typeof row.parentTurnId !== 'string' || row.parentTurnId.length !== 36 || !UUID_V4.test(row.parentTurnId))) ||
+        (row.parentTurnId !== undefined && (typeof row.parentTurnId !== 'string' || row.parentTurnId.length !== 36 || !UUID_V4.test(row.parentTurnId))))) ||
+      (row.operation !== 'chat_refinement' && row.parentTurnId !== undefined)) return false;
   if (row.batchId !== undefined && (typeof row.batchId !== 'string' || row.batchId.length < 1 || row.batchId.length > 256 || /[^A-Za-z0-9_-]/.test(row.batchId))) return false;
   if (row.accounting !== undefined && !validAccounting(row.accounting)) return false;
   if (row.chatBinding !== undefined && !validChatBinding(row.chatBinding)) return false;
@@ -212,11 +232,12 @@ function validJob(value: unknown): value is OpenRouterBatchJob {
   if ((row.status === 'result_not_retained') !== (row.failureCode === 'result_not_retained')) return false;
   if (row.sourceRemoved === true) {
     return row.status === 'source_removed' && (row.requestProfileVersion === 1 || row.requestProfileVersion === 2) &&
-      exactKeys(row, [...commonRequired, 'sourceRemoved', 'requestProfileVersion'], [...commonOptional, 'chatBinding']);
+      (row.operation !== 'chat_refinement' || (row.requestProfileVersion === 2 && row.reasoningEffort === row.effort)) &&
+      exactKeys(row, [...commonRequired, 'sourceRemoved', 'requestProfileVersion'], [...commonOptional, 'operation', 'reasoningEffort', 'parentTurnId', 'chatBinding']);
   }
   if (row.sourceRemoved !== undefined || row.status === 'source_removed' || !exactKeys(row,
     [...commonRequired, 'settingsFingerprint', 'sourceFingerprint', 'requestProfileVersion', 'requestBytes', 'omittedSourceCount', 'requestBody', 'sourceVersions'],
-    [...commonOptional, 'noteId', 'noteRevision', 'intent', 'question', 'knowledgeSelection', 'capturedAt', 'captureTimeZone', 'answeredAsOf', 'appliedNoteRevision', 'chatBinding'])) return false;
+    [...commonOptional, 'operation', 'reasoningEffort', 'parentTurnId', 'noteId', 'noteRevision', 'intent', 'question', 'knowledgeSelection', 'capturedAt', 'captureTimeZone', 'answeredAsOf', 'appliedNoteRevision', 'chatBinding'])) return false;
   if (typeof row.settingsFingerprint !== 'string' || row.settingsFingerprint.length !== 64 || !SHA256.test(row.settingsFingerprint) ||
       typeof row.sourceFingerprint !== 'string' || row.sourceFingerprint.length !== 64 || !SHA256.test(row.sourceFingerprint) ||
       (row.requestProfileVersion !== 1 && row.requestProfileVersion !== 2) ||
@@ -225,7 +246,7 @@ function validJob(value: unknown): value is OpenRouterBatchJob {
       typeof row.requestBody !== 'string' || new TextEncoder().encode(row.requestBody).byteLength > 1024 * 1024 ||
       new TextEncoder().encode(row.requestBody).byteLength !== row.requestBytes) return false;
   try {
-    if (!isOpenRouterBatchRequestProfile(JSON.parse(row.requestBody), row.requestProfileVersion)) return false;
+    if (!isOpenRouterBatchRequestProfile(JSON.parse(row.requestBody), row.requestProfileVersion, row.operation ?? 'note_assistance')) return false;
   } catch { return false; }
   if (row.kind === 'note_assistance') {
     if (typeof row.noteId !== 'string' || !row.noteId || row.noteId.length > 512 || !Number.isSafeInteger(row.noteRevision) || (row.noteRevision as number) < 1 ||
@@ -234,6 +255,9 @@ function validJob(value: unknown): value is OpenRouterBatchJob {
         (row.question !== undefined && (typeof row.question !== 'string' || row.question.length > 16_384)) ||
         (row.answeredAsOf !== undefined && !canonicalIso(row.answeredAsOf)) ||
         (row.knowledgeSelection !== undefined && !validKnowledgeSelection(row.knowledgeSelection))) return false;
+    if (row.operation === 'chat_refinement' && (row.intent !== 'answer' || row.requestProfileVersion !== 2 ||
+        !row.chatBinding || !row.chatBinding.refinementParent || row.reasoningEffort !== row.effort)) return false;
+    if (row.operation !== 'chat_refinement' && (row.reasoningEffort !== undefined || row.chatBinding?.refinementParent !== undefined)) return false;
   }
   const versions = record(row.sourceVersions);
   if (!versions || Object.entries(versions).some(([key, version]) => !key || key.length > 512 || typeof version !== 'string' || version.length > 320)) return false;
@@ -292,6 +316,9 @@ export function assistantBatchJobDTO(job: OpenRouterBatchJob, cleanupPending = f
     ...(job.noteRevision !== undefined ? { noteRevision: job.noteRevision } : {}),
     model: job.model,
     effort: job.effort,
+    ...(job.operation ? { operation: job.operation } : {}),
+    ...(job.reasoningEffort ? { reasoningEffort: job.reasoningEffort } : {}),
+    ...(job.parentTurnId ? { parentTurnId: job.parentTurnId } : {}),
     ...(job.requestBytes !== undefined ? { requestBytes: job.requestBytes } : {}),
     ...(job.omittedSourceCount !== undefined ? { omittedSourceCount: job.omittedSourceCount } : {}),
     unknownCharge: job.unknownCharge,
@@ -315,14 +342,16 @@ export function isOpenRouterBatchContentJob(job: OpenRouterBatchJob): job is Ope
 
 export function tombstoneOpenRouterBatchJob(job: OpenRouterBatchJob, updatedAt: string, stripChatBinding = false): OpenRouterBatchTombstone {
   if (job.sourceRemoved) {
-    if (!stripChatBinding || !job.chatBinding) return job as OpenRouterBatchTombstone;
-    const { chatBinding: _chatBinding, ...contentFreeReceipt } = job;
+    if (!stripChatBinding || (!job.chatBinding && job.parentTurnId === undefined)) return job as OpenRouterBatchTombstone;
+    const { chatBinding: _chatBinding, parentTurnId: _parentTurnId, ...contentFreeReceipt } = job;
     return Object.freeze(contentFreeReceipt) as OpenRouterBatchTombstone;
   }
   return Object.freeze({
     id: job.id, customId: job.customId, kind: job.kind, sourceRemoved: true,
     status: 'source_removed', createdAt: job.createdAt, updatedAt,
     model: job.model, effort: job.effort, requestProfileVersion: job.requestProfileVersion ?? 1, requestSha256: job.requestSha256,
+    ...(job.operation ? { operation: job.operation } : {}),
+    ...(job.reasoningEffort ? { reasoningEffort: job.reasoningEffort } : {}),
     ...(!stripChatBinding && job.chatBinding ? { chatBinding: job.chatBinding } : {}),
     ...(job.batchId ? { batchId: job.batchId } : {}),
     unknownCharge: job.unknownCharge,

@@ -122,6 +122,305 @@ describe('OpenRouter Batch controller lifecycle', () => {
     expect(JSON.stringify(deleted)).not.toContain('Bring the outline and a question for the team.');
   });
 
+  it('refines a completed answer with its exact inherited context and rebuilds nested refinements identically', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-13T10:00:00.000Z'));
+    try {
+      const postedBodies: { body: Record<string, unknown>; operationId: string }[] = [];
+      const fakeClient = {
+        submit: async (input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => {
+          await before();
+          assert();
+          postedBodies.push({ body: JSON.parse(input.requestBody) as Record<string, unknown>, operationId: input.operationId });
+          return { batchId: `batch_refinement_${postedBodies.length}`, status: 'validating', endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH,
+            model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h', total: 1, completed: 0, failed: 0 };
+        },
+        inspect: async (batchId: string, customId: string) => ({ ...completedInspection(customId, JSON.stringify({
+          summary: 'A compact summary of the prior answer.', answer: 'The complete prior answer contains useful details.', decisions: [], citations: [], clarifications: [],
+          proposals: batchId === 'batch_refinement_2' ? [{ kind: 'task', title: 'Prepare an outline', body: 'Bring a concise outline.', recipients: [], dueAt: null,
+            evidence: ['Please prepare a concise outline.'] }] : [], memorySuggestions: [],
+        })), batchId }),
+      } as unknown as OpenRouterBatchClient;
+      const store = new MemoryStore();
+      const app = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient });
+      await app.load();
+      await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
+      const conversation = await app.createChatConversation('Refinement');
+      const first = await app.submitChatTurn({ conversationId: conversation.id, text: 'Earlier context.' });
+      await app.refreshAssistantBatch(first.jobId);
+      const parent = await app.submitChatTurn({ conversationId: conversation.id, text: 'Please prepare a concise outline.' });
+      await app.refreshAssistantBatch(parent.jobId);
+      const parentProposal = app.getSnapshot().proposals.find((proposal) => proposal.kind === 'task');
+      expect(parentProposal).toBeDefined();
+      const approvedParentProposal = await app.approveProposal(parentProposal!.id, { expectedRevision: parentProposal!.revision });
+      expect(approvedParentProposal.status).toBe('approved');
+      const executedParentProposal = await app.executeProposal(approvedParentProposal.id, { expectedRevision: approvedParentProposal.revision });
+      expect(executedParentProposal.status).toBe('executed');
+      const beforeRefine = store.value as AppState & {
+        assistantChatLedger: { conversations: { turns: { id: string; noteId: string }[] }[] };
+        openRouterBatchLedger: { jobs: { id: string; requestBody: string; chatBinding?: { context: unknown[] } }[] };
+      };
+      const originalParentJob = beforeRefine.openRouterBatchLedger.jobs.find((job) => job.id === parent.jobId)!;
+      const originalParentNote = structuredClone(beforeRefine.notes.find((note) => note.id === beforeRefine.assistantChatLedger.conversations[0]?.turns.find((turn) => turn.id === parent.turnId)?.noteId));
+      const originalParentProposal = structuredClone(beforeRefine.proposals.find((proposal) => proposal.id === parentProposal!.id));
+      const originalTasks = structuredClone(beforeRefine.tasks);
+      const originalDispatchRecords = structuredClone(beforeRefine.dispatchRecords);
+
+      vi.setSystemTime(new Date('2026-10-13T10:05:00.000Z'));
+
+      const refined = await app.refineChatTurn({ conversationId: conversation.id, parentTurnId: parent.turnId, effort: 'high' });
+      const afterSubmit = store.value as AppState & { assistantChatLedger: { conversations: { turns: { id: string; parentTurnId?: string; operation?: string; capturedAt?: string; createdAt: string; reply?: unknown }[] }[] }; openRouterBatchLedger: { jobs: { id: string; operation?: string; effort: string; reasoningEffort?: string; requestProfileVersion: number; requestBody: string; knowledgeSelection?: unknown[]; parentTurnId?: string; chatBinding?: { context: unknown[]; refinementParent?: { turnId: string } } }[] } };
+      const childTurn = afterSubmit.assistantChatLedger.conversations[0]?.turns.find((turn) => turn.id === refined.turnId)!;
+      const childJob = afterSubmit.openRouterBatchLedger.jobs.find((job) => job.id === refined.jobId)!;
+      expect(childTurn).toMatchObject({ parentTurnId: parent.turnId, operation: 'chat_refinement', capturedAt: '2026-10-13T10:00:00.000Z' });
+      expect(childTurn.createdAt).toBe('2026-10-13T10:05:00.000Z');
+      expect(childTurn.capturedAt).not.toBe(childTurn.createdAt);
+      expect(childJob).toMatchObject({ operation: 'chat_refinement', effort: 'high', reasoningEffort: 'high', requestProfileVersion: 2, parentTurnId: parent.turnId });
+      expect(childJob.chatBinding?.context).toEqual(originalParentJob.chatBinding?.context);
+      const childWire = postedBodies.at(-1)?.body as { reasoning: { effort: string }; response_format: { json_schema: { name: string } }; messages: { content: string }[] };
+      expect(childWire.reasoning.effort).toBe('high');
+      expect(childWire.response_format.json_schema.name).toBe('chat_refinement');
+      expect(childWire.messages.some((message) => message.content.includes('Earlier context.'))).toBe(true);
+      expect(childWire.messages.some((message) => message.content.includes('A compact summary of the prior answer.'))).toBe(true);
+      expect(childWire.messages.some((message) => message.content.includes('The complete prior answer contains useful details.'))).toBe(true);
+      await app.refreshAssistantBatch(refined.jobId);
+      expect(app.getSnapshot().assistantChatConversations?.[0]?.turns.find((turn) => turn.id === refined.turnId)?.reply?.answer)
+        .toBe('The complete prior answer contains useful details.');
+
+      vi.setSystemTime(new Date('2026-10-13T10:07:00.000Z'));
+      const nested = await app.refineChatTurn({ conversationId: conversation.id, parentTurnId: refined.turnId, effort: 'max' });
+      const nestedPersisted = store.value as typeof afterSubmit;
+      const nestedJob = nestedPersisted.openRouterBatchLedger.jobs.find((job) => job.id === nested.jobId)!;
+      expect(nestedJob).toMatchObject({ operation: 'chat_refinement', effort: 'max', reasoningEffort: 'max', parentTurnId: refined.turnId });
+      expect(nestedJob.chatBinding?.context).toEqual(childJob.chatBinding?.context);
+      expect(nestedJob.chatBinding?.refinementParent?.turnId).toBe(refined.turnId);
+      const nestedTurn = nestedPersisted.assistantChatLedger.conversations[0]?.turns.find((turn) => turn.id === nested.turnId)!;
+      expect(nestedTurn.capturedAt).toBe('2026-10-13T10:00:00.000Z');
+      expect(nestedTurn.createdAt).toBe('2026-10-13T10:07:00.000Z');
+      expect(nestedTurn.createdAt).not.toBe(nestedTurn.capturedAt);
+      const nestedWire = postedBodies.at(-1)?.body as { messages: { content: string }[] };
+      expect(nestedWire.messages.some((message) => message.content.includes('Earlier context.'))).toBe(true);
+      expect(nestedWire.messages.some((message) => message.content.includes('The complete prior answer contains useful details.'))).toBe(true);
+      await app.refreshAssistantBatch(nested.jobId);
+      expect(app.getSnapshot().assistantChatConversations?.[0]?.turns.find((turn) => turn.id === nested.turnId)?.reply?.answer)
+        .toBe('The complete prior answer contains useful details.');
+      const restored = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient });
+      await restored.load();
+      expect(restored.getSnapshot().assistantBatchRecoveryStatus?.blocked).not.toBe(true);
+      expect(restored.getSnapshot().assistantChatConversations?.[0]?.turns.find((turn) => turn.id === nested.turnId)?.reply?.answer)
+        .toBe('The complete prior answer contains useful details.');
+      const finalState = store.value as typeof afterSubmit;
+      expect(finalState.openRouterBatchLedger.jobs.find((job) => job.id === parent.jobId)?.requestBody).toBe(originalParentJob.requestBody);
+      expect(finalState.notes.find((note) => note.id === originalParentNote?.id)).toEqual(originalParentNote);
+      expect(finalState.proposals.find((proposal) => proposal.id === parentProposal!.id)).toEqual(originalParentProposal);
+      expect(finalState.tasks).toEqual(originalTasks);
+      expect(finalState.dispatchRecords).toEqual(originalDispatchRecords);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps the captured refinement choices and releases only the originally locked conversation', async () => {
+    const posted: Record<string, unknown>[] = [];
+    const fakeClient = {
+      submit: async (input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => {
+        await before(); assert(); posted.push(JSON.parse(input.requestBody) as Record<string, unknown>);
+        return { batchId: `batch_mutable_${posted.length}`, status: 'validating', endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH,
+          model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h', total: 1, completed: 0, failed: 0 };
+      },
+      inspect: async (batchId: string, customId: string) => ({ ...completedInspection(customId), batchId }),
+    } as unknown as OpenRouterBatchClient;
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient });
+    await app.load();
+    await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
+    const originalConversation = await app.createChatConversation('Captured inputs');
+    const otherConversation = await app.createChatConversation('Other conversation');
+    const parent = await app.submitChatTurn({ conversationId: originalConversation.id, text: 'Retain this message.' });
+    await app.refreshAssistantBatch(parent.jobId);
+
+    const originalDigest = Crypto.digestStringAsync.bind(Crypto);
+    let releaseDigest!: () => void;
+    let reachedDigest!: () => void;
+    const digestStarted = new Promise<void>((resolve) => { reachedDigest = resolve; });
+    const digestGate = new Promise<void>((resolve) => { releaseDigest = resolve; });
+    let holdFirstDigest = true;
+    const spy = vi.spyOn(Crypto, 'digestStringAsync').mockImplementation(async (...args) => {
+      if (holdFirstDigest) { holdFirstDigest = false; reachedDigest(); await digestGate; }
+      return originalDigest(...args);
+    });
+    const mutableInput: { conversationId: string; parentTurnId: string; effort: 'medium' | 'high' | 'max' } = {
+      conversationId: originalConversation.id, parentTurnId: parent.turnId, effort: 'high',
+    };
+    try {
+      const refining = app.refineChatTurn(mutableInput);
+      await digestStarted;
+      mutableInput.conversationId = otherConversation.id;
+      mutableInput.parentTurnId = '00000000-0000-4000-8000-000000000001';
+      mutableInput.effort = 'max';
+      releaseDigest();
+      const accepted = await refining;
+      expect(accepted.conversationId).toBe(originalConversation.id);
+      expect((posted.at(-1)?.reasoning as { effort: string }).effort).toBe('high');
+      await expect(app.submitChatTurn({ conversationId: originalConversation.id, text: 'Original lock is released.' })).resolves.toMatchObject({ kind: 'accepted' });
+      await expect(app.submitChatTurn({ conversationId: otherConversation.id, text: 'Other conversation remains usable.' })).resolves.toMatchObject({ kind: 'accepted' });
+    } finally { releaseDigest(); spy.mockRestore(); }
+  });
+
+  it('refuses a required parent source that cannot fit before saving or posting a child request', async () => {
+    let posts = 0;
+    const hugeAnswer = 'P'.repeat(1_100_000);
+    const fakeClient = {
+      submit: async (_input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => {
+        await before(); assert(); posts += 1;
+        return { batchId: `batch_parent_capacity_${posts}`, status: 'validating', endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH,
+          model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h', total: 1, completed: 0, failed: 0 };
+      },
+      inspect: async (batchId: string, customId: string) => ({ ...completedInspection(customId, JSON.stringify({
+        summary: 'A full answer.', answer: hugeAnswer, decisions: [], citations: [], clarifications: [], proposals: [], memorySuggestions: [],
+      })), batchId }),
+    } as unknown as OpenRouterBatchClient;
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient });
+    await app.load();
+    await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
+    const conversation = await app.createChatConversation('Required parent capacity');
+    const parent = await app.submitChatTurn({ conversationId: conversation.id, text: 'Keep the entire parent answer.' });
+    expect((await app.refreshAssistantBatch(parent.jobId)).status).toBe('completed');
+    const savesBeforeChild = store.saves;
+    const beforeChild = store.value as AppState & { assistantChatLedger: { conversations: { turns: unknown[] }[] } };
+    const turnsBeforeChild = beforeChild.assistantChatLedger.conversations[0]?.turns.length;
+    await expect(app.refineChatTurn({ conversationId: conversation.id, parentTurnId: parent.turnId, effort: 'high' }))
+      .rejects.toThrow(/request|context|source|too large|limit|fit/i);
+    expect(posts).toBe(1);
+    expect(store.saves).toBe(savesBeforeChild);
+    expect((store.value as typeof beforeChild).assistantChatLedger.conversations[0]?.turns).toHaveLength(turnsBeforeChild);
+  });
+
+  it('tombstones refinements when their required parent source is removed', async () => {
+    let postCount = 0;
+    const fakeClient = {
+      submit: async (input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => {
+        await before(); assert(); postCount += 1;
+        return { batchId: `batch_removed_parent_${postCount}`, status: 'validating', endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH,
+          model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h', total: 1, completed: 0, failed: 0 };
+      },
+      inspect: async (batchId: string, customId: string) => ({ ...completedInspection(customId, JSON.stringify({
+        summary: `Summary ${batchId}.`, answer: `Answer ${batchId}.`, decisions: [], citations: [], clarifications: [], proposals: [], memorySuggestions: [],
+      })), batchId }),
+    } as unknown as OpenRouterBatchClient;
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient });
+    await app.load();
+    await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
+    const person = await app.savePerson({ name: 'Maya', aliases: [], narrative: 'A private parent source.' });
+    const conversation = await app.createChatConversation('Removed refinement source');
+    const parent = await app.submitChatTurn({ conversationId: conversation.id, text: 'Summarize this person.', knowledgeSelection: [{ kind: 'person', id: person.id }] });
+    await app.refreshAssistantBatch(parent.jobId);
+    const child = await app.refineChatTurn({ conversationId: conversation.id, parentTurnId: parent.turnId, effort: 'high' });
+    await app.refreshAssistantBatch(child.jobId);
+    expect(app.getSnapshot().assistantChatConversations?.[0]?.turns.find((turn) => turn.id === child.turnId)?.reply).toBeDefined();
+
+    const currentPerson = app.getSnapshot().knowledge.people.find((item) => item.id === person.id)!;
+    const narrative = app.getSnapshot().documents.find((item) => item.path === person.narrativePath)!;
+    await app.savePerson({ id: person.id, expectedRevision: currentPerson.revision, expectedDocumentRevision: narrative.revision,
+      name: 'Maya', aliases: [], narrative: 'The parent source has been removed.' });
+    const persisted = store.value as AppState & {
+      assistantChatLedger: { conversations: { turns: { id: string; reply?: unknown; replySha256?: string }[] }[] };
+      openRouterBatchLedger: { jobs: { id: string; status: string; requestBody?: string; chatBinding?: unknown }[] };
+    };
+    for (const turnId of [parent.turnId, child.turnId]) {
+      const turn = persisted.assistantChatLedger.conversations[0]?.turns.find((item) => item.id === turnId);
+      expect(turn?.reply).toBeUndefined();
+      expect(turn?.replySha256).toBeUndefined();
+    }
+    for (const jobId of [parent.jobId, child.jobId]) {
+      const job = persisted.openRouterBatchLedger.jobs.find((item) => item.id === jobId);
+      expect(job).toMatchObject({ status: 'source_removed' });
+      expect(job).not.toHaveProperty('requestBody');
+      expect(job).not.toHaveProperty('chatBinding');
+    }
+    expect(JSON.stringify(persisted)).not.toContain('A private parent source.');
+  });
+
+  it('rebuilds refinement requests with the parent context omission count unchanged', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-13T10:00:00.000Z'));
+    try {
+      const longAnswer = 'C'.repeat(30_000);
+      const fakeClient = {
+        submit: async (input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => {
+          await before(); assert();
+          return { batchId: `batch_omission_${input.operationId.slice(0, 8)}`, status: 'validating', endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH,
+            model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h', total: 1, completed: 0, failed: 0 };
+        },
+        inspect: async (batchId: string, customId: string) => ({ ...completedInspection(customId, JSON.stringify({
+          summary: 'Prior summary.', answer: longAnswer, decisions: [], citations: [], clarifications: [], proposals: [], memorySuggestions: [],
+        })), batchId }),
+      } as unknown as OpenRouterBatchClient;
+      const store = new MemoryStore();
+      const app = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient });
+      await app.load();
+      await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
+      const conversation = await app.createChatConversation('Omitted history');
+      const first = await app.submitChatTurn({ conversationId: conversation.id, text: 'First history item.' });
+      await app.refreshAssistantBatch(first.jobId);
+      const second = await app.submitChatTurn({ conversationId: conversation.id, text: 'Second history item.' });
+      await app.refreshAssistantBatch(second.jobId);
+      const parent = await app.submitChatTurn({ conversationId: conversation.id, text: 'Refine the recent context.' });
+      await app.refreshAssistantBatch(parent.jobId);
+      const before = store.value as AppState & { openRouterBatchLedger: { jobs: { id: string; omittedSourceCount: number; chatBinding?: { omittedTurnCount: number; context: unknown[] } }[] } };
+      const parentJob = before.openRouterBatchLedger.jobs.find((job) => job.id === parent.jobId)!;
+      expect(parentJob.chatBinding?.omittedTurnCount).toBe(1);
+      expect(parentJob.chatBinding?.context).toHaveLength(1);
+      const child = await app.refineChatTurn({ conversationId: conversation.id, parentTurnId: parent.turnId, effort: 'medium' });
+      const after = store.value as typeof before;
+      const childJob = after.openRouterBatchLedger.jobs.find((job) => job.id === child.jobId)!;
+      expect(childJob.chatBinding?.omittedTurnCount).toBe(1);
+      expect(childJob.chatBinding?.context).toEqual(parentJob.chatBinding?.context);
+      await app.refreshAssistantBatch(child.jobId);
+      expect(app.getSnapshot().assistantBatchJobs?.find((job) => job.id === child.jobId)?.status).toBe('completed');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('retains paid accounting but rejects action-bearing refinement output', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-13T10:00:00.000Z'));
+    try {
+      let batchCount = 0;
+      const normal = JSON.stringify({ summary: 'Original summary.', answer: 'Original answer.', decisions: [], citations: [], clarifications: [], proposals: [], memorySuggestions: [] });
+      const actionBearing = JSON.stringify({ summary: 'Refined summary.', answer: 'Refined answer.', decisions: [], citations: [], clarifications: [],
+        proposals: [{ kind: 'task', title: 'Should be rejected', body: 'No action from a refinement.', recipients: [], dueAt: null, evidence: ['Please refine this.'] }], memorySuggestions: [] });
+      const fakeClient = {
+        submit: async (_input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => {
+          await before(); assert(); batchCount += 1;
+          return { batchId: `batch_action_${batchCount}`, status: 'validating', endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH,
+            model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h', total: 1, completed: 0, failed: 0 };
+        },
+        inspect: async (batchId: string, customId: string) => completedInspection(customId, batchId === 'batch_action_2' ? actionBearing : normal),
+      } as unknown as OpenRouterBatchClient;
+      const store = new MemoryStore();
+      const app = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient });
+      await app.load();
+      await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
+      const conversation = await app.createChatConversation('Answer only');
+      const parent = await app.submitChatTurn({ conversationId: conversation.id, text: 'Please refine this.' });
+      await app.refreshAssistantBatch(parent.jobId);
+      const child = await app.refineChatTurn({ conversationId: conversation.id, parentTurnId: parent.turnId, effort: 'medium' });
+      const result = await app.refreshAssistantBatch(child.jobId);
+      expect(result.status).toBe('result_invalid');
+      expect(result.unknownCharge).toBe(false);
+      expect(result.providerReportedCostUsd).toBe(0.001);
+      expect(app.getSnapshot().assistantChatConversations?.[0]?.turns.find((turn) => turn.id === child.turnId)?.reply).toBeUndefined();
+      expect(app.getSnapshot().proposals).toHaveLength(0);
+      expect(app.getSnapshot().assistantBatchJobs?.find((job) => job.id === child.jobId)?.status).toBe('result_invalid');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('does not claim an ambiguously acknowledged Chat save or send again after reload', async () => {
     let posts = 0;
     const fakeClient = { submit: async () => { posts += 1; throw new Error('unexpected dispatch'); } } as unknown as OpenRouterBatchClient;
@@ -139,6 +438,35 @@ describe('OpenRouter Batch controller lifecycle', () => {
     expect(reloaded.getSnapshot().assistantChatConversations?.[0]?.turns).toHaveLength(1);
     expect(reloaded.getSnapshot().assistantChatConversations?.[0]?.turns[0]?.job?.status).toBe('failed');
     expect(posts).toBe(0);
+  });
+
+  it('does not return an accepted Chat DTO when privacy admission fails after the staged save', async () => {
+    let privacyBlocked = false;
+    let postCalls = 0;
+    const privacySession = { epoch: 'fixture-epoch', assertCurrent: async () => {
+      if (privacyBlocked) throw new Error('The privacy session was invalidated.');
+    } };
+    const fakeClient = {
+      submit: async (_input: { operationId: string; requestBody: string }, before: () => Promise<void>) => {
+        privacyBlocked = true;
+        await before();
+        postCalls += 1;
+        return { batchId: 'batch_should_not_exist', status: 'validating', endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH,
+          model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h', total: 1, completed: 0, failed: 0 };
+      },
+    } as unknown as OpenRouterBatchClient;
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient, privacySession });
+    await app.load();
+    await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
+    const conversation = await app.createChatConversation('Privacy admission');
+    await expect(app.submitChatTurn({ conversationId: conversation.id, text: 'Do not dispatch after invalidation.' }))
+      .rejects.toThrow(/privacy session was invalidated/i);
+    expect(postCalls).toBe(0);
+    const persisted = store.value as AppState & { openRouterBatchLedger: { jobs: { status: string; batchId?: string }[] } };
+    expect(persisted.openRouterBatchLedger.jobs).toHaveLength(1);
+    expect(persisted.openRouterBatchLedger.jobs[0]).toMatchObject({ status: 'preparing' });
+    expect(persisted.openRouterBatchLedger.jobs[0]).not.toHaveProperty('batchId');
   });
 
   it('quarantines a malformed Chat ledger and hides its synthetic notes', async () => {

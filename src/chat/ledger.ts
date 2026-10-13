@@ -98,7 +98,7 @@ function parseReply(value: unknown): ChatReplySnapshot {
 
 function parseTurn(value: unknown): ChatTurn {
   if (!object(value)) fail('Chat turn is invalid.');
-  exactKeys(value, ['id', 'noteId', 'noteRevision', 'jobId', 'userText', 'createdAt', 'captureTimeZone'], ['reply', 'replySha256']);
+  exactKeys(value, ['id', 'noteId', 'noteRevision', 'jobId', 'userText', 'createdAt', 'captureTimeZone'], ['capturedAt', 'operation', 'reasoningEffort', 'parentTurnId', 'reply', 'replySha256']);
   const base = {
     id: uuid(value.id, 'Chat turn ID'),
     noteId: uuid(value.noteId, 'Chat note ID'),
@@ -107,7 +107,15 @@ function parseTurn(value: unknown): ChatTurn {
     userText: text(value.userText, 'Chat message'),
     createdAt: timestamp(value.createdAt, 'Chat turn time'),
     captureTimeZone: timeZone(value.captureTimeZone),
+    ...(value.capturedAt !== undefined ? { capturedAt: timestamp(value.capturedAt, 'Chat capture time') } : {}),
+    ...(value.operation !== undefined ? { operation: value.operation as 'chat_refinement' } : {}),
+    ...(value.reasoningEffort !== undefined ? { reasoningEffort: value.reasoningEffort as 'medium' | 'high' | 'max' } : {}),
+    ...(value.parentTurnId !== undefined ? { parentTurnId: uuid(value.parentTurnId, 'Chat parent turn ID') } : {}),
   };
+  if (value.operation !== undefined || value.reasoningEffort !== undefined || value.parentTurnId !== undefined) {
+    if (value.operation !== 'chat_refinement' || typeof value.reasoningEffort !== 'string' || !['medium', 'high', 'max'].includes(value.reasoningEffort) ||
+        typeof value.parentTurnId !== 'string' || value.capturedAt === undefined) fail('Chat refinement binding is invalid.');
+  }
   const hasReply = Object.prototype.hasOwnProperty.call(value, 'reply');
   const hasReplyDigest = Object.prototype.hasOwnProperty.call(value, 'replySha256');
   if (hasReply !== hasReplyDigest || (hasReplyDigest && (typeof value.replySha256 !== 'string' || value.replySha256.length !== 64 || !SHA256.test(value.replySha256)))) {
@@ -161,6 +169,16 @@ export function validateChatLedger(value: unknown): ReadonlyChatLedger {
     for (const turn of conversation.turns) {
       if (turnIds.has(turn.id) || noteIds.has(turn.noteId) || jobIds.has(turn.jobId)) fail('Chat turn, note, and job references must be unique.');
       turnIds.add(turn.id); noteIds.add(turn.noteId); jobIds.add(turn.jobId);
+    }
+    for (let index = 0; index < conversation.turns.length; index += 1) {
+      const turn = conversation.turns[index];
+      if (turn.operation !== 'chat_refinement') continue;
+      const parentIndex = conversation.turns.findIndex((candidate) => candidate.id === turn.parentTurnId);
+      const parent = conversation.turns[parentIndex];
+      if (parentIndex < 0 || parentIndex >= index || parent.userText !== turn.userText ||
+          (parent.capturedAt ?? parent.createdAt) !== turn.capturedAt || parent.captureTimeZone !== turn.captureTimeZone) {
+        fail('Chat refinement must preserve the exact parent message and capture anchor.');
+      }
     }
   }
   const ledger = Object.freeze({ version: 1 as const, conversations: frozenArray(conversations) });

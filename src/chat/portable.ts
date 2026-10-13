@@ -27,6 +27,8 @@ export type PortableChatTurn = Readonly<{
   createdAt: string;
   capturedAt: string;
   captureTimeZone: string;
+  operation?: 'chat_refinement';
+  reasoningEffort?: 'medium' | 'high' | 'max';
   reply?: PortableChatReply;
   accounting?: PortableChatAccounting;
 }>;
@@ -59,7 +61,7 @@ export type InertImportedChatConversation = Readonly<{
 }>;
 
 const PORTABLE_TURN_KEYS = ['userText', 'createdAt', 'capturedAt', 'captureTimeZone'] as const;
-const PORTABLE_TURN_OPTIONAL_KEYS = ['reply', 'accounting'] as const;
+const PORTABLE_TURN_OPTIONAL_KEYS = ['reply', 'accounting', 'operation', 'reasoningEffort'] as const;
 
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const CANONICAL_ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
@@ -152,15 +154,19 @@ function parseReply(value: unknown): PortableChatReply {
 }
 function parseTurn(value: unknown, conversationCreated: string, conversationUpdated: string): PortableChatTurn {
   if (!object(value)) fail('Portable Chat turn is invalid.');
-  exactKeys(value, ['userText', 'createdAt', 'capturedAt', 'captureTimeZone'], ['reply', 'accounting']);
+  exactKeys(value, ['userText', 'createdAt', 'capturedAt', 'captureTimeZone'], ['reply', 'accounting', 'operation', 'reasoningEffort']);
   const createdAt = timestamp(value.createdAt, 'Portable Chat turn time');
   const capturedAt = timestamp(value.capturedAt, 'Portable Chat capture time');
   if (Date.parse(createdAt) < Date.parse(conversationCreated) || Date.parse(createdAt) > Date.parse(conversationUpdated) || Date.parse(capturedAt) > Date.parse(createdAt)) {
     fail('Portable Chat turn times are outside their conversation.');
   }
   const reply = value.reply === undefined ? undefined : parseReply(value.reply);
+  if ((value.operation !== undefined && value.operation !== 'chat_refinement') ||
+      ((value.operation === 'chat_refinement') !== (value.reasoningEffort !== undefined)) ||
+      (value.reasoningEffort !== undefined && !['medium', 'high', 'max'].includes(String(value.reasoningEffort)))) fail('Portable Chat operation annotation is invalid.');
   if (reply && (Date.parse(reply.completedAt) < Date.parse(createdAt) || Date.parse(reply.completedAt) > Date.parse(conversationUpdated))) fail('Portable Chat reply time is outside its conversation.');
   return Object.freeze({ userText: text(value.userText, 'Portable Chat message'), createdAt, capturedAt, captureTimeZone: zone(value.captureTimeZone),
+    ...(value.operation === 'chat_refinement' ? { operation: 'chat_refinement' as const, reasoningEffort: value.reasoningEffort as 'medium' | 'high' | 'max' } : {}),
     ...(reply ? { reply } : {}), ...(value.accounting !== undefined ? { accounting: accounting(value.accounting) } : {}) });
 }
 
@@ -238,8 +244,8 @@ export function validateInertImportedChatHistory(value: unknown): readonly Inert
 export function projectInertImportedChatHistory(value: unknown): PortableChatHistory {
   const conversations = validateInertImportedChatHistory(value);
   return validatePortableChatHistory({ version: PORTABLE_CHAT_HISTORY_VERSION, conversations: conversations.map(({ title, createdAt, updatedAt, turns }) => ({
-    title, createdAt, updatedAt, turns: turns.map(({ userText, createdAt: turnCreatedAt, capturedAt, captureTimeZone, reply, accounting }) => ({
-      userText, createdAt: turnCreatedAt, capturedAt, captureTimeZone, ...(reply ? { reply } : {}), ...(accounting ? { accounting } : {}),
+    title, createdAt, updatedAt, turns: turns.map(({ userText, createdAt: turnCreatedAt, capturedAt, captureTimeZone, operation, reasoningEffort, reply, accounting }) => ({
+      userText, createdAt: turnCreatedAt, capturedAt, captureTimeZone, ...(operation ? { operation, reasoningEffort } : {}), ...(reply ? { reply } : {}), ...(accounting ? { accounting } : {}),
     })),
   })) });
 }
@@ -285,9 +291,10 @@ export async function createPortableChatHistory(
     const turnById = new Map(conversation.turns.map((turn) => [turn.id, turn]));
     for (const turn of conversation.turns) {
       const job = jobs.get(turn.jobId);
-      if (!job || job.kind !== 'note_assistance' || job.sourceRemoved && turn.reply) fail('Chat history could not be linked to its validated job receipt.');
+      if (!job || job.kind !== 'note_assistance' || job.sourceRemoved && turn.reply || job.operation !== turn.operation ||
+          (turn.operation === 'chat_refinement' && (job.reasoningEffort !== turn.reasoningEffort || (job.parentTurnId !== undefined && job.parentTurnId !== turn.parentTurnId)))) fail('Chat history could not be linked to its validated job receipt.');
       if (job.sourceRemoved !== true && (!job.chatBinding || job.chatBinding.conversationId !== conversation.id || job.chatBinding.turnId !== turn.id ||
-          job.noteId !== turn.noteId || job.noteRevision !== turn.noteRevision || job.capturedAt !== turn.createdAt || job.captureTimeZone !== turn.captureTimeZone)) {
+          job.noteId !== turn.noteId || job.noteRevision !== turn.noteRevision || job.capturedAt !== (turn.capturedAt ?? turn.createdAt) || job.captureTimeZone !== turn.captureTimeZone)) {
         fail('Chat history could not be linked to its validated request.');
       }
       if (turn.reply) {
@@ -307,11 +314,23 @@ export async function createPortableChatHistory(
           }
           priorIndex = index;
         }
+        if (job.operation === 'chat_refinement') {
+          const reference = job.chatBinding.refinementParent;
+          const parent = reference && turnById.get(reference.turnId);
+          const parentJob = parent && jobs.get(parent.jobId);
+          if (!reference || !parent?.reply || !parent.replySha256 || !parentJob || parent.id !== turn.parentTurnId ||
+              parent.userText !== turn.userText || parent.replySha256 !== reference.replySha256 || parent.jobId !== reference.jobId ||
+              parent.noteId !== reference.noteId || parent.noteRevision !== reference.noteRevision || parent.reply.requestProfileVersion !== reference.replyProfileVersion ||
+              parentJob.status !== 'completed' || parentJob.sourceRemoved || parentJob.requestSha256 !== parent.reply.requestSha256 || !(await verifyTurn(parent))) {
+            fail('Chat refinement has an unverifiable parent reply.');
+          }
+        }
       }
       const reply = turn.reply ? Object.freeze({ summary: turn.reply.summary, answer: turn.reply.answer,
         clarifications: Object.freeze([...turn.reply.clarifications]), completedAt: turn.reply.completedAt }) : undefined;
       const receipt = projectedAccounting(job);
-      turns.push(Object.freeze({ userText: turn.userText, createdAt: turn.createdAt, capturedAt: turn.createdAt, captureTimeZone: turn.captureTimeZone,
+      turns.push(Object.freeze({ userText: turn.userText, createdAt: turn.createdAt, capturedAt: turn.capturedAt ?? turn.createdAt, captureTimeZone: turn.captureTimeZone,
+        ...(turn.operation ? { operation: turn.operation, reasoningEffort: turn.reasoningEffort } : {}),
         ...(reply ? { reply } : {}), ...(receipt ? { accounting: receipt } : {}) }));
     }
     conversations.push(Object.freeze({ title: conversation.title, createdAt: conversation.createdAt, updatedAt: conversation.updatedAt, turns: Object.freeze(turns) }));

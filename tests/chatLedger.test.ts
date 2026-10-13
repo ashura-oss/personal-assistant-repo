@@ -85,6 +85,20 @@ describe('chat ledger', () => {
     expect(checked.conversations[0].turns.map((item) => item.reply?.completedAt)).toEqual([at(4), at(5)]);
   });
 
+  it('binds a refinement to an earlier same-conversation parent message and its original capture anchor', () => {
+    const parent = turn(1, 1, true);
+    const refinement: ChatTurn = { ...turn(2, 3), userText: parent.userText, capturedAt: parent.createdAt,
+      operation: 'chat_refinement', reasoningEffort: 'high', parentTurnId: parent.id };
+    const valid = validateChatLedger({ version: 1, conversations: [conversation([parent, refinement])] });
+    expect(valid.conversations[0]?.turns[1]).toMatchObject({ operation: 'chat_refinement', reasoningEffort: 'high', parentTurnId: parent.id, capturedAt: parent.createdAt });
+
+    expect(() => validateChatLedger({ version: 1, conversations: [conversation([parent, { ...refinement, userText: 'edited' }])] })).toThrow(/parent|refinement/i);
+    expect(() => validateChatLedger({ version: 1, conversations: [conversation([parent, { ...refinement, capturedAt: at(2) }])] })).toThrow(/anchor|refinement/i);
+    expect(() => validateChatLedger({ version: 1, conversations: [conversation([parent, { ...refinement, captureTimeZone: 'UTC' }])] })).toThrow(/anchor|refinement/i);
+    expect(() => validateChatLedger({ version: 1, conversations: [conversation([parent, { ...refinement, reasoningEffort: ['high'] as unknown as 'high' }])] })).toThrow(/refinement/i);
+    expect(() => validateChatLedger({ version: 1, conversations: [conversation([{ ...refinement, parentTurnId: ids.turn3 }])] })).toThrow(/parent|refinement/i);
+  });
+
   it('enforces the whole-ledger limit using UTF-8 bytes', () => {
     const oversized = { ...turn(1, 1, true), reply: { ...turn(1, 1, true).reply!, answer: 'é'.repeat(Math.floor(STATE_SNAPSHOT_READ_MAX_BYTES / 2) + 1) } };
     expect(() => validateChatLedger({ version: 1, conversations: [conversation([oversized])] })).toThrow(/size limit/i);

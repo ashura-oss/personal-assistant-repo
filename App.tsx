@@ -1638,6 +1638,42 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
       return accepted;
     });
   }, [controller, credentials, openSettings, run, selectedChatConversation, state.settings.llmProvider, state.settings.mode]);
+  const chatRefineTurn = useCallback(async (request: {
+    conversationId: string;
+    parentTurnId: string;
+    parentJobId: string;
+    effort: 'medium' | 'high' | 'max';
+  }) => runAcceptedChatSubmission(run, async () => {
+    if ((!isOpenRouterChatDemo && (!productionChatSubmissionEnabled ||
+        state.settings.mode !== 'provider' || state.settings.llmProvider !== 'openrouter')) || chatAppBlocked) {
+      throw new Error('Chat refinement is unavailable until the workspace is ready.');
+    }
+    const liveConversation = (state.assistantChatConversations ?? []).find((item) => item.id === request.conversationId);
+    const parent = liveConversation?.turns.find((turn) => turn.id === request.parentTurnId);
+    if (!liveConversation || selectedChatConversationId !== request.conversationId || !parent?.reply ||
+        parent.job?.status !== 'completed' || parent.job.id !== request.parentJobId) {
+      throw new Error('The saved answer changed. Reopen the refinement review.');
+    }
+    if (!isOpenRouterChatDemo) {
+      const credentialStatus = await credentials.getCredentials();
+      if (credentialStatus.openRouterConfigured !== true) {
+        openSettings();
+        throw new Error('Save an OpenRouter API key in Settings before refining a chat answer.');
+      }
+    }
+    const accepted = await controller.refineChatTurn({
+      conversationId: request.conversationId,
+      parentTurnId: request.parentTurnId,
+      effort: request.effort,
+    });
+    if (!accepted || accepted.kind !== 'accepted' || accepted.conversationId !== request.conversationId) {
+      throw new Error('The refinement request was not explicitly accepted.');
+    }
+    setNotice(isOpenRouterChatDemo
+      ? 'SAMPLE · Simulated refinement saved. Its request status is shown below. No provider or external service was contacted.'
+      : 'Refinement request saved. Its request status is shown below.');
+    return accepted;
+  }), [chatAppBlocked, controller, credentials, openSettings, run, selectedChatConversationId, state.assistantChatConversations, state.settings.llmProvider, state.settings.mode]);
   const chatDeleteConversation = useCallback(async (conversationId: string) => {
     const result = await run(async () => {
       await controller.deleteChatConversation(conversationId);
@@ -2832,6 +2868,7 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
                   return updated;
                 })}
                 onRetryJobCleanup={(jobId) => controller.retryAssistantBatchCleanup(jobId)}
+                onRefineTurn={chatRefineTurn}
               />
             ) : tab === "record" ? (
               <RecordScreen
