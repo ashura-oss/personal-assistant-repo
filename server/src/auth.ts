@@ -263,6 +263,29 @@ export class AuthService {
     return Object.freeze({ preAuthToken, csrfToken, expiresAt });
   }
 
+  /** Reuses a still-live HttpOnly pre-auth token without creating more challenge rows. */
+  resumeLoginChallenge(preAuthToken: string): LoginChallenge {
+    this.assertOpen();
+    validToken(preAuthToken, 'challenge_invalid');
+    const expectedCsrf = hmac(this.#secret, 'preauth-csrf:v1', preAuthToken);
+    return this.kernel.withTrustedDatabaseTransaction((db) => {
+      if (!db.prepare('SELECT 1 AS present FROM auth_owner WHERE singleton=1').get()) {
+        reject('not_enrolled', 'The owner account has not been enrolled.');
+      }
+      const now = this.clock();
+      const throttle = db.prepare('SELECT last_now FROM auth_throttle WHERE singleton=1').get() as { last_now: number } | undefined;
+      if (!throttle) reject('auth_schema_corrupt', 'The login throttle is unavailable.');
+      if (now < throttle.last_now) reject('clock_rollback', 'The server clock moved backwards.');
+      const challenge = db.prepare('SELECT * FROM auth_challenges WHERE challenge_hash=?').get(sha256(preAuthToken)) as ChallengeRow | undefined;
+      if (!challenge || challenge.consumed_at !== null || now < challenge.created_at || now >= challenge.expires_at ||
+        !constantTimeHexEqual(challenge.csrf_hash, sha256(expectedCsrf))) {
+        reject('challenge_invalid', 'The login challenge is invalid or expired.');
+      }
+      db.prepare('UPDATE auth_throttle SET last_now=? WHERE singleton=1').run(now);
+      return Object.freeze({ preAuthToken, csrfToken: expectedCsrf, expiresAt: challenge.expires_at });
+    });
+  }
+
   async login(input: { password: string; origin: string; preAuthToken: string; csrfToken: string; previousSessionToken?: string }): Promise<LoginResult> {
     this.assertOpen(); this.assertOrigin(input?.origin); validPassword(input?.password);
     if (!input || typeof input !== 'object' || Array.isArray(input) ||

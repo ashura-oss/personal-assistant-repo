@@ -139,6 +139,25 @@ test('login challenges are exact-origin, CSRF-bound, expiring, one-use, and surv
   }
 });
 
+test('resuming a live HttpOnly login challenge derives its CSRF value without creating rows or reusing consumed challenges', async () => {
+  const f = setup();
+  try {
+    await enroll(f);
+    const first = challenge(f);
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      assert.deepEqual(f.auth.resumeLoginChallenge(first.preAuthToken), first);
+    }
+    const db = new Database(f.databasePath);
+    assert.equal(db.prepare('SELECT count(*) AS count FROM auth_challenges WHERE consumed_at IS NULL').get().count, 1);
+    db.close();
+    await f.auth.login(credentials(first));
+    assert.throws(() => f.auth.resumeLoginChallenge(first.preAuthToken),
+      (error) => error instanceof AuthError && error.code === 'challenge_invalid');
+    const replacement = challenge(f);
+    assert.notEqual(replacement.preAuthToken, first.preAuthToken);
+  } finally { cleanup(f); }
+});
+
 test('successful login rotates the presented session; logout requires matching origin and CSRF', async () => {
   const f = setup();
   try {
