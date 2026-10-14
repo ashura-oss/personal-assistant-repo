@@ -2,11 +2,16 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { constants, lstatSync, openSync, closeSync, fstatSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
 import { extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { AuthError, type AuthService } from './auth.js';
+import { KernelError } from './kernel.js';
+import { VaultError } from './vault.js';
+import type { SafeCredentialMetadataSnapshot, ServerCredentialCommandService } from './credentialCommands.js';
 
 const BODY_LIMIT = 16 * 1024;
+const CREDENTIAL_BODY_LIMIT = 2 * 16 * 1024 * 1024 + 64 * 1024;
 const COOKIE_LIMIT = 4096;
 const BODY_TIMEOUT_MS = 10_000;
 const TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
+const COMMAND_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const HASHED_BASENAME_RE = /(?:^|[._-])[a-f\d]{8,}(?:[._-]|$)/i;
 const PROTECTED_PATH_RE = /(?:^|\/)(?:api|auth|oauth|callback|audio|uploads?|secrets?|recordings?|private|state)(?:\/|$)/i;
 const FIXED_PUBLIC_PATHS = new Map([
@@ -26,6 +31,7 @@ export interface StillHttpOptions {
   readonly canonicalOrigin: string;
   readonly staticRoot: string;
   readonly allowLocalHttp?: boolean;
+  readonly credentialCommands?: ServerCredentialCommandService;
 }
 
 interface CookieValues { readonly session?: string; readonly preauth?: string }
@@ -141,13 +147,15 @@ function jsonCookies(sessionToken: string | undefined, preauthToken: string | un
   return cookies;
 }
 
-async function readJsonBody(request: IncomingMessage, response: ServerResponse): Promise<unknown> {
+async function readJsonBody(request: IncomingMessage, response: ServerResponse, maxBytes = BODY_LIMIT): Promise<unknown> {
   const contentType = uniqueHeader(request, 'content-type', true) ?? '';
   const contentEncoding = uniqueHeader(request, 'content-encoding');
   if (!/^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(contentType) ||
     (contentEncoding !== undefined && contentEncoding.toLowerCase() !== 'identity')) throw problem(415, 'unsupported_media_type');
   const lengthHeader = uniqueHeader(request, 'content-length');
-  if (lengthHeader !== undefined && (!/^\d+$/.test(lengthHeader) || Number(lengthHeader) > BODY_LIMIT)) {
+  if (lengthHeader !== undefined && (!/^\d+$/.test(lengthHeader) || Number(lengthHeader) > maxBytes)) {
+    response.setHeader('Connection', 'close');
+    request.resume();
     throw problem(413, 'request_too_large');
   }
   const chunks: Buffer[] = [];
@@ -163,7 +171,7 @@ async function readJsonBody(request: IncomingMessage, response: ServerResponse):
     const onData = (chunk: Buffer | string) => {
       const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       size += bytes.length;
-      if (size > BODY_LIMIT) { failRequest(problem(413, 'request_too_large')); request.resume(); return; }
+      if (size > maxBytes) { response.setHeader('Connection', 'close'); failRequest(problem(413, 'request_too_large')); request.resume(); return; }
       chunks.push(bytes);
     };
     const onEnd = () => { cleanup(); resolvePromise(); };
@@ -183,6 +191,135 @@ function exactObject(value: unknown, keys: string[]): Record<string, unknown> {
     throw problem(400, 'bad_request');
   }
   return object;
+}
+
+function credentialObject(value: unknown, keys: readonly string[]): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw problem(400, 'invalid_credential_request');
+  const object = value as Record<string, unknown>;
+  const actual = Object.keys(object).sort();
+  const expected = [...keys].sort();
+  if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) {
+    throw problem(400, 'invalid_credential_request');
+  }
+  return object;
+}
+
+function canonicalCredentialValue(value: unknown): unknown {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (Array.isArray(value)) return value.map(canonicalCredentialValue);
+  if (value && typeof value === 'object') {
+    const source = value as Record<string, unknown>;
+    const target: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+    for (const key of Object.keys(source).sort()) target[key] = canonicalCredentialValue(source[key]);
+    return target;
+  }
+  throw problem(400, 'invalid_credential_request');
+}
+
+function canonicalCredentialBody(value: unknown): string {
+  const body = canonicalCredentialValue(value);
+  try { return JSON.stringify(body); }
+  catch { throw problem(400, 'invalid_credential_request'); }
+}
+
+function validateCredentialRequest(value: unknown, operation: 'put' | 'delete'): string {
+  const body = credentialObject(value, operation === 'put'
+    ? ['expectedPrivacyEpoch', 'expectedGenerations', 'keys']
+    : ['expectedPrivacyEpoch', 'expectedGenerations', 'kinds']);
+  if (!Number.isSafeInteger(body.expectedPrivacyEpoch) || (body.expectedPrivacyEpoch as number) < 0) {
+    throw problem(400, 'invalid_credential_request');
+  }
+  const allowedKinds = ['openrouter', 'speech'];
+  const requestedKinds: string[] = [];
+  if (operation === 'put') {
+    const keys = body.keys;
+    if (!keys || typeof keys !== 'object' || Array.isArray(keys)) throw problem(400, 'invalid_credential_request');
+    for (const kind of Object.keys(keys)) {
+      const secret = (keys as Record<string, unknown>)[kind];
+      if (!allowedKinds.includes(kind) || typeof secret !== 'string' || secret.length === 0 ||
+        Buffer.from(secret, 'utf8').toString('utf8') !== secret || Buffer.byteLength(secret, 'utf8') > 16 * 1024 * 1024) {
+        throw problem(400, 'invalid_credential_request');
+      }
+      requestedKinds.push(kind);
+    }
+    if (requestedKinds.length === 0) throw problem(400, 'invalid_credential_request');
+  } else {
+    const kinds = body.kinds;
+    if (!Array.isArray(kinds) || kinds.length === 0 || kinds.some((kind) => typeof kind !== 'string' || !allowedKinds.includes(kind)) ||
+      new Set(kinds).size !== kinds.length || kinds.some((kind, index) => kind !== [...kinds].sort()[index])) {
+      throw problem(400, 'invalid_credential_request');
+    }
+    requestedKinds.push(...kinds as string[]);
+  }
+  const generations = body.expectedGenerations;
+  if (!generations || typeof generations !== 'object' || Array.isArray(generations)) throw problem(400, 'invalid_credential_request');
+  const generationMap = generations as Record<string, unknown>;
+  if (Object.keys(generationMap).length !== requestedKinds.length || requestedKinds.some((kind) =>
+    !Object.hasOwn(generationMap, kind) || !Number.isSafeInteger(generationMap[kind]) || (generationMap[kind] as number) < 0)) {
+    throw problem(400, 'invalid_credential_request');
+  }
+  return canonicalCredentialBody(body);
+}
+
+function credentialServiceFailure(error: unknown): { readonly status: number; readonly code: string } {
+  if (error instanceof AuthError) return { status: authStatus(error), code: error.code };
+  if (error instanceof KernelError) {
+    switch (error.code) {
+      case 'unauthenticated': return { status: 401, code: 'unauthenticated' };
+      case 'forbidden': return { status: 403, code: 'forbidden' };
+      case 'invalid_id': case 'invalid_input': case 'invalid_json': case 'size_limit': return { status: 400, code: 'invalid_credential_request' };
+      case 'stale_epoch': case 'stale_account': case 'idempotency_conflict': return { status: 409, code: 'credential_conflict' };
+      default: return { status: 503, code: 'service_unavailable' };
+    }
+  }
+  if (error instanceof VaultError) {
+    if (error.code.startsWith('invalid_')) return { status: 400, code: 'invalid_credential_request' };
+    if (['stale_generation', 'stale_account_generation', 'generation_overflow'].includes(error.code)) {
+      return { status: 409, code: 'credential_conflict' };
+    }
+    return { status: 503, code: 'service_unavailable' };
+  }
+  if (error instanceof Error) {
+    if (error.message === 'This credential command id is already bound to different content or workspace state.') {
+      return { status: 409, code: 'credential_conflict' };
+    }
+    if (error.message === 'This credential command requires inspection and cannot be resubmitted.') {
+      return { status: 409, code: 'credential_inspection_required' };
+    }
+  }
+  return { status: 503, code: 'service_unavailable' };
+}
+
+function authenticatedMutation(request: IncomingMessage, auth: AuthService, canonicalOrigin: URL):
+  { readonly sessionToken: string; readonly origin: string; readonly csrf: string } {
+  const origin = uniqueHeader(request, 'origin');
+  if (origin !== canonicalOrigin.origin) throw problem(403, 'origin_rejected');
+  const cookies = readCookies(request);
+  if (!cookies.session) throw problem(401, 'unauthenticated');
+  const csrf = uniqueHeader(request, 'x-still-csrf');
+  if (!csrf || !TOKEN_RE.test(csrf)) throw problem(403, 'csrf_rejected');
+  return Object.freeze({ sessionToken: cookies.session, origin, csrf });
+}
+
+function assertCredentialMutation(response: ServerResponse, auth: AuthService,
+  captured: { readonly sessionToken: string; readonly origin: string; readonly csrf: string }): boolean {
+  try { auth.assertMutation(captured.sessionToken, captured.origin, captured.csrf); return true; }
+  catch (error) {
+    const mapped = credentialServiceFailure(error);
+    sendError(response, mapped.status, mapped.code);
+    return false;
+  }
+}
+
+function credentialCommandId(request: IncomingMessage): string {
+  const commandId = uniqueHeader(request, 'x-still-command');
+  if (!commandId || !COMMAND_ID_RE.test(commandId)) throw problem(400, 'invalid_credential_command_id');
+  return commandId;
+}
+
+function sendCredentialMetadata(response: ServerResponse, metadata: SafeCredentialMetadataSnapshot): void {
+  sendJson(response, 200, metadata);
 }
 
 function staticMime(pathname: string): string {
@@ -310,7 +447,7 @@ export function createStillHttpServer(options: StillHttpOptions): Server {
   const { paths, index } = collectStaticPaths(realRoot);
   const server = createServer((request, response) => {
     securityHeaders(response);
-    void handleRequest(request, response, options.auth, origin, realRoot, paths, index).catch((error: unknown) => {
+    void handleRequest(request, response, options.auth, origin, realRoot, paths, index, options.credentialCommands).catch((error: unknown) => {
       if (response.headersSent) { response.destroy(); return; }
       if (isHttpProblem(error)) { sendError(response, error.status, error.code); return; }
       if (error instanceof AuthError) { sendError(response, authStatus(error), error.code); return; }
@@ -325,11 +462,11 @@ export function createStillHttpServer(options: StillHttpOptions): Server {
 }
 
 async function handleRequest(request: IncomingMessage, response: ServerResponse, auth: AuthService, canonicalOrigin: URL,
-  staticRoot: string, staticPaths: Set<string>, index: Buffer): Promise<void> {
+  staticRoot: string, staticPaths: Set<string>, index: Buffer, credentialCommands?: ServerCredentialCommandService): Promise<void> {
   const host = uniqueHeader(request, 'host', true);
   if (!host || host.toLowerCase() !== canonicalOrigin.host.toLowerCase()) throw problem(403, 'host_rejected');
   const { pathname, hasQuery } = safePath(request.url);
-  if (pathname.startsWith('/auth/') || pathname === '/healthz') {
+  if (pathname.startsWith('/auth/') || pathname.startsWith('/api/') || pathname === '/healthz') {
     response.setHeader('Cache-Control', 'no-store');
     response.setHeader('Pragma', 'no-cache');
   }
@@ -397,6 +534,52 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     const challenge = auth.createLoginChallenge(canonicalOrigin.origin);
     sendJson(response, 200, { authenticated: false, setupRequired: false, csrfToken: challenge.csrfToken }, false,
       { 'Set-Cookie': jsonCookies(undefined, challenge.preAuthToken) });
+    return;
+  }
+  if (pathname === '/api/credentials') {
+    if (!credentialCommands) throw problem(503, 'service_unavailable');
+    if (hasQuery) throw problem(400, 'bad_request');
+    if (request.method === 'GET') {
+      const cookies = readCookies(request);
+      if (!cookies.session || !auth.getSession(cookies.session).authenticated) throw problem(401, 'unauthenticated');
+      sendCredentialMetadata(response, credentialCommands.getMetadata(cookies.session));
+      return;
+    }
+    if (request.method !== 'PUT' && request.method !== 'DELETE') {
+      response.setHeader('Allow', 'GET, PUT, DELETE'); throw problem(405, 'method_not_allowed');
+    }
+    const captured = authenticatedMutation(request, auth, canonicalOrigin);
+    if (!assertCredentialMutation(response, auth, captured)) return;
+    const commandId = credentialCommandId(request);
+    const bodyValue = await readJsonBody(request, response, CREDENTIAL_BODY_LIMIT);
+    const canonicalBody = validateCredentialRequest(bodyValue, request.method === 'PUT' ? 'put' : 'delete');
+    // The request body can take seconds to arrive. Recheck the session/CSRF fence
+    // after that await, immediately before the synchronous atomic command.
+    if (!assertCredentialMutation(response, auth, captured)) return;
+    try {
+      const metadata = request.method === 'PUT'
+        ? credentialCommands.put(captured.sessionToken, commandId, canonicalBody)
+        : credentialCommands.delete(captured.sessionToken, commandId, canonicalBody);
+      sendCredentialMetadata(response, metadata);
+    } catch (error) {
+      const mapped = credentialServiceFailure(error);
+      sendError(response, mapped.status, mapped.code);
+    }
+    return;
+  }
+  const commandMatch = /^\/api\/credential-commands\/([0-9a-f-]{36})$/i.exec(pathname);
+  if (commandMatch) {
+    if (!credentialCommands) throw problem(503, 'service_unavailable');
+    if (request.method !== 'GET') { response.setHeader('Allow', 'GET'); throw problem(405, 'method_not_allowed'); }
+    if (hasQuery) throw problem(400, 'bad_request');
+    const cookies = readCookies(request);
+    if (!cookies.session || !auth.getSession(cookies.session).authenticated) throw problem(401, 'unauthenticated');
+    if (!COMMAND_ID_RE.test(commandMatch[1]!)) throw problem(400, 'invalid_credential_command_id');
+    try { sendJson(response, 200, credentialCommands.inspect(cookies.session, commandMatch[1]!)); }
+    catch (error) {
+      const mapped = credentialServiceFailure(error);
+      sendError(response, mapped.status, mapped.code);
+    }
     return;
   }
   if (pathname === '/auth' || pathname.startsWith('/auth/')) {
