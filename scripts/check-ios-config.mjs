@@ -150,6 +150,7 @@ export function validateIosConfiguration({ config, autolink, podspecContent, pro
     podspecHasAssignment(podspec, 'homepage', "['\"]https://docs\\.expo\\.dev/modules/overview/['\"]"),
     podspecHasAssignment(podspec, 'platforms', '\\{[^\\n]*\\}'),
     podspecHasAssignment(podspec, 'source', '\\{[^\\n]*\\}'),
+    podspecHasAssignment(podspec, 'swift_version', "['\\\"]5\\.0['\\\"]"),
     /s\.dependency\s+['"]ExpoModulesCore['"]/.test(podspec),
   ].every(Boolean);
   const podspecFilePresent = expectedPodspecDir !== '' && existsSync(path.join(expectedPodspecDir, 'StillPrivacy.podspec'));

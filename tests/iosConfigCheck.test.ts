@@ -14,6 +14,7 @@ const podspecContent = `Pod::Spec.new do |s|
   s.homepage = 'https://docs.expo.dev/modules/overview/'
   s.platforms = { :ios => '16.4' }
   s.source = { :path => '.' }
+  s.swift_version = '5.0'
   s.dependency 'ExpoModulesCore'
 end
 `;
@@ -195,5 +196,11 @@ describe('read-only iOS config validation', () => {
     const missingHomepage = validFixture();
     missingHomepage.podspecContent = missingHomepage.podspecContent.replace("  s.homepage = 'https://docs.expo.dev/modules/overview/'\n", '');
     expect(validateIosConfiguration(missingHomepage).failures).toContain('The local StillPrivacy podspec is missing required bounded metadata.');
+  });
+
+  it('rejects an invalid Swift language version in the native podspec', () => {
+    const invalidSwiftVersion = validFixture();
+    invalidSwiftVersion.podspecContent = invalidSwiftVersion.podspecContent.replace("s.swift_version = '5.0'", "s.swift_version = '5.9'");
+    expect(validateIosConfiguration(invalidSwiftVersion).failures).toContain('The local StillPrivacy podspec is missing required bounded metadata.');
   });
 });
