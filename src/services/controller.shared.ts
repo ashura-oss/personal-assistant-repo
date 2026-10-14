@@ -295,6 +295,20 @@ function initialState(id: () => string): AppState {
   };
 }
 
+/** Creates a complete fresh workspace root for trusted server enrollment bootstrap. */
+export function createInitialWorkspaceState(id: () => string,
+  settings?: Pick<AppSettings, 'mode' | 'llmProvider' | 'openRouterModel' | 'openRouterReasoningEffort' | 'llmRequestContractVersion'>): AppState {
+  const state = initialState(id);
+  if (settings) {
+    state.settings.mode = settings.mode;
+    if (settings.llmProvider !== undefined) state.settings.llmProvider = settings.llmProvider;
+    if (settings.openRouterModel !== undefined) state.settings.openRouterModel = settings.openRouterModel;
+    if (settings.openRouterReasoningEffort !== undefined) state.settings.openRouterReasoningEffort = settings.openRouterReasoningEffort;
+    if (settings.llmRequestContractVersion !== undefined) state.settings.llmRequestContractVersion = settings.llmRequestContractVersion;
+  }
+  return state;
+}
+
 function emptyDeviceCalendarState(id: () => string, installationId = id()): DeviceCalendarState {
   return { schemaVersion: 1, installationId, generation: 1, selectionRevision: 1, enabled: false, selectedCalendarIds: [], calendars: [], events: [], dispatchRecords: [] };
 }

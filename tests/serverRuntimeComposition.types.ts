@@ -1,7 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
-import type { AppState } from '../src/core';
+import type { AppSettings, AppState } from '../src/core';
 import type { StateStore } from '../src/storage/contracts';
 import { AppControllerImpl, type ControllerCryptoPort, type ControllerRuntimePorts } from '../src/services/controller.shared';
+import { createInitialWorkspaceState } from '../src/services/controller.shared';
+import type { createInitialWorkspaceState as BundledInitialWorkspaceStateFactory } from '../server/src/sharedControllerNode.mjs';
 import { CommandJournal } from '../server/src/commandJournal';
 import type { DurableKernel, OwnedWorkspaceIdentity } from '../server/src/kernel';
 import { WorkspaceRegistry } from '../server/src/workspaceRegistry';
@@ -30,3 +32,12 @@ export function createTypedServerRuntime(
     return new AppControllerImpl({ store: sharedStore, crypto, providers, integration });
   });
 }
+
+/** The generated server bundle's declaration stays compatible with the actual complete AppState factory. */
+const bundledInitialWorkspaceStateFactory: typeof BundledInitialWorkspaceStateFactory = createInitialWorkspaceState;
+const compatibleInitialSettings: Pick<AppSettings, 'mode' | 'llmProvider' | 'openRouterModel' | 'openRouterReasoningEffort' | 'llmRequestContractVersion'> = {
+  mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch',
+  openRouterReasoningEffort: 'low', llmRequestContractVersion: 1,
+};
+void compatibleInitialSettings;
+void bundledInitialWorkspaceStateFactory;

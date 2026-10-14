@@ -10,7 +10,11 @@
     "build": "tsc -p tsconfig.json && node scripts/build-shared-controller.mjs",
     "test": "npm run build && node --test test/*.test.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "check": "npm run typecheck && npm test"
+    "check": "npm run typecheck && npm test",
+    "start": "node scripts/still-server.mjs start",
+    "status": "node scripts/still-server.mjs status",
+    "enroll": "node scripts/still-server.mjs enroll",
+    "reset-password": "node scripts/still-server.mjs reset-password"
   },
   "dependencies": {
     "better-sqlite3": "13.0.3"
