@@ -28,8 +28,18 @@ export interface OpenRouterMailReplyFrozenPolicy {
   readonly sha256: string;
 }
 
+export interface OpenRouterMailReplyContextSource {
+  readonly selectionId: string;
+  readonly source: MailReplySourceSnapshot;
+  readonly body: Readonly<{ text: string; textDigest: string; bytes: number; extractionVersion: SelectedMailTextSnapshot['extractionVersion'];
+    representation: SelectedMailTextSnapshot['representation']; completeness: SelectedMailTextSnapshot['completeness']; omissionReasons: readonly string[] }>;
+  readonly receivedAt?: string;
+  readonly sentAt?: string;
+  readonly isDraft: false;
+}
+
 export interface OpenRouterMailReplyBinding {
-  readonly version: 1;
+  readonly version: 1 | 2;
   readonly messageId: string;
   readonly mode: 'reply' | 'reply_all';
   readonly source: MailReplySourceSnapshot;
@@ -45,12 +55,13 @@ export interface OpenRouterMailReplyBinding {
   readonly settingsSnapshot: string;
   readonly requestAsOf: string;
   readonly timeZone: string;
+  readonly context?: readonly OpenRouterMailReplyContextSource[];
 }
 
 export function validOpenRouterMailReplyBinding(value: unknown): value is OpenRouterMailReplyBinding {
   const row = object(value);
-  if (!row || !exact(row, ['version', 'messageId', 'mode', 'source', 'body', 'subject', 'to', 'cc', 'brief', 'policy', 'settingsFingerprint', 'settingsSnapshot', 'requestAsOf', 'timeZone'], ['note']) ||
-      row.version !== 1 || typeof row.messageId !== 'string' || !row.messageId || row.messageId.length > 256 ||
+  if (!row || !exact(row, ['version', 'messageId', 'mode', 'source', 'body', 'subject', 'to', 'cc', 'brief', 'policy', 'settingsFingerprint', 'settingsSnapshot', 'requestAsOf', 'timeZone'], ['note', 'context']) ||
+      (row.version !== 1 && row.version !== 2) || typeof row.messageId !== 'string' || !row.messageId || row.messageId.length > 256 ||
       !['reply', 'reply_all'].includes(String(row.mode)) || typeof row.subject !== 'string' || typeof row.brief !== 'string' ||
       typeof row.settingsFingerprint !== 'string' || row.settingsFingerprint.length !== 64 || !SHA256.test(row.settingsFingerprint) ||
       typeof row.settingsSnapshot !== 'string' || row.settingsSnapshot.length > 16 * 1024 ||
@@ -59,16 +70,21 @@ export function validOpenRouterMailReplyBinding(value: unknown): value is OpenRo
       !Array.isArray(row.to) || row.to.length > 100 || row.to.some((item) => typeof item !== 'string') ||
       !Array.isArray(row.cc) || row.cc.length > 100 || row.cc.some((item) => typeof item !== 'string') ||
       !Array.isArray(row.policy) || row.policy.length > 128) return false;
-  try {
-    new Intl.DateTimeFormat('en', { timeZone: row.timeZone }).format(0);
-    const sourceRow = object(row.source);
+  const validSource = (candidate: unknown, localMessageId?: string): candidate is MailReplySourceSnapshot => {
+    const sourceRow = object(candidate);
     const identity = object(sourceRow?.identity);
     if (!sourceRow || !identity || !exact(sourceRow, ['version', 'accountId', 'accountEmail', 'identity', 'connectionGeneration', 'localMessageId', 'providerMessageId', 'idFormat', 'internetMessageId', 'subject', 'replyMetadataComplete', 'observedAt', 'sourceDigest'], ['verifiedSelfEmail', 'providerVersion', 'threadId', 'references', 'inReplyTo', 'from', 'senderEmail', 'replyTo', 'to', 'cc', 'snippet']) ||
-        !exact(identity, ['providerNamespace', 'clientId', 'subject'], ['issuer', 'tenantId', 'resourceUserId']) || typeof sourceRow.sourceDigest !== 'string' || sourceRow.sourceDigest.length !== 64 || !SHA256.test(sourceRow.sourceDigest)) return false;
-    canonicalMailReplySource(row.source as MailReplySourceSnapshot);
+        !exact(identity, ['providerNamespace', 'clientId', 'subject'], ['issuer', 'tenantId', 'resourceUserId']) ||
+        typeof sourceRow.sourceDigest !== 'string' || sourceRow.sourceDigest.length !== 64 || !SHA256.test(sourceRow.sourceDigest) ||
+        (localMessageId !== undefined && sourceRow.localMessageId !== localMessageId)) return false;
+    try { canonicalMailReplySource(candidate as MailReplySourceSnapshot); return true; } catch { return false; }
+  };
+  try {
+    new Intl.DateTimeFormat('en', { timeZone: row.timeZone }).format(0);
+    if (!validSource(row.source, row.version === 1 ? row.messageId : undefined)) return false;
   } catch { return false; }
   const source = object(row.source);
-  if (!source || source.localMessageId !== row.messageId) return false;
+  if (!source || (row.version === 2 && (source.threadId === undefined || source.localMessageId !== row.messageId))) return false;
   const body = object(row.body);
   if (!body || !exact(body, ['text', 'textDigest', 'bytes', 'extractionVersion', 'representation', 'completeness', 'omissionReasons']) ||
       typeof body.text !== 'string' || !body.text.trim() || typeof body.textDigest !== 'string' || body.textDigest.length !== 64 || !SHA256.test(body.textDigest) ||
@@ -88,6 +104,31 @@ export function validOpenRouterMailReplyBinding(value: unknown): value is OpenRo
         typeof note.captureTimeZone !== 'string' || !note.captureTimeZone || note.captureTimeZone.length > 128) return false;
     try { new Intl.DateTimeFormat('en', { timeZone: note.captureTimeZone }).format(0); } catch { return false; }
   }
+  if ((row.version === 1 && row.context !== undefined) || (row.version === 2 && (!Array.isArray(row.context) || row.context.length < 1))) return false;
+  const selectionIds = new Set<string>();
+  const providerIds = new Set<string>([String(source.providerMessageId)]);
+  for (const candidate of row.version === 2 ? row.context as unknown[] : []) {
+    const entry = object(candidate);
+    const entrySource = object(entry?.source);
+    const entryBody = object(entry?.body);
+    if (!entry || !exact(entry, ['selectionId', 'source', 'body', 'isDraft'], ['receivedAt', 'sentAt']) ||
+        typeof entry.selectionId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(entry.selectionId) ||
+        selectionIds.has(entry.selectionId) || entry.isDraft !== false || !validSource(entrySource, entry.selectionId) ||
+        entrySource.threadId !== source.threadId || entrySource.accountId !== source.accountId || entrySource.connectionGeneration !== source.connectionGeneration ||
+        !sameCanonicalIdentity(entrySource.identity, source.identity) || typeof entrySource.providerMessageId !== 'string' ||
+        providerIds.has(entrySource.providerMessageId) || !entryBody || !exact(entryBody, ['text', 'textDigest', 'bytes', 'extractionVersion', 'representation', 'completeness', 'omissionReasons']) ||
+        typeof entryBody.text !== 'string' || !entryBody.text.trim() || typeof entryBody.textDigest !== 'string' || entryBody.textDigest.length !== 64 || !SHA256.test(entryBody.textDigest) ||
+        !Number.isSafeInteger(entryBody.bytes) || (entryBody.bytes as number) < 1 || (entryBody.bytes as number) > 16 * 1024 || utf8Bytes(entryBody.text) !== entryBody.bytes || !validReplyText(entryBody.text) ||
+        !['mail-text-v1', 'mail-text-v2'].includes(String(entryBody.extractionVersion)) || !['plain', 'converted_html', 'snippet'].includes(String(entryBody.representation)) ||
+        !['complete_text', 'excerpt'].includes(String(entryBody.completeness)) || !Array.isArray(entryBody.omissionReasons) || entryBody.omissionReasons.length > 16 ||
+        entryBody.omissionReasons.some((reason) => typeof reason !== 'string' || !reason || reason.length > 240) ||
+        (entryBody.representation === 'converted_html' && (entryBody.extractionVersion !== 'mail-text-v2' || entryBody.completeness !== 'excerpt')) ||
+        (entryBody.representation === 'snippet' && entryBody.completeness !== 'excerpt') ||
+        (entryBody.completeness === 'complete_text' && entryBody.representation !== 'plain') ||
+        (entry.receivedAt !== undefined && !canonicalOptionalDate(entry.receivedAt)) || (entry.sentAt !== undefined && !canonicalOptionalDate(entry.sentAt))) return false;
+    selectionIds.add(entry.selectionId);
+    providerIds.add(entrySource.providerMessageId as string);
+  }
   const paths = new Set<string>();
   return row.policy.every((item) => {
     const policy = object(item);
@@ -98,6 +139,16 @@ export function validOpenRouterMailReplyBinding(value: unknown): value is OpenRo
     paths.add(policy.path);
     return true;
   });
+}
+
+function canonicalOptionalDate(value: unknown): boolean {
+  return value === undefined || (typeof value === 'string' && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value);
+}
+
+function sameCanonicalIdentity(a: unknown, b: unknown): boolean {
+  const left = object(a); const right = object(b);
+  return Boolean(left && right && JSON.stringify(Object.entries(left).sort(([x], [y]) => x.localeCompare(y))) ===
+    JSON.stringify(Object.entries(right).sort(([x], [y]) => x.localeCompare(y))));
 }
 
 /** Strictly parses one inert Batch result. It never creates a proposal or performs side effects. */

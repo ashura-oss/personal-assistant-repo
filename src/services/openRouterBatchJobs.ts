@@ -55,7 +55,7 @@ export interface OpenRouterBatchJob {
   readonly id: string;
   readonly customId: string;
   readonly kind: AssistantBatchKind;
-  readonly operation?: 'chat_refinement';
+  readonly operation?: 'chat_refinement' | 'mail_reply_context';
   readonly reasoningEffort?: OpenRouterChatRefinementEffort;
   readonly status: AssistantBatchStatus;
   readonly parentTurnId?: string;
@@ -126,7 +126,7 @@ export interface AssistantBatchJobDTO {
   readonly noteRevision?: number;
   readonly model: typeof OPENROUTER_BATCH_MODEL;
   readonly effort: 'none' | 'low' | OpenRouterChatRefinementEffort;
-  readonly operation?: 'chat_refinement';
+  readonly operation?: 'chat_refinement' | 'mail_reply_context';
   readonly reasoningEffort?: OpenRouterChatRefinementEffort;
   readonly parentTurnId?: string;
   readonly requestBytes?: number;
@@ -143,6 +143,7 @@ export interface AssistantBatchJobDTO {
   readonly mailMessageId?: string;
   readonly hasMailReplyResult?: boolean;
   readonly canReviewMailReply?: boolean;
+  readonly mailReplyContextCount?: number;
   readonly proposalId?: string;
 }
 
@@ -299,7 +300,7 @@ function validJob(value: unknown): value is OpenRouterBatchJob {
 function validMailReplyJob(row: Record<string, unknown>): boolean {
   const commonRequired = ['id', 'customId', 'kind', 'status', 'createdAt', 'updatedAt', 'model', 'effort', 'requestSha256', 'unknownCharge'];
   const commonOptional = ['batchId', 'accounting', 'failureCode', 'proposalId'];
-  if (!exactKeys(row, commonRequired, [...commonOptional, 'sourceRemoved', 'requestProfileVersion', 'settingsFingerprint', 'sourceFingerprint',
+  if (!exactKeys(row, commonRequired, [...commonOptional, 'operation', 'sourceRemoved', 'requestProfileVersion', 'settingsFingerprint', 'sourceFingerprint',
       'requestBytes', 'omittedSourceCount', 'requestBody', 'sourceVersions', 'mailReplyBinding', 'resultText', 'resultSha256']) ||
       typeof row.id !== 'string' || row.id.length !== 36 || !UUID_V4.test(row.id) || row.customId !== row.id ||
       row.kind !== 'mail_reply' || typeof row.status !== 'string' || !STATUSES.has(row.status) ||
@@ -312,13 +313,14 @@ function validMailReplyJob(row: Record<string, unknown>): boolean {
       (row.proposalId !== undefined && (typeof row.proposalId !== 'string' || row.proposalId.length !== 36 || !UUID_V4.test(row.proposalId)))) return false;
   if ((row.status === 'result_not_retained') !== (row.failureCode === 'result_not_retained')) return false;
   if (row.sourceRemoved === true) {
-      return row.status === 'source_removed' && (row.requestProfileVersion === 1 || row.requestProfileVersion === 2) &&
-      exactKeys(row, [...commonRequired, 'sourceRemoved', 'requestProfileVersion'], [...commonOptional]);
+      return row.status === 'source_removed' && (row.requestProfileVersion === 1 || row.requestProfileVersion === 2 || row.requestProfileVersion === 3) &&
+      ((row.requestProfileVersion === 3) === (row.operation === 'mail_reply_context')) &&
+      exactKeys(row, [...commonRequired, 'sourceRemoved', 'requestProfileVersion'], [...commonOptional, 'operation']);
   }
   if (row.sourceRemoved !== undefined || row.status === 'source_removed' || !validOpenRouterMailReplyBinding(row.mailReplyBinding) ||
       typeof row.settingsFingerprint !== 'string' || row.settingsFingerprint.length !== 64 || !SHA256.test(row.settingsFingerprint) ||
       typeof row.sourceFingerprint !== 'string' || row.sourceFingerprint.length !== 64 || !SHA256.test(row.sourceFingerprint) ||
-      (row.requestProfileVersion !== 1 && row.requestProfileVersion !== 2) ||
+      (row.requestProfileVersion !== 1 && row.requestProfileVersion !== 2 && row.requestProfileVersion !== 3) ||
       !Number.isSafeInteger(row.requestBytes) || (row.requestBytes as number) < 1 || (row.requestBytes as number) > 1024 * 1024 ||
       !Number.isSafeInteger(row.omittedSourceCount) || (row.omittedSourceCount as number) < 0 ||
       typeof row.requestBody !== 'string' || new TextEncoder().encode(row.requestBody).byteLength !== row.requestBytes ||
@@ -327,7 +329,10 @@ function validMailReplyJob(row: Record<string, unknown>): boolean {
     const request = JSON.parse(row.requestBody) as Record<string, unknown>;
     const responseFormat = record(request.response_format);
     const schema = record(responseFormat?.json_schema);
-    if (!isOpenRouterBatchRequestProfile(request, row.requestProfileVersion, 'note_assistance') || schema?.name !== 'mail_reply_body') return false;
+    const contextOperation = row.operation === 'mail_reply_context';
+    if ((contextOperation && (row.requestProfileVersion !== 3 || row.mailReplyBinding?.version !== 2)) ||
+        (!contextOperation && (row.operation !== undefined || row.requestProfileVersion === 3 || row.mailReplyBinding?.version !== 1)) ||
+        !isOpenRouterBatchRequestProfile(request, row.requestProfileVersion, contextOperation ? 'mail_reply_context' : 'note_assistance') || schema?.name !== 'mail_reply_body') return false;
   } catch { return false; }
   const versions = record(row.sourceVersions)!;
   if (Object.entries(versions).some(([key, version]) => !key || key.length > 512 || typeof version !== 'string' || version.length > 320)) return false;
@@ -404,6 +409,7 @@ export function assistantBatchJobDTO(job: OpenRouterBatchJob, cleanupPending = f
     ...(job.accounting?.totalTokens !== undefined ? { totalTokens: job.accounting.totalTokens } : {}),
     ...(job.failureCode ? { failureCode: job.failureCode } : {}),
     ...(job.kind === 'mail_reply' && job.mailReplyBinding ? { mailMessageId: job.mailReplyBinding.messageId } : {}),
+    ...(job.kind === 'mail_reply' && job.mailReplyBinding?.version === 2 ? { mailReplyContextCount: job.mailReplyBinding.context?.length ?? 0 } : {}),
     ...(job.kind === 'mail_reply' && job.resultText !== undefined ? { hasMailReplyResult: true, canReviewMailReply: !job.proposalId && job.status === 'completed' } : {}),
     ...(job.kind === 'mail_reply' && job.proposalId ? { proposalId: job.proposalId } : {}),
   });

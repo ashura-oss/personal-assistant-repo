@@ -618,7 +618,60 @@ export interface MailReplyTextGenerationInput {
   composerRevision: number;
   noteId?: string;
   noteRevision?: number;
+  /** Opaque IDs from explicit conversation-context discovery; omitted/empty retains the legacy request path exactly. */
+  contextSelectionIds?: readonly string[];
+  /** Explicit user consent for selected context bodies that are excerpts rather than complete messages. */
+  contextExcerptSelectionIds?: readonly string[];
   forceRefresh?: boolean;
+}
+
+export interface MailReplyConversationContextRow {
+  readonly rowId: string;
+  readonly subject: string;
+  readonly sender?: string;
+  readonly receivedAt?: string;
+  readonly sentAt?: string;
+  readonly isDraft?: boolean;
+}
+
+export interface MailReplyConversationContextDiscovery {
+  readonly sessionId: string;
+  readonly targetMessageId: string;
+  readonly rows: readonly MailReplyConversationContextRow[];
+  readonly coverage: 'complete_metadata' | 'partial';
+  readonly omissionReasons: readonly string[];
+  readonly hasMore: boolean;
+  readonly expiresAt: string;
+}
+
+export interface MailReplyContextSelection {
+  readonly selectionId: string;
+  readonly subject: string;
+  readonly sender?: string;
+  readonly receivedAt?: string;
+  readonly sentAt?: string;
+  readonly text: string;
+  readonly bytes: number;
+  readonly representation: SelectedMailTextSnapshot['representation'];
+  readonly completeness: SelectedMailTextSnapshot['completeness'];
+  readonly omissionReasons: readonly string[];
+}
+
+export interface MailReplyBatchContextReviewItem extends Omit<MailReplyConversationContextRow, 'rowId'> {
+  readonly selectionId: string;
+  readonly isReplyTarget?: boolean;
+  readonly representation: SelectedMailTextSnapshot['representation'];
+  readonly completeness: SelectedMailTextSnapshot['completeness'];
+  readonly bytes: number;
+  readonly omissionReasons: readonly string[];
+}
+
+export interface MailReplyBatchSourcesRefreshResult {
+  readonly status: 'current';
+  readonly jobId: string;
+  readonly checkedAt: string;
+  readonly expiresAt: string;
+  readonly sources: readonly MailReplyBatchContextReviewItem[];
 }
 
 export interface MailReplyTextGenerationResult {
@@ -643,6 +696,7 @@ export interface MailReplyBatchReviewPlan {
   readonly to: readonly string[];
   readonly cc: readonly string[];
   readonly text: string;
+  readonly contextMessages?: readonly MailReplyBatchContextReviewItem[];
   readonly expiresAt: string;
 }
 
@@ -978,6 +1032,12 @@ export interface AppController {
   }): Promise<{ status: 'activated' | 'unchanged'; document: ContextDocument; mirrorPending: boolean }>;
   deleteNote(id: string): Promise<void>;
   getMailReplySource(messageId: string): Promise<MailReplySourceResult>;
+  discoverMailReplyContext(input: { messageId: string; sourceDigest: string }): Promise<MailReplyConversationContextDiscovery>;
+  continueMailReplyContextDiscovery(input: { sessionId: string }): Promise<MailReplyConversationContextDiscovery>;
+  loadMailReplyContextMessage(input: { sessionId: string; rowId: string }): Promise<MailReplyContextSelection>;
+  cancelMailReplyContextDiscovery(sessionId: string): Promise<void>;
+  refreshMailReplyBatchSources(jobId: string): Promise<MailReplyBatchSourcesRefreshResult>;
+  getMailReplyBatchSourcesStatus(jobId: string): { readonly status: 'missing' | 'refresh_required' | 'current' | 'invalid'; readonly expiresAt?: string };
   createMailReplyProposal(input: { messageId: string; mode: 'reply' | 'reply_all'; sourceDigest: string; text: string; to?: string[]; cc?: string[] }): Promise<Proposal>;
   loadMailReplyText(input: { messageId: string; sourceDigest: string }): Promise<MailReplyTextLoadResult>;
   getMailReplyText(messageId: string): Promise<MailReplyTextCacheResult>;

@@ -18,7 +18,7 @@ function refinementBody(): string {
 const at = '2026-10-13T10:00:00.000Z';
 
 function contentJob(overrides: Partial<OpenRouterBatchJob> = {}): OpenRouterBatchJob {
-  const requestProfileVersion = overrides.requestProfileVersion ?? 1;
+  const requestProfileVersion: 1 | 2 = overrides.requestProfileVersion === 2 ? 2 : 1;
   const requestBody = overrides.requestBody ?? bodyFor(requestProfileVersion);
   return {
     id: operationId, customId: operationId, kind: 'note_assistance', status: 'queued', createdAt: at, updatedAt: at,

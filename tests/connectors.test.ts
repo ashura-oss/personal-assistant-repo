@@ -30,7 +30,8 @@ function replyFixture(provider: 'google' | 'microsoft' = 'google', mode: 'reply'
     to: ['me@example.test'], cc: ['colleague@example.test'], snippet: 'Earlier message', replyMetadataComplete: true,
     observedAt: new Date(Date.now()).toISOString(), sourceDigest: digest,
   };
-  const replySource: MailReplyProvenance = { version: 2, kind: 'mail_reply', sourceDigest: digest, source, expiresAt: new Date(Date.now() + 3_600_000).toISOString() };
+  const replySource: MailReplyProvenance = { version: 2, kind: 'mail_reply', sourceDigest: digest, source,
+    expiresAt: new Date(Date.parse(source.observedAt) + 15 * 60_000).toISOString() };
   const payload: EmailProposalPayload = {
     operation: 'draft', to: ['reply@example.test', ...(mode === 'reply_all' ? ['me@example.test'] : [])],
     cc: mode === 'reply_all' ? ['colleague@example.test'] : [], bcc: [], subject: source.subject, text: 'Approved reply body', attachments: [],
@@ -805,13 +806,62 @@ describe('provider connector clients', () => {
 
   it('rechecks reply source expiry at the final pre-dispatch fence', async () => {
     const fixtureData = replyFixture();
-    const replySource = { ...fixtureData.replySource, expiresAt: '2000-01-01T00:00:00.000Z' };
+    const observedAt = new Date(Date.now() - 30 * 60_000).toISOString();
+    const replySource = { ...fixtureData.replySource, source: { ...fixtureData.replySource.source, observedAt },
+      expiresAt: new Date(Date.parse(observedAt) + 15 * 60_000).toISOString() };
     const tokenGet = vi.fn(async () => token());
     const fetcher = vi.fn() as typeof fetch;
     const client = new ConnectorClient({ tokenStore: { get: tokenGet, set: async () => {} }, fetcher });
     await expect(client.createDraft(fixtureData.selectedAccount, { ...fixtureData.dispatch, replySource }, verifier)).rejects.toThrow(/source approval has expired/i);
     expect(tokenGet).toHaveBeenCalledTimes(1);
     expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it('replaces only reply-source age when the controller verifies an exact refreshed Batch envelope', async () => {
+    const fixtureData = replyFixture();
+    const observedAt = new Date(Date.now() - 30 * 60_000).toISOString();
+    const staleSource = { ...fixtureData.replySource, source: { ...fixtureData.replySource.source, observedAt },
+      expiresAt: new Date(Date.parse(observedAt) + 15 * 60_000).toISOString() };
+    const fetcher = vi.fn(async () => response({ id: 'freshness-proof-draft', message: { threadId: 'gmail-thread-id' } })) as typeof fetch;
+    const client = fixture({ fetcher }).client;
+    const verified = { ...verifier, inspectRefreshedReplySource: () => 'verified' as const };
+    await expect(client.createDraft(fixtureData.selectedAccount, { ...fixtureData.dispatch, replySource: staleSource }, verified))
+      .resolves.toMatchObject({ status: 'accepted', id: 'freshness-proof-draft' });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+
+    const rejectedFetcher = vi.fn() as typeof fetch;
+    const rejectedClient = fixture({ fetcher: rejectedFetcher }).client;
+    const missing = { ...verifier, inspectRefreshedReplySource: () => 'required_missing' as const };
+    await expect(rejectedClient.createDraft(fixtureData.selectedAccount, { ...fixtureData.dispatch, replySource: staleSource }, missing))
+      .rejects.toThrow(/refresh the selected reply sources/i);
+    expect(rejectedFetcher).not.toHaveBeenCalled();
+
+    const malformedExpiryFetcher = vi.fn() as typeof fetch;
+    const malformedExpiryClient = fixture({ fetcher: malformedExpiryFetcher }).client;
+    const malformedExpiry = { ...staleSource, expiresAt: '2000-01-01T00:00:00.000Z' };
+    await expect(malformedExpiryClient.createDraft(fixtureData.selectedAccount, { ...fixtureData.dispatch, replySource: malformedExpiry }, verified))
+      .rejects.toThrow(/invalid observation window/i);
+    expect(malformedExpiryFetcher).not.toHaveBeenCalled();
+  });
+
+  it('rechecks the refreshed-source proof after OAuth token refresh and before the draft POST', async () => {
+    const fixtureData = replyFixture();
+    const paths: string[] = [];
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input)); paths.push(url.pathname);
+      if (url.pathname.endsWith('/token')) return response({ access_token: 'rotated-access', expires_in: 3600 });
+      if (url.pathname.includes('/userinfo')) return response({ sub: tokenIdentity.subject, name: 'Test', email: 'me@example.test', email_verified: true });
+      return response({ id: 'should-not-be-created' });
+    }) as typeof fetch;
+    const expiredToken = token({ expiresAt: 0 });
+    const tokenStore = { get: vi.fn(async () => expiredToken), set: vi.fn(async (_ref: string, _next: StoredOAuthToken) => undefined) };
+    const client = new ConnectorClient({ tokenStore, fetcher, googleClientId: 'test-google-client' });
+    const verifierWithChangingProof = { ...verifier, inspectRefreshedReplySource: () =>
+      tokenStore.set.mock.calls.length > 0 ? 'required_missing' as const : 'verified' as const };
+    await expect(client.createDraft(fixtureData.selectedAccount, fixtureData.dispatch, verifierWithChangingProof))
+      .rejects.toThrow(/refresh the selected reply sources/i);
+    expect(tokenStore.set).toHaveBeenCalledTimes(1);
+    expect(paths.some((path) => path.endsWith('/drafts'))).toBe(false);
   });
 
   it('creates a Graph reply-all draft with the immutable source ID, exact approved body and no extra fields', async () => {

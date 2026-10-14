@@ -6,6 +6,7 @@ import type {
   ProposalProvenance, SaveNoteInput, SettingsPatch, MailboxSnapshotMessage, CalendarEventSnapshot, OAuthInstallResult,
   NoteProposalProvenance, MailReplyProvenance, MailReplySourceSnapshot, MailReplySourceResult,
   SelectedMailTextSnapshot, MailReplyTextLoadResult, MailReplyTextCacheResult, MailReplyTextGenerationInput, MailReplyTextGenerationResult, MailReplyBatchReviewPlan,
+  MailReplyConversationContextDiscovery, MailReplyContextSelection, MailReplyBatchContextReviewItem, MailReplyBatchSourcesRefreshResult,
   ProactiveCandidateEntry, ProactiveCandidateSourceResult,
   ProactiveState, SavedProactiveRule, RecordingAttachmentPreview,
   DeviceCalendarAccessState, StartupRecoveryStatus,
@@ -43,7 +44,7 @@ import type {
   ApprovedDispatch, DispatchVerifier, OAuthBridgeResult, StoredOAuthToken, OAuthTokenStore,
   MessageSummary, SelectedMessageTextResult, RequestGuard, MessageWindowPageMetadata, CalendarSummary, SyncPage, MutationReceipt,
 } from '../connectors';
-import { ConnectorClient, ProviderWriteRejectedError, describeMessageWindowQuery, withCredentialLock } from '../connectors';
+import { ConnectorClient, ProviderHttpError, ProviderWriteRejectedError, describeMessageWindowQuery, withCredentialLock } from '../connectors';
 import { scopeGrantsCapability } from '../connectors/oauth';
 import { oauthTokenStore, deleteOAuthToken } from '../auth/tokenStore';
 import { Platform } from 'react-native';
@@ -111,7 +112,7 @@ import {
   type AssistantBatchJobDTO, type OpenRouterBatchJob, type OpenRouterBatchContentJob, type OpenRouterMailReplyContentJob, type OpenRouterBatchLedger, type OpenRouterBatchAccounting,
   type OpenRouterChatBinding,
 } from './openRouterBatchJobs';
-import { parseOpenRouterMailReplyResult, validOpenRouterMailReplyBinding, validReplyText, type OpenRouterMailReplyBinding, type OpenRouterMailReplyFrozenNote, type OpenRouterMailReplyFrozenPolicy } from './openRouterMailReply';
+import { parseOpenRouterMailReplyResult, validOpenRouterMailReplyBinding, validReplyText, type OpenRouterMailReplyBinding, type OpenRouterMailReplyFrozenNote, type OpenRouterMailReplyFrozenPolicy, type OpenRouterMailReplyContextSource } from './openRouterMailReply';
 
 const now = () => new Date().toISOString();
 const ASSIST_CONTRACT_VERSION = 'assist-v3';
@@ -1382,6 +1383,53 @@ interface RecordingAttachmentReceipt {
   sha256: string;
 }
 
+interface MailReplyContextDiscoverySession {
+  readonly sessionId: string;
+  readonly targetMessageId: string;
+  readonly sourceDigest: string;
+  readonly accountId: string;
+  readonly identityKey: string;
+  readonly connectionGeneration: number;
+  readonly targetProviderMessageId: string;
+  readonly threadId: string;
+  readonly bootstrapGeneration: number;
+  readonly privacyEpoch?: string;
+  readonly expiresAtMs: number;
+  readonly createdAtMs: number;
+  cursor?: string;
+  readonly seenCursors: Set<string>;
+  readonly rows: Map<string, MessageSummary>;
+  readonly providerRows: Map<string, string>;
+  readonly selections: Map<string, OpenRouterMailReplyContextSource>;
+  bytes: number;
+  invalid: boolean;
+  coverage: 'complete_metadata' | 'partial';
+  readonly omissionReasons: Set<string>;
+}
+
+interface MailReplyContextFreshnessProof {
+  readonly jobId: string;
+  readonly resultSha256: string;
+  readonly dependencyDigest: string;
+  readonly localDependencyDigest: string;
+  readonly accountId: string;
+  readonly connectionGeneration: number;
+  readonly bootstrapGeneration: number;
+  readonly privacyEpoch?: string;
+  readonly admittedAtMs: number;
+  readonly expiresAtMs: number;
+  readonly checkedAt: string;
+  readonly contextBySelection: Readonly<Record<string, string>>;
+  readonly targetSource: MailReplySourceSnapshot;
+  readonly targetBody: SelectedMailTextSnapshot;
+  readonly requestSha256: string;
+  readonly sourceFingerprint: string;
+}
+
+class MailReplyContextRefreshRequiredError extends Error {
+  constructor() { super('Refresh the selected conversation sources before approving this reply.'); this.name = 'MailReplyContextRefreshRequiredError'; }
+}
+
 export class AppControllerImpl implements AppController {
   private state = initialState();
   private snapshot = deepFreeze(clone(this.state));
@@ -1448,6 +1496,9 @@ export class AppControllerImpl implements AppController {
   }>();
   private readonly activeMailReplyBatchReviews = new Set<string>();
   private readonly activeMailReplyBatchSubmissions = new Map<string, string | undefined>();
+  private readonly mailReplyContextSessions = new Map<string, MailReplyContextDiscoverySession>();
+  private readonly mailReplyContextProofs = new Map<string, MailReplyContextFreshnessProof>();
+  private readonly activeMailReplyContextRefreshes = new Map<string, object>();
   private assistantBatchCleanupRetries = new Map<string, () => Promise<void>>();
   private activeBatchNoteOperations = new Set<string>();
   private activeBatchJobInspections = new Set<string>();
@@ -1612,6 +1663,9 @@ export class AppControllerImpl implements AppController {
     this.chatTranscriptTransferPlans.clear();
     this.mailReplyBatchReviewPlans.clear();
     this.activeMailReplyBatchReviews.clear();
+    this.mailReplyContextSessions.clear();
+    this.mailReplyContextProofs.clear();
+    this.activeMailReplyContextRefreshes.clear();
     this.assistantBatchCleanupRetries.clear();
     this.activeBatchNoteOperations.clear();
     this.activeBatchJobInspections.clear();
@@ -3128,21 +3182,27 @@ export class AppControllerImpl implements AppController {
       if (proposal.requiresRebuild || proposal.kind !== 'email' || !proposal.email?.reply || proposal.email.operation !== 'draft') throw new Error('This mail reply needs a fresh, explicitly reviewed source before approval.');
       const account = state.accounts.find((item) => item.id === proposal.accountId);
       const message = state.mailbox.find((item) => item.id === provenance.source.localMessageId && item.accountId === provenance.source.accountId);
+      const linkedMailJob = provenance.batchJobId ? this.assistantBatchLedger.jobs.find((item) => item.id === provenance.batchJobId) : undefined;
+      const refreshedContext = Boolean(linkedMailJob && isOpenRouterMailReplyContentJob(linkedMailJob) && linkedMailJob.requestProfileVersion === 3 &&
+        linkedMailJob.operation === 'mail_reply_context' && linkedMailJob.mailReplyBinding.version === 2);
       if (!account || account.id !== provenance.source.accountId || account.provider !== provenance.source.identity.providerNamespace ||
           !account.connected || account.authStatus !== 'connected' || !account.capabilities?.includes('mail.read') ||
           (account.connectionGeneration ?? 0) !== provenance.source.connectionGeneration || !sameAccountIdentity(account.identity, provenance.source.identity) ||
-          !message || message.providerDeletedAt || !message.replyMetadataComplete || message.verifiedIdentityKey !== identityKey(account) ||
-          message.connectionGeneration !== account.connectionGeneration) throw new Error('The source message or verified mailbox connection is no longer available. Refresh the inbox and create a new reply draft.');
+          (!refreshedContext && (!message || message.providerDeletedAt || !message.replyMetadataComplete || message.verifiedIdentityKey !== identityKey(account) ||
+            message.connectionGeneration !== account.connectionGeneration))) throw new Error('The source message or verified mailbox connection is no longer available. Refresh the inbox and create a new reply draft.');
+      if (refreshedContext) this.requireCurrentMailReplyContextProof(state, linkedMailJob as OpenRouterMailReplyContentJob);
       const age = Date.now() - Date.parse(provenance.source.observedAt);
       const expiry = Date.parse(provenance.expiresAt);
       if (!Number.isFinite(expiry) || new Date(expiry).toISOString() !== provenance.expiresAt ||
-          expiry !== Date.parse(provenance.source.observedAt) + 15 * 60_000 || !Number.isFinite(age) || age < 0 || age >= 15 * 60_000 || Date.now() >= expiry) {
+          expiry !== Date.parse(provenance.source.observedAt) + 15 * 60_000 || (!refreshedContext && (!Number.isFinite(age) || age < 0 || age >= 15 * 60_000 || Date.now() >= expiry))) {
         throw new Error('This reply source is stale. Refresh the inbox and create a new reply draft.');
       }
       if (!await validateMailReplySource(provenance.source, async (canonical) => Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, canonical, { encoding: Crypto.CryptoEncoding.HEX }))) {
         throw new Error('This reply has an invalid frozen source digest. Create a new reply draft.');
       }
-      const current = this.mailReplySourceFromRow(message, account, provenance.source.observedAt);
+      const current = refreshedContext
+        ? this.requireCurrentMailReplyContextProof(state, linkedMailJob as OpenRouterMailReplyContentJob).targetSource
+        : this.mailReplySourceFromRow(message!, account, provenance.source.observedAt);
       if (canonicalMailReplySource(current) !== canonicalMailReplySource(provenance.source)) throw new Error('The source message changed. Refresh it and create a new reply draft.');
       validateReplyBinding(proposal.email, provenance);
       await this.validateMailReplyBatchIntegrity(state, proposal, provenance);
@@ -3198,18 +3258,25 @@ export class AppControllerImpl implements AppController {
   private mailReplyDependencyProjection(state: AppState, proposal: Proposal, provenance: MailReplyProvenance): string {
     const account = state.accounts.find((item) => item.id === provenance.source.accountId);
     const message = state.mailbox.find((item) => item.id === provenance.source.localMessageId && item.accountId === provenance.source.accountId);
-    if (!account || !message || !account.connected || account.authStatus !== 'connected' || !account.capabilities?.includes('mail.read') ||
+    const linkedJob = provenance.batchJobId ? this.assistantBatchLedger.jobs.find((item) => item.id === provenance.batchJobId) : undefined;
+    const contextJob = linkedJob && isOpenRouterMailReplyContentJob(linkedJob) && linkedJob.requestProfileVersion === 3 &&
+      linkedJob.operation === 'mail_reply_context' && linkedJob.mailReplyBinding.version === 2 ? linkedJob : undefined;
+    const contextProof = contextJob ? this.requireCurrentMailReplyContextProof(state, contextJob) : undefined;
+    if (!account || !account.connected || account.authStatus !== 'connected' || !account.capabilities?.includes('mail.read') ||
         account.connectionGeneration !== provenance.source.connectionGeneration || !sameAccountIdentity(account.identity, provenance.source.identity) ||
-        message.providerDeletedAt || !message.replyMetadataComplete || message.verifiedIdentityKey !== identityKey(account) ||
-        message.connectionGeneration !== account.connectionGeneration) throw new Error('The source message or verified connection is no longer current.');
+        (!contextProof && !message) || (message && (message.providerDeletedAt || !message.replyMetadataComplete || message.verifiedIdentityKey !== identityKey(account) ||
+          message.connectionGeneration !== account.connectionGeneration || message.providerMessageId !== provenance.source.providerMessageId ||
+          message.idFormat !== provenance.source.idFormat || message.threadId !== provenance.source.threadId))) throw new Error('The source message or verified connection is no longer current.');
     const expiry = Date.parse(provenance.expiresAt);
     const sourceObserved = Date.parse(provenance.source.observedAt);
     const age = Date.now() - sourceObserved;
+    const contextBound = Boolean(contextProof);
     if (!Number.isFinite(expiry) || !Number.isFinite(sourceObserved) || new Date(expiry).toISOString() !== provenance.expiresAt ||
-        expiry !== sourceObserved + 15 * 60_000 || !Number.isFinite(age) || age < 0 || age >= 15 * 60_000 || Date.now() >= expiry) {
+        expiry !== sourceObserved + 15 * 60_000 || (!contextBound && (!Number.isFinite(age) || age < 0 || age >= 15 * 60_000 || Date.now() >= expiry))) {
       throw new Error('The original message observation has expired.');
     }
-    const current = this.mailReplySourceFromRow(message, account, provenance.source.observedAt);
+    const current = contextProof?.targetSource ?? this.mailReplySourceFromRow(message!, account, provenance.source.observedAt);
+    if (canonicalMailReplySource(current) !== canonicalMailReplySource(provenance.source)) throw new Error('The source message changed. Refresh and approve the reply again.');
     if (!proposal.email) throw new Error('Reply payload is missing.');
     validateReplyBinding(proposal.email, provenance);
     const base = { source: canonicalMailReplySource(current), sourceDigest: provenance.sourceDigest,
@@ -3226,10 +3293,11 @@ export class AppControllerImpl implements AppController {
       throw new Error('The Batch result or its frozen source binding is no longer available. Review a fresh result before approval.');
     }
     const frozen = job.mailReplyBinding;
+    const batchContextProof = frozen.version === 2 ? this.requireCurrentMailReplyContextProof(state, job) : undefined;
     const cached = state.selectedMailTexts.find((item) => item.messageId === frozen.messageId);
-    if (!cached || cached.text !== frozen.body.text || cached.textDigest !== frozen.body.textDigest || cached.bytes !== frozen.body.bytes ||
+    if ((!cached && !batchContextProof) || (cached && (cached.text !== frozen.body.text || cached.textDigest !== frozen.body.textDigest || cached.bytes !== frozen.body.bytes ||
         cached.extractionVersion !== frozen.body.extractionVersion || cached.representation !== frozen.body.representation ||
-        cached.completeness !== frozen.body.completeness || stableJson(cached.omissionReasons) !== stableJson(frozen.body.omissionReasons) ||
+        cached.completeness !== frozen.body.completeness || stableJson(cached.omissionReasons) !== stableJson(frozen.body.omissionReasons))) ||
         stableJson(openRouterSettingsBinding(state.settings)) !== frozen.settingsSnapshot) throw new Error('The Batch reply inputs changed. Review a fresh result before approval.');
     const note = frozen.note && state.notes.find((item) => item.id === frozen.note!.id);
     if (frozen.note ? !note || note.revision !== frozen.note.revision || note.transcript !== frozen.note.text ||
@@ -3245,6 +3313,20 @@ export class AppControllerImpl implements AppController {
       resultSha256: job.resultSha256, resultText: job.resultText, binding: frozen } });
   }
 
+  private requireCurrentMailReplyContextProof(state: AppState, job: OpenRouterMailReplyContentJob): MailReplyContextFreshnessProof {
+    const status = this.getMailReplyBatchSourcesStatus(job.id);
+    if (status.status === 'refresh_required') throw new MailReplyContextRefreshRequiredError();
+    if (status.status !== 'current') throw new Error('The selected conversation source changed. Refresh it and review the reply again.');
+    const proof = this.mailReplyContextProofs.get(job.id);
+    const account = state.accounts.find((item) => item.id === job.mailReplyBinding.source.accountId);
+    if (!proof || !account || proof.connectionGeneration !== (account.connectionGeneration ?? 0) ||
+        proof.dependencyDigest.length === 0 || proof.resultSha256 !== job.resultSha256 || proof.requestSha256 !== job.requestSha256 ||
+        proof.sourceFingerprint !== job.sourceFingerprint) {
+      throw new Error('The selected conversation source changed. Refresh it and review the reply again.');
+    }
+    return proof;
+  }
+
   private async validateMailReplyBatchIntegrity(state: AppState, proposal: Proposal, provenance: MailReplyProvenance): Promise<void> {
     if (!provenance.batchJobId) return;
     const job = this.assistantBatchLedger.jobs.find((item) => item.id === provenance.batchJobId);
@@ -3258,7 +3340,9 @@ export class AppControllerImpl implements AppController {
 
   private async assertMailReplyBatchJobIntegrity(job: OpenRouterMailReplyContentJob, requireResult: boolean): Promise<void> {
     const binding = job.mailReplyBinding;
-    if (!binding || !validOpenRouterMailReplyBinding(binding) || job.requestProfileVersion !== OPENROUTER_BATCH_REQUEST_PROFILE_VERSION ||
+    if (!binding || !validOpenRouterMailReplyBinding(binding) ||
+        (binding.version === 1 ? job.requestProfileVersion !== OPENROUTER_BATCH_REQUEST_PROFILE_VERSION || job.operation !== undefined :
+          job.requestProfileVersion !== 3 || job.operation !== 'mail_reply_context') ||
         !job.requestBody || utf8Bytes(job.requestBody) !== job.requestBytes) throw new Error('The saved Batch request failed integrity validation.');
     let settingsValue: unknown;
     try { settingsValue = JSON.parse(binding.settingsSnapshot) as unknown; } catch { throw new Error('The frozen reply settings are invalid.'); }
@@ -3270,19 +3354,30 @@ export class AppControllerImpl implements AppController {
         settingsValue.timezone !== binding.timeZone) throw new Error('The frozen reply settings are invalid.');
     const frozenSettings = { ...this.state.settings, ...settingsValue } as AppSettings;
     const policyContext = binding.policy.map((item) => `### ${item.path} (revision ${item.revision})\n${item.content}`).join('\n\n');
-    const prepared = new OpenRouterBatchRequestBuilder().prepareReply({ sourceText: binding.body.text, sourceRepresentation: binding.body.representation,
+    const requestInput = { sourceText: binding.body.text, sourceRepresentation: binding.body.representation,
       sourceCompleteness: binding.body.completeness, subject: binding.subject, to: [...binding.to], cc: [...binding.cc], brief: binding.brief,
       noteContext: binding.note?.text, policyContext, asOf: binding.requestAsOf, timeZone: binding.timeZone,
-      noteCapture: binding.note ? { capturedAt: binding.note.capturedAt, timeZone: binding.note.captureTimeZone } : undefined }, frozenSettings);
+      noteCapture: binding.note ? { capturedAt: binding.note.capturedAt, timeZone: binding.note.captureTimeZone } : undefined };
+    const prepared = binding.version === 2
+      ? new OpenRouterBatchRequestBuilder().prepareReplyWithContext({ ...requestInput, contextMessages: binding.context!.map((item) => ({ text: item.body.text,
+          subject: item.source.subject, ...(item.source.senderEmail ? { sender: item.source.senderEmail } : {}),
+          ...(item.receivedAt ? { receivedAt: item.receivedAt } : {}), ...(item.sentAt ? { sentAt: item.sentAt } : {}),
+          representation: item.body.representation, completeness: item.body.completeness, omissionReasons: item.body.omissionReasons })) }, frozenSettings)
+      : new OpenRouterBatchRequestBuilder().prepareReply(requestInput, frozenSettings);
     const expectedFingerprint = stableJson({ source: canonicalMailReplySource(binding.source), body: { textDigest: binding.body.textDigest,
       representation: binding.body.representation, completeness: binding.body.completeness, extractionVersion: binding.body.extractionVersion,
-      omissionReasons: binding.body.omissionReasons }, note: binding.note ?? null, policy: binding.policy,
+      omissionReasons: binding.body.omissionReasons }, note: binding.note ?? null, policy: binding.policy, ...(binding.version === 2 ? { context: binding.context } : {}),
       settingsFingerprint: binding.settingsFingerprint, recipients: { to: binding.to, cc: binding.cc } });
-    const [sourceDigest, bodyTextDigest, noteDigest, policyDigests, settingsFingerprint, requestSha256, fingerprint, resultSha256] = await Promise.all([
+    const [sourceDigest, bodyTextDigest, noteDigest, policyDigests, contextDigests, settingsFingerprint, requestSha256, fingerprint, resultSha256] = await Promise.all([
       Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, canonicalMailReplySource(binding.source), { encoding: Crypto.CryptoEncoding.HEX }),
       Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, binding.body.text, { encoding: Crypto.CryptoEncoding.HEX }),
       binding.note ? Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, binding.note.text, { encoding: Crypto.CryptoEncoding.HEX }) : Promise.resolve(undefined),
       Promise.all(binding.policy.map((item) => Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, item.content, { encoding: Crypto.CryptoEncoding.HEX }))),
+      Promise.all((binding.context ?? []).map(async (item) => ({
+        sourceValid: await validateMailReplySource(item.source, async (canonical) =>
+          Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, canonical, { encoding: Crypto.CryptoEncoding.HEX })),
+        bodyDigest: await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, item.body.text, { encoding: Crypto.CryptoEncoding.HEX }),
+      }))),
       Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, binding.settingsSnapshot, { encoding: Crypto.CryptoEncoding.HEX }),
       Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, job.requestBody, { encoding: Crypto.CryptoEncoding.HEX }),
       Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, expectedFingerprint, { encoding: Crypto.CryptoEncoding.HEX }),
@@ -3291,6 +3386,7 @@ export class AppControllerImpl implements AppController {
     const request = JSON.parse(prepared.body) as { reasoning?: { effort?: string } };
     if (sourceDigest !== binding.source.sourceDigest || bodyTextDigest !== binding.body.textDigest ||
         (binding.note && noteDigest !== binding.note.textSha256) || binding.policy.some((item, index) => item.sha256 !== policyDigests[index]) ||
+        contextDigests.some((item, index) => !item.sourceValid || item.bodyDigest !== binding.context?.[index]?.body.textDigest) ||
         settingsFingerprint !== binding.settingsFingerprint || requestSha256 !== job.requestSha256 || fingerprint !== job.sourceFingerprint ||
         prepared.body !== job.requestBody || prepared.requestBytes !== job.requestBytes || request.reasoning?.effort !== job.effort ||
         (requireResult && (!job.resultText || !validReplyText(job.resultText) || resultSha256 !== job.resultSha256))) {
@@ -3346,6 +3442,7 @@ export class AppControllerImpl implements AppController {
         return { changed: false, result: { current: true } };
       } catch (error) {
         issue = error instanceof Error ? error.message : 'The saved suggestion source could not be verified.';
+        if (error instanceof MailReplyContextRefreshRequiredError) return { changed: false, result: { current: false, reason: issue } };
         const changed = proposal.status !== 'draft' || !proposal.requiresRebuild || Boolean(proposal.approvedPayloadDigest || proposal.approvedRevision !== undefined);
         if (!changed) return { changed: false, result: { current: false, reason: issue } };
         proposal.status = 'draft';
@@ -5290,11 +5387,15 @@ export class AppControllerImpl implements AppController {
         typeof input.textDigest !== 'string' || !Array.isArray(input.to) || !Array.isArray(input.cc) || typeof input.brief !== 'string' ||
         input.to.some((item) => typeof item !== 'string') || input.cc.some((item) => typeof item !== 'string') ||
         (input.noteId !== undefined && typeof input.noteId !== 'string') ||
-        (input.noteRevision !== undefined && !Number.isSafeInteger(input.noteRevision))) {
+        (input.noteRevision !== undefined && !Number.isSafeInteger(input.noteRevision)) ||
+        (input.contextSelectionIds !== undefined && (!Array.isArray(input.contextSelectionIds) || input.contextSelectionIds.some((id) => typeof id !== 'string'))) ||
+        (input.contextExcerptSelectionIds !== undefined && (!Array.isArray(input.contextExcerptSelectionIds) || input.contextExcerptSelectionIds.some((id) => typeof id !== 'string')))) {
       throw new Error('Review the selected message and reply details before submitting.');
     }
     if (this.activeMailReplyBatchSubmissions.has(input.messageId)) throw new Error('A mail reply Batch request for this message is still settling.');
-    const capturedInput = Object.freeze({ ...input, to: Object.freeze([...input.to]), cc: Object.freeze([...input.cc]) });
+    const capturedInput = Object.freeze({ ...input, to: Object.freeze([...input.to]), cc: Object.freeze([...input.cc]),
+      ...(input.contextSelectionIds ? { contextSelectionIds: Object.freeze([...input.contextSelectionIds]) } : {}),
+      ...(input.contextExcerptSelectionIds ? { contextExcerptSelectionIds: Object.freeze([...input.contextExcerptSelectionIds]) } : {}) });
     this.activeMailReplyBatchSubmissions.set(capturedInput.messageId, undefined);
     try { return await this.submitMailReplyBatchCaptured(capturedInput); }
     finally { this.activeMailReplyBatchSubmissions.delete(capturedInput.messageId); }
@@ -5358,31 +5459,63 @@ export class AppControllerImpl implements AppController {
       }
       const asOf = now();
       const timeZone = validTimezone(draft.settings.timezone);
-      const prepared = await new OpenRouterBatchRequestBuilder().prepareReply({ sourceText: body.text,
-        sourceRepresentation: body.representation, sourceCompleteness: body.completeness, subject: source.subject,
-        to: [...input.to], cc: [...input.cc], brief: input.brief, noteContext, policyContext, asOf, timeZone, noteCapture }, draft.settings);
+      let context: OpenRouterMailReplyContextSource[] | undefined;
+      const selectionIds = input.contextSelectionIds ?? [];
+      const excerptIds = input.contextExcerptSelectionIds ?? [];
+      if (!selectionIds.length && excerptIds.length) throw new Error('Excerpt consent must match selected conversation messages.');
+      if (selectionIds.length) {
+        if (new Set(selectionIds).size !== selectionIds.length || new Set(excerptIds).size !== excerptIds.length || excerptIds.some((id) => !selectionIds.includes(id))) {
+          throw new Error('Selected conversation messages or excerpt consent changed. Reload context and try again.');
+        }
+        const owner = [...this.mailReplyContextSessions.values()].find((session) => session.targetMessageId === input.messageId &&
+          session.sourceDigest.toLowerCase() === input.sourceDigest.toLowerCase() && selectionIds.every((id) => session.selections.has(id)));
+        if (!owner) throw new Error('Selected conversation context expired. Reload it before submitting.');
+        this.mailReplyContextSession(owner.sessionId);
+        if (owner.accountId !== account.id || owner.threadId !== source.threadId || owner.connectionGeneration !== (account.connectionGeneration ?? 0)) {
+          throw new Error('Selected conversation context belongs to a different message or mailbox connection.');
+        }
+        context = selectionIds.map((id) => {
+          const selected = owner.selections.get(id)!;
+          if (selected.source.threadId !== source.threadId || selected.source.providerMessageId === source.providerMessageId ||
+              selected.source.accountId !== source.accountId || selected.source.connectionGeneration !== source.connectionGeneration ||
+              !sameAccountIdentity(selected.source.identity, source.identity) ||
+              (selected.body.completeness === 'excerpt') !== excerptIds.includes(id)) {
+            throw new Error('Selected conversation context is incomplete, stale, or lacks explicit excerpt consent.');
+          }
+          return selected;
+        });
+      } else if (excerptIds.length) throw new Error('Excerpt consent must match selected conversation messages.');
+      const replyInput = { sourceText: body.text, sourceRepresentation: body.representation, sourceCompleteness: body.completeness, subject: source.subject,
+        to: [...input.to], cc: [...input.cc], brief: input.brief, noteContext, policyContext, asOf, timeZone, noteCapture };
+      const prepared = context
+        ? new OpenRouterBatchRequestBuilder().prepareReplyWithContext({ ...replyInput, contextMessages: context.map((item) => ({ text: item.body.text,
+            subject: item.source.subject, ...(item.source.senderEmail ? { sender: item.source.senderEmail } : {}),
+            ...(item.receivedAt ? { receivedAt: item.receivedAt } : {}), ...(item.sentAt ? { sentAt: item.sentAt } : {}),
+            representation: item.body.representation, completeness: item.body.completeness, omissionReasons: item.body.omissionReasons })) }, draft.settings)
+        : await new OpenRouterBatchRequestBuilder().prepareReply(replyInput, draft.settings);
       const policy: OpenRouterMailReplyFrozenPolicy[] = [];
       for (const doc of policies) policy.push(Object.freeze({ path: doc.path as OpenRouterMailReplyFrozenPolicy['path'], revision: doc.revision,
         content: doc.content, sha256: await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, doc.content, { encoding: Crypto.CryptoEncoding.HEX }) }));
       const settingsFingerprint = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, stableJson(openRouterSettingsBinding(draft.settings)), { encoding: Crypto.CryptoEncoding.HEX });
-      const binding: OpenRouterMailReplyBinding = Object.freeze({ version: 1, messageId: input.messageId, mode: input.mode, source: clone(source),
+      const binding: OpenRouterMailReplyBinding = Object.freeze({ version: context ? 2 : 1, messageId: input.messageId, mode: input.mode, source: clone(source),
         body: Object.freeze({ text: body.text, textDigest: body.textDigest, bytes: body.bytes, extractionVersion: body.extractionVersion,
           representation: body.representation, completeness: body.completeness, omissionReasons: [...body.omissionReasons] }),
         subject: source.subject, to: Object.freeze([...input.to]), cc: Object.freeze([...input.cc]), brief: input.brief,
         ...(frozenNote ? { note: frozenNote } : {}), policy: Object.freeze(policy), settingsFingerprint,
-        settingsSnapshot: stableJson(openRouterSettingsBinding(draft.settings)), requestAsOf: asOf, timeZone });
+        settingsSnapshot: stableJson(openRouterSettingsBinding(draft.settings)), requestAsOf: asOf, timeZone, ...(context ? { context: Object.freeze(context) } : {}) });
       if (!validOpenRouterMailReplyBinding(binding)) throw new Error('The reply context could not be frozen safely. Refresh the message and try again.');
       const requestSha256 = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, prepared.body, { encoding: Crypto.CryptoEncoding.HEX });
       const sourceFingerprint = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256,
         stableJson({ source: canonicalMailReplySource(source), body: { textDigest: body.textDigest, representation: body.representation,
           completeness: body.completeness, extractionVersion: body.extractionVersion, omissionReasons: body.omissionReasons }, note: frozenNote ?? null,
-          policy, settingsFingerprint, recipients: { to: input.to, cc: input.cc } }), { encoding: Crypto.CryptoEncoding.HEX });
+          policy, ...(context ? { context } : {}), settingsFingerprint, recipients: { to: input.to, cc: input.cc } }), { encoding: Crypto.CryptoEncoding.HEX });
       const id = newId();
       const preparedRequest = JSON.parse(prepared.body) as { reasoning: { effort: 'none' | 'low' } };
       const timestamp = now();
       const job: OpenRouterBatchJob = Object.freeze({ id, customId: id, kind: 'mail_reply', status: 'preparing', createdAt: timestamp, updatedAt: timestamp,
         model: OPENROUTER_BATCH_MODEL, effort: preparedRequest.reasoning.effort, requestSha256, unknownCharge: false,
-        settingsFingerprint, sourceFingerprint, requestProfileVersion: OPENROUTER_BATCH_REQUEST_PROFILE_VERSION,
+        ...(context ? { operation: 'mail_reply_context' as const } : {}), settingsFingerprint, sourceFingerprint,
+        requestProfileVersion: context ? 3 : OPENROUTER_BATCH_REQUEST_PROFILE_VERSION,
         requestBytes: utf8Bytes(prepared.body), omittedSourceCount: 0, requestBody: prepared.body, sourceVersions: Object.freeze({}), mailReplyBinding: binding });
       return job;
     }, undefined, (_draft, job) => validateOpenRouterBatchLedger({ version: 1, jobs: [...this.assistantBatchLedger.jobs, job] }));
@@ -5408,6 +5541,327 @@ export class AppControllerImpl implements AppController {
     const affectedJobIds = new Set(this.assistantBatchLedger.jobs.filter(isOpenRouterMailReplyContentJob)
       .filter((job) => job.mailReplyBinding.source.accountId === accountId).map((job) => job.id));
     for (const [planId, plan] of this.mailReplyBatchReviewPlans) if (affectedJobIds.has(plan.jobId)) this.mailReplyBatchReviewPlans.delete(planId);
+    for (const [jobId, proof] of this.mailReplyContextProofs) if (proof.accountId === accountId) this.mailReplyContextProofs.delete(jobId);
+    for (const [sessionId, session] of this.mailReplyContextSessions) if (session.accountId === accountId) this.mailReplyContextSessions.delete(sessionId);
+  }
+
+  private mailReplyJobUsesMessage(job: OpenRouterMailReplyContentJob, accountId: string, localMessageId?: string, providerMessageId?: string): boolean {
+    const binding = job.mailReplyBinding;
+    if (binding.source.accountId !== accountId) return false;
+    if ((localMessageId && binding.source.localMessageId === localMessageId) ||
+        (providerMessageId && binding.source.providerMessageId === providerMessageId)) return true;
+    return binding.context?.some((member) => member.source.accountId === accountId &&
+      ((localMessageId && member.source.localMessageId === localMessageId) ||
+        (providerMessageId && member.source.providerMessageId === providerMessageId))) ?? false;
+  }
+
+  private mailReplyObservationConflictsSource(row: MailboxSnapshotMessage, source: MailReplySourceSnapshot, account: Account): boolean {
+    if (row.accountId !== source.accountId || row.providerMessageId !== source.providerMessageId || row.providerDeletedAt !== undefined ||
+        (row.idFormat !== undefined && row.idFormat !== source.idFormat) ||
+        (row.verifiedIdentityKey !== undefined && row.verifiedIdentityKey !== identityKey(account)) ||
+        (row.connectionGeneration !== undefined && row.connectionGeneration !== source.connectionGeneration) ||
+        (row.identityKey !== undefined && row.identityKey !== `${identityKey(account)}:${source.providerMessageId}`)) return true;
+    const scalarFacts: [unknown, unknown][] = [
+      [row.threadId, source.threadId], [row.providerVersion, source.providerVersion], [row.internetMessageId, source.internetMessageId],
+      [row.references, source.references], [row.inReplyTo, source.inReplyTo], [row.subject, source.subject],
+      [row.from, source.from], [row.senderEmail, source.senderEmail], [row.snippet, source.snippet],
+    ];
+    if (scalarFacts.some(([observed, frozen]) => observed !== undefined && observed !== frozen)) return true;
+    const listFacts: [string[] | undefined, string[] | undefined][] = [[row.replyTo, source.replyTo], [row.to, source.to], [row.cc, source.cc]];
+    if (listFacts.some(([observed, frozen]) => observed !== undefined && stableJson(observed) !== stableJson(frozen))) return true;
+    if (row.replyMetadataComplete === true) {
+      try {
+        const observed = this.mailReplySourceFromRow({ ...row, id: source.localMessageId }, account, source.observedAt);
+        if (canonicalMailReplySource(observed) !== canonicalMailReplySource(source)) return true;
+      } catch { /* A malformed/partial cached projection does not establish a provider-side change. */ }
+    }
+    return false;
+  }
+
+  private mailReplySummaryConflictsSource(message: MessageSummary | undefined, source: MailReplySourceSnapshot, account: Account): boolean {
+    if (!message) return false;
+    return this.mailReplyObservationConflictsSource({
+      id: source.localMessageId, accountId: source.accountId, providerMessageId: message.id,
+      identityKey: `${identityKey(account)}:${source.providerMessageId}`, verifiedIdentityKey: identityKey(account),
+      connectionGeneration: source.connectionGeneration, idFormat: message.idFormat, threadId: message.threadId,
+      subject: message.subject, from: message.from, senderEmail: message.senderEmail, internetMessageId: message.internetMessageId,
+      providerVersion: message.providerVersion, references: message.references, inReplyTo: message.inReplyTo, replyTo: message.replyTo,
+      to: message.to, cc: message.cc, snippet: message.snippet, replyMetadataComplete: message.replyMetadataComplete,
+    }, source, account) || message.isDraft === true;
+  }
+
+  private async invalidateObservedMailReplySource(binding: OpenRouterMailReplyBinding, providerMessageId: string,
+    observation?: { readonly kind: 'changed'; readonly message: MessageSummary; readonly observedAt: string } |
+      { readonly kind: 'deleted'; readonly observedAt: string }, guard?: () => void): Promise<void> {
+    guard?.();
+    const affectedJobs = this.assistantBatchLedger.jobs.filter((job) => isOpenRouterMailReplyContentJob(job) &&
+      this.mailReplyJobUsesMessage(job, binding.source.accountId, undefined, providerMessageId));
+    const affectedJobIds = new Set(affectedJobs.map((job) => job.id));
+    const ownActiveMailReviewJobId = affectedJobs.find((job) => this.activeMailReplyBatchReviews.has(job.id))?.id;
+    const sourceRemoval = this.sourceRemovalCommit((job) => isOpenRouterMailReplyContentJob(job) && affectedJobIds.has(job.id),
+      { ...(ownActiveMailReviewJobId ? { ownActiveMailReviewJobId } : {}), retainUncertainMailObservation: true });
+    await this.mutate((state) => {
+      guard?.();
+      const account = state.accounts.find((item) => item.id === binding.source.accountId);
+      if (!account || !account.connected || account.authStatus !== 'connected' || account.connectionGeneration !== binding.source.connectionGeneration ||
+          !sameAccountIdentity(account.identity, binding.source.identity)) throw new Error('The verified mailbox connection changed during source invalidation.');
+      const localIds = new Set([binding.messageId, binding.source.localMessageId,
+        ...(binding.context ?? []).filter((item) => item.source.providerMessageId === providerMessageId).map((item) => item.selectionId)]);
+      const matchingRows = state.mailbox.filter((row) => row.accountId === binding.source.accountId && row.providerMessageId === providerMessageId);
+      for (const row of matchingRows) {
+        localIds.add(row.id);
+        if (observation?.kind === 'deleted') {
+          row.providerDeletedAt = observation.observedAt;
+          row.observedAt = observation.observedAt;
+        } else if (observation?.kind === 'changed') {
+          const message = observation.message;
+          row.idFormat = message.idFormat;
+          row.threadId = message.threadId;
+          row.subject = message.subject;
+          row.from = message.from;
+          row.senderEmail = message.senderEmail;
+          row.receivedAt = message.receivedAt;
+          row.internetMessageId = message.internetMessageId;
+          row.providerVersion = message.providerVersion;
+          row.references = message.references;
+          row.inReplyTo = message.inReplyTo;
+          row.replyTo = message.replyTo ? [...message.replyTo] : undefined;
+          row.to = message.to ? [...message.to] : undefined;
+          row.cc = message.cc ? [...message.cc] : undefined;
+          row.snippet = message.snippet;
+          row.replyMetadataComplete = message.replyMetadataComplete;
+          row.verifiedIdentityKey = identityKey(account);
+          row.connectionGeneration = account.connectionGeneration ?? 0;
+          row.observedAt = observation.observedAt;
+          delete row.providerDeletedAt;
+        }
+      }
+      state.selectedMailTexts = state.selectedMailTexts.filter((item) => !localIds.has(item.messageId));
+      for (const proposal of state.proposals) {
+        const source = proposal.provenance?.version === 2 ? proposal.provenance.source : undefined;
+        const linkedToAffectedJob = proposal.provenance?.version === 2 && proposal.provenance.batchJobId && affectedJobIds.has(proposal.provenance.batchJobId);
+        if ((source?.accountId === binding.source.accountId && source.providerMessageId === providerMessageId || linkedToAffectedJob) &&
+            ['draft', 'approved', 'failed'].includes(proposal.status)) {
+          this.invalidate(proposal);
+          proposal.requiresRebuild = true;
+        }
+      }
+    }, undefined, (state) => { guard?.(); return sourceRemoval.batch(state); }, () => { guard?.(); return sourceRemoval.chat(); });
+  }
+
+  getMailReplyBatchSourcesStatus(jobId: string): { readonly status: 'missing' | 'refresh_required' | 'current' | 'invalid'; readonly expiresAt?: string } {
+    const job = this.assistantBatchLedger.jobs.find((item) => item.id === jobId);
+    if (!job || !isOpenRouterMailReplyContentJob(job) || job.requestProfileVersion !== 3 || job.operation !== 'mail_reply_context' ||
+        job.mailReplyBinding.version !== 2 || !job.mailReplyBinding.context?.length) return Object.freeze({ status: 'missing' });
+    if (!validOpenRouterMailReplyBinding(job.mailReplyBinding) || job.status !== 'completed' || !job.resultSha256 || !job.resultText) return Object.freeze({ status: 'invalid' });
+    const proof = this.mailReplyContextProofs.get(jobId);
+    const at = Date.now();
+    if (!proof) return Object.freeze({ status: 'refresh_required' });
+    if (at < proof.admittedAtMs || at >= proof.expiresAtMs || proof.bootstrapGeneration !== this.bootstrapGeneration ||
+        proof.privacyEpoch !== this.integration.privacySession?.epoch || proof.resultSha256 !== job.resultSha256 ||
+        proof.requestSha256 !== job.requestSha256 || proof.sourceFingerprint !== job.sourceFingerprint) {
+      return Object.freeze({ status: 'refresh_required' });
+    }
+    const account = this.snapshot.accounts.find((item) => item.id === proof.accountId);
+    if (!account || !account.connected || account.authStatus !== 'connected' || (account.connectionGeneration ?? 0) !== proof.connectionGeneration ||
+        !sameAccountIdentity(account.identity, job.mailReplyBinding.source.identity)) return Object.freeze({ status: 'invalid' });
+    try {
+      if (this.mailReplyContextLocalDependencyDigest(this.snapshot, job.mailReplyBinding) !== proof.localDependencyDigest) return Object.freeze({ status: 'invalid' });
+    } catch { return Object.freeze({ status: 'invalid' }); }
+    return Object.freeze({ status: 'current', expiresAt: new Date(proof.expiresAtMs).toISOString() });
+  }
+
+  async refreshMailReplyBatchSources(jobId: string): Promise<MailReplyBatchSourcesRefreshResult> {
+    if (this.activeMailReplyContextRefreshes.has(jobId)) throw new Error('A source refresh for this mail reply is already running.');
+    this.mailReplyContextProofs.delete(jobId);
+    const ticket = {};
+    this.activeMailReplyContextRefreshes.set(jobId, ticket);
+    const admittedAtMs = Date.now();
+    const generation = this.bootstrapGeneration;
+    const epoch = this.integration.privacySession?.epoch;
+    try {
+      await this.load();
+      await this.assertPrivacySessionCurrent();
+      const job = this.assistantBatchLedger.jobs.find((item) => item.id === jobId);
+      if (!job || !isOpenRouterMailReplyContentJob(job) || job.requestProfileVersion !== 3 || job.operation !== 'mail_reply_context' ||
+          job.mailReplyBinding.version !== 2 || !job.mailReplyBinding.context?.length || job.status !== 'completed' || !job.resultSha256 || !job.resultText) {
+        throw new Error('This saved Batch job has no selected conversation sources to refresh.');
+      }
+      const binding = job.mailReplyBinding;
+      await this.assertMailReplyBatchJobIntegrity(job, true);
+      const account = this.snapshot.accounts.find((item) => item.id === binding.source.accountId);
+      if (!account || !this.connector?.readSelectedMessageText) throw new Error('The verified mailbox connection is unavailable.');
+      const capturedState = this.snapshot;
+      const guardContext: RequestGuard = () => this.requireMailReplyContextRefreshContext(job, binding, generation, epoch, admittedAtMs, capturedState, ticket);
+      guardContext();
+      let targetRead: SelectedMessageTextResult;
+      try { targetRead = await this.connector.readSelectedMessageText(clone(account), binding.source.providerMessageId, { guard: guardContext }); }
+      catch (error) {
+        if (error instanceof ProviderHttpError && (error.status === 404 || error.status === 410)) {
+          await this.invalidateObservedMailReplySource(binding, binding.source.providerMessageId, { kind: 'deleted', observedAt: new Date().toISOString() }, guardContext);
+        }
+        throw error;
+      }
+      guardContext();
+      const targetMessage = targetRead.message;
+      if (this.mailReplySummaryConflictsSource(targetMessage, binding.source, account)) {
+        if (targetMessage) await this.invalidateObservedMailReplySource(binding, binding.source.providerMessageId,
+          { kind: 'changed', message: targetMessage, observedAt: targetRead.checkedAt }, guardContext);
+        throw new Error('The target message changed. Review a fresh Batch request.');
+      }
+      if (targetRead.status !== 'available' || !targetMessage || targetMessage.id !== binding.source.providerMessageId ||
+          targetMessage.idFormat !== binding.source.idFormat || targetMessage.threadId !== binding.source.threadId || targetMessage.isDraft !== false ||
+          targetMessage.replyMetadataComplete !== true || !targetRead.text || targetRead.completeness === 'unavailable' ||
+          !validReplyText(targetRead.text) || targetRead.bytes !== utf8Bytes(targetRead.text) || targetRead.bytes > 16 * 1024) {
+        throw new Error('The target message changed, became a draft, or is no longer available. Review a fresh Batch request.');
+      }
+      const targetSession = { sessionId: '', targetMessageId: binding.messageId, sourceDigest: '', accountId: binding.source.accountId,
+        identityKey: identityKey(account), connectionGeneration: binding.source.connectionGeneration,
+        targetProviderMessageId: binding.source.providerMessageId, threadId: binding.source.threadId!, bootstrapGeneration: generation,
+        privacyEpoch: epoch, createdAtMs: admittedAtMs, expiresAtMs: admittedAtMs + 15 * 60_000, seenCursors: new Set(), rows: new Map(),
+        providerRows: new Map(), selections: new Map(), bytes: 0, invalid: false, coverage: 'complete_metadata', omissionReasons: new Set() } as MailReplyContextDiscoverySession;
+      const targetRow = this.mailboxRowForContext({ ...targetMessage, id: binding.source.providerMessageId }, targetSession, targetMessage, binding.messageId);
+      const targetSource = await createMailReplySource(this.mailReplySourceFromRow(targetRow, account, targetRead.checkedAt), async (canonical) =>
+        Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, canonical, { encoding: Crypto.CryptoEncoding.HEX }));
+      const targetTextDigest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, targetRead.text, { encoding: Crypto.CryptoEncoding.HEX });
+      if (canonicalMailReplySource(targetSource) !== canonicalMailReplySource(binding.source) || targetTextDigest !== binding.body.textDigest ||
+          targetRead.bytes !== binding.body.bytes || targetRead.representation !== binding.body.representation || targetRead.completeness !== binding.body.completeness ||
+          targetRead.extractionVersion !== binding.body.extractionVersion || stableJson(targetRead.reasons.slice(0, 16)) !== stableJson(binding.body.omissionReasons)) {
+        await this.invalidateObservedMailReplySource(binding, binding.source.providerMessageId,
+          { kind: 'changed', message: targetMessage, observedAt: targetRead.checkedAt }, guardContext);
+        throw new Error('The target message changed during refresh. Review a fresh Batch request.');
+      }
+      const targetBody: SelectedMailTextSnapshot = { version: 1, messageId: binding.messageId, accountId: account.id, identityKey: identityKey(account),
+        identity: clone(account.identity!), connectionGeneration: account.connectionGeneration ?? 0, providerMessageId: targetMessage.id,
+        idFormat: targetMessage.idFormat, sourceDigest: targetSource.sourceDigest, checkedAt: targetRead.checkedAt, text: targetRead.text,
+        textDigest: targetTextDigest, bytes: targetRead.bytes, extractionVersion: targetRead.extractionVersion, representation: targetRead.representation,
+        completeness: targetRead.completeness as SelectedMailTextSnapshot['completeness'], omissionReasons: Object.freeze(targetRead.reasons.slice(0, 16)) as unknown as string[] };
+      const contextDigests: Record<string, string> = {};
+      const items: MailReplyBatchContextReviewItem[] = [];
+      for (const member of binding.context!) {
+        const guard: RequestGuard = guardContext;
+        let fresh: SelectedMessageTextResult;
+        try { fresh = await this.connector.readSelectedMessageText(clone(account), member.source.providerMessageId, { guard }); }
+        catch (error) {
+          if (error instanceof ProviderHttpError && (error.status === 404 || error.status === 410)) {
+            await this.invalidateObservedMailReplySource(binding, member.source.providerMessageId,
+              { kind: 'deleted', observedAt: new Date().toISOString() }, guardContext);
+          }
+          throw error;
+        }
+        guard();
+        const returned = fresh.message;
+        if (this.mailReplySummaryConflictsSource(returned, member.source, account)) {
+          if (returned) await this.invalidateObservedMailReplySource(binding, member.source.providerMessageId,
+            { kind: 'changed', message: returned, observedAt: fresh.checkedAt }, guardContext);
+          throw new Error('A selected conversation message changed. Review a new Batch request.');
+        }
+        if (fresh.status !== 'available' || !returned || returned.id !== member.source.providerMessageId || returned.idFormat !== member.source.idFormat ||
+            returned.threadId !== binding.source.threadId || returned.isDraft !== false || returned.replyMetadataComplete !== true || !fresh.text ||
+            fresh.completeness === 'unavailable' || !validReplyText(fresh.text) || fresh.bytes !== utf8Bytes(fresh.text) || fresh.bytes > 16 * 1024) {
+          throw new Error('A selected conversation message changed, became a draft, or is no longer available. Review a new Batch request.');
+        }
+        const freshSourceRow = this.mailboxRowForContext({ ...returned, id: member.source.providerMessageId }, {
+          sessionId: '', targetMessageId: member.selectionId, sourceDigest: '', accountId: binding.source.accountId,
+          identityKey: identityKey(account), connectionGeneration: binding.source.connectionGeneration,
+          targetProviderMessageId: binding.source.providerMessageId, threadId: binding.source.threadId!, bootstrapGeneration: generation,
+          privacyEpoch: epoch, createdAtMs: admittedAtMs, expiresAtMs: admittedAtMs + 15 * 60_000, seenCursors: new Set(), rows: new Map(),
+          providerRows: new Map(), selections: new Map(), bytes: 0, invalid: false, coverage: 'complete_metadata', omissionReasons: new Set() }, returned, member.selectionId);
+        const freshSource = await createMailReplySource(this.mailReplySourceFromRow(freshSourceRow, account, fresh.checkedAt),
+          async (canonical) => Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, canonical, { encoding: Crypto.CryptoEncoding.HEX }));
+        if (canonicalMailReplySource(freshSource) !== canonicalMailReplySource(member.source) || fresh.text !== member.body.text ||
+            fresh.bytes !== member.body.bytes || fresh.representation !== member.body.representation || fresh.completeness !== member.body.completeness ||
+            fresh.extractionVersion !== member.body.extractionVersion || stableJson(fresh.reasons.slice(0, 16)) !== stableJson(member.body.omissionReasons) ||
+            (returned.receivedAt !== undefined && returned.receivedAt !== member.receivedAt) ||
+            (returned.sentAt !== undefined && returned.sentAt !== member.sentAt) || returned.isDraft !== member.isDraft) {
+          await this.invalidateObservedMailReplySource(binding, member.source.providerMessageId,
+            { kind: 'changed', message: returned, observedAt: fresh.checkedAt }, guardContext);
+          throw new Error('A selected conversation message changed. Review a new Batch request.');
+        }
+        const bodyDigest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, fresh.text, { encoding: Crypto.CryptoEncoding.HEX });
+        if (bodyDigest !== member.body.textDigest) {
+          await this.invalidateObservedMailReplySource(binding, member.source.providerMessageId,
+            { kind: 'changed', message: returned, observedAt: fresh.checkedAt }, guardContext);
+          throw new Error('A selected conversation body changed. Review a new Batch request.');
+        }
+        contextDigests[member.selectionId] = stableJson({ source: canonicalMailReplySource(freshSource), bodyDigest,
+          bytes: fresh.bytes, representation: fresh.representation, completeness: fresh.completeness, extractionVersion: fresh.extractionVersion,
+          omissionReasons: fresh.reasons.slice(0, 16), receivedAt: returned.receivedAt ?? null, sentAt: returned.sentAt ?? null, isDraft: returned.isDraft });
+        items.push(Object.freeze({ selectionId: member.selectionId, subject: member.source.subject,
+          ...(member.source.senderEmail ? { sender: member.source.senderEmail } : {}), ...(returned.receivedAt ? { receivedAt: returned.receivedAt } : {}),
+          ...(returned.sentAt ? { sentAt: returned.sentAt } : {}), representation: member.body.representation, completeness: member.body.completeness,
+          bytes: member.body.bytes, omissionReasons: Object.freeze([...member.body.omissionReasons]) }));
+      }
+      const checkedState = this.snapshot;
+      this.requireMailReplyContextRefreshContext(job, binding, generation, epoch, admittedAtMs, checkedState, ticket);
+      const targetDigest = stableJson({ source: canonicalMailReplySource(targetSource), textDigest: targetBody.textDigest,
+        bytes: targetBody.bytes, representation: targetBody.representation, completeness: targetBody.completeness,
+        extractionVersion: targetBody.extractionVersion, omissionReasons: targetBody.omissionReasons });
+      const dependencyDigest = stableJson({ targetDigest, contextDigests, accountId: account.id, generation: account.connectionGeneration,
+        identity: account.identity, settings: openRouterSettingsBinding(checkedState.settings) });
+      const localDependencyDigest = this.mailReplyContextLocalDependencyDigest(checkedState, binding);
+      const expiresAtMs = Math.min(admittedAtMs + 15 * 60_000, Date.now() + 15 * 60_000);
+      const checkedAt = new Date().toISOString();
+      const proof: MailReplyContextFreshnessProof = Object.freeze({ jobId, resultSha256: job.resultSha256!, dependencyDigest, accountId: account.id,
+        connectionGeneration: account.connectionGeneration ?? 0, bootstrapGeneration: generation, ...(epoch ? { privacyEpoch: epoch } : {}),
+        admittedAtMs, expiresAtMs, checkedAt, contextBySelection: Object.freeze(contextDigests), requestSha256: job.requestSha256,
+        sourceFingerprint: job.sourceFingerprint, localDependencyDigest, targetSource: Object.freeze(targetSource), targetBody: Object.freeze(targetBody) });
+      if (this.store.assertCurrent) await this.store.assertCurrent();
+      await this.assertPrivacySessionCurrent();
+      this.requireMailReplyContextRefreshContext(job, binding, generation, epoch, admittedAtMs, capturedState, ticket);
+      if (this.activeMailReplyContextRefreshes.get(jobId) !== ticket) throw new Error('This source refresh was superseded. Start a new explicit refresh.');
+      this.mailReplyContextProofs.set(jobId, proof);
+      const targetItem: MailReplyBatchContextReviewItem = Object.freeze({ selectionId: binding.source.localMessageId, isReplyTarget: true,
+        subject: binding.source.subject, ...(binding.source.senderEmail ? { sender: binding.source.senderEmail } : {}),
+        representation: binding.body.representation, completeness: binding.body.completeness, bytes: binding.body.bytes,
+        omissionReasons: Object.freeze([...binding.body.omissionReasons]) });
+      return Object.freeze({ status: 'current', jobId, checkedAt, expiresAt: new Date(expiresAtMs).toISOString(), sources: Object.freeze([targetItem, ...items]) });
+    } finally { if (this.activeMailReplyContextRefreshes.get(jobId) === ticket) this.activeMailReplyContextRefreshes.delete(jobId); }
+  }
+
+  private requireMailReplyContextRefreshContext(job: OpenRouterMailReplyContentJob, binding: OpenRouterMailReplyBinding,
+    generation: number, epoch: string | undefined, admittedAtMs: number, expectedState?: AppState, ticket?: object): void {
+    const at = Date.now();
+    const current = this.assistantBatchLedger.jobs.find((item) => item.id === job.id);
+    if (at < admittedAtMs || at - admittedAtMs >= 15 * 60_000 || generation !== this.bootstrapGeneration || epoch !== this.integration.privacySession?.epoch ||
+        !this.loaded || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired ||
+        (ticket !== undefined && this.activeMailReplyContextRefreshes.get(job.id) !== ticket) ||
+        (expectedState && this.snapshot !== expectedState) || !current || !isOpenRouterMailReplyContentJob(current) ||
+        current.status !== 'completed' || current.resultSha256 !== job.resultSha256 || current.requestSha256 !== job.requestSha256 ||
+        current.sourceFingerprint !== job.sourceFingerprint || current.customId !== job.customId) {
+      throw new Error('The saved reply or workspace changed during source refresh. Start a new explicit refresh.');
+    }
+  }
+
+  private mailReplyContextLocalDependencyDigest(state: AppState, binding: OpenRouterMailReplyBinding): string {
+    const account = state.accounts.find((item) => item.id === binding.source.accountId);
+    const targetRows = state.mailbox.filter((item) => item.accountId === binding.source.accountId &&
+      item.providerMessageId === binding.source.providerMessageId);
+    const body = state.selectedMailTexts.find((item) => item.messageId === binding.messageId);
+    if (!account || !account.connected || account.authStatus !== 'connected' || account.provider === 'local' ||
+        account.connectionGeneration !== binding.source.connectionGeneration || !sameAccountIdentity(account.identity, binding.source.identity) ||
+        stableJson(openRouterSettingsBinding(state.settings)) !== binding.settingsSnapshot) throw new Error('The local mail reply sources changed.');
+    if (targetRows.some((row) => this.mailReplyObservationConflictsSource(row, binding.source, account))) throw new Error('The cached target message changed.');
+    if (body && (body.text !== binding.body.text || body.textDigest !== binding.body.textDigest || body.bytes !== binding.body.bytes ||
+        body.representation !== binding.body.representation || body.completeness !== binding.body.completeness ||
+        body.extractionVersion !== binding.body.extractionVersion || stableJson(body.omissionReasons) !== stableJson(binding.body.omissionReasons))) {
+      throw new Error('The cached target text changed.');
+    }
+    for (const member of binding.context ?? []) {
+      const matches = state.mailbox.filter((item) => item.accountId === binding.source.accountId && item.providerMessageId === member.source.providerMessageId);
+      if (matches.some((row) => this.mailReplyObservationConflictsSource(row, member.source, account) ||
+          (row.receivedAt !== undefined && member.receivedAt !== undefined && row.receivedAt !== member.receivedAt))) {
+        throw new Error('A cached conversation message changed.');
+      }
+    }
+    const note = binding.note && state.notes.find((item) => item.id === binding.note!.id);
+    if (binding.note && (!note || note.revision !== binding.note.revision || note.transcript !== binding.note.text)) throw new Error('The selected note changed.');
+    const policy = state.documents.filter((item) => /^memory\/(?:RULES|ROUTINES)\.md$/i.test(item.path)).map((item) => ({ path: item.path, revision: item.revision, content: item.content }));
+    if (stableJson(policy) !== stableJson(binding.policy.map((item) => ({ path: item.path, revision: item.revision, content: item.content })))) throw new Error('Reply guidance changed.');
+    return stableJson({ source: canonicalMailReplySource(binding.source), body: {
+      textDigest: binding.body.textDigest, bytes: binding.body.bytes, representation: binding.body.representation, completeness: binding.body.completeness,
+      extractionVersion: binding.body.extractionVersion, omissionReasons: binding.body.omissionReasons }, note: binding.note ?? null, policy,
+      settings: openRouterSettingsBinding(state.settings), accountId: account.id, generation: account.connectionGeneration });
   }
 
   async reviewMailReplyBatch(jobId: string): Promise<MailReplyBatchReviewPlan> {
@@ -5425,45 +5879,66 @@ export class AppControllerImpl implements AppController {
       await this.load();
       await this.assertPrivacySessionCurrent();
       if (!this.loaded || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired || this.assistantBatchLedgerMalformed) throw new Error('Refresh local data before reviewing this reply.');
-      const integrityState = this.state;
+      let integrityState = this.state;
       const integrityGeneration = this.bootstrapGeneration;
       const integrityEpoch = this.integration.privacySession?.epoch;
       const integrityJob = this.assistantBatchLedger.jobs.find((item) => item.id === jobId);
       if (integrityJob !== job || !isOpenRouterMailReplyContentJob(integrityJob) || integrityJob.status !== 'completed' ||
           integrityJob.proposalId || integrityJob.mailReplyBinding !== binding) throw new Error('The Batch result changed before review. Reopen it and try again.');
       await this.assertMailReplyBatchJobIntegrity(job, true);
+      if (binding.version === 2) {
+        await this.refreshMailReplyBatchSources(jobId);
+        integrityState = this.state;
+      }
       await this.assertPrivacySessionCurrent();
       const jobBeforeRead = this.assistantBatchLedger.jobs.find((item) => item.id === jobId);
       if (this.state !== integrityState || generation !== this.bootstrapGeneration || integrityGeneration !== this.bootstrapGeneration ||
           epoch !== this.integration.privacySession?.epoch || integrityEpoch !== this.integration.privacySession?.epoch ||
-          !this.loaded || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired || jobBeforeRead !== job ||
-          !isOpenRouterMailReplyContentJob(jobBeforeRead) || jobBeforeRead.status !== 'completed' || jobBeforeRead.proposalId ||
-          jobBeforeRead.resultSha256 !== job.resultSha256 || jobBeforeRead.mailReplyBinding !== binding) {
+          !this.loaded || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired ||
+          !jobBeforeRead || !isOpenRouterMailReplyContentJob(jobBeforeRead) || jobBeforeRead.status !== 'completed' || jobBeforeRead.proposalId ||
+          jobBeforeRead.id !== job.id || jobBeforeRead.requestSha256 !== job.requestSha256 || jobBeforeRead.sourceFingerprint !== job.sourceFingerprint ||
+          jobBeforeRead.resultSha256 !== job.resultSha256 || stableJson(jobBeforeRead.mailReplyBinding) !== stableJson(binding)) {
         throw new Error('The Batch result or workspace changed during integrity review. Reopen it and try again.');
       }
-      const before = await this.getMailReplySource(binding.messageId);
-      if (!before.source || before.status === 'unavailable' || canonicalMailReplySource(before.source) !== canonicalMailReplySource(binding.source) ||
-          before.source.connectionGeneration !== binding.source.connectionGeneration || !sameAccountIdentity(before.source.identity, binding.source.identity)) {
-        throw new Error('The original message changed or is no longer available. Review a fresh Batch request.');
+      let after: MailReplySourceResult;
+      let loaded: MailReplyTextLoadResult;
+      if (binding.version === 2) {
+        const proof = this.requireCurrentMailReplyContextProof(this.state, job);
+        after = { status: 'current', source: proof.targetSource };
+        loaded = { status: 'current', snapshot: proof.targetBody };
+      } else {
+        const before = await this.getMailReplySource(binding.messageId);
+        if (!before.source || before.status === 'unavailable' || canonicalMailReplySource(before.source) !== canonicalMailReplySource(binding.source) ||
+            before.source.connectionGeneration !== binding.source.connectionGeneration || !sameAccountIdentity(before.source.identity, binding.source.identity)) {
+          throw new Error('The original message changed or is no longer available. Review a fresh Batch request.');
+        }
+        loaded = await this.loadMailReplyTextInternal({ messageId: binding.messageId, sourceDigest: before.source.sourceDigest }, jobId);
+        if (loaded.status !== 'current' || !loaded.snapshot) throw new Error('The selected message text could not be refreshed for review.');
+        after = await this.getMailReplySource(binding.messageId);
+        if (after.status !== 'current' || !after.source || canonicalMailReplySource(after.source) !== canonicalMailReplySource(binding.source)) {
+          throw new Error('The original message changed during review. Review a fresh Batch request.');
+        }
       }
-      const loaded = await this.loadMailReplyTextInternal({ messageId: binding.messageId, sourceDigest: before.source.sourceDigest }, jobId);
-      if (loaded.status !== 'current' || !loaded.snapshot) throw new Error('The selected message text could not be refreshed for review.');
-      const after = await this.getMailReplySource(binding.messageId);
-      if (after.status !== 'current' || !after.source || canonicalMailReplySource(after.source) !== canonicalMailReplySource(binding.source)) {
+      if (!after.source || !loaded.snapshot || canonicalMailReplySource(after.source) !== canonicalMailReplySource(binding.source)) {
         throw new Error('The original message changed during review. Review a fresh Batch request.');
       }
       const state = this.state;
       const currentJob = this.assistantBatchLedger.jobs.find((item) => item.id === jobId);
       if (generation !== this.bootstrapGeneration || epoch !== this.integration.privacySession?.epoch || !this.loaded ||
-          this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired || currentJob !== job ||
+          this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired ||
           !currentJob || !isOpenRouterMailReplyContentJob(currentJob) || currentJob.status !== 'completed' || currentJob.proposalId ||
-          currentJob.resultSha256 !== job.resultSha256 || currentJob.mailReplyBinding !== binding) throw new Error('The Batch result changed during review. Reopen it and try again.');
+          currentJob.requestSha256 !== job.requestSha256 || currentJob.sourceFingerprint !== job.sourceFingerprint || currentJob.resultSha256 !== job.resultSha256 ||
+          stableJson(currentJob.mailReplyBinding) !== stableJson(binding)) throw new Error('The Batch result changed during review. Reopen it and try again.');
       await this.assertMailReplyBatchInputsCurrent(state, binding, after.source, loaded.snapshot, job);
       const preparedAtMs = Date.now();
       const expiresAt = new Date(preparedAtMs + 5 * 60_000).toISOString();
       const publicPlan: MailReplyBatchReviewPlan = Object.freeze({ planId: newId(), jobId, messageId: binding.messageId,
         mode: binding.mode, subject: binding.subject, to: Object.freeze([...binding.to]), cc: Object.freeze([...binding.cc]),
-        text: job.resultText, expiresAt });
+        text: job.resultText, ...(binding.version === 2 ? { contextMessages: Object.freeze(binding.context!.map((item) => Object.freeze({
+          selectionId: item.selectionId, subject: item.source.subject, ...(item.source.senderEmail ? { sender: item.source.senderEmail } : {}),
+          ...(item.receivedAt ? { receivedAt: item.receivedAt } : {}), ...(item.sentAt ? { sentAt: item.sentAt } : {}), representation: item.body.representation,
+          completeness: item.body.completeness, bytes: item.body.bytes, omissionReasons: Object.freeze([...item.body.omissionReasons]),
+        }))) } : {}), expiresAt });
       const [bodyDigest, bindingDigest] = await Promise.all([
         Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, stableJson(binding.body), { encoding: Crypto.CryptoEncoding.HEX }),
         Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, stableJson(binding), { encoding: Crypto.CryptoEncoding.HEX }),
@@ -5495,16 +5970,19 @@ export class AppControllerImpl implements AppController {
     source: MailReplySourceSnapshot, body: SelectedMailTextSnapshot, job: OpenRouterMailReplyContentJob): Promise<void> {
     const account = state.accounts.find((item) => item.id === binding.source.accountId);
     const message = state.mailbox.find((item) => item.id === binding.messageId && item.accountId === binding.source.accountId);
-    if (!account || !message || !account.connected || account.authStatus !== 'connected' || account.provider === 'local' ||
+    const proof = binding.version === 2 ? this.requireCurrentMailReplyContextProof(state, job) : undefined;
+    if (!account || (!message && !proof) || !account.connected || account.authStatus !== 'connected' || account.provider === 'local' ||
         account.connectionGeneration !== binding.source.connectionGeneration || !sameAccountIdentity(account.identity, binding.source.identity) ||
-        message.providerDeletedAt || message.connectionGeneration !== account.connectionGeneration || message.verifiedIdentityKey !== identityKey(account) ||
+        (message && (message.providerDeletedAt || message.providerMessageId !== binding.source.providerMessageId || message.idFormat !== binding.source.idFormat ||
+          message.threadId !== binding.source.threadId || message.connectionGeneration !== account.connectionGeneration || message.verifiedIdentityKey !== identityKey(account))) ||
+        (binding.version === 2 && proof && (proof.targetBody.text !== body.text || proof.targetBody.textDigest !== body.textDigest)) ||
         body.accountId !== account.id || body.identityKey !== identityKey(account) || !sameAccountIdentity(body.identity, account.identity) ||
-        body.connectionGeneration !== (account.connectionGeneration ?? 0) || body.providerMessageId !== message.providerMessageId || body.sourceDigest !== binding.source.sourceDigest ||
-        body.idFormat !== message.idFormat || message.identityKey !== `${identityKey(account)}:${message.providerMessageId}` ||
+        body.connectionGeneration !== (account.connectionGeneration ?? 0) || body.providerMessageId !== binding.source.providerMessageId || body.sourceDigest !== binding.source.sourceDigest ||
+        body.idFormat !== binding.source.idFormat || (message && message.identityKey !== `${identityKey(account)}:${message.providerMessageId}`) ||
         canonicalMailReplySource(source) !== canonicalMailReplySource(binding.source) || body.text !== binding.body.text || body.textDigest !== binding.body.textDigest ||
         body.bytes !== binding.body.bytes || body.extractionVersion !== binding.body.extractionVersion || body.representation !== binding.body.representation ||
         body.completeness !== binding.body.completeness || stableJson(body.omissionReasons) !== stableJson(binding.body.omissionReasons) ||
-        !isMailTextFresh(body) || stableJson(openRouterSettingsBinding(state.settings)) !== binding.settingsSnapshot || !job.resultText || !job.resultSha256) {
+        (!proof && !isMailTextFresh(body)) || stableJson(openRouterSettingsBinding(state.settings)) !== binding.settingsSnapshot || !job.resultText || !job.resultSha256) {
       throw new Error('The message, account, selected text, settings, or result changed. Review a fresh Batch request.');
     }
     const currentNote = binding.note && state.notes.find((item) => item.id === binding.note!.id);
@@ -5557,10 +6035,11 @@ export class AppControllerImpl implements AppController {
           job.resultSha256 !== plan.resultSha256 || job.mailReplyBinding.messageId !== plan.messageId || job.mailReplyBinding.mode !== plan.mode) {
         throw new Error('This Batch result changed or was already activated. Review an available result again.');
       }
-      const currentSource = await this.getMailReplySource(plan.messageId);
+      const currentProof = job.mailReplyBinding.version === 2 ? this.requireCurrentMailReplyContextProof(this.state, job) : undefined;
+      const currentSource = currentProof ? { status: 'current' as const, source: currentProof.targetSource } : await this.getMailReplySource(plan.messageId);
       if (!currentSource.source || currentSource.status === 'unavailable') throw new Error('Refresh the original message before activating this reply.');
-      const latestSource = await this.getMailReplySource(plan.messageId);
-      const reviewedBody = this.snapshot.selectedMailTexts.find((item) => item.messageId === plan.messageId);
+      const latestSource = currentProof ? currentSource : await this.getMailReplySource(plan.messageId);
+      const reviewedBody = currentProof?.targetBody ?? this.snapshot.selectedMailTexts.find((item) => item.messageId === plan.messageId);
       if (!latestSource.source || latestSource.status !== 'current' || !reviewedBody) {
         throw new Error('The reviewed message cache is no longer current. Review the saved result again.');
       }
@@ -5582,16 +6061,20 @@ export class AppControllerImpl implements AppController {
         if (!currentJob || !isOpenRouterMailReplyContentJob(currentJob) || currentJob.status !== 'completed' || currentJob.proposalId ||
             currentJob.resultSha256 !== plan.resultSha256 || currentJob.mailReplyBinding !== job.mailReplyBinding) throw new Error('This Batch result was already consumed or changed.');
         await this.assertMailReplyBatchJobIntegrity(currentJob, true);
+        if (currentJob.mailReplyBinding.version === 2) this.requireCurrentMailReplyContextProof(state, currentJob);
         await this.assertMailReplyBatchInputsCurrent(state, job.mailReplyBinding, latestSource.source!, reviewedBody, job);
-        const freshSource = await this.currentMailReplySource(state, plan.messageId);
+        const queuedProof = currentJob.mailReplyBinding.version === 2 ? this.requireCurrentMailReplyContextProof(state, currentJob) : undefined;
+        const freshSource = queuedProof ? { status: 'current' as const, source: queuedProof.targetSource } : await this.currentMailReplySource(state, plan.messageId);
         if (freshSource.status !== 'current' || !freshSource.source || canonicalMailReplySource(freshSource.source) !== canonicalMailReplySource(job.mailReplyBinding.source)) {
           throw new Error('The original message changed before activation. Review a fresh Batch result.');
         }
         const activationAt = Date.now();
         if (activationAt < plan.preparedAtMs || activationAt >= Date.parse(plan.expiresAt) || this.bootstrapGeneration !== plan.bootstrapGeneration ||
             this.integration.privacySession?.epoch !== plan.privacyEpoch) throw new Error('This reply review expired while activation was queued. Review the saved result again.');
-        const proposal = this.buildMailReplyProposal(state, freshSource.source, { messageId: plan.messageId, mode: plan.mode,
-          sourceDigest: freshSource.source.sourceDigest, text: job.resultText!, to: job.mailReplyBinding.to, cc: job.mailReplyBinding.cc }, job.id);
+        if (currentJob.mailReplyBinding.version === 2) this.requireCurrentMailReplyContextProof(state, currentJob);
+        const proposalSource = currentJob.mailReplyBinding.version === 2 ? currentJob.mailReplyBinding.source : freshSource.source;
+        const proposal = this.buildMailReplyProposal(state, proposalSource, { messageId: plan.messageId, mode: plan.mode,
+          sourceDigest: proposalSource.sourceDigest, text: job.resultText!, to: job.mailReplyBinding.to, cc: job.mailReplyBinding.cc }, job.id);
         proposal.id = proposalId;
         state.proposals.unshift(proposal);
         addActivity(state, 'proposal_created', 'Mail reply prepared from the explicitly reviewed Batch result.', { proposalId });
@@ -6298,6 +6781,18 @@ export class AppControllerImpl implements AppController {
     const requireInspectionContext = () => {
       if (!inspectionContextIsCurrent()) throw new Error('The saved Batch job changed during inspection. Refresh local data before continuing.');
     };
+    if (isOpenRouterMailReplyContentJob(job)) {
+      try {
+        await this.assertMailReplyBatchJobIntegrity(job, false);
+        requireInspectionContext();
+        if (this.assistantBatchLedger.jobs.find((item) => item.id === job.id) !== job) throw new Error('The saved Batch job changed during request validation.');
+      } catch {
+        requireInspectionContext();
+        if (this.assistantBatchLedger.jobs.find((item) => item.id === job.id) !== job) throw new Error('The saved Batch job changed during request validation.');
+        return this.updateOpenRouterBatchJob(job.id, (current) => ({ ...current, status: 'result_invalid', failureCode: 'invalid_result',
+          resultText: undefined, resultSha256: undefined, unknownCharge: true, updatedAt: now() }), { state: capturedState, generation: capturedGeneration });
+      }
+    }
     let inspection: OpenRouterBatchInspection;
     try {
       inspection = await this.openRouterBatchClient.inspect(job.batchId, job.customId, () => {
@@ -6394,7 +6889,7 @@ export class AppControllerImpl implements AppController {
     requireInspectionContext();
     let generated: DraftAnalysis;
     try {
-      generated = parseBatchAssistantResult(inspection, prepared, job.operation).generated;
+      generated = parseBatchAssistantResult(inspection, prepared, job.operation === 'chat_refinement' ? 'chat_refinement' : undefined).generated;
     } catch {
       requireInspectionContext();
       return this.updateOpenRouterBatchJob(job.id, (current) => ({ ...current, status: 'result_invalid', unknownCharge: accounting?.providerReportedCostUsd === undefined, failureCode: 'invalid_result', ...(accounting ? { accounting } : {}), updatedAt: now() }), { state: capturedState, generation: capturedGeneration });
@@ -6405,7 +6900,7 @@ export class AppControllerImpl implements AppController {
       try {
         chatReply = Object.freeze({ summary: generated.summary, answer: generated.answer,
           clarifications: Object.freeze([...generated.clarifications]), completedAt: now(),
-          requestSha256: job.requestSha256, requestProfileVersion: job.requestProfileVersion ?? 1 });
+          requestSha256: job.requestSha256, requestProfileVersion: job.requestProfileVersion === 2 ? 2 : 1 });
         chatReplySha256 = await this.chatReplyDigest(chatReply);
         this.chatLedgerWithReply(job.chatBinding, chatReply, chatReplySha256);
       } catch {
@@ -6533,6 +7028,7 @@ export class AppControllerImpl implements AppController {
         const directlyAffected = this.assistantBatchLedger.jobs.filter((job) =>
           (isOpenRouterBatchContentJob(job) || isOpenRouterMailReplyContentJob(job)) && predicate(job));
         if (!directlyAffected.length) return undefined;
+        for (const job of directlyAffected) this.mailReplyContextProofs.delete(job.id);
         if (directlyAffected.some(isOpenRouterMailReplyContentJob) && this.hasUnresolvedDispatchRecoveryEvidence() && !options.retainUncertainMailObservation) {
           throw new Error('Dispatch history failed integrity validation. Refresh local data before removing mail Batch content.');
         }
@@ -7702,6 +8198,11 @@ export class AppControllerImpl implements AppController {
       catch (error) {
         this.invalidate(proposal);
         proposal.status = 'draft';
+        if (error instanceof MailReplyContextRefreshRequiredError) {
+          proposal.requiresRebuild = false;
+          addActivity(state, 'error', 'The selected conversation-source review expired before execution. Refresh those sources and approve this saved reply again.', { proposalId: proposal.id, noteId: proposal.noteId });
+          return { proposal, dependencyProjection: '', invalidated: 'The selected conversation-source review expired. Refresh the sources and approve this saved reply again.' };
+        }
         proposal.requiresRebuild = true;
         addActivity(state, 'error', 'An approved suggestion was invalidated because its source context changed. Run Assist again before reviewing it.', { proposalId: proposal.id, noteId: proposal.noteId });
         return { proposal, dependencyProjection: '', invalidated: error instanceof Error ? error.message : 'The source context changed.' };
@@ -7935,6 +8436,21 @@ export class AppControllerImpl implements AppController {
             if (!target || !target.connected || !target.writable || target.accountId !== currentAccount.id || target.providerId !== record.calendar?.providerId) return false;
           }
           return true;
+        }, inspectRefreshedReplySource: (candidate) => {
+          const linkedId = candidate.replySource?.batchJobId;
+          if (!linkedId) return 'not_required';
+          const linked = this.assistantBatchLedger.jobs.find((item) => item.id === linkedId);
+          if (!linked || !isOpenRouterMailReplyContentJob(linked) || linked.status !== 'completed' || linked.proposalId !== id ||
+              candidate.replySource?.sourceDigest !== linked.mailReplyBinding.source.sourceDigest ||
+              stableJson(candidate) !== stableJson(envelope)) return 'required_missing';
+          if (linked.mailReplyBinding.version === 1 && linked.requestProfileVersion !== 3) return 'not_required';
+          if (linked.mailReplyBinding.version !== 2 || linked.requestProfileVersion !== 3 || linked.operation !== 'mail_reply_context' ||
+              this.getMailReplyBatchSourcesStatus(linkedId).status !== 'current') return 'required_missing';
+          const proof = this.mailReplyContextProofs.get(linkedId);
+          if (!proof || proof.requestSha256 !== linked.requestSha256 || proof.sourceFingerprint !== linked.sourceFingerprint || proof.resultSha256 !== linked.resultSha256 ||
+              proof.bootstrapGeneration !== this.bootstrapGeneration || proof.privacyEpoch !== this.integration.privacySession?.epoch ||
+              Date.now() < proof.admittedAtMs || Date.now() >= proof.expiresAtMs) return 'required_missing';
+          return 'verified';
         } };
         try {
           const receipt: MutationReceipt = operation === 'draft'
@@ -9824,6 +10340,167 @@ export class AppControllerImpl implements AppController {
     });
   }
 
+  private mailReplyContextSession(sessionId: string): MailReplyContextDiscoverySession {
+    const session = this.mailReplyContextSessions.get(sessionId);
+    const at = Date.now();
+    if (!session || session.invalid || at < session.createdAtMs || at >= session.expiresAtMs ||
+        session.bootstrapGeneration !== this.bootstrapGeneration || session.privacyEpoch !== this.integration.privacySession?.epoch) {
+      this.mailReplyContextSessions.delete(sessionId);
+      throw new Error('Conversation discovery expired or changed. Reopen the selected message and discover its context again.');
+    }
+    const state = this.snapshot;
+    const target = state.mailbox.find((item) => item.id === session.targetMessageId);
+    const account = target && state.accounts.find((item) => item.id === target.accountId);
+    if (!target || !account || target.threadId !== session.threadId || target.providerMessageId !== session.targetProviderMessageId ||
+        account.id !== session.accountId || identityKey(account) !== session.identityKey ||
+        (account.connectionGeneration ?? 0) !== session.connectionGeneration || !account.connected || account.authStatus !== 'connected') {
+      this.mailReplyContextSessions.delete(sessionId);
+      throw new Error('The selected message or mailbox connection changed. Reopen it before using conversation context.');
+    }
+    return session;
+  }
+
+  private mailReplyContextDiscoveryDTO(session: MailReplyContextDiscoverySession): MailReplyConversationContextDiscovery {
+    return Object.freeze({ sessionId: session.sessionId, targetMessageId: session.targetMessageId,
+      rows: Object.freeze([...session.rows.entries()].map(([rowId, row]) => Object.freeze({ rowId, subject: row.subject ?? '(no subject)',
+        ...(row.senderEmail ?? row.from ? { sender: row.senderEmail ?? row.from } : {}),
+        ...(row.receivedAt ? { receivedAt: row.receivedAt } : {}), ...(row.sentAt ? { sentAt: row.sentAt } : {}),
+        ...(row.isDraft === undefined ? {} : { isDraft: row.isDraft }) }))),
+      coverage: session.coverage, omissionReasons: Object.freeze([...session.omissionReasons]),
+      hasMore: Boolean(session.cursor), expiresAt: new Date(session.expiresAtMs).toISOString() });
+  }
+
+  async discoverMailReplyContext(input: { messageId: string; sourceDigest: string }): Promise<MailReplyConversationContextDiscovery> {
+    await this.load();
+    await this.assertPrivacySessionCurrent();
+    if (!this.loaded || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired ||
+        typeof input?.messageId !== 'string' || !/^[a-f\d]{64}$/i.test(input.sourceDigest)) throw new Error('Refresh the selected message before discovering conversation context.');
+    const state = this.snapshot;
+    const target = state.mailbox.find((item) => item.id === input.messageId);
+    const account = target && state.accounts.find((item) => item.id === target.accountId);
+    const source = await this.currentMailReplySource(state, input.messageId);
+    if (state !== this.snapshot || source.status !== 'current' || !source.source || source.source.sourceDigest.toLowerCase() !== input.sourceDigest.toLowerCase() ||
+        !target || !account || !target.threadId || !account.connected || account.authStatus !== 'connected' || account.provider === 'local' ||
+        !account.identity || !account.capabilities?.includes('mail.read') || !account.grantedScopes || !scopeGrantsCapability(account.provider, account.grantedScopes, 'mail.read') ||
+        target.providerDeletedAt || target.verifiedIdentityKey !== identityKey(account) || target.connectionGeneration !== account.connectionGeneration) {
+      throw new Error('The selected message or verified mailbox connection is not current. Refresh it before discovering context.');
+    }
+    for (const [id, existing] of this.mailReplyContextSessions) if (existing.targetMessageId === target.id) this.mailReplyContextSessions.delete(id);
+    const session: MailReplyContextDiscoverySession = { sessionId: newId(), targetMessageId: target.id, sourceDigest: source.source.sourceDigest,
+      accountId: account.id, identityKey: identityKey(account), connectionGeneration: account.connectionGeneration ?? 0,
+      targetProviderMessageId: target.providerMessageId, threadId: target.threadId, bootstrapGeneration: this.bootstrapGeneration,
+      privacyEpoch: this.integration.privacySession?.epoch, createdAtMs: Date.now(), expiresAtMs: Date.now() + 15 * 60_000,
+      seenCursors: new Set(), rows: new Map(), providerRows: new Map(), selections: new Map(), bytes: 0, invalid: false,
+      coverage: 'complete_metadata', omissionReasons: new Set() };
+    this.mailReplyContextSessions.set(session.sessionId, session);
+    return this.fetchMailReplyContextPage(session);
+  }
+
+  async continueMailReplyContextDiscovery(input: { sessionId: string }): Promise<MailReplyConversationContextDiscovery> {
+    const session = this.mailReplyContextSession(input?.sessionId);
+    if (!session.cursor) return this.mailReplyContextDiscoveryDTO(session);
+    return this.fetchMailReplyContextPage(session);
+  }
+
+  private async fetchMailReplyContextPage(session: MailReplyContextDiscoverySession): Promise<MailReplyConversationContextDiscovery> {
+    if (!this.connector?.listConversationMessages) throw new Error('Conversation discovery is unavailable for this mailbox.');
+    const state = this.snapshot;
+    const account = state.accounts.find((item) => item.id === session.accountId);
+    const target = state.mailbox.find((item) => item.id === session.targetMessageId);
+    if (!account || !target) throw new Error('The selected message is no longer available.');
+    const guard: RequestGuard = () => {
+      this.mailReplyContextSession(session.sessionId);
+      if (this.snapshot !== state) throw new Error('The workspace changed during conversation discovery.');
+    };
+    const cursor = session.cursor;
+    const page = await this.connector.listConversationMessages(clone(account), { threadId: session.threadId, ...(cursor ? { cursor } : {}), guard });
+    guard();
+    if (page.coverage !== 'complete_metadata' || page.messages.length > 50) throw new Error('The provider did not return complete bounded conversation metadata.');
+    const nextIds = new Set<string>();
+    for (const row of page.messages) {
+      if (row.threadId !== session.threadId || !row.id || row.id === session.targetProviderMessageId) continue;
+      const priorId = session.providerRows.get(row.id);
+      if (priorId) {
+        const prior = session.rows.get(priorId);
+        if (!prior || stableJson(prior) !== stableJson(row)) {
+          session.invalid = true; this.mailReplyContextSessions.delete(session.sessionId);
+          throw new Error('The provider returned conflicting duplicate conversation messages. Reload discovery to continue.');
+        }
+        continue;
+      }
+      if (nextIds.has(row.id)) {
+        session.invalid = true; this.mailReplyContextSessions.delete(session.sessionId);
+        throw new Error('The provider returned duplicate conversation messages. Reload discovery to continue.');
+      }
+      nextIds.add(row.id);
+      const rowId = newId();
+      const safe = clone(row);
+      const bytes = utf8Bytes(stableJson(safe));
+      if (session.bytes + bytes > 1024 * 1024) { this.mailReplyContextSessions.delete(session.sessionId); throw new Error('Conversation metadata exceeded the 1 MiB safety bound.'); }
+      session.bytes += bytes; session.rows.set(rowId, safe); session.providerRows.set(row.id, rowId);
+    }
+    session.cursor = page.nextCursor;
+    if (page.coverage !== 'complete_metadata' || page.omissionReasons.length) session.coverage = 'partial';
+    for (const reason of page.omissionReasons) session.omissionReasons.add(reason);
+    if (session.cursor) {
+      if (session.seenCursors.has(session.cursor)) {
+        this.mailReplyContextSessions.delete(session.sessionId);
+        throw new Error('The provider returned a repeated conversation continuation. Reload discovery to continue.');
+      }
+      session.seenCursors.add(session.cursor);
+    }
+    return this.mailReplyContextDiscoveryDTO(session);
+  }
+
+  async loadMailReplyContextMessage(input: { sessionId: string; rowId: string }): Promise<MailReplyContextSelection> {
+    const session = this.mailReplyContextSession(input?.sessionId);
+    const row = session.rows.get(input?.rowId);
+    if (!row || row.isDraft !== false || row.threadId !== session.threadId) throw new Error('Only a known non-draft message in the selected conversation can be loaded.');
+    const state = this.snapshot;
+    const account = state.accounts.find((item) => item.id === session.accountId);
+    if (!account || !this.connector?.readSelectedMessageText) throw new Error('Full message text is unavailable for this mailbox.');
+    const expectedGeneration = session.connectionGeneration;
+    const guard: RequestGuard = () => {
+      this.mailReplyContextSession(session.sessionId);
+      const current = this.snapshot.accounts.find((item) => item.id === session.accountId);
+      if (this.snapshot !== state || !current || (current.connectionGeneration ?? 0) !== expectedGeneration) throw new Error('The mailbox changed while loading selected context.');
+    };
+    const body = await this.connector.readSelectedMessageText(clone(account), row.id, { sizeEstimate: row.sizeEstimate, sizeCheckedAt: row.sizeCheckedAt, guard });
+    guard();
+    const returned = body.message;
+    if (body.status !== 'available' || !returned || returned.id !== row.id || returned.idFormat !== row.idFormat ||
+        returned.threadId !== session.threadId || returned.isDraft !== false || returned.replyMetadataComplete !== true || !body.text ||
+        body.completeness === 'unavailable' || !validReplyText(body.text) || utf8Bytes(body.text) !== body.bytes || body.bytes > 16 * 1024) {
+      throw new Error('The selected conversation message is unavailable or incomplete.');
+    }
+    const selectionId = newId();
+    const currentSource = await createMailReplySource(this.mailReplySourceFromRow({ ...this.mailboxRowForContext(row, session, returned, selectionId), ...returned,
+      id: selectionId, accountId: session.accountId, providerMessageId: row.id, identityKey: `${session.identityKey}:${row.id}`,
+      verifiedIdentityKey: session.identityKey, connectionGeneration: session.connectionGeneration, idFormat: row.idFormat }, account, body.checkedAt), async (canonical) =>
+      Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, canonical, { encoding: Crypto.CryptoEncoding.HEX }));
+    guard();
+    const frozen: OpenRouterMailReplyContextSource = Object.freeze({ selectionId, source: currentSource,
+      body: Object.freeze({ text: body.text, textDigest: await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, body.text, { encoding: Crypto.CryptoEncoding.HEX }),
+        bytes: body.bytes, extractionVersion: body.extractionVersion, representation: body.representation, completeness: body.completeness,
+        omissionReasons: Object.freeze(body.reasons.slice(0, 16)) }), ...(returned.receivedAt ? { receivedAt: returned.receivedAt } : {}),
+      ...(returned.sentAt ? { sentAt: returned.sentAt } : {}), isDraft: false });
+    session.selections.set(selectionId, frozen);
+    return Object.freeze({ selectionId, subject: currentSource.subject, ...(currentSource.senderEmail ? { sender: currentSource.senderEmail } : {}),
+      ...(frozen.receivedAt ? { receivedAt: frozen.receivedAt } : {}), ...(frozen.sentAt ? { sentAt: frozen.sentAt } : {}), text: body.text,
+      bytes: body.bytes, representation: body.representation, completeness: body.completeness, omissionReasons: Object.freeze([...frozen.body.omissionReasons]) });
+  }
+
+  private mailboxRowForContext(row: MessageSummary, session: MailReplyContextDiscoverySession, returned: MessageSummary, selectionId: string): MailboxSnapshotMessage {
+    return { id: selectionId, accountId: session.accountId, providerMessageId: row.id, identityKey: `${session.identityKey}:${row.id}`,
+      verifiedIdentityKey: session.identityKey, connectionGeneration: session.connectionGeneration, idFormat: row.idFormat,
+      threadId: returned.threadId, subject: returned.subject, from: returned.from, senderEmail: returned.senderEmail,
+      receivedAt: returned.receivedAt, isRead: returned.isRead, replyMetadataComplete: returned.replyMetadataComplete,
+      internetMessageId: returned.internetMessageId, providerVersion: returned.providerVersion, replyTo: returned.replyTo,
+      to: returned.to, cc: returned.cc, references: returned.references, inReplyTo: returned.inReplyTo, headers: returned.headers, observedAt: now() };
+  }
+
+  async cancelMailReplyContextDiscovery(sessionId: string): Promise<void> { this.mailReplyContextSessions.delete(sessionId); }
+
   private buildMailReplyProposal(state: AppState, source: MailReplySourceSnapshot,
     input: { messageId: string; mode: 'reply' | 'reply_all'; sourceDigest: string; text: string; to: readonly string[]; cc: readonly string[] }, batchJobId?: string): Proposal {
     if (input.messageId !== source.localMessageId || input.sourceDigest.toLowerCase() !== source.sourceDigest.toLowerCase() ||
@@ -10025,7 +10702,8 @@ export class AppControllerImpl implements AppController {
     } : this.selectedMailTextUnavailable(baseMessage, account, sourceForCache.sourceDigest, omissionReasons[0] ?? 'text_unavailable', checkedAt,
       validUnavailablePair ? extractionVersion : 'mail-text-v2', validUnavailablePair ? omissionReasons : undefined);
     const sourceChanged = Boolean(updatedSource && updatedSource.sourceDigest !== input.sourceDigest);
-    const sourceRemoval = this.sourceRemovalCommit((job) => isOpenRouterMailReplyContentJob(job) && job.mailReplyBinding.messageId === input.messageId,
+    const sourceRemoval = this.sourceRemovalCommit((job) => isOpenRouterMailReplyContentJob(job) &&
+      this.mailReplyJobUsesMessage(job, original.accountId, input.messageId, original.providerMessageId),
       { ...(ownActiveMailReviewJobId ? { ownActiveMailReviewJobId } : {}), retainUncertainMailObservation: true });
     await this.mutate((state) => {
       if (this.selectedMailFence(state, input.messageId) !== expectedFence) throw new Error('Selected message changed while text was being saved.');
@@ -10079,6 +10757,9 @@ export class AppControllerImpl implements AppController {
   }
 
   async generateMailReplyText(input: MailReplyTextGenerationInput): Promise<MailReplyTextGenerationResult> {
+    if ((input.contextSelectionIds?.length ?? 0) > 0 || (input.contextExcerptSelectionIds?.length ?? 0) > 0) {
+      throw new Error('Selected conversation context is available only through the queued mail reply review flow.');
+    }
     await this.load();
     if (!input || !Number.isSafeInteger(input.composerRevision) || input.composerRevision < 0 || !['reply', 'reply_all'].includes(input.mode)) throw new Error('Reply composer version or mode is invalid.');
     const validationSnapshot = this.snapshot;
@@ -10421,8 +11102,22 @@ export class AppControllerImpl implements AppController {
         }
       };
       const changedReplySourceIds = new Set<string>();
+      const contextSourcesByProviderId = new Map<string, MailReplySourceSnapshot[]>();
+      for (const job of this.assistantBatchLedger.jobs) if (isOpenRouterMailReplyContentJob(job) && job.mailReplyBinding.version === 2 &&
+          job.mailReplyBinding.source.accountId === accountId) {
+        const targetRows = contextSourcesByProviderId.get(job.mailReplyBinding.source.providerMessageId) ?? [];
+        targetRows.push(job.mailReplyBinding.source);
+        contextSourcesByProviderId.set(job.mailReplyBinding.source.providerMessageId, targetRows);
+        for (const member of job.mailReplyBinding.context ?? []) {
+          const rows = contextSourcesByProviderId.get(member.source.providerMessageId) ?? [];
+          rows.push(member.source); contextSourcesByProviderId.set(member.source.providerMessageId, rows);
+        }
+      }
       const sourceRemoval = this.sourceRemovalCommit(
-        (job) => job.kind === 'mail_reply' && Boolean(job.mailReplyBinding && changedReplySourceIds.has(job.mailReplyBinding.messageId)),
+        (job) => isOpenRouterMailReplyContentJob(job) && Boolean(job.mailReplyBinding &&
+          (changedReplySourceIds.has(job.mailReplyBinding.messageId) || this.mailReplyJobUsesMessage(job, accountId,
+            undefined, [...changedReplySourceIds].find((id) => id === job.mailReplyBinding.source.providerMessageId ||
+              job.mailReplyBinding.context?.some((member) => member.source.providerMessageId === id))))),
         { retainUncertainMailObservation: true });
       const persistPage = async (items: MessageSummary[], cursor: string | undefined, metadata: MessageWindowPageMetadata) => this.mutate((state) => {
         ensureCurrent(state);
@@ -10448,7 +11143,10 @@ export class AppControllerImpl implements AppController {
             observedAt: timestamp,
           };
           const changed = !prior || canonicalMailboxContent(prior) !== canonicalMailboxContent(value);
-          if (prior && changed) changedReplySourceIds.add(prior.id);
+          if (prior && changed) { changedReplySourceIds.add(prior.id); changedReplySourceIds.add(prior.providerMessageId); }
+          for (const source of contextSourcesByProviderId.get(item.id) ?? []) {
+            if (this.mailReplyObservationConflictsSource(value, source, immutableAccount)) changedReplySourceIds.add(item.id);
+          }
           if (prior) { Object.assign(prior, value); delete prior.providerDeletedAt; } else state.mailbox.push(value);
           if (changed) markAnalysesStale(state, [`mail:${encodeURIComponent(key)}:${encodeURIComponent(item.id)}`]);
         }
@@ -10463,8 +11161,9 @@ export class AppControllerImpl implements AppController {
             verifiedIdentityKey: key, connectionGeneration: generation, idFormat: immutableAccount.provider === 'microsoft' ? 'graph-immutable' : 'gmail',
             providerDeletedAt: deletedAt, observedAt: timestamp,
           };
+          if ((contextSourcesByProviderId.get(id)?.length ?? 0) > 0) changedReplySourceIds.add(id);
           if (!prior || !prior.providerDeletedAt) markAnalysesStale(state, [`mail:${encodeURIComponent(key)}:${encodeURIComponent(id)}`]);
-          if (prior) { changedReplySourceIds.add(prior.id); Object.assign(prior, tombstone); } else state.mailbox.push(tombstone);
+          if (prior) { changedReplySourceIds.add(prior.id); changedReplySourceIds.add(prior.providerMessageId); Object.assign(prior, tombstone); } else state.mailbox.push(tombstone);
           unavailableCount++;
         }
         const accountMessages = state.mailbox.filter((entry) => entry.accountId === accountId)

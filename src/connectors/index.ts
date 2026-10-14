@@ -81,6 +81,8 @@ export interface DispatchVerifier {
   verify(envelope: ApprovedDispatch): Promise<boolean>;
   /** Synchronous final check after async preparation and token refresh, immediately before dispatch. */
   verifyBeforeDispatch(envelope: ApprovedDispatch): boolean;
+  /** Distinguishes legacy source-age validation from an exact, volatile refreshed-context proof. */
+  inspectRefreshedReplySource?(envelope: ApprovedDispatch): 'not_required' | 'verified' | 'required_missing';
 }
 
 export type MutationReceipt = { status: 'accepted'; id?: string; replyDraftCheck?: 'matches_approved' | 'differs' | 'unverified' } | { status: 'unknown' };
@@ -1360,10 +1362,20 @@ export class ConnectorClient {
     if (envelope.replySource) {
       try { canonicalMailReplySource(envelope.replySource.source); }
       catch { throw new Error('Reply source approval is invalid. Review the source and approve the reply again.'); }
+      const proofStatus = verifier.inspectRefreshedReplySource?.(envelope);
+      if (proofStatus !== undefined && !['not_required', 'verified', 'required_missing'].includes(proofStatus)) {
+        throw new Error('Reply source verification failed. Review and approve the reply again.');
+      }
+      if (proofStatus === 'required_missing') throw new Error('Refresh the selected reply sources before dispatch.');
       const now = this.now();
       const observedAt = Date.parse(envelope.replySource.source.observedAt);
       const expiresAt = Date.parse(envelope.replySource.expiresAt);
-      if (!Number.isFinite(observedAt) || observedAt > now || now - observedAt > SELECTED_SIZE_FRESH_MS || !Number.isFinite(expiresAt) || expiresAt <= now) {
+      if (!Number.isFinite(observedAt) || new Date(observedAt).toISOString() !== envelope.replySource.source.observedAt || observedAt > now ||
+          !Number.isFinite(expiresAt) || new Date(expiresAt).toISOString() !== envelope.replySource.expiresAt || expiresAt !== observedAt + SELECTED_SIZE_FRESH_MS) {
+        throw new Error('Reply source approval has an invalid observation window. Review the source and approve the reply again.');
+      }
+      if (proofStatus === 'verified') return;
+      if (now - observedAt >= SELECTED_SIZE_FRESH_MS || expiresAt <= now) {
         throw new Error('Reply source approval has expired. Review the source and approve the reply again.');
       }
     }
