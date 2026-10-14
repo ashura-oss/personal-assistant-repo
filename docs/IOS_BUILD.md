@@ -18,6 +18,8 @@ The workflow sets `EXPO_NO_DOTENV=1`; it does not read `.env`, provider keys, or
 
 One fictional OpenRouter Batch request was submitted with one POST, then checked through read-only status and ownership diagnostics. The exact request, strict `READY` result, outer canonical Luna model, and inline base model were verified. OpenRouter reported 75 prompt tokens, 14 completion tokens, and US$0.00000725 for that request. It contained no personal audio or user content. The original local submission journal remains `submission_unknown`; the separately verified diagnostic receipt was not adopted into it, and the utility will not resubmit automatically. This proves only that this synthetic Batch request completed with the validated response and usage; it does not prove in-app queued chat, general model availability, future pricing, or any iOS behavior. The OpenRouter key is stored outside the repository and is not used by this workflow.
 
+On 2026-10-14 at 08:05:01 SGT, a read-only GET checked the already-submitted synthetic same-owned assistant Batch job from the earlier Chat handoff. The response reached `READY` and passed the ownership, canonical-model, schema, and semantic validation gates. OpenRouter reported 690 prompt tokens, 100 completion tokens, 790 total tokens, and US$0.0000595 actual cost. No new POST was made. This is Node wire/client and response-validation evidence for that synthetic job, not proof of in-app Chat interaction, refinement, generated mail replies, future pricing, native behavior, or user-content handling. No repeated GET is needed for this result.
+
 ## Local checks on Windows
 
 Run the repository's static iOS configuration gate first, followed by the existing project checks:

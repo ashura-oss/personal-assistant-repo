@@ -39,6 +39,13 @@ export interface OpenRouterChatBinding {
   readonly context: readonly OpenRouterChatContextReference[];
   readonly omittedTurnCount: number;
   readonly refinementParent?: OpenRouterChatContextReference;
+  readonly transcriptSource?: Readonly<{
+    noteId: string;
+    noteRevision: number;
+    transcriptSha256: string;
+    capturedAt: string;
+    captureTimeZone: string;
+  }>;
 }
 
 /** Private persisted job record. Raw request text never enters AppState/public projections. */
@@ -170,7 +177,7 @@ function validChatBinding(value: unknown): value is OpenRouterChatBinding {
       return Boolean(descriptor?.enumerable && Object.prototype.hasOwnProperty.call(descriptor, 'value'));
     });
   };
-  if (!row || !plainDataObject(row) || !exactKeys(row, ['conversationId', 'turnId', 'context', 'omittedTurnCount'], ['refinementParent']) ||
+  if (!row || !plainDataObject(row) || !exactKeys(row, ['conversationId', 'turnId', 'context', 'omittedTurnCount'], ['refinementParent', 'transcriptSource']) ||
       typeof row.conversationId !== 'string' || row.conversationId.length !== 36 || !UUID_V4.test(row.conversationId) ||
       typeof row.turnId !== 'string' || row.turnId.length !== 36 || !UUID_V4.test(row.turnId) ||
       !Number.isSafeInteger(row.omittedTurnCount) || (row.omittedTurnCount as number) < 0 ||
@@ -195,6 +202,16 @@ function validChatBinding(value: unknown): value is OpenRouterChatBinding {
       (item.replyProfileVersion === 1 || item.replyProfileVersion === 2));
   };
   if (row.refinementParent !== undefined && !validReference(row.refinementParent)) return false;
+  if (row.refinementParent !== undefined && row.transcriptSource !== undefined) return false;
+  if (row.transcriptSource !== undefined) {
+    const source = record(row.transcriptSource);
+    if (!source || !plainDataObject(source) || !exactKeys(source, ['noteId', 'noteRevision', 'transcriptSha256', 'capturedAt', 'captureTimeZone']) ||
+        typeof source.noteId !== 'string' || source.noteId.length < 1 || source.noteId.length > 512 || /[\u0000-\u001f\u007f-\u009f]/.test(source.noteId) ||
+        !Number.isSafeInteger(source.noteRevision) || (source.noteRevision as number) < 1 ||
+        typeof source.transcriptSha256 !== 'string' || source.transcriptSha256.length !== 64 || !SHA256.test(source.transcriptSha256) ||
+        !canonicalIso(source.capturedAt) || typeof source.captureTimeZone !== 'string' || !source.captureTimeZone || source.captureTimeZone.length > 128) return false;
+    try { new Intl.DateTimeFormat('en', { timeZone: source.captureTimeZone }).format(0); } catch { return false; }
+  }
   if (row.refinementParent !== undefined && row.context.some((candidate) => record(candidate)?.turnId === record(row.refinementParent)?.turnId)) return false;
   const seenTurnIds = new Set<string>();
   const seenJobIds = new Set<string>();

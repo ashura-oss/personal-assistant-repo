@@ -16,6 +16,7 @@ export type ChatTurn = Readonly<{
   createdAt: string;
   captureTimeZone: string;
   capturedAt?: string;
+  messageOrigin?: 'saved_transcript';
   operation?: 'chat_refinement';
   reasoningEffort?: 'medium' | 'high' | 'max';
   parentTurnId?: string;
@@ -54,11 +55,25 @@ export type ChatTurnDTO = Readonly<{
   noteId: string;
   userText: string;
   createdAt: string;
+  messageOrigin?: 'saved_transcript';
+  capturedAt?: string;
+  captureTimeZone?: string;
   operation?: 'chat_refinement';
   reasoningEffort?: 'medium' | 'high' | 'max';
   parentTurnId?: string;
   reply?: Pick<ChatReplySnapshot, 'summary' | 'answer' | 'clarifications' | 'completedAt'>;
   job?: import('../services/openRouterBatchJobs').AssistantBatchJobDTO;
+}>;
+
+/** Safe preview of a saved transcript before the user copies it into Chat. */
+export type ChatTranscriptTransferPlan = Readonly<{
+  planId: string;
+  noteId: string;
+  noteRevision: number;
+  transcript: string;
+  capturedAt: string;
+  captureTimeZone: string;
+  expiresAt: string;
 }>;
 
 export type ChatConversationDTO = Readonly<{

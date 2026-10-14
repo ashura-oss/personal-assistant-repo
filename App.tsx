@@ -87,7 +87,9 @@ import { PendingRecordingRecoveryPanel } from "./src/components/PendingRecording
 import { BackgroundRefreshSection, type BackgroundRefreshActionResult } from "./src/components/BackgroundRefreshSection";
 import { AssistantBatchHistorySection } from "./src/ui/AssistantBatchHistorySection";
 import { ChatSection } from "./src/ui/ChatSection";
-import { runAcceptedChatSubmission } from "./src/ui/chatSubmission";
+import { isAcceptedChatSubmission, runAcceptedChatSubmission } from "./src/ui/chatSubmission";
+import type { ChatTranscriptTransferPlan } from "./src/chat/types";
+import { VoiceChatTransferOwnership } from "./src/ui/voiceChatTransferOwnership";
 import { createSpeechTranscriptionAdmission, runExplicitSpeechTranscriptionAction } from "./src/ui/speechTranscriptionAction";
 import type { AssistantBatchJobDTO } from "./src/services/openRouterBatchJobs";
 import { MailAlertPreview } from "./src/dev/mailAlertPreview";
@@ -113,6 +115,7 @@ import type { PrivacyAudioBoundary } from "./src/privacy/audioBoundary";
 import type { PrivacyPublicStatus, PrivacyErasePlan } from "./src/privacy/types";
 
 type Tab = "inbox" | "record" | "chat" | "library";
+const EMPTY_CHAT_CONVERSATIONS: NonNullable<AppState["assistantChatConversations"]> = [];
 
 const previewScenario =
   typeof __DEV__ !== "undefined" && __DEV__
@@ -525,6 +528,32 @@ const previewCredentialService: ProviderCredentialService = {
 function isPrivacyBootstrapError(error: unknown): boolean {
   return !!error && typeof error === "object" &&
     ["stale_epoch", "cleanup_in_progress", "unsupported_runtime", "control_unavailable"].includes(String((error as { code?: unknown }).code));
+}
+
+function isUsableCaptureTimeZone(value: string | undefined): value is string {
+  if (!value?.trim()) return false;
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: value }).format();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function matchesSavedTranscriptPlan(note: Note | undefined, plan: ChatTranscriptTransferPlan): boolean {
+  return Boolean(note && note.id === plan.noteId && note.revision === plan.noteRevision &&
+    note.transcript === plan.transcript && note.transcript.trim() &&
+    note.importOrigin?.originalTimeZoneUnknown !== true &&
+    isUsableCaptureTimeZone(note.captureTimeZone) && note.captureTimeZone === plan.captureTimeZone &&
+    (note.capturedAt ?? note.createdAt) === plan.capturedAt);
+}
+
+function matchesSavedTranscriptNote(note: Note | undefined, expected: Note): boolean {
+  return Boolean(note && note.id === expected.id && note.revision === expected.revision &&
+    note.transcript === expected.transcript && note.transcript.trim() &&
+    note.importOrigin?.originalTimeZoneUnknown !== true &&
+    isUsableCaptureTimeZone(note.captureTimeZone) && note.captureTimeZone === expected.captureTimeZone &&
+    (note.capturedAt ?? note.createdAt) === (expected.capturedAt ?? expected.createdAt));
 }
 
 function unavailableReason(): "dedicated_ios_build_required" | "secure_context_and_web_locks_required" {
@@ -948,6 +977,16 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
   const [proactiveRecoveryRefreshedId, setProactiveRecoveryRefreshedId] = useState<string | undefined>();
   const [proactiveRecoverySheetOpen, setProactiveRecoverySheetOpen] = useState(false);
   const [selectedChatConversationId, setSelectedChatConversationId] = useState<string | undefined>();
+  const [chatTranscriptTransferPlan, setChatTranscriptTransferPlan] = useState<ChatTranscriptTransferPlan | undefined>();
+  const [chatTranscriptTransferPreparedAt, setChatTranscriptTransferPreparedAt] = useState<number | undefined>();
+  const [chatTranscriptTransferBusy, setChatTranscriptTransferBusy] = useState(false);
+  const [chatTranscriptTransferKeyReady, setChatTranscriptTransferKeyReady] = useState(false);
+  const chatTranscriptTransferPlanRef = useRef<ChatTranscriptTransferPlan | undefined>(undefined);
+  const chatTranscriptTransferActionRef = useRef(false);
+  const chatTranscriptTransferGenerationRef = useRef(0);
+  const chatTranscriptTransferActionTokenRef = useRef(0);
+  const chatTranscriptTransferOwnershipRef = useRef<VoiceChatTransferOwnership | null>(null);
+  if (chatTranscriptTransferOwnershipRef.current == null) chatTranscriptTransferOwnershipRef.current = new VoiceChatTransferOwnership();
   const [chatDeleteReviewOpen, setChatDeleteReviewOpen] = useState(false);
   const [chatInteractionLocked, setChatInteractionLocked] = useState(false);
   const chatInteractionLock = useRef(false);
@@ -1228,7 +1267,7 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
           p.status,
         )),
   );
-  const chatConversations = state.assistantChatConversations ?? [];
+  const chatConversations = state.assistantChatConversations ?? EMPTY_CHAT_CONVERSATIONS;
   const selectedChatConversation = chatConversations.find((item) => item.id === selectedChatConversationId);
   const chatRecoveryMessage = state.assistantChatRecoveryStatus?.message ?? state.assistantBatchRecoveryStatus?.message ??
     (state.mailAlertRefreshRequired ? "Saved data changed. Refresh local data before continuing." : undefined) ??
@@ -1255,6 +1294,78 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
   const activeDetailNote = detail
     ? state.notes.find((note) => note.id === detail.id)
     : undefined;
+  const voiceTransferHardBlocked = !startupReady || loading || isIsolatedDemo || isolatedPreviewFailed ||
+    privacyReviewOpen || privacyOutcomeUnknown || (busy && !chatTranscriptTransferBusy) ||
+    audio.status !== "idle" || pendingCaptureLoading || Boolean(captureJournal && pendingCaptureStatus?.kind !== "empty") ||
+    foregroundResumeRefreshing || !foregroundCatchupComplete || proactiveRecoverySheetOpen || proactiveRecoveryRequiresRefresh ||
+    Boolean(state.mailAlertRefreshRequired || state.assistantChatRecoveryStatus || state.assistantBatchRecoveryStatus ||
+      state.proactiveMailAlertRecoveryStatus || state.backupRecoveryStatus || state.knowledgeRecoveryStatus || state.reminderRecoveryStatus) ||
+    Boolean(review || replyMessageId || reminderReviewId || doc || recordingAttachmentNoteId || manualOpen || settingsOpen ||
+      mailAlertTapResolution || mailAlertTapPending || chatDeleteReviewOpen || chatInteractionLocked);
+  const voiceTransferBlockedRef = useRef(voiceTransferHardBlocked);
+  useEffect(() => {
+    voiceTransferBlockedRef.current = voiceTransferHardBlocked;
+    if (voiceTransferHardBlocked) chatTranscriptTransferGenerationRef.current += 1;
+  }, [voiceTransferHardBlocked]);
+  const cancelVoiceTransferPlan = useCallback((expectedPlanId?: string) => {
+    const current = chatTranscriptTransferPlanRef.current;
+    if (!current || (expectedPlanId && current.planId !== expectedPlanId)) return;
+    chatTranscriptTransferPlanRef.current = undefined;
+    chatTranscriptTransferOwnershipRef.current?.clearPlan(current.planId);
+    setChatTranscriptTransferPlan(undefined);
+    setChatTranscriptTransferPreparedAt(undefined);
+    setChatTranscriptTransferKeyReady(false);
+    chatTranscriptTransferGenerationRef.current += 1;
+    void controller.cancelChatFromTranscript(current.planId).catch(() => undefined);
+  }, [controller]);
+  const publishDetailOwner = useCallback((next: Note | null) => {
+    const ownership = chatTranscriptTransferOwnershipRef.current!;
+    const currentOwner = next ? ownership.captureOwner(next) : undefined;
+    if (!currentOwner) {
+      cancelVoiceTransferPlan();
+      ownership.publishOwner(next);
+      chatTranscriptTransferGenerationRef.current += 1;
+      chatTranscriptTransferActionTokenRef.current += 1;
+      chatTranscriptTransferActionRef.current = false;
+      setChatTranscriptTransferBusy(false);
+    }
+    setDetail(next);
+  }, [cancelVoiceTransferPlan]);
+  const closeDetail = useCallback(() => publishDetailOwner(null), [publishDetailOwner]);
+  useEffect(() => {
+    const plan = chatTranscriptTransferPlan;
+    if (!plan) return;
+    const preparedAt = chatTranscriptTransferPreparedAt;
+    const now = Date.now();
+    const expiry = Date.parse(plan.expiresAt);
+    const currentNote = controller.getSnapshot().notes.find((note) => note.id === plan.noteId);
+    if (voiceTransferHardBlocked || !preparedAt || now < preparedAt || !Number.isFinite(expiry) || now >= expiry ||
+        !matchesSavedTranscriptPlan(activeDetailNote, plan) || !matchesSavedTranscriptPlan(currentNote, plan)) {
+      cancelVoiceTransferPlan(plan.planId);
+    }
+  }, [activeDetailNote, cancelVoiceTransferPlan, chatTranscriptTransferPlan, chatTranscriptTransferPreparedAt, controller, voiceTransferHardBlocked]);
+  useEffect(() => {
+    const plan = chatTranscriptTransferPlan;
+    if (!plan) return;
+    const expiresAt = Date.parse(plan.expiresAt);
+    if (!Number.isFinite(expiresAt)) {
+      cancelVoiceTransferPlan(plan.planId);
+      return;
+    }
+    const timer = setTimeout(() => cancelVoiceTransferPlan(plan.planId), Math.max(0, expiresAt - Date.now()));
+    return () => clearTimeout(timer);
+  }, [cancelVoiceTransferPlan, chatTranscriptTransferPlan]);
+  useEffect(() => () => {
+    const current = chatTranscriptTransferPlanRef.current;
+    if (current) {
+      chatTranscriptTransferPlanRef.current = undefined;
+      chatTranscriptTransferOwnershipRef.current?.clearPlan(current.planId);
+      void controller.cancelChatFromTranscript(current.planId).catch(() => undefined);
+      setChatTranscriptTransferPlan(undefined);
+      setChatTranscriptTransferPreparedAt(undefined);
+    }
+    chatTranscriptTransferGenerationRef.current += 1;
+  }, [controller, session?.epoch]);
   const recordingAttachmentNote = recordingAttachmentNoteId
     ? state.notes.find((note) => note.id === recordingAttachmentNoteId)
     : undefined;
@@ -1613,6 +1724,181 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
     });
     if (!created) setNotice("The conversation could not be created yet. Wait for startup or recovery to finish, then try again.");
   }, [busy, chatAppBlocked, chatDeleteReviewOpen, controller, mailAlertTapResolution, run]);
+  const prepareTranscriptForChat = useCallback(async () => {
+    const noteAtPress = activeDetailNote;
+    const ownership = chatTranscriptTransferOwnershipRef.current!;
+    const owner = noteAtPress ? ownership.captureOwner(noteAtPress) : undefined;
+    if (!noteAtPress || voiceTransferHardBlocked || busyLock.current || chatTranscriptTransferActionRef.current ||
+        !owner ||
+        noteAtPress.origin === "assistant_chat" || noteAtPress.importOrigin?.originalTimeZoneUnknown === true ||
+        !noteAtPress.transcript.trim() || !isUsableCaptureTimeZone(noteAtPress.captureTimeZone)) {
+      setNotice("Save a complete transcript with a confirmed capture time zone before reviewing it in Chat.");
+      return;
+    }
+    chatTranscriptTransferActionRef.current = true;
+    const actionToken = ++chatTranscriptTransferActionTokenRef.current;
+    setChatTranscriptTransferBusy(true);
+    const generation = ++chatTranscriptTransferGenerationRef.current;
+    try {
+      const prepared = await run(async () => {
+        const current = controller.getSnapshot().notes.find((note) => note.id === noteAtPress.id);
+        if (!matchesSavedTranscriptNote(current, noteAtPress)) throw new Error("The saved transcript changed. Reopen the note before reviewing it in Chat.");
+        const outcome = await ownership.prepareOwnedPlan({
+          owner,
+          readReadiness: async () => {
+            const settingsBeforeKeyCheck = controller.getSnapshot().settings;
+            let keyReady = false;
+            try {
+              keyReady = settingsBeforeKeyCheck.mode === "provider" && settingsBeforeKeyCheck.llmProvider === "openrouter" &&
+                (await credentials.getCredentials()).openRouterConfigured === true;
+            } catch { keyReady = false; }
+            return { keyReady, settingsBeforeKeyCheck };
+          },
+          prepare: async (readiness) => {
+            const snapshotAfterKeyCheck = controller.getSnapshot();
+            const currentAfterKeyCheck = snapshotAfterKeyCheck.notes.find((note) => note.id === noteAtPress.id);
+            if (generation !== chatTranscriptTransferGenerationRef.current || voiceTransferBlockedRef.current ||
+                !matchesSavedTranscriptNote(currentAfterKeyCheck, noteAtPress)) {
+              throw new Error("The saved transcript or workspace changed. Prepare a fresh review from the note.");
+            }
+            const keyReady = readiness.keyReady && snapshotAfterKeyCheck.settings.mode === readiness.settingsBeforeKeyCheck.mode &&
+              snapshotAfterKeyCheck.settings.llmProvider === readiness.settingsBeforeKeyCheck.llmProvider;
+            const plan = await controller.prepareChatFromTranscript({ noteId: noteAtPress.id, expectedRevision: noteAtPress.revision });
+            return { plan, keyReady };
+          },
+          cancelLatePlan: ({ plan }) => controller.cancelChatFromTranscript(plan.planId),
+        });
+        if (outcome.kind === "stale") throw new Error("The note review changed. Prepare a fresh review from the note.");
+        const { plan, keyReady } = outcome.plan;
+        const latest = controller.getSnapshot().notes.find((note) => note.id === plan.noteId);
+        const expiresAt = Date.parse(plan.expiresAt);
+        if (!ownership.owns(owner) || generation !== chatTranscriptTransferGenerationRef.current || voiceTransferBlockedRef.current || plan.noteId !== noteAtPress.id ||
+            !matchesSavedTranscriptPlan(latest, plan) || !Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+          void controller.cancelChatFromTranscript(plan.planId).catch(() => undefined);
+          throw new Error("The saved transcript changed before review. Prepare a fresh review from the note.");
+        }
+        if (!ownership.publishPlan(plan, owner)) {
+          void controller.cancelChatFromTranscript(plan.planId).catch(() => undefined);
+          throw new Error("The note review changed before it could be shown. Prepare a fresh review from the note.");
+        }
+        chatTranscriptTransferPlanRef.current = plan;
+        setChatTranscriptTransferPreparedAt(Date.now());
+        setChatTranscriptTransferKeyReady(keyReady);
+        setChatTranscriptTransferPlan(plan);
+        return plan;
+      });
+      if (!prepared) setNotice("The transcript review could not be prepared. Check the note and try again.");
+    } finally {
+      if (chatTranscriptTransferActionTokenRef.current === actionToken) {
+        chatTranscriptTransferActionRef.current = false;
+        setChatTranscriptTransferBusy(false);
+      }
+    }
+  }, [activeDetailNote, controller, credentials, run, voiceTransferHardBlocked]);
+  const createTranscriptChatConversation = useCallback(async (expectedPlanId: string) => {
+    const ownership = chatTranscriptTransferOwnershipRef.current!;
+    const plan = ownership.getPlan(expectedPlanId);
+    const owner = plan ? ownership.captureOwner({ id: plan.noteId, revision: plan.noteRevision }) : undefined;
+    if (!plan || !owner || chatTranscriptTransferPlanRef.current?.planId !== expectedPlanId ||
+        voiceTransferHardBlocked || busyLock.current || chatTranscriptTransferActionRef.current ||
+        !matchesSavedTranscriptPlan(controller.getSnapshot().notes.find((note) => note.id === plan.noteId), plan)) return undefined;
+    chatTranscriptTransferActionRef.current = true;
+    const actionToken = ++chatTranscriptTransferActionTokenRef.current;
+    setChatTranscriptTransferBusy(true);
+    const generation = chatTranscriptTransferGenerationRef.current;
+    try {
+      const conversation = await run(async () => controller.createChatConversation());
+      if (!conversation || !ownership.owns(owner) || ownership.getPlan(expectedPlanId) !== plan ||
+          chatTranscriptTransferPlanRef.current?.planId !== expectedPlanId ||
+          generation !== chatTranscriptTransferGenerationRef.current || voiceTransferBlockedRef.current) return undefined;
+      if (!controller.getSnapshot().assistantChatConversations?.some((item) => item.id === conversation.id)) {
+        throw new Error("The new conversation could not be confirmed in saved Chat history.");
+      }
+      if (!ownership.owns(owner) || ownership.getPlan(expectedPlanId) !== plan) return undefined;
+      setSelectedChatConversationId(conversation.id);
+      return conversation;
+    } finally {
+      if (chatTranscriptTransferActionTokenRef.current === actionToken) {
+        chatTranscriptTransferActionRef.current = false;
+        setChatTranscriptTransferBusy(false);
+      }
+    }
+  }, [controller, run, voiceTransferHardBlocked]);
+  const sendTranscriptToChat = useCallback(async (expectedPlanId: string, conversationId: string) => {
+    const ownership = chatTranscriptTransferOwnershipRef.current!;
+    const plan = ownership.getPlan(expectedPlanId);
+    const owner = plan ? ownership.captureOwner({ id: plan.noteId, revision: plan.noteRevision }) : undefined;
+    if (!plan || !owner || chatTranscriptTransferPlanRef.current?.planId !== expectedPlanId ||
+        voiceTransferHardBlocked || busyLock.current || chatTranscriptTransferActionRef.current) {
+      throw new Error("The transcript review is no longer available. Prepare it again from the note.");
+    }
+    const preparedAt = chatTranscriptTransferPreparedAt;
+    const generation = chatTranscriptTransferGenerationRef.current;
+    const expiresAt = Date.parse(plan.expiresAt);
+    const now = Date.now();
+    if (!preparedAt || now < preparedAt || !Number.isFinite(expiresAt) || now >= expiresAt ||
+        !matchesSavedTranscriptPlan(controller.getSnapshot().notes.find((note) => note.id === plan.noteId), plan) ||
+        !chatConversations.some((item) => item.id === conversationId)) {
+      cancelVoiceTransferPlan(plan.planId);
+      throw new Error("The transcript or conversation changed. Prepare a fresh review before sending.");
+    }
+    chatTranscriptTransferActionRef.current = true;
+    const actionToken = ++chatTranscriptTransferActionTokenRef.current;
+    setChatTranscriptTransferBusy(true);
+    let enteredControllerPath = false;
+    try {
+      const accepted = await run(async () => {
+        if (!ownership.owns(owner) || ownership.getPlan(expectedPlanId) !== plan ||
+            chatTranscriptTransferPlanRef.current?.planId !== expectedPlanId || generation !== chatTranscriptTransferGenerationRef.current) {
+          throw new Error("The note review changed. Prepare it again from the note.");
+        }
+        enteredControllerPath = true;
+        // The controller consumes the one-use plan at submission admission, before key checks or queued work.
+        chatTranscriptTransferPlanRef.current = undefined;
+        ownership.clearPlan(expectedPlanId);
+        setChatTranscriptTransferPlan(undefined);
+        setChatTranscriptTransferPreparedAt(undefined);
+        setChatTranscriptTransferKeyReady(false);
+        const currentSettings = controller.getSnapshot().settings;
+        if (currentSettings.mode !== "provider" || currentSettings.llmProvider !== "openrouter") {
+          void controller.cancelChatFromTranscript(plan.planId).catch(() => undefined);
+          openSettings();
+          throw new Error("Choose OpenRouter in Provider mode before sending a transcript to Chat.");
+        }
+        const current = controller.getSnapshot().notes.find((note) => note.id === plan.noteId);
+        if (now < preparedAt || Date.now() >= expiresAt || !matchesSavedTranscriptPlan(current, plan) ||
+            !ownership.owns(owner) ||
+            !controller.getSnapshot().assistantChatConversations?.some((item) => item.id === conversationId)) {
+          throw new Error("The transcript review expired or changed. Prepare it again before sending.");
+        }
+        const result = await controller.submitChatFromTranscript({ planId: plan.planId, conversationId });
+        if (!isAcceptedChatSubmission(result) || result.conversationId !== conversationId) {
+          throw new Error("The saved Chat message could not be confirmed.");
+        }
+        if (!ownership.owns(owner) || generation !== chatTranscriptTransferGenerationRef.current || voiceTransferBlockedRef.current) {
+          throw new Error("The workspace changed while the message was being saved. Check the conversation request status.");
+        }
+        setSelectedChatConversationId(conversationId);
+        setTab("chat");
+        closeDetail();
+        setNotice("Transcript saved in Chat. Its request status is shown in the conversation.");
+        return result;
+      });
+      if (!enteredControllerPath || !isAcceptedChatSubmission(accepted) || accepted.conversationId !== conversationId) {
+        throw new Error("Could not confirm the Chat message. Check the conversation request status before trying again.");
+      }
+      return accepted;
+    } finally {
+      if (chatTranscriptTransferActionTokenRef.current === actionToken) {
+        chatTranscriptTransferActionRef.current = false;
+        setChatTranscriptTransferBusy(false);
+      }
+    }
+  }, [cancelVoiceTransferPlan, chatConversations, chatTranscriptTransferPreparedAt, closeDetail, controller, openSettings, run, voiceTransferHardBlocked]);
+  const closeTranscriptTransfer = useCallback((expectedPlanId: string) => {
+    if (!chatTranscriptTransferOwnershipRef.current?.getPlan(expectedPlanId)) return;
+    cancelVoiceTransferPlan(expectedPlanId);
+  }, [cancelVoiceTransferPlan]);
   const chatSend = useCallback(async (text: string) => {
     return runAcceptedChatSubmission(run, async () => {
       if (!isOpenRouterChatDemo && !productionChatSubmissionEnabled) {
@@ -1911,10 +2197,10 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
     }
     return () => { native.remove(); removeWeb?.(); };
   }, [isIsolatedDemo, loading, onPrivacyInvalidated, privacy, session, startupReady]);
-  const openNote = (note: Note) => {
-    setDetail(note);
+  const openNote = useCallback((note: Note) => {
+    publishDetailOwner(note);
     setTab("record");
-  };
+  }, [publishDetailOwner]);
   const openProposal = (proposal: Proposal) => {
     const latest = controller
       .getSnapshot()
@@ -1948,7 +2234,7 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
     try {
       const note = await controller.savePendingCapture(receipt);
       commitAudioCapture(note.id);
-      setDetail(note);
+      openNote(note);
       setNotice(durationSeconds > state.settings.maxAudioSeconds
         ? "Saved locally. This recording exceeds your Speech limit; adjust it in Settings before transcribing."
         : "Recording saved on this device. Add a transcript to create a reviewable proposal.");
@@ -1959,7 +2245,7 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
       await refreshPendingCaptureStatus();
       throw error;
     } finally { setPendingCaptureBusy(false); }
-  }, [commitAudioCapture, controller, refreshPendingCaptureStatus, state.settings.maxAudioSeconds]);
+  }, [commitAudioCapture, controller, openNote, refreshPendingCaptureStatus, state.settings.maxAudioSeconds]);
 
   const applyPendingCaptureResult = useCallback(async (receipt: PendingCaptureReceipt): Promise<boolean> => {
     setPendingCaptureBusy(true);
@@ -2061,12 +2347,12 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
       captureTimeZone: result.captureTimeZone,
     });
     audio.commit(result.uri);
-    setDetail(note);
+    openNote(note);
     setNotice(
       "Recording saved on this device. Add a transcript to create a reviewable proposal.",
     );
     return true;
-  }, [applyPendingCaptureResult, audio, controller, refreshPendingCaptureStatus]);
+  }, [applyPendingCaptureResult, audio, controller, openNote, refreshPendingCaptureStatus]);
   const savePendingFromPanel = useCallback((receipt: PendingCaptureReceipt) => {
     void run(async () => {
       const current = pendingCaptureStatus;
@@ -2596,7 +2882,7 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
                         "UTC",
                     });
                     setManualOpen(false);
-                    setDetail(note);
+                    openNote(note);
                   })
                 }
               />
@@ -2622,6 +2908,25 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
                 transcriptionRequestRunning={transcribingNoteId === detail.id}
                 transcriptionRequestCleanupAttemptIds={(state.transcriptionRequestCleanupPending ?? []).map(({ attemptId }) => attemptId)}
                 retryingTranscriptionCleanupId={retryingTranscriptionCleanupId}
+                voiceChatTransfer={{
+                  plan: chatTranscriptTransferPlan,
+                  conversations: chatConversations,
+                  selectedConversationId: selectedChatConversationId,
+                  blocked: voiceTransferHardBlocked,
+                  busy: busy || chatTranscriptTransferBusy || loading || !startupReady,
+                  providerReady: state.settings.mode === "provider" && state.settings.llmProvider === "openrouter" &&
+                    chatTranscriptTransferKeyReady,
+                  onPrepare: () => { void prepareTranscriptForChat(); },
+                  onSelectConversation: (conversationId) => {
+                    if (chatTranscriptTransferPlanRef.current && !voiceTransferHardBlocked && !busy && !chatTranscriptTransferBusy &&
+                        controller.getSnapshot().assistantChatConversations?.some((conversation) => conversation.id === conversationId)) {
+                      setSelectedChatConversationId(conversationId);
+                    }
+                  },
+                  onCreateConversation: createTranscriptChatConversation,
+                  onSend: sendTranscriptToChat,
+                  onCancel: closeTranscriptTransfer,
+                }}
                 analysisStatusError={
                   analysisStatusError?.key === analysisFreshnessKey
                     ? analysisStatusError.message
@@ -2639,14 +2944,14 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
                   setAnalysisStatusCheckedKey("");
                   setAnalysisStatusRetry((retry) => retry + 1);
                 }}
-                onClose={() => setDetail(null)}
+                onClose={closeDetail}
                 onUpdate={(transcript) =>
                   run(async () => {
                     const updated = await controller.updateTranscript(
                       detail.id,
                       transcript,
                     );
-                    setDetail(updated);
+                    publishDetailOwner(updated);
                   })
                 }
                 onConfirmImportedTimeZone={(timeZone) => {
@@ -2659,7 +2964,7 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
                       detail.id,
                       { timeZone, expectedRevision: currentNote.revision },
                     );
-                    setDetail(updated);
+                    publishDetailOwner(updated);
                     setNotice("Capture time zone confirmed for this imported note.");
                   });
                 }}
@@ -2696,7 +3001,7 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
                     const updated = controller
                       .getSnapshot()
                       .notes.find((n) => n.id === detail.id);
-                    if (updated) setDetail(updated);
+                    if (updated) publishDetailOwner(updated);
                     setNotice(
                       result.source === "offline_preview"
                         ? "Local preview is ready. It was not generated by AI."
@@ -2721,7 +3026,7 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
                 onOpenProposals={() => {
                   setInboxFilter("pending");
                   setTab("inbox");
-                  setDetail(null);
+                  closeDetail();
                 }}
                 onTranscribe={(expectedRevision) => {
                   const selectedSpeechProvider = state.settings.speechProvider ?? "azure";
@@ -2751,7 +3056,7 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
                         setTranscribingNoteId(detail.id);
                         try {
                           const updated = await controller.transcribeNote(detail.id, { expectedRevision });
-                          setDetail(updated);
+                          publishDetailOwner(updated);
                           setNotice(isTranscriptionDemo
                             ? "Sample transcript saved — Azure was not contacted."
                             : selectedSpeechProvider === "openrouter"
@@ -2832,7 +3137,7 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
                     () =>
                       run(async () => {
                         await controller.deleteNote(detail.id);
-                        setDetail(null);
+                        closeDetail();
                       }),
                   )
                 }
@@ -3343,7 +3648,7 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
               controller.cancelRecordingAttachment(sessionId)
             }
             onAttached={(updated) => {
-              setDetail(updated);
+              openNote(updated);
               setNotice("Recording attached. Review it before transcription.");
             }}
             onClose={() => setRecordingAttachmentNoteId(null)}

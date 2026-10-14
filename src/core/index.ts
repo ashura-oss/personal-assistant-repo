@@ -8,6 +8,7 @@ import type { PendingCaptureReceipt, PendingCaptureSafeStatus } from '../audio/p
 import type { ProactiveMailAlertState } from '../proactiveMailAlerts/types';
 import type { MailAlertTapKey, MailAlertTapResolution } from '../proactiveMailAlerts/taps';
 import type { ProactiveRecoveryPlan, ProactiveRecoveryReceiptInspection, ProactiveRecoveryResult, ProactiveRecoveryStatus } from '../proactive/recovery';
+import type { ChatTranscriptTransferPlan } from '../chat/types';
 
 export type NoteStatus = 'recorded' | 'processed' | 'error';
 export type ProposalKind = 'task' | 'reminder' | 'email' | 'event' | 'memory';
@@ -859,6 +860,9 @@ export interface AppController {
   createChatConversation(title?: string): Promise<import('../chat/types').ChatConversationDTO>;
   submitChatTurn(input: { conversationId: string; text: string; knowledgeSelection?: KnowledgeSelection }): Promise<{ kind: 'accepted'; conversationId: string; turnId: string; jobId: string }>;
   refineChatTurn(input: { conversationId: string; parentTurnId: string; effort: 'medium' | 'high' | 'max' }): Promise<{ kind: 'accepted'; conversationId: string; turnId: string; jobId: string }>;
+  prepareChatFromTranscript(input: { noteId: string; expectedRevision: number }): Promise<ChatTranscriptTransferPlan>;
+  cancelChatFromTranscript(planId: string): Promise<void>;
+  submitChatFromTranscript(input: { planId: string; conversationId: string }): Promise<{ kind: 'accepted'; conversationId: string; turnId: string; jobId: string }>;
   deleteChatConversation(id: string): Promise<void>;
   refreshAssistantBatch(jobId: string): Promise<import('../services/openRouterBatchJobs').AssistantBatchJobDTO>;
   retryAssistantBatchCleanup(jobId: string): Promise<import('../services/openRouterBatchJobs').AssistantBatchJobDTO>;

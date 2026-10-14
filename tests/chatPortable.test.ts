@@ -94,6 +94,24 @@ describe('inert portable Chat history', () => {
     expect(() => materializeInertChatHistory(payload, () => '50000000-0000-4000-8000-000000000001', new Set(['50000000-0000-4000-8000-000000000001']))).toThrow(/collided/i);
   });
 
+  it('retains saved transcript provenance as inert content only', async () => {
+    const payload = await createPortableChatHistory(sourceLedger(), batchLedger(), async (_reply, digest) => digest === 'b'.repeat(64));
+    const annotated = validatePortableChatHistory({
+      ...payload,
+      conversations: payload.conversations.map((conversation) => ({
+        ...conversation,
+        turns: conversation.turns.map((turn) => ({ ...turn, messageOrigin: 'saved_transcript' as const })),
+      })),
+    });
+    const ids = ['50000000-0000-4000-8000-000000000001', '60000000-0000-4000-8000-000000000001'];
+    const imported = materializeInertChatHistory(annotated, () => ids.shift()!);
+    const turn = imported[0]?.turns[0];
+    expect(turn?.messageOrigin).toBe('saved_transcript');
+    expect(turn?.origin).toBe(IMPORTED_CHAT_HISTORY_ORIGIN);
+    expect(turn).not.toHaveProperty('noteId');
+    expect(turn).not.toHaveProperty('jobId');
+  });
+
   it('strictly rejects authority fields, malformed accounting, invalid Unicode and invalid time zones', () => {
     const minimal = { version: 1, conversations: [{ title: 'Plain', createdAt: at, updatedAt: at, turns: [{ userText: 'A message.', capturedAt: at, captureTimeZone: 'UTC' }] }] };
     expect(() => validatePortableChatHistory({ ...minimal, providerBatchId: 'provider-id' })).toThrow(/unknown|missing/i);

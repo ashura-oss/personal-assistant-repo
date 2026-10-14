@@ -98,7 +98,7 @@ import {
 import { OpenRouterSpeechClient } from './openRouterSpeech';
 import { OpenRouterSpeechAdapter } from './openRouterSpeechAdapter';
 import { emptyChatLedger, selectCompletedChatContext, validateChatLedger } from '../chat/ledger';
-import type { ChatConversation, ChatConversationDTO, ChatReplySnapshot, ReadonlyChatLedger } from '../chat/types';
+import type { ChatConversation, ChatConversationDTO, ChatReplySnapshot, ChatTranscriptTransferPlan, ReadonlyChatLedger } from '../chat/types';
 import {
   emptyOpenRouterBatchLedger, validateOpenRouterBatchLedger, assistantBatchJobDTO, accountingFromInspection,
   isOpenRouterBatchContentJob, tombstoneOpenRouterBatchJob,
@@ -559,7 +559,7 @@ function deviceReminderSourceProjection(state: AppState, binding: NonNullable<Ex
       notesTruncated: event.notesTruncated, start: event.start, end: event.end, timeZone: event.timeZone ?? null, allDay: event.allDay, cancelled: event.cancelled } });
 }
 
-function assistContext(state: AppState, note: Note, intent: AssistIntent, question?: string, knowledgeSelection: KnowledgeSelection = []): { documents: ContextDocument[]; additionalSources: AssistantSourceInput[]; omittedSourceCount: number; omittedSourceIds: string[] } {
+function assistContext(state: AppState, note: Note, intent: AssistIntent, question?: string, knowledgeSelection: KnowledgeSelection = [], excludedRelatedNoteIds: ReadonlySet<string> = new Set()): { documents: ContextDocument[]; additionalSources: AssistantSourceInput[]; omittedSourceCount: number; omittedSourceIds: string[] } {
   const allDocuments = state.documents.filter(({ path }) => !path.startsWith('logs/') && path !== 'memory/INFERENCES.md' && path !== 'memory/DECISIONS.md' &&
     !path.startsWith('people/') && !path.startsWith('projects/'));
   const taskQuery = intent === 'answer' && /\b(task|tasks|task count|how many|todo|to-do|action item)\b/i.test(question ?? '');
@@ -609,7 +609,7 @@ function assistContext(state: AppState, note: Note, intent: AssistIntent, questi
     query: `${question ?? ''}\n${note.transcript}`,
     intent,
     documents: allDocuments.map((doc) => ({ path: doc.path, revision: doc.revision, content: doc.content, updatedAt: doc.updatedAt, selectionPriority: linkedDocumentPaths.has(doc.path) ? 1 as const : 0 as const })),
-    notes: state.notes.filter((item) => item.origin !== 'assistant_chat' && linkedNoteIds.has(item.id) && item.id !== note.id).map((item) => ({ id: item.id, title: item.title, revision: item.revision, transcript: item.transcript, updatedAt: item.capturedAt ?? item.createdAt, selectionPriority: 1 as const })),
+    notes: state.notes.filter((item) => item.origin !== 'assistant_chat' && linkedNoteIds.has(item.id) && item.id !== note.id && !excludedRelatedNoteIds.has(item.id)).map((item) => ({ id: item.id, title: item.title, revision: item.revision, transcript: item.transcript, updatedAt: item.capturedAt ?? item.createdAt, selectionPriority: 1 as const })),
     knowledge: knowledgeSources,
     tasks: taskQuery || linkedTaskIds.size ? state.tasks.filter((task) => taskQuery || linkedTaskIds.has(task.id)).map((task) => ({ id: task.id, title: task.title, body: task.body, status: task.status, dueAt: task.dueAt, updatedAt: task.completedAt ?? task.createdAt, selectionPriority: (linkedTaskIds.has(task.id) ? 1 : 0) as 0 | 1 })) : [],
     calendars: state.calendars.flatMap((calendar) => {
@@ -715,7 +715,7 @@ function parseBatchAssistantResult(inspection: OpenRouterBatchInspection, prepar
   const choices = body.choices;
   if (!Array.isArray(choices) || choices.length !== 1 || !isRecord(choices[0]) || choices[0].index !== 0 ||
       choices[0].finish_reason !== 'stop' || !isRecord(choices[0].message) || choices[0].message.role !== 'assistant' ||
-      choices[0].message.refusal !== undefined || typeof choices[0].message.content !== 'string' ||
+      choices[0].message.refusal != null || typeof choices[0].message.content !== 'string' ||
       (prepared.requestProfileVersion === 1
         ? choices[0].message.content.length > 128 * 1024
         : new TextEncoder().encode(choices[0].message.content).byteLength > OPENROUTER_BATCH_RESPONSE_MAX_BYTES)) {
@@ -1319,6 +1319,18 @@ export class AppControllerImpl implements AppController {
   private assistantChatLedgerHasRaw = false;
   private assistantChatLedger: ReadonlyChatLedger = emptyChatLedger();
   private assistantChatLedgerMalformed = false;
+  private readonly chatTranscriptTransferPlans = new Map<string, {
+    readonly planId: string;
+    readonly noteId: string;
+    readonly noteRevision: number;
+    readonly capturedAt: string;
+    readonly captureTimeZone: string;
+    readonly expiresAt: string;
+    readonly transcriptSha256: string;
+    readonly bootstrapGeneration: number;
+    readonly privacyEpoch?: string;
+    readonly preparedAtMs: number;
+  }>();
   private assistantBatchCleanupRetries = new Map<string, () => Promise<void>>();
   private activeBatchNoteOperations = new Set<string>();
   private activeBatchJobInspections = new Set<string>();
@@ -1452,6 +1464,7 @@ export class AppControllerImpl implements AppController {
     this.assistantChatLedgerHasRaw = false;
     this.assistantChatLedger = emptyChatLedger();
     this.assistantChatLedgerMalformed = false;
+    this.chatTranscriptTransferPlans.clear();
     this.assistantBatchCleanupRetries.clear();
     this.activeBatchNoteOperations.clear();
     this.activeBatchJobInspections.clear();
@@ -1489,6 +1502,7 @@ export class AppControllerImpl implements AppController {
     // are deliberately retained until their stage owner completes cleanup.
     this.backupImportSessions.clear();
     this.knowledgeActivationSessions.clear();
+    this.chatTranscriptTransferPlans.clear();
     // Stop new provider-side admissions while retaining jobs and their leases
     // until each underlying request actually settles.
     for (const job of this.transcriptionJobs.values()) job.controller.abort();
@@ -2116,6 +2130,7 @@ export class AppControllerImpl implements AppController {
         const job = this.assistantBatchLedger.jobs.find((item) => item.id === turn.jobId);
         const dto = job ? assistantBatchJobDTO(job, this.assistantBatchCleanupRetries.has(job.id)) : undefined;
         return Object.freeze({ id: turn.id, noteId: turn.noteId, userText: turn.userText, createdAt: turn.createdAt,
+          ...(turn.messageOrigin ? { messageOrigin: turn.messageOrigin, capturedAt: turn.capturedAt, captureTimeZone: turn.captureTimeZone } : {}),
           ...(turn.operation ? { operation: turn.operation } : {}),
           ...(turn.reasoningEffort ? { reasoningEffort: turn.reasoningEffort } : {}),
           ...(turn.parentTurnId ? { parentTurnId: turn.parentTurnId } : {}),
@@ -2150,14 +2165,28 @@ export class AppControllerImpl implements AppController {
           job.kind !== 'note_assistance' || job.intent !== 'answer' || job.question !== 'Respond to the current user message.' ||
           binding.conversationId !== conversation.id || binding.turnId !== turn.id || job.operation !== turn.operation ||
           job.reasoningEffort !== turn.reasoningEffort || job.parentTurnId !== turn.parentTurnId) return false;
+      if (turn.messageOrigin === 'saved_transcript') {
+        const source = turn.operation === 'chat_refinement' ? undefined : binding.transcriptSource;
+        if (turn.operation !== 'chat_refinement' && (!source || source.noteId === turn.noteId || source.capturedAt !== turn.capturedAt || source.captureTimeZone !== turn.captureTimeZone)) return false;
+        if (turn.operation !== 'chat_refinement') {
+          const sourceNote = source && state.notes.find((candidate) => candidate.id === source.noteId);
+          if (!source || !sourceNote || sourceNote.revision !== source.noteRevision || sourceNote.capturedAt !== source.capturedAt ||
+              sourceNote.captureTimeZone !== source.captureTimeZone || Date.parse(source.capturedAt) > Date.parse(turn.createdAt)) return false;
+        }
+      } else if (binding.transcriptSource || turn.messageOrigin !== undefined) return false;
       if (turn.operation === 'chat_refinement') {
         const parent = turns.get(turn.parentTurnId ?? '');
+        const parentJob = parent && this.assistantBatchLedger.jobs.find((candidate) => candidate.id === parent.turn.jobId);
         const reference = binding.refinementParent;
         if (!parent || parent.conversation.id !== conversation.id || parent.index >= index || parent.turn.userText !== turn.userText ||
             !parent.turn.reply || !parent.turn.replySha256 || !reference || reference.turnId !== parent.turn.id ||
             reference.jobId !== parent.turn.jobId || reference.noteId !== parent.turn.noteId || reference.noteRevision !== parent.turn.noteRevision ||
-            reference.replySha256 !== parent.turn.replySha256 || reference.replyProfileVersion !== parent.turn.reply.requestProfileVersion) return false;
-      } else if (binding.refinementParent || turn.parentTurnId || turn.reasoningEffort || turn.capturedAt) return false;
+            reference.replySha256 !== parent.turn.replySha256 || reference.replyProfileVersion !== parent.turn.reply.requestProfileVersion ||
+            (parent.turn.messageOrigin === 'saved_transcript' ? turn.messageOrigin !== undefined : parent.turn.messageOrigin !== turn.messageOrigin) ||
+            (parent.turn.capturedAt ?? parent.turn.createdAt) !== turn.capturedAt ||
+            binding.transcriptSource !== undefined ||
+            (turn.messageOrigin === 'saved_transcript' && !parentJob?.chatBinding)) return false;
+      } else if (binding.refinementParent || turn.parentTurnId || turn.reasoningEffort || (turn.capturedAt && turn.messageOrigin !== 'saved_transcript')) return false;
       if (turn.reply && (!turn.replySha256 || job.requestSha256 !== turn.reply.requestSha256 || job.requestProfileVersion !== turn.reply.requestProfileVersion ||
           !['completed', 'result_stale', 'source_removed'].includes(job.status))) return false;
       const contextTurnIds = new Set<string>();
@@ -2212,6 +2241,52 @@ export class AppControllerImpl implements AppController {
       turn.reasoningEffort === expectedJob.reasoningEffort && job.reasoningEffort === expectedJob.reasoningEffort &&
       turn.parentTurnId === expectedJob.parentTurnId && job.parentTurnId === expectedJob.parentTurnId &&
       job.chatBinding.refinementParent?.turnId === expectedJob.parentTurnId;
+  }
+
+  private async savedTranscriptSourceBinding(note: Note, expectedRevision: number): Promise<NonNullable<OpenRouterChatBinding['transcriptSource']>> {
+    const capturedAt = note.capturedAt;
+    const captureTimeZone = note.captureTimeZone;
+    if (note.origin === 'assistant_chat' || note.revision !== expectedRevision || !note.transcript.trim() ||
+        typeof capturedAt !== 'string' || typeof captureTimeZone !== 'string' || !captureTimeZone || captureTimeZone.length > 100 ||
+        note.importOrigin?.originalTimeZoneUnknown === true) {
+      throw new Error('Choose a saved transcript with a confirmed capture time zone.');
+    }
+    const parsed = Date.parse(capturedAt);
+    if (!Number.isFinite(parsed) || new Date(parsed).toISOString() !== capturedAt) throw new Error('The saved transcript capture time is invalid.');
+    try { new Intl.DateTimeFormat('en', { timeZone: captureTimeZone }).format(0); }
+    catch { throw new Error('Choose a saved transcript with a confirmed capture time zone.'); }
+    const transcriptSha256 = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, note.transcript, { encoding: Crypto.CryptoEncoding.HEX });
+    return Object.freeze({ noteId: note.id, noteRevision: note.revision, transcriptSha256, capturedAt, captureTimeZone });
+  }
+
+  private pruneChatTranscriptTransferPlans(at = Date.now()): void {
+    for (const [planId, plan] of this.chatTranscriptTransferPlans) {
+      if (at < plan.preparedAtMs || at >= Date.parse(plan.expiresAt)) this.chatTranscriptTransferPlans.delete(planId);
+    }
+  }
+
+  private async transcriptSourceIsCurrent(state: AppState, source: NonNullable<OpenRouterChatBinding['transcriptSource']>): Promise<boolean> {
+    const note = state.notes.find((item) => item.id === source.noteId);
+    if (!note || note.origin === 'assistant_chat' || note.revision !== source.noteRevision || note.transcript.trim() === '' ||
+        note.transcript.length === 0 || note.capturedAt !== source.capturedAt || note.captureTimeZone !== source.captureTimeZone ||
+        note.importOrigin?.originalTimeZoneUnknown === true) return false;
+    try {
+      const digest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, note.transcript, { encoding: Crypto.CryptoEncoding.HEX });
+      return digest === source.transcriptSha256;
+    } catch { return false; }
+  }
+
+  private chatTranscriptSourceForTurn(turn: ChatConversation['turns'][number]): NonNullable<OpenRouterChatBinding['transcriptSource']> | undefined {
+    const allTurns = new Map(this.assistantChatLedger.conversations.flatMap((conversation) => conversation.turns).map((item) => [item.id, item]));
+    const seen = new Set<string>();
+    let current: ChatConversation['turns'][number] | undefined = turn;
+    while (current && !seen.has(current.id)) {
+      seen.add(current.id);
+      const job = this.assistantBatchLedger.jobs.find((candidate) => candidate.id === current!.jobId);
+      if (job?.chatBinding?.transcriptSource) return job.chatBinding.transcriptSource;
+      current = current.parentTurnId ? allTurns.get(current.parentTurnId) : undefined;
+    }
+    return undefined;
   }
 
   private chatTurnContextSource(turn: ChatConversation['turns'][number]): AssistantSourceInput {
@@ -2309,7 +2384,11 @@ export class AppControllerImpl implements AppController {
         (note.capturedAt ?? note.createdAt) !== (turn.capturedAt ?? turn.createdAt) ||
         await this.chatReplyDigest(turn.reply) !== turn.replySha256) return false;
     try {
-      const context = assistContext(state, note, job.intent!, job.question, [...(job.knowledgeSelection ?? [])]);
+      const transcriptSource = this.chatTranscriptSourceForTurn(turn);
+      if ((turn.messageOrigin === 'saved_transcript' && !transcriptSource) ||
+          (transcriptSource && !await this.transcriptSourceIsCurrent(state, transcriptSource))) return false;
+      const context = assistContext(state, note, job.intent!, job.question, [...(job.knowledgeSelection ?? [])],
+        transcriptSource ? new Set([transcriptSource.noteId]) : new Set());
       const chatSources = await this.chatSourcesForBinding(state, job.chatBinding!, memo);
       const rebuilt = await new OpenRouterBatchRequestBuilder().prepareAnalysis(note, context.documents, state.settings, {
         intent: job.intent, question: job.question, chatMode: true,
@@ -2335,6 +2414,9 @@ export class AppControllerImpl implements AppController {
     memo: { results: Map<string, Promise<boolean>>; active: Set<string> } = { results: new Map(), active: new Set() },
   ): Promise<AssistantSourceInput[]> {
     const sources = this.chatSourcesFromBinding(state, binding);
+    if (binding.transcriptSource && !await this.transcriptSourceIsCurrent(state, binding.transcriptSource)) {
+      throw new Error('The saved transcript copied into Chat changed. This reply can no longer be applied.');
+    }
     const conversation = this.assistantChatLedger.conversations.find((item) => item.id === binding.conversationId);
     for (const reference of binding.context) {
       const turn = conversation?.turns.find((candidate) => candidate.id === reference.turnId);
@@ -2785,10 +2867,15 @@ export class AppControllerImpl implements AppController {
     if (provenance.answeredAsOf && !Number.isFinite(Date.parse(provenance.answeredAsOf))) throw new Error('This suggestion has an invalid question-time anchor. Run Assist again before approving it.');
     if (provenance.expiresAt && (!Number.isFinite(Date.parse(provenance.expiresAt)) || Date.now() >= Date.parse(provenance.expiresAt))) throw new Error('This answer-based suggestion expired at the next question-time window. Run Assist again before approving or continuing it.');
     if (!Array.isArray(provenance.knowledgeSelection)) throw new Error('This suggestion has no saved knowledge selection. Run Assist again before approving it.');
-    const { documents, additionalSources } = assistContext(state, note, provenance.intent, provenance.question, provenance.knowledgeSelection);
+    const linkedChatTurn = note.origin === 'assistant_chat'
+      ? this.assistantChatLedger.conversations.flatMap((item) => item.turns).find((candidate) => candidate.noteId === note.id)
+      : undefined;
+    const transcriptSource = linkedChatTurn ? this.chatTranscriptSourceForTurn(linkedChatTurn) : undefined;
+    const { documents, additionalSources } = assistContext(state, note, provenance.intent, provenance.question, provenance.knowledgeSelection,
+      transcriptSource ? new Set([transcriptSource.noteId]) : new Set());
     let chatSources: AssistantSourceInput[] = [];
     if (note.origin === 'assistant_chat') {
-      const turn = this.assistantChatLedger.conversations.flatMap((conversation) => conversation.turns).find((candidate) => candidate.noteId === note.id);
+      const turn = linkedChatTurn;
       const job = turn && this.assistantBatchLedger.jobs.find((candidate) => candidate.id === turn.jobId);
       if (this.assistantChatLedgerMalformed || this.assistantBatchLedgerMalformed || !turn || !job?.chatBinding) {
         throw new Error('Saved chat history could not be validated. Refresh local data before continuing.');
@@ -4050,6 +4137,7 @@ export class AppControllerImpl implements AppController {
   }
 
   async updateTranscript(id: string, text: string): Promise<Note> {
+    const sourceRemoval = this.sourceTranscriptRevisionCommit(id);
     const result = await this.mutate((state) => {
       const note = this.note(state, id);
       if (note.origin === 'assistant_chat') throw new Error('Chat messages are immutable. Continue the conversation or delete it from Chat.');
@@ -4067,7 +4155,7 @@ export class AppControllerImpl implements AppController {
       if (note.analysis) note.analysis.stale = true;
       addActivity(state, 'note_saved', 'Transcript edited. Earlier approvals were cleared.', { noteId: id });
       return note;
-    });
+    }, undefined, (draft) => sourceRemoval.batch(draft), () => sourceRemoval.chat());
     return result;
   }
 
@@ -4180,6 +4268,7 @@ export class AppControllerImpl implements AppController {
       const { sessionId: _sessionId, planHash: _planHash, noteId: _noteId, expectedRevision: _revision, ...previewMetadata } = session.preview;
       if (stableJson(inspected) !== stableJson(previewMetadata)) throw new Error('The staged recording changed after preview. Select it again.');
       if (session.status !== 'applying') throw new Error('Recording attachment was canceled before it could be saved.');
+      const sourceRemoval = this.sourceTranscriptRevisionCommit(session.preview.noteId);
       const saved = await this.mutate((state) => {
         const attachTime = Date.now();
         if (attachTime < session.preparedAtMs || attachTime - session.preparedAtMs >= 15 * 60_000) throw new Error('Recording preview expired. Select the file again.');
@@ -4201,7 +4290,7 @@ export class AppControllerImpl implements AppController {
         }
         addActivity(state, 'local_action', `A user-selected recording was attached to imported note “${note.title}”. It is not verified as the original file.`, { noteId: note.id });
         return note;
-      });
+      }, undefined, (draft) => sourceRemoval.batch(draft), () => sourceRemoval.chat());
       committed = true;
       this.recordingAttachmentReceipts.set(input.sessionId, { planHash: input.planHash, noteId: saved.id, uri: session.staged.uri, sha256: inspected.sha256 });
       while (this.recordingAttachmentReceipts.size > 2) {
@@ -4238,6 +4327,7 @@ export class AppControllerImpl implements AppController {
     if (!timeZone || timeZone !== input.timeZone) throw new Error('Enter a canonical IANA time zone name.');
     try { new Intl.DateTimeFormat('en-US', { timeZone }).format(new Date(0)); }
     catch { throw new Error('Enter a valid IANA time zone, such as Asia/Singapore or America/Los_Angeles.'); }
+    const sourceRemoval = this.sourceTranscriptRevisionCommit(noteId);
     return this.mutate((state) => {
       const note = state.notes.find((item) => item.id === noteId);
       if (!note) throw new Error('Note was not found.');
@@ -4258,7 +4348,7 @@ export class AppControllerImpl implements AppController {
       }
       addActivity(state, 'local_action', `Confirmed the capture time zone for imported note “${note.title}”.`, { noteId: note.id });
       return note;
-    });
+    }, undefined, (draft) => sourceRemoval.batch(draft), () => sourceRemoval.chat());
   }
 
   async processNote(id: string): Promise<Proposal[]> {
@@ -4389,7 +4479,9 @@ export class AppControllerImpl implements AppController {
       }
       const boundFingerprint = analysis.fingerprint;
       const boundSourceRevision = analysis.sourceRevision;
-      const { documents, additionalSources, omittedSourceCount, omittedSourceIds } = assistContext(state, note, analysis.intent, analysis.question, analysis.knowledgeSelection ?? []);
+      const transcriptSource = chatTurn ? this.chatTranscriptSourceForTurn(chatTurn) : undefined;
+      const { documents, additionalSources, omittedSourceCount, omittedSourceIds } = assistContext(state, note, analysis.intent, analysis.question,
+        analysis.knowledgeSelection ?? [], transcriptSource ? new Set([transcriptSource.noteId]) : new Set());
       const chatSources = chatJob?.chatBinding ? await this.chatSourcesForBinding(state, chatJob.chatBinding) : [];
       const request = {
         intent: analysis.intent, question: analysis.question,
@@ -4477,6 +4569,188 @@ export class AppControllerImpl implements AppController {
       version: 1, conversations: [...this.assistantChatLedger.conversations, conversation],
     }));
     return this.chatConversationDTOs().find((item) => item.id === conversation.id)!;
+  }
+
+  async prepareChatFromTranscript(input: { noteId: string; expectedRevision: number }): Promise<ChatTranscriptTransferPlan> {
+    this.pruneChatTranscriptTransferPlans();
+    const noteId = input?.noteId;
+    const expectedRevision = input?.expectedRevision;
+    if (typeof noteId !== 'string' || !noteId || noteId.length > 512 || !Number.isSafeInteger(expectedRevision) || expectedRevision < 1) {
+      throw new Error('Choose the current saved transcript again.');
+    }
+    // This is a read-only preflight. It waits for already queued workspace writes,
+    // but does not invoke the generic mutator or any external service.
+    await this.transactionQueue;
+    await this.assertPrivacySessionCurrent();
+    if (!this.loaded || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired ||
+        this.assistantChatLedgerMalformed || this.assistantBatchLedgerMalformed) {
+      throw new Error('Refresh local data before copying a transcript into Chat.');
+    }
+    const capturedState = this.state;
+    const capturedGeneration = this.bootstrapGeneration;
+    const privacyEpoch = this.integration.privacySession?.epoch;
+    if (this.store.assertCurrent) await this.store.assertCurrent();
+    const note = capturedState.notes.find((candidate) => candidate.id === noteId);
+    if (!note || note.revision !== expectedRevision || note.origin === 'assistant_chat' || !note.transcript.trim() ||
+        note.importOrigin?.originalTimeZoneUnknown === true || !note.capturedAt || !note.captureTimeZone) {
+      throw new Error('Choose a saved transcript with a confirmed capture time zone.');
+    }
+    const source = await this.savedTranscriptSourceBinding(note, expectedRevision);
+    const preparedAtMs = Date.now();
+    const expiresAt = new Date(preparedAtMs + 5 * 60_000).toISOString();
+    if (this.store.assertCurrent) await this.store.assertCurrent();
+    await this.assertPrivacySessionCurrent();
+    if (this.state !== capturedState || this.bootstrapGeneration !== capturedGeneration ||
+        this.integration.privacySession?.epoch !== privacyEpoch || this.mailAlertRefreshRequired) {
+      throw new Error('The saved transcript changed. Reopen Chat and review it again.');
+    }
+    const planId = newId();
+    const plan: ChatTranscriptTransferPlan = Object.freeze({ planId, noteId, noteRevision: note.revision,
+      transcript: note.transcript, capturedAt: source.capturedAt, captureTimeZone: source.captureTimeZone, expiresAt });
+    for (const [existingPlanId, existingPlan] of this.chatTranscriptTransferPlans) {
+      if (existingPlan.noteId === noteId) this.chatTranscriptTransferPlans.delete(existingPlanId);
+    }
+    this.chatTranscriptTransferPlans.set(planId, Object.freeze({ planId, noteId, noteRevision: note.revision,
+      capturedAt: source.capturedAt, captureTimeZone: source.captureTimeZone, expiresAt, transcriptSha256: source.transcriptSha256,
+      bootstrapGeneration: capturedGeneration, ...(privacyEpoch ? { privacyEpoch } : {}), preparedAtMs }));
+    return plan;
+  }
+
+  async cancelChatFromTranscript(planId: string): Promise<void> {
+    this.pruneChatTranscriptTransferPlans();
+    const id = planId;
+    if (typeof id !== 'string') return;
+    this.chatTranscriptTransferPlans.delete(id);
+  }
+
+  async submitChatFromTranscript(input: { planId: string; conversationId: string }): Promise<{ kind: 'accepted'; conversationId: string; turnId: string; jobId: string }> {
+    this.pruneChatTranscriptTransferPlans();
+    const planId = input?.planId;
+    const conversationId = input?.conversationId;
+    if (typeof planId !== 'string' || typeof conversationId !== 'string' || !conversationId) {
+      throw new Error('Review the saved transcript again before adding it to Chat.');
+    }
+    // Consume synchronously before any await or queueing. A failed or uncertain
+    // staging attempt requires a new explicit review and cannot replay this plan.
+    const transfer = this.chatTranscriptTransferPlans.get(planId);
+    this.chatTranscriptTransferPlans.delete(planId);
+    if (!transfer) throw new Error('This transcript review expired. Review it again before continuing.');
+    const submittedAtMs = Date.now();
+    if (submittedAtMs < transfer.preparedAtMs || submittedAtMs >= Date.parse(transfer.expiresAt)) {
+      throw new Error('This transcript review expired. Review it again before continuing.');
+    }
+    if (this.activeChatConversationSubmissions.has(conversationId)) throw new Error('A message in this conversation is still being submitted. Try again after it settles.');
+    this.activeChatConversationSubmissions.add(conversationId);
+    try {
+      await this.assertPrivacySessionCurrent();
+      if (!this.loaded || this.bootstrapGeneration !== transfer.bootstrapGeneration ||
+          this.integration.privacySession?.epoch !== transfer.privacyEpoch || this.startupRecoveryPhase !== 'ready' ||
+          this.mailAlertRefreshRequired || this.assistantChatLedgerMalformed || this.assistantBatchLedgerMalformed) {
+        throw new Error('This transcript review is no longer current. Review it again before continuing.');
+      }
+      if (this.store.assertCurrent) await this.store.assertCurrent();
+      const capturedBootstrapGeneration = transfer.bootstrapGeneration;
+      const staged = await this.mutate(async (draft) => {
+        const queuedAtMs = Date.now();
+        if (queuedAtMs < transfer.preparedAtMs || queuedAtMs >= Date.parse(transfer.expiresAt)) {
+          throw new Error('This transcript review expired. Review it again before continuing.');
+        }
+        const createdAt = new Date(queuedAtMs).toISOString();
+        if (Date.parse(createdAt) < Date.parse(transfer.capturedAt)) throw new Error('The transcript capture time is later than the current time. Review it again later.');
+        if (this.assistantChatLedgerMalformed || this.assistantBatchLedgerMalformed) throw new Error('Saved chat history could not be validated. Refresh local data before continuing.');
+        if (draft.settings.mode !== 'provider' || draft.settings.llmProvider !== 'openrouter') throw new Error('Select OpenRouter in Provider mode before sending a chat message.');
+        const sourceNote = draft.notes.find((note) => note.id === transfer.noteId);
+        if (!sourceNote || sourceNote.revision !== transfer.noteRevision || sourceNote.origin === 'assistant_chat' ||
+            sourceNote.importOrigin?.originalTimeZoneUnknown === true || sourceNote.capturedAt !== transfer.capturedAt ||
+            sourceNote.captureTimeZone !== transfer.captureTimeZone || !await this.transcriptSourceIsCurrent(draft, {
+              noteId: transfer.noteId, noteRevision: transfer.noteRevision, transcriptSha256: transfer.transcriptSha256,
+              capturedAt: transfer.capturedAt, captureTimeZone: transfer.captureTimeZone,
+            })) throw new Error('The saved transcript changed. Review the current note and try again.');
+        const existingConversation = this.assistantChatLedger.conversations.find((item) => item.id === conversationId);
+        if (!existingConversation) throw new Error('This chat could not be validated. Refresh local data before continuing.');
+        const timezone = transfer.captureTimeZone;
+        const message = sourceNote.transcript;
+        const noteId = newId();
+        const turnId = newId();
+        const jobId = newId();
+        const note: Note = { id: noteId, title: 'Chat message', transcript: message, durationSeconds: 0, createdAt,
+          capturedAt: transfer.capturedAt, captureTimeZone: timezone, status: 'recorded', origin: 'assistant_chat', revision: 1 };
+        const eligibleJobIds = new Set<string>();
+        const validationMemo = { results: new Map<string, Promise<boolean>>(), active: new Set<string>() };
+        for (const job of this.assistantBatchLedger.jobs) {
+          if (job.status !== 'completed' || job.sourceRemoved || !job.chatBinding) continue;
+          const prior = existingConversation.turns.find((turn) => turn.id === job.chatBinding!.turnId);
+          if (prior && await this.chatTurnMatchesFrozenRequest(draft, existingConversation, prior, validationMemo)) eligibleJobIds.add(job.id);
+        }
+        const pendingTurn = Object.freeze({ id: '__new_turn__', noteId, noteRevision: 1, jobId, userText: message, createdAt,
+          capturedAt: transfer.capturedAt, captureTimeZone: timezone, messageOrigin: 'saved_transcript' as const });
+        const conversationForSelection: ChatConversation = Object.freeze({ ...existingConversation,
+          updatedAt: createdAt, turns: Object.freeze([...existingConversation.turns, pendingTurn]) });
+        const history = selectCompletedChatContext(conversationForSelection, pendingTurn.id, eligibleJobIds, 48 * 1024);
+        const historySources: AssistantSourceInput[] = [];
+        const contextReferences: OpenRouterChatBinding['context'][number][] = [];
+        for (const selected of history.turns) {
+          const prior = existingConversation.turns.find((turn) => turn.id === selected.turnId);
+          if (!prior?.reply) throw new Error('Earlier chat context changed. Refresh the conversation before sending.');
+          historySources.push(this.chatTurnContextSource(prior));
+          const replySha256 = await this.chatReplyDigest(prior.reply);
+          if (replySha256 !== prior.replySha256) throw new Error('Earlier chat reply changed. Refresh the conversation before sending.');
+          contextReferences.push(Object.freeze({ turnId: prior.id, jobId: prior.jobId, noteId: prior.noteId,
+            noteRevision: prior.noteRevision, replySha256, replyProfileVersion: prior.reply.requestProfileVersion }));
+        }
+        const transcriptSource: NonNullable<OpenRouterChatBinding['transcriptSource']> = Object.freeze({ noteId: sourceNote.id,
+          noteRevision: sourceNote.revision, transcriptSha256: transfer.transcriptSha256, capturedAt: transfer.capturedAt, captureTimeZone: timezone });
+        const chatBinding: OpenRouterChatBinding = Object.freeze({ conversationId, turnId,
+          context: Object.freeze(contextReferences), omittedTurnCount: history.omittedTurnCount, transcriptSource });
+        const fixedQuestion = 'Respond to the current user message.';
+        // The original saved note is excluded from related-note context: its
+        // transcript is already the copied Chat message and its analysis is private.
+        const context = assistContext(draft, note, 'answer', fixedQuestion, [], new Set([sourceNote.id]));
+        const prepared = await new OpenRouterBatchRequestBuilder().prepareAnalysis(note, context.documents, draft.settings, {
+          intent: 'answer', question: fixedQuestion, chatMode: true,
+          additionalSources: [...context.additionalSources, ...historySources],
+          preselection: { omittedSourceCount: context.omittedSourceCount + history.omittedTurnCount, omittedSourceIds: context.omittedSourceIds },
+        });
+        const requestBody = JSON.parse(prepared.body) as { reasoning: { effort: 'none' | 'low' } };
+        const job: OpenRouterBatchJob = Object.freeze({
+          id: jobId, customId: jobId, kind: 'note_assistance', status: 'preparing', createdAt, updatedAt: createdAt,
+          noteId, noteRevision: 1, intent: 'answer', question: fixedQuestion, knowledgeSelection: Object.freeze([]),
+          capturedAt: transfer.capturedAt, captureTimeZone: timezone,
+          settingsFingerprint: await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, stableJson(openRouterSettingsBinding(draft.settings)), { encoding: Crypto.CryptoEncoding.HEX }),
+          sourceFingerprint: await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, stableJson(prepared.sourceVersions), { encoding: Crypto.CryptoEncoding.HEX }),
+          requestProfileVersion: prepared.requestProfileVersion, model: OPENROUTER_BATCH_MODEL, effort: requestBody.reasoning.effort,
+          requestBytes: new TextEncoder().encode(prepared.body).byteLength, omittedSourceCount: prepared.omittedSourceCount,
+          requestBody: prepared.body,
+          requestSha256: await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, prepared.body, { encoding: Crypto.CryptoEncoding.HEX }),
+          sourceVersions: Object.freeze({ ...prepared.sourceVersions }), chatBinding, unknownCharge: false,
+        });
+        const turn = Object.freeze({ id: turnId, noteId, noteRevision: 1, jobId, userText: message, createdAt,
+          capturedAt: transfer.capturedAt, captureTimeZone: timezone, messageOrigin: 'saved_transcript' as const });
+        const updatedAt = Date.parse(createdAt) > Date.parse(existingConversation.updatedAt) ? createdAt : existingConversation.updatedAt;
+        const nextConversation = Object.freeze({ ...existingConversation, updatedAt,
+          turns: Object.freeze([...existingConversation.turns, turn]) });
+        draft.notes.unshift(note);
+        const nextChatLedger = validateChatLedger({ version: 1, conversations: this.assistantChatLedger.conversations.map((conversation) =>
+          conversation.id === nextConversation.id ? nextConversation : conversation) });
+        return { job, noteId, turnId, conversationId, nextChatLedger, transcriptSource };
+      }, undefined,
+      (_draft, result) => validateOpenRouterBatchLedger({ version: 1, jobs: [...this.assistantBatchLedger.jobs, result.job] }),
+      (_draft, result) => result.nextChatLedger);
+      if (!isOpenRouterBatchContentJob(staged.job)) throw new Error('The prepared chat request could not be retained.');
+      try {
+        await this.dispatchPreparedBatch(staged.job, capturedBootstrapGeneration, this.state, async () => {
+          const latest = this.state.notes.find((note) => note.id === transfer.noteId);
+          if (!latest || latest.revision !== transfer.noteRevision ||
+              !await this.transcriptSourceIsCurrent(this.state, staged.transcriptSource)) throw new Error('The original saved transcript changed before the chat request was sent.');
+        });
+      } catch {
+        const accepted = await this.durableChatTurnAccepted(staged, capturedBootstrapGeneration, 'note_assistance');
+        if (!accepted) throw new Error('The chat submission outcome could not be confirmed. Refresh local data and review the transcript again.');
+      }
+      return { kind: 'accepted', conversationId: staged.conversationId, turnId: staged.turnId, jobId: staged.job.id };
+    } finally {
+      this.activeChatConversationSubmissions.delete(conversationId);
+    }
   }
 
   async submitChatTurn(input: { conversationId: string; text: string; knowledgeSelection?: KnowledgeSelection }): Promise<{ kind: 'accepted'; conversationId: string; turnId: string; jobId: string }> {
@@ -4628,7 +4902,9 @@ export class AppControllerImpl implements AppController {
         const parentKnowledgeSelection = [...(parentJob.knowledgeSelection ?? [])].map((row) => Object.freeze({ ...row }));
         const parentContext = parentJob.chatBinding.context.filter((reference) => reference.turnId !== parent.id)
           .map((reference) => Object.freeze({ ...reference }));
-        const context = assistContext(draft, note, 'answer', fixedQuestion, parentKnowledgeSelection);
+        const transcriptSource = this.chatTranscriptSourceForTurn(parent);
+        const context = assistContext(draft, note, 'answer', fixedQuestion, parentKnowledgeSelection,
+          transcriptSource ? new Set([transcriptSource.noteId]) : new Set());
         const requiredParentSource = this.chatRefinementParentSource(parent);
         const parentReplySha256 = await this.chatReplyDigest(parent.reply);
         if (parentReplySha256 !== parent.replySha256) throw new Error('The parent answer changed. Refresh the conversation before refining it.');
@@ -4774,7 +5050,7 @@ export class AppControllerImpl implements AppController {
     return this.dispatchPreparedBatch(staged, capturedBootstrapGeneration, this.state);
   }
 
-  private async dispatchPreparedBatch(staged: OpenRouterBatchContentJob, capturedBootstrapGeneration: number, preparedState: AppState): Promise<AssistantBatchJobDTO> {
+  private async dispatchPreparedBatch(staged: OpenRouterBatchContentJob, capturedBootstrapGeneration: number, preparedState: AppState, beforePersistSubmitting?: () => Promise<void>): Promise<AssistantBatchJobDTO> {
     if (!this.openRouterBatchClient) throw new Error('The OpenRouter Batch service is unavailable in this workspace.');
     let submittingState: AppState | undefined;
     const submittedContextIsCurrent = () => this.loaded && this.bootstrapGeneration === capturedBootstrapGeneration &&
@@ -4782,6 +5058,7 @@ export class AppControllerImpl implements AppController {
     try {
       const ack = await this.openRouterBatchClient.submit({ operationId: staged.id, requestBody: staged.requestBody, requestProfileVersion: staged.requestProfileVersion, operation: staged.operation ?? 'note_assistance' }, async () => {
         if (!this.loaded || this.bootstrapGeneration !== capturedBootstrapGeneration || this.state !== preparedState || this.mailAlertRefreshRequired || this.assistantBatchLedgerMalformed) throw new Error('The saved note changed before Batch submission.');
+        await beforePersistSubmitting?.();
         await this.updateOpenRouterBatchJob(staged.id, (job) => ({ ...job, status: 'submitting', unknownCharge: true, updatedAt: now() }), { state: preparedState, generation: capturedBootstrapGeneration });
         submittingState = this.state;
       }, () => {
@@ -4908,7 +5185,10 @@ export class AppControllerImpl implements AppController {
       const note = fresh.notes.find((item) => item.id === job.noteId);
       if (settingsFingerprint !== job.settingsFingerprint || !note || note.revision !== job.noteRevision ||
           fresh.settings.mode !== 'provider' || fresh.settings.llmProvider !== 'openrouter') throw new Error('The saved analysis sources changed.');
-      const context = assistContext(fresh, note, job.intent!, job.question, [...(job.knowledgeSelection ?? [])]);
+      const voiceTurn = job.chatBinding ? this.assistantChatLedger.conversations.flatMap((item) => item.turns).find((turn) => turn.id === job.chatBinding!.turnId) : undefined;
+      const transcriptSource = voiceTurn ? this.chatTranscriptSourceForTurn(voiceTurn) : undefined;
+      const context = assistContext(fresh, note, job.intent!, job.question, [...(job.knowledgeSelection ?? [])],
+        transcriptSource ? new Set([transcriptSource.noteId]) : new Set());
       const chatSources = job.chatBinding ? await this.chatSourcesForBinding(fresh, job.chatBinding) : [];
       prepared = await new OpenRouterBatchRequestBuilder().prepareAnalysis(note, context.documents, fresh.settings, {
         intent: job.intent, question: job.question,
@@ -5079,6 +5359,10 @@ export class AppControllerImpl implements AppController {
         if (directlyAffected.some((job) => job.noteId && this.activeBatchNoteOperations.has(job.noteId))) {
           throw new Error('A Batch operation is still using this source. Try again after it finishes.');
         }
+        if (directlyAffected.some((job) => job.chatBinding?.transcriptSource?.noteId &&
+            this.activeBatchNoteOperations.has(job.chatBinding.transcriptSource.noteId))) {
+          throw new Error('A Chat request is still using this source. Try again after it finishes.');
+        }
 
         if (affectedTurnIds.size) {
           for (const note of draft.notes) if (affectedNoteIds.has(note.id)) {
@@ -5107,6 +5391,10 @@ export class AppControllerImpl implements AppController {
       },
       chat: () => nextChatLedger,
     };
+  }
+
+  private sourceTranscriptRevisionCommit(noteId: string) {
+    return this.sourceRemovalCommit((job) => job.chatBinding?.transcriptSource?.noteId === noteId);
   }
 
   private tombstoneOpenRouterBatchJobs(predicate: (job: OpenRouterBatchJob) => boolean): OpenRouterBatchLedger {
@@ -5147,7 +5435,10 @@ export class AppControllerImpl implements AppController {
     const knowledgeSelection = normalizeKnowledgeSelection(options.knowledgeSelection ?? []);
     for (const selected of knowledgeSelection) if (!getKnowledgeEntity(state.knowledge, selected.kind, selected.id)) throw new Error('One of the selected people or projects no longer exists. Refresh the selection and try again.');
     const sourceRevision = note.revision;
-    const { documents: contextDocs, additionalSources: baseSources, omittedSourceCount, omittedSourceIds } = assistContext(state, note, intent, question, knowledgeSelection);
+    const chatTurn = batch?.chatBinding ? this.assistantChatLedger.conversations.flatMap((item) => item.turns).find((turn) => turn.id === batch.chatBinding!.turnId) : undefined;
+    const transcriptSource = chatTurn ? this.chatTranscriptSourceForTurn(chatTurn) : undefined;
+    const { documents: contextDocs, additionalSources: baseSources, omittedSourceCount, omittedSourceIds } = assistContext(state, note, intent, question,
+      knowledgeSelection, transcriptSource ? new Set([transcriptSource.noteId]) : new Set());
     const chatSources = batch?.chatBinding ? await this.chatSourcesForBinding(state, batch.chatBinding) : [];
     const localSources = [...baseSources, ...chatSources];
     const capturedAt = note.capturedAt ?? note.createdAt;
@@ -5258,7 +5549,8 @@ export class AppControllerImpl implements AppController {
         ? stableJson(openRouterSettingsBinding(draft.settings)) !== stableJson(openRouterSettingsBinding(state.settings))
         : JSON.stringify(draft.settings) !== JSON.stringify(state.settings);
       try {
-        const currentContext = assistContext(draft, current, intent, question, knowledgeSelection);
+        const currentContext = assistContext(draft, current, intent, question, knowledgeSelection,
+          transcriptSource ? new Set([transcriptSource.noteId]) : new Set());
         const currentChatSources = batch?.chatBinding ? await this.chatSourcesForBinding(draft, batch.chatBinding) : [];
         let currentVersions: Record<string, string>;
         if (draft.settings.mode === 'provider') {
@@ -5503,6 +5795,7 @@ export class AppControllerImpl implements AppController {
     if (speechProvider === 'azure' && !initial.settings.speechEndpoint) throw new Error('Add an Azure Speech endpoint before transcribing.');
     if (speechProvider === 'openrouter' && !this.openRouterSpeechAdapter) throw new Error('OpenRouter speech transcription is unavailable in this workspace.');
     const sourceRevision = note.revision;
+    const sourceRevisionRemoval = this.sourceTranscriptRevisionCommit(id);
     const source = transcriptionSourceProjection(note, initial.settings);
     const settings = clone(initial.settings);
     const settingsProjection = speechSettingsProjection(settings);
@@ -5630,6 +5923,16 @@ export class AppControllerImpl implements AppController {
         const lease = state.transcription.cleanupLeases.find((item) => item.leaseId === leaseId);
         if (lease) lease.outcome = 'pending_cleanup';
         if (!matches || !current) return { note: current, discarded: true };
+        try {
+          // Probe the source-removal closure before applying a provider result.
+          // If a dependent Chat request is still active, preserve the original
+          // note and its valid Chat lineage while retaining this speech receipt.
+          sourceRevisionRemoval.batch(clone(state));
+        } catch {
+          savedAttempt.outcome = 'discarded';
+          savedAttempt.code = 'discarded';
+          return { note: current, discarded: true };
+        }
         current.transcript = result.transcript;
         current.title = result.transcript.split(/\s+/).slice(0, 7).join(' ').slice(0, 72);
         current.revision += 1;
@@ -5642,13 +5945,17 @@ export class AppControllerImpl implements AppController {
         }
         addActivity(state, 'local_action', isOpenRouterSpeechResult(result) ? 'Audio transcribed with OpenRouter and saved to the note.' : 'Audio transcribed by Azure Speech and saved to the note.', { noteId: id });
         return { note: current, discarded: false };
-      });
+      }, undefined, (draft, result) => !result.discarded && result.note?.revision !== undefined && result.note.revision > sourceRevision
+        ? sourceRevisionRemoval.batch(draft) : undefined,
+      (_draft, result) => !result.discarded && result.note?.revision !== undefined && result.note.revision > sourceRevision
+        ? sourceRevisionRemoval.chat() : undefined);
       if (savedNote.discarded || !savedNote.note) throw new Error('The note changed while transcription was in progress. The valid provider result was recorded but not applied.');
       let updated = clone(savedNote.note);
       const terminal = this.snapshot.transcription.attempts.find((item) => item.id === attemptId);
       if (terminal?.outcome === 'completed' && this.snapshot.settings.audioRetention === 'delete_after_transcription' && source.audioUri) {
         const retentionUri = source.audioUri;
         try {
+          const sourceRevisionRemoval = this.sourceTranscriptRevisionCommit(id);
           const detach = await this.mutate((draft) => {
             const current = draft.notes.find((item) => item.id === id);
             if (!current || current.revision !== updated.revision || current.audioUri !== retentionUri || draft.settings.audioRetention !== 'delete_after_transcription' || draft.notes.some((other) => other.id !== id && other.audioUri === retentionUri)) return { note: current, detached: false };
@@ -5658,7 +5965,8 @@ export class AppControllerImpl implements AppController {
             for (const proposal of draft.proposals.filter((item) => item.noteId === id && ['draft', 'approved', 'failed'].includes(item.status))) { this.invalidate(proposal); proposal.status = 'draft'; }
             addActivity(draft, 'local_action', 'Original recording detached after transcription, as configured.', { noteId: id });
             return { note: current, detached: true };
-          });
+          }, undefined, (draft, result) => result.detached ? sourceRevisionRemoval.batch(draft) : undefined,
+          (_draft, result) => result.detached ? sourceRevisionRemoval.chat() : undefined);
           if (detach.detached && detach.note) { try { await (this.integration.removeAudio?.(retentionUri) ?? removeAudio(retentionUri, this.integration.audioBoundary)); } catch { /* The note no longer references this private clip. */ } updated = clone(detach.note); }
         } catch { /* Durable transcript stays committed if clip cleanup fails. */ }
       }
@@ -9561,7 +9869,7 @@ export class AppControllerImpl implements AppController {
     if (this.state.notes.find((note) => note.id === id)?.origin === 'assistant_chat') throw new Error('Delete this message from its Chat conversation.');
     if (this.activeBatchNoteOperations.has(id)) throw new Error('A Batch request is still using this note. Try again after it finishes.');
     const audioUri = this.snapshot.notes.find((note) => note.id === id)?.audioUri;
-    const sourceRemoval = this.sourceRemovalCommit((job) => job.noteId === id || job.sourceVersions?.[`note:${id}`] !== undefined);
+    const sourceRemoval = this.sourceRemovalCommit((job) => job.noteId === id || job.sourceVersions?.[`note:${id}`] !== undefined || job.chatBinding?.transcriptSource?.noteId === id);
     await this.mutate(async (state) => {
       if (this.activeBatchNoteOperations.has(id)) throw new Error('A Batch request is still using this note. Try again after it finishes.');
       if (state.proposals.some((proposal) => proposal.noteId === id && (proposal.kind !== 'reminder' && ['dispatching', 'unknown'].includes(proposal.status)))) throw new Error('Wait for the in-progress external action result before deleting this note.');

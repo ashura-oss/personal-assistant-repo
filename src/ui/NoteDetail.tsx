@@ -10,10 +10,12 @@ import {
 import type { AssistIntent, Note, NoteAssistResult, Proposal } from "../core";
 import type { TranscriptionAttempt } from "../transcription";
 import type { AssistantBatchJobDTO } from "../services/openRouterBatchJobs";
+import type { ChatConversationDTO, ChatTranscriptTransferPlan } from "../chat/types";
 import type { KnowledgeChange, KnowledgeEntityKind, Person, Project } from "../knowledge/types";
 import { Button, Field, IconButton } from "./primitives";
 import { TranscriptionPanel } from "./TranscriptionPanel";
 import { AssistantBatchJobCard } from "./AssistantBatchJobCard";
+import { VoiceChatTransferReview } from "./VoiceChatTransferReview";
 import { C, s } from "./theme";
 
 function validTimeZone(value: string) {
@@ -23,6 +25,11 @@ function validTimeZone(value: string) {
   } catch {
     return false;
   }
+}
+
+export function canUseSavedTranscriptInChat(note: Note, draft: string, busy: boolean, blocked: boolean): boolean {
+  return !busy && !blocked && draft === note.transcript && Boolean(draft.trim()) &&
+    note.importOrigin?.originalTimeZoneUnknown !== true && validTimeZone(note.captureTimeZone ?? "");
 }
 
 type Props = {
@@ -65,6 +72,19 @@ type Props = {
   onRetryTranscriptionRequestCleanup?: (attemptId: string) => Promise<void>;
   onCheckAssistantBatch?: (jobId: string) => Promise<unknown> | unknown;
   onRetryAssistantBatchCleanup?: (jobId: string) => Promise<unknown> | unknown;
+  voiceChatTransfer?: {
+    plan?: ChatTranscriptTransferPlan;
+    conversations: readonly ChatConversationDTO[];
+    selectedConversationId?: string;
+    blocked: boolean;
+    busy: boolean;
+    providerReady: boolean;
+    onPrepare: () => void;
+    onSelectConversation: (conversationId: string) => void;
+    onCreateConversation: (expectedPlanId: string) => Promise<ChatConversationDTO | undefined>;
+    onSend: (expectedPlanId: string, conversationId: string) => Promise<unknown>;
+    onCancel: (expectedPlanId: string) => void;
+  };
   onOpenSpeechSettings: () => void;
   onAttachRecording: () => void;
   onPlay: () => void;
@@ -114,6 +134,7 @@ export function NoteDetail({
   onRetryTranscriptionRequestCleanup,
   onCheckAssistantBatch,
   onRetryAssistantBatchCleanup,
+  voiceChatTransfer,
   onOpenSpeechSettings,
   onAttachRecording,
   onPlay,
@@ -308,6 +329,28 @@ export function NoteDetail({
           Audio is never transcribed automatically. Your transcript stays
           editable.
         </Text>
+        {voiceChatTransfer ? (
+          <>
+            <Button
+              label="Use saved transcript in Chat"
+              tone="quiet"
+              disabled={!canUseSavedTranscriptInChat(note, text, busy, voiceChatTransfer.blocked)}
+              onPress={voiceChatTransfer.onPrepare}
+            />
+            <VoiceChatTransferReview
+              plan={voiceChatTransfer.plan}
+              conversations={voiceChatTransfer.conversations}
+              selectedConversationId={voiceChatTransfer.selectedConversationId}
+              blocked={voiceChatTransfer.blocked}
+              busy={voiceChatTransfer.busy}
+              providerReady={voiceChatTransfer.providerReady}
+              onSelectConversation={voiceChatTransfer.onSelectConversation}
+              onCreateConversation={voiceChatTransfer.onCreateConversation}
+              onSend={voiceChatTransfer.onSend}
+              onCancel={voiceChatTransfer.onCancel}
+            />
+          </>
+        ) : null}
         {(!demoMode || transcriptionDemoMode) &&
         (note.audioUri || transcriptionAttempts.length > 0) ? (
           <TranscriptionPanel

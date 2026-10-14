@@ -25,6 +25,7 @@ export type PortableChatReply = Readonly<{
 export type PortableChatTurn = Readonly<{
   userText: string;
   createdAt: string;
+  messageOrigin?: 'saved_transcript';
   capturedAt: string;
   captureTimeZone: string;
   operation?: 'chat_refinement';
@@ -61,7 +62,7 @@ export type InertImportedChatConversation = Readonly<{
 }>;
 
 const PORTABLE_TURN_KEYS = ['userText', 'createdAt', 'capturedAt', 'captureTimeZone'] as const;
-const PORTABLE_TURN_OPTIONAL_KEYS = ['reply', 'accounting', 'operation', 'reasoningEffort'] as const;
+const PORTABLE_TURN_OPTIONAL_KEYS = ['reply', 'accounting', 'operation', 'reasoningEffort', 'messageOrigin'] as const;
 
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const CANONICAL_ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
@@ -154,7 +155,7 @@ function parseReply(value: unknown): PortableChatReply {
 }
 function parseTurn(value: unknown, conversationCreated: string, conversationUpdated: string): PortableChatTurn {
   if (!object(value)) fail('Portable Chat turn is invalid.');
-  exactKeys(value, ['userText', 'createdAt', 'capturedAt', 'captureTimeZone'], ['reply', 'accounting', 'operation', 'reasoningEffort']);
+  exactKeys(value, ['userText', 'createdAt', 'capturedAt', 'captureTimeZone'], ['reply', 'accounting', 'operation', 'reasoningEffort', 'messageOrigin']);
   const createdAt = timestamp(value.createdAt, 'Portable Chat turn time');
   const capturedAt = timestamp(value.capturedAt, 'Portable Chat capture time');
   if (Date.parse(createdAt) < Date.parse(conversationCreated) || Date.parse(createdAt) > Date.parse(conversationUpdated) || Date.parse(capturedAt) > Date.parse(createdAt)) {
@@ -163,9 +164,12 @@ function parseTurn(value: unknown, conversationCreated: string, conversationUpda
   const reply = value.reply === undefined ? undefined : parseReply(value.reply);
   if ((value.operation !== undefined && value.operation !== 'chat_refinement') ||
       ((value.operation === 'chat_refinement') !== (value.reasoningEffort !== undefined)) ||
-      (value.reasoningEffort !== undefined && !['medium', 'high', 'max'].includes(String(value.reasoningEffort)))) fail('Portable Chat operation annotation is invalid.');
+      (value.reasoningEffort !== undefined && !['medium', 'high', 'max'].includes(String(value.reasoningEffort))) ||
+      (value.operation === 'chat_refinement' && value.messageOrigin !== undefined)) fail('Portable Chat operation annotation is invalid.');
   if (reply && (Date.parse(reply.completedAt) < Date.parse(createdAt) || Date.parse(reply.completedAt) > Date.parse(conversationUpdated))) fail('Portable Chat reply time is outside its conversation.');
+  if (value.messageOrigin !== undefined && value.messageOrigin !== 'saved_transcript') fail('Portable Chat message origin is invalid.');
   return Object.freeze({ userText: text(value.userText, 'Portable Chat message'), createdAt, capturedAt, captureTimeZone: zone(value.captureTimeZone),
+    ...(value.messageOrigin === 'saved_transcript' ? { messageOrigin: 'saved_transcript' as const } : {}),
     ...(value.operation === 'chat_refinement' ? { operation: 'chat_refinement' as const, reasoningEffort: value.reasoningEffort as 'medium' | 'high' | 'max' } : {}),
     ...(reply ? { reply } : {}), ...(value.accounting !== undefined ? { accounting: accounting(value.accounting) } : {}) });
 }
@@ -244,8 +248,8 @@ export function validateInertImportedChatHistory(value: unknown): readonly Inert
 export function projectInertImportedChatHistory(value: unknown): PortableChatHistory {
   const conversations = validateInertImportedChatHistory(value);
   return validatePortableChatHistory({ version: PORTABLE_CHAT_HISTORY_VERSION, conversations: conversations.map(({ title, createdAt, updatedAt, turns }) => ({
-    title, createdAt, updatedAt, turns: turns.map(({ userText, createdAt: turnCreatedAt, capturedAt, captureTimeZone, operation, reasoningEffort, reply, accounting }) => ({
-      userText, createdAt: turnCreatedAt, capturedAt, captureTimeZone, ...(operation ? { operation, reasoningEffort } : {}), ...(reply ? { reply } : {}), ...(accounting ? { accounting } : {}),
+    title, createdAt, updatedAt, turns: turns.map(({ userText, createdAt: turnCreatedAt, messageOrigin, capturedAt, captureTimeZone, operation, reasoningEffort, reply, accounting }) => ({
+      userText, createdAt: turnCreatedAt, capturedAt, captureTimeZone, ...(messageOrigin ? { messageOrigin } : {}), ...(operation ? { operation, reasoningEffort } : {}), ...(reply ? { reply } : {}), ...(accounting ? { accounting } : {}),
     })),
   })) });
 }
@@ -330,6 +334,7 @@ export async function createPortableChatHistory(
         clarifications: Object.freeze([...turn.reply.clarifications]), completedAt: turn.reply.completedAt }) : undefined;
       const receipt = projectedAccounting(job);
       turns.push(Object.freeze({ userText: turn.userText, createdAt: turn.createdAt, capturedAt: turn.capturedAt ?? turn.createdAt, captureTimeZone: turn.captureTimeZone,
+        ...(turn.messageOrigin === 'saved_transcript' ? { messageOrigin: turn.messageOrigin } : {}),
         ...(turn.operation ? { operation: turn.operation, reasoningEffort: turn.reasoningEffort } : {}),
         ...(reply ? { reply } : {}), ...(receipt ? { accounting: receipt } : {}) }));
     }

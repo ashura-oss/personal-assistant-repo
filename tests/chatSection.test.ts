@@ -65,6 +65,19 @@ function button(label: string) {
 }
 
 describe('ChatSection review and submission behavior', () => {
+  it('shows saved-transcript provenance with the original capture time while retaining the later Chat time', () => {
+    const capturedAt = '2026-10-13T10:00:00.000Z';
+    const addedAt = '2026-10-14T01:00:00.000Z';
+    const turn = {
+      id: 'saved-turn', noteId: 'source-note', userText: 'Use the saved words.', createdAt: addedAt,
+      messageOrigin: 'saved_transcript' as const, capturedAt, captureTimeZone: 'Asia/Singapore',
+    };
+    renderChat({ conversations: [{ ...conversation, turns: [turn] }], turns: [turn] });
+    expect(host.textContent).toContain('From saved transcript');
+    expect(host.textContent).toContain('Asia/Singapore');
+    expect(host.textContent).toContain('Added to Chat');
+  });
+
   const completedParentTurn = {
     id: 'parent-turn', noteId: 'note-parent', userText: 'Summarize the planning notes.',
     createdAt: conversation.createdAt,

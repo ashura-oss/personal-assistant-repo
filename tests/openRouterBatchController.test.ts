@@ -53,7 +53,8 @@ async function fakeSubmit(
 
 function completedInspection(customId: string, content = JSON.stringify({
   summary: 'A concise summary.', answer: '', decisions: [], citations: [], clarifications: [], proposals: [], memorySuggestions: [],
-})): OpenRouterBatchInspection {
+}), refusal?: unknown): OpenRouterBatchInspection {
+  const message = { role: 'assistant', content, ...(refusal === undefined ? {} : { refusal }) };
   return {
     batchId: 'batch_completed_fixture', status: 'completed', endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH,
     model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h', total: 1, completed: 1, failed: 0,
@@ -61,12 +62,55 @@ function completedInspection(customId: string, content = JSON.stringify({
     usage: { cost: 0.001, promptTokens: 12, completionTokens: 5, totalTokens: 17 },
     result: { customId, statusCode: 200, finishReason: 'stop', responseBody: {
       model: OPENROUTER_BATCH_BODY_MODEL,
-      choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content } }],
+      choices: [{ index: 0, finish_reason: 'stop', message }],
     } },
   };
 }
 
 describe('OpenRouter Batch controller lifecycle', () => {
+  it('accepts an explicit null refusal field on strict structured output', async () => {
+    const fakeClient = {
+      submit: (input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => fakeSubmit('batch_null_refusal', input, before, assert),
+      inspect: async (_batchId: string, customId: string) => ({ ...completedInspection(customId, JSON.stringify({
+        summary: 'Ready.', answer: 'READY', decisions: [], citations: [], clarifications: [], proposals: [], memorySuggestions: [],
+      }), null), batchId: 'batch_null_refusal' }),
+    } as unknown as OpenRouterBatchClient;
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient });
+    await app.load();
+    await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
+    const note = await app.saveNote({ transcript: 'one two three four five six structured null refusal' });
+    const job = await app.submitNoteBatch(note.id, { intent: 'answer', question: 'Return READY.' });
+
+    const result = await app.refreshAssistantBatch(job.id);
+    expect(result).toMatchObject({ status: 'completed', providerReportedCostUsd: 0.001 });
+    expect(app.getSnapshot().notes.find((item) => item.id === note.id)?.analysis?.answer).toBe('READY');
+    expect(app.getSnapshot().proposals).toHaveLength(0);
+  });
+
+  it.each(['', {}])('rejects a non-null refusal field and retains accounting without actions: %j', async (refusal) => {
+    const fakeClient = {
+      submit: (input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => fakeSubmit('batch_nonnull_refusal', input, before, assert),
+      inspect: async (_batchId: string, customId: string) => ({ ...completedInspection(customId, JSON.stringify({
+        summary: 'Must not apply.', answer: 'MUST_NOT_APPLY', decisions: [], citations: [], clarifications: [], proposals: [{
+          kind: 'task', title: 'Must not be created', body: 'Invalid refusal response.', recipients: [], dueAt: null, evidence: ['MUST_NOT_APPLY'],
+        }], memorySuggestions: [],
+      }), refusal), batchId: 'batch_nonnull_refusal' }),
+    } as unknown as OpenRouterBatchClient;
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient });
+    await app.load();
+    await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
+    const note = await app.saveNote({ transcript: 'one two three four five six non-null refusal' });
+    const job = await app.submitNoteBatch(note.id, { intent: 'answer', question: 'Return READY.' });
+
+    const result = await app.refreshAssistantBatch(job.id);
+    expect(result).toMatchObject({ status: 'result_invalid', providerReportedCostUsd: 0.001, costStatus: 'reported' });
+    expect(app.getSnapshot().notes.find((item) => item.id === note.id)?.analysis).toBeUndefined();
+    expect(app.getSnapshot().proposals).toHaveLength(0);
+    expect(app.getSnapshot().tasks).toHaveLength(0);
+  });
+
   it('freezes Chat replies by reply digest, reuses only the saved prior context, and deletes its content-free receipts', async () => {
     const postedBodies: Record<string, unknown>[] = [];
     const fakeClient = {

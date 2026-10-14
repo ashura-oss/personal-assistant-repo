@@ -98,7 +98,7 @@ function parseReply(value: unknown): ChatReplySnapshot {
 
 function parseTurn(value: unknown): ChatTurn {
   if (!object(value)) fail('Chat turn is invalid.');
-  exactKeys(value, ['id', 'noteId', 'noteRevision', 'jobId', 'userText', 'createdAt', 'captureTimeZone'], ['capturedAt', 'operation', 'reasoningEffort', 'parentTurnId', 'reply', 'replySha256']);
+  exactKeys(value, ['id', 'noteId', 'noteRevision', 'jobId', 'userText', 'createdAt', 'captureTimeZone'], ['capturedAt', 'messageOrigin', 'operation', 'reasoningEffort', 'parentTurnId', 'reply', 'replySha256']);
   const base = {
     id: uuid(value.id, 'Chat turn ID'),
     noteId: uuid(value.noteId, 'Chat note ID'),
@@ -108,14 +108,19 @@ function parseTurn(value: unknown): ChatTurn {
     createdAt: timestamp(value.createdAt, 'Chat turn time'),
     captureTimeZone: timeZone(value.captureTimeZone),
     ...(value.capturedAt !== undefined ? { capturedAt: timestamp(value.capturedAt, 'Chat capture time') } : {}),
+    ...(value.messageOrigin !== undefined ? { messageOrigin: value.messageOrigin as 'saved_transcript' } : {}),
     ...(value.operation !== undefined ? { operation: value.operation as 'chat_refinement' } : {}),
     ...(value.reasoningEffort !== undefined ? { reasoningEffort: value.reasoningEffort as 'medium' | 'high' | 'max' } : {}),
     ...(value.parentTurnId !== undefined ? { parentTurnId: uuid(value.parentTurnId, 'Chat parent turn ID') } : {}),
   };
+  if (value.messageOrigin !== undefined && (value.messageOrigin !== 'saved_transcript' || value.capturedAt === undefined)) {
+    fail('Saved transcript message binding is invalid.');
+  }
   if (value.operation !== undefined || value.reasoningEffort !== undefined || value.parentTurnId !== undefined) {
     if (value.operation !== 'chat_refinement' || typeof value.reasoningEffort !== 'string' || !['medium', 'high', 'max'].includes(value.reasoningEffort) ||
         typeof value.parentTurnId !== 'string' || value.capturedAt === undefined) fail('Chat refinement binding is invalid.');
   }
+  if (value.operation === 'chat_refinement' && value.messageOrigin !== undefined) fail('Chat refinement cannot carry a saved transcript origin marker.');
   const hasReply = Object.prototype.hasOwnProperty.call(value, 'reply');
   const hasReplyDigest = Object.prototype.hasOwnProperty.call(value, 'replySha256');
   if (hasReply !== hasReplyDigest || (hasReplyDigest && (typeof value.replySha256 !== 'string' || value.replySha256.length !== 64 || !SHA256.test(value.replySha256)))) {

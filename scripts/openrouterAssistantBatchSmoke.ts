@@ -226,7 +226,7 @@ function validateAssistantInspection(inspection: OpenRouterBatchInspection, prep
   const modelValidated = row?.model === 'openai/gpt-6-luna' || row?.model === 'openai/gpt-6-luna-20260922';
   const choices = Array.isArray(row?.choices) ? row.choices : [];
   const message = object(object(choices[0])?.message);
-  if (!modelValidated || typeof message?.content !== 'string' || message.refusal !== undefined || choices.length !== 1 || object(choices[0])?.index !== 0 || object(choices[0])?.finish_reason !== 'stop' || message.role !== 'assistant') return { modelValidated, strictSchemaValidated: false, assistantResultValidated: false, intendedReplyMatched: false };
+  if (!modelValidated || typeof message?.content !== 'string' || message.refusal != null || choices.length !== 1 || object(choices[0])?.index !== 0 || object(choices[0])?.finish_reason !== 'stop' || message.role !== 'assistant') return { modelValidated, strictSchemaValidated: false, assistantResultValidated: false, intendedReplyMatched: false };
   let parsed: unknown;
   try { parsed = JSON.parse(message.content); } catch { return { modelValidated, strictSchemaValidated: false, assistantResultValidated: false, intendedReplyMatched: false }; }
   const parsedRow = object(parsed);

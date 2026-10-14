@@ -47,6 +47,17 @@ function dateLabel(value: string) {
     : 'Time unavailable';
 }
 
+function captureDateLabel(value: string, timeZone: string | undefined) {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return 'time unavailable';
+  if (!timeZone) return dateLabel(value);
+  try {
+    return new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short', timeZone }).format(date);
+  } catch {
+    return 'time unavailable';
+  }
+}
+
 function ConversationButton({
   conversation,
   selected,
@@ -413,7 +424,12 @@ export function ChatSection({
               ) : (
                 <View style={styles.userBubble}>
                   <Text style={styles.userText}>{turn.userText}</Text>
-                  <Text style={styles.meta}>{dateLabel(turn.createdAt)}</Text>
+                  {turn.messageOrigin === 'saved_transcript' ? (
+                    <>
+                      <Text style={styles.meta}>From saved transcript · captured {turn.capturedAt ? captureDateLabel(turn.capturedAt, turn.captureTimeZone) : 'time unavailable'} · {turn.captureTimeZone ?? 'time zone unavailable'}</Text>
+                      <Text style={styles.meta}>Added to Chat {dateLabel(turn.createdAt)}</Text>
+                    </>
+                  ) : <Text style={styles.meta}>{dateLabel(turn.createdAt)}</Text>}
                 </View>
               )}
               {turn.reply ? (
