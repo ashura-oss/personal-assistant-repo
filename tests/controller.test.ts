@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { AppState, MailReplyTextGenerationInput, Proposal } from '../src/core';
+import type { AppState, MailReplyTextGenerationInput, Note, Proposal } from '../src/core';
 import { AppControllerImpl } from '../src/services/controller';
+import { extractPreviewProposals as extractSharedPreviewProposals } from '../src/services/controller.shared';
 import type { StateStore } from '../src/storage/contracts';
 import { AzureOpenAIClient } from '../src/services/azure';
 import { cancelReminderNotification, reminderNotificationId, requestReminderNotification } from '../src/services/notifications';
@@ -27,6 +28,30 @@ async function saveDocumentCurrent(app: AppControllerImpl, path: string, content
 }
 
 describe('application state controller', () => {
+  it('uses the injected UUID port for shared preview proposal IDs', () => {
+    const note = { id: 'note-1', transcript: 'Please send the update.', revision: 3 } as Note;
+    const ids = ['node-uuid-1', 'node-uuid-2'];
+    const proposals = extractSharedPreviewProposals(note, () => ids.shift()!);
+
+    expect(proposals).toHaveLength(1);
+    expect(proposals[0]).toMatchObject({ id: 'node-uuid-1', noteId: 'note-1', kind: 'email', sourceRevision: 3 });
+    expect(ids).toEqual(['node-uuid-2']);
+  });
+
+  it('uses native defaults without mutating a frozen integration object', async () => {
+    const store = new MemoryStore();
+    const integration = Object.freeze({ writeDocument: vi.fn(async () => {}), privacySession: { epoch: 'frozen-port', assertCurrent: vi.fn(async () => {}) } });
+    const app = new AppControllerImpl(store, {}, integration);
+
+    await app.load();
+    const note = await app.saveNote({ transcript: 'Frozen integration stays caller-owned.' });
+
+    expect(note.transcript).toBe('Frozen integration stays caller-owned.');
+    expect(Object.keys(integration)).toEqual(['writeDocument', 'privacySession']);
+    expect(integration.privacySession.assertCurrent).toHaveBeenCalled();
+    expect(Object.isFrozen(integration)).toBe(true);
+  });
+
   it('rejects immediate paid text before preparation, source lookup, cache access, or usage reservation', async () => {
     const store = new MemoryStore();
     const prepare = vi.fn(async () => ({}));

@@ -1,6 +1,8 @@
 import type { AppSettings, ContextDocument, Note } from '../core';
 import { assistantChatRefinementSchemaV2, assistantResponseSchema, assistantResponseSchemaV2 } from '../assistant';
-import { assistantReplyTextSchema, prepareAssistantWireRequest, type AssistantPrepareRequest, type PreparedAnalysis, type ReplyGenerationInput } from './azure';
+import { assistantReplyTextSchema, prepareAssistantWireRequest } from './assistantWire';
+import type { AssistantPrepareRequest, PreparedAnalysis } from './assistantWire';
+import type { ReplyGenerationInput } from './azure';
 import type { ProviderCancellationRetry, ProviderResponseLifetime } from './providerResponseLifetime';
 
 /** Settings select the fixed Batch listing; each JSONL request uses the base model slug. */
@@ -354,6 +356,8 @@ function buildOpenRouterAnalysisBody(instructions: string, userInput: string, se
 
 /** Builds locally bounded Batch payloads only. This module does not perform HTTP calls. */
 export class OpenRouterBatchRequestBuilder {
+  constructor(private readonly sha256?: (value: Uint8Array) => Promise<string>) {}
+
   async prepareAnalysis(
     note: Note,
     docs: ContextDocument[],
@@ -376,7 +380,7 @@ export class OpenRouterBatchRequestBuilder {
       // The whole serialized Batch envelope (custom ID and routing included) is capped in submit().
       maxRequestBytes: 1024 * 1024 - 4096,
       buildBody: (instructions, userInput, currentSettings) => buildOpenRouterAnalysisBody(instructions, userInput, currentSettings, profileVersion, operation, request.reasoningEffortOverride),
-    });
+    }, this.sha256);
     return Object.freeze({ ...prepared, endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH, requestProfileVersion: profileVersion, selection: Object.freeze({ ...prepared.selection }), includedSourceIds: Object.freeze([...prepared.includedSourceIds]), includedSources: Object.freeze(prepared.includedSources.map((source) => Object.freeze({ ...source }))), omittedSourceIds: Object.freeze([...prepared.omittedSourceIds]), sourceVersions: Object.freeze({ ...prepared.sourceVersions }) });
   }
 

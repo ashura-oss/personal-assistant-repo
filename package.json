@@ -16,7 +16,7 @@
     "test:watch": "vitest",
     "postinstall": "patch-package --error-on-fail",
     "check:ios-config": "node scripts/check-ios-config.mjs",
-    "check:server": "npm --prefix server run check"
+    "check:server": "npm --prefix server run check && node --test tests/nodeControllerRuntime.test.mjs"
   },
   "dependencies": {
     "@expo/vector-icons": "^15.0.3",

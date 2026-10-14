@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
-import { AzureOpenAIClient, validateAzureEndpoint } from '../src/services/azure';
+import { AzureOpenAIClient, prepareAssistantWireRequest, validateAzureEndpoint } from '../src/services/azure';
+import type { AssistantWireProfile } from '../src/services/azure';
 import * as Crypto from 'expo-crypto';
 import type { AppSettings, Note } from '../src/core';
 
@@ -12,6 +13,22 @@ const note: Note = { id: 'n1', title: 'Note', transcript: 'I need to call Alex t
 const noteSourceVersion = async () => `1:${await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, note.transcript.normalize('NFC'))}`;
 
 describe('Azure endpoint and Responses request', () => {
+  it('keeps the standalone Azure wire helper on Expo SHA when WebCrypto is unavailable', async () => {
+    const digest = vi.spyOn(Crypto, 'digestStringAsync');
+    vi.stubGlobal('crypto', undefined);
+    const profile: AssistantWireProfile = {
+      endpoint: 'https://example.openai.azure.com', maxRequestBytes: settings.maxRequestBytes,
+      buildBody: (_instructions, userInput) => userInput,
+    };
+    try {
+      await prepareAssistantWireRequest(note, [], settings, {}, profile);
+      expect(digest).toHaveBeenCalledWith(Crypto.CryptoDigestAlgorithm.SHA256, note.transcript.normalize('NFC'), { encoding: 'hex' });
+    } finally {
+      vi.unstubAllGlobals();
+      digest.mockRestore();
+    }
+  });
+
   it('rejects insecure and lookalike Azure hosts', () => {
     expect(() => validateAzureEndpoint('http://example.openai.azure.com', 'openai')).toThrow();
     expect(() => validateAzureEndpoint('https://openai.azure.com.attacker.test', 'openai')).toThrow();

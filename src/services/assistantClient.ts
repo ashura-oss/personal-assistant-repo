@@ -1,6 +1,6 @@
 import type { AppSettings, AssistIntent, ContextDocument, Note } from '../core';
 import type { AssistantSourceInput } from '../assistant';
-import { AzureOpenAIClient, type DraftAnalysis, type PreparedAnalysis, type ReplyGenerationInput, type ReplyGenerationResult } from './azure';
+import type { AzureOpenAIClient, DraftAnalysis, PreparedAnalysis, ReplyGenerationInput, ReplyGenerationResult } from './azure';
 
 type AnalysisRequest = {
   intent?: AssistIntent;

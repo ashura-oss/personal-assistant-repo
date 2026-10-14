@@ -5,6 +5,8 @@ import type {
   DeviceCalendarReadWindow, DeviceCalendarRow, DeviceEventCreateResult,
   DeviceEventDispatchRecord, DeviceEventLookupResult, DeviceEventSnapshot,
 } from '../deviceCalendars';
+import { DeviceCalendarBackendError } from './controllerRuntimeErrors';
+export { DeviceCalendarBackendError } from './controllerRuntimeErrors';
 
 type ExpoCalendarModule = typeof import('expo-calendar');
 type PermissionResponse = { status?: string; granted?: boolean; canAskAgain?: boolean };
@@ -17,15 +19,6 @@ type NativeEvent = {
   endDate: string | Date; originalStartDate?: string | Date | null; timeZone?: string | null;
   allDay?: boolean; status?: unknown;
 };
-
-export class DeviceCalendarBackendError extends Error {
-  readonly code: DeviceCalendarBackendErrorCode;
-  constructor(code: DeviceCalendarBackendErrorCode) {
-    super(`Device calendar ${code.replaceAll('_', ' ')}.`);
-    this.name = 'DeviceCalendarBackendError';
-    this.code = code;
-  }
-}
 
 export interface DeviceCalendarBackend {
   readonly platform: DeviceCalendarPlatform;

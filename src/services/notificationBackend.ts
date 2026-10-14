@@ -1,9 +1,12 @@
 import { Platform } from 'react-native';
 import {
-  legacyReminderIdentifier, notificationContentForIntent, reminderNotificationIdentifier,
-  validateLegacyReminderCancellation, validateReminderIntent,
+  notificationContentForIntent, validateReminderIntent,
 } from '../reminders';
 import type { LegacyReminderCancellation, ReminderIntent } from '../reminders';
+import { NotificationBackendError } from './controllerRuntimeErrors';
+import { isOwnedLegacyReminderCancellation } from './notificationMatching';
+export { NotificationBackendError } from './controllerRuntimeErrors';
+export { isMatchingPending, isOwnedLegacyReminderCancellation } from './notificationMatching';
 
 export type NotificationPlatform = 'ios' | 'android' | 'web' | 'mock';
 export type NotificationPermission = 'authorized' | 'provisional' | 'denied' | 'undetermined' | 'unavailable';
@@ -42,11 +45,6 @@ export interface ExpoForegroundNotification {
   date?: unknown;
 }
 
-export class NotificationBackendError extends Error {
-  readonly code: 'permission_denied' | 'permission_unavailable' | 'listing_failed' | 'schedule_failed' | 'cancel_failed' | 'invalid_request' | 'unverifiable' | 'unavailable';
-  constructor(code: NotificationBackendError['code']) { super(`Reminder notification ${code.replaceAll('_', ' ')}.`); this.name = 'NotificationBackendError'; this.code = code; }
-}
-
 export interface NotificationBackend {
   readonly platform: NotificationPlatform;
   getPermission(): Promise<NotificationPermission>;
@@ -60,12 +58,6 @@ export interface NotificationBackend {
 
 type UnknownRecord = Record<string, unknown>;
 function object(value: unknown): value is UnknownRecord { return Boolean(value && typeof value === 'object' && !Array.isArray(value)); }
-function exactData(data: unknown, expected: Record<string, unknown>): boolean {
-  if (!object(data)) return false;
-  const keys = Object.keys(data);
-  return keys.length === Object.keys(expected).length && keys.every((key) => Object.prototype.hasOwnProperty.call(expected, key) && data[key] === expected[key]);
-}
-
 function zeroOffsetZone(value: unknown): value is string {
   return typeof value === 'string' && ['UTC', 'GMT', 'Etc/UTC', 'Etc/GMT', 'Etc/GMT0', 'GMT0', 'UCT', 'Universal', 'Zulu', 'Greenwich'].includes(value);
 }
@@ -123,24 +115,6 @@ function normalizeRequest(value: unknown, platform: NotificationPlatform): Pendi
     ...(object(content.data) ? { data: { ...content.data } } : {}),
     trigger: normalizeTrigger(value.trigger, platform), extraContentSafe: extraContentSafe(content),
   };
-}
-
-export function isMatchingPending(intent: ReminderIntent, pending: PendingNotificationRequest, installationId: string): boolean {
-  try {
-    const valid = validateReminderIntent(intent, installationId);
-    const projection = notificationContentForIntent(valid, installationId);
-    return valid.desired === 'scheduled' && pending.identifier === reminderNotificationIdentifier(installationId, valid.reminderId, valid.epoch) &&
-      pending.title === projection.title && pending.body === projection.body && exactData(pending.data, projection.data) && pending.extraContentSafe &&
-      pending.trigger.verifiable && pending.trigger.repeats === false && Boolean(valid.payload) && pending.trigger.dueAt === valid.payload!.dueAt;
-  } catch { return false; }
-}
-
-export function isOwnedLegacyReminderCancellation(cancellation: LegacyReminderCancellation, pending: PendingNotificationRequest): boolean {
-  try {
-    const valid = validateLegacyReminderCancellation(cancellation);
-    return pending.identifier === legacyReminderIdentifier(valid.proposalId, valid.proposalRevision) && pending.identifier === valid.identifier &&
-      pending.data?.proposalId === valid.proposalId && pending.data?.proposalRevision === valid.proposalRevision;
-  } catch { return false; }
 }
 
 function permission(value: unknown, platform: NotificationPlatform): NotificationPermission {
