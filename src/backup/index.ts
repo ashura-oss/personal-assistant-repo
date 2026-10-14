@@ -280,7 +280,7 @@ function normalizeV2(value: unknown): PortableBackupV2 {
     if (item.originalTimeZoneUnknown === true && captureTimeZone !== undefined) fail('Unknown original time zone cannot claim a capture time zone.');
     return {
       sourceId: validateId(item.sourceId, 'Note source ID'), title: validateTitle(item.title, 'Note title'),
-      transcript: boundedString(item.transcript, 'Note transcript'), durationSeconds: duration,
+      transcript: boundedString(item.transcript, 'Note transcript', BACKUP_LIMITS.maxRestoredTextBytes), durationSeconds: duration,
       createdAt: validateDate(item.createdAt, 'Note creation time'),
       ...(item.capturedAt !== undefined ? { capturedAt: validateDate(item.capturedAt, 'Note capture time') } : {}),
       ...(captureTimeZone ? { captureTimeZone } : {}), ...(item.originalTimeZoneUnknown ? { originalTimeZoneUnknown: true as const } : {}), ...(item.audioMissing ? { audioMissing: true as const } : {}),
@@ -316,7 +316,7 @@ function normalizeV2(value: unknown): PortableBackupV2 {
     if (!isRecord(item)) fail('Document entry must be an object.');
     ownKeys(item, ['path', 'content', 'revision', 'updatedAt'], 'Document entry');
     if (!Number.isSafeInteger(item.revision) || (item.revision as number) < 1) fail('Document revision is invalid.');
-    return { path: validatePortableDocumentPath(item.path), content: boundedString(item.content, 'Markdown document'), revision: item.revision as number,
+    return { path: validatePortableDocumentPath(item.path), content: boundedString(item.content, 'Markdown document', BACKUP_LIMITS.maxRestoredTextBytes), revision: item.revision as number,
       updatedAt: validateDate(item.updatedAt, 'Document update time') };
   });
   const documentPaths = new Set<string>();
@@ -330,7 +330,7 @@ function normalizeV2(value: unknown): PortableBackupV2 {
     ownKeys(item, ['sourceId', 'path', 'content', 'revision', 'updatedAt'], 'Archived document entry');
     if (!Number.isSafeInteger(item.revision) || (item.revision as number) < 1) fail('Archived document revision is invalid.');
     return { sourceId: validateId(item.sourceId, 'Archived document source ID'), path: validatePortableDocumentPath(item.path),
-      content: boundedString(item.content, 'Archived Markdown document'), revision: item.revision as number,
+      content: boundedString(item.content, 'Archived Markdown document', BACKUP_LIMITS.maxRestoredTextBytes), revision: item.revision as number,
       updatedAt: validateDate(item.updatedAt, 'Archived document update time') };
   });
   duplicateIds(backup.archivedDocuments, 'Archived documents');
@@ -571,7 +571,7 @@ function migrateV1(raw: Record<string, unknown>): { backup: PortableBackupV2; ig
     if (!isRecord(item) || typeof item.id !== 'string' || typeof item.title !== 'string' || typeof item.transcript !== 'string' || typeof item.createdAt !== 'string') fail('Legacy backup contains an invalid note entry.');
     if (typeof item.durationSeconds !== 'number' || !Number.isFinite(item.durationSeconds) || item.durationSeconds < 0 || item.durationSeconds > 86_400) fail('Legacy note duration is invalid.');
     const noteId = validateId(item.id, 'Legacy note ID');
-    backup.notes.push({ sourceId: noteId, title: validateTitle(item.title, 'Legacy note title'), transcript: boundedString(item.transcript, 'Legacy note transcript'),
+    backup.notes.push({ sourceId: noteId, title: validateTitle(item.title, 'Legacy note title'), transcript: boundedString(item.transcript, 'Legacy note transcript', BACKUP_LIMITS.maxRestoredTextBytes),
       durationSeconds: item.durationSeconds,
       createdAt: legacyDate(item.createdAt, exportedAt, 'Legacy note creation time'),
       ...(typeof item.capturedAt === 'string' ? { capturedAt: validateDate(item.capturedAt, 'Legacy note capture time') } : {}),
@@ -595,7 +595,7 @@ function migrateV1(raw: Record<string, unknown>): { backup: PortableBackupV2; ig
   for (const item of legacyArray(raw, 'documents', BACKUP_LIMITS.documents)) {
     if (!isRecord(item) || typeof item.path !== 'string' || typeof item.content !== 'string' || typeof item.updatedAt !== 'string') fail('Legacy backup contains an invalid Markdown document.');
     if (!Number.isSafeInteger(item.revision) || (item.revision as number) < 1) fail('Legacy Markdown document revision is invalid.');
-    backup.documents.push({ path: validatePortableDocumentPath(item.path), content: boundedString(item.content, 'Legacy Markdown document'),
+    backup.documents.push({ path: validatePortableDocumentPath(item.path), content: boundedString(item.content, 'Legacy Markdown document', BACKUP_LIMITS.maxRestoredTextBytes),
       revision: item.revision as number,
       updatedAt: validateDate(item.updatedAt, 'Legacy document update time') });
   }
@@ -720,7 +720,7 @@ export function validateImportedBackupArchive(value: unknown): ImportedBackupArc
       const activatedAt = row.activatedAt === undefined ? undefined : validateDate(row.activatedAt, 'Archive activation time');
       if ((activatedPath === undefined) !== (activatedAt === undefined)) fail('Archive activation metadata is incomplete.');
       return { id: validateId(row.id, 'Archive document ID'), path: validatePortableDocumentPath(row.path),
-        content: boundedString(row.content, 'Archived Markdown document'), revision: row.revision as number,
+        content: boundedString(row.content, 'Archived Markdown document', BACKUP_LIMITS.maxRestoredTextBytes), revision: row.revision as number,
         updatedAt: validateDate(row.updatedAt, 'Archived document update time'), ...(activatedPath ? { activatedPath, activatedAt } : {}) };
     });
     if (new Set(documents.map((document) => document.id)).size !== documents.length) fail('Archive documents contain duplicate IDs.');

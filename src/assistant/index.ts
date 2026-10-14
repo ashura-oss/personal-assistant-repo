@@ -8,6 +8,7 @@ export type { AssistantCitation, AssistantDecision, AssistantIntent, AssistantPr
 const MAX_SOURCES = 200;
 const MAX_SOURCE_BYTES = 256 * 1024;
 const MAX_VERSION_BYTES = 1024 * 1024;
+const MAX_SOURCE_CATALOG_BYTES = 16 * 1024 * 1024;
 const MAX_SCAN_PER_KIND = 5_000;
 const MAX_MAIL_PER_ACCOUNT = 200;
 const MAX_OMITTED_SOURCE_IDS = 100;
@@ -45,6 +46,8 @@ function requireStableIdentity(identityKey: string | undefined): string | undefi
 
 /** Scans bounded metadata, ranks before hashing, and returns a small source set plus omission metadata. */
 export function buildLocalSourceSet(input: LocalContextSnapshotInput): BoundedLocalSourceSet {
+  const inputPolicyVersion = input.inputPolicyVersion ?? 1;
+  if (inputPolicyVersion !== 1 && inputPolicyVersion !== 2) throw new Error('The saved Batch input policy is invalid.');
   if (!Number.isSafeInteger(input.transcript.revision) || input.transcript.revision < 0) throw new Error('Current transcript revision is invalid.');
   const query = input.query?.slice(0, 2000) ?? '';
   const taskQuery = input.intent === 'answer' && /\b(task|tasks|task count|how many)\b/i.test(query);
@@ -81,7 +84,7 @@ export function buildLocalSourceSet(input: LocalContextSnapshotInput): BoundedLo
   const tasks = input.tasks ?? [];
   const taskScan = tasks.slice(0, MAX_SCAN_PER_KIND);
   for (const task of taskScan) {
-    addCandidate({ id: `task:${encodeURIComponent(task.id)}`, revision: 0, text: [`Task: ${safeSourceLabel(task.title)}`, `Status: ${safeSourceLabel(task.status)}`, task.dueAt ? `Due: ${safeSourceLabel(task.dueAt)}` : '', safeSourceLabel(task.body.slice(0, 4_000))].filter(Boolean).join('\n'), required: false, kind: 'task', title: safeSourceLabel(task.title), updatedAt: task.updatedAt, selectionPriority: task.selectionPriority });
+    addCandidate({ id: `task:${encodeURIComponent(task.id)}`, revision: 0, text: [`Task: ${safeSourceLabel(task.title)}`, `Status: ${safeSourceLabel(task.status)}`, task.dueAt ? `Due: ${safeSourceLabel(task.dueAt)}` : '', safeSourceLabel(task.body)].filter(Boolean).join('\n'), required: false, kind: 'task', title: safeSourceLabel(task.title), updatedAt: task.updatedAt, selectionPriority: task.selectionPriority });
   }
   for (const task of tasks.slice(MAX_SCAN_PER_KIND)) omit(`task:${encodeURIComponent(task.id)}`);
   if (taskQuery) {
@@ -90,7 +93,7 @@ export function buildLocalSourceSet(input: LocalContextSnapshotInput): BoundedLo
     const open = tasks.filter((task) => task.status === 'open').length;
     const completed = tasks.filter((task) => task.status === 'completed').length;
     const versionMaterial = JSON.stringify({ total: tasks.length, indexed: indexRows });
-    if (byteLength(versionMaterial) <= MAX_VERSION_BYTES) {
+    if (inputPolicyVersion === 2 || byteLength(versionMaterial) <= MAX_VERSION_BYTES) {
       addCandidate({ id: 'task:index', revision: 0, text: `Task list snapshot: ${tasks.length} total; ${open} open; ${completed} completed.`, versionMaterial, required: true, kind: 'task', title: 'Task index' });
     } else omit('task:index');
   }
@@ -127,7 +130,7 @@ export function buildLocalSourceSet(input: LocalContextSnapshotInput): BoundedLo
     const overflow = snapshot.events.length > visibleRows.length;
     const metadata = `Calendar snapshot for a bounded range: ${snapshot.timeMin} to ${snapshot.timeMax}; synced as of ${snapshot.asOf}; partial=${snapshot.partial ? 'yes' : 'no'}${overflow ? `; showing ${visibleRows.length} of ${snapshot.events.length} events` : ''}.`;
     const text = [metadata, ...visibleRows].join('\n');
-    if (byteLength(text) <= MAX_SOURCE_BYTES && byteLength(JSON.stringify({ range: [snapshot.timeMin, snapshot.timeMax], asOf: snapshot.asOf, partial: snapshot.partial, events: rows })) <= MAX_VERSION_BYTES) {
+    if (inputPolicyVersion === 2 || (byteLength(text) <= MAX_SOURCE_BYTES && byteLength(JSON.stringify({ range: [snapshot.timeMin, snapshot.timeMax], asOf: snapshot.asOf, partial: snapshot.partial, events: rows })) <= MAX_VERSION_BYTES)) {
       addCandidate({ id: `calendar:index:${encodeURIComponent(snapshot.identityKey)}`, revision: 0, text,
         versionMaterial: JSON.stringify({ range: [snapshot.timeMin, snapshot.timeMax], asOf: snapshot.asOf, partial: snapshot.partial, events: rows }),
         required: true, kind: 'calendar', title: 'Calendar snapshot' });
@@ -168,9 +171,9 @@ export function buildLocalSourceSet(input: LocalContextSnapshotInput): BoundedLo
       const text = [`On-device calendar snapshot for selected calendars (${deviceSnapshot.selectedCalendarIds.length})`,
         `Range: ${deviceSnapshot.timeMin} to ${deviceSnapshot.timeMax}; checked ${deviceSnapshot.asOf}; partial=${partial ? 'yes' : 'no'}; omitted=${omitted}; showing ${visible.length} of ${events.length} cached events.`,
         ...visible].join('\n');
-      if (byteLength(text) <= MAX_SOURCE_BYTES && byteLength(JSON.stringify({ generation: deviceSnapshot.generation,
+      if (inputPolicyVersion === 2 || (byteLength(text) <= MAX_SOURCE_BYTES && byteLength(JSON.stringify({ generation: deviceSnapshot.generation,
         selectionRevision: deviceSnapshot.selectionRevision, selected: deviceSnapshot.selectedCalendarIds, range: [deviceSnapshot.timeMin, deviceSnapshot.timeMax],
-        partial, omitted, events: rows })) <= MAX_VERSION_BYTES) {
+        partial, omitted, events: rows })) <= MAX_VERSION_BYTES)) {
         addCandidate({ id: `device_calendar:index:${encodeURIComponent(deviceSnapshot.installationId)}`, revision: deviceSnapshot.generation,
           text, versionMaterial: JSON.stringify({ generation: deviceSnapshot.generation, selectionRevision: deviceSnapshot.selectionRevision,
             selected: deviceSnapshot.selectedCalendarIds, range: [deviceSnapshot.timeMin, deviceSnapshot.timeMax], partial,
@@ -203,7 +206,7 @@ export function buildLocalSourceSet(input: LocalContextSnapshotInput): BoundedLo
   const ids = explicitIds(query);
   const scored = candidates.filter((source) => !requiredIds.has(source.id)).map((source, index) => ({ source, index, score: Math.max(scoreSource(source, queryTerms, transcriptTerms, ids), (source.selectionPriority ?? 0) * 10_000) }));
   scored.sort((a, b) => b.score - a.score || (b.source.updatedAt ?? '').localeCompare(a.source.updatedAt ?? '') || a.index - b.index);
-  const room = Math.max(0, MAX_SOURCES - required.length);
+  const room = inputPolicyVersion === 2 ? scored.length : Math.max(0, MAX_SOURCES - required.length);
   const selected = scored.filter(({ score }) => score > 0).slice(0, room).map(({ source }) => source);
   const selectedIds = new Set([...required, ...selected].map((source) => source.id));
   for (const { source } of scored) if (!selectedIds.has(source.id)) omit(source.id);
@@ -222,16 +225,20 @@ function validRevision(value: string | number): boolean {
 }
 
 /** Builds an immutable, locally hashed snapshot. Hashing is injected so this module has no platform/runtime dependency. */
-export async function createSourceCatalog(inputs: readonly AssistantSourceInput[], sha256: Sha256): Promise<SourceCatalog> {
-  if (inputs.length > MAX_SOURCES) throw new Error(`Local context is limited to ${MAX_SOURCES} sources.`);
+export async function createSourceCatalog(inputs: readonly AssistantSourceInput[], sha256: Sha256, inputPolicyVersion: 1 | 2 = 1): Promise<SourceCatalog> {
+  if (inputPolicyVersion !== 1 && inputPolicyVersion !== 2) throw new Error('The saved Batch input policy is invalid.');
+  if (inputPolicyVersion === 1 && inputs.length > MAX_SOURCES) throw new Error(`Local context is limited to ${MAX_SOURCES} sources.`);
   if (typeof sha256 !== 'function') throw new Error('A local SHA-256 implementation is required to fingerprint source snapshots.');
   const sources: AssistantSource[] = [];
   const seen = new Set<string>();
+  let catalogBytes = 0;
   for (const input of inputs) {
     if (!input.id || input.id.length > 512 || /[\u0000-\u001f\u007f]/.test(input.id) || seen.has(input.id)) throw new Error('Context source IDs must be unique, stable, and bounded.');
     if (!validRevision(input.revision)) throw new Error(`Context source ${input.id} has an invalid revision.`);
     if (typeof input.required !== 'boolean' || (input.kind !== undefined && !['note', 'document', 'task', 'calendar', 'mail', 'knowledge', 'device_calendar', 'device_calendar_event'].includes(input.kind)) || (input.title !== undefined && (typeof input.title !== 'string' || input.title.length > 1000))) throw new Error(`Context source ${input.id} has invalid metadata.`);
-    if (typeof input.text !== 'string' || byteLength(input.text) > MAX_SOURCE_BYTES || (input.versionMaterial !== undefined && (typeof input.versionMaterial !== 'string' || byteLength(input.versionMaterial) > MAX_VERSION_BYTES))) throw new Error(`Context source ${input.id} is too large to validate safely.`);
+    if (typeof input.text !== 'string' || (inputPolicyVersion === 1 && byteLength(input.text) > MAX_SOURCE_BYTES) || (input.versionMaterial !== undefined && (typeof input.versionMaterial !== 'string' || (inputPolicyVersion === 1 && byteLength(input.versionMaterial) > MAX_VERSION_BYTES)))) throw new Error(`Context source ${input.id} is too large to validate safely.`);
+    catalogBytes += byteLength(input.text) + (input.versionMaterial === undefined ? 0 : byteLength(input.versionMaterial));
+    if (inputPolicyVersion === 2 && catalogBytes > MAX_SOURCE_CATALOG_BYTES) throw new Error('The complete local source catalog exceeds the physical safety limit.');
     if (input.updatedAt !== undefined && !Number.isFinite(Date.parse(input.updatedAt))) throw new Error(`Context source ${input.id} has an invalid update time.`);
     const contentHash = (await sha256(encoder.encode(normalizeSourceText(input.versionMaterial ?? input.text)))).toLowerCase();
     if (!/^[a-f0-9]{64}$/.test(contentHash)) throw new Error('The local SHA-256 implementation returned an invalid digest.');
@@ -245,6 +252,7 @@ export async function createSourceCatalog(inputs: readonly AssistantSourceInput[
 }
 
 export interface SelectContextOptions {
+  inputPolicyVersion?: 1 | 2;
   query?: string;
   transcript?: string;
   transcriptSourceId?: string;
@@ -313,6 +321,8 @@ function excerptThatFits(source: AssistantSource, existing: string[], options: S
 
 /** Selects deterministic exact excerpts while accounting for escaped JSON/schema overhead via buildBody. */
 export function selectContext(catalog: SourceCatalog, options: SelectContextOptions): ContextSelection {
+  const inputPolicyVersion = options.inputPolicyVersion ?? 1;
+  if (inputPolicyVersion !== 1 && inputPolicyVersion !== 2) throw new Error('The saved Batch input policy is invalid.');
   const transcriptSourceId = options.transcriptSourceId ?? 'transcript';
   const transcript = catalog.byId.get(transcriptSourceId);
   if (!transcript) throw new Error('The current transcript source is missing from the context snapshot.');
@@ -342,8 +352,10 @@ export function selectContext(catalog: SourceCatalog, options: SelectContextOpti
     .map((source, index) => ({ source, index, score: Math.max(scoreSource(source, relevantTerms, transcriptTerms, ids), (source.selectionPriority ?? 0) * 10_000) }))
     .sort((a, b) => b.score - a.score || (b.source.updatedAt ?? '').localeCompare(a.source.updatedAt ?? '') || a.index - b.index)
     .filter(({ source, score }) => score > 0 || (source.kind === 'document' && /(?:^|\/)profile\.md$/i.test(source.id)));
-  const requestedSupplemental = options.maxSupplementalSources ?? MAX_SUPPLEMENTAL;
-  const maxSupplemental = Number.isFinite(requestedSupplemental) ? Math.max(0, Math.min(MAX_SUPPLEMENTAL, Math.floor(requestedSupplemental))) : MAX_SUPPLEMENTAL;
+  const requestedSupplemental = options.maxSupplementalSources ?? (inputPolicyVersion === 2 ? candidates.length : MAX_SUPPLEMENTAL);
+  const requestedCount = Number.isFinite(requestedSupplemental) ? Math.max(0, Math.floor(requestedSupplemental)) :
+    (inputPolicyVersion === 2 ? candidates.length : MAX_SUPPLEMENTAL);
+  const maxSupplemental = inputPolicyVersion === 2 ? requestedCount : Math.min(MAX_SUPPLEMENTAL, requestedCount);
   let selected = 0;
   const included = new Set(alreadyIncluded);
   for (const { source } of candidates) {

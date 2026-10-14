@@ -3504,6 +3504,19 @@ export const workspaceSnapshotSchema = {
         "id": {
           "kind": "string"
         },
+        "inputPolicyVersion": {
+          "kind": "union",
+          "alternatives": [
+            {
+              "kind": "literal",
+              "value": 1
+            },
+            {
+              "kind": "literal",
+              "value": 2
+            }
+          ]
+        },
         "originalChange": {
           "kind": "union",
           "alternatives": [
@@ -3657,6 +3670,19 @@ export const workspaceSnapshotSchema = {
             "kind": "ref",
             "name": "R0110"
           }
+        },
+        "inputPolicyVersion": {
+          "kind": "union",
+          "alternatives": [
+            {
+              "kind": "literal",
+              "value": 1
+            },
+            {
+              "kind": "literal",
+              "value": 2
+            }
+          ]
         },
         "intent": {
           "kind": "union",

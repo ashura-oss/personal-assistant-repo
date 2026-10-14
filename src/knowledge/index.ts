@@ -199,7 +199,7 @@ function normalizeChange(value: unknown): KnowledgeChange {
 }
 function normalizeSuggestion(value: unknown): KnowledgeSuggestion {
   if (!record(value)) fail('Knowledge suggestion must be an object.');
-  ownKeys(value, ['id', 'revision', 'change', 'targetRevision', 'evidence', 'status', 'createdAt', 'updatedAt', 'reviewedAt', 'originalChange', 'originalEvidence', 'sourceNoteId', 'sourceAnalysisFingerprint', 'staleReason'], 'Knowledge suggestion');
+  ownKeys(value, ['id', 'revision', 'change', 'targetRevision', 'evidence', 'status', 'createdAt', 'updatedAt', 'reviewedAt', 'originalChange', 'originalEvidence', 'sourceNoteId', 'sourceAnalysisFingerprint', 'inputPolicyVersion', 'staleReason'], 'Knowledge suggestion');
   if (!['pending', 'accepted', 'dismissed', 'stale'].includes(String(value.status))) fail('Knowledge suggestion status is invalid.');
   const hasLegacyCalendarLink = [value.change, value.originalChange].some((change) => record(change) && change.type === 'add_source_link' && record(change.reference) && change.reference.kind === 'calendar' && change.reference.calendarId === undefined);
   const status = value.status === 'pending' && hasLegacyCalendarLink ? 'stale' : value.status as KnowledgeSuggestion['status'];
@@ -207,6 +207,7 @@ function normalizeSuggestion(value: unknown): KnowledgeSuggestion {
     ? timestamp(value.updatedAt, 'Suggestion update time')
     : value.reviewedAt === undefined ? undefined : timestamp(value.reviewedAt, 'Suggestion review time');
   if ((status === 'pending') === (reviewedAt !== undefined)) fail('Suggestion review metadata is inconsistent with its status.');
+  if (value.inputPolicyVersion !== undefined && value.inputPolicyVersion !== 1 && value.inputPolicyVersion !== 2) fail('Suggestion input policy version is invalid.');
   return { id: id(value.id, 'Knowledge suggestion ID'), revision: revision(value.revision, 'Knowledge suggestion revision'), change: normalizeChange(value.change),
     targetRevision: revision(value.targetRevision, 'Suggestion target revision'), evidence: normalizeEvidence(value.evidence), status,
     createdAt: timestamp(value.createdAt, 'Suggestion creation time'), updatedAt: timestamp(value.updatedAt, 'Suggestion update time'),
@@ -214,6 +215,7 @@ function normalizeSuggestion(value: unknown): KnowledgeSuggestion {
     ...(value.originalEvidence !== undefined ? { originalEvidence: normalizeEvidence(value.originalEvidence) } : {}),
     ...(value.sourceNoteId !== undefined ? { sourceNoteId: string(value.sourceNoteId, 'Suggestion source note ID', KNOWLEDGE_LIMITS.sourceIdChars, KNOWLEDGE_LIMITS.sourceIdChars) } : {}),
     ...(value.sourceAnalysisFingerprint !== undefined ? { sourceAnalysisFingerprint: string(value.sourceAnalysisFingerprint, 'Suggestion analysis fingerprint', 256, 256) } : {}),
+    ...(value.inputPolicyVersion !== undefined ? { inputPolicyVersion: value.inputPolicyVersion as 1 | 2 } : {}),
     ...(hasLegacyCalendarLink && value.status === 'pending' ? { staleReason: 'Calendar destination could not be verified after a schema update.' }
       : value.staleReason !== undefined ? { staleReason: string(value.staleReason, 'Suggestion stale reason', KNOWLEDGE_LIMITS.statementBytes) } : {}) };
 }

@@ -1,6 +1,6 @@
 import type { MailReplySourceSnapshot, SelectedMailTextSnapshot } from '../core';
 import { canonicalMailReplySource } from '../mailReply';
-import { utf8Bytes } from '../mailText';
+import { MAX_SELECTED_MAIL_TEXT_BYTES, utf8Bytes } from '../mailText';
 import { OPENROUTER_BATCH_BODY_MODEL, OPENROUTER_CHAT_COMPLETIONS_PATH, type OpenRouterBatchInspection } from './openRouter';
 
 const SHA256 = /^[a-f0-9]{64}$/;
@@ -58,7 +58,9 @@ export interface OpenRouterMailReplyBinding {
   readonly context?: readonly OpenRouterMailReplyContextSource[];
 }
 
-export function validOpenRouterMailReplyBinding(value: unknown): value is OpenRouterMailReplyBinding {
+export function validOpenRouterMailReplyBinding(value: unknown, inputPolicyVersion: 1 | 2 = 1): value is OpenRouterMailReplyBinding {
+  if (inputPolicyVersion !== 1 && inputPolicyVersion !== 2) return false;
+  const maxSourceBytes = inputPolicyVersion === 2 ? MAX_SELECTED_MAIL_TEXT_BYTES : 16 * 1024;
   const row = object(value);
   if (!row || !exact(row, ['version', 'messageId', 'mode', 'source', 'body', 'subject', 'to', 'cc', 'brief', 'policy', 'settingsFingerprint', 'settingsSnapshot', 'requestAsOf', 'timeZone'], ['note', 'context']) ||
       (row.version !== 1 && row.version !== 2) || typeof row.messageId !== 'string' || !row.messageId || row.messageId.length > 256 ||
@@ -88,7 +90,7 @@ export function validOpenRouterMailReplyBinding(value: unknown): value is OpenRo
   const body = object(row.body);
   if (!body || !exact(body, ['text', 'textDigest', 'bytes', 'extractionVersion', 'representation', 'completeness', 'omissionReasons']) ||
       typeof body.text !== 'string' || !body.text.trim() || typeof body.textDigest !== 'string' || body.textDigest.length !== 64 || !SHA256.test(body.textDigest) ||
-      !Number.isSafeInteger(body.bytes) || (body.bytes as number) < 1 || (body.bytes as number) > 16 * 1024 || utf8Bytes(body.text) !== body.bytes || !validReplyText(body.text) ||
+      !Number.isSafeInteger(body.bytes) || (body.bytes as number) < 1 || (body.bytes as number) > maxSourceBytes || utf8Bytes(body.text) !== body.bytes || !validReplyText(body.text, inputPolicyVersion === 2 ? MAX_SELECTED_MAIL_TEXT_BYTES : 100_000) ||
       !['mail-text-v1', 'mail-text-v2'].includes(String(body.extractionVersion)) ||
       !['plain', 'converted_html', 'snippet'].includes(String(body.representation)) ||
       !['complete_text', 'excerpt'].includes(String(body.completeness)) || !Array.isArray(body.omissionReasons) ||
@@ -118,7 +120,7 @@ export function validOpenRouterMailReplyBinding(value: unknown): value is OpenRo
         !sameCanonicalIdentity(entrySource.identity, source.identity) || typeof entrySource.providerMessageId !== 'string' ||
         providerIds.has(entrySource.providerMessageId) || !entryBody || !exact(entryBody, ['text', 'textDigest', 'bytes', 'extractionVersion', 'representation', 'completeness', 'omissionReasons']) ||
         typeof entryBody.text !== 'string' || !entryBody.text.trim() || typeof entryBody.textDigest !== 'string' || entryBody.textDigest.length !== 64 || !SHA256.test(entryBody.textDigest) ||
-        !Number.isSafeInteger(entryBody.bytes) || (entryBody.bytes as number) < 1 || (entryBody.bytes as number) > 16 * 1024 || utf8Bytes(entryBody.text) !== entryBody.bytes || !validReplyText(entryBody.text) ||
+        !Number.isSafeInteger(entryBody.bytes) || (entryBody.bytes as number) < 1 || (entryBody.bytes as number) > maxSourceBytes || utf8Bytes(entryBody.text) !== entryBody.bytes || !validReplyText(entryBody.text, inputPolicyVersion === 2 ? MAX_SELECTED_MAIL_TEXT_BYTES : 100_000) ||
         !['mail-text-v1', 'mail-text-v2'].includes(String(entryBody.extractionVersion)) || !['plain', 'converted_html', 'snippet'].includes(String(entryBody.representation)) ||
         !['complete_text', 'excerpt'].includes(String(entryBody.completeness)) || !Array.isArray(entryBody.omissionReasons) || entryBody.omissionReasons.length > 16 ||
         entryBody.omissionReasons.some((reason) => typeof reason !== 'string' || !reason || reason.length > 240) ||
@@ -176,8 +178,8 @@ export function parseOpenRouterMailReplyResult(inspection: OpenRouterBatchInspec
   return { text: result.text, sha256Input: result.text };
 }
 
-export function validReplyText(text: string): boolean {
-  if (!text.trim() || text.length > 100_000 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(text)) return false;
+export function validReplyText(text: string, maxChars = 100_000): boolean {
+  if (!text.trim() || text.length > maxChars || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(text)) return false;
   for (let index = 0; index < text.length; index += 1) {
     const code = text.charCodeAt(index);
     if (code >= 0xd800 && code <= 0xdbff) {

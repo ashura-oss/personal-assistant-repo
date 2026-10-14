@@ -7,6 +7,7 @@ export interface HtmlTextConversion {
 
 const MAX_HTML_BYTES = 256 * 1024;
 const MAX_OUTPUT_BYTES = 16 * 1024;
+const MAX_ALLOWED_OUTPUT_BYTES = 256 * 1024;
 const MAX_DEPTH = 64;
 const MAX_TAGS = 4096;
 const MAX_CALLBACKS = 32768;
@@ -44,7 +45,8 @@ function safeAttributes(attributes: Record<string, string>, reasons: Set<string>
 }
 
 /** Converts bounded HTML into a conservative text excerpt using parser callbacks only. */
-export function convertHtmlToText(html: string): HtmlTextConversion {
+export function convertHtmlToText(html: string, maxOutputBytes = MAX_OUTPUT_BYTES): HtmlTextConversion {
+  if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes < 1 || maxOutputBytes > MAX_ALLOWED_OUTPUT_BYTES) throw new Error('HTML text output bound is invalid.');
   const reasons = new Set<string>(['html_non_rendering_conversion', 'html_css_visibility_not_computed']);
   const bounded = boundedHtml(html);
   if (bounded.truncated) {
@@ -77,7 +79,7 @@ export function convertHtmlToText(html: string): HtmlTextConversion {
   const last = () => chunks[chunks.length - 1] ?? '';
   const appendCharacter = (character: string): boolean => {
     const size = utf8Length(character);
-    if (outputBytes + size > MAX_OUTPUT_BYTES) { stop('html_output_byte_limit'); return false; }
+    if (outputBytes + size > maxOutputBytes) { stop('html_output_byte_limit'); return false; }
     chunks.push(character);
     outputBytes += size;
     return true;
@@ -189,7 +191,7 @@ export function convertHtmlToText(html: string): HtmlTextConversion {
   let finalBytes = 0;
   for (const character of normalized) {
     const size = utf8Length(character);
-    if (finalBytes + size > MAX_OUTPUT_BYTES) { reasons.add('html_output_byte_limit'); break; }
+    if (finalBytes + size > maxOutputBytes) { reasons.add('html_output_byte_limit'); break; }
     output += character;
     finalBytes += size;
   }

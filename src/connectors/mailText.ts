@@ -12,6 +12,7 @@ export interface MailTextExtraction {
 }
 
 const MAX_TEXT_BYTES = 16 * 1024;
+const MAX_ALLOWED_TEXT_BYTES = 256 * 1024;
 const MAX_MIME_DEPTH = 12;
 const MAX_MIME_PARTS = 128;
 
@@ -80,7 +81,8 @@ interface Candidate { text?: string; representation: 'plain' | 'converted_html';
 interface VisitResult { candidate?: Candidate; reasons: Set<string>; incomplete: boolean; }
 
 /** Extracts bounded selected-message text with deferred HTML conversion; attachments are never fetched and HTML is never rendered. */
-export function extractGmailMessageText(payload: unknown, snippet?: string): MailTextExtraction {
+export function extractGmailMessageText(payload: unknown, snippet?: string, maxTextBytes = MAX_TEXT_BYTES): MailTextExtraction {
+  if (!Number.isSafeInteger(maxTextBytes) || maxTextBytes < 1 || maxTextBytes > MAX_ALLOWED_TEXT_BYTES) throw new Error('Mail text output bound is invalid.');
   const limitReasons = new Set<string>();
   let visited = 0;
   let limitHit = false;
@@ -90,7 +92,7 @@ export function extractGmailMessageText(payload: unknown, snippet?: string): Mai
     if (candidate.htmlData === undefined) return { candidate, reasons: new Set(), incomplete: false };
     try {
       const html = decodeText(decodeBase64Url(candidate.htmlData), candidate.htmlCharset);
-      const converted = convertHtmlToText(html);
+      const converted = convertHtmlToText(html, maxTextBytes);
       return { candidate: converted.text.trim() ? { text: converted.text, representation: 'converted_html' } : undefined,
         reasons: new Set(converted.reasons), incomplete: true };
     } catch (error) {
@@ -198,7 +200,7 @@ export function extractGmailMessageText(payload: unknown, snippet?: string): Mai
   let completeness: MailTextCompleteness = candidate?.representation === 'converted_html' ? 'excerpt' : 'complete_text';
   if (text === undefined || (!text.trim() && typeof snippet === 'string' && snippet.trim())) {
     if (typeof snippet === 'string' && snippet.trim()) {
-      const bounded = boundedText(snippet);
+      const bounded = boundedText(snippet, maxTextBytes);
       text = bounded.text;
       representation = 'snippet';
       completeness = 'excerpt';
@@ -208,7 +210,7 @@ export function extractGmailMessageText(payload: unknown, snippet?: string): Mai
       return { bytes: 0, representation: 'none', completeness: 'unavailable', reasons: [...reasons].slice(0, 16) };
     }
   } else {
-    const bounded = boundedText(text);
+    const bounded = boundedText(text, maxTextBytes);
     text = bounded.text;
     if (bounded.truncated) { completeness = 'excerpt'; reasons.add('text_byte_limit'); }
     if (limitHit || result.incomplete) completeness = 'excerpt';
@@ -217,16 +219,18 @@ export function extractGmailMessageText(payload: unknown, snippet?: string): Mai
   return { text, bytes, representation, completeness, reasons: [...reasons].slice(0, 16) };
 }
 
-export function boundGraphText(text: string): MailTextExtraction {
-  const bounded = boundedText(text);
+export function boundGraphText(text: string, maxTextBytes = MAX_TEXT_BYTES): MailTextExtraction {
+  if (!Number.isSafeInteger(maxTextBytes) || maxTextBytes < 1 || maxTextBytes > MAX_ALLOWED_TEXT_BYTES) throw new Error('Mail text output bound is invalid.');
+  const bounded = boundedText(text, maxTextBytes);
   return { text: bounded.text, bytes: utf8Bytes(bounded.text), representation: 'plain',
     completeness: bounded.truncated ? 'excerpt' : 'complete_text', reasons: bounded.truncated ? ['text_byte_limit'] : [] };
 }
 
-export function extractGraphHtmlText(html: string): MailTextExtraction {
-  const converted = convertHtmlToText(html);
+export function extractGraphHtmlText(html: string, maxTextBytes = MAX_TEXT_BYTES): MailTextExtraction {
+  if (!Number.isSafeInteger(maxTextBytes) || maxTextBytes < 1 || maxTextBytes > MAX_ALLOWED_TEXT_BYTES) throw new Error('Mail text output bound is invalid.');
+  const converted = convertHtmlToText(html, maxTextBytes);
   if (!converted.text.trim()) return { bytes: 0, representation: 'none', completeness: 'unavailable', reasons: converted.reasons };
-  const bounded = boundedText(converted.text);
+  const bounded = boundedText(converted.text, maxTextBytes);
   const reasons = [...converted.reasons];
   if (bounded.truncated) reasons.push('text_byte_limit');
   return { text: bounded.text, bytes: utf8Bytes(bounded.text), representation: 'converted_html', completeness: 'excerpt', reasons: reasons.slice(0, 16) };

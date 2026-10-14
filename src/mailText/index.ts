@@ -1,6 +1,8 @@
 import type { SelectedMailTextSnapshot } from '../core';
 
-export const MAX_SELECTED_MAIL_TEXT_BYTES = 16 * 1024;
+/** Physical body-cache bound. Policy 1 still enforces its historical 16 KiB request cap. */
+export const MAX_SELECTED_MAIL_TEXT_BYTES = 256 * 1024;
+export const LEGACY_SELECTED_MAIL_TEXT_BYTES = 16 * 1024;
 export const MAIL_TEXT_FRESHNESS_MS = 15 * 60_000;
 
 export function utf8Bytes(value: string): number { return new TextEncoder().encode(value).length; }

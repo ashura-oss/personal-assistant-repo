@@ -51,7 +51,7 @@ describe('knowledge controller integration', () => {
     expect(analysis.knowledgeSelection).toEqual([]);
   });
 
-  it('preselects a bounded set of many directly linked notes and reports the omitted remainder', async () => {
+  it('keeps more than 200 directly linked small notes when policy v2 has request room', async () => {
     const { app } = createController();
     await app.load();
     await enableProvider(app);
@@ -77,8 +77,7 @@ describe('knowledge controller integration', () => {
 
     const { analysis: result } = await completeNoteBatch(app, note.id, { intent: 'summarize', knowledgeSelection: people.map((person) => ({ kind: 'person' as const, id: person.id })) });
     expect(result.source).toBe('provider');
-    expect(Object.keys(result.sourceVersions).length).toBeLessThanOrEqual(200);
-    expect(result.omittedSourceCount).toBeGreaterThan(0);
+    expect(Object.keys(result.sourceVersions).length).toBeGreaterThan(200);
   });
 
   it('follows linked knowledge associations one hop without re-entering a cycle', async () => {
@@ -130,6 +129,7 @@ describe('knowledge controller integration', () => {
     const suggestion = await app.createKnowledgeSuggestionFromNote({ noteId: note.id, sourceId: 'transcript', quote: 'I prefer concise project updates.',
       targetKind: 'person', targetId: person.id, change: { type: 'add_fact', entityKind: 'person', entityId: person.id, statement: 'Prefers concise project updates.' } });
     expect(suggestion.evidence[0].sourceId).toBe(`note:${note.id}`);
+    expect(suggestion.inputPolicyVersion).toBe(2);
     expect(app.getSnapshot().documents.find((item) => item.path === 'memory/INFERENCES.md')?.content).toContain(`knowledge-suggestion:${suggestion.id}`);
     const accepted = await app.reviewKnowledgeSuggestion(suggestion.id, { expectedRevision: suggestion.revision, decision: 'accept', targetRevision: person.revision });
     expect(accepted.status).toBe('accepted');
@@ -213,6 +213,50 @@ describe('knowledge controller integration', () => {
     expect(response.memorySuggestionIds).toEqual([suggestion?.id]);
     expect(suggestion).toMatchObject({ sourceNoteId: note.id, evidence: [{ sourceId: `note:${note.id}`, sourceVersion: responseSourceVersion }] });
     expect(suggestion?.sourceAnalysisFingerprint).toMatch(/^[a-f0-9]{64}$/);
+    expect(suggestion?.inputPolicyVersion).toBe(2);
+  });
+
+  it('reviews policy-2 Batch memory from a transcript above 256 KiB and rejects a tampered policy marker', async () => {
+    const quote = 'Maya prefers concise weekly updates.';
+    const text = `${quote}\n${'Additional verified source context. '.repeat(10_000)}`;
+    expect(new TextEncoder().encode(text).length).toBeGreaterThan(256 * 1024);
+    const store = new MemoryStore();
+    let targetSourceId = '';
+    let targetRevision = 1;
+    let sourceVersion = '';
+    const transport = createCompletedAssistantBatchClient(() => ({
+      summary: 'Maya prefers concise weekly updates.', answer: '', decisions: [], citations: [], clarifications: [], proposals: [],
+      memorySuggestions: [{ targetSourceId, targetRevision, type: 'add_fact', statement: 'Prefers concise weekly updates.', address: null, label: null, relatedSourceId: null, role: null,
+        evidence: [{ sourceId: 'transcript', revision: 1, sourceVersion, quote }] }],
+    }));
+    const app = new AppControllerImpl(store, {}, { writeDocument: async () => undefined, openRouterBatchClient: transport.client });
+    await app.load();
+    await enableProvider(app);
+    const note = await app.saveNote({ transcript: text });
+    let person = await app.savePerson({ name: 'Maya', aliases: [], narrative: '' });
+    targetSourceId = `knowledge:person:${person.id}`;
+    const queued = await app.submitNoteBatch(note.id, { intent: 'summarize', knowledgeSelection: [{ kind: 'person', id: person.id }] });
+    sourceVersion = transport.calls[0]?.requestBody?.match(/sourceVersion=(1:[a-f0-9]{64}); kind=note/)?.[1] ?? '';
+    expect(sourceVersion).toMatch(/^1:[a-f0-9]{64}$/);
+    const completed = await app.refreshAssistantBatch(queued.id);
+    expect(completed.status).toBe('completed');
+    const analysis = app.getSnapshot().notes.find((item) => item.id === note.id)?.analysis;
+    const suggestionId = analysis?.memorySuggestionIds?.[0];
+    expect(suggestionId).toBeDefined();
+    const suggestion = app.getSnapshot().knowledge.suggestions.find((item) => item.id === suggestionId)!;
+    expect(suggestion.inputPolicyVersion).toBe(2);
+    await (app as unknown as { mutate(operation: (state: AppState) => void): Promise<void> }).mutate((state) => {
+      state.knowledge.suggestions.find((item) => item.id === suggestion.id)!.inputPolicyVersion = 1;
+    });
+    await expect(app.reviewKnowledgeSuggestion(suggestion.id, { expectedRevision: suggestion.revision, decision: 'accept', targetRevision: person.revision }))
+      .rejects.toThrow(/source analysis changed/i);
+    await (app as unknown as { mutate(operation: (state: AppState) => void): Promise<void> }).mutate((state) => {
+      state.knowledge.suggestions.find((item) => item.id === suggestion.id)!.inputPolicyVersion = 2;
+    });
+    const reloaded = new AppControllerImpl(store, {}, { writeDocument: async () => undefined, openRouterBatchClient: transport.client });
+    await reloaded.load();
+    const reviewed = await reloaded.reviewKnowledgeSuggestion(suggestion.id, { expectedRevision: suggestion.revision, decision: 'accept', targetRevision: person.revision });
+    expect(reviewed.status).toBe('accepted');
   });
 
   it('rejects a knowledge suggestion when its cited local document has changed', async () => {

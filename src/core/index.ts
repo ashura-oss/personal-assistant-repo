@@ -45,6 +45,8 @@ export interface NoteAssistResult {
   answeredAsOf?: string;
   answerTimeZone?: string;
   stale?: boolean;
+  /** Saved input-policy identity; absent results retain the exact legacy policy-1 fingerprint. */
+  inputPolicyVersion?: 1 | 2;
 }
 
 export interface ImportedTaskOrigin {

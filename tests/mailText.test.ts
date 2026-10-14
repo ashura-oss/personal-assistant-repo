@@ -11,6 +11,15 @@ const encoded = (value: string) => {
 const textPart = (text: string, extra: Record<string, unknown> = {}) => ({ mimeType: 'text/plain', body: { data: encoded(text) }, ...extra });
 
 describe('selected mail text extraction', () => {
+  it('uses an explicit larger policy bound while keeping the legacy extraction default at 16 KiB', () => {
+    const long = 'mail body '.repeat(2_000);
+    const payload = textPart(long);
+    expect(extractGmailMessageText(payload).bytes).toBeLessThanOrEqual(16 * 1024);
+    const current = extractGmailMessageText(payload, undefined, 256 * 1024);
+    expect(current.text).toBe(long);
+    expect(current.bytes).toBeGreaterThan(16 * 1024);
+  });
+
   it('chooses plain text from multipart/alternative without concatenating HTML', () => {
     const result = extractGmailMessageText({ mimeType: 'multipart/alternative', parts: [
       { mimeType: 'text/html', body: { data: encoded('<p>HTML copy</p>') } }, textPart('Plain copy'),

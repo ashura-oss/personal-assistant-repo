@@ -280,6 +280,7 @@ function projectAnalysis(value: NoteAssistResult): NoteAssistResult {
     ...(value.answeredAsOf !== undefined ? { answeredAsOf: value.answeredAsOf } : {}),
     ...(value.answerTimeZone !== undefined ? { answerTimeZone: value.answerTimeZone } : {}),
     ...(value.stale !== undefined ? { stale: value.stale } : {}),
+    ...(value.inputPolicyVersion !== undefined ? { inputPolicyVersion: value.inputPolicyVersion } : {}),
   };
 }
 
@@ -562,7 +563,7 @@ function projectKnowledgeChange(value: KnowledgeChange): KnowledgeChange {
     case 'add_member': return pick(value, ['type', 'entityKind', 'entityId', 'personId', 'personRevision', 'role']) as KnowledgeChange;
   }
 }
-function projectSuggestion(value: KnowledgeSuggestion): KnowledgeSuggestion { return { id: value.id, revision: value.revision, change: projectKnowledgeChange(value.change), targetRevision: value.targetRevision, evidence: value.evidence.map(projectKnowledgeEvidence), status: value.status, createdAt: value.createdAt, updatedAt: value.updatedAt, ...(value.reviewedAt ? { reviewedAt: value.reviewedAt } : {}), ...(value.originalChange ? { originalChange: projectKnowledgeChange(value.originalChange) } : {}), ...(value.originalEvidence ? { originalEvidence: value.originalEvidence.map(projectKnowledgeEvidence) } : {}), ...(value.sourceNoteId ? { sourceNoteId: value.sourceNoteId } : {}), ...(value.sourceAnalysisFingerprint ? { sourceAnalysisFingerprint: value.sourceAnalysisFingerprint } : {}), ...(value.staleReason ? { staleReason: value.staleReason } : {}) }; }
+function projectSuggestion(value: KnowledgeSuggestion): KnowledgeSuggestion { return { id: value.id, revision: value.revision, change: projectKnowledgeChange(value.change), targetRevision: value.targetRevision, evidence: value.evidence.map(projectKnowledgeEvidence), status: value.status, createdAt: value.createdAt, updatedAt: value.updatedAt, ...(value.reviewedAt ? { reviewedAt: value.reviewedAt } : {}), ...(value.originalChange ? { originalChange: projectKnowledgeChange(value.originalChange) } : {}), ...(value.originalEvidence ? { originalEvidence: value.originalEvidence.map(projectKnowledgeEvidence) } : {}), ...(value.sourceNoteId ? { sourceNoteId: value.sourceNoteId } : {}), ...(value.sourceAnalysisFingerprint ? { sourceAnalysisFingerprint: value.sourceAnalysisFingerprint } : {}), ...(value.inputPolicyVersion !== undefined ? { inputPolicyVersion: value.inputPolicyVersion } : {}), ...(value.staleReason ? { staleReason: value.staleReason } : {}) }; }
 function projectKnowledge(value: KnowledgeState): KnowledgeState { return { schemaVersion: 1, people: value.people.map(projectPerson), projects: value.projects.map(projectProject), suggestions: value.suggestions.map(projectSuggestion) }; }
 
 function projectProactiveCandidate(value: import('../proactive').ProactiveCandidate): import('../proactive').ProactiveCandidate {

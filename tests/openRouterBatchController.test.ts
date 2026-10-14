@@ -57,8 +57,8 @@ async function fakeSubmit(
     model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h' as const, total: 1, completed: 0, failed: 0 };
 }
 
-async function mailFixture(fakeClient: OpenRouterBatchClient, connector: Record<string, unknown> = {}) {
-  const text = 'Selected message body for a controlled mail Batch controller fixture.';
+async function mailFixture(fakeClient: OpenRouterBatchClient, connector: Record<string, unknown> = {}, textOverride?: string) {
+  const text = textOverride ?? 'Selected message body for a controlled mail Batch controller fixture.';
   const identity = { providerNamespace: 'google' as const, clientId: 'mail-fixture-client', subject: 'mail-fixture-subject' };
   const identityKey = 'google:mail-fixture-client:mail-fixture-subject:';
   const store = new MemoryStore();
@@ -99,7 +99,7 @@ async function mailFixture(fakeClient: OpenRouterBatchClient, connector: Record<
   return { app, store, integration, account, message, source, text, textDigest, identity, identityKey };
 }
 
-function conversationContextConnector(options: { contextText?: string; contextDraft?: boolean } = {}) {
+function conversationContextConnector(options: { contextText?: string; targetText?: string; contextDraft?: boolean } = {}) {
   const contextText = options.contextText ?? 'Prior thread context body with one useful detail.';
   const reads: string[] = [];
   const contextSummary = { id: 'context-provider-message', idFormat: 'gmail' as const, threadId: 'mail-fixture-thread', subject: 'Earlier detail',
@@ -115,7 +115,7 @@ function conversationContextConnector(options: { contextText?: string; contextDr
       reads.push(id);
       const isTarget = id === targetSummary.id;
       const message = isTarget ? targetSummary : { ...contextSummary, replyMetadataComplete: true };
-      const text = isTarget ? 'Selected message body for a controlled mail Batch controller fixture.' : contextText;
+      const text = isTarget ? options.targetText ?? 'Selected message body for a controlled mail Batch controller fixture.' : contextText;
       return { status: 'available' as const, message, text, bytes: new TextEncoder().encode(text).length,
         representation: isTarget ? 'plain' as const : (options.contextDraft ? 'plain' as const : 'snippet' as const),
         completeness: isTarget ? 'complete_text' as const : 'excerpt' as const,
@@ -174,6 +174,39 @@ function truncatedInspection(customId: string, batchId = 'batch_truncated_fixtur
 }
 
 describe('OpenRouter Batch controller lifecycle', () => {
+  it('keeps >16 KiB target and conversation bodies through policy-v2 submission and a current source proof', async () => {
+    const fakeClient = {
+      submit: async (_input: unknown, before: () => Promise<void>, assert: () => void) => {
+        await before(); assert();
+        return { batchId: 'batch_large_mail_fixture', status: 'validating' as const, endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH,
+          model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h' as const, total: 1, completed: 0, failed: 0 };
+      },
+      inspect: async (batchId: string, customId: string) => ({ ...completedInspection(customId, JSON.stringify({ text: 'A careful reviewed reply.' })), batchId }),
+    } as unknown as OpenRouterBatchClient;
+    const targetText = 'large target message '.repeat(1_200);
+    const contextText = 'large selected conversation excerpt '.repeat(900);
+    expect(new TextEncoder().encode(targetText).length).toBeGreaterThan(16 * 1024);
+    expect(new TextEncoder().encode(contextText).length).toBeGreaterThan(16 * 1024);
+    const connector = conversationContextConnector({ targetText, contextText });
+    const fixture = await mailFixture(fakeClient, connector.connector, targetText);
+    const discovery = await fixture.app.discoverMailReplyContext({ messageId: fixture.message.id, sourceDigest: fixture.source.source!.sourceDigest });
+    const selected = await fixture.app.loadMailReplyContextMessage({ sessionId: discovery.sessionId, rowId: discovery.rows[0]!.rowId });
+    expect(selected.bytes).toBeGreaterThan(16 * 1024);
+    const queued = await fixture.app.submitMailReplyBatch({ messageId: fixture.message.id, sourceDigest: fixture.source.source!.sourceDigest,
+      textDigest: fixture.textDigest, mode: 'reply', to: ['sam@example.test'], cc: [], brief: 'Reply briefly.', composerRevision: 1,
+      contextSelectionIds: [selected.selectionId], contextExcerptSelectionIds: [selected.selectionId] });
+    const stored = fixture.store.value as AppState & { openRouterBatchLedger: { jobs: { id: string; inputPolicyVersion?: number; mailReplyBinding?: { body: { bytes: number }; context?: { body: { bytes: number } }[] } & Record<string, unknown> }[] } };
+    const job = stored.openRouterBatchLedger.jobs.find((item) => item.id === queued.id)!;
+    expect(job.inputPolicyVersion).toBe(2);
+    expect(job.mailReplyBinding?.body.bytes).toBeGreaterThan(16 * 1024);
+    expect(job.mailReplyBinding?.context?.[0]?.body.bytes).toBeGreaterThan(16 * 1024);
+    expect(validOpenRouterMailReplyBinding(job.mailReplyBinding, 2)).toBe(true);
+    expect(validOpenRouterMailReplyBinding(job.mailReplyBinding, 1)).toBe(false);
+    await fixture.app.refreshAssistantBatch(queued.id);
+    await expect(fixture.app.reviewMailReplyBatch(queued.id)).resolves.toMatchObject({ jobId: queued.id });
+    expect(fixture.app.getMailReplyBatchSourcesStatus(queued.id).status).toBe('current');
+  });
+
   it('submits only opaque, explicitly consented conversation excerpts and refreshes every frozen source before activation', async () => {
     const posted: { operationId: string; requestBody: string }[] = [];
     const fakeClient = {
@@ -2039,6 +2072,36 @@ describe('OpenRouter Batch controller lifecycle', () => {
     expect(JSON.stringify(deleted)).not.toContain('Bring the outline and a question for the team.');
   });
 
+  it('includes eligible Chat history above the former 48 KiB selection ceiling for new policy-2 turns', async () => {
+    const largeAnswer = `history-marker-${'useful context '.repeat(4_200)}`;
+    expect(new TextEncoder().encode(largeAnswer).length).toBeGreaterThan(48 * 1024);
+    const postedBodies: string[] = [];
+    const fakeClient = {
+      submit: async (input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => {
+        await before(); assert(); postedBodies.push(input.requestBody);
+        return { batchId: `batch_large_chat_${postedBodies.length}`, status: 'validating' as const, endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH,
+          model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h' as const, total: 1, completed: 0, failed: 0 };
+      },
+      inspect: async (batchId: string, customId: string) => ({ ...completedInspection(customId, JSON.stringify({
+        summary: 'Saved the long context.', answer: largeAnswer, decisions: [], citations: [], clarifications: [], proposals: [], memorySuggestions: [],
+      })), batchId }),
+    } as unknown as OpenRouterBatchClient;
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient });
+    await app.load();
+    await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
+    const conversation = await app.createChatConversation('Large saved context');
+    const first = await app.submitChatTurn({ conversationId: conversation.id, text: 'Retain this long answer.' });
+    await app.refreshAssistantBatch(first.jobId);
+    const second = await app.submitChatTurn({ conversationId: conversation.id, text: 'Use the prior detail.' });
+    const persisted = store.value as AppState & { openRouterBatchLedger: { jobs: { id: string; inputPolicyVersion?: number; chatBinding?: { omittedTurnCount: number; context: unknown[] } }[] } };
+    const secondJob = persisted.openRouterBatchLedger.jobs.find((job) => job.id === second.jobId)!;
+    expect(secondJob.inputPolicyVersion).toBe(2);
+    expect(secondJob.chatBinding?.context).toHaveLength(1);
+    expect(secondJob.chatBinding?.omittedTurnCount).toBe(0);
+    expect(postedBodies[1]).toContain(largeAnswer);
+  });
+
   it('refines a completed answer with its exact inherited context and rebuilds nested refinements identically', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-10-13T10:00:00.000Z'));
@@ -2260,7 +2323,7 @@ describe('OpenRouter Batch controller lifecycle', () => {
     expect(JSON.stringify(persisted)).not.toContain('A private parent source.');
   });
 
-  it('rebuilds refinement requests with the parent context omission count unchanged', async () => {
+  it('rebuilds refinement requests with the parent context omission count unchanged when all v2 history fits', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-10-13T10:00:00.000Z'));
     try {
@@ -2288,12 +2351,12 @@ describe('OpenRouter Batch controller lifecycle', () => {
       await app.refreshAssistantBatch(parent.jobId);
       const before = store.value as AppState & { openRouterBatchLedger: { jobs: { id: string; omittedSourceCount: number; chatBinding?: { omittedTurnCount: number; context: unknown[] } }[] } };
       const parentJob = before.openRouterBatchLedger.jobs.find((job) => job.id === parent.jobId)!;
-      expect(parentJob.chatBinding?.omittedTurnCount).toBe(1);
-      expect(parentJob.chatBinding?.context).toHaveLength(1);
+      expect(parentJob.chatBinding?.omittedTurnCount).toBe(0);
+      expect(parentJob.chatBinding?.context).toHaveLength(2);
       const child = await app.refineChatTurn({ conversationId: conversation.id, parentTurnId: parent.turnId, effort: 'medium' });
       const after = store.value as typeof before;
       const childJob = after.openRouterBatchLedger.jobs.find((job) => job.id === child.jobId)!;
-      expect(childJob.chatBinding?.omittedTurnCount).toBe(1);
+      expect(childJob.chatBinding?.omittedTurnCount).toBe(0);
       expect(childJob.chatBinding?.context).toEqual(parentJob.chatBinding?.context);
       await app.refreshAssistantBatch(child.jobId);
       expect(app.getSnapshot().assistantBatchJobs?.find((job) => job.id === child.jobId)?.status).toBe('completed');

@@ -107,6 +107,8 @@ export interface KnowledgeSuggestion {
   originalEvidence?: KnowledgeEvidence[];
   sourceNoteId?: string;
   sourceAnalysisFingerprint?: string;
+  /** Input-selection policy captured when note evidence was fingerprinted; absent legacy values mean policy 1. */
+  inputPolicyVersion?: 1 | 2;
   staleReason?: string;
 }
 

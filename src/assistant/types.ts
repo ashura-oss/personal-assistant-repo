@@ -17,6 +17,7 @@ export interface AssistantSourceInput {
 }
 
 export interface LocalContextSnapshotInput {
+  inputPolicyVersion?: 1 | 2;
   transcript: { revision: number; text: string };
   query?: string;
   intent?: AssistantIntent;

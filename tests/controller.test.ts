@@ -1581,13 +1581,82 @@ describe('application state controller', () => {
     const initial = await completeNoteBatch(first, note.id);
     expect(initial.analysis.proposalIds.length).toBeGreaterThan(0);
 
+    const persisted = store.value as AppState & { openRouterBatchLedger: { jobs: Record<string, unknown>[] } };
+    const matchingV2Job = persisted.openRouterBatchLedger.jobs.find((job) => job.noteId === note.id)!;
+    const legacyDuplicateId = '00000000-0000-4000-8000-000000000001';
+    const matchingLegacyJob = structuredClone(matchingV2Job);
+    matchingLegacyJob.id = legacyDuplicateId;
+    matchingLegacyJob.customId = legacyDuplicateId;
+    delete matchingLegacyJob.inputPolicyVersion;
+    persisted.openRouterBatchLedger.jobs.unshift(matchingLegacyJob);
+
     const reloaded = new AppControllerImpl(store, {}, { openRouterBatchClient: batch.client });
     await reloaded.load();
     expect(reloaded.getSnapshot().notes.find((item) => item.id === note.id)?.analysis?.fingerprint).toBe(initial.analysis.fingerprint);
+    expect(reloaded.getSnapshot().notes.find((item) => item.id === note.id)?.analysis?.inputPolicyVersion).toBe(2);
+    const observedPolicies: unknown[] = [];
+    const testController = reloaded as unknown as { createOpenRouterBatchRequestBuilder: () => { prepareAnalysis: (...args: unknown[]) => Promise<{ sourceVersions: Record<string, string> }> } };
+    const originalBuilderFactory = testController.createOpenRouterBatchRequestBuilder.bind(reloaded);
+    testController.createOpenRouterBatchRequestBuilder = () => ({
+      prepareAnalysis: async (...args) => {
+        observedPolicies.push(args[5]);
+        return { sourceVersions: initial.analysis.sourceVersions };
+      },
+    });
+    expect((await reloaded.refreshAnalysisStatus(note.id))?.stale).toBeUndefined();
+    expect(observedPolicies).toEqual([2]);
+    testController.createOpenRouterBatchRequestBuilder = originalBuilderFactory;
+    await (reloaded as unknown as { mutate(operation: (draft: AppState) => void): Promise<void> }).mutate((draft) => {
+      draft.notes.find((item) => item.id === note.id)!.analysis!.inputPolicyVersion = 1;
+    });
+    expect((await reloaded.refreshAnalysisStatus(note.id))?.stale).toBe(true);
+    await (reloaded as unknown as { mutate(operation: (draft: AppState) => void): Promise<void> }).mutate((draft) => {
+      draft.notes.find((item) => item.id === note.id)!.analysis!.inputPolicyVersion = 2;
+    });
+    expect((await reloaded.refreshAnalysisStatus(note.id))?.stale).toBe(false);
     await saveDocumentCurrent(reloaded, 'memory/PROFILE.md', '# Profile\n\nSam prefers email.\n');
     expect((await reloaded.refreshAnalysisStatus(note.id))?.stale).toBe(true);
     await completeNoteBatch(reloaded, note.id);
     expect(batch.calls.filter((call) => call.method === 'POST')).toHaveLength(2);
+  });
+  it('approves a policy-2 proposal with >256 KiB rules despite an earlier matching legacy job', async () => {
+    const quote = 'I need to call Sam tomorrow.';
+    const transcript = quote;
+    const rules = `# Rules\n\n${'A saved rule for this workspace. '.repeat(10_000)}`;
+    expect(new TextEncoder().encode(rules).length).toBeGreaterThan(256 * 1024);
+    const sourceVersion = `1:${await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, transcript.normalize('NFC'))}`;
+    const batch = createCompletedAssistantBatchClient(() => ({
+      summary: 'Call Sam tomorrow.', answer: '', decisions: [],
+      citations: [{ sourceId: 'transcript', revision: 1, sourceVersion, quote }], clarifications: [],
+      proposals: [{ kind: 'task', title: 'Call Sam', body: 'Call Sam tomorrow', recipients: [], dueAt: null, evidence: [quote] }], memorySuggestions: [],
+    }));
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store, {}, { openRouterBatchClient: batch.client });
+    await app.load();
+    await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
+    await saveDocumentCurrent(app, 'memory/RULES.md', rules);
+    const note = await app.saveNote({ transcript });
+    const queued = await app.submitNoteBatch(note.id);
+    const completion = await app.refreshAssistantBatch(queued.id);
+    expect(completion, JSON.stringify(completion)).toMatchObject({ status: 'completed' });
+    const completed = { analysis: app.getSnapshot().notes.find((item) => item.id === note.id)!.analysis!, job: completion };
+    expect(completed.analysis.inputPolicyVersion).toBe(2);
+    const proposalId = completed.analysis.proposalIds[0]!;
+    const proposal = app.getSnapshot().proposals.find((item) => item.id === proposalId)!;
+    expect(proposal.provenance?.version).toBe(1);
+    expect(JSON.parse((proposal.provenance as Extract<NonNullable<Proposal['provenance']>, { version: 1 }>).analysisFingerprint)).toMatchObject({ inputPolicyVersion: 2 });
+
+    const persisted = store.value as AppState & { openRouterBatchLedger: { jobs: Record<string, unknown>[] } };
+    const matchingV2Job = persisted.openRouterBatchLedger.jobs.find((job) => job.noteId === note.id)!;
+    const legacyDuplicateId = '00000000-0000-4000-8000-000000000002';
+    const matchingLegacyJob = structuredClone(matchingV2Job);
+    matchingLegacyJob.id = legacyDuplicateId;
+    matchingLegacyJob.customId = legacyDuplicateId;
+    delete matchingLegacyJob.inputPolicyVersion;
+    persisted.openRouterBatchLedger.jobs.unshift(matchingLegacyJob);
+    const reloaded = new AppControllerImpl(store, {}, { openRouterBatchClient: batch.client });
+    await reloaded.load();
+    await expect(reloaded.approveProposal(proposalId)).resolves.toMatchObject({ status: 'approved' });
   });
   it('persists an empty Batch result across reloads without hidden resubmission', async () => {
     const batch = createCompletedAssistantBatchClient(() => ({ summary: 'No actions.', answer: '', decisions: [], citations: [], clarifications: [], proposals: [], memorySuggestions: [] }));

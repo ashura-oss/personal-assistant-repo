@@ -108,6 +108,31 @@ describe('portable backup schema', () => {
     expect(canonicalPortableContent(backup)).toBe(canonicalPortableContent(another));
   });
 
+  it('roundtrips large note transcripts and Markdown guidance within the aggregate restore bound', () => {
+    const state = emptyState();
+    const transcript = `Required guidance: keep Maya’s weekly updates concise.\n${'Verified source detail. '.repeat(14_000)}`;
+    const guidance = `# Workspace guidance\n${'Use the selected evidence carefully. '.repeat(14_000)}`;
+    expect(new TextEncoder().encode(transcript).length).toBeGreaterThan(BACKUP_LIMITS.textBytes);
+    expect(new TextEncoder().encode(guidance).length).toBeGreaterThan(BACKUP_LIMITS.textBytes);
+    state.notes.push({ id: 'large-transcript', title: 'Large transcript', transcript, durationSeconds: 0, createdAt: at, status: 'recorded', revision: 1 });
+    state.documents.push({ path: 'memory/guidance.md', content: guidance, revision: 1, updatedAt: at });
+
+    const exported = createPortableBackup(state, { exportId: 'large-guidance', exportedAt: at });
+    const restored = parsePortableBackup(JSON.stringify(exported)).backup;
+    expect(restored.notes[0]?.transcript).toBe(transcript);
+    expect(restored.documents.find((item) => item.path === 'memory/guidance.md')?.content).toBe(guidance);
+
+    const legacy = parsePortableBackup(JSON.stringify({ format: 'voice-assistant-export-v1', exportedAt: at,
+      notes: [{ id: 'legacy-large', title: 'Legacy transcript', transcript, durationSeconds: 0, createdAt: at }],
+      documents: [{ path: 'memory/guidance.md', content: guidance, revision: 1, updatedAt: at }] })).backup;
+    expect(legacy.notes[0]?.transcript).toBe(transcript);
+    expect(legacy.documents[0]?.content).toBe(guidance);
+
+    state.notes[0]!.transcript = 'x'.repeat(12 * 1024 * 1024 + 1);
+    state.documents[0]!.content = 'y'.repeat(12 * 1024 * 1024);
+    expect(() => createPortableBackup(state, { exportId: 'aggregate-too-large', exportedAt: at })).toThrow(/total restore limit/i);
+  });
+
   it('adapts the exact v1 marker as content and historical claims only', () => {
     const legacy = {
       format: 'voice-assistant-export-v1', exportedAt: at, tokenRef: 'opaque-secret', executableThing: { token: 'secret' },

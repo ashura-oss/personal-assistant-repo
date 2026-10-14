@@ -606,7 +606,7 @@ function deviceReminderSourceProjection(state: AppState, binding: NonNullable<Ex
       notesTruncated: event.notesTruncated, start: event.start, end: event.end, timeZone: event.timeZone ?? null, allDay: event.allDay, cancelled: event.cancelled } });
 }
 
-function assistContext(state: AppState, note: Note, intent: AssistIntent, question?: string, knowledgeSelection: KnowledgeSelection = [], excludedRelatedNoteIds: ReadonlySet<string> = new Set()): { documents: ContextDocument[]; additionalSources: AssistantSourceInput[]; omittedSourceCount: number; omittedSourceIds: string[] } {
+function assistContext(state: AppState, note: Note, intent: AssistIntent, question?: string, knowledgeSelection: KnowledgeSelection = [], excludedRelatedNoteIds: ReadonlySet<string> = new Set(), inputPolicyVersion: 1 | 2 = 1): { documents: ContextDocument[]; additionalSources: AssistantSourceInput[]; omittedSourceCount: number; omittedSourceIds: string[] } {
   const allDocuments = state.documents.filter(({ path }) => !path.startsWith('logs/') && path !== 'memory/INFERENCES.md' && path !== 'memory/DECISIONS.md' &&
     !path.startsWith('people/') && !path.startsWith('projects/'));
   const taskQuery = intent === 'answer' && /\b(task|tasks|task count|how many|todo|to-do|action item)\b/i.test(question ?? '');
@@ -652,6 +652,7 @@ function assistContext(state: AppState, note: Note, intent: AssistIntent, questi
     }));
   const linkedTaskSourceIds = new Set([...linkedTaskIds].map((id) => `task:${encodeURIComponent(id)}`));
   const built = buildLocalSourceSet({
+    inputPolicyVersion,
     transcript: { revision: note.revision, text: note.transcript },
     query: `${question ?? ''}\n${note.transcript}`,
     intent,
@@ -723,6 +724,20 @@ function assistContext(state: AppState, note: Note, intent: AssistIntent, questi
     omittedSourceCount: built.omittedSourceCount,
     omittedSourceIds: built.omittedSourceIds,
   };
+}
+
+function batchSourceFingerprintInput(sourceVersions: Record<string, string>, inputPolicyVersion?: 1 | 2): unknown {
+  // Preserve the exact historical digest for jobs without an explicit policy marker.
+  return inputPolicyVersion === 2 ? { inputPolicyVersion: 2, sourceVersions } : sourceVersions;
+}
+
+function inputPolicyFromAnalysisFingerprint(fingerprint: string): 1 | 2 {
+  let parsed: unknown;
+  try { parsed = JSON.parse(fingerprint); } catch { throw new Error('The saved analysis policy could not be verified. Run Assist again before continuing this action.'); }
+  if (!isRecord(parsed)) throw new Error('The saved analysis policy could not be verified. Run Assist again before continuing this action.');
+  if (!Object.prototype.hasOwnProperty.call(parsed, 'inputPolicyVersion')) return 1;
+  if (parsed.inputPolicyVersion === 1 || parsed.inputPolicyVersion === 2) return parsed.inputPolicyVersion;
+  throw new Error('The saved analysis policy is invalid. Run Assist again before continuing this action.');
 }
 
 function sameSourceVersions(left: Record<string, string>, right: Record<string, string>): boolean {
@@ -2698,7 +2713,7 @@ export class AppControllerImpl implements AppController {
       if ((turn.messageOrigin === 'saved_transcript' && !transcriptSource) ||
           (transcriptSource && !await this.transcriptSourceIsCurrent(state, transcriptSource))) return false;
       const context = assistContext(state, note, job.intent!, job.question, [...(job.knowledgeSelection ?? [])],
-        transcriptSource ? new Set([transcriptSource.noteId]) : new Set());
+        transcriptSource ? new Set([transcriptSource.noteId]) : new Set(), job.inputPolicyVersion ?? 1);
       const chatSources = await this.chatSourcesForBinding(state, job.chatBinding!, memo);
       const baseProfile = job.requestProfileVersion === 4 ? job.recoveryBinding!.baseRequestProfileVersion : job.requestProfileVersion;
       const rebuiltBase = await this.createOpenRouterBatchRequestBuilder().prepareAnalysis(note, context.documents, state.settings, {
@@ -2707,10 +2722,10 @@ export class AppControllerImpl implements AppController {
           reasoningEffortOverride: job.reasoningEffort } : {}),
         additionalSources: [...context.additionalSources, ...chatSources],
         preselection: { omittedSourceCount: context.omittedSourceCount + job.chatBinding!.omittedTurnCount, omittedSourceIds: context.omittedSourceIds },
-      }, baseProfile);
+      }, baseProfile, job.inputPolicyVersion ?? 1);
       const rebuilt = job.requestProfileVersion === 4 ? { ...rebuiltBase, body: this.withBatchEffort(rebuiltBase.body, job.effort) } : rebuiltBase;
       const requestDigest = await this.crypto.sha256( rebuilt.body);
-      const sourceDigest = await this.crypto.sha256( stableJson(rebuilt.sourceVersions));
+      const sourceDigest = await this.crypto.sha256(stableJson(batchSourceFingerprintInput(rebuilt.sourceVersions, job.inputPolicyVersion)));
       return rebuilt.body === job.requestBody && requestDigest === job.requestSha256 && sourceDigest === job.sourceFingerprint &&
         sameSourceVersions({ ...rebuilt.sourceVersions }, { ...job.sourceVersions });
     } catch { return false; }
@@ -3178,7 +3193,7 @@ export class AppControllerImpl implements AppController {
     if (!value) throw new Error('Proposal was not found.');
     return value;
   }
-  private proposalDependencyInputs(state: AppState, proposal: Proposal): { note: Note; provenance: NoteProposalProvenance; inputs: AssistantSourceInput[]; policyInputs: AssistantSourceInput[] } {
+  private proposalDependencyInputs(state: AppState, proposal: Proposal): { note: Note; provenance: NoteProposalProvenance; inputs: AssistantSourceInput[]; policyInputs: AssistantSourceInput[]; inputPolicyVersion: 1 | 2 } {
     const provenance = proposal.provenance;
     if (!provenance || proposal.requiresRebuild) throw new Error('This saved suggestion has no verifiable source history. Run Assist again before approving it.');
     if (provenance.version !== 1) throw new Error('Mail reply provenance cannot be used as note provenance.');
@@ -3201,6 +3216,7 @@ export class AppControllerImpl implements AppController {
     if (!validSources(provenance.sources) || !validSources(provenance.policySources)) throw new Error('This suggestion has malformed source fingerprints. Run Assist again before approving it.');
     if (!proposal.noteId) throw new Error('This suggestion has no source note.');
     const note = this.note(state, proposal.noteId);
+    const inputPolicyVersion = inputPolicyFromAnalysisFingerprint(provenance.analysisFingerprint);
     if (provenance.noteId !== proposal.noteId || provenance.noteRevision !== proposal.sourceRevision || note.revision !== proposal.sourceRevision) {
       throw new Error('The source transcript changed. Run Assist again before approving or continuing this action.');
     }
@@ -3214,13 +3230,14 @@ export class AppControllerImpl implements AppController {
     const linkedChatTurn = note.origin === 'assistant_chat'
       ? this.assistantChatLedger.conversations.flatMap((item) => item.turns).find((candidate) => candidate.noteId === note.id)
       : undefined;
+    const linkedChatJob = linkedChatTurn && this.assistantBatchLedger.jobs.find((candidate) => candidate.id === linkedChatTurn.jobId);
     const transcriptSource = linkedChatTurn ? this.chatTranscriptSourceForTurn(linkedChatTurn) : undefined;
     const { documents, additionalSources } = assistContext(state, note, provenance.intent, provenance.question, provenance.knowledgeSelection,
-      transcriptSource ? new Set([transcriptSource.noteId]) : new Set());
+      transcriptSource ? new Set([transcriptSource.noteId]) : new Set(), inputPolicyVersion);
     let chatSources: AssistantSourceInput[] = [];
     if (note.origin === 'assistant_chat') {
       const turn = linkedChatTurn;
-      const job = turn && this.assistantBatchLedger.jobs.find((candidate) => candidate.id === turn.jobId);
+      const job = turn && linkedChatJob;
       if (this.assistantChatLedgerMalformed || this.assistantBatchLedgerMalformed || !turn || !job?.chatBinding) {
         throw new Error('Saved chat history could not be validated. Refresh local data before continuing.');
       }
@@ -3242,14 +3259,15 @@ export class AppControllerImpl implements AppController {
       id: `doc:${document.path}`, revision: document.revision, text: document.content, required: true, kind: 'document' as const,
       title: document.path, updatedAt: document.updatedAt,
     }));
-    return { note, provenance, inputs: selected, policyInputs };
+    return { note, provenance, inputs: selected, policyInputs, inputPolicyVersion };
   }
   private proposalDependencyProjection(state: AppState, proposal: Proposal): string | undefined {
     try {
       if (proposal.provenance?.version === 2) return this.mailReplyDependencyProjection(state, proposal, proposal.provenance);
-      const { note, provenance, inputs, policyInputs } = this.proposalDependencyInputs(state, proposal);
+      const { note, provenance, inputs, policyInputs, inputPolicyVersion } = this.proposalDependencyInputs(state, proposal);
       return JSON.stringify({
         contractVersion: ASSIST_CONTRACT_VERSION, analysisFingerprint: provenance.analysisFingerprint,
+        inputPolicyVersion,
         note: { id: note.id, revision: note.revision, capturedAt: note.capturedAt ?? note.createdAt, captureTimeZone: note.captureTimeZone },
         settings: state.settings, answeredAsOf: provenance.answeredAsOf ?? null, knowledgeSelection: provenance.knowledgeSelection ?? [],
         sources: inputs.map((source) => ({ id: source.id, revision: source.revision, text: source.text,
@@ -3292,7 +3310,7 @@ export class AppControllerImpl implements AppController {
       await this.validateMailReplyBatchIntegrity(state, proposal, provenance);
       return this.mailReplyDependencyProjection(state, proposal, provenance);
     }
-    const { inputs, policyInputs, provenance } = this.proposalDependencyInputs(state, proposal);
+    const { inputs, policyInputs, provenance, inputPolicyVersion } = this.proposalDependencyInputs(state, proposal);
     const proposalNote = proposal.noteId ? state.notes.find((item) => item.id === proposal.noteId) : undefined;
     if (proposalNote?.origin === 'assistant_chat') {
       const conversation = this.assistantChatLedger.conversations.find((item) => item.turns.some((turn) => turn.noteId === proposalNote.id));
@@ -3307,12 +3325,12 @@ export class AppControllerImpl implements AppController {
       await this.chatSourcesForBinding(state, job.chatBinding, memo);
     }
     const catalog = await createSourceCatalog(inputs, async (bytes) =>
-      this.crypto.sha256( new TextDecoder().decode(bytes)));
+      this.crypto.sha256( new TextDecoder().decode(bytes)), inputPolicyVersion);
     const current = Object.fromEntries(catalog.sources.map((source) => [source.id, source.version]));
     const expected = Object.fromEntries(provenance.sources.map((source) => [source.sourceId, source.sourceVersion]));
     if (!sameSourceVersions(expected, current)) throw new Error('The source or selected context changed. Run Assist again before approving or continuing this action.');
     const policyCatalog = await createSourceCatalog(policyInputs, async (bytes) =>
-      this.crypto.sha256( new TextDecoder().decode(bytes)));
+      this.crypto.sha256( new TextDecoder().decode(bytes)), inputPolicyVersion);
     const currentPolicy = Object.fromEntries(policyCatalog.sources.map((source) => [source.id, source.version]));
     const expectedPolicy = Object.fromEntries(provenance.policySources.map((source) => [source.sourceId, source.sourceVersion]));
     if (!sameSourceVersions(expectedPolicy, currentPolicy)) throw new Error('Rules or routines changed. Run Assist again before approving or continuing this action.');
@@ -3444,7 +3462,7 @@ export class AppControllerImpl implements AppController {
     const binding = job.mailReplyBinding;
     const recovery = job.requestProfileVersion === 4 ? job.recoveryBinding : undefined;
     const recoveryBaseProfile = recovery?.baseRequestProfileVersion;
-    if (!binding || !validOpenRouterMailReplyBinding(binding) ||
+    if (!binding || !validOpenRouterMailReplyBinding(binding, job.inputPolicyVersion === 2 ? 2 : 1) ||
         (binding.version === 1 ? (job.requestProfileVersion !== OPENROUTER_BATCH_REQUEST_PROFILE_VERSION &&
           !(job.requestProfileVersion === 4 && recoveryBaseProfile !== undefined && recoveryBaseProfile <= 2 && recovery?.baseOperation === 'mail_reply_body')) ||
           (job.requestProfileVersion !== 4 && job.operation !== undefined) :
@@ -3469,15 +3487,16 @@ export class AppControllerImpl implements AppController {
       ? this.createOpenRouterBatchRequestBuilder().prepareReplyWithContext({ ...requestInput, contextMessages: binding.context!.map((item) => ({ text: item.body.text,
           subject: item.source.subject, ...(item.source.senderEmail ? { sender: item.source.senderEmail } : {}),
           ...(item.receivedAt ? { receivedAt: item.receivedAt } : {}), ...(item.sentAt ? { sentAt: item.sentAt } : {}),
-          representation: item.body.representation, completeness: item.body.completeness, omissionReasons: item.body.omissionReasons })) }, frozenSettings)
-      : this.createOpenRouterBatchRequestBuilder().prepareReply(requestInput, frozenSettings);
+          representation: item.body.representation, completeness: item.body.completeness, omissionReasons: item.body.omissionReasons })) }, frozenSettings, job.inputPolicyVersion === 2 ? 2 : 1)
+      : this.createOpenRouterBatchRequestBuilder().prepareReply(requestInput, frozenSettings, job.inputPolicyVersion === 2 ? 2 : 1);
     const prepared = job.requestProfileVersion === 4
       ? Object.freeze({ ...basePrepared, body: this.withBatchEffort(basePrepared.body, job.effort), requestBytes: utf8Bytes(this.withBatchEffort(basePrepared.body, job.effort)) })
       : basePrepared;
     const expectedFingerprint = stableJson({ source: canonicalMailReplySource(binding.source), body: { textDigest: binding.body.textDigest,
       representation: binding.body.representation, completeness: binding.body.completeness, extractionVersion: binding.body.extractionVersion,
       omissionReasons: binding.body.omissionReasons }, note: binding.note ?? null, policy: binding.policy, ...(binding.version === 2 ? { context: binding.context } : {}),
-      settingsFingerprint: binding.settingsFingerprint, recipients: { to: binding.to, cc: binding.cc } });
+      settingsFingerprint: binding.settingsFingerprint, recipients: { to: binding.to, cc: binding.cc },
+      ...(job.inputPolicyVersion === 2 ? { inputPolicyVersion: 2 } : {}) });
     const [sourceDigest, bodyTextDigest, noteDigest, policyDigests, contextDigests, settingsFingerprint, requestSha256, fingerprint, resultSha256] = await Promise.all([
       this.crypto.sha256( canonicalMailReplySource(binding.source)),
       this.crypto.sha256( binding.body.text),
@@ -5312,7 +5331,8 @@ export class AppControllerImpl implements AppController {
     return true;
   }
 
-  private materializeAssistantMemorySuggestions(state: AppState, rows: DraftAnalysis['memorySuggestions'], note: Note, fingerprint: string, chatJob?: OpenRouterBatchContentJob): string[] {
+  private materializeAssistantMemorySuggestions(state: AppState, rows: DraftAnalysis['memorySuggestions'], note: Note, fingerprint: string,
+    chatJob?: OpenRouterBatchContentJob, inputPolicyVersion: 1 | 2 = 1): string[] {
     if (this.knowledgeQuarantine.length || !rows.length) return [];
     if (chatJob?.operation === 'chat_refinement') return [];
     const ids: string[] = [];
@@ -5345,7 +5365,8 @@ export class AppControllerImpl implements AppController {
       } else continue;
       if (state.knowledge.suggestions.some((item) => ['pending', 'accepted'].includes(item.status) && stableJson(item.change) === stableJson(change))) continue;
       if (state.knowledge.suggestions.filter((item) => item.status === 'pending').length >= 200) break;
-      const suggestion = validateKnowledgeSuggestion({ id: this.freshStateId(state), revision: 1, change, targetRevision: target.revision, evidence, status: 'pending', createdAt: now(), updatedAt: now(), sourceNoteId: note.id, sourceAnalysisFingerprint: fingerprint });
+      const suggestion = validateKnowledgeSuggestion({ id: this.freshStateId(state), revision: 1, change, targetRevision: target.revision, evidence, status: 'pending', createdAt: now(), updatedAt: now(), sourceNoteId: note.id, sourceAnalysisFingerprint: fingerprint,
+        ...(inputPolicyVersion === 2 ? { inputPolicyVersion: 2 as const } : {}) });
       state.knowledge.suggestions.push(suggestion); ids.push(suggestion.id);
       this.journalKnowledgeReview(state, 'created', suggestion, target.name);
     }
@@ -5371,6 +5392,9 @@ export class AppControllerImpl implements AppController {
     if (!this.chatLedgerLinksAreValid(this.assistantChatLedger, state)) return staleReason;
     const expectedAnalysisFingerprint = await this.crypto.sha256( note.processingFingerprint ?? '');
     if (suggestion.sourceAnalysisFingerprint !== expectedAnalysisFingerprint) return staleReason;
+    const analysisPolicy = inputPolicyFromAnalysisFingerprint(note.processingFingerprint ?? '');
+    if (analysisPolicy !== (note.analysis?.inputPolicyVersion ?? 1) || analysisPolicy !== (suggestion.inputPolicyVersion ?? 1) ||
+        analysisPolicy !== (job.inputPolicyVersion ?? 1)) return staleReason;
     const memo = { results: new Map<string, Promise<boolean>>(), active: new Set<string>() };
     if (!await this.chatTurnMatchesFrozenRequest(state, conversation, turn, memo)) return staleReason;
     if (!job.sourceVersions.transcript || job.sourceVersions[`knowledge:${suggestion.change.entityKind}:${suggestion.change.entityId}`] === undefined) return staleReason;
@@ -5412,6 +5436,7 @@ export class AppControllerImpl implements AppController {
         ? this.assistantChatLedger.conversations.flatMap((conversation) => conversation.turns).find((turn) => turn.noteId === note.id)
         : undefined;
       const chatJob = chatTurn && this.assistantBatchLedger.jobs.find((job) => job.id === chatTurn.jobId);
+      const analysisInputPolicyVersion = analysis.inputPolicyVersion ?? 1;
       if (note.origin === 'assistant_chat' && (!chatTurn || !chatJob?.chatBinding || this.assistantChatLedgerMalformed || this.assistantBatchLedgerMalformed)) {
         throw new Error('Saved chat history could not be validated. Refresh local data before continuing.');
       }
@@ -5419,7 +5444,7 @@ export class AppControllerImpl implements AppController {
       const boundSourceRevision = analysis.sourceRevision;
       const transcriptSource = chatTurn ? this.chatTranscriptSourceForTurn(chatTurn) : undefined;
       const { documents, additionalSources, omittedSourceCount, omittedSourceIds } = assistContext(state, note, analysis.intent, analysis.question,
-        analysis.knowledgeSelection ?? [], transcriptSource ? new Set([transcriptSource.noteId]) : new Set());
+        analysis.knowledgeSelection ?? [], transcriptSource ? new Set([transcriptSource.noteId]) : new Set(), analysisInputPolicyVersion);
       const chatSources = chatJob?.chatBinding ? await this.chatSourcesForBinding(state, chatJob.chatBinding) : [];
       const request = {
         intent: analysis.intent, question: analysis.question,
@@ -5430,7 +5455,7 @@ export class AppControllerImpl implements AppController {
       let currentVersions: Record<string, string>;
       if (state.settings.mode === 'provider' && analysis.source === 'provider') {
         currentVersions = state.settings.llmProvider === 'openrouter'
-          ? (await this.createOpenRouterBatchRequestBuilder().prepareAnalysis(note, documents, state.settings, request)).sourceVersions
+          ? (await this.createOpenRouterBatchRequestBuilder().prepareAnalysis(note, documents, state.settings, request, undefined, analysisInputPolicyVersion)).sourceVersions
           : (await this.openAiClient.prepare(note, documents, state.settings, request)).sourceVersions;
       } else {
         const calendarAvailable = usableDeviceCalendarSnapshot(state) || state.calendars.some((calendar) => {
@@ -5449,13 +5474,14 @@ export class AppControllerImpl implements AppController {
       if (note.analysis?.fingerprint !== boundFingerprint || note.analysis?.sourceRevision !== boundSourceRevision) {
         return { changed: false, result: note.analysis };
       }
-      let priorFingerprint: { settings?: AppSettings; contractVersion?: string } | undefined;
-      try { priorFingerprint = JSON.parse(analysis.fingerprint) as { settings?: AppSettings; contractVersion?: string }; } catch { priorFingerprint = undefined; }
+      let priorFingerprint: { settings?: AppSettings; contractVersion?: string; inputPolicyVersion?: 1 | 2 } | undefined;
+      try { priorFingerprint = JSON.parse(analysis.fingerprint) as { settings?: AppSettings; contractVersion?: string; inputPolicyVersion?: 1 | 2 }; } catch { priorFingerprint = undefined; }
       const providerSettingsChanged = priorFingerprint?.settings?.llmProvider === 'openrouter'
         ? stableJson(priorFingerprint.settings) !== stableJson(openRouterSettingsBinding(state.settings))
         : JSON.stringify(priorFingerprint?.settings) !== JSON.stringify(state.settings);
       const settingsChanged = !priorFingerprint?.settings || providerSettingsChanged ||
         priorFingerprint.contractVersion !== ASSIST_CONTRACT_VERSION ||
+        (analysisInputPolicyVersion === 2 ? priorFingerprint.inputPolicyVersion !== 2 : priorFingerprint.inputPolicyVersion !== undefined) ||
         (analysis.source === 'provider') !== (state.settings.mode === 'provider');
       const answerWindowExpired = Boolean(!chatJob?.chatBinding && analysis.answeredAsOf &&
         Math.floor(Date.now() / 900_000) !== Math.floor(Date.parse(analysis.answeredAsOf) / 900_000));
@@ -5576,9 +5602,6 @@ export class AppControllerImpl implements AppController {
       } else if (input.noteRevision !== undefined) throw new Error('A note revision was supplied without a selected note.');
       const policies = draft.documents.filter((doc) => /^memory\/(?:RULES|ROUTINES)\.md$/i.test(doc.path));
       const policyContext = policies.map((doc) => `### ${doc.path} (revision ${doc.revision})\n${doc.content}`).join('\n\n');
-      if (utf8Bytes(input.brief) + utf8Bytes(noteContext ?? '') > 4 * 1024 || utf8Bytes(policyContext) > 4 * 1024) {
-        throw new Error('The reply brief, selected note, or RULES.md / ROUTINES.md guidance exceeds the request limit. Shorten it before submitting.');
-      }
       const asOf = now();
       const timeZone = validTimezone(draft.settings.timezone);
       let context: OpenRouterMailReplyContextSource[] | undefined;
@@ -5613,8 +5636,8 @@ export class AppControllerImpl implements AppController {
         ? this.createOpenRouterBatchRequestBuilder().prepareReplyWithContext({ ...replyInput, contextMessages: context.map((item) => ({ text: item.body.text,
             subject: item.source.subject, ...(item.source.senderEmail ? { sender: item.source.senderEmail } : {}),
             ...(item.receivedAt ? { receivedAt: item.receivedAt } : {}), ...(item.sentAt ? { sentAt: item.sentAt } : {}),
-            representation: item.body.representation, completeness: item.body.completeness, omissionReasons: item.body.omissionReasons })) }, draft.settings)
-        : await this.createOpenRouterBatchRequestBuilder().prepareReply(replyInput, draft.settings);
+            representation: item.body.representation, completeness: item.body.completeness, omissionReasons: item.body.omissionReasons })) }, draft.settings, 2)
+        : await this.createOpenRouterBatchRequestBuilder().prepareReply(replyInput, draft.settings, 2);
       const policy: OpenRouterMailReplyFrozenPolicy[] = [];
       for (const doc of policies) policy.push(Object.freeze({ path: doc.path as OpenRouterMailReplyFrozenPolicy['path'], revision: doc.revision,
         content: doc.content, sha256: await this.crypto.sha256( doc.content) }));
@@ -5625,12 +5648,12 @@ export class AppControllerImpl implements AppController {
         subject: source.subject, to: Object.freeze([...input.to]), cc: Object.freeze([...input.cc]), brief: input.brief,
         ...(frozenNote ? { note: frozenNote } : {}), policy: Object.freeze(policy), settingsFingerprint,
         settingsSnapshot: stableJson(openRouterSettingsBinding(draft.settings)), requestAsOf: asOf, timeZone, ...(context ? { context: Object.freeze(context) } : {}) });
-      if (!validOpenRouterMailReplyBinding(binding)) throw new Error('The reply context could not be frozen safely. Refresh the message and try again.');
+      if (!validOpenRouterMailReplyBinding(binding, 2)) throw new Error('The reply context could not be frozen safely. Refresh the message and try again.');
       const requestSha256 = await this.crypto.sha256( prepared.body);
       const sourceFingerprint = await this.crypto.sha256(
         stableJson({ source: canonicalMailReplySource(source), body: { textDigest: body.textDigest, representation: body.representation,
           completeness: body.completeness, extractionVersion: body.extractionVersion, omissionReasons: body.omissionReasons }, note: frozenNote ?? null,
-          policy, ...(context ? { context } : {}), settingsFingerprint, recipients: { to: input.to, cc: input.cc } }));
+          policy, ...(context ? { context } : {}), settingsFingerprint, recipients: { to: input.to, cc: input.cc }, inputPolicyVersion: 2 }));
       const id = this.newId();
       const preparedRequest = JSON.parse(prepared.body) as { reasoning: { effort: 'none' | 'low' } };
       const timestamp = now();
@@ -5638,6 +5661,7 @@ export class AppControllerImpl implements AppController {
         model: OPENROUTER_BATCH_MODEL, effort: preparedRequest.reasoning.effort, requestSha256, unknownCharge: false,
         ...(context ? { operation: 'mail_reply_context' as const } : {}), settingsFingerprint, sourceFingerprint,
         requestProfileVersion: context ? 3 : OPENROUTER_BATCH_REQUEST_PROFILE_VERSION,
+        inputPolicyVersion: 2,
         requestBytes: utf8Bytes(prepared.body), omittedSourceCount: 0, requestBody: prepared.body, sourceVersions: Object.freeze({}), mailReplyBinding: binding });
       return job;
     }, undefined, (_draft, job) => validateOpenRouterBatchLedger({ version: 1, jobs: [...this.assistantBatchLedger.jobs, job] }));
@@ -5792,7 +5816,7 @@ export class AppControllerImpl implements AppController {
   }
 
   private isMailContextRefreshJob(job: OpenRouterBatchJob): job is OpenRouterMailReplyContentJob {
-    if (!isOpenRouterMailReplyContentJob(job) || !validOpenRouterMailReplyBinding(job.mailReplyBinding) ||
+    if (!isOpenRouterMailReplyContentJob(job) || !validOpenRouterMailReplyBinding(job.mailReplyBinding, job.inputPolicyVersion === 2 ? 2 : 1) ||
         job.mailReplyBinding.version !== 2 || !job.mailReplyBinding.context?.length ||
         !((job.requestProfileVersion === 3 && job.operation === 'mail_reply_context') ||
           (job.requestProfileVersion === 4 && job.operation === 'mail_reply_context' && job.recoveryBinding?.baseRequestProfileVersion === 3 &&
@@ -5824,7 +5848,8 @@ export class AppControllerImpl implements AppController {
       const guardContext: RequestGuard = () => this.requireMailReplyContextRefreshContext(job, binding, generation, epoch, admittedAtMs, capturedState, ticket);
       guardContext();
       let targetRead: SelectedMessageTextResult;
-      try { targetRead = await this.connector.readSelectedMessageText(clone(account), binding.source.providerMessageId, { guard: guardContext }); }
+      try { targetRead = await this.connector.readSelectedMessageText(clone(account), binding.source.providerMessageId,
+        { guard: guardContext, maxTextBytes: job.inputPolicyVersion === 2 ? MAX_SELECTED_MAIL_TEXT_BYTES : 16 * 1024 }); }
       catch (error) {
         if (error instanceof ProviderHttpError && (error.status === 404 || error.status === 410)) {
           await this.invalidateObservedMailReplySource(binding, binding.source.providerMessageId, { kind: 'deleted', observedAt: new Date().toISOString() }, guardContext);
@@ -5841,7 +5866,8 @@ export class AppControllerImpl implements AppController {
       if (targetRead.status !== 'available' || !targetMessage || targetMessage.id !== binding.source.providerMessageId ||
           targetMessage.idFormat !== binding.source.idFormat || targetMessage.threadId !== binding.source.threadId || targetMessage.isDraft !== false ||
           targetMessage.replyMetadataComplete !== true || !targetRead.text || targetRead.completeness === 'unavailable' ||
-          !validReplyText(targetRead.text) || targetRead.bytes !== utf8Bytes(targetRead.text) || targetRead.bytes > 16 * 1024) {
+          !validReplyText(targetRead.text, job.inputPolicyVersion === 2 ? MAX_SELECTED_MAIL_TEXT_BYTES : 100_000) || targetRead.bytes !== utf8Bytes(targetRead.text) ||
+          targetRead.bytes > (job.inputPolicyVersion === 2 ? MAX_SELECTED_MAIL_TEXT_BYTES : 16 * 1024)) {
         throw new Error('The target message changed, became a draft, or is no longer available. Review a fresh Batch request.');
       }
       const targetSession = { sessionId: '', targetMessageId: binding.messageId, sourceDigest: '', accountId: binding.source.accountId,
@@ -5870,7 +5896,8 @@ export class AppControllerImpl implements AppController {
       for (const member of binding.context!) {
         const guard: RequestGuard = guardContext;
         let fresh: SelectedMessageTextResult;
-        try { fresh = await this.connector.readSelectedMessageText(clone(account), member.source.providerMessageId, { guard }); }
+        try { fresh = await this.connector.readSelectedMessageText(clone(account), member.source.providerMessageId,
+          { guard, maxTextBytes: job.inputPolicyVersion === 2 ? MAX_SELECTED_MAIL_TEXT_BYTES : 16 * 1024 }); }
         catch (error) {
           if (error instanceof ProviderHttpError && (error.status === 404 || error.status === 410)) {
             await this.invalidateObservedMailReplySource(binding, member.source.providerMessageId,
@@ -5887,7 +5914,8 @@ export class AppControllerImpl implements AppController {
         }
         if (fresh.status !== 'available' || !returned || returned.id !== member.source.providerMessageId || returned.idFormat !== member.source.idFormat ||
             returned.threadId !== binding.source.threadId || returned.isDraft !== false || returned.replyMetadataComplete !== true || !fresh.text ||
-            fresh.completeness === 'unavailable' || !validReplyText(fresh.text) || fresh.bytes !== utf8Bytes(fresh.text) || fresh.bytes > 16 * 1024) {
+            fresh.completeness === 'unavailable' || !validReplyText(fresh.text, job.inputPolicyVersion === 2 ? MAX_SELECTED_MAIL_TEXT_BYTES : 100_000) ||
+            fresh.bytes !== utf8Bytes(fresh.text) || fresh.bytes > (job.inputPolicyVersion === 2 ? MAX_SELECTED_MAIL_TEXT_BYTES : 16 * 1024)) {
           throw new Error('A selected conversation message changed, became a draft, or is no longer available. Review a new Batch request.');
         }
         const freshSourceRow = this.mailboxRowForContext({ ...returned, id: member.source.providerMessageId }, {
@@ -6367,7 +6395,7 @@ export class AppControllerImpl implements AppController {
           capturedAt: transfer.capturedAt, captureTimeZone: timezone, messageOrigin: 'saved_transcript' as const });
         const conversationForSelection: ChatConversation = Object.freeze({ ...existingConversation,
           updatedAt: createdAt, turns: Object.freeze([...existingConversation.turns, pendingTurn]) });
-        const history = selectCompletedChatContext(conversationForSelection, pendingTurn.id, eligibleJobIds, 48 * 1024);
+        const history = selectCompletedChatContext(conversationForSelection, pendingTurn.id, eligibleJobIds, Number.MAX_SAFE_INTEGER);
         const historySources: AssistantSourceInput[] = [];
         const contextReferences: OpenRouterChatBinding['context'][number][] = [];
         for (const selected of history.turns) {
@@ -6386,19 +6414,20 @@ export class AppControllerImpl implements AppController {
         const fixedQuestion = 'Respond to the current user message.';
         // The original saved note is excluded from related-note context: its
         // transcript is already the copied Chat message and its analysis is private.
-        const context = assistContext(draft, note, 'answer', fixedQuestion, [], new Set([sourceNote.id]));
+        const context = assistContext(draft, note, 'answer', fixedQuestion, [], new Set([sourceNote.id]), 2);
         const prepared = await this.createOpenRouterBatchRequestBuilder().prepareAnalysis(note, context.documents, draft.settings, {
           intent: 'answer', question: fixedQuestion, chatMode: true,
           additionalSources: [...context.additionalSources, ...historySources],
           preselection: { omittedSourceCount: context.omittedSourceCount + history.omittedTurnCount, omittedSourceIds: context.omittedSourceIds },
-        });
+        }, undefined, 2);
         const requestBody = JSON.parse(prepared.body) as { reasoning: { effort: 'none' | 'low' } };
         const job: OpenRouterBatchJob = Object.freeze({
           id: jobId, customId: jobId, kind: 'note_assistance', status: 'preparing', createdAt, updatedAt: createdAt,
           noteId, noteRevision: 1, intent: 'answer', question: fixedQuestion, knowledgeSelection: Object.freeze([]),
           capturedAt: transfer.capturedAt, captureTimeZone: timezone,
           settingsFingerprint: await this.crypto.sha256( stableJson(openRouterSettingsBinding(draft.settings))),
-          sourceFingerprint: await this.crypto.sha256( stableJson(prepared.sourceVersions)),
+          sourceFingerprint: await this.crypto.sha256(stableJson(batchSourceFingerprintInput(prepared.sourceVersions, 2))),
+          inputPolicyVersion: 2,
           requestProfileVersion: prepared.requestProfileVersion, model: OPENROUTER_BATCH_MODEL, effort: requestBody.reasoning.effort,
           requestBytes: new TextEncoder().encode(prepared.body).byteLength, omittedSourceCount: prepared.omittedSourceCount,
           requestBody: prepared.body,
@@ -6474,7 +6503,7 @@ export class AppControllerImpl implements AppController {
           createdAt, captureTimeZone: timezone });
         const conversationForSelection: ChatConversation = Object.freeze({ ...existingConversation,
           updatedAt: createdAt, turns: Object.freeze([...existingConversation.turns, pendingTurn]) });
-        const history = selectCompletedChatContext(conversationForSelection, pendingTurn.id, eligibleJobIds, 48 * 1024);
+        const history = selectCompletedChatContext(conversationForSelection, pendingTurn.id, eligibleJobIds, Number.MAX_SAFE_INTEGER);
         const historySources: AssistantSourceInput[] = [];
         const contextReferences: OpenRouterChatBinding['context'][number][] = [];
         for (const selected of history.turns) {
@@ -6492,12 +6521,12 @@ export class AppControllerImpl implements AppController {
         }
         const chatBinding: OpenRouterChatBinding = Object.freeze({ conversationId: existingConversation.id, turnId,
           context: Object.freeze(contextReferences), omittedTurnCount: history.omittedTurnCount });
-        const context = assistContext(draft, note, 'answer', 'Respond to the current user message.', knowledgeSelection);
+        const context = assistContext(draft, note, 'answer', 'Respond to the current user message.', knowledgeSelection, new Set(), 2);
         const prepared = await this.createOpenRouterBatchRequestBuilder().prepareAnalysis(note, context.documents, draft.settings, {
           intent: 'answer', question: 'Respond to the current user message.', chatMode: true,
           additionalSources: [...context.additionalSources, ...historySources],
           preselection: { omittedSourceCount: context.omittedSourceCount + history.omittedTurnCount, omittedSourceIds: context.omittedSourceIds },
-        });
+        }, undefined, 2);
         const body = JSON.parse(prepared.body) as { reasoning: { effort: 'none' | 'low' } };
         const job: OpenRouterBatchJob = Object.freeze({
           id: jobId, customId: jobId, kind: 'note_assistance', status: 'preparing', createdAt, updatedAt: createdAt,
@@ -6505,7 +6534,8 @@ export class AppControllerImpl implements AppController {
           knowledgeSelection: Object.freeze(knowledgeSelection.map((row) => Object.freeze({ ...row }))),
           capturedAt: createdAt, captureTimeZone: timezone,
           settingsFingerprint: await this.crypto.sha256( stableJson(openRouterSettingsBinding(draft.settings))),
-          sourceFingerprint: await this.crypto.sha256( stableJson(prepared.sourceVersions)),
+          sourceFingerprint: await this.crypto.sha256(stableJson(batchSourceFingerprintInput(prepared.sourceVersions, 2))),
+          inputPolicyVersion: 2,
           requestProfileVersion: prepared.requestProfileVersion, model: OPENROUTER_BATCH_MODEL, effort: body.reasoning.effort,
           requestBytes: new TextEncoder().encode(prepared.body).byteLength, omittedSourceCount: prepared.omittedSourceCount,
           requestBody: prepared.body,
@@ -6590,8 +6620,9 @@ export class AppControllerImpl implements AppController {
         const parentContext = parentJob.chatBinding.context.filter((reference) => reference.turnId !== parent.id)
           .map((reference) => Object.freeze({ ...reference }));
         const transcriptSource = this.chatTranscriptSourceForTurn(parent);
+        const inputPolicyVersion = parentJob.inputPolicyVersion ?? 1;
         const context = assistContext(draft, note, 'answer', fixedQuestion, parentKnowledgeSelection,
-          transcriptSource ? new Set([transcriptSource.noteId]) : new Set());
+          transcriptSource ? new Set([transcriptSource.noteId]) : new Set(), inputPolicyVersion);
         const requiredParentSource = this.chatRefinementParentSource(parent);
         const parentReplySha256 = await this.chatReplyDigest(parent.reply);
         if (parentReplySha256 !== parent.replySha256) throw new Error('The parent answer changed. Refresh the conversation before refining it.');
@@ -6608,7 +6639,7 @@ export class AppControllerImpl implements AppController {
           reasoningEffortOverride: effort,
           additionalSources: [...context.additionalSources, ...frozenContextSources, requiredParentSource],
           preselection: { omittedSourceCount: context.omittedSourceCount + parentJob.chatBinding.omittedTurnCount, omittedSourceIds: context.omittedSourceIds },
-        }, 2);
+        }, 2, inputPolicyVersion);
         const requestBody = JSON.parse(prepared.body) as { reasoning: { effort: 'medium' | 'high' | 'max' } };
         const job: OpenRouterBatchJob = Object.freeze({
           id: jobId, customId: jobId, kind: 'note_assistance', operation: 'chat_refinement', reasoningEffort: effort,
@@ -6616,7 +6647,8 @@ export class AppControllerImpl implements AppController {
           noteId, noteRevision: note.revision, intent: 'answer', question: fixedQuestion,
           knowledgeSelection: Object.freeze(parentKnowledgeSelection), capturedAt: captureAnchor, captureTimeZone,
           settingsFingerprint: await this.crypto.sha256( stableJson(openRouterSettingsBinding(draft.settings))),
-          sourceFingerprint: await this.crypto.sha256( stableJson(prepared.sourceVersions)),
+          sourceFingerprint: await this.crypto.sha256(stableJson(batchSourceFingerprintInput(prepared.sourceVersions, inputPolicyVersion))),
+          ...(parentJob.inputPolicyVersion !== undefined ? { inputPolicyVersion } : {}),
           requestProfileVersion: 2, model: OPENROUTER_BATCH_MODEL, effort: requestBody.reasoning.effort,
           requestBytes: new TextEncoder().encode(prepared.body).byteLength, omittedSourceCount: prepared.omittedSourceCount,
           requestBody: prepared.body,
@@ -6701,7 +6733,7 @@ export class AppControllerImpl implements AppController {
       this.requireConfirmedCaptureTimeZone(note);
       if (!note.transcript.trim()) throw new Error('This note has no transcript to queue.');
       for (const selected of knowledgeSelection) if (!getKnowledgeEntity(draft.knowledge, selected.kind, selected.id)) throw new Error('A selected knowledge source is no longer available. Refresh the selection and try again.');
-      const context = assistContext(draft, note, intent, question, knowledgeSelection);
+      const context = assistContext(draft, note, intent, question, knowledgeSelection, new Set(), 2);
       const answeredAsOf = intent === 'answer' ? createdAt : undefined;
       const request = {
         intent, question,
@@ -6709,7 +6741,7 @@ export class AppControllerImpl implements AppController {
         additionalSources: context.additionalSources,
         preselection: { omittedSourceCount: context.omittedSourceCount, omittedSourceIds: context.omittedSourceIds },
       };
-      prepared = await this.createOpenRouterBatchRequestBuilder().prepareAnalysis(note, context.documents, draft.settings, request);
+      prepared = await this.createOpenRouterBatchRequestBuilder().prepareAnalysis(note, context.documents, draft.settings, request, undefined, 2);
       if (this.assistantBatchLedger.jobs.some((job) => job.noteId === noteId && ['preparing', 'submitting', 'submission_unknown', 'queued', 'processing', 'cleanup_pending'].includes(job.status))) {
         throw new Error('This note already has an unfinished Batch job. Inspect that saved job before queuing another.');
       }
@@ -6722,7 +6754,8 @@ export class AppControllerImpl implements AppController {
         capturedAt: note.capturedAt ?? note.createdAt, captureTimeZone: note.captureTimeZone || draft.settings.timezone,
         ...(answeredAsOf ? { answeredAsOf } : {}),
         settingsFingerprint: await this.crypto.sha256( stableJson(openRouterSettingsBinding(draft.settings))),
-        sourceFingerprint: await this.crypto.sha256( stableJson(prepared.sourceVersions)),
+        sourceFingerprint: await this.crypto.sha256(stableJson(batchSourceFingerprintInput(prepared.sourceVersions, 2))),
+        inputPolicyVersion: 2,
         requestProfileVersion: prepared.requestProfileVersion, model: OPENROUTER_BATCH_MODEL, effort: body.reasoning.effort,
         requestBytes: new TextEncoder().encode(prepared.body).byteLength, omittedSourceCount: prepared.omittedSourceCount,
         requestBody: prepared.body,
@@ -6898,14 +6931,14 @@ export class AppControllerImpl implements AppController {
     if (!job.chatBinding) {
       if (note.origin === 'assistant_chat') throw new Error('The saved Chat request could not be validated.');
       this.requireConfirmedCaptureTimeZone(note);
-      const context = assistContext(state, note, job.intent!, job.question, [...(job.knowledgeSelection ?? [])]);
+      const context = assistContext(state, note, job.intent!, job.question, [...(job.knowledgeSelection ?? [])], new Set(), job.inputPolicyVersion ?? 1);
       const timezone = state.settings.timezone;
       return this.createOpenRouterBatchRequestBuilder().prepareAnalysis(note, context.documents, state.settings, {
         intent: job.intent, question: job.question,
         ...(job.answeredAsOf ? { queryTimeAnchor: job.answeredAsOf, queryTimeZone: timezone } : {}),
         additionalSources: context.additionalSources,
         preselection: { omittedSourceCount: context.omittedSourceCount, omittedSourceIds: context.omittedSourceIds },
-      }, baseProfile);
+      }, baseProfile, job.inputPolicyVersion ?? 1);
     }
     if (note.origin !== 'assistant_chat' || this.assistantChatLedgerMalformed || !this.chatLedgerLinksAreValid(this.assistantChatLedger, state)) {
       throw new Error('The saved Chat request could not be validated.');
@@ -6920,7 +6953,7 @@ export class AppControllerImpl implements AppController {
     const transcriptSource = this.chatTranscriptSourceForTurn(turn);
     if (transcriptSource && !await this.transcriptSourceIsCurrent(state, transcriptSource)) throw new Error('The original saved transcript changed. Refresh it before reviewing more compute.');
     const context = assistContext(state, note, job.intent!, job.question, [...(job.knowledgeSelection ?? [])],
-      transcriptSource ? new Set([transcriptSource.noteId]) : new Set());
+      transcriptSource ? new Set([transcriptSource.noteId]) : new Set(), job.inputPolicyVersion ?? 1);
     const chatSources = await this.chatSourcesForBinding(state, job.chatBinding);
     const baseOperation = job.requestProfileVersion === 4 ? job.recoveryBinding!.baseOperation : job.operation ?? 'note_assistance';
     const refinement = baseOperation === 'chat_refinement';
@@ -6930,7 +6963,7 @@ export class AppControllerImpl implements AppController {
       ...(refinement ? { chatRefinement: true as const, operation: 'chat_refinement' as const, reasoningEffortOverride: job.effort as 'medium' | 'high' | 'max' } : {}),
       additionalSources: [...context.additionalSources, ...chatSources],
       preselection: { omittedSourceCount: context.omittedSourceCount + job.chatBinding.omittedTurnCount, omittedSourceIds: context.omittedSourceIds },
-    }, baseProfile);
+    }, baseProfile, job.inputPolicyVersion ?? 1);
   }
 
   private async verifyMoreComputeParent(job: OpenRouterBatchJob, state: AppState): Promise<PreparedOpenRouterAnalysis | undefined> {
@@ -6954,7 +6987,7 @@ export class AppControllerImpl implements AppController {
     const actualBody = job.requestProfileVersion === 4 ? this.withBatchEffort(prepared.body, job.effort) : prepared.body;
     const [requestDigest, sourceDigest, settingsDigest] = await Promise.all([
       this.crypto.sha256( actualBody),
-      this.crypto.sha256( stableJson(prepared.sourceVersions)),
+      this.crypto.sha256(stableJson(batchSourceFingerprintInput(prepared.sourceVersions, job.inputPolicyVersion))),
       this.crypto.sha256( stableJson(openRouterSettingsBinding(state.settings))),
     ]);
     if (actualBody !== job.requestBody || requestDigest !== job.requestSha256 || sourceDigest !== job.sourceFingerprint ||
@@ -6983,6 +7016,7 @@ export class AppControllerImpl implements AppController {
       const child: OpenRouterBatchJob = Object.freeze({ id: jobId, customId: jobId, kind: 'mail_reply', status: 'preparing', createdAt: timestamp, updatedAt: timestamp,
         model: OPENROUTER_BATCH_MODEL, effort, requestSha256, unknownCharge: false, ...(parent.mailReplyBinding.version === 2 ? { operation: 'mail_reply_context' as const } : {}),
         settingsFingerprint: parent.settingsFingerprint, sourceFingerprint: parent.sourceFingerprint, requestProfileVersion: 4,
+        ...(parent.inputPolicyVersion !== undefined ? { inputPolicyVersion: parent.inputPolicyVersion } : {}),
         requestBytes: utf8Bytes(requestBody), omittedSourceCount: parent.omittedSourceCount, requestBody, sourceVersions: Object.freeze({}),
         mailReplyBinding: parent.mailReplyBinding, recoveryBinding: Object.freeze({ version: 1, parentJobId: parent.id, parentKind: parent.kind,
           parentRequestProfileVersion: parent.requestProfileVersion, ...(parent.operation ? { parentOperation: parent.operation } : {}), parentEffort: parent.effort,
@@ -7014,14 +7048,14 @@ export class AppControllerImpl implements AppController {
         analysis: undefined, processingFingerprint: undefined };
       const transcriptSource = this.chatTranscriptSourceForTurn(this.assistantChatLedger.conversations.flatMap((item) => item.turns).find((turn) => turn.id === parent.chatBinding!.turnId)!);
       const context = assistContext(this.state, childNote, parent.intent!, parent.question, [...(parent.knowledgeSelection ?? [])],
-        transcriptSource ? new Set([transcriptSource.noteId]) : new Set());
+        transcriptSource ? new Set([transcriptSource.noteId]) : new Set(), parent.inputPolicyVersion ?? 1);
       const sources = await this.chatSourcesForBinding(this.state, parent.chatBinding);
       childPrepared = await this.createOpenRouterBatchRequestBuilder().prepareAnalysis(childNote, context.documents, this.state.settings, {
         intent: parent.intent, question: parent.question, chatMode: true,
         ...(parent.operation === 'chat_refinement' ? { chatRefinement: true as const, operation: 'chat_refinement' as const, reasoningEffortOverride: plan.publicPlan.requestedEffort } : {}),
         additionalSources: [...context.additionalSources, ...sources],
         preselection: { omittedSourceCount: context.omittedSourceCount + parent.chatBinding.omittedTurnCount, omittedSourceIds: context.omittedSourceIds },
-      }, baseRequestProfileVersion as 1 | 2);
+      }, baseRequestProfileVersion as 1 | 2, parent.inputPolicyVersion ?? 1);
       childBinding = Object.freeze({ ...parent.chatBinding, turnId: childTurnId!, recoveryParentTurnId: parent.chatBinding.turnId });
     }
     const requestBody = parent.operation === 'chat_refinement'
@@ -7029,7 +7063,7 @@ export class AppControllerImpl implements AppController {
       : this.withBatchEffort(childPrepared.body, plan.publicPlan.requestedEffort);
     const [requestSha256, sourceFingerprint, settingsFingerprint] = await Promise.all([
       this.crypto.sha256( requestBody),
-      this.crypto.sha256( stableJson(childPrepared.sourceVersions)),
+      this.crypto.sha256(stableJson(batchSourceFingerprintInput(childPrepared.sourceVersions, parent.inputPolicyVersion))),
       this.crypto.sha256( stableJson(openRouterSettingsBinding(this.state.settings))),
     ]);
     const noteRemap = parent.chatBinding ? Object.freeze({ fromNoteId: parent.noteId!, toNoteId: childNoteId }) : undefined;
@@ -7047,6 +7081,7 @@ export class AppControllerImpl implements AppController {
       captureTimeZone: parent.chatBinding ? note.captureTimeZone ?? parent.captureTimeZone : parent.captureTimeZone,
       ...(parent.answeredAsOf ? { answeredAsOf: parent.answeredAsOf } : {}),
       settingsFingerprint, sourceFingerprint, requestProfileVersion: 4, requestBytes: utf8Bytes(requestBody), omittedSourceCount: childPrepared.omittedSourceCount,
+      ...(parent.inputPolicyVersion !== undefined ? { inputPolicyVersion: parent.inputPolicyVersion } : {}),
       requestBody, sourceVersions: Object.freeze({ ...childPrepared.sourceVersions }), ...(childBinding ? { chatBinding: childBinding } : {}), recoveryBinding: binding });
     let nextChatLedger: ReadonlyChatLedger | undefined;
     let childTurn: ChatConversation['turns'][number] | undefined;
@@ -7158,7 +7193,7 @@ export class AppControllerImpl implements AppController {
     const note = state.notes.find((item) => item.id === job.noteId);
     if (!note) throw new Error('The saved source is missing.');
     const context = assistContext(state, note, job.intent ?? 'assist', job.question, [...(job.knowledgeSelection ?? [])],
-      job.chatBinding?.transcriptSource ? new Set([job.chatBinding.transcriptSource.noteId]) : new Set());
+      job.chatBinding?.transcriptSource ? new Set([job.chatBinding.transcriptSource.noteId]) : new Set(), job.inputPolicyVersion ?? 1);
     const chatSources = job.chatBinding ? await this.chatSourcesForBinding(state, job.chatBinding) : [];
     const sourceTextById = new Map<string, string>();
     for (const document of context.documents) sourceTextById.set(`doc:${document.path}`, document.content);
@@ -7354,7 +7389,7 @@ export class AppControllerImpl implements AppController {
       const voiceTurn = job.chatBinding ? this.assistantChatLedger.conversations.flatMap((item) => item.turns).find((turn) => turn.id === job.chatBinding!.turnId) : undefined;
       const transcriptSource = voiceTurn ? this.chatTranscriptSourceForTurn(voiceTurn) : undefined;
       const context = assistContext(fresh, note, job.intent!, job.question, [...(job.knowledgeSelection ?? [])],
-        transcriptSource ? new Set([transcriptSource.noteId]) : new Set());
+        transcriptSource ? new Set([transcriptSource.noteId]) : new Set(), job.inputPolicyVersion ?? 1);
       const chatSources = job.chatBinding ? await this.chatSourcesForBinding(fresh, job.chatBinding) : [];
       const baseProfile = job.requestProfileVersion === 4 ? job.recoveryBinding!.baseRequestProfileVersion : job.requestProfileVersion;
       const preparedBase = await this.createOpenRouterBatchRequestBuilder().prepareAnalysis(note, context.documents, fresh.settings, {
@@ -7365,11 +7400,11 @@ export class AppControllerImpl implements AppController {
         ...(!job.chatBinding && job.answeredAsOf ? { queryTimeAnchor: job.answeredAsOf, queryTimeZone: fresh.settings.timezone } : {}),
         additionalSources: [...context.additionalSources, ...chatSources],
         preselection: { omittedSourceCount: context.omittedSourceCount + (job.chatBinding?.omittedTurnCount ?? 0), omittedSourceIds: context.omittedSourceIds },
-      }, baseProfile);
+      }, baseProfile, job.inputPolicyVersion ?? 1);
       prepared = job.requestProfileVersion === 4 ? { ...preparedBase, body: this.withBatchEffort(preparedBase.body, job.effort) } : preparedBase;
       requireInspectionContext();
       const digest = await this.crypto.sha256( prepared.body);
-      const sourceDigest = await this.crypto.sha256( stableJson(prepared.sourceVersions));
+      const sourceDigest = await this.crypto.sha256(stableJson(batchSourceFingerprintInput(prepared.sourceVersions, job.inputPolicyVersion)));
       requireInspectionContext();
       if (prepared.body !== job.requestBody || digest !== job.requestSha256 || sourceDigest !== job.sourceFingerprint || !sameSourceVersions({ ...job.sourceVersions }, { ...prepared.sourceVersions })) throw new Error('The saved analysis sources changed.');
     } catch {
@@ -7411,6 +7446,7 @@ export class AppControllerImpl implements AppController {
       prepared, generated,
       capturedState, capturedGeneration,
       jobId: job.id,
+      inputPolicyVersion: job.inputPolicyVersion ?? 1,
       nextLedger: (applied) => this.updatedBatchLedger(job.id, (current) => ({
         ...current,
         status: applied.stale ? 'result_stale' : 'completed',
@@ -7678,7 +7714,7 @@ export class AppControllerImpl implements AppController {
     id: string,
     options: { intent?: AssistIntent; question?: string; forceRefresh?: boolean; knowledgeSelection?: KnowledgeSelection } = {},
     requestedAt = new Date(),
-    batch?: { prepared: PreparedOpenRouterAnalysis; generated: DraftAnalysis; capturedState: AppState; capturedGeneration: number; jobId: string; nextLedger: (analysis: NoteAssistResult) => OpenRouterBatchLedger; chatBinding?: OpenRouterChatBinding; nextChatLedger?: () => ReadonlyChatLedger; operation?: 'chat_refinement'; reasoningEffort?: 'medium' | 'high' | 'max' },
+    batch?: { prepared: PreparedOpenRouterAnalysis; generated: DraftAnalysis; capturedState: AppState; capturedGeneration: number; jobId: string; nextLedger: (analysis: NoteAssistResult) => OpenRouterBatchLedger; inputPolicyVersion?: 1 | 2; chatBinding?: OpenRouterChatBinding; nextChatLedger?: () => ReadonlyChatLedger; operation?: 'chat_refinement'; reasoningEffort?: 'medium' | 'high' | 'max' },
   ): Promise<NoteAssistResult> {
     const requireBatchContext = () => {
       if (batch && (!this.loaded || this.state !== batch.capturedState || this.bootstrapGeneration !== batch.capturedGeneration ||
@@ -7709,7 +7745,7 @@ export class AppControllerImpl implements AppController {
     const chatTurn = batch?.chatBinding ? this.assistantChatLedger.conversations.flatMap((item) => item.turns).find((turn) => turn.id === batch.chatBinding!.turnId) : undefined;
     const transcriptSource = chatTurn ? this.chatTranscriptSourceForTurn(chatTurn) : undefined;
     const { documents: contextDocs, additionalSources: baseSources, omittedSourceCount, omittedSourceIds } = assistContext(state, note, intent, question,
-      knowledgeSelection, transcriptSource ? new Set([transcriptSource.noteId]) : new Set());
+      knowledgeSelection, transcriptSource ? new Set([transcriptSource.noteId]) : new Set(), batch?.inputPolicyVersion ?? 1);
     const chatSources = batch?.chatBinding ? await this.chatSourcesForBinding(state, batch.chatBinding) : [];
     const localSources = [...baseSources, ...chatSources];
     const capturedAt = note.capturedAt ?? note.createdAt;
@@ -7721,7 +7757,7 @@ export class AppControllerImpl implements AppController {
       preselection: { omittedSourceCount: omittedSourceCount + (batch?.chatBinding?.omittedTurnCount ?? 0), omittedSourceIds } };
     const prepared = batch?.prepared ?? (state.settings.mode === 'provider'
       ? (state.settings.llmProvider === 'openrouter'
-        ? await this.createOpenRouterBatchRequestBuilder().prepareAnalysis(note, contextDocs, state.settings, request)
+        ? await this.createOpenRouterBatchRequestBuilder().prepareAnalysis(note, contextDocs, state.settings, request, undefined, batch?.inputPolicyVersion ?? 1)
         : await this.openAiClient.prepare(note, contextDocs, state.settings, request))
       : undefined);
     requireBatchContext();
@@ -7743,7 +7779,8 @@ export class AppControllerImpl implements AppController {
       async (bytes) => this.crypto.sha256( new TextDecoder().decode(bytes))) : undefined;
     requireBatchContext();
     const sourceVersions = prepared?.sourceVersions ?? Object.fromEntries(offlineCatalog?.sources.map((source) => [source.id, source.version]) ?? [['transcript', transcriptVersion]]);
-    const processingFingerprint = JSON.stringify({ contractVersion: ASSIST_CONTRACT_VERSION, transcript: note.transcript, sourceRevision, sources: sourceVersions, settings: batch ? openRouterSettingsBinding(state.settings) : state.settings, intent, question, knowledgeSelection, ...(batch?.chatBinding ? { chatBinding: batch.chatBinding } : {}), ...(batch?.operation ? { operation: batch.operation, reasoningEffort: batch.reasoningEffort } : {}),
+    const processingFingerprint = JSON.stringify({ contractVersion: ASSIST_CONTRACT_VERSION, transcript: note.transcript, sourceRevision, sources: sourceVersions, settings: batch ? openRouterSettingsBinding(state.settings) : state.settings, intent, question, knowledgeSelection,
+      ...(batch?.inputPolicyVersion === 2 ? { inputPolicyVersion: 2 } : {}), ...(batch?.chatBinding ? { chatBinding: batch.chatBinding } : {}), ...(batch?.operation ? { operation: batch.operation, reasoningEffort: batch.reasoningEffort } : {}),
       capturedAt, captureTimeZone: note.captureTimeZone || state.settings.timezone,
       ...(answeredAsOf ? { queryBucket, queryTimeZone: state.settings.timezone } : {}),
     });
@@ -7795,7 +7832,7 @@ export class AppControllerImpl implements AppController {
       title: document.path, updatedAt: document.updatedAt,
     }));
     const policyCatalog = await createSourceCatalog(policyInputs, async (bytes) =>
-      this.crypto.sha256( new TextDecoder().decode(bytes)));
+      this.crypto.sha256( new TextDecoder().decode(bytes)), batch?.inputPolicyVersion ?? 1);
     requireBatchContext();
     const policySources = policyCatalog.sources.map((source) => ({ sourceId: source.id, revision: source.revision, sourceVersion: source.version }));
     const memorySuggestionFingerprint = await this.crypto.sha256( processingFingerprint);
@@ -7821,7 +7858,7 @@ export class AppControllerImpl implements AppController {
         : JSON.stringify(draft.settings) !== JSON.stringify(state.settings);
       try {
         const currentContext = assistContext(draft, current, intent, question, knowledgeSelection,
-          transcriptSource ? new Set([transcriptSource.noteId]) : new Set());
+          transcriptSource ? new Set([transcriptSource.noteId]) : new Set(), batch?.inputPolicyVersion ?? 1);
         const currentChatSources = batch?.chatBinding ? await this.chatSourcesForBinding(draft, batch.chatBinding) : [];
         let currentVersions: Record<string, string>;
         if (draft.settings.mode === 'provider') {
@@ -7830,7 +7867,7 @@ export class AppControllerImpl implements AppController {
             ...(answeredAsOf ? { queryTimeAnchor: answeredAsOf, queryTimeZone: state.settings.timezone } : {}), additionalSources: [...currentContext.additionalSources, ...currentChatSources],
             preselection: { omittedSourceCount: currentContext.omittedSourceCount + (batch?.chatBinding?.omittedTurnCount ?? 0), omittedSourceIds: currentContext.omittedSourceIds } };
           currentVersions = draft.settings.llmProvider === 'openrouter'
-            ? (await this.createOpenRouterBatchRequestBuilder().prepareAnalysis(current, currentContext.documents, draft.settings, currentRequest)).sourceVersions
+            ? (await this.createOpenRouterBatchRequestBuilder().prepareAnalysis(current, currentContext.documents, draft.settings, currentRequest, undefined, batch?.inputPolicyVersion ?? 1)).sourceVersions
             : (await this.openAiClient.prepare(current, currentContext.documents, draft.settings, currentRequest)).sourceVersions;
         } else {
           const calendarAvailable = draft.calendars.some((calendar) => {
@@ -7858,7 +7895,7 @@ export class AppControllerImpl implements AppController {
           clarifications: [...generated.clarifications, 'Local context changed while this response was being prepared. Refresh the analysis to use the current sources.'],
           proposalIds: [], source: state.settings.mode === 'provider' ? 'provider' : 'offline_preview',
           includedSourceIds: generated.includedSourceIds, includedSources: generated.includedSources, omittedSourceIds: generated.omittedSourceIds, omittedSourceCount: generated.omittedSourceCount,
-          sourceVersions: generated.sourceVersions, knowledgeSelection, stale: true,
+          sourceVersions: generated.sourceVersions, knowledgeSelection, ...(batch?.inputPolicyVersion === 2 ? { inputPolicyVersion: 2 as const } : {}), stale: true,
         };
         current.status = 'processed'; current.processingFingerprint = processingFingerprint; current.analysis = analysis;
         addActivity(draft, 'error', 'Assist response retained as stale because local context changed during processing. No proposals were created.', { noteId: id }, this.newId);
@@ -7894,8 +7931,8 @@ export class AppControllerImpl implements AppController {
         job.id === batch.jobId && isOpenRouterBatchContentJob(job)) : undefined;
       const memorySuggestionIds = batch?.chatBinding
         ? (memoryChatJob && batch.operation !== 'chat_refinement'
-          ? this.materializeAssistantMemorySuggestions(draft, generated.memorySuggestions, current, memorySuggestionFingerprint, memoryChatJob) : [])
-        : this.materializeAssistantMemorySuggestions(draft, generated.memorySuggestions, current, memorySuggestionFingerprint);
+          ? this.materializeAssistantMemorySuggestions(draft, generated.memorySuggestions, current, memorySuggestionFingerprint, memoryChatJob, batch.inputPolicyVersion ?? 1) : [])
+        : this.materializeAssistantMemorySuggestions(draft, generated.memorySuggestions, current, memorySuggestionFingerprint, undefined, batch?.inputPolicyVersion ?? 1);
       if (memorySuggestionIds.length) this.validateKnowledgeAndBackup(draft);
       const analysis: NoteAssistResult = {
         noteId: id, sourceRevision, intent, ...(question ? { question } : {}), fingerprint: processingFingerprint,
@@ -7904,6 +7941,7 @@ export class AppControllerImpl implements AppController {
         clarifications: generated.clarifications, proposalIds: selected.map((proposal) => proposal.id), memorySuggestionIds,
         source: state.settings.mode === 'provider' ? 'provider' : 'offline_preview',
         includedSourceIds: generated.includedSourceIds, includedSources: generated.includedSources, omittedSourceIds: generated.omittedSourceIds, omittedSourceCount: generated.omittedSourceCount, sourceVersions: generated.sourceVersions, knowledgeSelection,
+        ...(batch?.inputPolicyVersion === 2 ? { inputPolicyVersion: 2 as const } : {}),
       };
       current.analysis = analysis;
       const docs = [
@@ -10223,7 +10261,7 @@ export class AppControllerImpl implements AppController {
       const target = this.findKnowledgeEntity(state, input.targetKind, input.targetId);
       if (target.archivedAt) throw new Error('Unarchive the person or project before creating a suggestion.');
       const transcriptSource = { id: `note:${note.id}`, revision: note.revision, text: note.transcript, required: true, kind: 'note' as const };
-      const catalog = await createSourceCatalog([transcriptSource], async (bytes) => this.crypto.sha256( new TextDecoder().decode(bytes)));
+      const catalog = await createSourceCatalog([transcriptSource], async (bytes) => this.crypto.sha256( new TextDecoder().decode(bytes)), 2);
       const source = catalog.byId.get(`note:${note.id}`)!;
       let change = { ...clone(input.change), entityKind: input.targetKind, entityId: input.targetId } as KnowledgeChange;
       if (change.type === 'add_source_link') {
@@ -10244,7 +10282,7 @@ export class AppControllerImpl implements AppController {
       const suggestion = validateKnowledgeSuggestion({
         id: this.freshStateId(state), revision: 1, change, targetRevision: target.revision,
         evidence: [{ sourceId: `note:${note.id}`, revision: source.revision, sourceVersion: source.version, quote }],
-        status: 'pending', createdAt: now(), updatedAt: now(), sourceNoteId: note.id,
+        status: 'pending', createdAt: now(), updatedAt: now(), sourceNoteId: note.id, inputPolicyVersion: 2,
       });
       state.knowledge.suggestions.push(suggestion);
       this.journalKnowledgeReview(state, 'created', suggestion, target.name);
@@ -10338,7 +10376,7 @@ export class AppControllerImpl implements AppController {
         if (!citedNote) continue;
         if (noteId && citedNote.id === noteId) sources.push({ id: sourceId, revision: citedNote.revision, text: citedNote.transcript, required: true, kind: 'note', title: citedNote.title, updatedAt: citedNote.capturedAt ?? citedNote.createdAt });
         else {
-          const built = buildLocalSourceSet({ transcript: { revision: 0, text: '' }, notes: [{ id: citedNote.id, title: citedNote.title, revision: citedNote.revision, transcript: citedNote.transcript,
+          const built = buildLocalSourceSet({ inputPolicyVersion: suggestion.inputPolicyVersion ?? 1, transcript: { revision: 0, text: '' }, notes: [{ id: citedNote.id, title: citedNote.title, revision: citedNote.revision, transcript: citedNote.transcript,
             updatedAt: citedNote.capturedAt ?? citedNote.createdAt, selectionPriority: 1 }] });
           sources.push(...built.sources.filter((item) => item.id === sourceId));
         }
@@ -10354,7 +10392,7 @@ export class AppControllerImpl implements AppController {
         try { taskId = decodeURIComponent(sourceId.slice(5)); } catch { continue; }
         const task = state.tasks.find((item) => item.id === taskId);
         if (task) {
-          const built = buildLocalSourceSet({ transcript: { revision: 0, text: '' }, tasks: [{ id: task.id, title: task.title, body: task.body, status: task.status, dueAt: task.dueAt, updatedAt: task.completedAt ?? task.createdAt, selectionPriority: 1 }] });
+          const built = buildLocalSourceSet({ inputPolicyVersion: suggestion.inputPolicyVersion ?? 1, transcript: { revision: 0, text: '' }, tasks: [{ id: task.id, title: task.title, body: task.body, status: task.status, dueAt: task.dueAt, updatedAt: task.completedAt ?? task.createdAt, selectionPriority: 1 }] });
           sources.push(...built.sources.filter((item) => item.id === sourceId));
         }
         continue;
@@ -10376,7 +10414,7 @@ export class AppControllerImpl implements AppController {
           const account = message && state.accounts.find((item) => item.id === message.accountId && item.connected && item.authStatus === 'connected' && identityKey(item) === identity &&
             (item.connectionGeneration ?? 0) === (message.connectionGeneration ?? 0) && item.capabilities?.includes('mail.read'));
           if (message && account) {
-            const built = buildLocalSourceSet({ transcript: { revision: 0, text: '' }, mailbox: [{ id: message.id, accountId: account.id, providerMessageId, identityKey: identity, subject: message.subject, from: message.from, receivedAt: message.receivedAt, snippet: message.snippet }] });
+          const built = buildLocalSourceSet({ inputPolicyVersion: suggestion.inputPolicyVersion ?? 1, transcript: { revision: 0, text: '' }, mailbox: [{ id: message.id, accountId: account.id, providerMessageId, identityKey: identity, subject: message.subject, from: message.from, receivedAt: message.receivedAt, snippet: message.snippet }] });
             sources.push(...built.sources.filter((item) => item.id === sourceId));
           }
         } catch { /* malformed provider source IDs fail closed */ }
@@ -10417,7 +10455,7 @@ export class AppControllerImpl implements AppController {
               !device.selectedCalendarIds.includes(calendarId) || !this.deviceCalendarGenerationIsCurrent(state, device.generation, installationId) ||
               !Number.isFinite(age) || age < 0 || age >= 15 * 60_000) continue;
           const start = Date.parse(event.start);
-          const built = buildLocalSourceSet({ transcript: { revision: 0, text: '' }, deviceCalendarSnapshot: {
+          const built = buildLocalSourceSet({ inputPolicyVersion: suggestion.inputPolicyVersion ?? 1, transcript: { revision: 0, text: '' }, deviceCalendarSnapshot: {
             installationId, generation: device.generation, selectionRevision: device.selectionRevision,
             selectedCalendarIds: [calendarId], timeMin: new Date(start - 60_000).toISOString(), timeMax: new Date(start + 60_000).toISOString(),
             asOf: event.observedAt, partial: false, omittedEvents: 0,
@@ -10430,7 +10468,7 @@ export class AppControllerImpl implements AppController {
       }
     }
     const catalog = await createSourceCatalog([...new Map(sources.map((source) => [source.id, source])).values()],
-      async (bytes) => this.crypto.sha256( new TextDecoder().decode(bytes)));
+      async (bytes) => this.crypto.sha256( new TextDecoder().decode(bytes)), suggestion.inputPolicyVersion ?? 1);
     const versions = new Map(catalog.sources.map((source) => [source.id, { revision: source.revision, version: source.version, text: source.text }]));
     if (note && suggestion.evidence.some((item) => item.sourceId === 'transcript')) {
       const transcript = versions.get(`note:${note.id}`);
@@ -10456,6 +10494,17 @@ export class AppControllerImpl implements AppController {
         addActivity(state, 'local_action', 'A memory suggestion was dismissed.', { noteId: suggestion.sourceNoteId }, this.newId);
         this.validateKnowledgeAndBackup(state);
         return suggestion;
+      }
+      if (suggestion.sourceAnalysisFingerprint) {
+        const analysisNote = suggestion.sourceNoteId ? state.notes.find((note) => note.id === suggestion.sourceNoteId) : undefined;
+        const expectedFingerprint = await this.crypto.sha256(analysisNote?.processingFingerprint ?? '');
+        let analysisPolicy: 1 | 2;
+        try { analysisPolicy = inputPolicyFromAnalysisFingerprint(analysisNote?.processingFingerprint ?? ''); }
+        catch { throw new Error('The source analysis changed. Refresh the suggestion before accepting it.'); }
+        if (!analysisNote?.processingFingerprint || suggestion.sourceAnalysisFingerprint !== expectedFingerprint ||
+            analysisPolicy !== (analysisNote.analysis?.inputPolicyVersion ?? 1) || analysisPolicy !== (suggestion.inputPolicyVersion ?? 1)) {
+          throw new Error('The source analysis changed. Refresh the suggestion before accepting it.');
+        }
       }
       if (suggestion.sourceNoteId && state.notes.some((note) => note.id === suggestion.sourceNoteId && note.origin === 'assistant_chat')) {
         const reason = await this.chatMemorySuggestionEligibility(state, suggestion);
@@ -11018,12 +11067,13 @@ export class AppControllerImpl implements AppController {
       const current = this.snapshot.accounts.find((item) => item.id === session.accountId);
       if (this.snapshot !== state || !current || (current.connectionGeneration ?? 0) !== expectedGeneration) throw new Error('The mailbox changed while loading selected context.');
     };
-    const body = await this.connector.readSelectedMessageText(clone(account), row.id, { sizeEstimate: row.sizeEstimate, sizeCheckedAt: row.sizeCheckedAt, guard });
+    const body = await this.connector.readSelectedMessageText(clone(account), row.id, { sizeEstimate: row.sizeEstimate, sizeCheckedAt: row.sizeCheckedAt, guard,
+      maxTextBytes: MAX_SELECTED_MAIL_TEXT_BYTES });
     guard();
     const returned = body.message;
     if (body.status !== 'available' || !returned || returned.id !== row.id || returned.idFormat !== row.idFormat ||
         returned.threadId !== session.threadId || returned.isDraft !== false || returned.replyMetadataComplete !== true || !body.text ||
-        body.completeness === 'unavailable' || !validReplyText(body.text) || utf8Bytes(body.text) !== body.bytes || body.bytes > 16 * 1024) {
+        body.completeness === 'unavailable' || !validReplyText(body.text, MAX_SELECTED_MAIL_TEXT_BYTES) || utf8Bytes(body.text) !== body.bytes || body.bytes > MAX_SELECTED_MAIL_TEXT_BYTES) {
       throw new Error('The selected conversation message is unavailable or incomplete.');
     }
     const selectionId = this.newId();
@@ -11181,7 +11231,7 @@ export class AppControllerImpl implements AppController {
     let result: SelectedMessageTextResult;
     try {
       result = await this.connector.readSelectedMessageText(clone(account), original.providerMessageId, {
-        sizeEstimate: original.sizeEstimate, sizeCheckedAt: original.sizeCheckedAt, guard: ensureCurrent,
+        sizeEstimate: original.sizeEstimate, sizeCheckedAt: original.sizeCheckedAt, guard: ensureCurrent, maxTextBytes: MAX_SELECTED_MAIL_TEXT_BYTES,
       });
     } catch (error) {
       if (this.selectedMailFence(this.snapshot, input.messageId) !== expectedFence) return { status: 'stale' };

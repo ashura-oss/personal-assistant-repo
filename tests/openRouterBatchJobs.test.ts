@@ -73,6 +73,15 @@ describe('private OpenRouter Batch ledger receipts', () => {
     expect(() => validateOpenRouterBatchLedger({ version: 1, jobs: [contentJob({ requestProfileVersion: 2, requestBody: bodyFor(1) })] })).toThrow(/integrity validation/i);
   });
 
+  it('persists an explicit input-policy version privately and preserves it in a content-free tombstone', () => {
+    const current = validateOpenRouterBatchLedger({ version: 1, jobs: [contentJob({ inputPolicyVersion: 2 })] });
+    expect(current.jobs[0]?.inputPolicyVersion).toBe(2);
+    const removed = tombstoneOpenRouterBatchJob(current.jobs[0]!, at);
+    expect(removed.inputPolicyVersion).toBe(2);
+    expect(validateOpenRouterBatchLedger({ version: 1, jobs: [removed] }).jobs[0]?.inputPolicyVersion).toBe(2);
+    expect(() => validateOpenRouterBatchLedger({ version: 1, jobs: [contentJob({ inputPolicyVersion: 3 as 1 | 2 })] })).toThrow(/integrity validation/i);
+  });
+
   it('requires every recovery edge to come from an intact cutoff and use strictly higher effort', () => {
     const parentId = '20000000-0000-4000-8000-000000000011';
     const childId = '20000000-0000-4000-8000-000000000012';

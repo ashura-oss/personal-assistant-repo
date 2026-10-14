@@ -127,6 +127,36 @@ describe('local assistant context and response validation', () => {
     await expect(createSourceCatalog([{ ...transcript, text: 'x'.repeat(300_000) }], fakeSha256)).rejects.toThrow(/too large/i);
   });
 
+  it('uses input policy v2 to keep all relevant small sources beyond legacy caps while preserving the physical aggregate bound', async () => {
+    const docs = Array.from({ length: 230 }, (_, index) => ({ path: `memory/source-${index}.md`, revision: 1,
+      content: `needle relevant source ${index}`, selectionPriority: 1 as const }));
+    const selected = buildLocalSourceSet({ inputPolicyVersion: 2, transcript: { revision: 1, text: 'needle request' }, intent: 'answer', query: 'needle', documents: docs });
+    expect(selected.sources.length).toBeGreaterThan(200);
+    const catalog = await createSourceCatalog(selected.sources, fakeSha256, 2);
+    const context = selectContext(catalog, { inputPolicyVersion: 2, query: 'needle', byteBudget: 500_000, buildBody: (value) => JSON.stringify({ value }) });
+    expect(context.includedSourceIds.filter((id) => id.startsWith('doc:')).length).toBeGreaterThan(5);
+    await expect(createSourceCatalog([{ id: 'huge', revision: 1, text: 'x'.repeat(17 * 1024 * 1024), required: true }], fakeSha256, 2))
+      .rejects.toThrow(/physical safety limit/i);
+  });
+
+  it('preserves the policy-1 supplemental ceiling for explicit and non-finite requests while policy 2 can exceed it', async () => {
+    const sources: AssistantSourceInput[] = [transcript, ...Array.from({ length: 7 }, (_, index) => ({
+      id: `doc:memory/relevant-${index}.md`, revision: 1, text: `needle source ${index}`, required: false, kind: 'document' as const,
+    }))];
+    const catalog = await createSourceCatalog(sources, fakeSha256);
+    const selection = (inputPolicyVersion: 1 | 2, maxSupplementalSources: number) => selectContext(catalog, {
+      inputPolicyVersion, query: 'needle', byteBudget: 100_000, maxSupplementalSources,
+      buildBody: (value) => JSON.stringify({ value }),
+    });
+    const legacyExplicit = selection(1, 20);
+    const legacyNonFinite = selection(1, Number.POSITIVE_INFINITY);
+    const current = selection(2, 20);
+    expect(legacyExplicit.includedSourceIds.filter((id) => id.startsWith('doc:'))).toHaveLength(5);
+    expect(legacyNonFinite.includedSourceIds.filter((id) => id.startsWith('doc:'))).toHaveLength(5);
+    expect(current.includedSourceIds.filter((id) => id.startsWith('doc:'))).toHaveLength(7);
+  });
+
+
   it('validates source revision, normalized source version, and exact quotes against included excerpts', async () => {
     const catalog = await createSourceCatalog([transcript, rules, profile], fakeSha256);
     const selection = selectContext(catalog, { query: 'North', byteBudget: 4000, buildBody: (context) => JSON.stringify({ context }) });

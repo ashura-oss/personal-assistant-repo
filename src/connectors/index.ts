@@ -1081,13 +1081,15 @@ export class ConnectorClient {
   }
 
   async readSelectedMessageText(account: Account, providerMessageId: string, options: {
-    sizeEstimate?: number; sizeCheckedAt?: string; guard?: RequestGuard; signal?: AbortSignal;
+    sizeEstimate?: number; sizeCheckedAt?: string; guard?: RequestGuard; signal?: AbortSignal; maxTextBytes?: number;
   } = {}): Promise<SelectedMessageTextResult> {
     capability(account, 'mail.read');
     if ((account.provider !== 'google' && account.provider !== 'microsoft') || !account.grantedScopes ||
         !scopeGrantsCapability(account.provider, account.grantedScopes, 'mail.read')) throw new Error('Full message body read permission is required.');
     if (!providerMessageId || providerMessageId.length > 2048 || /[\r\n\0]/.test(providerMessageId)) throw new Error('Selected message identifier is invalid.');
     const idFormat = account.provider === 'google' ? 'gmail' as const : 'graph-immutable' as const;
+    const maxTextBytes = options.maxTextBytes ?? 16 * 1024;
+    if (!Number.isSafeInteger(maxTextBytes) || maxTextBytes < 1 || maxTextBytes > MAX_SELECTED_MESSAGE_BYTES) throw new Error('Mail text output bound is invalid.');
     const initialMessage: MessageSummary = { id: providerMessageId, idFormat };
     let sizeEstimate: number | undefined;
     let providerVersion: string | undefined;
@@ -1140,7 +1142,7 @@ export class ConnectorClient {
       if (!selected.message) return unavailable(['message_id_mismatch_or_invalid_response'], initialMessage);
       const actualEstimate = selected.message.sizeEstimate;
       if (actualEstimate !== undefined && actualEstimate > MAX_SELECTED_MESSAGE_BYTES) return unavailable(['size_limit'], selected.message);
-      const extracted = extractGmailMessageText(selected.payload, selected.snippet);
+      const extracted = extractGmailMessageText(selected.payload, selected.snippet, maxTextBytes);
       const reasons = [...extracted.reasons];
       if (!selected.message.replyMetadataComplete) reasons.push('reply_metadata_incomplete');
       return { status: selected.message.replyMetadataComplete && extracted.text !== undefined ? 'available' : 'unavailable', message: selected.message,
@@ -1167,15 +1169,15 @@ export class ConnectorClient {
     if (!selected.message) return unavailable(['message_id_mismatch_or_invalid_response'], initialMessage);
     const contentType = typeof selected.body?.contentType === 'string' ? selected.body.contentType.toLowerCase() : '';
     let extracted;
-    if (contentType === 'text' && typeof selected.body?.content === 'string') extracted = boundGraphText(selected.body.content);
+    if (contentType === 'text' && typeof selected.body?.content === 'string') extracted = boundGraphText(selected.body.content, maxTextBytes);
     else if (contentType === 'html' && typeof selected.body?.content === 'string') {
-      extracted = extractGraphHtmlText(selected.body.content);
+      extracted = extractGraphHtmlText(selected.body.content, maxTextBytes);
       if (extracted.text === undefined) {
-        const fallback = extractGmailMessageText(undefined, selected.snippet);
+        const fallback = extractGmailMessageText(undefined, selected.snippet, maxTextBytes);
         extracted = { ...fallback, reasons: [...extracted.reasons, ...fallback.reasons].slice(0, 16) };
       }
     } else {
-      extracted = extractGmailMessageText(undefined, selected.snippet);
+      extracted = extractGmailMessageText(undefined, selected.snippet, maxTextBytes);
       extracted.reasons = [...extracted.reasons, 'plain_body_unavailable'].slice(0, 16);
     }
     const reasons = [...extracted.reasons];

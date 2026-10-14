@@ -52,6 +52,13 @@ describe('OpenRouter Batch local request builder', () => {
     expect(body.response_format.json_schema.schema).toEqual(assistantResponseSchema);
   });
 
+  it('rejects a policy-v2 aggregate request that exceeds the serialized physical request bound', async () => {
+    await expect(new OpenRouterBatchRequestBuilder().prepareAnalysis(note, [], settings, {
+      intent: 'answer', question: 'Review the selected source.', inputPolicyVersion: 2,
+      additionalSources: [{ id: 'large-required-source', revision: 1, text: 'x'.repeat(1024 * 1024), required: true }],
+    }, undefined, 2)).rejects.toThrow(/request limit|serialized request limit/i);
+  });
+
   it('builds explicit answer-only refinements with strict empty action arrays and request-local effort', async () => {
     const prepared = await new OpenRouterBatchRequestBuilder().prepareAnalysis(note, [], settings, {
       intent: 'answer', question: 'Respond to the current user message.', chatMode: true, chatRefinement: true,
@@ -89,5 +96,28 @@ describe('OpenRouter Batch local request builder', () => {
     expect(messages[1]?.content).toContain('LOCKED TO:\nalex@example.test');
     expect(messages[1]?.content).toContain('USER BRIEF:\nSay that I will confirm.');
     expect(prepared.requestBytes).toBe(new TextEncoder().encode(prepared.body).length);
+  });
+
+  it('accepts uncapped v2 mail input while retaining the same physical request limit', () => {
+    const longBody = 'email '.repeat(3_000);
+    const brief = 'brief '.repeat(1_000);
+    const noteContext = 'note '.repeat(1_000);
+    const policyContext = 'guidance '.repeat(1_000);
+    const prepared = new OpenRouterBatchRequestBuilder().prepareReply({
+      sourceText: longBody, sourceRepresentation: 'plain', sourceCompleteness: 'complete_text',
+      subject: 'Schedule', to: ['alex@example.test'], cc: [], brief, noteContext, policyContext,
+      asOf: '2026-10-13T10:00:00.000Z', timeZone: 'Asia/Singapore',
+    }, settings, 2);
+    const body = JSON.parse(prepared.body) as { messages: { content: string }[] };
+    expect(body.messages[1]?.content).toContain(longBody);
+    expect(body.messages[1]?.content).toContain(brief);
+    expect(body.messages[1]?.content).toContain(noteContext);
+    expect(body.messages[0]?.content).toContain(policyContext);
+    expect(prepared.requestBytes).toBeLessThan(1024 * 1024 - 4096);
+    expect(() => new OpenRouterBatchRequestBuilder().prepareReply({
+      sourceText: longBody, sourceRepresentation: 'plain', sourceCompleteness: 'complete_text',
+      subject: 'Schedule', to: ['alex@example.test'], cc: [], brief: 'Reply.', noteContext: '', policyContext: '',
+      asOf: '2026-10-13T10:00:00.000Z', timeZone: 'Asia/Singapore',
+    }, settings)).toThrow(/16 KiB/i);
   });
 });
