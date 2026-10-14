@@ -241,10 +241,14 @@ describe('read-only iOS config validation', () => {
     expect(validateIosConfiguration(duplicateStartCanHang).failures).toContain('The pinned Expo fetch lifetime/cancellation helper is missing or changed.');
 
     const duplicateStartChangesRedirect = validFixture();
-    duplicateStartChangesRedirect.expoNativeRequestSwiftSource = duplicateStartChangesRedirect.expoNativeRequestSwiftSource.replace(
+    duplicateStartChangesRedirect.expoNativeRequestSwiftSource = duplicateStartChangesRedirect.expoNativeRequestSwiftSource.replace(/\r?\n/g, '\r\n');
+    const normalizedNativeRequest = duplicateStartChangesRedirect.expoNativeRequestSwiftSource.replace(/\r\n?/g, '\n');
+    const mutatedNativeRequest = normalizedNativeRequest.replace(
       'case .started:\n      self.response.redirectMode = requestInit.redirect',
       'self.response.redirectMode = requestInit.redirect\n    case .started:'
     );
+    expect(mutatedNativeRequest).not.toBe(normalizedNativeRequest);
+    duplicateStartChangesRedirect.expoNativeRequestSwiftSource = mutatedNativeRequest;
     expect(validateIosConfiguration(duplicateStartChangesRedirect).failures).toContain('The pinned Expo fetch lifetime/cancellation helper is missing or changed.');
   });
 
