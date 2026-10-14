@@ -139,6 +139,19 @@ export class OwnedWorkspaceRuntime {
     });
   }
 
+  /** Read-only receipt lookup. It deliberately bypasses busy/refresh-required state and never touches the controller. */
+  inspectCommandReceipt(admission: OwnedWorkspaceAdmission, idempotencyKey: string): CommandAdmission | undefined {
+    this.assertAdmission(admission);
+    const identity = this.options.kernel.getOwnedIdentity(admission.sessionToken);
+    const result = this.journal.inspectIfExists(admission.sessionToken, idempotencyKey);
+    admission.assertCurrent();
+    const current = this.options.kernel.getOwnedIdentity(admission.sessionToken);
+    if (current.workspaceId !== identity.workspaceId || current.ownerId !== identity.ownerId || current.privacyEpoch !== identity.privacyEpoch) {
+      throw new Error('workspace_ownership_changed');
+    }
+    return result;
+  }
+
   /** Stops admission synchronously, drains owned promises, then disposes exact registry entries. */
   closeAfterDrain(): Promise<void> {
     if (this.closePromise) return this.closePromise;

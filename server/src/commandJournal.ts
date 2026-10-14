@@ -264,12 +264,19 @@ export class CommandJournal {
   }
 
   inspect(sessionToken: string, idempotencyKey: string): CommandAdmission {
+    const result = this.inspectIfExists(sessionToken, idempotencyKey);
+    if (!result) throw new Error('The command receipt was not found.');
+    return result;
+  }
+
+  /** Authenticated read-only receipt lookup; absence is distinct from any recorded status. */
+  inspectIfExists(sessionToken: string, idempotencyKey: string): CommandAdmission | undefined {
     requireKey(idempotencyKey);
     const identity = this.kernel.getOwnedIdentity(sessionToken);
     return this.kernel.withOwnedTransaction(sessionToken, identity.privacyEpoch, (context) => {
       const row = context.db.prepare(`SELECT * FROM async_command_journal WHERE workspace_id=? AND idempotency_key=?`)
         .get(context.workspaceId, idempotencyKey) as JournalRow | undefined;
-      if (!row) throw new Error('The command receipt was not found.');
+      if (!row) return undefined;
       if (row.owner_id !== context.ownerId || row.workspace_id !== context.workspaceId || row.privacy_epoch !== context.privacyEpoch) throw new Error('The command receipt belongs to another workspace or privacy epoch.');
       return Object.freeze({ fresh: false, status: row.status,
         ...(row.receipt_json ? { receipt: parseJson(row.receipt_json) } : {}),
