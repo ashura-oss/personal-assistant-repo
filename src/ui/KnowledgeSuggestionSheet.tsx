@@ -1,7 +1,8 @@
-import React, { useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { Modal, Pressable, ScrollView, Text, View } from 'react-native';
-import type { KnowledgeChange, KnowledgeReference, KnowledgeSuggestion, Person, Project } from '../knowledge/types';
+import type { KnowledgeChange, KnowledgeReference, KnowledgeSuggestion, KnowledgeSuggestionReview, Person, Project } from '../knowledge/types';
 import type { EditKnowledgeSuggestionInput, ReviewKnowledgeSuggestionInput } from '../core';
+import { KnowledgeSuggestionReviewOwnership, type KnowledgeSuggestionReviewOwner } from './knowledgeSuggestionReviewOwnership';
 import { Button, Field, IconButton } from './primitives';
 import { s } from './theme';
 
@@ -11,6 +12,10 @@ type Props = {
   projects: Project[];
   sourceLabels: Record<string, string>;
   busy: boolean;
+  blocked?: boolean;
+  openRequest?: Readonly<{ suggestionId: string; requestId: number }>;
+  onRequestHandled?: (requestId: number) => void;
+  onPrepareReview: (id: string, input: { expectedRevision: number }) => Promise<KnowledgeSuggestionReview>;
   onReview: (id: string, input: ReviewKnowledgeSuggestionInput) => Promise<unknown>;
   onEdit: (id: string, input: EditKnowledgeSuggestionInput) => Promise<KnowledgeSuggestion | undefined>;
 };
@@ -29,7 +34,7 @@ type OpenSnapshot = {
   sourceLabels: Record<string, string>;
 };
 
-export function KnowledgeSuggestionSheet({ suggestions, people, projects, sourceLabels, busy, onReview, onEdit }: Props) {
+export function KnowledgeSuggestionSheet({ suggestions, people, projects, sourceLabels, busy, blocked = false, openRequest, onRequestHandled, onPrepareReview, onReview, onEdit }: Props) {
   const [filter, setFilter] = useState<Filter>('pending');
   const [opened, setOpened] = useState<OpenSnapshot | null>(null);
   const [editing, setEditing] = useState(false);
@@ -38,6 +43,29 @@ export function KnowledgeSuggestionSheet({ suggestions, people, projects, source
   const [editPersonId, setEditPersonId] = useState('');
   const [message, setMessage] = useState('');
   const [successMessage, setSuccessMessage] = useState('');
+  const [preparedReview, setPreparedReview] = useState<KnowledgeSuggestionReview>();
+  const [preparingReview, setPreparingReview] = useState(false);
+  const [preflightReason, setPreflightReason] = useState('');
+  const [selectedOwnerGeneration, setSelectedOwnerGeneration] = useState<number | undefined>(undefined);
+  const ownerRef = useRef(new KnowledgeSuggestionReviewOwnership());
+  const selectedOwnerRef = useRef<KnowledgeSuggestionReviewOwner | undefined>(undefined);
+  const actionLock = useRef(false);
+  const actionTokenSequence = useRef(0);
+  const activeActionTokenRef = useRef<number | undefined>(undefined);
+  const mounted = useRef(true);
+  const pendingEditedPreflightRef = useRef<KnowledgeSuggestionReviewOwner | undefined>(undefined);
+  const [waitingEditedRevision, setWaitingEditedRevision] = useState(false);
+  const requestIdRef = useRef<number | undefined>(openRequest?.requestId);
+  const requestRef = useRef(openRequest);
+  const openSuggestionRef = useRef<(suggestion: KnowledgeSuggestion) => void>(() => undefined);
+  const contextRef = useRef({ suggestions, people, projects, blocked, busy, onPrepareReview, onRequestHandled });
+  useLayoutEffect(() => { contextRef.current = { suggestions, people, projects, blocked, busy, onPrepareReview, onRequestHandled }; }, [suggestions, people, projects, blocked, busy, onPrepareReview, onRequestHandled]);
+  useLayoutEffect(() => {
+    mounted.current = true;
+    const ownership = ownerRef.current;
+    return () => { mounted.current = false; ownership.publish(); selectedOwnerRef.current = undefined; };
+  }, []);
+  useLayoutEffect(() => { requestIdRef.current = openRequest?.requestId; requestRef.current = openRequest; }, [openRequest]);
   const selected = opened?.suggestion;
   const liveSuggestion = selected && suggestions.find((item) => item.id === selected.id);
   const liveEntity = selected ? findTarget(selected, people, projects) : undefined;
@@ -46,16 +74,51 @@ export function KnowledgeSuggestionSheet({ suggestions, people, projects, source
   const liveMemberPerson = selectedMemberPersonId ? people.find((person) => person.id === selectedMemberPersonId) : undefined;
   const selectedReference = selected?.change.type === 'add_source_link' ? selected.change.reference : undefined;
   const liveReferencedEntity = selectedReference ? findReferencedEntity(selectedReference, people, projects) : undefined;
-  const snapshotChanged = Boolean(selected && (
-    !liveSuggestion || liveSuggestion.revision !== selected.revision ||
+  const suggestionChanged = Boolean(selected && (!liveSuggestion || liveSuggestion.revision !== selected.revision));
+  const preparedReviewCurrent = Boolean(selected && preparedReview?.suggestion.id === selected.id && preparedReview.suggestion.revision === selected.revision);
+  const targetSnapshotChanged = Boolean(selected && (
     liveEntity?.revision !== opened?.entityRevision ||
     (selectedMemberPersonId && liveMemberPerson?.revision !== opened?.memberRevision) ||
     (selectedReference && (selectedReference.kind === 'person' || selectedReference.kind === 'project') &&
       (!liveReferencedEntity || liveReferencedEntity.revision !== opened?.referenceRevision || Boolean(liveReferencedEntity.archivedAt)))
   ));
+  const reviewIsPreparing = preparingReview && selectedOwnerGeneration !== undefined;
   const items = suggestions.filter((item) => item.status === filter).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 
+  const isOwnerCurrent = useCallback((owner: KnowledgeSuggestionReviewOwner) => {
+    const context = contextRef.current;
+    const current = context.suggestions.find((item) => item.id === owner.suggestionId);
+    return mounted.current && !context.blocked && ownerRef.current.owns(owner) &&
+      (!context.busy || actionLock.current) && current?.revision === owner.revision && current.status === 'pending';
+  }, []);
+
+  const closeSuggestion = () => {
+    ownerRef.current.publish(); selectedOwnerRef.current = undefined; setSelectedOwnerGeneration(undefined); pendingEditedPreflightRef.current = undefined; setWaitingEditedRevision(false); actionLock.current = false; activeActionTokenRef.current = undefined;
+    setOpened(null); setEditing(false); setPreparedReview(undefined); setPreparingReview(false); setPreflightReason('');
+  };
+
+  const prepareCurrent = useCallback(async (owner: KnowledgeSuggestionReviewOwner) => {
+    setPreparingReview(true); setPreparedReview(undefined); setPreflightReason('');
+    try {
+      const result = await ownerRef.current.prepare({
+        owner,
+        isCurrent: () => isOwnerCurrent(owner),
+        prepare: () => contextRef.current.onPrepareReview(owner.suggestionId, { expectedRevision: owner.revision }),
+      });
+      if (result.kind === 'prepared' && isOwnerCurrent(owner)) {
+        setPreparedReview(result.review);
+        setPreflightReason(result.review.reason ?? '');
+      }
+    } catch (error) {
+      if (isOwnerCurrent(owner)) setPreflightReason(error instanceof Error ? error.message : 'Could not check the latest suggestion. Close and reopen it.');
+    } finally {
+      if (ownerRef.current.owns(owner)) setPreparingReview(false);
+    }
+  }, [isOwnerCurrent]);
+
   const openSuggestion = (suggestion: KnowledgeSuggestion) => {
+    if (blocked || busy || actionLock.current) return;
+    pendingEditedPreflightRef.current = undefined;
     const entity = findTarget(suggestion, people, projects);
     const personId = suggestion.change.type === 'add_member' ? suggestion.change.personId : undefined;
     const person = personId ? people.find((item) => item.id === personId) : undefined;
@@ -63,28 +126,88 @@ export function KnowledgeSuggestionSheet({ suggestions, people, projects, source
     const referencedEntity = reference ? findReferencedEntity(reference, people, projects) : undefined;
     setOpened({ suggestion, entity: entity ? cloneValue(entity) : undefined, entityRevision: entity?.revision, memberPerson: person ? cloneValue(person) : undefined, memberRevision: person?.revision, referencedEntity: referencedEntity ? cloneValue(referencedEntity) : undefined, referenceRevision: referencedEntity?.revision, people: cloneValue(people), projects: cloneValue(projects), sourceLabels: { ...sourceLabels } });
     setEditing(false); setMessage(''); setSuccessMessage('');
+    setPreparedReview(undefined); setPreflightReason('');
+    const owner = ownerRef.current.publish(suggestion.id, suggestion.revision)!;
+    selectedOwnerRef.current = owner;
+    setSelectedOwnerGeneration(owner.generation);
+    if (suggestion.status === 'pending') void prepareCurrent(owner);
   };
+  useLayoutEffect(() => { openSuggestionRef.current = openSuggestion; });
+
+  useEffect(() => {
+    const request = requestRef.current;
+    if (!request) return;
+    if (blocked) { contextRef.current.onRequestHandled?.(request.requestId); return; }
+    if (busy) return;
+    void Promise.resolve().then(() => {
+      if (!mounted.current || requestIdRef.current !== request.requestId || requestRef.current?.requestId !== request.requestId || contextRef.current.blocked || contextRef.current.busy) return;
+      const suggestion = contextRef.current.suggestions.find((item) => item.id === request.suggestionId && item.status === 'pending');
+      if (suggestion) openSuggestionRef.current(suggestion);
+      else setMessage('This Chat suggestion is no longer pending. Refresh the latest Memory list.');
+      contextRef.current.onRequestHandled?.(request.requestId);
+    });
+  }, [openRequest?.requestId, blocked, busy]);
+
+  useEffect(() => {
+    const owner = pendingEditedPreflightRef.current;
+    if (!owner || blocked || busy || !ownerRef.current.owns(owner)) return;
+    const live = suggestions.find((item) => item.id === owner.suggestionId);
+    if (!live || live.revision !== owner.revision || live.status !== 'pending') return;
+    pendingEditedPreflightRef.current = undefined;
+    void Promise.resolve().then(() => {
+      if (!mounted.current || blocked || busy || !isOwnerCurrent(owner)) return;
+      setWaitingEditedRevision(false);
+      void prepareCurrent(owner);
+    });
+  }, [suggestions, blocked, busy, waitingEditedRevision, isOwnerCurrent, prepareCurrent]);
+
+  useLayoutEffect(() => {
+    if (blocked && selectedOwnerRef.current) {
+      ownerRef.current.publish();
+      selectedOwnerRef.current = undefined;
+      activeActionTokenRef.current = undefined;
+      actionLock.current = false;
+      pendingEditedPreflightRef.current = undefined;
+      void Promise.resolve().then(() => {
+        if (!mounted.current || selectedOwnerRef.current) return;
+        setOpened(null); setEditing(false); setPreparedReview(undefined); setPreparingReview(false); setPreflightReason(''); setSelectedOwnerGeneration(undefined); setWaitingEditedRevision(false);
+      });
+    }
+  }, [blocked]);
 
   const decide = async (decision: 'accept' | 'dismiss') => {
-    if (!selected || busy || snapshotChanged) return;
+    const owner = selectedOwnerRef.current;
+    if (!selected || !owner || busy || blocked || actionLock.current || suggestionChanged || selected.status !== 'pending' ||
+      (decision === 'dismiss' ? false : targetSnapshotChanged || !preparedReviewCurrent || !preparedReview ||
+        ownerRef.current.current(owner)?.canAccept !== true)) return;
+    if (decision === 'dismiss' && !preparedReviewCurrent && !preflightReason && !suggestionChanged) return;
+    if (!isOwnerCurrent(owner)) return;
+    actionLock.current = true;
+    const actionToken = ++actionTokenSequence.current;
+    activeActionTokenRef.current = actionToken;
     try {
       setMessage('');
       setSuccessMessage('');
-      const result = await onReview(selected.id, {
+      const result = await onReview(owner.suggestionId, {
         expectedRevision: selected.revision,
         decision,
         ...(decision === 'accept' && opened?.entityRevision !== undefined ? { targetRevision: opened.entityRevision } : {}),
         ...(decision === 'accept' && opened?.memberRevision !== undefined ? { memberPersonRevision: opened.memberRevision } : {}),
       });
-      if (result) setOpened(null);
-      else setMessage('This review could not be saved. Check the app notice, then close and reopen it.');
+      if (!ownerRef.current.owns(owner)) return;
+      if (result) closeSuggestion();
+      else if (isOwnerCurrent(owner)) setMessage('This review could not be saved. Check the app notice, then close and reopen it.');
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'This review changed. Close and reopen the latest version.');
+      if (isOwnerCurrent(owner)) setMessage(error instanceof Error ? error.message : 'This review changed. Close and reopen the latest version.');
+    } finally {
+      if (activeActionTokenRef.current === actionToken) { actionLock.current = false; activeActionTokenRef.current = undefined; }
     }
   };
 
   const beginEdit = () => {
-    if (!selected) return;
+    const owner = selectedOwnerRef.current;
+    if (!selected || !owner || !isOwnerCurrent(owner) || suggestionChanged || targetSnapshotChanged ||
+      !preparedReviewCurrent || !preparedReview || ownerRef.current.current(owner)?.canEdit !== true || busy || blocked || actionLock.current) return;
     switch (selected.change.type) {
       case 'add_fact': setEditValue(selected.change.statement); break;
       case 'add_contact': setEditValue(selected.change.address); setEditLabel(selected.change.label); break;
@@ -95,21 +218,36 @@ export function KnowledgeSuggestionSheet({ suggestions, people, projects, source
   };
 
   const saveEdit = async () => {
-    if (!selected || !opened || busy || snapshotChanged) return;
+    const owner = selectedOwnerRef.current;
+    if (!selected || !opened || !owner || busy || blocked || actionLock.current || suggestionChanged || targetSnapshotChanged ||
+      !preparedReviewCurrent || !preparedReview || ownerRef.current.current(owner)?.canEdit !== true || !isOwnerCurrent(owner)) return;
     const change = editedChange(selected.change, editValue, editLabel, editPersonId, opened.people);
     if (!change) { setMessage('Choose a valid value for this suggestion.'); return; }
+    actionLock.current = true;
+    const actionToken = ++actionTokenSequence.current;
+    activeActionTokenRef.current = actionToken;
     try {
-      const result = await onEdit(selected.id, { expectedRevision: selected.revision, change, evidence: selected.evidence });
+      const result = await onEdit(owner.suggestionId, { expectedRevision: owner.revision, change, evidence: selected.evidence });
+      if (!ownerRef.current.owns(owner) || selectedOwnerRef.current?.generation !== owner.generation) return;
       if (!result) { setMessage('The edit was not saved. Check the app notice, then reopen this suggestion.'); return; }
+      if (result.id !== owner.suggestionId || result.revision <= owner.revision) { setMessage('The edit result could not be matched to this suggestion. Reopen the latest Memory list.'); return; }
       const entity = findTarget(result, people, projects);
       const personId = result.change.type === 'add_member' ? result.change.personId : undefined;
       const person = personId ? people.find((item) => item.id === personId) : undefined;
       const reference = result.change.type === 'add_source_link' ? result.change.reference : undefined;
       const referencedEntity = reference ? findReferencedEntity(reference, people, projects) : undefined;
       setOpened({ suggestion: result, entity: entity ? cloneValue(entity) : undefined, entityRevision: entity?.revision, memberPerson: person ? cloneValue(person) : undefined, memberRevision: person?.revision, referencedEntity: referencedEntity ? cloneValue(referencedEntity) : undefined, referenceRevision: referencedEntity?.revision, people: cloneValue(people), projects: cloneValue(projects), sourceLabels: { ...sourceLabels } });
+      const nextOwner = ownerRef.current.publish(result.id, result.revision)!;
+      selectedOwnerRef.current = nextOwner;
+      setSelectedOwnerGeneration(nextOwner.generation);
+      setPreparedReview(undefined); setPreparingReview(false); setPreflightReason('');
+      pendingEditedPreflightRef.current = nextOwner;
+      setWaitingEditedRevision(true);
       setEditing(false); setMessage(''); setSuccessMessage('The original remains in review history. This edit is a new suggestion revision.');
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'This suggestion changed. Close and reopen the latest version.');
+      if (isOwnerCurrent(owner)) setMessage(error instanceof Error ? error.message : 'This suggestion changed. Close and reopen the latest version.');
+    } finally {
+      if (activeActionTokenRef.current === actionToken) { actionLock.current = false; activeActionTokenRef.current = undefined; }
     }
   };
 
@@ -123,16 +261,20 @@ export function KnowledgeSuggestionSheet({ suggestions, people, projects, source
       </Pressable>;
     }) : <View style={s.knowledgeEmpty}><Text style={s.emptyTitle}>{filter === 'pending' ? 'Nothing to review' : `No ${filter} suggestions`}</Text><Text style={s.emptyText}>Suggestions stay separate from saved knowledge until you review them.</Text></View>}
 
-    <Modal visible={Boolean(opened)} animationType="slide" presentationStyle="pageSheet" onRequestClose={() => setOpened(null)}>
+    <Modal visible={Boolean(opened && selectedOwnerGeneration !== undefined && !blocked)} animationType="slide" presentationStyle="pageSheet" onRequestClose={closeSuggestion}>
       <View style={s.safe}>
         {selected ? <>
-          <View style={s.modalHeader}><IconButton name="chevron-back" label="Close suggestion review" onPress={() => setOpened(null)} /><Text style={s.modalTitle}>Memory suggestion</Text><View style={{ width: 46 }} /></View>
+          <View style={s.modalHeader}><IconButton name="chevron-back" label="Close suggestion review" onPress={closeSuggestion} /><Text style={s.modalTitle}>Memory suggestion</Text><View style={{ width: 46 }} /></View>
           <ScrollView contentContainerStyle={s.scroll} showsVerticalScrollIndicator={false}>
             <Text style={s.kicker}>{selected.status.toUpperCase()} · REVIEW BEFORE SAVING</Text>
             <Text style={s.h1Small}>{changeLabel(selected)}</Text>
             <Text style={s.analysisSource}>{selectedEntity ? `${entityLabel(selected.change.entityKind)} · ${selectedEntity.name}${selectedEntity.importOrigin?.kind === 'backup_knowledge' ? ' · Imported copy' : ''}` : 'Target unavailable'}</Text>
             {selectedEntity?.archivedAt ? <Text style={s.knowledgeFootnote}>This {selected.change.entityKind} is archived.</Text> : null}
-            {snapshotChanged ? <View style={s.analysisStale}><Text style={s.analysisText}>The suggestion, target, member, or linked entity changed while this sheet was open. Close and reopen it to review the current revision.</Text></View> : null}
+            {suggestionChanged ? <View style={s.analysisStale}><Text style={s.analysisText}>This suggestion changed. Close and reopen the latest revision before reviewing it.</Text></View> : null}
+            {targetSnapshotChanged && !suggestionChanged ? <View style={s.analysisStale}><Text style={s.analysisText}>The target, member, or linked entity changed while this sheet was open. Edit or save is unavailable. You can still dismiss this exact suggestion revision.</Text></View> : null}
+            {selected.status === 'pending' && reviewIsPreparing ? <Text style={s.knowledgeFootnote}>Checking the current source before enabling review…</Text> : null}
+            {selected.status === 'pending' && waitingEditedRevision ? <Text style={s.knowledgeFootnote}>Waiting for the saved revision before checking it…</Text> : null}
+            {selected.status === 'pending' && preflightReason ? <Text style={s.knowledgeError}>{preflightReason}</Text> : null}
             <Text style={s.sectionTitle}>Proposed change</Text>
             <Text style={s.analysisText}>{changeDescription(selected, opened?.people ?? [], opened?.projects ?? [], opened?.sourceLabels ?? {})}</Text>
             <Text style={s.sectionTitle}>Current saved context</Text>
@@ -147,9 +289,9 @@ export function KnowledgeSuggestionSheet({ suggestions, people, projects, source
             {message ? <Text accessibilityRole="alert" style={s.knowledgeError}>{message}</Text> : null}
             {successMessage ? <Text style={s.knowledgeFootnote}>{successMessage}</Text> : null}
             {selected.status === 'pending' && !editing ? <>
-              <Button label="Edit suggestion" tone="quiet" disabled={busy || snapshotChanged} onPress={beginEdit} />
-              <Button label="Save this suggestion" disabled={busy || snapshotChanged || !selectedEntity || Boolean(selectedEntity?.archivedAt)} onPress={() => void decide('accept')} />
-              <Button label="Dismiss suggestion" tone="quiet" disabled={busy || snapshotChanged} onPress={() => void decide('dismiss')} />
+              <Button label="Edit suggestion" tone="quiet" disabled={blocked || busy || selectedOwnerGeneration === undefined || reviewIsPreparing || !preparedReviewCurrent || !preparedReview?.canEdit || targetSnapshotChanged || suggestionChanged} onPress={beginEdit} />
+              <Button label="Save this suggestion" disabled={blocked || busy || selectedOwnerGeneration === undefined || reviewIsPreparing || !preparedReviewCurrent || !preparedReview?.canAccept || targetSnapshotChanged || suggestionChanged || !selectedEntity || Boolean(selectedEntity?.archivedAt)} onPress={() => void decide('accept')} />
+              <Button label="Dismiss suggestion" tone="quiet" disabled={blocked || busy || selectedOwnerGeneration === undefined || reviewIsPreparing || (!preparedReviewCurrent && !preflightReason) || suggestionChanged} onPress={() => void decide('dismiss')} />
               <Text style={s.knowledgeFootnote}>Saving adds a new claim or link and keeps its evidence. It does not send a message or verify contact details.</Text>
             </> : null}
             {editing ? <>
@@ -157,7 +299,7 @@ export function KnowledgeSuggestionSheet({ suggestions, people, projects, source
               {selected.change.type === 'add_contact' ? <><Field label="Contact address · not verified" value={editValue} onChangeText={setEditValue} keyboardType="email-address" /><Field label="Claim label" value={editLabel} onChangeText={setEditLabel} /></> : null}
               {selected.change.type === 'add_source_link' ? <Field label="Link label" value={editValue} onChangeText={setEditValue} /> : null}
               {selected.change.type === 'add_member' ? <><Text style={s.label}>Person</Text>{(opened?.people ?? []).filter((person) => !person.archivedAt).map((person) => <Pressable key={person.id} accessibilityRole="radio" accessibilityState={{ selected: editPersonId === person.id }} onPress={() => setEditPersonId(person.id)} style={[s.knowledgeStatusChoice, editPersonId === person.id && s.knowledgeStatusSelected]}><Text style={s.knowledgeMeta}>{person.name}{person.importOrigin?.kind === 'backup_knowledge' ? ' · Imported copy' : ''}</Text></Pressable>)}<Field label="Role" value={editValue} onChangeText={setEditValue} /></> : null}
-              <Button label="Save as a new suggestion revision" disabled={busy || snapshotChanged || !editValue.trim()} onPress={() => void saveEdit()} />
+              <Button label="Save as a new suggestion revision" disabled={blocked || busy || selectedOwnerGeneration === undefined || !preparedReviewCurrent || !preparedReview?.canEdit || targetSnapshotChanged || suggestionChanged || !editValue.trim()} onPress={() => void saveEdit()} />
               <Button label="Cancel edit" tone="quiet" disabled={busy} onPress={() => setEditing(false)} />
             </> : null}
           </ScrollView>

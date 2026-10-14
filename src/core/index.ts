@@ -1,7 +1,7 @@
 /** Stable application contracts shared by the UI, services, and storage. */
 import type { AssistantCitation, AssistantDecision } from '../assistant';
 import type { AudioRecoveryMetadata } from '../audio/recovery.types';
-import type { KnowledgeState, KnowledgeEntityKind, KnowledgeFact, ContactClaim, KnowledgeSourceLink, ProjectMember, KnowledgeSuggestion, KnowledgeChange, KnowledgeEvidence } from '../knowledge/types';
+import type { KnowledgeState, KnowledgeEntityKind, KnowledgeFact, ContactClaim, KnowledgeSourceLink, ProjectMember, KnowledgeSuggestion, KnowledgeSuggestionReview, KnowledgeChange, KnowledgeEvidence } from '../knowledge/types';
 import type { ReminderRecord, ReminderState, ReminderPayload } from '../reminders';
 import type { StartupRecoveryInspection, StartupRecoveryPlan, StartupRecoveryReceipt, StartupRecoveryCommitInput } from '../storage/startupRecovery';
 import type { PendingCaptureReceipt, PendingCaptureSafeStatus } from '../audio/pendingCaptureService.types';
@@ -917,6 +917,7 @@ export interface AppController {
   removeKnowledgeMember(input: KnowledgeItemCommand & { entityKind: 'project' }): Promise<void>;
   createKnowledgeSuggestionFromNote(input: { noteId: string; sourceId: string; quote: string; targetKind: KnowledgeEntityKind; targetId: string; change: import('../knowledge/types').KnowledgeChange }): Promise<KnowledgeSuggestion>;
   editKnowledgeSuggestion(id: string, input: EditKnowledgeSuggestionInput): Promise<KnowledgeSuggestion>;
+  prepareKnowledgeSuggestionReview(id: string, input: { expectedRevision: number }): Promise<KnowledgeSuggestionReview>;
   reviewKnowledgeSuggestion(id: string, input: ReviewKnowledgeSuggestionInput): Promise<KnowledgeSuggestion>;
   saveDocument(path: string, content: string, options?: { expectedRevision?: number; expectedEntityRevision?: number }): Promise<ContextDocument>;
   prepareImportedKnowledgeActivation(input: { archiveId: string; cohortId: string; kind: KnowledgeEntityKind; entityId: string }): Promise<ImportedKnowledgeActivationPreview>;

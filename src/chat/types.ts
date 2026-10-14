@@ -61,6 +61,7 @@ export type ChatTurnDTO = Readonly<{
   operation?: 'chat_refinement';
   reasoningEffort?: 'medium' | 'high' | 'max';
   parentTurnId?: string;
+  memorySuggestionIds?: readonly string[];
   reply?: Pick<ChatReplySnapshot, 'summary' | 'answer' | 'clarifications' | 'completedAt'>;
   job?: import('../services/openRouterBatchJobs').AssistantBatchJobDTO;
 }>;

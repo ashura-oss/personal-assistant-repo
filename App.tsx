@@ -51,7 +51,7 @@ import type {
   ProactiveRecoveryStatus,
 } from "./src/proactive/recovery";
 import type { StartupRecoveryPlan } from "./src/storage/startupRecovery";
-import type { KnowledgeEntityKind, KnowledgeReference, KnowledgeSuggestion } from "./src/knowledge/types";
+import type { KnowledgeEntityKind, KnowledgeReference, KnowledgeSuggestion, KnowledgeSuggestionReview } from "./src/knowledge/types";
 import { SpeechTranscriptionError } from "./src/transcription/types";
 import { OPENROUTER_SPEECH_DEFAULT_MODEL } from "./src/transcription/openRouterSpeechProfiles";
 import { useAudioCapture } from "./src/audio/useAudioCapture";
@@ -90,8 +90,10 @@ import { PendingRecordingRecoveryPanel } from "./src/components/PendingRecording
 import { BackgroundRefreshSection, type BackgroundRefreshActionResult } from "./src/components/BackgroundRefreshSection";
 import { AssistantBatchHistorySection } from "./src/ui/AssistantBatchHistorySection";
 import { ChatSection } from "./src/ui/ChatSection";
+import { safeChatMemoryEvidenceLabels } from "./src/ui/chatMemoryReview";
+import { prepareKnowledgeSuggestionReviewWithPrivacy } from "./src/ui/knowledgeSuggestionReviewOwnership";
 import { isAcceptedChatSubmission, runAcceptedChatSubmission } from "./src/ui/chatSubmission";
-import type { ChatTranscriptTransferPlan } from "./src/chat/types";
+import type { ChatConversationDTO, ChatTranscriptTransferPlan, ChatTurnDTO } from "./src/chat/types";
 import { VoiceChatTransferOwnership } from "./src/ui/voiceChatTransferOwnership";
 import { createSpeechTranscriptionAdmission, runExplicitSpeechTranscriptionAction } from "./src/ui/speechTranscriptionAction";
 import type { AssistantBatchJobDTO } from "./src/services/openRouterBatchJobs";
@@ -983,6 +985,8 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
   const [proactiveRecoveryRefreshedId, setProactiveRecoveryRefreshedId] = useState<string | undefined>();
   const [proactiveRecoverySheetOpen, setProactiveRecoverySheetOpen] = useState(false);
   const [selectedChatConversationId, setSelectedChatConversationId] = useState<string | undefined>();
+  const [knowledgeReviewRequest, setKnowledgeReviewRequest] = useState<{ suggestionId: string; requestId: number } | undefined>();
+  const knowledgeReviewRequestSequence = useRef(0);
   const [chatTranscriptTransferPlan, setChatTranscriptTransferPlan] = useState<ChatTranscriptTransferPlan | undefined>();
   const [chatTranscriptTransferPreparedAt, setChatTranscriptTransferPreparedAt] = useState<number | undefined>();
   const [chatTranscriptTransferBusy, setChatTranscriptTransferBusy] = useState(false);
@@ -1284,6 +1288,15 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
     audio.status !== "idle" || pendingCaptureLoading || Boolean(captureJournal && pendingCaptureStatus?.kind !== "empty") ||
     foregroundResumeRefreshing || !foregroundCatchupComplete || proactiveRecoverySheetOpen || proactiveRecoveryRequiresRefresh ||
     Boolean(review || replyMessageId || reminderReviewId || detail || doc || recordingAttachmentNoteId || manualOpen || settingsOpen || mailAlertTapResolution);
+  const knowledgeReviewBlocked = !startupReady || loading || isIsolatedDemo || isolatedPreviewFailed || privacyReviewOpen || privacyOutcomeUnknown ||
+    audio.status !== "idle" || pendingCaptureLoading || Boolean(captureJournal && pendingCaptureStatus?.kind !== "empty") ||
+    foregroundResumeRefreshing || !foregroundCatchupComplete || proactiveRecoverySheetOpen || proactiveRecoveryRequiresRefresh ||
+    Boolean(state.mailAlertRefreshRequired || state.assistantChatRecoveryStatus || state.assistantBatchRecoveryStatus ||
+      state.proactiveMailAlertRecoveryStatus || state.backupRecoveryStatus || state.knowledgeRecoveryStatus || state.reminderRecoveryStatus) ||
+    Boolean(review || replyMessageId || reminderReviewId || detail || doc || recordingAttachmentNoteId || manualOpen || settingsOpen ||
+      mailAlertTapResolution || mailAlertTapPending || chatDeleteReviewOpen || chatInteractionLocked);
+  const knowledgeReviewBlockedRef = useRef(knowledgeReviewBlocked);
+  useLayoutEffect(() => { knowledgeReviewBlockedRef.current = knowledgeReviewBlocked; }, [knowledgeReviewBlocked]);
   const chatDisabledReason = isOpenRouterChatDemo
     ? undefined
     : !productionChatSubmissionEnabled
@@ -1966,6 +1979,33 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
       : 'Refinement request saved. Its request status is shown below.');
     return accepted;
   }), [chatAppBlocked, controller, credentials, openSettings, run, selectedChatConversationId, state.assistantChatConversations, state.settings.llmProvider, state.settings.mode]);
+  const openChatMemorySuggestion = useCallback((suggestionId: string, conversation: ChatConversationDTO, turn: ChatTurnDTO) => {
+    if (knowledgeReviewBlockedRef.current || selectedChatConversationId !== conversation.id || turn.operation === 'chat_refinement' ||
+        !(turn.memorySuggestionIds ?? []).includes(suggestionId)) return;
+    const currentConversation = (controller.getSnapshot().assistantChatConversations ?? []).find((item) => item.id === conversation.id);
+    const currentTurn = currentConversation?.turns.find((item) => item.id === turn.id);
+    if (!currentConversation || !currentTurn || currentTurn.operation === 'chat_refinement' || currentTurn.noteId !== turn.noteId ||
+        currentTurn.createdAt !== turn.createdAt || currentTurn.userText !== turn.userText ||
+        !(currentTurn.memorySuggestionIds ?? []).includes(suggestionId)) return;
+    const requestId = ++knowledgeReviewRequestSequence.current;
+    setKnowledgeReviewRequest({ suggestionId, requestId });
+    setTab('library');
+  }, [controller, selectedChatConversationId]);
+  const handleKnowledgeReviewRequest = useCallback((requestId: number) => {
+    setKnowledgeReviewRequest((current) => current?.requestId === requestId ? undefined : current);
+  }, []);
+  const prepareKnowledgeSuggestionReview = useCallback(async (id: string, input: { expectedRevision: number }): Promise<KnowledgeSuggestionReview> => {
+    if (knowledgeReviewBlockedRef.current) throw new Error('Memory review is unavailable while the workspace is blocked.');
+    return prepareKnowledgeSuggestionReviewWithPrivacy({
+      prepare: async () => {
+      const result = await controller.prepareKnowledgeSuggestionReview(id, input);
+      if (knowledgeReviewBlockedRef.current) throw new Error('Memory review changed while the workspace was blocked. Reopen the current suggestion.');
+      return result;
+      },
+      isPrivacyError: isPrivacyBootstrapError,
+      onPrivacyInvalidated: () => onPrivacyInvalidated(),
+    });
+  }, [controller, onPrivacyInvalidated]);
   const chatDeleteConversation = useCallback(async (conversationId: string) => {
     const result = await run(async () => {
       await controller.deleteChatConversation(conversationId);
@@ -3428,6 +3468,7 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
                 })}
                 onRetryJobCleanup={(jobId) => controller.retryAssistantBatchCleanup(jobId)}
                 onRefineTurn={chatRefineTurn}
+                onReviewMemorySuggestion={openChatMemorySuggestion}
               />
             ) : tab === "record" ? (
               <RecordScreen
@@ -3522,6 +3563,10 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
                 knowledgeRecoveryStatus={state.knowledgeRecoveryStatus}
                 references={knowledgeReferenceOptions(state)}
                 evidenceLabels={knowledgeEvidenceLabels(state)}
+                chatEvidenceLabels={safeChatMemoryEvidenceLabels(chatConversations)}
+                memoryReviewBlocked={knowledgeReviewBlocked}
+                memoryReviewRequest={knowledgeReviewRequest}
+                onMemoryReviewRequestHandled={handleKnowledgeReviewRequest}
                 previewMode={isIsolatedDemo}
                 sampleBackupMode={isBackupImportDemo}
                 knowledgeDemoMode={isKnowledgeDemo}
@@ -3561,6 +3606,7 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
                 onRemoveKnowledgeMember={(input) => run(async () => { await controller.removeKnowledgeMember(input); return true; })}
                 onReviewKnowledgeSuggestion={(id, input) => run(() => controller.reviewKnowledgeSuggestion(id, input))}
                 onEditKnowledgeSuggestion={(id, input) => run(() => controller.editKnowledgeSuggestion(id, input))}
+                onPrepareKnowledgeSuggestionReview={prepareKnowledgeSuggestionReview}
                 onRun={(action) => run(action)}
                 onOpenDoc={(d) => {
                   const existing = state.documents.find(
@@ -4592,6 +4638,10 @@ function LibraryScreen({
   knowledgeRecoveryStatus,
   references,
   evidenceLabels,
+  chatEvidenceLabels,
+  memoryReviewBlocked,
+  memoryReviewRequest,
+  onMemoryReviewRequestHandled,
   previewMode,
   sampleBackupMode,
   knowledgeDemoMode,
@@ -4623,6 +4673,7 @@ function LibraryScreen({
   onRemoveKnowledgeMember,
   onReviewKnowledgeSuggestion,
   onEditKnowledgeSuggestion,
+  onPrepareKnowledgeSuggestionReview,
   onRun,
 }: {
   notes: Note[];
@@ -4639,6 +4690,10 @@ function LibraryScreen({
   knowledgeRecoveryStatus?: AppState["knowledgeRecoveryStatus"];
   references: { reference: KnowledgeReference; label: string }[];
   evidenceLabels: Record<string, string>;
+  chatEvidenceLabels: Record<string, string>;
+  memoryReviewBlocked: boolean;
+  memoryReviewRequest?: { suggestionId: string; requestId: number };
+  onMemoryReviewRequestHandled: (requestId: number) => void;
   previewMode: boolean;
   sampleBackupMode: boolean;
   knowledgeDemoMode: boolean;
@@ -4670,10 +4725,12 @@ function LibraryScreen({
   onRemoveKnowledgeMember: (input: KnowledgeItemCommand & { entityKind: 'project' }) => Promise<unknown>;
   onReviewKnowledgeSuggestion: (id: string, input: ReviewKnowledgeSuggestionInput) => Promise<unknown>;
   onEditKnowledgeSuggestion: (id: string, input: EditKnowledgeSuggestionInput) => Promise<KnowledgeSuggestion | undefined>;
+  onPrepareKnowledgeSuggestionReview: (id: string, input: { expectedRevision: number }) => Promise<KnowledgeSuggestionReview>;
   onRun: <T>(action: () => Promise<T>) => Promise<T | undefined>;
 }) {
   const [importOpen, setImportOpen] = useState(false);
-  const [section, setSection] = useState<'notes' | 'people' | 'projects' | 'memory' | 'reminders'>(reminderDemoMode ? 'reminders' : knowledgeDemoMode ? 'memory' : 'notes');
+  const [section, setSection] = useState<'notes' | 'people' | 'projects' | 'memory' | 'reminders'>(() =>
+    memoryReviewRequest ? 'memory' : reminderDemoMode ? 'reminders' : knowledgeDemoMode ? 'memory' : 'notes');
   const [entityKind, setEntityKind] = useState<'person' | 'project'>('person');
   const [editingEntityId, setEditingEntityId] = useState<string | null>(null);
   const [editorInstance, setEditorInstance] = useState(0);
@@ -4859,8 +4916,12 @@ function LibraryScreen({
             suggestions={knowledge.suggestions}
             people={knowledge.people}
             projects={knowledge.projects}
-            sourceLabels={evidenceLabels}
+            sourceLabels={{ ...evidenceLabels, ...chatEvidenceLabels }}
             busy={busy}
+            blocked={memoryReviewBlocked}
+            openRequest={memoryReviewRequest}
+            onRequestHandled={onMemoryReviewRequestHandled}
+            onPrepareReview={onPrepareKnowledgeSuggestionReview}
             onReview={onReviewKnowledgeSuggestion}
             onEdit={onEditKnowledgeSuggestion}
           />

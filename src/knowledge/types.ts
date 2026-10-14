@@ -110,6 +110,13 @@ export interface KnowledgeSuggestion {
   staleReason?: string;
 }
 
+export interface KnowledgeSuggestionReview {
+  readonly suggestion: KnowledgeSuggestion;
+  readonly canEdit: boolean;
+  readonly canAccept: boolean;
+  readonly reason?: string;
+}
+
 export interface KnowledgeState {
   schemaVersion: 1;
   people: Person[];

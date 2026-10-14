@@ -109,6 +109,89 @@ describe('saved transcript to Chat transfer', () => {
     expect(dispatches).toHaveLength(1);
   });
 
+  it('rejects saved-transcript Chat dispatch if settings change while the journal mirror is waiting', async () => {
+    const store = new MemoryStore();
+    const bodies: Record<string, unknown>[] = [];
+    const dispatches: string[] = [];
+    let markMirrorStarted!: () => void;
+    let releaseMirror!: () => void;
+    const mirrorStarted = new Promise<void>((resolve) => { markMirrorStarted = resolve; });
+    const mirrorGate = new Promise<void>((resolve) => { releaseMirror = resolve; });
+    const app = new AppControllerImpl(store, {}, {
+      openRouterBatchClient: batchClient(bodies, dispatches),
+      writeDocument: async (_path, content) => {
+        if (content.includes('saved-chat:')) { markMirrorStarted(); await mirrorGate; }
+      },
+    });
+    await app.load();
+    await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
+    const original = await app.saveNote({ transcript: 'A stable saved transcript.', capturedAt: '2026-10-13T01:00:00.000Z', captureTimeZone: 'Asia/Singapore' });
+    const plan = await app.prepareChatFromTranscript({ noteId: original.id, expectedRevision: original.revision });
+    const conversation = await app.createChatConversation('Transfer mirror race');
+
+    const submission = app.submitChatFromTranscript({ planId: plan.planId, conversationId: conversation.id });
+    await mirrorStarted;
+    await app.saveSettings({ mode: 'preview' });
+    releaseMirror();
+
+    await expect(submission).resolves.toMatchObject({ kind: 'accepted' });
+    expect(dispatches).toHaveLength(0);
+    expect(app.getSnapshot().assistantChatConversations?.[0]?.turns[0]?.userText).toBe(original.transcript);
+  });
+
+  it('retires a pending saved-transcript Chat candidate when its original note changes, preserving the copied user message', async () => {
+    const store = new MemoryStore();
+    let personId = '';
+    let targetRevision = 1;
+    const client = {
+      submit: async (_input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => {
+        await before(); assert();
+        return { batchId: 'voice-memory-batch', status: 'validating' as const, endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH,
+          model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h' as const, total: 1, completed: 0, failed: 0 };
+      },
+      inspect: async (batchId: string, customId: string) => {
+        const job = (store.value as (AppState & { openRouterBatchLedger?: { jobs: { id: string; sourceVersions: Record<string, string> }[] } }) | undefined)
+          ?.openRouterBatchLedger?.jobs.find((item) => item.id === customId);
+        const content = JSON.stringify({ summary: 'A saved transcript preference.', answer: 'I will remember this preference.',
+          decisions: [], citations: [], clarifications: [], proposals: [], memorySuggestions: [{
+            targetSourceId: `knowledge:person:${personId}`, targetRevision, type: 'add_fact', statement: 'Prefers short summaries.',
+            address: null, label: null, relatedSourceId: null, role: null,
+            evidence: [{ sourceId: 'transcript', revision: 1, sourceVersion: job?.sourceVersions.transcript, quote: 'Maya prefers short summaries.' }],
+          }] });
+        return { batchId, status: 'completed', endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH, model: OPENROUTER_BATCH_BODY_MODEL,
+          completionWindow: '24h', total: 1, completed: 1, failed: 0, metadataValidation: 'valid', resultValidation: 'valid',
+          usage: { cost: 0.001, promptTokens: 8, completionTokens: 8, totalTokens: 16 },
+          result: { customId, statusCode: 200, finishReason: 'stop', responseBody: { model: OPENROUTER_BATCH_BODY_MODEL,
+            choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content } }] } } };
+      },
+    } as unknown as OpenRouterBatchClient;
+    const app = new AppControllerImpl(store, {}, { openRouterBatchClient: client });
+    await app.load();
+    await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
+    const original = await app.saveNote({ transcript: 'Maya prefers short summaries.', capturedAt: '2026-10-13T01:00:00.000Z', captureTimeZone: 'Asia/Singapore' });
+    const person = await app.savePerson({ name: 'Maya', aliases: [], narrative: '' });
+    personId = person.id;
+    await app.saveKnowledgeSourceLink({ entityKind: 'person', entityId: person.id, expectedEntityRevision: person.revision,
+      reference: { kind: 'note', id: original.id }, label: 'Transcript context' });
+    targetRevision = app.getSnapshot().knowledge.people.find((item) => item.id === person.id)!.revision;
+    const conversation = await app.createChatConversation('Voice memory source');
+    const plan = await app.prepareChatFromTranscript({ noteId: original.id, expectedRevision: original.revision });
+    const accepted = await app.submitChatFromTranscript({ planId: plan.planId, conversationId: conversation.id });
+    await app.refreshAssistantBatch(accepted.jobId);
+    const suggestion = app.getSnapshot().knowledge.suggestions.find((item) => item.status === 'pending')!;
+    const copiedText = app.getSnapshot().assistantChatConversations?.[0]?.turns[0]?.userText;
+    expect(suggestion).toBeTruthy();
+    expect(await app.prepareKnowledgeSuggestionReview(suggestion.id, { expectedRevision: suggestion.revision })).toMatchObject({ canAccept: true });
+
+    await app.updateTranscript(original.id, 'The saved transcript was corrected.');
+
+    expect(app.getSnapshot().assistantChatConversations?.[0]?.turns[0]?.userText).toBe(copiedText);
+    expect(app.getSnapshot().assistantChatConversations?.[0]?.turns[0]?.userText).toBe(original.transcript);
+    expect(app.getSnapshot().knowledge.suggestions.find((item) => item.id === suggestion.id)?.status).not.toBe('pending');
+    await expect(app.reviewKnowledgeSuggestion(suggestion.id, { expectedRevision: suggestion.revision, decision: 'accept', targetRevision }))
+      .rejects.toThrow();
+  });
+
   it('exports live saved-transcript provenance through strict import and re-export without source authority', async () => {
     const sourceStore = new MemoryStore();
     const sourceBodies: Record<string, unknown>[] = [];

@@ -99,6 +99,7 @@ import { OpenRouterSpeechClient } from './openRouterSpeech';
 import { OpenRouterSpeechAdapter } from './openRouterSpeechAdapter';
 import { emptyChatLedger, selectCompletedChatContext, validateChatLedger } from '../chat/ledger';
 import type { ChatConversation, ChatConversationDTO, ChatReplySnapshot, ChatTranscriptTransferPlan, ReadonlyChatLedger } from '../chat/types';
+import type { KnowledgeSuggestionReview } from '../knowledge/types';
 import {
   emptyOpenRouterBatchLedger, validateOpenRouterBatchLedger, assistantBatchJobDTO, accountingFromInspection,
   isOpenRouterBatchContentJob, isOpenRouterMailReplyContentJob, tombstoneOpenRouterBatchJob,
@@ -2136,12 +2137,23 @@ export class AppControllerImpl implements AppController {
 
   private chatConversationDTOs(): ChatConversationDTO[] {
     if (this.assistantChatLedgerMalformed) return [];
+    const jobsById = new Map(this.assistantBatchLedger.jobs.map((job) => [job.id, job]));
+    const suggestionsById = new Map(this.state.knowledge.suggestions.map((suggestion) => [suggestion.id, suggestion]));
+    const pendingMemoryIdsByNote = new Map<string, readonly string[]>();
+    for (const note of this.state.notes) {
+      const ids = note.analysis?.memorySuggestionIds?.filter((suggestionId) => {
+        const suggestion = suggestionsById.get(suggestionId);
+        return suggestion?.sourceNoteId === note.id && suggestion.status === 'pending';
+      });
+      if (ids?.length) pendingMemoryIdsByNote.set(note.id, Object.freeze([...ids]));
+    }
     return this.assistantChatLedger.conversations.map((conversation) => Object.freeze({
       id: conversation.id, title: conversation.title, createdAt: conversation.createdAt, updatedAt: conversation.updatedAt,
       turns: Object.freeze(conversation.turns.map((turn) => {
-        const job = this.assistantBatchLedger.jobs.find((item) => item.id === turn.jobId);
+        const job = jobsById.get(turn.jobId);
         const dto = job ? assistantBatchJobDTO(job, this.assistantBatchCleanupRetries.has(job.id)) : undefined;
-        return Object.freeze({ id: turn.id, noteId: turn.noteId, userText: turn.userText, createdAt: turn.createdAt,
+        const memorySuggestionIds = pendingMemoryIdsByNote.get(turn.noteId) ?? [];
+        return Object.freeze({ id: turn.id, noteId: turn.noteId, userText: turn.userText, createdAt: turn.createdAt, memorySuggestionIds: Object.freeze([...memorySuggestionIds]),
           ...(turn.messageOrigin ? { messageOrigin: turn.messageOrigin, capturedAt: turn.capturedAt, captureTimeZone: turn.captureTimeZone } : {}),
           ...(turn.operation ? { operation: turn.operation } : {}),
           ...(turn.reasoningEffort ? { reasoningEffort: turn.reasoningEffort } : {}),
@@ -2723,6 +2735,35 @@ export class AppControllerImpl implements AppController {
           throw error;
         }
         await this.cancelNewMailAlertIntents(newCancellationIntents);
+      }
+      return clone(result);
+    });
+    this.transactionQueue = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  /** A serialized read with privacy, storage ownership, and bootstrap fences; it never saves or runs mutation reconciliation. */
+  private async serializedRead<T>(operation: (state: AppState) => Promise<T>): Promise<T> {
+    await this.assertPrivacySessionCurrent();
+    const capturedBootstrapGeneration = this.bootstrapGeneration;
+    const capturedPrivacyEpoch = this.integration.privacySession?.epoch;
+    const run = this.transactionQueue.then(async () => {
+      if (capturedBootstrapGeneration !== this.bootstrapGeneration) throw new Error('The app restarted while this review was waiting. Refresh and try again.');
+      if (!this.loaded || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired) throw new Error('App startup is not ready. Retry startup or complete the recovery flow first.');
+      await this.assertPrivacySessionCurrent();
+      if (capturedBootstrapGeneration !== this.bootstrapGeneration || this.integration.privacySession?.epoch !== capturedPrivacyEpoch ||
+          this.startupRecoveryPhase !== 'ready' || !this.loaded || this.mailAlertRefreshRequired) {
+        throw new Error('App startup changed while this review was waiting. Refresh and try again.');
+      }
+      await this.store.assertCurrent?.();
+      const capturedState = this.state;
+      const result = await operation(capturedState);
+      await this.store.assertCurrent?.();
+      await this.assertPrivacySessionCurrent();
+      if (this.state !== capturedState || capturedBootstrapGeneration !== this.bootstrapGeneration ||
+          this.integration.privacySession?.epoch !== capturedPrivacyEpoch || this.startupRecoveryPhase !== 'ready' ||
+          !this.loaded || this.mailAlertRefreshRequired) {
+        throw new Error('The review changed while it was being checked. Refresh and try again.');
       }
       return clone(result);
     });
@@ -4525,15 +4566,40 @@ export class AppControllerImpl implements AppController {
     return undefined;
   }
 
-  private materializeAssistantMemorySuggestions(state: AppState, rows: DraftAnalysis['memorySuggestions'], note: Note, fingerprint: string): string[] {
+  private chatMemoryReferenceIsAllowed(state: AppState, row: DraftAnalysis['memorySuggestions'][number], note: Note, job: OpenRouterBatchContentJob): boolean {
+    if (row.type === 'add_member') {
+      if (!row.relatedSourceId?.startsWith('knowledge:person:') || job.sourceVersions[row.relatedSourceId] === undefined) return false;
+      const id = row.relatedSourceId.slice('knowledge:person:'.length);
+      const person = state.knowledge.people.find((item) => item.id === id);
+      return Boolean(person && !person.archivedAt);
+    }
+    if (row.type !== 'add_source_link') return true;
+    const sourceId = row.relatedSourceId;
+    if (!sourceId || sourceId.startsWith('chat_turn:') || job.sourceVersions[sourceId] === undefined) return false;
+    const reference = this.sourceReference(state, sourceId, note);
+    if (!reference) return false;
+    if (reference.kind === 'note') {
+      const cited = state.notes.find((item) => item.id === reference.id);
+      if (!cited || (cited.origin === 'assistant_chat' && cited.id !== note.id)) return false;
+    }
+    try { this.assertKnowledgeReferenceExists(state, reference); } catch { return false; }
+    return true;
+  }
+
+  private materializeAssistantMemorySuggestions(state: AppState, rows: DraftAnalysis['memorySuggestions'], note: Note, fingerprint: string, chatJob?: OpenRouterBatchContentJob): string[] {
     if (this.knowledgeQuarantine.length || !rows.length) return [];
+    if (chatJob?.operation === 'chat_refinement') return [];
     const ids: string[] = [];
     for (const row of rows.slice(0, 4)) {
+      if (chatJob && (row.evidence.length < 1 || row.evidence.some((item) => item.sourceId !== 'transcript' || item.revision !== note.revision ||
+          item.sourceVersion !== chatJob.sourceVersions.transcript || !item.quote || !note.transcript.includes(item.quote)) ||
+          !this.chatMemoryReferenceIsAllowed(state, row, note, chatJob))) continue;
       const match = /^knowledge:(person|project):([0-9a-f-]+)$/.exec(row.targetSourceId);
       if (!match) continue;
       const entityKind = match[1] as KnowledgeEntityKind, entityId = match[2];
       const target = getKnowledgeEntity(state.knowledge, entityKind, entityId);
-      if (!target || target.archivedAt || target.revision !== row.targetRevision) continue;
+      if (!target || target.archivedAt || target.revision !== row.targetRevision ||
+          (chatJob && chatJob.sourceVersions[row.targetSourceId] === undefined)) continue;
       const evidence = row.evidence.map(({ sourceId, revision, sourceVersion, quote }) => ({
         sourceId: sourceId === 'transcript' ? `note:${note.id}` : sourceId, revision, sourceVersion, quote,
       }));
@@ -4559,6 +4625,55 @@ export class AppControllerImpl implements AppController {
     }
     state.knowledge = validateKnowledgeState(state.knowledge);
     return ids;
+  }
+
+  private async chatMemorySuggestionEligibility(state: AppState, suggestion: KnowledgeSuggestion): Promise<string | undefined> {
+    const staleReason = 'The source chat or its transcript changed. You can dismiss this suggestion.';
+    if (this.assistantChatLedgerMalformed || this.assistantBatchLedgerMalformed || !suggestion.sourceNoteId || !suggestion.sourceAnalysisFingerprint) return staleReason;
+    const matches = this.assistantChatLedger.conversations.flatMap((conversation) => conversation.turns
+      .filter((turn) => turn.noteId === suggestion.sourceNoteId).map((turn) => ({ conversation, turn })));
+    if (matches.length !== 1) return staleReason;
+    const { conversation, turn } = matches[0]!;
+    const note = state.notes.find((item) => item.id === turn.noteId);
+    const job = this.assistantBatchLedger.jobs.find((item) => item.id === turn.jobId);
+    if (!note || note.origin !== 'assistant_chat' || !job || !isOpenRouterBatchContentJob(job) || job.status !== 'completed' || job.sourceRemoved ||
+        turn.operation || job.operation || !turn.reply || !turn.replySha256 || note.revision !== turn.noteRevision || note.transcript !== turn.userText ||
+        note.analysis?.stale === true || note.analysis?.sourceRevision !== turn.noteRevision || note.analysis?.fingerprint !== note.processingFingerprint ||
+        !note.analysis?.memorySuggestionIds?.includes(suggestion.id) || job.noteId !== turn.noteId || job.noteRevision !== turn.noteRevision ||
+        !job.chatBinding || job.chatBinding.conversationId !== conversation.id || job.chatBinding.turnId !== turn.id ||
+        (note.capturedAt ?? note.createdAt) !== (turn.capturedAt ?? turn.createdAt) || note.captureTimeZone !== turn.captureTimeZone) return staleReason;
+    if (!this.chatLedgerLinksAreValid(this.assistantChatLedger, state)) return staleReason;
+    const expectedAnalysisFingerprint = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, note.processingFingerprint ?? '', { encoding: Crypto.CryptoEncoding.HEX });
+    if (suggestion.sourceAnalysisFingerprint !== expectedAnalysisFingerprint) return staleReason;
+    const memo = { results: new Map<string, Promise<boolean>>(), active: new Set<string>() };
+    if (!await this.chatTurnMatchesFrozenRequest(state, conversation, turn, memo)) return staleReason;
+    if (!job.sourceVersions.transcript || job.sourceVersions[`knowledge:${suggestion.change.entityKind}:${suggestion.change.entityId}`] === undefined) return staleReason;
+    if (suggestion.evidence.length < 1 || suggestion.evidence.some((evidence) => evidence.sourceId !== `note:${note.id}` ||
+        evidence.revision !== note.revision || evidence.sourceVersion !== job.sourceVersions.transcript || !evidence.quote || !note.transcript.includes(evidence.quote))) return staleReason;
+    if (suggestion.change.type === 'add_source_link') {
+      let matchedFrozenReference = false;
+      for (const sourceId of Object.keys(job.sourceVersions)) {
+        if (sourceId.startsWith('chat_turn:')) continue;
+        const reference = this.sourceReference(state, sourceId, note);
+        if (!reference || stableJson(reference) !== stableJson(suggestion.change.reference)) continue;
+        if (reference.kind === 'note') {
+          const cited = state.notes.find((item) => item.id === reference.id);
+          if (!cited || (cited.origin === 'assistant_chat' && cited.id !== note.id)) continue;
+        }
+        try { this.assertKnowledgeReferenceExists(state, reference); } catch { continue; }
+        matchedFrozenReference = true;
+        break;
+      }
+      if (!matchedFrozenReference) return staleReason;
+    } else if (suggestion.change.type === 'add_member') {
+      const member = suggestion.change;
+      const person = state.knowledge.people.find((item) => item.id === member.personId);
+      if (!person || person.archivedAt || person.revision !== member.personRevision ||
+          job.sourceVersions[`knowledge:person:${person.id}`] === undefined) return staleReason;
+    }
+    const target = getKnowledgeEntity(state.knowledge, suggestion.change.entityKind, suggestion.change.entityId);
+    if (!target || target.archivedAt || target.revision !== suggestion.targetRevision) return staleReason;
+    return undefined;
   }
 
   async refreshAnalysisStatus(noteId: string): Promise<NoteAssistResult | undefined> {
@@ -5175,13 +5290,16 @@ export class AppControllerImpl implements AppController {
         draft.notes.unshift(note);
         const nextChatLedger = validateChatLedger({ version: 1, conversations: this.assistantChatLedger.conversations.map((conversation) =>
           conversation.id === nextConversation.id ? nextConversation : conversation) });
-        return { job, noteId, turnId, conversationId, nextChatLedger, transcriptSource };
+        const docs = recordJournal(draft, `saved-chat:${turnId}:${jobId}`, `Saved Chat turn ${turnId} in conversation ${conversationId} (job ${jobId}).`);
+        return { job, noteId, turnId, conversationId, nextChatLedger, transcriptSource, docs };
       }, undefined,
       (_draft, result) => validateOpenRouterBatchLedger({ version: 1, jobs: [...this.assistantBatchLedger.jobs, result.job] }),
       (_draft, result) => result.nextChatLedger);
       if (!isOpenRouterBatchContentJob(staged.job)) throw new Error('The prepared chat request could not be retained.');
+      const stagedState = this.state;
+      await Promise.all(staged.docs.map((document) => this.mirrorDocument(document)));
       try {
-        await this.dispatchPreparedBatch(staged.job, capturedBootstrapGeneration, this.state, async () => {
+        await this.dispatchPreparedBatch(staged.job, capturedBootstrapGeneration, stagedState, async () => {
           const latest = this.state.notes.find((note) => note.id === transfer.noteId);
           if (!latest || latest.revision !== transfer.noteRevision ||
               !await this.transcriptSourceIsCurrent(this.state, staged.transcriptSource)) throw new Error('The original saved transcript changed before the chat request was sent.');
@@ -5278,15 +5396,18 @@ export class AppControllerImpl implements AppController {
         draft.notes.unshift(note);
         const nextChatLedger = validateChatLedger({ version: 1, conversations: this.assistantChatLedger.conversations.map((conversation) =>
           conversation.id === nextConversation.id ? nextConversation : conversation) });
-        return { job, noteId, turnId, conversationId: existingConversation.id, nextChatLedger, preparedState: draft };
+        const docs = recordJournal(draft, `saved-chat:${turnId}:${jobId}`, `Saved Chat turn ${turnId} in conversation ${existingConversation.id} (job ${jobId}).`);
+        return { job, noteId, turnId, conversationId: existingConversation.id, nextChatLedger, docs };
       }, undefined,
       (_draft, result) => validateOpenRouterBatchLedger({ version: 1, jobs: [...this.assistantBatchLedger.jobs, result.job] }),
       (_draft, result) => result.nextChatLedger);
       if (!isOpenRouterBatchContentJob(staged.job)) throw new Error('The prepared chat request could not be retained.');
+      const stagedState = this.state;
+      await Promise.all(staged.docs.map((document) => this.mirrorDocument(document)));
       // The user turn and immutable request were already durably saved. Network or
       // acknowledgement failures remain visible on that same safe job receipt.
       try {
-        await this.dispatchPreparedBatch(staged.job, capturedBootstrapGeneration, this.state);
+        await this.dispatchPreparedBatch(staged.job, capturedBootstrapGeneration, stagedState);
       } catch {
         if (!await this.durableChatTurnAccepted(staged, capturedBootstrapGeneration, 'note_assistance')) throw new Error('The chat submission outcome could not be confirmed. Refresh local data before continuing.');
         // The durable turn/job is still tied to this exact loaded workspace. Keep it
@@ -6214,7 +6335,12 @@ export class AppControllerImpl implements AppController {
       ];
       current.status = 'processed';
       current.processingFingerprint = processingFingerprint;
-      const memorySuggestionIds = batch?.chatBinding ? [] : this.materializeAssistantMemorySuggestions(draft, generated.memorySuggestions, current, memorySuggestionFingerprint);
+      const memoryChatJob = batch?.chatBinding ? this.assistantBatchLedger.jobs.find((job): job is OpenRouterBatchContentJob =>
+        job.id === batch.jobId && isOpenRouterBatchContentJob(job)) : undefined;
+      const memorySuggestionIds = batch?.chatBinding
+        ? (memoryChatJob && batch.operation !== 'chat_refinement'
+          ? this.materializeAssistantMemorySuggestions(draft, generated.memorySuggestions, current, memorySuggestionFingerprint, memoryChatJob) : [])
+        : this.materializeAssistantMemorySuggestions(draft, generated.memorySuggestions, current, memorySuggestionFingerprint);
       if (memorySuggestionIds.length) this.validateKnowledgeAndBackup(draft);
       const analysis: NoteAssistResult = {
         noteId: id, sourceRevision, intent, ...(question ? { question } : {}), fingerprint: processingFingerprint,
@@ -6225,13 +6351,18 @@ export class AppControllerImpl implements AppController {
         includedSourceIds: generated.includedSourceIds, includedSources: generated.includedSources, omittedSourceIds: generated.omittedSourceIds, omittedSourceCount: generated.omittedSourceCount, sourceVersions: generated.sourceVersions, knowledgeSelection,
       };
       current.analysis = analysis;
-      const docs = batch?.chatBinding ? [] : [
-        ...recordJournal(draft, `processed:${id}:r${sourceRevision}`, `Processed note ${current.title}; ${created.length} review suggestion(s) created.`),
-        ...created.filter((proposal) => !existingByAction.has(proposal.sourceActionKey!)).map((proposal) => appendInference(draft, proposal, state.settings.mode)),
-        ...memorySuggestionIds.flatMap(() => draft.documents.filter((document) => document.path === 'memory/INFERENCES.md')),
+      const docs = [
+        ...recordJournal(draft, batch?.chatBinding
+          ? `processed:chat:${batch.chatBinding.turnId}:${batch.jobId}`
+          : `processed:${id}:r${sourceRevision}`,
+        batch?.chatBinding ? `Processed Chat turn ${batch.chatBinding.turnId}; ${memorySuggestionIds.length} pending inference suggestion(s) created.`
+          : `Processed note ${current.title}; ${created.length} review suggestion(s) created.`),
+        ...(!batch?.chatBinding ? created.filter((proposal) => !existingByAction.has(proposal.sourceActionKey!)).map((proposal) => appendInference(draft, proposal, state.settings.mode)) : []),
+        ...(memorySuggestionIds.length ? draft.documents.filter((document) => document.path === 'memory/INFERENCES.md') : []),
       ];
+      const reviewSuggestionCount = batch?.chatBinding ? created.length + memorySuggestionIds.length : created.length;
       addActivity(draft, 'proposal_created', state.settings.mode === 'provider'
-        ? `Azure OpenAI assisted with this recorded note and drafted ${created.length} review suggestion${created.length === 1 ? '' : 's'}.`
+        ? `${state.settings.llmProvider === 'openrouter' ? 'OpenRouter' : 'Azure OpenAI'} assisted with this ${batch?.chatBinding ? 'Chat turn' : 'recorded note'} and drafted ${reviewSuggestionCount} review suggestion${reviewSuggestionCount === 1 ? '' : 's'}.`
         : `Preview mode extracted ${created.length} suggestion${created.length === 1 ? '' : 's'} from your transcript. No provider was contacted.`, { noteId: id });
       if (memorySuggestionIds.length) this.validateKnowledgeAndBackup(draft);
       return { proposals: selected, analysis, docs: [...new Map(docs.map((document) => [document.path, document])).values()] };
@@ -8542,11 +8673,15 @@ export class AppControllerImpl implements AppController {
 
   async editKnowledgeSuggestion(id: string, input: EditKnowledgeSuggestionInput): Promise<KnowledgeSuggestion> {
     this.assertKnowledgeWritable();
-    const result = await this.mutate((state) => {
+    const result = await this.mutate(async (state) => {
       this.assertKnowledgeWritable();
       const suggestion = state.knowledge.suggestions.find((item) => item.id === id);
       if (!suggestion) throw new Error('Memory suggestion was not found.');
       if (suggestion.revision !== input.expectedRevision || suggestion.status !== 'pending') throw new Error('This memory suggestion changed or is no longer pending.');
+      if (suggestion.sourceNoteId && state.notes.some((note) => note.id === suggestion.sourceNoteId && note.origin === 'assistant_chat')) {
+        const reason = await this.chatMemorySuggestionEligibility(state, suggestion);
+        if (reason) throw new Error(reason);
+      }
       let editedChange = input.change;
       const target = this.findKnowledgeEntity(state, editedChange.entityKind, editedChange.entityId);
       if (target.archivedAt) throw new Error('Unarchive the person or project before editing its suggestion.');
@@ -8571,6 +8706,10 @@ export class AppControllerImpl implements AppController {
         originalEvidence: suggestion.originalEvidence ?? suggestion.evidence,
         change: clone(editedChange), evidence: clone(input.evidence), updatedAt: now(), reviewedAt: undefined, status: 'pending',
       });
+      if (next.sourceNoteId && state.notes.some((note) => note.id === next.sourceNoteId && note.origin === 'assistant_chat')) {
+        const reason = await this.chatMemorySuggestionEligibility(state, next);
+        if (reason) throw new Error(reason);
+      }
       Object.assign(suggestion, next);
       this.journalKnowledgeReview(state, 'edited', suggestion, target.name);
       this.validateKnowledgeAndBackup(state);
@@ -8578,6 +8717,26 @@ export class AppControllerImpl implements AppController {
     });
     await this.mirrorKnowledgeJournals();
     return result;
+  }
+
+  async prepareKnowledgeSuggestionReview(id: string, input: { expectedRevision: number }): Promise<KnowledgeSuggestionReview> {
+    this.assertKnowledgeWritable();
+    return this.serializedRead(async (state) => {
+      this.assertKnowledgeWritable();
+      const suggestion = state.knowledge.suggestions.find((item) => item.id === id);
+      if (!suggestion) throw new Error('Memory suggestion was not found.');
+      if (!Number.isSafeInteger(input?.expectedRevision) || suggestion.revision !== input.expectedRevision) {
+        throw new Error('This memory suggestion changed. Refresh the review and try again.');
+      }
+      let reason: string | undefined;
+      if (suggestion.status !== 'pending') reason = 'This suggestion has already been reviewed.';
+      else if (suggestion.sourceNoteId && state.notes.some((note) => note.id === suggestion.sourceNoteId && note.origin === 'assistant_chat')) {
+        reason = await this.chatMemorySuggestionEligibility(state, suggestion);
+      }
+      const pending = suggestion.status === 'pending';
+      return Object.freeze({ suggestion: clone(suggestion), canEdit: pending && !reason,
+        canAccept: pending && !reason, ...(reason ? { reason } : {}) });
+    });
   }
 
   private async currentKnowledgeSourceVersions(state: AppState, suggestion: KnowledgeSuggestion): Promise<Map<string, { revision: number; version: string; text: string }>> {
@@ -8712,6 +8871,10 @@ export class AppControllerImpl implements AppController {
         addActivity(state, 'local_action', 'A memory suggestion was dismissed.', { noteId: suggestion.sourceNoteId });
         this.validateKnowledgeAndBackup(state);
         return suggestion;
+      }
+      if (suggestion.sourceNoteId && state.notes.some((note) => note.id === suggestion.sourceNoteId && note.origin === 'assistant_chat')) {
+        const reason = await this.chatMemorySuggestionEligibility(state, suggestion);
+        if (reason) throw new Error(reason);
       }
       const target = this.findKnowledgeEntity(state, suggestion.change.entityKind, suggestion.change.entityId);
       if (target.archivedAt || target.revision !== suggestion.targetRevision || (input.targetRevision !== undefined && input.targetRevision !== target.revision)) throw new Error('The target person or project changed. Refresh the suggestion before accepting it.');

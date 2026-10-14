@@ -5,6 +5,7 @@ import type { ChatConversationDTO, ChatTurnDTO } from '../chat/types';
 import { AssistantBatchJobCard } from './AssistantBatchJobCard';
 import { Button } from './primitives';
 import { isAcceptedChatSubmission } from './chatSubmission';
+import { chatMemoryReviewSuggestionIds } from './chatMemoryReview';
 import { C, s } from './theme';
 
 export type ChatConversation = ChatConversationDTO;
@@ -38,6 +39,7 @@ export type ChatSectionProps = {
   onCheckJob: (jobId: string) => Promise<unknown> | unknown;
   onRetryJobCleanup: (jobId: string) => Promise<unknown> | unknown;
   onRefineTurn?: (request: ChatRefinementRequest) => Promise<unknown>;
+  onReviewMemorySuggestion?: (suggestionId: string, conversation: ChatConversation, turn: ChatTurn) => void;
 };
 
 function dateLabel(value: string) {
@@ -135,6 +137,7 @@ export function ChatSection({
   onCheckJob,
   onRetryJobCleanup,
   onRefineTurn,
+  onReviewMemorySuggestion,
 }: ChatSectionProps) {
   const [draft, setDraft] = useState('');
   const [sending, setSending] = useState(false);
@@ -468,6 +471,20 @@ export function ChatSection({
                   onOpenActions={onOpenActions}
                 />
               ) : null}
+              {selectedConversation && onReviewMemorySuggestion &&
+                chatMemoryReviewSuggestionIds(turn).map((suggestionId, index, ids) => (
+                  <Button
+                    key={`${turn.id}-memory-${suggestionId}`}
+                    label={index === 0 && ids.length === 1 ? 'Review memory' : `Review memory suggestion ${index + 1}`}
+                    tone="quiet"
+                    disabled={navigationBlocked}
+                    onPress={() => {
+                      if (!navigationBlocked && !sendLock.current && !deleteLock.current && !refinementReviewLock.current && !refinementLock.current) {
+                        onReviewMemorySuggestion(suggestionId, selectedConversation, turn);
+                      }
+                    }}
+                  />
+                ))}
               {turn.reply && turn.job?.id && turn.job.status === 'completed' && onRefineTurn ? (
                 <Button label={turn.operation === 'chat_refinement' ? `Think more · ${(turn.reasoningEffort ?? 'medium').toUpperCase()}` : 'Think more'} tone="quiet" disabled={navigationBlocked || !enabled} onPress={() => openRefinementReview(turn)} />
               ) : null}
