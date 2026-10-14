@@ -4,9 +4,11 @@ Status: the selected product is a complete iPhone Home Screen PWA backed by a po
 
 ## Current implementation
 
-The repository now contains server-owned controller/runtime and private credential-reader foundations, a safe workspace DTO projection, readonly note/transcription/task leaf types, strict dispatch for `tasks.complete`, `tasks.reopen`, and `chat.create`, and a same-origin browser command transport. The existing full `WorkspaceView` has a platform boundary with its native composition preserved. These pieces are foundations; they do not make the full app available from an authenticated cloud workspace.
+The server has a recursive closed workspace DTO codec with a generated schema, plus same-origin HTTP routes for session authentication, workspace snapshot/refresh, the current command allowlist and receipt inspection, and credential management. The server-owned runtime, private credential reader, and browser command transport are implemented. Strict command dispatch currently supports `tasks.complete`, `tasks.reopen`, and `chat.create`. Selected readonly note, transcription, task, mail, history, and reminder leaves have been adapted for reuse.
 
-`npm run export:pwa` still packages the existing legacy web app. The current export has 679 modules, 12 bundles, and 17 static paths. It does not mount the cloud workspace or establish server-backed saves. The complete DTO decoder and full-screen cloud composition are not in place.
+The full authenticated workspace is not mounted in the normal app. `npm run export:pwa` still packages the existing legacy web app, so its successful export is not evidence of the cloud composition or server-backed saves. The auth mount and full-screen cloud workspace, including its review sheet, remain in progress. The Node raw-response ownership/lifetime foundation is also not yet wired through the host controller, audio, or speech-transcription continuations.
+
+New Batch submissions use input policy 2, removing the former per-source and source-count ceilings, selected-context ceiling, 48 KiB chat-history selection ceiling, and reply-text ceilings. Already saved policy-1 jobs retain their captured legacy behavior through recovery and refinement. Aggregate physical request, storage, response, and file limits remain. Note transcripts and Markdown content can use the existing 24 MiB aggregate backup restore allowance within the 32 MiB backup file bound; workspace snapshots retain a 16 MiB physical limit. These are storage and transport bounds, not AI usage quotas. Provider-reported cost and usage remain the only reported values; missing values stay unknown.
 
 The PWA worker caches only the app shell and an explicit allowlist of hashed JavaScript/font assets, the manifest, and the app icon. It does not cache API responses, authentication or OAuth traffic, audio, uploads, secrets, or external URLs. A cached shell can open offline; authenticated workspace reads and writes require a connection. This describes the current packaging boundary, not evidence of cloud behavior on iPhone.
 
@@ -16,9 +18,8 @@ The target is an installable iPhone Home Screen app with saved workspace data, p
 
 Before the target can be mounted or deployed, the remaining work includes:
 
-- Wire the real same-origin HTTP routes and authenticated bootstrap for session, safe snapshots, refresh, commands, receipts, credentials, and private media.
-- Complete the recursive DTO decoder and connect command outcomes to a full-screen cloud composition without casting snapshots to `AppState` or exposing local-only capabilities.
-- Implement server-backed capture save and private-media read/export paths, then connect the permitted provider composition and OAuth flows.
+- Mount the authenticated cloud screen and finish the full reusable workspace composition, review flow, and auth-to-workspace lifecycle.
+- Connect server-backed capture save and private-media read/export paths, then wire the permitted production provider composition and OAuth flows without exposing browser token material.
 - Move scheduled work and delivery to server-owned scheduling and Web Push, with explicit unknown-outcome and recovery handling.
 - Define backup, restore, retention, deletion, and privacy-erasure behavior for server-owned data and media.
 - Produce portable deployment and operations runbooks covering TLS, secure cookies, secret protection, persistent storage, encrypted off-host backups, monitoring, upgrades, and tested restore.
@@ -37,7 +38,7 @@ The service worker does not call `skipWaiting`, claim open clients, or force a r
 
 ## Migration sequence
 
-1. Complete and verify HTTP authentication/bootstrap, full snapshot decoding, and server-backed workspace reads and writes using the existing command allowlist and revision/privacy fences.
+1. Mount the authenticated workspace over the implemented HTTP routes and verify snapshot decoding, command receipts, and revision/privacy fences end to end.
 2. Connect capture saves, private media, supported providers, and OAuth to explicit server-owned actions; preserve unknown outcomes for receipt inspection and never automatically replay paid or external work.
 3. Move scheduled due work and delivery to server-owned jobs and Web Push; verify duplicate delivery, delayed execution, reconnect, and recovery behavior.
 4. Define and test backup, restore, retention, and deletion, then prepare deployment and operations runbooks for the chosen VPS or GCP VM.
