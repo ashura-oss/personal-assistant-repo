@@ -1,13 +1,25 @@
 import React from "react";
 import { Text, View } from "react-native";
-import type { AccountSyncState } from "../core";
+import type { WorkspaceSnapshotDTO } from "../cloud/workspaceDto";
 import { Button } from "./primitives";
 import { C } from "./theme";
+
+type WorkspaceSyncState = WorkspaceSnapshotDTO["state"]["syncStates"][string];
+export type MailSyncControlsState = Readonly<{
+  status: WorkspaceSyncState["status"];
+  mailHead: Pick<WorkspaceSyncState["mailHead"], "status" | "lastPageCheckedAt" | "lastError">;
+  mailBackfill: Pick<WorkspaceSyncState["mailBackfill"],
+    "status" | "coverageNeededThrough" | "lastCompletedAt" | "olderHistoryNotCheckedBefore" | "lastError"
+  > & Readonly<{
+    coverage?: Pick<NonNullable<WorkspaceSyncState["mailBackfill"]["coverage"]>, "from" | "through">;
+    activeWindow?: Pick<NonNullable<WorkspaceSyncState["mailBackfill"]["activeWindow"]>, "from" | "through">;
+  }>;
+}>;
 
 type Props = {
   accountId: string;
   email: string;
-  syncState?: AccountSyncState;
+  syncState?: MailSyncControlsState;
   busy: boolean;
   onRefresh: (accountId: string) => void;
   onContinue: (accountId: string) => void;

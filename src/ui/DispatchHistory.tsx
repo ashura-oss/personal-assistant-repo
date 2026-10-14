@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import { Pressable, Text, View } from "react-native";
-import type { DispatchRecord, DispatchReconciliation } from "../dispatch";
+import type { DispatchReconciliation } from "../dispatch";
+import type { WorkspaceSnapshotDTO } from "../cloud/workspaceDto";
 import { Button, Field } from "./primitives";
 import { s } from "./theme";
 
@@ -10,8 +11,35 @@ type ReconcileInput = {
   remoteId?: string;
 };
 
+type WorkspaceDispatchRecord = WorkspaceSnapshotDTO["state"]["dispatchRecords"][number];
+type WorkspaceDispatchPayload = WorkspaceDispatchRecord["payload"];
+type WorkspaceEmailPayload = Extract<WorkspaceDispatchPayload, { kind: "email" }>["email"];
+type WorkspaceEventPayload = Extract<WorkspaceDispatchPayload, { kind: "event" }>["event"];
+type ReplySourceDisplay = Pick<Extract<WorkspaceDispatchRecord["sourceProvenance"], { version: 2 }>["source"],
+  "from" | "senderEmail" | "subject" | "snippet"
+>;
+type DispatchPayloadDisplay =
+  | Readonly<{
+      kind: "email";
+      email: Pick<WorkspaceEmailPayload, "to" | "cc" | "bcc" | "subject" | "text"> & Readonly<{
+        attachments: readonly Pick<WorkspaceEmailPayload["attachments"][number], "id" | "fileName" | "mimeType" | "sizeBytes">[];
+        reply?: Pick<NonNullable<WorkspaceEmailPayload["reply"]>, "mode">;
+      }>;
+    }>
+  | Readonly<{ kind: "event"; event: Pick<WorkspaceEventPayload, "title" | "description" | "start" | "end" | "timeZone" | "attendees" | "invitePolicy"> }>;
+export type DispatchHistoryRecord = Pick<WorkspaceDispatchRecord,
+  "id" | "operation" | "outcome" | "dispatchStartedAt" | "title" | "body" |
+  "payloadDigest" | "outcomeAt" | "rejectionCode" | "replyDraftCheck" | "remoteId"
+> & Readonly<{
+  payload: DispatchPayloadDisplay;
+  account: Pick<WorkspaceDispatchRecord["account"], "provider" | "displayName" | "email">;
+  calendar?: Pick<NonNullable<WorkspaceDispatchRecord["calendar"]>, "name" | "providerId">;
+  sourceProvenance: Readonly<{ version: 1 }> | Readonly<{ version: 2; source: ReplySourceDisplay }>;
+  reconciliations: readonly Pick<WorkspaceDispatchRecord["reconciliations"][number], "id" | "disposition" | "at" | "note" | "remoteId">[];
+}>;
+
 type DispatchHistoryProps = {
-  records: DispatchRecord[];
+  records: readonly DispatchHistoryRecord[];
   incomplete?: boolean;
   busy?: boolean;
   onReconcile?: (recordId: string, input: ReconcileInput) => Promise<unknown>;
@@ -81,7 +109,7 @@ function DispatchRecordView({
   busy,
   onReconcile,
 }: {
-  record: DispatchRecord;
+  record: DispatchHistoryRecord;
   attemptNumber: number;
   busy: boolean;
   onReconcile?: DispatchHistoryProps["onReconcile"];
@@ -338,7 +366,7 @@ function DispatchRecordView({
   );
 }
 
-function replyDraftCheckLabel(value: NonNullable<DispatchRecord["replyDraftCheck"]>) {
+function replyDraftCheckLabel(value: NonNullable<DispatchHistoryRecord["replyDraftCheck"]>) {
   switch (value) {
     case "matches_approved":
       return "matches the approved reply";
@@ -349,7 +377,7 @@ function replyDraftCheckLabel(value: NonNullable<DispatchRecord["replyDraftCheck
   }
 }
 
-function providerName(provider: DispatchRecord["account"]["provider"]): string {
+function providerName(provider: DispatchHistoryRecord["account"]["provider"]): string {
   return provider === "google" ? "Gmail" : "Microsoft";
 }
 

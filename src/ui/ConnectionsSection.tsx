@@ -1,7 +1,8 @@
 import React, { useState } from "react";
 import { Pressable, Text, View } from "react-native";
-import type { Account, AccountCapability, AccountSyncState } from "../core";
-import { MailSyncControls } from "./MailSyncControls";
+import type { AccountCapability } from "../core";
+import type { WorkspaceSnapshotDTO } from "../cloud/workspaceDto";
+import { MailSyncControls, type MailSyncControlsState } from "./MailSyncControls";
 
 type OAuthProvider = "google" | "microsoft";
 type AuthCapability = Extract<AccountCapability, "mail.read" | "mail.draft" | "mail.send" | "calendar.read" | "calendar.write">;
@@ -48,9 +49,15 @@ const options: { id: AuthCapability; title: string; description: string }[] = [
   },
 ];
 
+type WorkspaceAccount = WorkspaceSnapshotDTO["state"]["accounts"][number];
+export type ConnectionsAccountDisplay = Pick<WorkspaceAccount,
+  "id" | "provider" | "displayName" | "email" | "connected" | "authStatus" |
+  "lastSyncedAt" | "capabilities" | "syncStatus"
+>;
+
 type ConnectionsProps = {
-  accounts: Account[];
-  syncStates: Record<string, AccountSyncState>;
+  accounts: readonly ConnectionsAccountDisplay[];
+  syncStates: Readonly<Record<string, MailSyncControlsState>>;
   busy: boolean;
   demoMode: boolean;
   isWeb: boolean;
