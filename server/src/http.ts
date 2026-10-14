@@ -9,6 +9,7 @@ import type { WorkspaceHttpAdmission, WorkspaceHttpApi } from './workspaceHttp.j
 import { registerAcceptedHttpServer, trackAcceptedHttpRequest } from './httpRequestDrain.js';
 
 const BODY_LIMIT = 16 * 1024;
+const WORKSPACE_COMMAND_TEXT_BODY_LIMIT = 1024 * 1024;
 const CREDENTIAL_BODY_LIMIT = 2 * 16 * 1024 * 1024 + 64 * 1024;
 const COOKIE_LIMIT = 4096;
 const BODY_TIMEOUT_MS = 10_000;
@@ -152,7 +153,8 @@ function jsonCookies(sessionToken: string | undefined, preauthToken: string | un
   return cookies;
 }
 
-async function readJsonBody(request: IncomingMessage, response: ServerResponse, maxBytes = BODY_LIMIT): Promise<unknown> {
+async function readJsonBody(request: IncomingMessage, response: ServerResponse, maxBytes = BODY_LIMIT,
+  selectValueLimit?: (value: unknown) => number): Promise<unknown> {
   const contentType = uniqueHeader(request, 'content-type', true) ?? '';
   const contentEncoding = uniqueHeader(request, 'content-encoding');
   if (!/^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(contentType) ||
@@ -186,7 +188,10 @@ async function readJsonBody(request: IncomingMessage, response: ServerResponse, 
   });
   const text = Buffer.concat(chunks, size).toString('utf8');
   if (Buffer.from(text, 'utf8').length !== size) throw problem(400, 'bad_request');
-  try { return JSON.parse(text) as unknown; } catch { throw problem(400, 'bad_request'); }
+  let parsed: unknown;
+  try { parsed = JSON.parse(text) as unknown; } catch { throw problem(400, 'bad_request'); }
+  if (selectValueLimit && size > selectValueLimit(parsed)) throw problem(413, 'request_too_large');
+  return parsed;
 }
 
 function workspaceReadAdmission(request: IncomingMessage, auth: AuthService, canonicalOrigin: URL): WorkspaceHttpAdmission {
@@ -639,7 +644,12 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     if (!workspaceApi) throw problem(503, 'service_unavailable');
     const admission = workspaceMutationAdmission(request, auth, canonicalOrigin);
     try {
-      const envelope = await readJsonBody(request, response);
+      const envelope = await readJsonBody(request, response, WORKSPACE_COMMAND_TEXT_BODY_LIMIT, (value) => {
+        const command = value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>).command : undefined;
+        const kind = command && typeof command === 'object' && !Array.isArray(command) ? (command as Record<string, unknown>).kind : undefined;
+        return typeof kind === 'string' && ['notes.save', 'notes.updateTranscript', 'assistant.batch.submitNote', 'chat.submit'].includes(kind)
+          ? WORKSPACE_COMMAND_TEXT_BODY_LIMIT : BODY_LIMIT;
+      });
       admission.assertCurrent();
       if (admissionOpen && !admissionOpen()) throw problem(503, 'service_unavailable');
       const result = await workspaceApi.dispatchCommand(admission, envelope);

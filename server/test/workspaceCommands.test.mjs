@@ -17,12 +17,17 @@ import {
   parseWorkspaceCommandEnvelope,
 } from '../dist/workspaceCommands.node.mjs';
 
-function fixture() {
+function fixture({ providerBatchClient } = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'still-workspace-commands-'));
   const kernel = createDurableKernel({ databasePath: join(directory, 'workspace.sqlite'),
     validateSnapshot: (value) => assert.ok(value && typeof value === 'object' && !Array.isArray(value)) });
   const ownerId = randomUUID();
   const state = createInitialWorkspaceState(randomUUID);
+  if (providerBatchClient) {
+    state.settings.mode = 'provider';
+    state.settings.llmProvider = 'openrouter';
+    state.settings.openRouterModel = 'openai/gpt-6-luna:batch';
+  }
   state.tasks.push({ id: 'legacy task: 1', title: 'A task', body: '', status: 'open', createdAt: '2026-10-14T00:00:00.000Z',
     importOrigin: { kind: 'backup_import', archiveId: randomUUID(), sourceTaskId: 'legacy task: 1' } });
   const workspace = kernel.createWorkspace(ownerId, state);
@@ -44,6 +49,7 @@ function fixture() {
       async writeDocument() {}, async removeAudio() {},
       async loadRecordingRecovery() { return { async pickAndStage() { return null; }, async inspect() { throw new Error('unsupported'); }, async remove() {} }; },
       bindRecordingRecovery(service) { return service; },
+      ...(providerBatchClient ? { openRouterBatchClient: providerBatchClient } : {}),
     } });
   const admission = { sessionToken: admissionSession, assertCurrent() { kernel.getOwnedIdentity(admissionSession); } };
   return { directory, kernel, ownerId, workspace, admissionSession, runtimeSession, runtime, admission };
@@ -51,8 +57,9 @@ function fixture() {
 
 function deferred() {
   let resolve;
-  const promise = new Promise((done) => { resolve = done; });
-  return { promise, resolve };
+  let reject;
+  const promise = new Promise((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
 }
 
 function envelope(command, expectedRevision = 0, expectedPrivacyEpoch = 0, commandId = randomUUID()) {
@@ -69,6 +76,12 @@ test('shared command envelope enforces exact keys, UUIDs, revision fences, and p
   assert.throws(() => parseWorkspaceCommandEnvelope({ ...valid, command: { ...valid.command, extra: 'ignored?' } }), /workspace_command_invalid/);
   assert.throws(() => parseWorkspaceCommandEnvelope({ ...valid, commandId: 'not-a-uuid' }), /workspace_command_invalid/);
   assert.throws(() => parseWorkspaceCommandEnvelope({ ...valid, expectedRevision: -1 }), /workspace_command_invalid/);
+  assert.throws(() => parseWorkspaceCommandEnvelope(envelope({ kind: 'assistant.batch.submitNote', noteId: 'note-1', intent: ['assist'] })), /workspace_command_invalid/,
+    'intent must be one of the exact string enum values');
+  assert.throws(() => parseWorkspaceCommandEnvelope(envelope({ kind: 'chat.submit', conversationId: 'legacy-conversation', text: 'hello' })), /workspace_command_invalid/,
+    'chat conversations use UUID identifiers');
+  assert.throws(() => parseWorkspaceCommandEnvelope(envelope({ kind: 'assistant.batch.check', jobId: 'legacy-job' })), /workspace_command_invalid/,
+    'Batch jobs use UUID identifiers');
   assert.throws(() => parseWorkspaceCommandEnvelope(envelope({ kind: 'chat.create', title: 'x'.repeat(5000) })), /workspace_command_invalid/);
   let getterRuns = 0;
   const accessorCommand = { kind: 'chat.create' };
@@ -81,6 +94,192 @@ test('shared command envelope enforces exact keys, UUIDs, revision fences, and p
   assert.equal(getterRuns, 0, 'the command discriminator is never read before payload descriptors are checked');
   assert.equal(parseWorkspaceCommandEnvelope(envelope({ kind: 'chat.create', title: 'x'.repeat(4096) })).command.title.length, 4096,
     'the maximum allowed title remains below the independent 16 KiB envelope physical bound');
+  const largeTextCommand = envelope({ kind: 'notes.save', transcript: '😀\\\n漢'.repeat(70_000) });
+  const parsedLargeText = parseWorkspaceCommandEnvelope(largeTextCommand);
+  assert.equal(parsedLargeText.command.transcript, largeTextCommand.command.transcript);
+  assert.ok(new TextEncoder().encode(canonicalWorkspaceCommand(parsedLargeText)).length > 16 * 1024);
+  assert.throws(() => parseWorkspaceCommandEnvelope(envelope({ kind: 'notes.save', transcript: '雪'.repeat(350_000) })), /workspace_command_invalid/);
+  assert.throws(() => parseWorkspaceCommandEnvelope(envelope({ kind: 'chat.create', title: 'x'.repeat(20_000) })), /workspace_command_invalid/);
+  const emptyTextEnvelope = envelope({ kind: 'notes.save', transcript: '' });
+  const fixedEnvelopeBytes = new TextEncoder().encode(JSON.stringify(emptyTextEnvelope)).length;
+  const boundaryText = 'a'.repeat(1024 * 1024 - fixedEnvelopeBytes);
+  assert.equal(parseWorkspaceCommandEnvelope(envelope({ kind: 'notes.save', transcript: boundaryText })).command.transcript.length, boundaryText.length,
+    'the exact 1 MiB JSON envelope boundary is accepted');
+  assert.throws(() => parseWorkspaceCommandEnvelope(envelope({ kind: 'notes.save', transcript: `${boundaryText}a` })), /workspace_command_invalid/,
+    'one additional encoded byte is rejected');
+  const escapedBoundaryText = `${'a'.repeat(1024 * 1024 - fixedEnvelopeBytes - 2)}\n`;
+  assert.equal(new TextEncoder().encode(JSON.stringify(envelope({ kind: 'notes.save', transcript: escapedBoundaryText }))).length, 1024 * 1024);
+  assert.equal(parseWorkspaceCommandEnvelope(envelope({ kind: 'notes.save', transcript: escapedBoundaryText })).command.transcript, escapedBoundaryText,
+    'an escaped control character is counted by its JSON wire bytes at the exact boundary');
+  assert.throws(() => parseWorkspaceCommandEnvelope(envelope({ kind: 'notes.save', transcript: `${escapedBoundaryText}a` })), /workspace_command_invalid/);
+});
+
+test('large escaped-Unicode note save dispatches through the actual controller once and returns a safe exact receipt', async () => {
+  const f = fixture();
+  try {
+    const initial = await f.runtime.getSnapshot(f.admission);
+    const transcript = '😀\\\n漢'.repeat(70_000);
+    const command = envelope({ kind: 'notes.save', transcript }, initial.revision, initial.privacyEpoch);
+    const first = await dispatchWorkspaceCommand(f.runtime, f.admission, command);
+    assert.equal(first.status, 'finished');
+    assert.equal(first.receipt.kind, 'notes.save');
+    assert.ok(first.receipt.objectId);
+    assert.equal(first.snapshot.state.notes.find((note) => note.id === first.receipt.objectId).transcript, transcript);
+    assert.deepEqual(Object.keys(first.receipt).sort(), ['commandId', 'kind', 'objectId', 'schemaVersion']);
+
+    const replay = await dispatchWorkspaceCommand(f.runtime, f.admission, command);
+    assert.deepEqual(replay.receipt, first.receipt);
+    assert.equal(replay.snapshot.state.notes.filter((note) => note.transcript === transcript).length, 1);
+    assert.equal(replay.snapshot.state.activity.filter((item) => item.noteId === first.receipt.objectId && item.type === 'note_saved').length, 1,
+      'the exact duplicate receipt avoids a second controller save');
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test('a duplicate note Batch command returns its exact receipt without a second provider submission', async () => {
+  let providerSubmissions = 0;
+  const providerBatch = { async submit(_input, onBeforeDispatch) {
+    providerSubmissions += 1;
+    await onBeforeDispatch();
+    return { batchId: `fixture-batch-${providerSubmissions}` };
+  }, async inspect() { throw new Error('The duplicate command must not inspect or submit again.'); } };
+  const f = fixture({ providerBatchClient: providerBatch });
+  try {
+    const initial = await f.runtime.getSnapshot(f.admission);
+    const saved = await dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'notes.save', transcript: 'Prepare a short local summary.' }, initial.revision, initial.privacyEpoch));
+    const noteId = saved.receipt.objectId;
+    const command = envelope({ kind: 'assistant.batch.submitNote', noteId }, saved.snapshot.revision, saved.snapshot.privacyEpoch);
+    const first = await dispatchWorkspaceCommand(f.runtime, f.admission, command);
+    assert.equal(first.status, 'finished');
+    assert.equal(first.receipt.kind, 'assistant.batch.submitNote');
+    assert.equal(first.receipt.objectId, noteId);
+    assert.ok(first.receipt.jobId);
+    assert.equal(providerSubmissions, 1);
+    const replay = await dispatchWorkspaceCommand(f.runtime, f.admission, command);
+    assert.deepEqual(replay.receipt, first.receipt);
+    assert.equal(providerSubmissions, 1, 'the exact journal duplicate returns its receipt without repeating the paid provider POST');
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test('an invalid intent type is rejected before command admission or any provider submission', async () => {
+  let providerSubmissions = 0;
+  const f = fixture({ providerBatchClient: { async submit() { providerSubmissions += 1; throw new Error('must not submit'); } } });
+  try {
+    const initial = await f.runtime.getSnapshot(f.admission);
+    const invalid = envelope({ kind: 'assistant.batch.submitNote', noteId: 'legacy-note', intent: ['assist'] }, initial.revision, initial.privacyEpoch);
+    await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission, invalid), /workspace_command_invalid/);
+    assert.equal(providerSubmissions, 0);
+    assert.equal(inspectWorkspaceCommand(f.runtime, f.admission, invalid.commandId).status, 'unverified',
+      'invalid input never creates a journal admission or a provider-visible job');
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test('a paid Batch command admitted before browser revocation settles once and its later accounting remains inspectable', async () => {
+  const enteredSubmit = deferred();
+  const releaseSubmit = deferred();
+  let providerSubmissions = 0;
+  const providerBatch = {
+    async submit(_input, onBeforeDispatch) {
+      providerSubmissions += 1;
+      await onBeforeDispatch();
+      enteredSubmit.resolve();
+      await releaseSubmit.promise;
+      return { batchId: 'late-ack-batch' };
+    },
+    async inspect(batchId, _customId) {
+      return { batchId, status: 'in_progress', endpoint: '/v1/chat/completions', model: 'openai/gpt-6-luna', completionWindow: '24h',
+        total: 1, completed: 0, failed: 0, metadataValidation: 'valid', resultValidation: 'unavailable',
+        usage: { cost: 0.0042, promptTokens: 31, completionTokens: 0, totalTokens: 31 } };
+    },
+  };
+  const f = fixture({ providerBatchClient: providerBatch });
+  try {
+    const initial = await f.runtime.getSnapshot(f.admission);
+    const saved = await dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'notes.save', transcript: 'A saved note to submit once.' }, initial.revision, initial.privacyEpoch));
+    const command = envelope({ kind: 'assistant.batch.submitNote', noteId: saved.receipt.objectId },
+      saved.snapshot.revision, saved.snapshot.privacyEpoch);
+    const ownedSubmit = dispatchWorkspaceCommand(f.runtime, f.admission, command);
+    await enteredSubmit.promise;
+
+    f.kernel.revokeSession(f.admissionSession);
+    releaseSubmit.resolve();
+    await assert.rejects(ownedSubmit, /session|ownership|current/i,
+      'the revoked browser does not receive a late acknowledgement after the provider operation has already started');
+    assert.equal(providerSubmissions, 1);
+
+    const replacementSession = f.kernel.createSession(f.workspace.workspaceId, f.ownerId, Date.now() + 60 * 60_000);
+    const replacementAdmission = { sessionToken: replacementSession, assertCurrent() { f.kernel.getOwnedIdentity(replacementSession); } };
+    const snapshot = await f.runtime.refreshSnapshot(replacementAdmission);
+    const receipt = inspectWorkspaceCommand(f.runtime, replacementAdmission, command.commandId);
+    assert.equal(receipt.status, 'finished', 'the private owner records the already-admitted command outcome');
+    assert.match(receipt.receipt.jobId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+    assert.equal(Object.hasOwn(receipt, 'snapshot'), false, 'receipt inspection exposes no workspace snapshot or private provider payload');
+
+    const jobId = snapshot.state.assistantBatchJobs.find((job) => job.noteId === saved.receipt.objectId).id;
+    const replay = await dispatchWorkspaceCommand(f.runtime, replacementAdmission, command);
+    assert.equal(replay.receipt.jobId, jobId);
+    assert.equal(providerSubmissions, 1, 'replaying the saved command under the replacement browser never repeats the provider POST');
+
+    const checked = await dispatchWorkspaceCommand(f.runtime, replacementAdmission,
+      envelope({ kind: 'assistant.batch.check', jobId }, replay.snapshot.revision, replay.snapshot.privacyEpoch));
+    const settledJob = checked.snapshot.state.assistantBatchJobs.find((job) => job.id === jobId);
+    assert.equal(settledJob.status, 'processing');
+    assert.equal(settledJob.providerReportedCostUsd, 0.0042, 'later provider-reported accounting is retained after browser revocation');
+    assert.equal(settledJob.unknownCharge, false);
+    assert.equal(providerSubmissions, 1);
+  } finally {
+    releaseSubmit.resolve();
+    await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+test('the real gateway completes chat create, submit, check, and refinement with UUID-bound receipts', async () => {
+  const outputs = new Map();
+  let providerSubmissions = 0;
+  const providerBatch = {
+    async submit(input, onBeforeDispatch) {
+      providerSubmissions += 1;
+      await onBeforeDispatch();
+      outputs.set(input.operationId, { summary: 'A concise local Batch result.', answer: 'Start with the most urgent task.',
+        decisions: [], citations: [], clarifications: [], proposals: [], memorySuggestions: [] });
+      return { batchId: `chat-batch-${providerSubmissions}` };
+    },
+    async inspect(batchId, customId) {
+      return { batchId, status: 'completed', endpoint: '/v1/chat/completions', model: 'openai/gpt-6-luna', completionWindow: '24h',
+        total: 1, completed: 1, failed: 0, metadataValidation: 'valid', resultValidation: 'valid',
+        usage: { cost: 0.001, promptTokens: 20, completionTokens: 8, totalTokens: 28 },
+        result: { customId, statusCode: 200, finishReason: 'stop', responseBody: { model: 'openai/gpt-6-luna',
+          choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: JSON.stringify(outputs.get(customId)) } }] } } };
+    },
+  };
+  const f = fixture({ providerBatchClient: providerBatch });
+  try {
+    const initial = await f.runtime.getSnapshot(f.admission);
+    const created = await dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'chat.create', title: 'Gateway chat' }, initial.revision, initial.privacyEpoch));
+    const conversationId = created.receipt.objectId;
+    assert.match(conversationId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+
+    const submitted = await dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'chat.submit', conversationId, text: 'What should I prioritize today?' }, created.snapshot.revision, created.snapshot.privacyEpoch));
+    assert.equal(submitted.receipt.kind, 'chat.submit');
+    assert.equal(submitted.receipt.objectId, conversationId);
+    assert.match(submitted.receipt.turnId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+    assert.match(submitted.receipt.jobId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+
+    const checked = await dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'assistant.batch.check', jobId: submitted.receipt.jobId }, submitted.snapshot.revision, submitted.snapshot.privacyEpoch));
+    assert.deepEqual(checked.receipt, { schemaVersion: 1, commandId: checked.commandId, kind: 'assistant.batch.check', objectId: submitted.receipt.jobId });
+    const refined = await dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'chat.refine', conversationId, parentTurnId: submitted.receipt.turnId, effort: 'high' }, checked.snapshot.revision, checked.snapshot.privacyEpoch));
+    assert.equal(refined.receipt.kind, 'chat.refine');
+    assert.equal(refined.receipt.objectId, conversationId);
+    assert.equal(refined.receipt.parentTurnId, submitted.receipt.turnId);
+    assert.match(refined.receipt.turnId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+    assert.match(refined.receipt.jobId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+    assert.equal(providerSubmissions, 2, 'one submit and one refinement reached the injected Batch provider');
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test('explicit dispatcher calls only the task/chat allowlist and returns safe durable receipts', async () => {

@@ -233,14 +233,18 @@ describe('knowledge controller integration', () => {
     await app.load();
     await enableProvider(app);
     const note = await app.saveNote({ transcript: text });
-    let person = await app.savePerson({ name: 'Maya', aliases: [], narrative: '' });
+    const people: Awaited<ReturnType<typeof app.savePerson>>[] = [];
+    for (let index = 0; index < 6; index += 1) people.push(await app.savePerson({ name: `Maya ${index + 1}`, aliases: [], narrative: '' }));
+    const person = people[0]!;
     targetSourceId = `knowledge:person:${person.id}`;
-    const queued = await app.submitNoteBatch(note.id, { intent: 'summarize', knowledgeSelection: [{ kind: 'person', id: person.id }] });
+    const selectedKnowledge = people.map((item) => ({ kind: 'person' as const, id: item.id }));
+    const queued = await app.submitNoteBatch(note.id, { intent: 'summarize', knowledgeSelection: selectedKnowledge });
     sourceVersion = transport.calls[0]?.requestBody?.match(/sourceVersion=(1:[a-f0-9]{64}); kind=note/)?.[1] ?? '';
     expect(sourceVersion).toMatch(/^1:[a-f0-9]{64}$/);
     const completed = await app.refreshAssistantBatch(queued.id);
     expect(completed.status).toBe('completed');
     const analysis = app.getSnapshot().notes.find((item) => item.id === note.id)?.analysis;
+    expect(analysis?.knowledgeSelection).toEqual(selectedKnowledge);
     const suggestionId = analysis?.memorySuggestionIds?.[0];
     expect(suggestionId).toBeDefined();
     const suggestion = app.getSnapshot().knowledge.suggestions.find((item) => item.id === suggestionId)!;
@@ -255,6 +259,7 @@ describe('knowledge controller integration', () => {
     });
     const reloaded = new AppControllerImpl(store, {}, { writeDocument: async () => undefined, openRouterBatchClient: transport.client });
     await reloaded.load();
+    expect(reloaded.getSnapshot().assistantBatchJobs?.find((item) => item.id === queued.id)?.status).toBe('completed');
     const reviewed = await reloaded.reviewKnowledgeSuggestion(suggestion.id, { expectedRevision: suggestion.revision, decision: 'accept', targetRevision: person.revision });
     expect(reviewed.status).toBe('accepted');
   });

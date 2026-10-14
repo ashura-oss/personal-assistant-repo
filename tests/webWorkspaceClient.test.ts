@@ -9,6 +9,11 @@ const workspaceId = '7b906fca-65c1-4bd2-b18e-1b56cc6f48a8';
 const session: AuthenticatedSession = Object.freeze({ authenticated: true, workspaceId, privacyEpoch: 3, csrfToken: 'private-csrf' });
 const commandId = 'e53e7c18-4128-4e80-a55e-331db010a447';
 const nextCommandId = '6bcab02c-ab0a-4b82-b2fd-4b3038317c4a';
+const conversationId = '51ec9e62-8a76-4cb8-bc1e-f34e26d5177b';
+const anotherConversationId = 'ec6cf1a5-c680-4163-9fe0-615e1e7b5cfb';
+const parentTurnId = 'b095d70b-0061-431e-b89c-a96c3230e9a3';
+const anotherTurnId = '0ff611e5-2a17-4362-a94b-050e81565445';
+const jobId = 'bdb51402-7b76-47a6-9a1a-24e022d36bb0';
 
 function snapshot(revision: number): WorkspaceSnapshotDTO {
   let nextId = 0;
@@ -208,6 +213,65 @@ describe('same-origin web workspace command client', () => {
     await expect(client.inspectCommand()).rejects.toMatchObject({ kind: 'malformed' });
     expect(client.getPendingCommand()).toEqual({ commandId, command: { kind: 'tasks.complete', taskId: 'task-safe-id' } });
     expect(fetcher).toHaveBeenCalledTimes(3);
+    client.dispose();
+  });
+
+  it('sends large text within the text-command allowance and keeps mismatched chat lineage receipts unresolved', async () => {
+    const dto = snapshot(1);
+    const longText = '😀\\\n漢'.repeat(5_000);
+    const wrongReceipt = (overrides: Record<string, unknown> = {}) => ({
+      schemaVersion: 1,
+      commandId,
+      kind: 'chat.submit',
+      objectId: anotherConversationId,
+      jobId,
+      turnId: anotherTurnId,
+      ...overrides,
+    });
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(body(dto))
+      .mockResolvedValueOnce(body({ schemaVersion: 1, commandId, status: 'finished', receipt: wrongReceipt() }))
+      .mockResolvedValueOnce(body({ schemaVersion: 1, commandId, status: 'finished', receipt: wrongReceipt() }));
+    const client = createWebWorkspaceClient(session, {
+      assertCurrent: () => undefined,
+      decodeSnapshot: (value) => { if (JSON.stringify(value) !== JSON.stringify(dto)) throw new Error('bad DTO'); return dto; },
+      fetcher,
+      makeCommandId: () => commandId,
+    });
+    await client.getSnapshot();
+    await expect(client.execute({ kind: 'chat.submit', conversationId, text: longText })).rejects.toMatchObject({
+      name: 'WorkspaceCommandUnknownError', commandId,
+    });
+    const submittedBody = JSON.parse(String(fetcher.mock.calls[1]?.[1].body)) as { command: { text: string } };
+    expect(submittedBody.command.text).toBe(longText);
+    expect(Buffer.byteLength(String(fetcher.mock.calls[1]?.[1].body), 'utf8')).toBeGreaterThan(16 * 1024);
+    expect(client.getPendingCommand()?.command).toEqual({ kind: 'chat.submit', conversationId, text: longText });
+    await expect(client.inspectCommand()).rejects.toMatchObject({ kind: 'malformed' });
+    expect(client.getPendingCommand()?.command).toEqual({ kind: 'chat.submit', conversationId, text: longText });
+    expect(fetcher).toHaveBeenCalledTimes(3);
+    client.dispose();
+  });
+
+  it('binds chat refinement receipts to the requested conversation and parent turn', async () => {
+    const dto = snapshot(1);
+    const response = (parentTurnId: string) => ({ schemaVersion: 1, commandId, status: 'finished', receipt: {
+      schemaVersion: 1, commandId, kind: 'chat.refine', objectId: conversationId, jobId,
+      turnId: anotherTurnId, parentTurnId,
+    } });
+    const fetcher = vi.fn().mockResolvedValueOnce(body(dto)).mockResolvedValueOnce(body(response('wrong-parent')))
+      .mockResolvedValueOnce(body(response('wrong-parent')));
+    const client = createWebWorkspaceClient(session, {
+      assertCurrent: () => undefined,
+      decodeSnapshot: (value) => { if (JSON.stringify(value) !== JSON.stringify(dto)) throw new Error('bad DTO'); return dto; },
+      fetcher,
+      makeCommandId: () => commandId,
+    });
+    await client.getSnapshot();
+    const command = { kind: 'chat.refine' as const, conversationId, parentTurnId, effort: 'high' as const };
+    await expect(client.execute(command)).rejects.toMatchObject({ name: 'WorkspaceCommandUnknownError', commandId });
+    expect(client.getPendingCommand()?.command).toEqual(command);
+    await expect(client.inspectCommand()).rejects.toMatchObject({ kind: 'malformed' });
+    expect(client.getPendingCommand()?.command).toEqual(command);
     client.dispose();
   });
 

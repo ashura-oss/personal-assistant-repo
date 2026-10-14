@@ -967,7 +967,7 @@ export interface AppController {
   prepareRecordingAttachment(noteId: string, input: { expectedRevision: number }): Promise<RecordingAttachmentPreview | null>;
   attachRecording(input: { sessionId: string; planHash: string }): Promise<Note>;
   cancelRecordingAttachment(sessionId: string): Promise<void>;
-  updateTranscript(id: string, text: string): Promise<Note>;
+  updateTranscript(id: string, text: string, options?: { expectedRevision: number }): Promise<Note>;
   processNote(id: string): Promise<Proposal[]>;
   assistNote(id: string, options?: { intent?: AssistIntent; question?: string; forceRefresh?: boolean; knowledgeSelection?: KnowledgeSelection }): Promise<NoteAssistResult>;
   submitNoteBatch(noteId: string, options?: { intent?: AssistIntent; question?: string; knowledgeSelection?: KnowledgeSelection }): Promise<import('../services/openRouterBatchJobs').AssistantBatchJobDTO>;

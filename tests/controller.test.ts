@@ -430,6 +430,19 @@ describe('application state controller', () => {
     expect(fresh.sourceRevision).toBe(app.getSnapshot().notes[0].revision);
   });
 
+  it('checks an optional transcript revision inside the mutation before changing the note', async () => {
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store);
+    await app.load();
+    const note = await app.saveNote({ transcript: 'A transcript that is still current.' });
+    const current = app.getSnapshot().notes.find((item) => item.id === note.id)!;
+    const edited = await app.updateTranscript(note.id, 'The expected revision update.', { expectedRevision: current.revision });
+    expect(edited.transcript).toBe('The expected revision update.');
+    const stateBeforeStaleWrite = app.getSnapshot();
+    await expect(app.updateTranscript(note.id, 'A stale overwrite.', { expectedRevision: current.revision })).rejects.toThrow(/note changed/i);
+    expect(app.getSnapshot().notes.find((item) => item.id === note.id)).toEqual(stateBeforeStaleWrite.notes.find((item) => item.id === note.id));
+  });
+
   it('rechecks a proposal’s own provenance before review and persists invalidation only when it changes', async () => {
     const store = new MemoryStore();
     const app = new AppControllerImpl(store);

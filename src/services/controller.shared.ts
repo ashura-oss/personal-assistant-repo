@@ -540,8 +540,8 @@ function hasExactPlainDataKeys(value: unknown, keys: readonly string[]): value i
   } catch { return false; }
 }
 
-function normalizeKnowledgeSelection(value: unknown): KnowledgeSelection {
-  if (!Array.isArray(value) || value.length > 5) throw new Error('Select no more than five people or projects for this Assist request.');
+function normalizeKnowledgeSelection(value: unknown, inputPolicyVersion: 1 | 2 = 1): KnowledgeSelection {
+  if (!Array.isArray(value) || (inputPolicyVersion === 1 && value.length > 5)) throw new Error('Select no more than five people or projects for this Assist request.');
   const result: KnowledgeSelection = [];
   const seen = new Set<string>();
   for (const row of value) {
@@ -5019,10 +5019,13 @@ export class AppControllerImpl implements AppController {
     }
   }
 
-  async updateTranscript(id: string, text: string): Promise<Note> {
+  async updateTranscript(id: string, text: string, options?: { expectedRevision: number }): Promise<Note> {
     const sourceRemoval = this.sourceTranscriptRevisionCommit(id);
     const result = await this.mutate((state) => {
       const note = this.note(state, id);
+      if (options && (!Number.isSafeInteger(options.expectedRevision) || options.expectedRevision < 1 || note.revision !== options.expectedRevision)) {
+        throw new Error('The note changed before the transcript update was applied. Refresh the note and try again.');
+      }
       if (note.origin === 'assistant_chat') throw new Error('Chat messages are immutable. Continue the conversation or delete it from Chat.');
       note.transcript = text.trim();
       note.title = note.transcript ? note.transcript.split(/\s+/).slice(0, 7).join(' ').slice(0, 72) : 'Audio note';
@@ -6478,7 +6481,7 @@ export class AppControllerImpl implements AppController {
         if (draft.settings.mode !== 'provider' || draft.settings.llmProvider !== 'openrouter') throw new Error('Select OpenRouter in Provider mode before sending a chat message.');
         const existingConversation = this.assistantChatLedger.conversations.find((item) => item.id === input.conversationId);
         if (!existingConversation) throw new Error('This chat could not be validated. Refresh local data before continuing.');
-        const knowledgeSelection = normalizeKnowledgeSelection(input.knowledgeSelection ?? []);
+        const knowledgeSelection = normalizeKnowledgeSelection(input.knowledgeSelection ?? [], 2);
         for (const selected of knowledgeSelection) if (!getKnowledgeEntity(draft.knowledge, selected.kind, selected.id)) throw new Error('A selected knowledge source is no longer available. Refresh the selection and try again.');
         const message = input.text;
         if (typeof message !== 'string' || !message.trim()) throw new Error('Enter a message before sending it.');
@@ -6720,7 +6723,7 @@ export class AppControllerImpl implements AppController {
     const question = options.question?.trim() || undefined;
     if (!['assist', 'summarize', 'answer', 'extract'].includes(intent)) throw new Error('Choose a supported Assist action.');
     if (intent === 'answer' && !question) throw new Error('Add a question before asking about this note.');
-    const knowledgeSelection = normalizeKnowledgeSelection(options.knowledgeSelection ?? []);
+    const knowledgeSelection = normalizeKnowledgeSelection(options.knowledgeSelection ?? [], 2);
     const createdAt = now();
     const capturedBootstrapGeneration = this.bootstrapGeneration;
     let prepared!: PreparedOpenRouterAnalysis;
@@ -7739,7 +7742,7 @@ export class AppControllerImpl implements AppController {
     }
     this.requireConfirmedCaptureTimeZone(note);
     if (!note.transcript.trim()) throw new Error('This audio note has no transcript. Enter text or connect the speech provider before processing.');
-    const knowledgeSelection = normalizeKnowledgeSelection(options.knowledgeSelection ?? []);
+    const knowledgeSelection = normalizeKnowledgeSelection(options.knowledgeSelection ?? [], batch?.inputPolicyVersion ?? 1);
     for (const selected of knowledgeSelection) if (!getKnowledgeEntity(state.knowledge, selected.kind, selected.id)) throw new Error('One of the selected people or projects no longer exists. Refresh the selection and try again.');
     const sourceRevision = note.revision;
     const chatTurn = batch?.chatBinding ? this.assistantChatLedger.conversations.flatMap((item) => item.turns).find((turn) => turn.id === batch.chatBinding!.turnId) : undefined;

@@ -469,11 +469,11 @@ export function NoteDetail({
                     multiline
                   />
                 ) : null}
-                <Text style={s.label}>Optional context · up to 5</Text>
+                <Text style={s.label}>{preview ? 'Optional context · up to 5' : 'Optional context'}</Text>
                 <Text style={s.knowledgeFootnote}>Still uses active people and projects by default. Select an item to include it explicitly; archived context is marked.</Text>
                 {availableEntities.map((entity) => {
                   const chosen = knowledgeSelection.some((item) => item.kind === entity.kind && item.id === entity.id);
-                  return <Pressable key={`${entity.kind}:${entity.id}`} accessibilityRole="checkbox" accessibilityState={{ checked: chosen }} disabled={!chosen && knowledgeSelection.length >= 5} onPress={() => setKnowledgeSelection((current) => chosen ? current.filter((item) => !(item.kind === entity.kind && item.id === entity.id)) : [...current, { kind: entity.kind, id: entity.id }])} style={s.knowledgeCard}>
+                  return <Pressable key={`${entity.kind}:${entity.id}`} accessibilityRole="checkbox" accessibilityState={{ checked: chosen }} disabled={preview && !chosen && knowledgeSelection.length >= 5} onPress={() => setKnowledgeSelection((current) => chosen ? current.filter((item) => !(item.kind === entity.kind && item.id === entity.id)) : [...current, { kind: entity.kind, id: entity.id }])} style={s.knowledgeCard}>
                     <Text style={[s.knowledgeMeta, { flex: 1 }]}>{chosen ? '✓ ' : ''}{entity.name} · {entity.kind}{entity.importedCopy ? ' · Imported copy' : ''}{entity.archived ? ' · archived' : ''}</Text>
                   </Pressable>;
                 })}

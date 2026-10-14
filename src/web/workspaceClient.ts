@@ -236,11 +236,7 @@ export function createWebWorkspaceClient(session: AuthenticatedSession, options:
       if (record.schemaVersion !== 1 || !statuses.includes(record.status as (typeof statuses)[number]) ||
           (expectedCommand && commandId !== expectedCommand.commandId)) throw new Error('response_invalid');
       const status = record.status as WorkspaceCommandResponse['status'];
-      const expectedReceipt = expectedCommand ? {
-        commandId: expectedCommand.commandId,
-        kind: expectedCommand.command.kind,
-        ...(expectedCommand.command.kind === 'chat.create' ? {} : { objectId: expectedCommand.command.taskId }),
-      } : undefined;
+      const expectedReceipt = expectedCommand ? expectedReceiptFor(expectedCommand) : undefined;
       const receipt = Object.hasOwn(record, 'receipt')
         ? parseWorkspaceCommandReceipt(record.receipt, expectedReceipt)
         : undefined;
@@ -377,3 +373,26 @@ export function createWebWorkspaceClient(session: AuthenticatedSession, options:
     },
   });
 }
+
+function expectedReceiptFor(envelope: WorkspaceCommandEnvelope) {
+  const { command } = envelope;
+  switch (command.kind) {
+    case 'tasks.complete': case 'tasks.reopen':
+      return { commandId: envelope.commandId, kind: command.kind, objectId: command.taskId };
+    case 'chat.create': case 'notes.save':
+      return { commandId: envelope.commandId, kind: command.kind };
+    case 'notes.updateTranscript':
+      return { commandId: envelope.commandId, kind: command.kind, objectId: command.noteId };
+    case 'assistant.batch.submitNote':
+      return { commandId: envelope.commandId, kind: command.kind, objectId: command.noteId };
+    case 'assistant.batch.check':
+      return { commandId: envelope.commandId, kind: command.kind, objectId: command.jobId };
+    case 'chat.submit':
+      return { commandId: envelope.commandId, kind: command.kind, objectId: command.conversationId };
+    case 'chat.refine':
+      return { commandId: envelope.commandId, kind: command.kind, objectId: command.conversationId, parentTurnId: command.parentTurnId };
+    default: return assertNever(command);
+  }
+}
+
+function assertNever(_value: never): never { throw new WorkspaceClientError('malformed', 'The workspace action is unsupported.'); }

@@ -159,6 +159,32 @@ test('authenticated workspace snapshot, refresh, command dispatch, and receipt i
   } finally { await f.close(); }
 });
 
+test('workspace command route accepts text payloads above the ordinary 16 KiB body limit', async () => {
+  const f = await fixture();
+  try {
+    const auth = await login(f);
+    const snapshot = await (await f.request('/api/workspace/snapshot', { headers: { Cookie: auth.cookie } })).json();
+    const commandId = randomUUID();
+    const transcript = '😀\\\n漢'.repeat(2_500);
+    const command = { schemaVersion: 1, commandId, expectedRevision: snapshot.revision, expectedPrivacyEpoch: snapshot.privacyEpoch,
+      command: { kind: 'notes.save', transcript } };
+    const response = await f.request('/api/workspace/commands', { method: 'POST', headers: mutationHeaders(f, auth), body: JSON.stringify(command) });
+    assert.equal(response.status, 200);
+    const result = await response.json();
+    assert.equal(result.status, 'finished');
+    assert.equal(result.receipt.kind, 'notes.save');
+    assert.equal(result.snapshot.state.notes.find((note) => note.id === result.receipt.objectId).transcript, transcript);
+
+    const oversized = { ...command, commandId: randomUUID(), command: { kind: 'notes.save', transcript: 'x'.repeat(1024 * 1024) } };
+    const tooLarge = await f.request('/api/workspace/commands', { method: 'POST', headers: mutationHeaders(f, auth), body: JSON.stringify(oversized) });
+    assert.equal(tooLarge.status, 413, 'the widened text-command allowance still has a strict 1 MiB envelope ceiling');
+
+    const malformedKind = { ...command, commandId: randomUUID(), command: { kind: ['chat.submit'], text: 'x'.repeat(17 * 1024) } };
+    const malformedLarge = await f.request('/api/workspace/commands', { method: 'POST', headers: mutationHeaders(f, auth), body: JSON.stringify(malformedKind) });
+    assert.equal(malformedLarge.status, 413, 'a non-string kind cannot opt malformed input into the text-command body allowance');
+  } finally { await f.close(); }
+});
+
 test('workspace commands require same-origin CSRF, strict paths, and a live session after body parsing', async () => {
   const f = await fixture();
   try {

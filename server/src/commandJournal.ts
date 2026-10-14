@@ -5,6 +5,7 @@ import type { DurableKernel, JsonValue, OwnedTransactionContext } from './kernel
 
 const JOURNAL_SCHEMA_VERSION = 1;
 const MAX_RECEIPT_BYTES = 1024 * 1024;
+const MAX_REQUEST_BYTES = 1024 * 1024;
 const KEY = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const KIND = /^[a-z][a-z0-9._:-]{0,95}$/;
 
@@ -147,7 +148,7 @@ export class CommandJournal {
   admit(input: { admissionSessionToken: string; expectedRevision: number; expectedPrivacyEpoch: number; idempotencyKey: string; kind: string; canonicalBody: string }): CommandAdmission {
     requireKey(input?.idempotencyKey); requireKind(input?.kind);
     if (!Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 0 || !Number.isSafeInteger(input.expectedPrivacyEpoch) || input.expectedPrivacyEpoch < 0) throw new Error('Command admission revision or epoch is invalid.');
-    const parsed = parseCanonical(input.canonicalBody);
+    const parsed = parseCanonical(input.canonicalBody, MAX_REQUEST_BYTES);
     const requestDigest = digest(`${input.kind}\0${parsed.text}`);
     return this.kernel.withOwnedTransaction(input.admissionSessionToken, input.expectedPrivacyEpoch, (context) => {
       const prior = context.db.prepare(`SELECT * FROM async_command_journal WHERE workspace_id=? AND idempotency_key=?`)

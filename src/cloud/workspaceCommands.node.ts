@@ -5,6 +5,7 @@ import {
   parseWorkspaceCommandEnvelope,
   parseWorkspaceCommandId,
   parseWorkspaceCommandReceipt,
+  type WorkspaceCommand,
   type WorkspaceCommandEnvelope,
   type WorkspaceCommandResponse,
   type WorkspaceCommandStatus,
@@ -12,36 +13,60 @@ import {
 
 export * from './workspaceCommands';
 
-/** Execute only the small, explicit command allowlist through the owned controller. */
+/** Execute only explicit safe controller calls through the owned command journal. */
 export async function dispatchWorkspaceCommand(runtime: OwnedWorkspaceRuntime, admission: OwnedWorkspaceAdmission,
   untrustedEnvelope: unknown): Promise<WorkspaceCommandResponse> {
   const envelope = parseWorkspaceCommandEnvelope(untrustedEnvelope);
   const command = envelope.command;
   const result = await runtime.executeCommand({ ...admission, expectedRevision: envelope.expectedRevision,
     expectedPrivacyEpoch: envelope.expectedPrivacyEpoch, idempotencyKey: envelope.commandId,
-    kind: command.kind, canonicalBody: canonicalWorkspaceCommand(envelope) }, async (controller) => {
-    let objectId: string;
+    // Journal kinds use a stable lowercase namespace; the canonical envelope
+    // still binds the exact public discriminant and input bytes.
+    kind: command.kind.toLowerCase(), canonicalBody: canonicalWorkspaceCommand(envelope) }, async (controller) => {
     switch (command.kind) {
-      case 'tasks.complete': objectId = (await controller.completeTask(command.taskId)).id; break;
-      case 'tasks.reopen': objectId = (await controller.reopenTask(command.taskId)).id; break;
-      case 'chat.create': objectId = (await controller.createChatConversation(command.title)).id; break;
+      case 'tasks.complete': return receipt(envelope, command, { objectId: (await controller.completeTask(command.taskId)).id });
+      case 'tasks.reopen': return receipt(envelope, command, { objectId: (await controller.reopenTask(command.taskId)).id });
+      case 'chat.create': return receipt(envelope, command, { objectId: (await controller.createChatConversation(command.title)).id });
+      case 'notes.save': return receipt(envelope, command, { objectId: (await controller.saveNote({ transcript: command.transcript })).id });
+      case 'notes.updateTranscript': return receipt(envelope, command, {
+        objectId: (await controller.updateTranscript(command.noteId, command.text, { expectedRevision: command.expectedNoteRevision })).id,
+      });
+      case 'assistant.batch.submitNote': {
+        const job = await controller.submitNoteBatch(command.noteId, { intent: command.intent, question: command.question,
+          knowledgeSelection: command.knowledgeSelection?.map(({ kind, id }) => ({ kind, id })) });
+        return receipt(envelope, command, { objectId: command.noteId, jobId: job.id });
+      }
+      case 'assistant.batch.check': {
+        await controller.refreshAssistantBatch(command.jobId);
+        return receipt(envelope, command, { objectId: command.jobId });
+      }
+      case 'chat.submit': {
+        const accepted = await controller.submitChatTurn({ conversationId: command.conversationId, text: command.text,
+          knowledgeSelection: command.knowledgeSelection?.map(({ kind, id }) => ({ kind, id })) });
+        return receipt(envelope, command, { objectId: accepted.conversationId, turnId: accepted.turnId, jobId: accepted.jobId });
+      }
+      case 'chat.refine': {
+        const accepted = await controller.refineChatTurn({ conversationId: command.conversationId, parentTurnId: command.parentTurnId, effort: command.effort });
+        return receipt(envelope, command, { objectId: accepted.conversationId, parentTurnId: command.parentTurnId,
+          turnId: accepted.turnId, jobId: accepted.jobId });
+      }
       default: return assertNever(command);
     }
-    return parseWorkspaceCommandReceipt({ schemaVersion: 1, commandId: envelope.commandId, kind: command.kind, objectId },
-      expectedReceipt(envelope.commandId, command));
-  }, (receipt): JsonValue => ({ schemaVersion: receipt.schemaVersion, commandId: receipt.commandId,
-    kind: receipt.kind, objectId: receipt.objectId }));
+  }, (value): JsonValue => ({ schemaVersion: value.schemaVersion, commandId: value.commandId, kind: value.kind,
+    objectId: value.objectId, ...('jobId' in value ? { jobId: value.jobId } : {}), ...('turnId' in value ? { turnId: value.turnId } : {}),
+    ...('parentTurnId' in value ? { parentTurnId: value.parentTurnId } : {}) }));
 
+  const expectation = expectedReceipt(envelope.commandId, command);
   if (result.admission.fresh) {
-    const receipt = parseWorkspaceCommandReceipt(result.result, expectedReceipt(envelope.commandId, command));
+    const commandReceipt = parseWorkspaceCommandReceipt(result.result, expectation);
     if (!result.snapshot) throw new Error('workspace_command_snapshot_unavailable');
-    return Object.freeze({ schemaVersion: 1, commandId: envelope.commandId, status: 'finished', receipt, snapshot: result.snapshot });
+    return Object.freeze({ schemaVersion: 1, commandId: envelope.commandId, status: 'finished', receipt: commandReceipt, snapshot: result.snapshot });
   }
 
   const status = result.admission.status as WorkspaceCommandStatus;
   if (status === 'finished') {
-    const receipt = parseWorkspaceCommandReceipt(result.admission.receipt, expectedReceipt(envelope.commandId, command));
-    return Object.freeze({ schemaVersion: 1, commandId: envelope.commandId, status, receipt,
+    const commandReceipt = parseWorkspaceCommandReceipt(result.admission.receipt, expectation);
+    return Object.freeze({ schemaVersion: 1, commandId: envelope.commandId, status, receipt: commandReceipt,
       ...(result.snapshot ? { snapshot: result.snapshot } : {}) });
   }
   return Object.freeze({ schemaVersion: 1, commandId: envelope.commandId, status });
@@ -54,14 +79,30 @@ export function inspectWorkspaceCommand(runtime: OwnedWorkspaceRuntime, admissio
   const admissionResult = runtime.inspectCommandReceipt(admission, commandId);
   if (!admissionResult) return Object.freeze({ schemaVersion: 1, commandId, status: 'unverified' });
   if (admissionResult.status === 'finished') {
-    const receipt = parseWorkspaceCommandReceipt(admissionResult.receipt, { commandId });
-    return Object.freeze({ schemaVersion: 1, commandId, status: 'finished', receipt });
+    const commandReceipt = parseWorkspaceCommandReceipt(admissionResult.receipt, { commandId });
+    return Object.freeze({ schemaVersion: 1, commandId, status: 'finished', receipt: commandReceipt });
   }
   return Object.freeze({ schemaVersion: 1, commandId, status: admissionResult.status as WorkspaceCommandStatus });
 }
 
-function assertNever(_value: never): never { throw new Error('workspace_command_unsupported'); }
-
-function expectedReceipt(commandId: string, command: WorkspaceCommandEnvelope['command']) {
-  return { commandId, kind: command.kind, ...('taskId' in command ? { objectId: command.taskId } : {}) };
+function receipt(envelope: WorkspaceCommandEnvelope, command: WorkspaceCommand, fields: {
+  readonly objectId: string; readonly jobId?: string; readonly turnId?: string; readonly parentTurnId?: string;
+}) {
+  return parseWorkspaceCommandReceipt({ schemaVersion: 1, commandId: envelope.commandId, kind: command.kind, ...fields },
+    expectedReceipt(envelope.commandId, command));
 }
+
+function expectedReceipt(commandId: string, command: WorkspaceCommand) {
+  switch (command.kind) {
+    case 'tasks.complete': case 'tasks.reopen': return { commandId, kind: command.kind, objectId: command.taskId };
+    case 'chat.create': case 'notes.save': return { commandId, kind: command.kind };
+    case 'notes.updateTranscript': return { commandId, kind: command.kind, objectId: command.noteId };
+    case 'assistant.batch.submitNote': return { commandId, kind: command.kind, objectId: command.noteId };
+    case 'assistant.batch.check': return { commandId, kind: command.kind, objectId: command.jobId };
+    case 'chat.submit': return { commandId, kind: command.kind, objectId: command.conversationId };
+    case 'chat.refine': return { commandId, kind: command.kind, objectId: command.conversationId, parentTurnId: command.parentTurnId };
+    default: return assertNever(command);
+  }
+}
+
+function assertNever(_value: never): never { throw new Error('workspace_command_unsupported'); }

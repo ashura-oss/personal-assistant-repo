@@ -82,6 +82,22 @@ describe('private OpenRouter Batch ledger receipts', () => {
     expect(() => validateOpenRouterBatchLedger({ version: 1, jobs: [contentJob({ inputPolicyVersion: 3 as 1 | 2 })] })).toThrow(/integrity validation/i);
   });
 
+  it('keeps legacy five-source selection validation while accepting policy-2 Batch history without a selection-count ceiling', () => {
+    const knowledgeSelection = Array.from({ length: 6 }, (_, index) => ({ kind: 'person' as const, id: `person-${index}` }));
+    expect(() => validateOpenRouterBatchLedger({ version: 1, jobs: [contentJob({ knowledgeSelection })] })).toThrow(/integrity validation/i);
+    const current = validateOpenRouterBatchLedger({ version: 1, jobs: [contentJob({ inputPolicyVersion: 2, knowledgeSelection })] });
+    expect(current.jobs[0]?.knowledgeSelection).toHaveLength(6);
+  });
+
+  it('preserves the legacy question bound while allowing policy-2 questions within the physical envelope limit', () => {
+    const question = 'q'.repeat(20_000);
+    expect(() => validateOpenRouterBatchLedger({ version: 1, jobs: [contentJob({ question })] })).toThrow(/integrity validation/i);
+    const current = validateOpenRouterBatchLedger({ version: 1, jobs: [contentJob({ question, inputPolicyVersion: 2 })] });
+    expect(current.jobs[0]?.question).toBe(question);
+    const oversizedUnicode = '界'.repeat(Math.floor((1024 * 1024) / 3) + 1);
+    expect(() => validateOpenRouterBatchLedger({ version: 1, jobs: [contentJob({ question: oversizedUnicode, inputPolicyVersion: 2 })] })).toThrow(/integrity validation/i);
+  });
+
   it('requires every recovery edge to come from an intact cutoff and use strictly higher effort', () => {
     const parentId = '20000000-0000-4000-8000-000000000011';
     const childId = '20000000-0000-4000-8000-000000000012';

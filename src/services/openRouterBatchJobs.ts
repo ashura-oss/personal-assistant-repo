@@ -351,9 +351,12 @@ function validJob(value: unknown): value is OpenRouterBatchJob {
     if (typeof row.noteId !== 'string' || !row.noteId || row.noteId.length > 512 || !Number.isSafeInteger(row.noteRevision) || (row.noteRevision as number) < 1 ||
         typeof row.intent !== 'string' || !['assist', 'summarize', 'answer', 'extract'].includes(row.intent) || !canonicalIso(row.capturedAt) ||
         typeof row.captureTimeZone !== 'string' || !row.captureTimeZone || row.captureTimeZone.length > 100 || !validTimeZone(row.captureTimeZone) ||
-        (row.question !== undefined && (typeof row.question !== 'string' || row.question.length > 16_384)) ||
+        (row.question !== undefined && (typeof row.question !== 'string' ||
+          (row.inputPolicyVersion === 2
+            ? new TextEncoder().encode(row.question).byteLength > 1024 * 1024
+            : row.question.length > 16_384))) ||
         (row.answeredAsOf !== undefined && !canonicalIso(row.answeredAsOf)) ||
-        (row.knowledgeSelection !== undefined && !validKnowledgeSelection(row.knowledgeSelection))) return false;
+        (row.knowledgeSelection !== undefined && !validKnowledgeSelection(row.knowledgeSelection, row.inputPolicyVersion === 2 ? 2 : 1))) return false;
     if (row.operation === 'chat_refinement' && (row.intent !== 'answer' || (row.requestProfileVersion !== 2 && row.requestProfileVersion !== 4) ||
         !row.chatBinding || !row.chatBinding.refinementParent || row.reasoningEffort !== row.effort)) return false;
     if (row.operation !== 'chat_refinement' && (row.reasoningEffort !== undefined || row.chatBinding?.refinementParent !== undefined)) return false;
@@ -429,8 +432,8 @@ function validTimeZone(value: string): boolean {
   catch { return false; }
 }
 
-function validKnowledgeSelection(value: unknown): boolean {
-  if (!Array.isArray(value) || value.length > 5) return false;
+function validKnowledgeSelection(value: unknown, inputPolicyVersion: 1 | 2 = 1): boolean {
+  if (!Array.isArray(value) || (inputPolicyVersion === 1 && value.length > 5)) return false;
   const seen = new Set<string>();
   for (const candidate of value) {
     const row = record(candidate);
