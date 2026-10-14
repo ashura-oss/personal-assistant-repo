@@ -2,6 +2,9 @@
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { createWorkspaceSnapshotDTO } from '../src/cloud/workspaceDto';
+import type { AssistantBatchJobDTO } from '../src/services/openRouterBatchJobs';
+import { createInitialWorkspaceState } from '../src/services/controller.shared';
 import type { ChatConversationDTO, ChatTurnDTO } from '../src/chat/types';
 import { ChatSection } from '../src/ui/ChatSection';
 
@@ -51,5 +54,49 @@ describe('Chat memory review affordance', () => {
     ]);
     act(() => buttons.find((item) => item.textContent === 'Review memory suggestion 2')?.click());
     expect(onReviewMemorySuggestion).toHaveBeenCalledExactlyOnceWith('memory-b', chat, turns[0]);
+  });
+
+  it('renders deeply frozen snapshot chat and nested Batch DTOs and returns the exact readonly memory view', () => {
+    const stamp = '2026-10-14T08:00:00.000Z';
+    const job: AssistantBatchJobDTO = {
+      id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', kind: 'note_assistance', status: 'submission_unknown', canCheck: false,
+      createdAt: stamp, updatedAt: stamp, noteId: 'note-1', noteRevision: 2, model: 'openai/gpt-6-luna:batch', effort: 'low',
+      requestBytes: 150, omittedSourceCount: 0, unknownCharge: true, costStatus: 'waiting', billingScope: 'openrouter_reported',
+      promptTokens: 0, moreComputeEfforts: ['high'],
+    };
+    const turn: ChatTurnDTO = {
+      id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', noteId: 'note-1', userText: 'Keep the original message.', createdAt: stamp,
+      memorySuggestionIds: ['memory-safe-id'], job,
+    };
+    const conversation: ChatConversationDTO = {
+      id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', title: 'Planning', createdAt: stamp, updatedAt: stamp, turns: [turn],
+    };
+    const state = createInitialWorkspaceState(() => 'dddddddd-dddd-4ddd-8ddd-dddddddddddd');
+    state.assistantBatchJobs = [job];
+    state.assistantChatConversations = [conversation];
+    const snapshot = createWorkspaceSnapshotDTO({ getSnapshot: () => state }, {
+      workspaceId: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee', privacyEpoch: 1, revision: 9,
+    });
+    const readonlyConversation = snapshot.state.assistantChatConversations[0]!;
+    const readonlyTurn = readonlyConversation.turns[0]!;
+    expect(Object.isFrozen(readonlyConversation.turns)).toBe(true);
+    expect(Object.isFrozen(readonlyTurn.job)).toBe(true);
+    expect(Object.isFrozen(readonlyTurn.job?.moreComputeEfforts)).toBe(true);
+
+    const onReview = vi.fn();
+    act(() => root.render(React.createElement(ChatSection, {
+      conversations: snapshot.state.assistantChatConversations,
+      selectedConversationId: readonlyConversation.id,
+      turns: readonlyConversation.turns,
+      busy: false,
+      enabled: false,
+      onSelectConversation: vi.fn(), onCreateConversation: vi.fn(), onSend: vi.fn(async () => undefined),
+      onOpenActions: vi.fn(), onCheckJob: vi.fn(), onRetryJobCleanup: vi.fn(), onReviewMemorySuggestion: onReview,
+    })));
+    expect(host.textContent).toContain('Submission status uncertain');
+    expect(host.textContent).toContain('Provider-reported usage is not available yet.');
+    expect(host.textContent).toContain('0 prompt');
+    act(() => [...host.querySelectorAll('button')].find((item) => item.textContent === 'Review memory')?.click());
+    expect(onReview).toHaveBeenCalledExactlyOnceWith('memory-safe-id', readonlyConversation, readonlyTurn);
   });
 });

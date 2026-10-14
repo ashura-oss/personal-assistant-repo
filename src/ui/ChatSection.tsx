@@ -1,16 +1,16 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView, Text, TextInput, View } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
-import type { ChatConversationDTO, ChatTurnDTO } from '../chat/types';
 import { AssistantBatchJobCard } from './AssistantBatchJobCard';
 import { Button } from './primitives';
 import { isAcceptedChatSubmission } from './chatSubmission';
 import { chatMemoryReviewSuggestionIds } from './chatMemoryReview';
 import { C, s } from './theme';
 import type { MoreComputeReviewActions } from './MoreComputeReview';
+import type { WorkspaceChatConversationDisplay, WorkspaceChatTurnDisplay } from './workspaceChatDisplayTypes';
 
-export type ChatConversation = ChatConversationDTO;
-export type ChatTurn = ChatTurnDTO;
+export type ChatConversation = WorkspaceChatConversationDisplay;
+export type ChatTurn = WorkspaceChatTurnDisplay;
 type ChatRefinementEffort = 'medium' | 'high' | 'max';
 type ChatRefinementRequest = Readonly<{
   conversationId: string;

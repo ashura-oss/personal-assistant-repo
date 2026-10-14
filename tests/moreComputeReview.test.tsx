@@ -3,9 +3,9 @@ import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AssistantBatchMoreComputePlan } from '../src/core';
-import type { AssistantBatchJobDTO } from '../src/services/openRouterBatchJobs';
 import { AssistantBatchJobCard } from '../src/ui/AssistantBatchJobCard';
 import { MoreComputeReview, type MoreComputeReviewActions } from '../src/ui/MoreComputeReview';
+import type { WorkspaceAssistantBatchJobDisplay, WorkspaceMoreComputePlanDisplay } from '../src/ui/workspaceChatDisplayTypes';
 
 vi.mock('react-native', async () => {
   const ReactModule = await import('react');
@@ -28,7 +28,7 @@ beforeEach(() => {
 });
 afterEach(() => { act(() => root.unmount()); host.remove(); });
 
-const job = (overrides: Partial<AssistantBatchJobDTO> = {}): AssistantBatchJobDTO => ({
+const job = (overrides: Partial<WorkspaceAssistantBatchJobDisplay> = {}): WorkspaceAssistantBatchJobDisplay => ({
   id: 'parent-job', kind: 'note_assistance', status: 'result_not_retained', canCheck: false,
   createdAt: '2026-10-14T01:00:00.000Z', updatedAt: '2026-10-14T01:00:00.000Z',
   noteId: 'note-1', noteRevision: 2, model: 'openai/gpt-6-luna:batch', effort: 'medium',
@@ -51,7 +51,7 @@ describe('mounted More Compute review', () => {
   it('reviews structured request context without a key and submits only the exact reviewed plan after readiness', async () => {
     const prepared = plan();
     const onPrepare = vi.fn(async () => prepared);
-    const onSubmit = vi.fn(async () => ({ id: 'child-job', status: 'queued' }));
+    const onSubmit = vi.fn(async () => job({ id: 'child-job', status: 'queued' }));
     const onCancel = vi.fn();
     const onSubmitted = vi.fn();
     const actions: MoreComputeReviewActions = { ownerKey: 'note-owner', blocked: false, submitReady: false, onPrepare, onSubmit, onCancel, onSubmitted };
@@ -108,9 +108,47 @@ describe('mounted More Compute review', () => {
     expect([...dialog.querySelectorAll('button')].map((button) => button.textContent)).toContain('Cancel review');
   });
 
+  it('renders nested readonly chat source rows, preserves reported accounting, and returns the safe child display', async () => {
+    const frozenPlan: WorkspaceMoreComputePlanDisplay = Object.freeze({
+      ...plan(),
+      priorAccounting: Object.freeze({ costStatus: 'reported', providerReportedCostUsd: 0, promptTokens: 0, unknownCharge: true }),
+      preview: Object.freeze({
+        userText: 'Use the prior confirmed details.',
+        sourceLabels: Object.freeze([Object.freeze({ id: 'source-a', label: 'Selected note', text: 'Saved source text.' })]),
+        omittedSourceCount: 0,
+        chat: Object.freeze({
+          conversationId: 'conversation-a', parentTurnId: 'turn-a', recoveryParentTurnId: 'turn-a', isRefinement: true,
+          selectedContext: Object.freeze([Object.freeze({ userText: 'Earlier question', assistantText: 'Earlier answer', completedAt: '2026-10-13T08:00:00Z' })]),
+        }),
+      }),
+    });
+    const child = job({ id: 'child-job', status: 'submission_unknown', recoveredConversationId: 'conversation-a', recoveredTurnId: 'turn-b' });
+    const onSubmitted = vi.fn();
+    const actions: MoreComputeReviewActions = {
+      ownerKey: 'chat-owner', blocked: false, submitReady: true,
+      onPrepare: vi.fn(async () => frozenPlan), onSubmit: vi.fn(async () => child), onCancel: vi.fn(), onSubmitted,
+    };
+    render(actions, job({ kind: 'note_assistance', effort: 'medium', canRecoverMoreCompute: true, moreComputeEfforts: ['high'] }));
+    await act(async () => { host.querySelector<HTMLButtonElement>('button')!.click(); await Promise.resolve(); });
+    const dialog = host.querySelector('[role="dialog"]')!;
+    expect(Object.isFrozen(frozenPlan.preview.sourceLabels[0])).toBe(true);
+    expect(Object.isFrozen(frozenPlan.preview.chat?.selectedContext[0])).toBe(true);
+    expect(dialog.textContent).toContain('US$0');
+    expect(dialog.textContent).toContain('0 prompt');
+    expect(dialog.textContent).toContain('previous request may have incurred a charge');
+    expect(dialog.textContent).toContain('Saved source text.');
+    expect(dialog.textContent).toContain('Earlier answer');
+    await act(async () => {
+      [...dialog.querySelectorAll('button')].find((button) => button.textContent === 'Submit new paid request')!.click();
+      await Promise.resolve();
+    });
+    expect(onSubmitted).toHaveBeenCalledExactlyOnceWith(child, 'chat-owner');
+    expect(host.textContent).toContain('The new request status is uncertain.');
+  });
+
   it('cancels the exact late plan when owner changes during prepare and never opens the old review', async () => {
-    let finish!: (value: AssistantBatchMoreComputePlan) => void;
-    const onPrepare = vi.fn(() => new Promise<AssistantBatchMoreComputePlan>((resolve) => { finish = resolve; }));
+    let finish!: (value: WorkspaceMoreComputePlanDisplay) => void;
+    const onPrepare = vi.fn(() => new Promise<WorkspaceMoreComputePlanDisplay>((resolve) => { finish = resolve; }));
     const onCancel = vi.fn();
     const actions: MoreComputeReviewActions = { ownerKey: 'old-owner', blocked: false, submitReady: false, onPrepare, onSubmit: vi.fn(), onCancel };
     render(actions);
@@ -122,8 +160,8 @@ describe('mounted More Compute review', () => {
   });
 
   it('cancels preparation locally and cancels the exact plan if it arrives afterward', async () => {
-    let finish!: (value: AssistantBatchMoreComputePlan) => void;
-    const onPrepare = vi.fn(() => new Promise<AssistantBatchMoreComputePlan>((resolve) => { finish = resolve; }));
+    let finish!: (value: WorkspaceMoreComputePlanDisplay) => void;
+    const onPrepare = vi.fn(() => new Promise<WorkspaceMoreComputePlanDisplay>((resolve) => { finish = resolve; }));
     const onCancel = vi.fn();
     render({ ownerKey: 'owner', blocked: false, submitReady: false, onPrepare, onSubmit: vi.fn(), onCancel });
     await act(async () => { host.querySelector<HTMLButtonElement>('button')!.click(); await Promise.resolve(); });

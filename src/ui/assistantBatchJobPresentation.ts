@@ -1,7 +1,7 @@
-import type { AssistantBatchJobDTO } from '../services/openRouterBatchJobs';
+import type { WorkspaceAssistantBatchJobDisplay } from './workspaceChatDisplayTypes';
 import { formatProviderReportedCostUsd } from './formatProviderReportedCostUsd';
 
-export function assistantBatchStatusLabel(status: AssistantBatchJobDTO['status'], kind: AssistantBatchJobDTO['kind'] = 'note_assistance'): string {
+export function assistantBatchStatusLabel(status: WorkspaceAssistantBatchJobDisplay['status'], kind: WorkspaceAssistantBatchJobDisplay['kind'] = 'note_assistance'): string {
   switch (status) {
     case 'preparing': return 'Preparing request';
     case 'submitting': return 'Submitting request';
@@ -27,7 +27,7 @@ export function formatReportedBatchCost(value: number | undefined): string | und
   return formatProviderReportedCostUsd(value);
 }
 
-export function batchJobTokenSummary(job: AssistantBatchJobDTO): string | undefined {
+export function batchJobTokenSummary(job: WorkspaceAssistantBatchJobDisplay): string | undefined {
   const parts = [
     job.promptTokens !== undefined ? `${job.promptTokens.toLocaleString()} prompt` : undefined,
     job.completionTokens !== undefined ? `${job.completionTokens.toLocaleString()} completion` : undefined,
@@ -36,21 +36,21 @@ export function batchJobTokenSummary(job: AssistantBatchJobDTO): string | undefi
   return parts.length ? parts.join(' · ') : undefined;
 }
 
-export function canCheckBatchJob(job: AssistantBatchJobDTO): boolean {
+export function canCheckBatchJob(job: WorkspaceAssistantBatchJobDisplay): boolean {
   return job.canCheck;
 }
 
-export function batchCheckLabel(job: AssistantBatchJobDTO): 'Check for reply' | 'Check provider usage' {
+export function batchCheckLabel(job: WorkspaceAssistantBatchJobDisplay): 'Check for reply' | 'Check provider usage' {
   return job.status === 'queued' || job.status === 'processing'
     ? 'Check for reply'
     : 'Check provider usage';
 }
 
-export function canRetryBatchJobCleanup(job: AssistantBatchJobDTO): boolean {
+export function canRetryBatchJobCleanup(job: WorkspaceAssistantBatchJobDisplay): boolean {
   return job.status === 'cleanup_pending';
 }
 
-export function hasNoHigherSupportedReasoning(job: AssistantBatchJobDTO): boolean {
+export function hasNoHigherSupportedReasoning(job: WorkspaceAssistantBatchJobDisplay): boolean {
   return job.pendingRecoveryChildId === undefined &&
     (job.effort === 'max' || job.moreComputeEfforts !== undefined && job.moreComputeEfforts.length === 0);
 }

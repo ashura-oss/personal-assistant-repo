@@ -1,9 +1,9 @@
 import React, { useRef, useState } from 'react';
 import { Text, View } from 'react-native';
-import type { AssistantBatchJobDTO } from '../services/openRouterBatchJobs';
 import { Button } from './primitives';
 import { C, s } from './theme';
 import { MoreComputeReview, type MoreComputeReviewActions } from './MoreComputeReview';
+import type { WorkspaceAssistantBatchJobDisplay } from './workspaceChatDisplayTypes';
 import {
   assistantBatchStatusLabel,
   batchCheckLabel,
@@ -15,7 +15,7 @@ import {
 } from './assistantBatchJobPresentation';
 
 type Props = {
-  job: AssistantBatchJobDTO;
+  job: WorkspaceAssistantBatchJobDisplay;
   chatContext?: 'chat' | 'refinement';
   busy?: boolean;
   blocked?: boolean;

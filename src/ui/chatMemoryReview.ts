@@ -1,11 +1,11 @@
-import type { ChatConversationDTO, ChatTurnDTO } from '../chat/types';
+import type { WorkspaceChatConversationDisplay, WorkspaceChatTurnDisplay } from './workspaceChatDisplayTypes';
 
-export function chatMemoryReviewSuggestionIds(turn: ChatTurnDTO): readonly string[] {
+export function chatMemoryReviewSuggestionIds(turn: WorkspaceChatTurnDisplay): readonly string[] {
   return turn.operation === 'chat_refinement' ? [] : [...new Set(turn.memorySuggestionIds ?? [])];
 }
 
 /** Labels Chat note evidence from the public conversation/message DTO only. */
-export function safeChatMemoryEvidenceLabels(conversations: readonly ChatConversationDTO[]): Record<string, string> {
+export function safeChatMemoryEvidenceLabels(conversations: readonly WorkspaceChatConversationDisplay[]): Record<string, string> {
   const labels: Record<string, string> = Object.create(null) as Record<string, string>;
   for (const conversation of conversations) {
     const title = conversation.title.replace(/\s+/g, ' ').trim().slice(0, 80) || 'Untitled conversation';

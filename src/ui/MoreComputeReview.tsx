@@ -1,11 +1,10 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Modal, ScrollView, Text, View } from 'react-native';
-import type { AssistantBatchMoreComputePlan } from '../core';
-import type { AssistantBatchJobDTO } from '../services/openRouterBatchJobs';
 import type { OpenRouterChatRefinementEffort } from '../services/openRouter';
 import { Button } from './primitives';
 import { formatReportedBatchCost } from './assistantBatchJobPresentation';
 import { C, s } from './theme';
+import type { WorkspaceAssistantBatchJobDisplay, WorkspaceMoreComputePlanDisplay } from './workspaceChatDisplayTypes';
 
 const isExpiredAtNow = (value: string) => Date.parse(value) <= Date.now();
 
@@ -16,15 +15,15 @@ export type MoreComputeReviewActions = {
   blocked: boolean;
   prepareReady?: boolean;
   submitReady: boolean;
-  onPrepare: (jobId: string, effort: Effort, ownerKey: string, isOwnerCurrent: () => boolean) => Promise<AssistantBatchMoreComputePlan | undefined>;
-  onSubmit: (planId: string, jobId: string, ownerKey: string, isOwnerCurrent: () => boolean) => Promise<unknown>;
+  onPrepare: (jobId: string, effort: Effort, ownerKey: string, isOwnerCurrent: () => boolean) => Promise<WorkspaceMoreComputePlanDisplay | undefined>;
+  onSubmit: (planId: string, jobId: string, ownerKey: string, isOwnerCurrent: () => boolean) => Promise<WorkspaceAssistantBatchJobDisplay | undefined>;
   onCancel: (planId: string, ownerKey: string) => void;
-  onSubmitted?: (result: unknown, ownerKey: string) => void;
+  onSubmitted?: (result: WorkspaceAssistantBatchJobDisplay, ownerKey: string) => void;
 };
 
-type Props = MoreComputeReviewActions & { job: AssistantBatchJobDTO };
+type Props = MoreComputeReviewActions & { job: WorkspaceAssistantBatchJobDisplay };
 
-function validEfforts(job: AssistantBatchJobDTO): Effort[] {
+function validEfforts(job: WorkspaceAssistantBatchJobDisplay): Effort[] {
   const order: Effort[] = ['medium', 'high', 'max'];
   const current = order.indexOf(job.effort as Effort);
   return (job.moreComputeEfforts ?? []).filter((value): value is Effort => {
@@ -38,19 +37,19 @@ function readableEffort(value: string): string {
 }
 
 export function MoreComputeReview({ job, ownerKey, blocked, prepareReady = true, submitReady, onPrepare, onSubmit, onCancel, onSubmitted }: Props) {
-  const [plan, setPlan] = useState<AssistantBatchMoreComputePlan>();
+  const [plan, setPlan] = useState<WorkspaceMoreComputePlanDisplay>();
   const [effort, setEffort] = useState<Effort>();
   const [pending, setPending] = useState<'prepare' | 'submit' | undefined>();
   const [notice, setNotice] = useState('');
   const sequence = useRef(0);
   const alive = useRef(true);
-  const planRef = useRef<AssistantBatchMoreComputePlan | undefined>(undefined);
+  const planRef = useRef<WorkspaceMoreComputePlanDisplay | undefined>(undefined);
   const ownerRef = useRef(ownerKey);
   const observedRef = useRef({ ownerKey, jobId: job.id });
   const lock = useRef(false);
   const cleanupOwnerKey = ownerKey;
 
-  const cancelExact = React.useCallback((captured: AssistantBatchMoreComputePlan, capturedOwner: string) => {
+  const cancelExact = React.useCallback((captured: WorkspaceMoreComputePlanDisplay, capturedOwner: string) => {
     onCancel(captured.planId, capturedOwner);
   }, [onCancel]);
 
@@ -129,13 +128,12 @@ export function MoreComputeReview({ job, ownerKey, blocked, prepareReady = true,
       const isOwnerCurrent = () => alive.current && ownerRef.current === capturedOwner && observedRef.current.jobId === captured.jobId && !blocked;
       const result = await onSubmit(captured.planId, captured.jobId, capturedOwner, isOwnerCurrent);
       if (alive.current && sequence.current === ticket && ownerRef.current === capturedOwner) {
-        if (!result || typeof result !== 'object' || !('status' in result) || !('id' in result)) {
+        if (!result) {
           setNotice('No request status was confirmed. Check the existing request history before taking another action.');
           return;
         }
         onSubmitted?.(result, capturedOwner);
-        const saved = result as { status?: string };
-        setNotice(saved.status === 'submission_unknown' || saved.status === 'cleanup_pending'
+        setNotice(result.status === 'submission_unknown' || result.status === 'cleanup_pending'
           ? 'The new request status is uncertain. Check this saved request before taking another action.'
           : 'The new Batch request is saved in request history. Check its status when you choose.');
       }
