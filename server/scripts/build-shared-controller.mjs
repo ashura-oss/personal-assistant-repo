@@ -122,3 +122,24 @@ await build({
     },
   }],
 });
+
+await build({
+  entryPoints: [resolve(repositoryRoot, 'src/cloud/providerResponseLifetime.node.ts')],
+  outfile: resolve(import.meta.dirname, '../dist/providerResponseLifetime.node.mjs'),
+  bundle: true,
+  platform: 'node',
+  format: 'esm',
+  target: 'node22',
+  sourcemap: false,
+  plugins: [{
+    name: 'deny-native-runtime-imports',
+    setup(buildApi) {
+      buildApi.onResolve({ filter: /.*/ }, (args) => {
+        if (/^(?:expo(?:$|[-/])|react-native(?:$|\/))/.test(args.path)) {
+          return { errors: [{ text: `Node response lifetime import boundary rejected ${args.path} (imported by ${args.importer})` }] };
+        }
+        return undefined;
+      });
+    },
+  }],
+});
