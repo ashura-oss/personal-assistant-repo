@@ -47,6 +47,13 @@ const sha = async (text: string) => Crypto.digestStringAsync(Crypto.CryptoDigest
 afterEach(() => vi.restoreAllMocks());
 
 describe('controller portable backup workflow', () => {
+  it('rejects Batch job identifiers in portable proposal history instead of restoring authority', () => {
+    const malicious = structuredClone(fixture()) as PortableBackupV4 & { history: (PortableBackupV4['history'][number] & { batchJobId?: string })[] };
+    malicious.history.push({ kind: 'proposal', sourceId: 'proposal:linked', title: 'Imported history', content: 'Historical text only.',
+      status: 'Unverified historical result', batchJobId: '11111111-1111-4111-8111-111111111111' });
+    expect(() => parsePortableBackup(JSON.stringify(malicious))).toThrow();
+  });
+
   it('rejects oversized input before cloning, loading state, or hashing', async () => {
     const store = new MemoryStore();
     const app = new AppControllerImpl(store);

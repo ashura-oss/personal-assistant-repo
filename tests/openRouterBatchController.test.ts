@@ -2,9 +2,13 @@ import { describe, expect, it, vi } from 'vitest';
 import * as Crypto from 'expo-crypto';
 import { assistantResponseSchema } from '../src/assistant';
 import { AppControllerImpl } from '../src/services/controller';
-import { OpenRouterBatchClient, OpenRouterBatchRequestBuilder, OPENROUTER_BATCH_BODY_MODEL, OPENROUTER_CHAT_COMPLETIONS_PATH, type OpenRouterBatchInspection } from '../src/services/openRouter';
-import type { AppState } from '../src/core';
+import { validateDispatchRecord } from '../src/dispatch';
+import { describeMessageWindowQuery } from '../src/connectors';
+import { OpenRouterBatchClient, OpenRouterBatchDispatchError, OpenRouterBatchRequestBuilder, OPENROUTER_BATCH_BODY_MODEL, OPENROUTER_CHAT_COMPLETIONS_PATH, type OpenRouterBatchInspection } from '../src/services/openRouter';
+import { parseOpenRouterMailReplyResult } from '../src/services/openRouterMailReply';
+import type { AppState, SelectedMailTextSnapshot } from '../src/core';
 import type { StateStore } from '../src/storage/contracts';
+import { STATE_SNAPSHOT_READ_MAX_BYTES } from '../src/storage/contracts';
 
 class MemoryStore implements StateStore {
   value?: AppState;
@@ -51,6 +55,48 @@ async function fakeSubmit(
     model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h' as const, total: 1, completed: 0, failed: 0 };
 }
 
+async function mailFixture(fakeClient: OpenRouterBatchClient, connector: Record<string, unknown> = {}) {
+  const text = 'Selected message body for a controlled mail Batch controller fixture.';
+  const identity = { providerNamespace: 'google' as const, clientId: 'mail-fixture-client', subject: 'mail-fixture-subject' };
+  const identityKey = 'google:mail-fixture-client:mail-fixture-subject:';
+  const store = new MemoryStore();
+  const integration = { openRouterBatchClient: fakeClient,
+    tokenStore: { async get() { return { accessToken: 'fixture-token', expiresAt: Date.now() + 600_000, identity }; }, async set() {} },
+    connectorFactory: () => connector as never };
+  let app = new AppControllerImpl(store, {}, integration);
+  await app.load();
+  const state = structuredClone(app.getSnapshot());
+  const observedAt = new Date().toISOString();
+  const account = { id: 'mail-fixture-account', provider: 'google' as const, displayName: 'Mail', email: 'me@example.test', verifiedEmail: 'me@example.test',
+    connected: true, authStatus: 'connected' as const, identity, tokenRef: 'fixture-token-ref', capabilities: ['mail.read' as const],
+    grantedScopes: ['openid', 'https://www.googleapis.com/auth/gmail.readonly'], connectionGeneration: 2 };
+  const message = { id: 'mail-fixture-local', accountId: account.id, providerMessageId: 'mail-fixture-provider', identityKey: `${identityKey}:mail-fixture-provider`,
+    verifiedIdentityKey: identityKey, connectionGeneration: 2, idFormat: 'gmail' as const, threadId: 'mail-fixture-thread', subject: 'Fixture subject',
+    from: 'Sam <sam@example.test>', senderEmail: 'sam@example.test', receivedAt: observedAt, replyTo: ['sam@example.test'], to: ['me@example.test'], cc: [],
+    internetMessageId: '<mail-fixture@example.test>', replyMetadataComplete: true, observedAt };
+  state.accounts.push(account); state.mailbox.push(message);
+  state.settings = { ...state.settings, mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' };
+  await store.save(state);
+  app = new AppControllerImpl(store, {}, integration);
+  await app.load();
+  const connectedGeneration = app.getSnapshot().accounts.find((item) => item.id === account.id)!.connectionGeneration ?? 0;
+  await (app as unknown as { mutate(operation: (draft: AppState) => void): Promise<void> }).mutate((draft) => {
+    const current = draft.accounts.find((item) => item.id === account.id)!;
+    current.connected = true; current.authStatus = 'connected'; current.capabilities = ['mail.read'];
+    current.grantedScopes = ['openid', 'https://www.googleapis.com/auth/gmail.readonly']; current.connectionGeneration = connectedGeneration;
+    const row = draft.mailbox.find((item) => item.id === message.id)!;
+    row.connectionGeneration = connectedGeneration; row.verifiedIdentityKey = identityKey; row.identityKey = `${identityKey}:${message.providerMessageId}`;
+  });
+  const source = await app.getMailReplySource(message.id);
+  const textDigest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, text, { encoding: Crypto.CryptoEncoding.HEX });
+  const selected: SelectedMailTextSnapshot = { version: 1, messageId: message.id, accountId: account.id, identityKey, identity,
+    connectionGeneration: connectedGeneration, providerMessageId: message.providerMessageId, idFormat: 'gmail', sourceDigest: source.source!.sourceDigest,
+    checkedAt: observedAt, text, textDigest, bytes: new TextEncoder().encode(text).length, extractionVersion: 'mail-text-v1',
+    representation: 'plain', completeness: 'complete_text', omissionReasons: [] };
+  await (app as unknown as { mutate(operation: (draft: AppState) => void): Promise<void> }).mutate((draft) => { draft.selectedMailTexts = [selected]; });
+  return { app, store, integration, account, message, source, text, textDigest, identity, identityKey };
+}
+
 function completedInspection(customId: string, content = JSON.stringify({
   summary: 'A concise summary.', answer: '', decisions: [], citations: [], clarifications: [], proposals: [], memorySuggestions: [],
 }), refusal?: unknown): OpenRouterBatchInspection {
@@ -68,6 +114,489 @@ function completedInspection(customId: string, content = JSON.stringify({
 }
 
 describe('OpenRouter Batch controller lifecycle', () => {
+  it('preserves mail Batch history across account revocation and safely attaches a late owned POST acknowledgement', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-14T03:00:00.000Z'));
+    try {
+      let releaseBeforePersist!: () => void;
+      let beforePersistEntered!: () => void;
+      const beforePersistGate = new Promise<void>((resolve) => { releaseBeforePersist = resolve; });
+      const beforePersistStarted = new Promise<void>((resolve) => { beforePersistEntered = resolve; });
+      let prePostCalls = 0;
+      const prePostClient = {
+        submit: async (_input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => {
+          beforePersistEntered(); await beforePersistGate;
+          try { await before(); } catch { throw new OpenRouterBatchDispatchError('pre_dispatch', 'The saved note changed before Batch submission.'); }
+          assert(); prePostCalls += 1;
+          return { batchId: 'must-not-post', status: 'validating', endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH,
+            model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h' as const, total: 1, completed: 0, failed: 0 };
+        },
+      } as unknown as OpenRouterBatchClient;
+      const prePost = await mailFixture(prePostClient);
+      const beforePostAttempt = prePost.app.submitMailReplyBatch({ messageId: prePost.message.id, sourceDigest: prePost.source.source!.sourceDigest,
+        textDigest: prePost.textDigest, mode: 'reply', to: ['sam@example.test'], cc: [], brief: 'Before POST revocation.', composerRevision: 1 });
+      await beforePersistStarted;
+      const revokedBeforePost = await prePost.app.disconnectAccount(prePost.account.id);
+      expect(revokedBeforePost.connected).toBe(false);
+      releaseBeforePersist();
+      await expect(beforePostAttempt).rejects.toThrow(/changed before Batch submission/i);
+      expect(prePostCalls).toBe(0);
+      const prePostJob = prePost.app.getSnapshot().assistantBatchJobs?.[0];
+      expect(prePostJob).toMatchObject({ status: 'failed', failureCode: 'not_submitted', unknownCharge: false });
+      const prePostReload = new AppControllerImpl(prePost.store, {}, prePost.integration);
+      await prePostReload.load();
+      expect(prePostReload.getSnapshot().assistantBatchJobs?.[0]).toMatchObject({ status: 'failed', failureCode: 'not_submitted', unknownCharge: false });
+
+      let releasePost!: () => void;
+      let postStarted!: () => void;
+      const postGate = new Promise<void>((resolve) => { releasePost = resolve; });
+      const postHasStarted = new Promise<void>((resolve) => { postStarted = resolve; });
+      let postCalls = 0;
+      let inspectCalls = 0;
+      const lateAckClient = {
+        submit: async (input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => {
+          await before(); assert(); postCalls += 1; postStarted(); await postGate;
+          return { batchId: 'mail_late_ack', status: 'validating', endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH,
+            model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h' as const, total: 1, completed: 0, failed: 0 };
+        },
+        inspect: async (_batchId: string, customId: string) => {
+          inspectCalls += 1;
+          return { ...completedInspection(customId, JSON.stringify({ text: 'Saved after the late acknowledgement.' }), null), batchId: 'mail_late_ack' };
+        },
+      } as unknown as OpenRouterBatchClient;
+      const late = await mailFixture(lateAckClient);
+      const pending = late.app.submitMailReplyBatch({ messageId: late.message.id, sourceDigest: late.source.source!.sourceDigest,
+        textDigest: late.textDigest, mode: 'reply', to: ['sam@example.test'], cc: [], brief: 'POST already started.', composerRevision: 1 });
+      await postHasStarted;
+      const revoked = await late.app.disconnectAccount(late.account.id);
+      expect(revoked).toMatchObject({ connected: false, connectionGeneration: expect.any(Number) });
+      const submitting = late.app.getSnapshot().assistantBatchJobs?.find((item) => item.status === 'submitting');
+      expect(submitting).toBeDefined();
+      releasePost();
+      const queued = await pending;
+      expect(queued).toMatchObject({ status: 'queued', unknownCharge: true });
+      const lateLedger = (late.store.value as AppState & { openRouterBatchLedger: { jobs: { id: string; status: string; batchId?: string; unknownCharge: boolean }[] } }).openRouterBatchLedger;
+      expect(lateLedger.jobs.find((item) => item.id === queued.id)).toMatchObject({ status: 'queued', batchId: 'mail_late_ack', unknownCharge: true });
+      expect(postCalls).toBe(1);
+      expect(late.store.value?.accounts.find((item) => item.id === late.account.id)?.connected).toBe(false);
+      expect(late.store.value?.accounts.find((item) => item.id === late.account.id)?.connectionGeneration).toBeGreaterThan(late.account.connectionGeneration ?? 0);
+      expect(late.app.getSnapshot().assistantBatchJobs?.find((item) => item.id === queued.id)).toMatchObject({ status: 'queued' });
+      const check = await late.app.refreshAssistantBatch(queued.id);
+      expect(check).toMatchObject({ status: 'completed', providerReportedCostUsd: 0.001 });
+      expect(inspectCalls).toBe(1);
+      const restarted = new AppControllerImpl(late.store, {}, late.integration);
+      await restarted.load();
+      expect(restarted.getSnapshot().assistantBatchJobs?.find((item) => item.id === queued.id)).toMatchObject({ status: 'completed', providerReportedCostUsd: 0.001 });
+      await expect(restarted.reviewMailReplyBatch(queued.id)).rejects.toThrow(/changed|unavailable/i);
+
+      let releaseUnknown!: () => void;
+      let unknownPostStarted!: () => void;
+      let unknownInspectCalls = 0;
+      const unknownGate = new Promise<void>((resolve) => { releaseUnknown = resolve; });
+      const unknownStarted = new Promise<void>((resolve) => { unknownPostStarted = resolve; });
+      const unknownClient = {
+        submit: async (_input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => {
+          await before(); assert(); unknownPostStarted(); await unknownGate;
+          throw new OpenRouterBatchDispatchError('unknown', 'The provider POST outcome is unknown.');
+        },
+        inspect: async () => { unknownInspectCalls += 1; throw new Error('No provider inspection is allowed without a saved batch ID.'); },
+      } as unknown as OpenRouterBatchClient;
+      const unknown = await mailFixture(unknownClient);
+      const unknownPending = unknown.app.submitMailReplyBatch({ messageId: unknown.message.id, sourceDigest: unknown.source.source!.sourceDigest,
+        textDigest: unknown.textDigest, mode: 'reply', to: ['sam@example.test'], cc: [], brief: 'Unknown POST outcome.', composerRevision: 1 });
+      await unknownStarted;
+      await unknown.app.disconnectAccount(unknown.account.id);
+      releaseUnknown();
+      await expect(unknownPending).rejects.toThrow(/outcome is unknown/i);
+      const unknownJob = (unknown.store.value as AppState & { openRouterBatchLedger: { jobs: Record<string, unknown>[] } }).openRouterBatchLedger.jobs[0]!;
+      expect(unknownJob).toMatchObject({ status: 'submission_unknown', unknownCharge: true });
+      expect(unknownJob).not.toHaveProperty('batchId');
+      const unknownReload = new AppControllerImpl(unknown.store, {}, unknown.integration);
+      await unknownReload.load();
+      expect(unknownReload.getSnapshot().assistantBatchJobs?.[0]).toMatchObject({ status: 'submission_unknown', unknownCharge: true });
+      expect(await unknownReload.refreshAssistantBatch(unknownJob.id as string)).toMatchObject({ status: 'submission_unknown', unknownCharge: true });
+      expect(unknownInspectCalls).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('captures mail submission inputs before awaiting and admits only one POST per selected message', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-14T02:00:00.000Z'));
+    try {
+      let submitStarted!: () => void;
+      let releaseSubmit!: () => void;
+      const started = new Promise<void>((resolve) => { submitStarted = resolve; });
+      const postGate = new Promise<void>((resolve) => { releaseSubmit = resolve; });
+      const bodies: Record<string, unknown>[] = [];
+      const text = 'The selected message body is frozen for this explicit request.';
+      let providerVersion: string | undefined;
+      let providerDeletionObserved = false;
+      let selectedTextReads = 0;
+      const connector = { async readSelectedMessageText(_account: unknown, providerMessageId: string) {
+        selectedTextReads += 1;
+        return { status: 'available', message: { id: providerMessageId, idFormat: 'gmail' as const, threadId: 'batch-mail-thread', subject: 'Frozen subject',
+          from: 'Sam <sam@example.test>', senderEmail: 'sam@example.test', receivedAt: new Date().toISOString(), replyMetadataComplete: true,
+          internetMessageId: '<batch-mail@example.test>', replyTo: ['sam@example.test'], to: ['me@example.test'], cc: [], ...(providerVersion ? { providerVersion } : {}) }, text,
+          bytes: new TextEncoder().encode(text).length, representation: 'plain' as const, completeness: 'complete_text' as const,
+          reasons: [], checkedAt: new Date().toISOString(), extractionVersion: 'mail-text-v1' as const };
+      }, async createDraft(_account: unknown, envelope: Record<string, unknown>, verifier: { verify(value: never): Promise<boolean>; verifyBeforeDispatch(value: never): boolean }) {
+        expect(envelope.replySource).toMatchObject({ version: 2, kind: 'mail_reply' });
+        expect(await verifier.verify(envelope as never)).toBe(true);
+        expect(verifier.verifyBeforeDispatch(envelope as never)).toBe(true);
+        return { status: 'unknown' as const };
+      }, async syncMessageWindow(account: Parameters<typeof describeMessageWindowQuery>[0], options: Record<string, unknown>) {
+        const query = describeMessageWindowQuery(account, { timeMin: options.timeMin as string, timeMax: options.timeMax as string, pageSize: options.pageSize as number });
+        const existing = { id: 'batch-mail-provider', idFormat: 'gmail' as const, threadId: 'batch-mail-thread', subject: 'Frozen subject',
+          from: 'Sam <sam@example.test>', senderEmail: 'sam@example.test', receivedAt: new Date().toISOString(), replyMetadataComplete: true,
+          internetMessageId: '<batch-mail@example.test>', replyTo: ['sam@example.test'], to: ['me@example.test'], cc: [], providerVersion: 'mail-page-version' };
+        const unrelated = { ...existing, id: 'batch-mail-unrelated-provider', threadId: 'unrelated-thread', subject: 'Unrelated new message',
+          internetMessageId: '<unrelated@example.test>' };
+        const onPage = options.onPage as (items: unknown[], cursor: string | undefined, pagesRead: number, metadata: unknown) => Promise<void>;
+        const metadata = { unavailableIds: providerDeletionObserved ? ['batch-mail-provider'] : [], window: query.window, queryFingerprint: query.queryFingerprint };
+        const firstPage = providerDeletionObserved ? [unrelated] : [existing, unrelated];
+        await onPage(firstPage, 'next-page-cursor', 1, metadata);
+        await onPage(providerDeletionObserved ? [unrelated] : [existing], undefined, 2, metadata);
+        return { items: firstPage, nextCursor: undefined, partial: false, window: query.window,
+          queryFingerprint: query.queryFingerprint, unavailableIds: metadata.unavailableIds };
+      } };
+      const fakeClient = {
+        submit: async (input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => {
+          await before(); assert(); bodies.push(JSON.parse(input.requestBody) as Record<string, unknown>); submitStarted(); await postGate;
+          return { batchId: 'mail_batch_once', status: 'validating', endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH,
+            model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h' as const, total: 1, completed: 0, failed: 0 };
+        },
+        inspect: async (_batchId: string, customId: string) => ({ batchId: 'mail_batch_once', status: 'completed', endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH,
+          model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h', total: 1, completed: 1, failed: 0, metadataValidation: 'valid', resultValidation: 'valid',
+          usage: { cost: 0.001, promptTokens: 10, completionTokens: 4, totalTokens: 14 }, result: { customId, statusCode: 200, finishReason: 'stop',
+            responseBody: { model: 'openai/gpt-6-luna-20260922', choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', refusal: null, content: JSON.stringify({ text: 'Draft for explicit review.' }) } }] } } }),
+      } as unknown as OpenRouterBatchClient;
+      const integration = { openRouterBatchClient: fakeClient,
+        tokenStore: { async get() { return { accessToken: 'fixture-token', expiresAt: Date.now() + 600_000,
+          identity: { providerNamespace: 'google' as const, clientId: 'batch-mail-client', subject: 'batch-mail-subject' } }; }, async set() {} },
+        connectorFactory: () => connector as never };
+      const store = new MemoryStore();
+      let app = new AppControllerImpl(store, {}, integration);
+      await app.load();
+      const identity = { providerNamespace: 'google' as const, clientId: 'batch-mail-client', subject: 'batch-mail-subject' };
+      Object.assign(identity, { issuer: undefined, tenantId: undefined, resourceUserId: undefined });
+      const identityKey = 'google:batch-mail-client:batch-mail-subject:';
+      const textDigest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, text, { encoding: Crypto.CryptoEncoding.HEX });
+      const observedAt = new Date().toISOString();
+      const state = structuredClone(app.getSnapshot());
+      const account = { id: 'batch-mail-account', provider: 'google' as const, displayName: 'Mail', email: 'me@example.test', verifiedEmail: 'me@example.test',
+        connected: true, authStatus: 'connected' as const, identity, tokenRef: 'fixture-token-ref', capabilities: ['mail.read' as const],
+        grantedScopes: ['openid', 'https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/gmail.compose'], connectionGeneration: 2 };
+      const message = { id: 'batch-mail-local', accountId: account.id, providerMessageId: 'batch-mail-provider', identityKey: `${identityKey}:batch-mail-provider`,
+        verifiedIdentityKey: identityKey, connectionGeneration: 2, idFormat: 'gmail' as const, threadId: 'batch-mail-thread', subject: 'Frozen subject',
+        from: 'Sam <sam@example.test>', senderEmail: 'sam@example.test', receivedAt: observedAt, replyTo: ['sam@example.test'], to: ['me@example.test'], cc: [],
+        internetMessageId: '<batch-mail@example.test>', replyMetadataComplete: true, observedAt };
+      state.accounts.push(account);
+      state.mailbox.push(message);
+      state.settings = { ...state.settings, mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' };
+      await store.save(state);
+      app = new AppControllerImpl(store, {}, integration);
+      await app.load();
+      await (app as unknown as { mutate(operation: (draft: AppState) => void): Promise<void> }).mutate((draft) => {
+        Object.assign(draft.accounts.find((item) => item.id === account.id)!.identity!, { issuer: undefined, tenantId: undefined, resourceUserId: undefined });
+      });
+      const loadedAccount = app.getSnapshot().accounts.find((item) => item.id === account.id)!;
+      const connectedGeneration = loadedAccount.connectionGeneration ?? 0;
+      await (app as unknown as { mutate(operation: (draft: AppState) => void): Promise<void> }).mutate((draft) => {
+        const current = draft.accounts.find((item) => item.id === account.id)!;
+        current.connected = true; current.authStatus = 'connected'; current.capabilities = ['mail.read', 'mail.draft'];
+        current.grantedScopes = ['openid', 'https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/gmail.compose'];
+        current.connectionGeneration = connectedGeneration;
+        const row = draft.mailbox.find((item) => item.id === message.id)!;
+        row.connectionGeneration = connectedGeneration; row.verifiedIdentityKey = identityKey;
+        row.identityKey = `${identityKey}:${message.providerMessageId}`;
+      });
+      const source = await app.getMailReplySource(message.id);
+      expect(source.status).toBe('current');
+      const selected: SelectedMailTextSnapshot = { version: 1, messageId: message.id, accountId: account.id, identityKey, identity,
+        connectionGeneration: connectedGeneration, providerMessageId: message.providerMessageId, idFormat: 'gmail', sourceDigest: source.source!.sourceDigest,
+        checkedAt: observedAt, text, textDigest, bytes: new TextEncoder().encode(text).length, extractionVersion: 'mail-text-v1',
+        representation: 'plain', completeness: 'complete_text', omissionReasons: [] };
+      const internal = app as unknown as { mutate(operation: (draft: AppState) => void): Promise<void> };
+      await internal.mutate((draft) => { draft.selectedMailTexts = [selected]; });
+      const mutableInput = { messageId: message.id, sourceDigest: source.source!.sourceDigest, textDigest, mode: 'reply' as const,
+        to: ['sam@example.test'], cc: [] as string[], brief: 'Keep the frozen brief.', composerRevision: 1 };
+      const pending = app.submitMailReplyBatch(mutableInput);
+      mutableInput.brief = 'Mutated after the call began.';
+      mutableInput.to[0] = 'changed@example.test';
+      await started;
+      await expect(app.submitMailReplyBatch({ ...mutableInput })).rejects.toThrow(/still settling/i);
+      expect(JSON.stringify(bodies[0])).toContain('Keep the frozen brief.');
+      expect(JSON.stringify(bodies[0])).toContain('sam@example.test');
+      expect(JSON.stringify(bodies[0])).not.toContain('Mutated after the call began.');
+      expect(JSON.stringify(bodies[0])).not.toContain('changed@example.test');
+      releaseSubmit();
+      const job = await pending;
+      expect(job).toMatchObject({ status: 'queued', mailMessageId: message.id });
+      expect(bodies).toHaveLength(1);
+      const nullRefusal = completedInspection(job.id, JSON.stringify({ text: 'Strict mail reply body.' }), null);
+      expect(parseOpenRouterMailReplyResult(nullRefusal, JSON.stringify(bodies[0])).text).toBe('Strict mail reply body.');
+      const nonNullRefusal = { ...nullRefusal, result: { ...nullRefusal.result!, responseBody: { ...nullRefusal.result!.responseBody as Record<string, unknown>,
+        choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', refusal: '', content: JSON.stringify({ text: 'Must reject.' }) } }] } } };
+      expect(() => parseOpenRouterMailReplyResult(nonNullRefusal, JSON.stringify(bodies[0]))).toThrow(/invalid/i);
+      const readsBeforeInertCheck = selectedTextReads;
+      const checked = await app.refreshAssistantBatch(job.id);
+      expect(selectedTextReads).toBe(readsBeforeInertCheck);
+      expect(checked).toMatchObject({ status: 'completed', providerReportedCostUsd: 0.001, hasMailReplyResult: true });
+      expect(app.getSnapshot().proposals).toHaveLength(0);
+      expect(JSON.stringify(app.getSnapshot().assistantBatchJobs?.[0])).not.toContain('Draft for explicit review.');
+
+      const tamperedRequestStore = new MemoryStore();
+      tamperedRequestStore.value = structuredClone(store.value!);
+      const tamperedLedger = (tamperedRequestStore.value as AppState & { openRouterBatchLedger: { jobs: { id: string; requestBody: string; requestBytes: number }[] } }).openRouterBatchLedger;
+      const tamperedJob = tamperedLedger.jobs.find((item) => item.id === job.id)!;
+      tamperedJob.requestBody = tamperedJob.requestBody.replace('Keep the frozen brief.', 'A different frozen brief.');
+      tamperedJob.requestBytes = new TextEncoder().encode(tamperedJob.requestBody).length;
+      const tamperedApp = new AppControllerImpl(tamperedRequestStore, {}, integration);
+      await tamperedApp.load();
+      const readsBeforeTamperedReview = selectedTextReads;
+      await expect(tamperedApp.reviewMailReplyBatch(job.id)).rejects.toThrow(/integrity/i);
+      expect(selectedTextReads).toBe(readsBeforeTamperedReview);
+
+      const changedDuringReviewStore = new MemoryStore();
+      changedDuringReviewStore.value = structuredClone(store.value!);
+      const changedDuringReviewApp = new AppControllerImpl(changedDuringReviewStore, {}, integration);
+      await changedDuringReviewApp.load();
+      const oldSource = await changedDuringReviewApp.getMailReplySource(message.id);
+      const ordinaryDraft = await changedDuringReviewApp.createMailReplyProposal({ messageId: message.id, mode: 'reply',
+        sourceDigest: oldSource.source!.sourceDigest, text: 'Ordinary draft tied to the older message.' });
+      providerVersion = 'changed-during-explicit-review';
+      const readsBeforeChangedReview = selectedTextReads;
+      await expect(changedDuringReviewApp.reviewMailReplyBatch(job.id)).rejects.toThrow(/refreshed for review/i);
+      expect(selectedTextReads).toBe(readsBeforeChangedReview + 1);
+      const reviewRemovedJob = (changedDuringReviewStore.value as AppState & { openRouterBatchLedger: { jobs: Record<string, unknown>[] } }).openRouterBatchLedger.jobs.find((item) => item.id === job.id)!;
+      expect(reviewRemovedJob).toMatchObject({ status: 'source_removed', unknownCharge: false, accounting: { providerReportedCostUsd: 0.001 } });
+      expect(reviewRemovedJob).not.toHaveProperty('requestBody');
+      expect(reviewRemovedJob).not.toHaveProperty('mailReplyBinding');
+      expect(reviewRemovedJob).not.toHaveProperty('resultText');
+      expect(changedDuringReviewApp.getSnapshot().proposals.find((item) => item.id === ordinaryDraft.id)).toMatchObject({ status: 'draft', requiresRebuild: true });
+      providerVersion = undefined;
+
+      vi.setSystemTime(new Date(Date.now() + 16 * 60_000));
+      const readsBeforeDelayedReview = selectedTextReads;
+      const cancelledPlan = await app.reviewMailReplyBatch(job.id);
+      expect(selectedTextReads).toBe(readsBeforeDelayedReview + 1);
+      expect(cancelledPlan).toMatchObject({ jobId: job.id, messageId: message.id, text: 'Draft for explicit review.' });
+      await app.cancelMailReplyBatchReview(cancelledPlan.planId);
+      await expect(app.activateMailReplyBatch({ planId: cancelledPlan.planId })).rejects.toThrow(/expired|review/i);
+      const expiredPlan = await app.reviewMailReplyBatch(job.id);
+      vi.setSystemTime(new Date(Date.now() + 5 * 60_000));
+      await expect(app.activateMailReplyBatch({ planId: expiredPlan.planId })).rejects.toThrow(/expired/i);
+      const plan = await app.reviewMailReplyBatch(job.id);
+      expect(plan.text).toBe('Draft for explicit review.');
+      const readsBeforeActivation = selectedTextReads;
+      store.failAfterCommit = true;
+      await expect(app.activateMailReplyBatch({ planId: plan.planId })).rejects.toThrow(/lost the save acknowledgement/i);
+      expect(selectedTextReads).toBe(readsBeforeActivation);
+      app = new AppControllerImpl(store, {}, integration);
+      await app.load();
+      await expect(app.activateMailReplyBatch({ planId: plan.planId })).rejects.toThrow(/expired|review/i);
+      expect(app.getSnapshot().proposals).toHaveLength(1);
+      const linked = app.getSnapshot().assistantBatchJobs?.find((item) => item.id === job.id);
+      expect(linked?.proposalId).toBe(app.getSnapshot().proposals[0]?.id);
+      const proposal = app.getSnapshot().proposals[0]!;
+      expect(proposal).toMatchObject({ kind: 'email', status: 'draft', provenance: { version: 2, batchJobId: job.id }, email: { text: 'Draft for explicit review.' } });
+      await expect(app.editProposal(proposal.id, { email: { ...proposal.email!, text: 'Changed after activation.' } })).rejects.toThrow(/immutable/i);
+      const portableText = await app.exportData();
+      expect(portableText).not.toContain('batchJobId');
+      const importedPortableStore = new MemoryStore();
+      const importedPortableApp = new AppControllerImpl(importedPortableStore);
+      await importedPortableApp.load();
+      const portablePreview = await importedPortableApp.prepareBackupImport(portableText);
+      await importedPortableApp.applyBackupImport({ sessionId: portablePreview.sessionId, planHash: portablePreview.planHash });
+      expect(importedPortableApp.getSnapshot().assistantBatchJobs).toEqual([]);
+      expect(importedPortableApp.getSnapshot().proposals.some((item) => item.provenance?.version === 2 && item.provenance.batchJobId)).toBe(false);
+      expect((await app.approveProposal(proposal.id)).status).toBe('approved');
+      const corruptedStore = new MemoryStore();
+      corruptedStore.value = structuredClone(store.value!);
+      const corruptedLedger = (corruptedStore.value as AppState & { openRouterBatchLedger: { jobs: { id: string; resultText?: string }[] } }).openRouterBatchLedger;
+      corruptedLedger.jobs.find((item) => item.id === job.id)!.resultText = 'Tampered after approval.';
+      const corruptedApp = new AppControllerImpl(corruptedStore, {}, integration);
+      await corruptedApp.load();
+      await expect(corruptedApp.executeProposal(proposal.id)).rejects.toThrow(/integrity|changed|source/i);
+
+      const sourceChangedStore = new MemoryStore();
+      sourceChangedStore.value = structuredClone(store.value!);
+      const sourceChangedApp = new AppControllerImpl(sourceChangedStore, {}, integration);
+      await sourceChangedApp.load();
+      providerVersion = 'changed-provider-version';
+      const refreshed = await sourceChangedApp.loadMailReplyText({ messageId: message.id, sourceDigest: source.source!.sourceDigest });
+      expect(refreshed.status).toBe('source_changed');
+      const sourceRemoved = (sourceChangedStore.value as AppState & { openRouterBatchLedger: { jobs: Record<string, unknown>[] } }).openRouterBatchLedger.jobs.find((item) => item.id === job.id)!;
+      expect(sourceRemoved).toMatchObject({ status: 'source_removed', unknownCharge: false, accounting: { providerReportedCostUsd: 0.001 }, proposalId: proposal.id });
+      expect(sourceRemoved).not.toHaveProperty('requestBody');
+      expect(sourceChangedApp.getSnapshot().proposals.find((item) => item.id === proposal.id)).toMatchObject({ status: 'draft', requiresRebuild: true });
+      providerVersion = undefined;
+
+      const deletableStore = new MemoryStore();
+      deletableStore.value = structuredClone(store.value!);
+      const deletableApp = new AppControllerImpl(deletableStore, {}, integration);
+      await deletableApp.load();
+      await deletableApp.deleteMailReplyBatch(job.id);
+      const deletedJob = deletableApp.getSnapshot().assistantBatchJobs?.find((item) => item.id === job.id);
+      expect(deletedJob).toMatchObject({ proposalId: proposal.id, providerReportedCostUsd: 0.001 });
+      expect(deletedJob).not.toHaveProperty('hasMailReplyResult', true);
+      expect(deletableApp.getSnapshot().proposals.find((item) => item.id === proposal.id)).toMatchObject({ status: 'draft', requiresRebuild: true });
+      const deletedLedgerJob = (deletableStore.value as AppState & { openRouterBatchLedger: { jobs: Record<string, unknown>[] } }).openRouterBatchLedger.jobs.find((item) => item.id === job.id)!;
+      expect(deletedLedgerJob).not.toHaveProperty('requestBody');
+      expect(deletedLedgerJob).not.toHaveProperty('mailReplyBinding');
+      expect(deletedLedgerJob).not.toHaveProperty('resultText');
+
+      expect(await app.executeProposal(proposal.id)).toMatchObject({ status: 'unknown' });
+      const mailReceipt = app.getSnapshot().dispatchRecords[0]!;
+      expect(mailReceipt).toMatchObject({ outcome: 'unknown', sourceProvenance: { version: 2, batchJobId: job.id },
+        mailReplyBatchBinding: { jobId: job.id } });
+      if (mailReceipt.sourceProvenance.version === 2) {
+        expect(mailReceipt.sourceProvenance.source.identity).toHaveProperty('issuer', undefined);
+        expect(mailReceipt.sourceProvenance.source.identity).toHaveProperty('tenantId', undefined);
+        expect(mailReceipt.sourceProvenance.source.identity).toHaveProperty('resourceUserId', undefined);
+      }
+      const persistedMailReceipt = JSON.parse(JSON.stringify(mailReceipt)) as typeof mailReceipt;
+      expect(validateDispatchRecord(persistedMailReceipt)).toMatchObject({ sourceProvenance: { version: 2, batchJobId: job.id },
+        mailReplyBatchBinding: { jobId: job.id } });
+      if (persistedMailReceipt.sourceProvenance.version === 2) {
+        expect(persistedMailReceipt.sourceProvenance.source.identity).not.toHaveProperty('issuer');
+        expect(persistedMailReceipt.sourceProvenance.source.identity).not.toHaveProperty('tenantId');
+        expect(persistedMailReceipt.sourceProvenance.source.identity).not.toHaveProperty('resourceUserId');
+      }
+      const changedReceiptProvenance = structuredClone(mailReceipt);
+      if (changedReceiptProvenance.sourceProvenance.version === 2) changedReceiptProvenance.sourceProvenance.batchJobId = '00000000-0000-4000-8000-000000000099';
+      expect(() => validateDispatchRecord(changedReceiptProvenance)).toThrow(/consistency proof/i);
+      const strippedReceiptProof = structuredClone(mailReceipt) as typeof mailReceipt & { mailReplyBatchBinding?: unknown };
+      delete strippedReceiptProof.mailReplyBatchBinding;
+      expect(() => validateDispatchRecord(strippedReceiptProof)).toThrow(/consistency proof/i);
+      const changedReceiptProof = structuredClone(mailReceipt);
+      changedReceiptProof.mailReplyBatchBinding!.jobId = '00000000-0000-4000-8000-000000000099';
+      expect(() => validateDispatchRecord(changedReceiptProof)).toThrow(/consistency proof/i);
+
+      const uncertainStore = new MemoryStore();
+      uncertainStore.value = structuredClone(store.value!);
+      uncertainStore.value!.proposals = uncertainStore.value!.proposals.filter((item) => item.id !== proposal.id);
+      const uncertainApp = new AppControllerImpl(uncertainStore, {}, integration);
+      await uncertainApp.load();
+      const quarantinedStore = new MemoryStore();
+      quarantinedStore.value = structuredClone(uncertainStore.value!);
+      Object.assign(quarantinedStore.value, { dispatchRecordQuarantine: [{ reason: 'invalid_persisted_receipt', quarantinedAt: new Date().toISOString(), raw: { id: 'private-corrupt-receipt' } }] });
+      const quarantinedApp = new AppControllerImpl(quarantinedStore, {}, integration);
+      await quarantinedApp.load();
+      providerVersion = 'changed-during-quarantined-observation';
+      const quarantinedSource = await quarantinedApp.getMailReplySource(message.id);
+      const quarantineObserved = await quarantinedApp.loadMailReplyText({ messageId: message.id, sourceDigest: quarantinedSource.source!.sourceDigest });
+      expect(quarantineObserved.status).toBe('source_changed');
+      const quarantinedJob = (quarantinedStore.value as AppState & { openRouterBatchLedger: { jobs: Record<string, unknown>[] } }).openRouterBatchLedger.jobs.find((item) => item.id === job.id)!;
+      expect(quarantinedJob).toMatchObject({ status: 'completed', proposalId: proposal.id, accounting: { providerReportedCostUsd: 0.001 } });
+      expect(quarantinedJob).toHaveProperty('requestBody');
+      expect(quarantinedJob).toHaveProperty('resultText', 'Draft for explicit review.');
+      await expect(quarantinedApp.deleteMailReplyBatch(job.id)).rejects.toThrow(/uncertain or pending|dispatch history failed integrity/i);
+      const quarantineOnlyStore = new MemoryStore();
+      quarantineOnlyStore.value = structuredClone(uncertainStore.value!);
+      quarantineOnlyStore.value!.proposals = [];
+      quarantineOnlyStore.value!.dispatchRecords = [];
+      Object.assign(quarantineOnlyStore.value, { dispatchRecordQuarantine: [{ reason: 'invalid_persisted_receipt', quarantinedAt: new Date().toISOString(), raw: { id: 'orphan-private-receipt' } }] });
+      const quarantineOnlyApp = new AppControllerImpl(quarantineOnlyStore, {}, integration);
+      await quarantineOnlyApp.load();
+      await expect(quarantineOnlyApp.deleteMailReplyBatch(job.id)).rejects.toThrow(/dispatch history failed integrity/i);
+      const quarantineOnlyJob = (quarantineOnlyStore.value as AppState & { openRouterBatchLedger: { jobs: Record<string, unknown>[] } }).openRouterBatchLedger.jobs.find((item) => item.id === job.id)!;
+      expect(quarantineOnlyJob).toHaveProperty('requestBody');
+      expect(quarantineOnlyJob).toHaveProperty('resultText', 'Draft for explicit review.');
+      providerVersion = 'changed-during-uncertain-observation';
+      const changedSource = await uncertainApp.loadMailReplyText({ messageId: message.id, sourceDigest: source.source!.sourceDigest });
+      expect(changedSource.status).toBe('source_changed');
+      let observedJob = (uncertainStore.value as AppState & { openRouterBatchLedger: { jobs: Record<string, unknown>[] } }).openRouterBatchLedger.jobs.find((item) => item.id === job.id)!;
+      expect(observedJob).toMatchObject({ status: 'completed', proposalId: proposal.id, accounting: { providerReportedCostUsd: 0.001 } });
+      expect(observedJob).toHaveProperty('requestBody');
+      providerVersion = 'changed-during-mail-page';
+      await expect(uncertainApp.refreshMailHead(account.id)).resolves.toMatchObject({ status: 'complete' });
+      expect(uncertainApp.getSnapshot().mailbox.some((item) => item.providerMessageId === 'batch-mail-unrelated-provider')).toBe(true);
+      expect(uncertainApp.getSnapshot().syncStates[account.id]?.mailHead.lastPageSucceededAt).toBeDefined();
+      observedJob = (uncertainStore.value as AppState & { openRouterBatchLedger: { jobs: Record<string, unknown>[] } }).openRouterBatchLedger.jobs.find((item) => item.id === job.id)!;
+      expect(observedJob).toMatchObject({ status: 'completed', proposalId: proposal.id, accounting: { providerReportedCostUsd: 0.001 } });
+      expect(observedJob).toHaveProperty('resultText', 'Draft for explicit review.');
+      providerDeletionObserved = true;
+      await expect(uncertainApp.refreshMailHead(account.id)).resolves.toMatchObject({ status: 'complete' });
+      expect(uncertainApp.getSnapshot().mailbox.find((item) => item.id === message.id)?.providerDeletedAt).toBeDefined();
+      observedJob = (uncertainStore.value as AppState & { openRouterBatchLedger: { jobs: Record<string, unknown>[] } }).openRouterBatchLedger.jobs.find((item) => item.id === job.id)!;
+      expect(observedJob).toMatchObject({ status: 'completed', proposalId: proposal.id, accounting: { providerReportedCostUsd: 0.001 } });
+      expect(observedJob).toHaveProperty('resultText', 'Draft for explicit review.');
+      providerVersion = undefined;
+      await expect(uncertainApp.disconnectAccount(account.id)).resolves.toMatchObject({ connected: false });
+      expect(uncertainStore.value?.accounts.find((item) => item.id === account.id)?.connected).toBe(false);
+      expect(uncertainStore.value?.dispatchRecords[0]).toMatchObject({ proposalId: proposal.id, outcome: 'unknown' });
+      expect((uncertainStore.value as AppState & { openRouterBatchLedger: { jobs: { id: string; status: string }[] } }).openRouterBatchLedger.jobs
+        .find((item) => item.id === job.id)?.status).toBe('completed');
+      await expect(uncertainApp.deleteMailReplyBatch(job.id)).rejects.toThrow(/uncertain or pending/i);
+      expect((uncertainStore.value as AppState & { openRouterBatchLedger: { jobs: { id: string; status: string }[] } }).openRouterBatchLedger.jobs
+        .find((item) => item.id === job.id)?.status).toBe('completed');
+
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('does not attach a late mail Batch acknowledgement after privacy, bootstrap, or durable-job changes', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-14T05:00:00.000Z'));
+    try {
+      for (const scenario of ['privacy', 'bootstrap', 'job_removed'] as const) {
+        let release!: () => void;
+        let started!: () => void;
+        const gate = new Promise<void>((resolve) => { release = resolve; });
+        const posted = new Promise<void>((resolve) => { started = resolve; });
+        const fakeClient = {
+          submit: async (_input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => {
+            await before(); assert(); started(); await gate;
+            return { batchId: `late_${scenario}`, status: 'validating', endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH,
+              model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h' as const, total: 1, completed: 0, failed: 0 };
+          },
+        } as unknown as OpenRouterBatchClient;
+        const fixture = await mailFixture(fakeClient);
+        let epoch = 'privacy-epoch-before';
+        (fixture.integration as unknown as { privacySession?: { epoch: string; assertCurrent(): Promise<void> } }).privacySession = {
+          get epoch() { return epoch; }, async assertCurrent() {},
+        };
+        const pending = fixture.app.submitMailReplyBatch({ messageId: fixture.message.id, sourceDigest: fixture.source.source!.sourceDigest,
+          textDigest: fixture.textDigest, mode: 'reply', to: ['sam@example.test'], cc: [], brief: `Fence ${scenario}.`, composerRevision: 1 });
+        await posted;
+        if (scenario === 'privacy') epoch = 'privacy-epoch-after';
+        if (scenario === 'bootstrap') await fixture.app.refreshPersistedWorkspace();
+        if (scenario === 'job_removed') {
+          const saved = fixture.store.value as AppState & { openRouterBatchLedger: { version: 1; jobs: unknown[] } };
+          saved.openRouterBatchLedger.jobs = [];
+          await fixture.app.refreshPersistedWorkspace();
+        }
+        release();
+        await expect(pending).rejects.toThrow(/earlier (privacy or )?workspace session|safely retained|saved Batch request/i);
+        const jobs = (fixture.store.value as AppState & { openRouterBatchLedger: { jobs: Record<string, unknown>[] } }).openRouterBatchLedger.jobs;
+        expect(jobs.some((item) => item.batchId === `late_${scenario}`)).toBe(false);
+        if (scenario === 'job_removed') expect(jobs).toHaveLength(0);
+        else expect(jobs[0]).toMatchObject({ status: scenario === 'bootstrap' ? 'submission_unknown' : 'submitting', unknownCharge: true });
+      }
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('rechecks privacy epoch after the queued mail dispatch settlement store fence', async () => {
+    let epoch = 'settlement-epoch-before';
+    const fakeClient = {
+      submit: async (_input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => {
+        await before(); assert(); throw new OpenRouterBatchDispatchError('pre_dispatch', 'Fixture rejected before POST.');
+      },
+    } as unknown as OpenRouterBatchClient;
+    const fixture = await mailFixture(fakeClient);
+    (fixture.integration as unknown as { privacySession?: { epoch: string; assertCurrent(): Promise<void> } }).privacySession = {
+      get epoch() { return epoch; }, async assertCurrent() {},
+    };
+    Object.assign(fixture.store, { async assertCurrent() { epoch = 'settlement-epoch-after'; } });
+    await expect(fixture.app.submitMailReplyBatch({ messageId: fixture.message.id, sourceDigest: fixture.source.source!.sourceDigest,
+      textDigest: fixture.textDigest, mode: 'reply', to: ['sam@example.test'], cc: [], brief: 'Settlement epoch race.', composerRevision: 1 }))
+      .rejects.toThrow(/rejected before POST/i);
+    expect(fixture.store.value?.accounts.find((item) => item.id === fixture.account.id)?.connected).toBe(true);
+    const job = (fixture.store.value as AppState & { openRouterBatchLedger: { jobs: Record<string, unknown>[] } }).openRouterBatchLedger.jobs[0]!;
+    expect(job).toMatchObject({ status: 'submitting', unknownCharge: true });
+    expect(job).not.toHaveProperty('batchId');
+  });
+
   it('accepts an explicit null refusal field on strict structured output', async () => {
     const fakeClient = {
       submit: (input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => fakeSubmit('batch_null_refusal', input, before, assert),
@@ -109,6 +638,72 @@ describe('OpenRouter Batch controller lifecycle', () => {
     expect(app.getSnapshot().notes.find((item) => item.id === note.id)?.analysis).toBeUndefined();
     expect(app.getSnapshot().proposals).toHaveLength(0);
     expect(app.getSnapshot().tasks).toHaveLength(0);
+  });
+
+  it('retains accounting when a mail result pushes an otherwise valid saved state over 16 MiB', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-14T04:00:00.000Z'));
+    try {
+      const fakeClient = {
+        submit: (input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => fakeSubmit('mail_batch_overflow', input, before, assert),
+        inspect: async (_batchId: string, customId: string) => ({ ...completedInspection(customId, JSON.stringify({ text: 'r'.repeat(8_000) }), null), batchId: 'mail_batch_overflow' }),
+      } as unknown as OpenRouterBatchClient;
+      const text = 'Selected message body for the mail Batch storage overflow regression.';
+      const identity = { providerNamespace: 'google' as const, clientId: 'overflow-client', subject: 'overflow-subject' };
+      const identityKey = 'google:overflow-client:overflow-subject:';
+      const store = new MemoryStore();
+      let app = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient });
+      await app.load();
+      const state = structuredClone(app.getSnapshot());
+      const account = { id: 'overflow-account', provider: 'google' as const, displayName: 'Mail', email: 'me@example.test', verifiedEmail: 'me@example.test',
+        connected: true, authStatus: 'connected' as const, identity, tokenRef: 'overflow-token', capabilities: ['mail.read' as const],
+        grantedScopes: ['openid', 'https://www.googleapis.com/auth/gmail.readonly'], connectionGeneration: 2 };
+      const observedAt = new Date().toISOString();
+      const message = { id: 'overflow-local', accountId: account.id, providerMessageId: 'overflow-provider', identityKey: `${identityKey}:overflow-provider`,
+        verifiedIdentityKey: identityKey, connectionGeneration: 2, idFormat: 'gmail' as const, threadId: 'overflow-thread', subject: 'Overflow subject',
+        from: 'Sam <sam@example.test>', senderEmail: 'sam@example.test', receivedAt: observedAt, replyTo: ['sam@example.test'], to: ['me@example.test'], cc: [],
+        internetMessageId: '<overflow@example.test>', replyMetadataComplete: true, observedAt };
+      state.accounts.push(account); state.mailbox.push(message);
+      state.settings = { ...state.settings, mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' };
+      await store.save(state);
+      app = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient });
+      await app.load();
+      const connectedGeneration = app.getSnapshot().accounts.find((item) => item.id === account.id)!.connectionGeneration ?? 0;
+      await (app as unknown as { mutate(operation: (draft: AppState) => void): Promise<void> }).mutate((draft) => {
+        const current = draft.accounts.find((item) => item.id === account.id)!;
+        current.connected = true; current.authStatus = 'connected'; current.capabilities = ['mail.read'];
+        current.grantedScopes = ['openid', 'https://www.googleapis.com/auth/gmail.readonly']; current.connectionGeneration = connectedGeneration;
+        const row = draft.mailbox.find((item) => item.id === message.id)!;
+        row.connectionGeneration = connectedGeneration; row.verifiedIdentityKey = identityKey; row.identityKey = `${identityKey}:${message.providerMessageId}`;
+      });
+      const source = await app.getMailReplySource(message.id);
+      const textDigest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, text, { encoding: Crypto.CryptoEncoding.HEX });
+      const selected: SelectedMailTextSnapshot = { version: 1, messageId: message.id, accountId: account.id, identityKey, identity,
+        connectionGeneration: connectedGeneration, providerMessageId: message.providerMessageId, idFormat: 'gmail', sourceDigest: source.source!.sourceDigest,
+        checkedAt: observedAt, text, textDigest, bytes: new TextEncoder().encode(text).length, extractionVersion: 'mail-text-v1',
+        representation: 'plain', completeness: 'complete_text', omissionReasons: [] };
+      await (app as unknown as { mutate(operation: (draft: AppState) => void): Promise<void> }).mutate((draft) => { draft.selectedMailTexts = [selected]; });
+      const job = await app.submitMailReplyBatch({ messageId: message.id, sourceDigest: source.source!.sourceDigest, textDigest,
+        mode: 'reply', to: ['sam@example.test'], cc: [], brief: 'Short storage fixture.', composerRevision: 1 });
+
+      const fullState = store.value!;
+      const overflowNoteIndex = fullState.notes.length;
+      fullState.notes.push({ id: 'overflow-fixture-note', title: 'Overflow fixture', transcript: '', durationSeconds: 0, createdAt: observedAt,
+        capturedAt: observedAt, captureTimeZone: 'UTC', status: 'recorded', revision: 1 });
+      const emptyBytes = new TextEncoder().encode(JSON.stringify(fullState)).length;
+      fullState.notes[overflowNoteIndex]!.transcript = 'x'.repeat(Math.max(0, STATE_SNAPSHOT_READ_MAX_BYTES - emptyBytes - 4_000));
+      expect(new TextEncoder().encode(JSON.stringify(fullState)).length).toBeLessThanOrEqual(STATE_SNAPSHOT_READ_MAX_BYTES);
+      await store.save(fullState);
+      app = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient });
+      await app.load();
+      expect(app.getSnapshot().notes.find((item) => item.id === 'overflow-fixture-note')?.transcript.length).toBeGreaterThan(1_000_000);
+      const result = await app.refreshAssistantBatch(job.id);
+      expect(result).toMatchObject({ status: 'result_not_retained', failureCode: 'result_not_retained', providerReportedCostUsd: 0.001, unknownCharge: false });
+      const saved = store.value as AppState & { openRouterBatchLedger: { jobs: Record<string, unknown>[] } };
+      const savedJob = saved.openRouterBatchLedger.jobs.find((item) => item.id === job.id)!;
+      expect(savedJob).toMatchObject({ status: 'result_not_retained', failureCode: 'result_not_retained', accounting: { providerReportedCostUsd: 0.001 } });
+      expect(savedJob).not.toHaveProperty('resultText');
+    } finally { vi.useRealTimers(); }
   });
 
   it('freezes Chat replies by reply digest, reuses only the saved prior context, and deletes its content-free receipts', async () => {

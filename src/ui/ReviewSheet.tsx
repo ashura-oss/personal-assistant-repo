@@ -141,6 +141,7 @@ function ReviewSheetContent({
     proposal.provenance.kind === "mail_reply"
       ? proposal.provenance
       : null;
+  const immutableBatchReply = mailReply?.version === 2 && Boolean(mailReply.batchJobId?.trim());
   const frozenReplySource = mailReply?.source;
   const effectiveEmailOperation = mailReply ? "draft" : emailOperation;
   const parsedDate =
@@ -564,20 +565,32 @@ function ReviewSheetContent({
               {proposal.email?.reply?.mode === "reply_all" ? "Reply all" : "Reply"} · Mailbox draft for separate review and approval.
             </Text>
           )}
-          <Field
-            label="To"
-            value={emailTo}
-            onChangeText={setEmailTo}
-            placeholder="name@example.com"
-            keyboardType="email-address"
-          />
-          <Field
-            label="Cc"
-            value={emailCc}
-            onChangeText={setEmailCc}
-            placeholder="Optional recipients"
-            keyboardType="email-address"
-          />
+          {immutableBatchReply ? (
+            <View style={s.analysisBlock}>
+              <Text style={s.analysisSource}>To · {emailTo || "None"}</Text>
+              {emailCc.trim() ? <Text style={s.analysisSource}>Cc · {emailCc}</Text> : null}
+              <Text style={s.analysisSource}>Subject · {emailSubject}</Text>
+              <Text selectable style={s.analysisText}>Message · {emailText}</Text>
+              <Text style={s.disclaimer}>This reply draft came from a completed Batch request and is immutable. To change it, write a separate manual reply in the message composer.</Text>
+            </View>
+          ) : (
+            <>
+              <Field
+                label="To"
+                value={emailTo}
+                onChangeText={setEmailTo}
+                placeholder="name@example.com"
+                keyboardType="email-address"
+              />
+              <Field
+                label="Cc"
+                value={emailCc}
+                onChangeText={setEmailCc}
+                placeholder="Optional recipients"
+                keyboardType="email-address"
+              />
+            </>
+          )}
           {!mailReply ? (
             <Field
               label="Bcc"
@@ -587,23 +600,23 @@ function ReviewSheetContent({
               keyboardType="email-address"
             />
           ) : null}
-          {mailReply ? (
+          {!immutableBatchReply && mailReply ? (
             <View style={s.fieldWrap}>
               <Text style={s.label}>Subject · {emailSubject}</Text>
             </View>
-          ) : (
+          ) : !mailReply ? (
             <Field
               label="Subject"
               value={emailSubject}
               onChangeText={setEmailSubject}
             />
-          )}
-          <Field
+          ) : null}
+          {!immutableBatchReply ? <Field
             label="Message"
             value={emailText}
             onChangeText={setEmailText}
             multiline
-          />
+          /> : null}
           <Text style={s.disclaimer}>
             {proposal.email?.attachments.length
               ? `Attachments included in this approved draft (${proposal.email.attachments.length}); review is read-only because no attachment picker is configured.`
@@ -892,7 +905,7 @@ function ReviewSheetContent({
         Edits, approval, and action are separate. Approval applies only to this
         exact version.
       </Text>
-      {edited ? (
+      {edited && !immutableBatchReply ? (
         <Button
           label="Save edits"
           disabled={

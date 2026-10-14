@@ -61,9 +61,9 @@ export function AssistantBatchJobCard({ job, busy = false, blocked = false, onCh
 
   return (
     <View style={styles.card}>
-      <Text style={s.sectionTitle}>OpenRouter Batch</Text>
-      <Text style={styles.status}>{assistantBatchStatusLabel(job.status)}</Text>
-      <Text style={styles.meta}>Added {dateLabel(job.createdAt)} · Luna Batch · {job.effort} reasoning</Text>
+      <Text style={s.sectionTitle}>OpenRouter Batch · {job.kind === 'mail_reply' ? 'Mail reply' : 'Note assistance'}</Text>
+      <Text style={styles.status}>{assistantBatchStatusLabel(job.status, job.kind)}</Text>
+      <Text style={styles.meta}>Added {dateLabel(job.createdAt)} · {job.model} · {job.effort} reasoning</Text>
       {job.status === 'queued' || job.status === 'processing' ? (
         <Text style={styles.helper}>Batch replies may take up to 24 hours. Checks happen only when you ask.</Text>
       ) : null}
@@ -74,7 +74,13 @@ export function AssistantBatchJobCard({ job, busy = false, blocked = false, onCh
         <Text style={styles.helper}>The request was not submitted.</Text>
       ) : null}
       {job.status === 'completed' ? (
-        <Text style={styles.helper}>The validated reply was saved on this device.</Text>
+        <Text style={styles.helper}>{job.kind === 'mail_reply'
+          ? job.proposalId
+            ? 'A draft from this reply is available for normal review in the inbox.'
+            : job.hasMailReplyResult
+              ? 'A completed reply is saved on this device. Open the saved message reply composer to review it.'
+              : 'The completed reply is unavailable for review.'
+          : 'The validated reply was saved on this device.'}</Text>
       ) : null}
       {job.status === 'result_not_retained' ? (
         <Text style={styles.helper}>The reply did not fit in local saved data. Reported usage is still shown.</Text>
@@ -85,7 +91,7 @@ export function AssistantBatchJobCard({ job, busy = false, blocked = false, onCh
       {job.status === 'source_removed' || job.sourceRemoved ? (
         <Text style={styles.helper}>The request content was removed. This small receipt is retained as history.</Text>
       ) : null}
-      {(job.omittedSourceCount ?? 0) > 0 ? (
+      {job.kind === 'note_assistance' && (job.omittedSourceCount ?? 0) > 0 ? (
         <Text style={styles.meta}>{job.omittedSourceCount} context source{job.omittedSourceCount === 1 ? '' : 's'} omitted from the request.</Text>
       ) : null}
       {reportedCost !== undefined ? (

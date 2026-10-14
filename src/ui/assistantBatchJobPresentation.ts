@@ -1,7 +1,7 @@
 import type { AssistantBatchJobDTO } from '../services/openRouterBatchJobs';
 import { formatProviderReportedCostUsd } from './formatProviderReportedCostUsd';
 
-export function assistantBatchStatusLabel(status: AssistantBatchJobDTO['status']): string {
+export function assistantBatchStatusLabel(status: AssistantBatchJobDTO['status'], kind: AssistantBatchJobDTO['kind'] = 'note_assistance'): string {
   switch (status) {
     case 'preparing': return 'Preparing request';
     case 'submitting': return 'Submitting request';
@@ -12,7 +12,7 @@ export function assistantBatchStatusLabel(status: AssistantBatchJobDTO['status']
     case 'failed': return 'Request failed';
     case 'expired': return 'Request expired';
     case 'cancelled': return 'Request cancelled';
-    case 'result_stale': return 'Reply was not applied because the note or sources changed';
+    case 'result_stale': return kind === 'mail_reply' ? 'Reply was not applied because the saved message changed' : 'Reply was not applied because the note or sources changed';
     case 'result_invalid': return 'Reply could not be validated';
     case 'result_not_retained': return 'Reply could not be saved';
     case 'cleanup_pending': return 'Local cleanup needs attention';

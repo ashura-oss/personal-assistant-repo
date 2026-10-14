@@ -50,6 +50,8 @@ export interface DispatchRecord {
   /** Stable across reconnect generations; derived from immutable identity + action + operation. */
   duplicateKey: string;
   sourceProvenance: AnyProposalProvenance;
+  /** Private historical consistency proof for a reviewed Batch mail reply. */
+  mailReplyBatchBinding?: { jobId: string; provenanceCanonical: string };
   operation: DispatchOperation;
   accountId: string;
   account: DispatchAccountSnapshot;

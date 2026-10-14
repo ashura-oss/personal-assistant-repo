@@ -13,7 +13,7 @@ type Props = {
   onRetryCleanup?: (jobId: string) => Promise<unknown> | unknown;
 };
 
-/** Global, content-free queue and accounting view; it deliberately never renders job or note IDs. */
+/** Global, content-free queue and accounting view; it deliberately never renders job or source IDs. */
 export function AssistantBatchHistorySection({
   jobs,
   recoveryMessage,
@@ -23,7 +23,6 @@ export function AssistantBatchHistorySection({
   onRetryCleanup,
 }: Props) {
   const ordered = jobs
-    .filter((job) => job.kind === 'note_assistance')
     .slice()
     .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
 

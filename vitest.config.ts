@@ -11,5 +11,5 @@ export default defineConfig({
     'expo-sqlite': fromRoot('tests/mocks/expo-sqlite.ts'),
     'expo-file-system/legacy': fromRoot('tests/mocks/expo-file-system-legacy.ts'),
   } },
-  test: { environment: 'node', include: ['tests/**/*.test.ts'] },
+  test: { environment: 'node', include: ['tests/**/*.test.{ts,tsx}'] },
 });

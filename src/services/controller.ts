@@ -5,7 +5,7 @@ import type {
   BackupImportPreview, Calendar, CalendarConfig, ContextDocument, Note, NoteAssistResult, AssistIntent, LocalTask, Proposal, ProposalPatch,
   ProposalProvenance, SaveNoteInput, SettingsPatch, MailboxSnapshotMessage, CalendarEventSnapshot, OAuthInstallResult,
   NoteProposalProvenance, MailReplyProvenance, MailReplySourceSnapshot, MailReplySourceResult,
-  SelectedMailTextSnapshot, MailReplyTextLoadResult, MailReplyTextCacheResult, MailReplyTextGenerationInput, MailReplyTextGenerationResult,
+  SelectedMailTextSnapshot, MailReplyTextLoadResult, MailReplyTextCacheResult, MailReplyTextGenerationInput, MailReplyTextGenerationResult, MailReplyBatchReviewPlan,
   ProactiveCandidateEntry, ProactiveCandidateSourceResult,
   ProactiveState, SavedProactiveRule, RecordingAttachmentPreview,
   DeviceCalendarAccessState, StartupRecoveryStatus,
@@ -17,7 +17,7 @@ import type { StateStore } from '../storage/contracts';
 import { STATE_SNAPSHOT_READ_MAX_BYTES } from '../storage/contracts';
 import { recoveryUtf8Bytes, STARTUP_RECOVERY_SESSION_MS, validateRecoveryId, validateRecoveryIso, validateRecoveryReceipt, validateReplacementSnapshot, type StartupRecoveryInspection, type StartupRecoveryPlan, type StartupRecoveryReceipt, type StartupRecoveryCommitInput } from '../storage/startupRecovery';
 import { writePrivateDocument } from '../storage/documents';
-import { AzureOpenAIClient, AzureSpeechClient, ReplyGenerationError, ReplyGenerationPreDispatchError, validateAzureEndpoint, type DraftAnalysis, type PreparedAnalysis, type ReplyGenerationUsage } from './azure';
+import { AzureOpenAIClient, AzureSpeechClient, ReplyGenerationError, ReplyGenerationPreDispatchError, validateAzureEndpoint, type DraftAnalysis, type PreparedAnalysis, type ReplyGenerationInput, type ReplyGenerationUsage } from './azure';
 import { AssistantClientRouter, type AssistantModelClient } from './assistantClient';
 import {
   createNotificationBackend, isMatchingPending, isOwnedLegacyReminderCancellation, NotificationBackendError,
@@ -92,7 +92,7 @@ import { createProviderCredentialService, type ProviderCredentialService } from 
 import { credentialStore } from '../storage/credentials';
 import type { BackgroundTaskBackend } from '../background/backend.types';
 import {
-  OPENROUTER_BATCH_MODEL, OPENROUTER_BATCH_BODY_MODEL, OPENROUTER_BATCH_RESPONSE_MAX_BYTES, OpenRouterBatchClient, OpenRouterBatchDispatchError,
+  OPENROUTER_BATCH_MODEL, OPENROUTER_BATCH_BODY_MODEL, OPENROUTER_BATCH_RESPONSE_MAX_BYTES, OPENROUTER_BATCH_REQUEST_PROFILE_VERSION, OpenRouterBatchClient, OpenRouterBatchDispatchError,
   OpenRouterBatchRequestBuilder, isOpenRouterBatchRequestProfile, type OpenRouterBatchInspection, type PreparedOpenRouterAnalysis,
 } from './openRouter';
 import { OpenRouterSpeechClient } from './openRouterSpeech';
@@ -101,10 +101,11 @@ import { emptyChatLedger, selectCompletedChatContext, validateChatLedger } from 
 import type { ChatConversation, ChatConversationDTO, ChatReplySnapshot, ChatTranscriptTransferPlan, ReadonlyChatLedger } from '../chat/types';
 import {
   emptyOpenRouterBatchLedger, validateOpenRouterBatchLedger, assistantBatchJobDTO, accountingFromInspection,
-  isOpenRouterBatchContentJob, tombstoneOpenRouterBatchJob,
-  type AssistantBatchJobDTO, type OpenRouterBatchJob, type OpenRouterBatchContentJob, type OpenRouterBatchLedger, type OpenRouterBatchAccounting,
+  isOpenRouterBatchContentJob, isOpenRouterMailReplyContentJob, tombstoneOpenRouterBatchJob,
+  type AssistantBatchJobDTO, type OpenRouterBatchJob, type OpenRouterBatchContentJob, type OpenRouterMailReplyContentJob, type OpenRouterBatchLedger, type OpenRouterBatchAccounting,
   type OpenRouterChatBinding,
 } from './openRouterBatchJobs';
+import { parseOpenRouterMailReplyResult, validOpenRouterMailReplyBinding, validReplyText, type OpenRouterMailReplyBinding, type OpenRouterMailReplyFrozenNote, type OpenRouterMailReplyFrozenPolicy } from './openRouterMailReply';
 
 const now = () => new Date().toISOString();
 const ASSIST_CONTRACT_VERSION = 'assist-v3';
@@ -1331,6 +1332,14 @@ export class AppControllerImpl implements AppController {
     readonly privacyEpoch?: string;
     readonly preparedAtMs: number;
   }>();
+  private readonly mailReplyBatchReviewPlans = new Map<string, {
+    readonly planId: string; readonly jobId: string; readonly messageId: string; readonly mode: 'reply' | 'reply_all';
+    readonly sourceDigest: string; readonly bodyDigest: string; readonly bindingDigest: string; readonly resultSha256: string;
+    readonly settingsFingerprint: string; readonly expiresAt: string;
+    readonly bootstrapGeneration: number; readonly privacyEpoch?: string; readonly preparedAtMs: number;
+  }>();
+  private readonly activeMailReplyBatchReviews = new Set<string>();
+  private readonly activeMailReplyBatchSubmissions = new Map<string, string | undefined>();
   private assistantBatchCleanupRetries = new Map<string, () => Promise<void>>();
   private activeBatchNoteOperations = new Set<string>();
   private activeBatchJobInspections = new Set<string>();
@@ -1465,6 +1474,8 @@ export class AppControllerImpl implements AppController {
     this.assistantChatLedger = emptyChatLedger();
     this.assistantChatLedgerMalformed = false;
     this.chatTranscriptTransferPlans.clear();
+    this.mailReplyBatchReviewPlans.clear();
+    this.activeMailReplyBatchReviews.clear();
     this.assistantBatchCleanupRetries.clear();
     this.activeBatchNoteOperations.clear();
     this.activeBatchJobInspections.clear();
@@ -1503,6 +1514,7 @@ export class AppControllerImpl implements AppController {
     this.backupImportSessions.clear();
     this.knowledgeActivationSessions.clear();
     this.chatTranscriptTransferPlans.clear();
+    this.mailReplyBatchReviewPlans.clear();
     // Stop new provider-side admissions while retaining jobs and their leases
     // until each underlying request actually settles.
     for (const job of this.transcriptionJobs.values()) job.controller.abort();
@@ -2614,7 +2626,10 @@ export class AppControllerImpl implements AppController {
             version: batchLedger.version,
             jobs: batchLedger.jobs.map((job) => {
               if (job.id !== targetId) return job;
-              const { appliedNoteRevision: _appliedNoteRevision, ...receipt } = job;
+              const { appliedNoteRevision: _appliedNoteRevision, ...withoutAppliedRevision } = job;
+              const receipt = job.kind === 'mail_reply'
+                ? (({ resultText: _resultText, resultSha256: _resultSha256, ...mailReceipt }) => mailReceipt)(withoutAppliedRevision)
+                : withoutAppliedRevision;
               return { ...receipt, status: 'result_not_retained' as const, failureCode: 'result_not_retained' as const };
             }),
           });
@@ -2937,6 +2952,7 @@ export class AppControllerImpl implements AppController {
       const current = this.mailReplySourceFromRow(message, account, provenance.source.observedAt);
       if (canonicalMailReplySource(current) !== canonicalMailReplySource(provenance.source)) throw new Error('The source message changed. Refresh it and create a new reply draft.');
       validateReplyBinding(proposal.email, provenance);
+      await this.validateMailReplyBatchIntegrity(state, proposal, provenance);
       return this.mailReplyDependencyProjection(state, proposal, provenance);
     }
     const { inputs, policyInputs, provenance } = this.proposalDependencyInputs(state, proposal);
@@ -3003,9 +3019,90 @@ export class AppControllerImpl implements AppController {
     const current = this.mailReplySourceFromRow(message, account, provenance.source.observedAt);
     if (!proposal.email) throw new Error('Reply payload is missing.');
     validateReplyBinding(proposal.email, provenance);
-    return stableJson({ source: canonicalMailReplySource(current), sourceDigest: provenance.sourceDigest,
+    const base = { source: canonicalMailReplySource(current), sourceDigest: provenance.sourceDigest,
       expiry: provenance.expiresAt, accountGeneration: account.connectionGeneration ?? 0,
-      payload: proposal.email?.reply ?? null, recipients: { to: proposal.email?.to ?? [], cc: proposal.email?.cc ?? [] } });
+      payload: proposal.email.reply ?? null, recipients: { to: proposal.email.to, cc: proposal.email.cc } };
+    if (!provenance.batchJobId) return stableJson(base);
+    const job = this.assistantBatchLedger.jobs.find((item) => item.id === provenance.batchJobId);
+    if (!job || !isOpenRouterMailReplyContentJob(job) || job.status !== 'completed' || job.proposalId !== proposal.id ||
+        !job.resultText || job.resultText !== proposal.email.text || !job.resultSha256 || !job.mailReplyBinding ||
+        job.mailReplyBinding.messageId !== provenance.source.localMessageId ||
+        canonicalMailReplySource(job.mailReplyBinding.source) !== canonicalMailReplySource(provenance.source) ||
+        job.mailReplyBinding.mode !== proposal.email.reply?.mode || job.mailReplyBinding.subject !== proposal.email.subject ||
+        stableJson(job.mailReplyBinding.to) !== stableJson(proposal.email.to) || stableJson(job.mailReplyBinding.cc) !== stableJson(proposal.email.cc)) {
+      throw new Error('The Batch result or its frozen source binding is no longer available. Review a fresh result before approval.');
+    }
+    const frozen = job.mailReplyBinding;
+    const cached = state.selectedMailTexts.find((item) => item.messageId === frozen.messageId);
+    if (!cached || cached.text !== frozen.body.text || cached.textDigest !== frozen.body.textDigest || cached.bytes !== frozen.body.bytes ||
+        cached.extractionVersion !== frozen.body.extractionVersion || cached.representation !== frozen.body.representation ||
+        cached.completeness !== frozen.body.completeness || stableJson(cached.omissionReasons) !== stableJson(frozen.body.omissionReasons) ||
+        stableJson(openRouterSettingsBinding(state.settings)) !== frozen.settingsSnapshot) throw new Error('The Batch reply inputs changed. Review a fresh result before approval.');
+    const note = frozen.note && state.notes.find((item) => item.id === frozen.note!.id);
+    if (frozen.note ? !note || note.revision !== frozen.note.revision || note.transcript !== frozen.note.text ||
+        (note.capturedAt ?? note.createdAt) !== frozen.note.capturedAt || (note.captureTimeZone ?? state.settings.timezone) !== frozen.note.captureTimeZone : false) {
+      throw new Error('The selected note changed. Review a fresh Batch result before approval.');
+    }
+    const policies = state.documents.filter((doc) => /^memory\/(?:RULES|ROUTINES)\.md$/i.test(doc.path));
+    if (stableJson(policies.map((doc) => ({ path: doc.path, revision: doc.revision, content: doc.content }))) !==
+        stableJson(frozen.policy.map((doc) => ({ path: doc.path, revision: doc.revision, content: doc.content })))) {
+      throw new Error('Rules or routines changed. Review a fresh Batch result before approval.');
+    }
+    return stableJson({ ...base, batch: { jobId: job.id, requestSha256: job.requestSha256, sourceFingerprint: job.sourceFingerprint,
+      resultSha256: job.resultSha256, resultText: job.resultText, binding: frozen } });
+  }
+
+  private async validateMailReplyBatchIntegrity(state: AppState, proposal: Proposal, provenance: MailReplyProvenance): Promise<void> {
+    if (!provenance.batchJobId) return;
+    const job = this.assistantBatchLedger.jobs.find((item) => item.id === provenance.batchJobId);
+    if (!job || !isOpenRouterMailReplyContentJob(job) || job.status !== 'completed' || job.proposalId !== proposal.id ||
+        !job.resultText || !job.resultSha256 || job.resultText !== proposal.email?.text || !job.mailReplyBinding) {
+      throw new Error('The Batch result was removed or changed. A new explicit review is required.');
+    }
+    await this.assertMailReplyBatchJobIntegrity(job, true);
+    this.mailReplyDependencyProjection(state, proposal, provenance);
+  }
+
+  private async assertMailReplyBatchJobIntegrity(job: OpenRouterMailReplyContentJob, requireResult: boolean): Promise<void> {
+    const binding = job.mailReplyBinding;
+    if (!binding || !validOpenRouterMailReplyBinding(binding) || job.requestProfileVersion !== OPENROUTER_BATCH_REQUEST_PROFILE_VERSION ||
+        !job.requestBody || utf8Bytes(job.requestBody) !== job.requestBytes) throw new Error('The saved Batch request failed integrity validation.');
+    let settingsValue: unknown;
+    try { settingsValue = JSON.parse(binding.settingsSnapshot) as unknown; } catch { throw new Error('The frozen reply settings are invalid.'); }
+    const settingKeys = ['mode', 'llmProvider', 'openRouterModel', 'openRouterReasoningEffort', 'llmRequestContractVersion', 'timezone'];
+    if (!isRecord(settingsValue) || !settingKeys.every((key) => Object.hasOwn(settingsValue, key)) ||
+        Object.keys(settingsValue).some((key) => !settingKeys.includes(key)) || settingsValue.mode !== 'provider' || settingsValue.llmProvider !== 'openrouter' ||
+        settingsValue.openRouterModel !== OPENROUTER_BATCH_MODEL || typeof settingsValue.openRouterReasoningEffort !== 'string' ||
+        !['none', 'low'].includes(settingsValue.openRouterReasoningEffort) || settingsValue.llmRequestContractVersion !== OPENROUTER_BATCH_REQUEST_PROFILE_VERSION ||
+        settingsValue.timezone !== binding.timeZone) throw new Error('The frozen reply settings are invalid.');
+    const frozenSettings = { ...this.state.settings, ...settingsValue } as AppSettings;
+    const policyContext = binding.policy.map((item) => `### ${item.path} (revision ${item.revision})\n${item.content}`).join('\n\n');
+    const prepared = new OpenRouterBatchRequestBuilder().prepareReply({ sourceText: binding.body.text, sourceRepresentation: binding.body.representation,
+      sourceCompleteness: binding.body.completeness, subject: binding.subject, to: [...binding.to], cc: [...binding.cc], brief: binding.brief,
+      noteContext: binding.note?.text, policyContext, asOf: binding.requestAsOf, timeZone: binding.timeZone,
+      noteCapture: binding.note ? { capturedAt: binding.note.capturedAt, timeZone: binding.note.captureTimeZone } : undefined }, frozenSettings);
+    const expectedFingerprint = stableJson({ source: canonicalMailReplySource(binding.source), body: { textDigest: binding.body.textDigest,
+      representation: binding.body.representation, completeness: binding.body.completeness, extractionVersion: binding.body.extractionVersion,
+      omissionReasons: binding.body.omissionReasons }, note: binding.note ?? null, policy: binding.policy,
+      settingsFingerprint: binding.settingsFingerprint, recipients: { to: binding.to, cc: binding.cc } });
+    const [sourceDigest, bodyTextDigest, noteDigest, policyDigests, settingsFingerprint, requestSha256, fingerprint, resultSha256] = await Promise.all([
+      Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, canonicalMailReplySource(binding.source), { encoding: Crypto.CryptoEncoding.HEX }),
+      Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, binding.body.text, { encoding: Crypto.CryptoEncoding.HEX }),
+      binding.note ? Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, binding.note.text, { encoding: Crypto.CryptoEncoding.HEX }) : Promise.resolve(undefined),
+      Promise.all(binding.policy.map((item) => Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, item.content, { encoding: Crypto.CryptoEncoding.HEX }))),
+      Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, binding.settingsSnapshot, { encoding: Crypto.CryptoEncoding.HEX }),
+      Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, job.requestBody, { encoding: Crypto.CryptoEncoding.HEX }),
+      Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, expectedFingerprint, { encoding: Crypto.CryptoEncoding.HEX }),
+      requireResult && job.resultText ? Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, job.resultText, { encoding: Crypto.CryptoEncoding.HEX }) : Promise.resolve(undefined),
+    ]);
+    const request = JSON.parse(prepared.body) as { reasoning?: { effort?: string } };
+    if (sourceDigest !== binding.source.sourceDigest || bodyTextDigest !== binding.body.textDigest ||
+        (binding.note && noteDigest !== binding.note.textSha256) || binding.policy.some((item, index) => item.sha256 !== policyDigests[index]) ||
+        settingsFingerprint !== binding.settingsFingerprint || requestSha256 !== job.requestSha256 || fingerprint !== job.sourceFingerprint ||
+        prepared.body !== job.requestBody || prepared.requestBytes !== job.requestBytes || request.reasoning?.effort !== job.effort ||
+        (requireResult && (!job.resultText || !validReplyText(job.resultText) || resultSha256 !== job.resultSha256))) {
+      throw new Error('The saved Batch result or frozen request failed integrity validation.');
+    }
   }
 
   private async currentMailReplySource(state: AppState, messageId: string): Promise<MailReplySourceResult> {
@@ -4556,6 +4653,352 @@ export class AppControllerImpl implements AppController {
     finally { this.activeBatchNoteOperations.delete(noteId); }
   }
 
+  async submitMailReplyBatch(input: Omit<MailReplyTextGenerationInput, 'forceRefresh'>): Promise<AssistantBatchJobDTO> {
+    if (!input || !['reply', 'reply_all'].includes(input.mode) || !Number.isSafeInteger(input.composerRevision) || input.composerRevision < 0 ||
+        typeof input.messageId !== 'string' || !input.messageId || input.messageId.length > 256 || typeof input.sourceDigest !== 'string' ||
+        typeof input.textDigest !== 'string' || !Array.isArray(input.to) || !Array.isArray(input.cc) || typeof input.brief !== 'string' ||
+        input.to.some((item) => typeof item !== 'string') || input.cc.some((item) => typeof item !== 'string') ||
+        (input.noteId !== undefined && typeof input.noteId !== 'string') ||
+        (input.noteRevision !== undefined && !Number.isSafeInteger(input.noteRevision))) {
+      throw new Error('Review the selected message and reply details before submitting.');
+    }
+    if (this.activeMailReplyBatchSubmissions.has(input.messageId)) throw new Error('A mail reply Batch request for this message is still settling.');
+    const capturedInput = Object.freeze({ ...input, to: Object.freeze([...input.to]), cc: Object.freeze([...input.cc]) });
+    this.activeMailReplyBatchSubmissions.set(capturedInput.messageId, undefined);
+    try { return await this.submitMailReplyBatchCaptured(capturedInput); }
+    finally { this.activeMailReplyBatchSubmissions.delete(capturedInput.messageId); }
+  }
+
+  private async submitMailReplyBatchCaptured(input: Omit<MailReplyTextGenerationInput, 'forceRefresh' | 'to' | 'cc'> & { to: readonly string[]; cc: readonly string[] }): Promise<AssistantBatchJobDTO> {
+    await this.load();
+    if (this.assistantBatchLedgerMalformed || !this.loaded || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired) {
+      throw new Error('Refresh local data before submitting a mail reply Batch request.');
+    }
+    await this.assertPrivacySessionCurrent();
+    if (!input || !['reply', 'reply_all'].includes(input.mode) || !Number.isSafeInteger(input.composerRevision) || input.composerRevision < 0 ||
+        typeof input.messageId !== 'string' || typeof input.sourceDigest !== 'string' || typeof input.textDigest !== 'string' ||
+        !Array.isArray(input.to) || !Array.isArray(input.cc) || typeof input.brief !== 'string') {
+      throw new Error('Review the selected message and reply details before submitting.');
+    }
+    const capturedGeneration = this.bootstrapGeneration;
+    const privacyEpoch = this.integration.privacySession?.epoch;
+    const staged = await this.mutate(async (draft) => {
+      if (this.bootstrapGeneration !== capturedGeneration || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired ||
+          draft.settings.mode !== 'provider' || draft.settings.llmProvider !== 'openrouter') throw new Error('Select OpenRouter in Provider mode before submitting a mail reply.');
+      const sourceResult = await this.currentMailReplySource(draft, input.messageId);
+      if (sourceResult.status !== 'current' || !sourceResult.source || !sourceResult.defaults || sourceResult.source.sourceDigest !== input.sourceDigest) {
+        throw new Error('Refresh the selected message before submitting a reply.');
+      }
+      const body = draft.selectedMailTexts.find((item) => item.messageId === input.messageId);
+      const message = draft.mailbox.find((item) => item.id === input.messageId);
+      const account = message && draft.accounts.find((item) => item.id === message.accountId);
+      if (!body || !message || !account || body.textDigest !== input.textDigest || body.sourceDigest !== input.sourceDigest ||
+          body.accountId !== account.id || body.identityKey !== identityKey(account) || !sameAccountIdentity(body.identity, account.identity) ||
+          body.connectionGeneration !== (account.connectionGeneration ?? 0) || body.providerMessageId !== message.providerMessageId ||
+          body.idFormat !== message.idFormat || message.identityKey !== `${identityKey(account)}:${message.providerMessageId}` ||
+          body.completeness === 'unavailable' || !body.text || !body.textDigest || !isMailTextFresh(body) || !isMailTextFresh({ checkedAt: message.observedAt ?? '' }) ||
+          !account.connected || account.authStatus !== 'connected' || account.provider === 'local' || !account.capabilities?.includes('mail.read') || !account.grantedScopes ||
+          !scopeGrantsCapability(account.provider, account.grantedScopes, 'mail.read')) throw new Error('Load current message text and review its recipients before submitting.');
+      if (input.to.length < 1 || input.to.length > 100 || input.cc.length > 100 || [...input.to, ...input.cc].some((address) => !validEmail(address))) {
+        throw new Error('Check the locked reply recipients before submitting.');
+      }
+      const bodyDigest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, body.text, { encoding: Crypto.CryptoEncoding.HEX });
+      if (bodyDigest !== body.textDigest || utf8Bytes(body.text) !== body.bytes) throw new Error('The loaded message text failed integrity validation. Load it again.');
+      const source = sourceResult.source;
+      let frozenNote: OpenRouterMailReplyFrozenNote | undefined;
+      let noteContext: string | undefined;
+      let noteCapture: ReplyGenerationInput['noteCapture'];
+      if (input.noteId) {
+        const note = draft.notes.find((item) => item.id === input.noteId);
+        if (!note || note.revision !== input.noteRevision || note.origin === 'assistant_chat' || !note.transcript.trim()) throw new Error('The selected note changed or has no transcript. Reopen the picker and select it again.');
+        this.requireConfirmedCaptureTimeZone(note);
+        const capturedAt = note.capturedAt ?? note.createdAt;
+        const captureTimeZone = note.captureTimeZone ?? draft.settings.timezone;
+        frozenNote = Object.freeze({ id: note.id, revision: note.revision, text: note.transcript,
+          textSha256: await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, note.transcript, { encoding: Crypto.CryptoEncoding.HEX }),
+          capturedAt, captureTimeZone });
+        noteContext = note.transcript;
+        noteCapture = { capturedAt, timeZone: captureTimeZone };
+      } else if (input.noteRevision !== undefined) throw new Error('A note revision was supplied without a selected note.');
+      const policies = draft.documents.filter((doc) => /^memory\/(?:RULES|ROUTINES)\.md$/i.test(doc.path));
+      const policyContext = policies.map((doc) => `### ${doc.path} (revision ${doc.revision})\n${doc.content}`).join('\n\n');
+      if (utf8Bytes(input.brief) + utf8Bytes(noteContext ?? '') > 4 * 1024 || utf8Bytes(policyContext) > 4 * 1024) {
+        throw new Error('The reply brief, selected note, or RULES.md / ROUTINES.md guidance exceeds the request limit. Shorten it before submitting.');
+      }
+      const asOf = now();
+      const timeZone = validTimezone(draft.settings.timezone);
+      const prepared = await new OpenRouterBatchRequestBuilder().prepareReply({ sourceText: body.text,
+        sourceRepresentation: body.representation, sourceCompleteness: body.completeness, subject: source.subject,
+        to: [...input.to], cc: [...input.cc], brief: input.brief, noteContext, policyContext, asOf, timeZone, noteCapture }, draft.settings);
+      const policy: OpenRouterMailReplyFrozenPolicy[] = [];
+      for (const doc of policies) policy.push(Object.freeze({ path: doc.path as OpenRouterMailReplyFrozenPolicy['path'], revision: doc.revision,
+        content: doc.content, sha256: await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, doc.content, { encoding: Crypto.CryptoEncoding.HEX }) }));
+      const settingsFingerprint = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, stableJson(openRouterSettingsBinding(draft.settings)), { encoding: Crypto.CryptoEncoding.HEX });
+      const binding: OpenRouterMailReplyBinding = Object.freeze({ version: 1, messageId: input.messageId, mode: input.mode, source: clone(source),
+        body: Object.freeze({ text: body.text, textDigest: body.textDigest, bytes: body.bytes, extractionVersion: body.extractionVersion,
+          representation: body.representation, completeness: body.completeness, omissionReasons: [...body.omissionReasons] }),
+        subject: source.subject, to: Object.freeze([...input.to]), cc: Object.freeze([...input.cc]), brief: input.brief,
+        ...(frozenNote ? { note: frozenNote } : {}), policy: Object.freeze(policy), settingsFingerprint,
+        settingsSnapshot: stableJson(openRouterSettingsBinding(draft.settings)), requestAsOf: asOf, timeZone });
+      if (!validOpenRouterMailReplyBinding(binding)) throw new Error('The reply context could not be frozen safely. Refresh the message and try again.');
+      const requestSha256 = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, prepared.body, { encoding: Crypto.CryptoEncoding.HEX });
+      const sourceFingerprint = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256,
+        stableJson({ source: canonicalMailReplySource(source), body: { textDigest: body.textDigest, representation: body.representation,
+          completeness: body.completeness, extractionVersion: body.extractionVersion, omissionReasons: body.omissionReasons }, note: frozenNote ?? null,
+          policy, settingsFingerprint, recipients: { to: input.to, cc: input.cc } }), { encoding: Crypto.CryptoEncoding.HEX });
+      const id = newId();
+      const preparedRequest = JSON.parse(prepared.body) as { reasoning: { effort: 'none' | 'low' } };
+      const timestamp = now();
+      const job: OpenRouterBatchJob = Object.freeze({ id, customId: id, kind: 'mail_reply', status: 'preparing', createdAt: timestamp, updatedAt: timestamp,
+        model: OPENROUTER_BATCH_MODEL, effort: preparedRequest.reasoning.effort, requestSha256, unknownCharge: false,
+        settingsFingerprint, sourceFingerprint, requestProfileVersion: OPENROUTER_BATCH_REQUEST_PROFILE_VERSION,
+        requestBytes: utf8Bytes(prepared.body), omittedSourceCount: 0, requestBody: prepared.body, sourceVersions: Object.freeze({}), mailReplyBinding: binding });
+      return job;
+    }, undefined, (_draft, job) => validateOpenRouterBatchLedger({ version: 1, jobs: [...this.assistantBatchLedger.jobs, job] }));
+    if (capturedGeneration !== this.bootstrapGeneration || privacyEpoch !== this.integration.privacySession?.epoch) {
+      throw new Error('The reply request belongs to an earlier workspace session. Refresh before continuing.');
+    }
+    const currentJob = this.assistantBatchLedger.jobs.find((job) => job.id === staged.id);
+    if (!currentJob || !isOpenRouterMailReplyContentJob(currentJob)) throw new Error('The prepared reply request could not be retained.');
+    this.activeMailReplyBatchSubmissions.set(input.messageId, currentJob.id);
+    this.activeBatchJobInspections.add(currentJob.id);
+    try { return await this.dispatchPreparedBatch(currentJob, capturedGeneration, this.state); }
+    finally { this.activeBatchJobInspections.delete(currentJob.id); }
+  }
+
+  private pruneMailReplyBatchReviewPlans(): void {
+    const at = Date.now();
+    for (const [id, plan] of this.mailReplyBatchReviewPlans) {
+      if (at < plan.preparedAtMs || at >= Date.parse(plan.expiresAt)) this.mailReplyBatchReviewPlans.delete(id);
+    }
+  }
+
+  private clearMailReplyBatchReviewPlansForAccount(accountId: string): void {
+    const affectedJobIds = new Set(this.assistantBatchLedger.jobs.filter(isOpenRouterMailReplyContentJob)
+      .filter((job) => job.mailReplyBinding.source.accountId === accountId).map((job) => job.id));
+    for (const [planId, plan] of this.mailReplyBatchReviewPlans) if (affectedJobIds.has(plan.jobId)) this.mailReplyBatchReviewPlans.delete(planId);
+  }
+
+  async reviewMailReplyBatch(jobId: string): Promise<MailReplyBatchReviewPlan> {
+    this.pruneMailReplyBatchReviewPlans();
+    const job = this.assistantBatchLedger.jobs.find((item) => item.id === jobId);
+    if (!job || !isOpenRouterMailReplyContentJob(job) || job.status !== 'completed' || !job.resultText || !job.resultSha256 || job.proposalId) {
+      throw new Error('This saved job has no unclaimed mail reply result to review.');
+    }
+    if (this.activeMailReplyBatchReviews.has(jobId)) throw new Error('A review for this mail reply is already being checked.');
+    this.activeMailReplyBatchReviews.add(jobId);
+    const generation = this.bootstrapGeneration;
+    const epoch = this.integration.privacySession?.epoch;
+    const binding = job.mailReplyBinding;
+    try {
+      await this.load();
+      await this.assertPrivacySessionCurrent();
+      if (!this.loaded || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired || this.assistantBatchLedgerMalformed) throw new Error('Refresh local data before reviewing this reply.');
+      const integrityState = this.state;
+      const integrityGeneration = this.bootstrapGeneration;
+      const integrityEpoch = this.integration.privacySession?.epoch;
+      const integrityJob = this.assistantBatchLedger.jobs.find((item) => item.id === jobId);
+      if (integrityJob !== job || !isOpenRouterMailReplyContentJob(integrityJob) || integrityJob.status !== 'completed' ||
+          integrityJob.proposalId || integrityJob.mailReplyBinding !== binding) throw new Error('The Batch result changed before review. Reopen it and try again.');
+      await this.assertMailReplyBatchJobIntegrity(job, true);
+      await this.assertPrivacySessionCurrent();
+      const jobBeforeRead = this.assistantBatchLedger.jobs.find((item) => item.id === jobId);
+      if (this.state !== integrityState || generation !== this.bootstrapGeneration || integrityGeneration !== this.bootstrapGeneration ||
+          epoch !== this.integration.privacySession?.epoch || integrityEpoch !== this.integration.privacySession?.epoch ||
+          !this.loaded || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired || jobBeforeRead !== job ||
+          !isOpenRouterMailReplyContentJob(jobBeforeRead) || jobBeforeRead.status !== 'completed' || jobBeforeRead.proposalId ||
+          jobBeforeRead.resultSha256 !== job.resultSha256 || jobBeforeRead.mailReplyBinding !== binding) {
+        throw new Error('The Batch result or workspace changed during integrity review. Reopen it and try again.');
+      }
+      const before = await this.getMailReplySource(binding.messageId);
+      if (!before.source || before.status === 'unavailable' || canonicalMailReplySource(before.source) !== canonicalMailReplySource(binding.source) ||
+          before.source.connectionGeneration !== binding.source.connectionGeneration || !sameAccountIdentity(before.source.identity, binding.source.identity)) {
+        throw new Error('The original message changed or is no longer available. Review a fresh Batch request.');
+      }
+      const loaded = await this.loadMailReplyTextInternal({ messageId: binding.messageId, sourceDigest: before.source.sourceDigest }, jobId);
+      if (loaded.status !== 'current' || !loaded.snapshot) throw new Error('The selected message text could not be refreshed for review.');
+      const after = await this.getMailReplySource(binding.messageId);
+      if (after.status !== 'current' || !after.source || canonicalMailReplySource(after.source) !== canonicalMailReplySource(binding.source)) {
+        throw new Error('The original message changed during review. Review a fresh Batch request.');
+      }
+      const state = this.state;
+      const currentJob = this.assistantBatchLedger.jobs.find((item) => item.id === jobId);
+      if (generation !== this.bootstrapGeneration || epoch !== this.integration.privacySession?.epoch || !this.loaded ||
+          this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired || currentJob !== job ||
+          !currentJob || !isOpenRouterMailReplyContentJob(currentJob) || currentJob.status !== 'completed' || currentJob.proposalId ||
+          currentJob.resultSha256 !== job.resultSha256 || currentJob.mailReplyBinding !== binding) throw new Error('The Batch result changed during review. Reopen it and try again.');
+      await this.assertMailReplyBatchInputsCurrent(state, binding, after.source, loaded.snapshot, job);
+      const preparedAtMs = Date.now();
+      const expiresAt = new Date(preparedAtMs + 5 * 60_000).toISOString();
+      const publicPlan: MailReplyBatchReviewPlan = Object.freeze({ planId: newId(), jobId, messageId: binding.messageId,
+        mode: binding.mode, subject: binding.subject, to: Object.freeze([...binding.to]), cc: Object.freeze([...binding.cc]),
+        text: job.resultText, expiresAt });
+      const [bodyDigest, bindingDigest] = await Promise.all([
+        Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, stableJson(binding.body), { encoding: Crypto.CryptoEncoding.HEX }),
+        Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, stableJson(binding), { encoding: Crypto.CryptoEncoding.HEX }),
+      ]);
+      await this.assertPrivacySessionCurrent();
+      const finalJob = this.assistantBatchLedger.jobs.find((item) => item.id === jobId);
+      if (generation !== this.bootstrapGeneration || epoch !== this.integration.privacySession?.epoch || !this.loaded ||
+          this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired || this.state !== state || finalJob !== job ||
+          !finalJob || !isOpenRouterMailReplyContentJob(finalJob) || finalJob.status !== 'completed' || finalJob.proposalId ||
+          finalJob.resultSha256 !== job.resultSha256 || finalJob.mailReplyBinding !== binding) {
+        throw new Error('The Batch result or workspace changed during review. Reopen it and try again.');
+      }
+      await this.assertMailReplyBatchInputsCurrent(this.state, binding, after.source, loaded.snapshot, job);
+      if (this.store.assertCurrent) await this.store.assertCurrent();
+      await this.assertPrivacySessionCurrent();
+      if (generation !== this.bootstrapGeneration || epoch !== this.integration.privacySession?.epoch || this.state !== state || this.mailAlertRefreshRequired) {
+        throw new Error('The workspace session changed during review. Reopen it and try again.');
+      }
+      this.pruneMailReplyBatchReviewPlans();
+      for (const [id, plan] of this.mailReplyBatchReviewPlans) if (plan.jobId === jobId) this.mailReplyBatchReviewPlans.delete(id);
+      this.mailReplyBatchReviewPlans.set(publicPlan.planId, Object.freeze({ planId: publicPlan.planId, jobId, messageId: binding.messageId,
+        mode: binding.mode, sourceDigest: binding.source.sourceDigest, bodyDigest, bindingDigest, resultSha256: job.resultSha256,
+        settingsFingerprint: binding.settingsFingerprint, expiresAt, bootstrapGeneration: generation, ...(epoch ? { privacyEpoch: epoch } : {}), preparedAtMs }));
+      return publicPlan;
+    } finally { this.activeMailReplyBatchReviews.delete(jobId); }
+  }
+
+  private async assertMailReplyBatchInputsCurrent(state: AppState, binding: OpenRouterMailReplyBinding,
+    source: MailReplySourceSnapshot, body: SelectedMailTextSnapshot, job: OpenRouterMailReplyContentJob): Promise<void> {
+    const account = state.accounts.find((item) => item.id === binding.source.accountId);
+    const message = state.mailbox.find((item) => item.id === binding.messageId && item.accountId === binding.source.accountId);
+    if (!account || !message || !account.connected || account.authStatus !== 'connected' || account.provider === 'local' ||
+        account.connectionGeneration !== binding.source.connectionGeneration || !sameAccountIdentity(account.identity, binding.source.identity) ||
+        message.providerDeletedAt || message.connectionGeneration !== account.connectionGeneration || message.verifiedIdentityKey !== identityKey(account) ||
+        body.accountId !== account.id || body.identityKey !== identityKey(account) || !sameAccountIdentity(body.identity, account.identity) ||
+        body.connectionGeneration !== (account.connectionGeneration ?? 0) || body.providerMessageId !== message.providerMessageId || body.sourceDigest !== binding.source.sourceDigest ||
+        body.idFormat !== message.idFormat || message.identityKey !== `${identityKey(account)}:${message.providerMessageId}` ||
+        canonicalMailReplySource(source) !== canonicalMailReplySource(binding.source) || body.text !== binding.body.text || body.textDigest !== binding.body.textDigest ||
+        body.bytes !== binding.body.bytes || body.extractionVersion !== binding.body.extractionVersion || body.representation !== binding.body.representation ||
+        body.completeness !== binding.body.completeness || stableJson(body.omissionReasons) !== stableJson(binding.body.omissionReasons) ||
+        !isMailTextFresh(body) || stableJson(openRouterSettingsBinding(state.settings)) !== binding.settingsSnapshot || !job.resultText || !job.resultSha256) {
+      throw new Error('The message, account, selected text, settings, or result changed. Review a fresh Batch request.');
+    }
+    const currentNote = binding.note && state.notes.find((item) => item.id === binding.note!.id);
+    if (binding.note ? !currentNote || currentNote.revision !== binding.note.revision || currentNote.transcript !== binding.note.text ||
+        (currentNote.capturedAt ?? currentNote.createdAt) !== binding.note.capturedAt ||
+        (currentNote.captureTimeZone ?? state.settings.timezone) !== binding.note.captureTimeZone || currentNote.importOrigin?.originalTimeZoneUnknown === true : false) {
+      throw new Error('The selected note changed. Review a fresh Batch request.');
+    }
+    const policies = state.documents.filter((doc) => /^memory\/(?:RULES|ROUTINES)\.md$/i.test(doc.path));
+    if (stableJson(policies.map((doc) => ({ path: doc.path, revision: doc.revision, content: doc.content }))) !==
+        stableJson(binding.policy.map((doc) => ({ path: doc.path, revision: doc.revision, content: doc.content })))) {
+      throw new Error('Rules or routines changed. Review a fresh Batch request.');
+    }
+    const checks = await Promise.all([
+      validateMailReplySource(source, async (canonical) => Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, canonical, { encoding: Crypto.CryptoEncoding.HEX })),
+      Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, body.text, { encoding: Crypto.CryptoEncoding.HEX }),
+      binding.note ? Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, binding.note.text, { encoding: Crypto.CryptoEncoding.HEX }) : Promise.resolve(undefined),
+      Promise.all(binding.policy.map((item) => Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, item.content, { encoding: Crypto.CryptoEncoding.HEX }))),
+      Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, binding.settingsSnapshot, { encoding: Crypto.CryptoEncoding.HEX }),
+    ]);
+    if (!checks[0] || checks[1] !== binding.body.textDigest || (binding.note && checks[2] !== binding.note.textSha256) ||
+        binding.policy.some((item, index) => item.sha256 !== checks[3][index]) || checks[4] !== binding.settingsFingerprint) {
+      throw new Error('The selected mail inputs failed integrity validation. Review a fresh Batch request.');
+    }
+  }
+
+  async cancelMailReplyBatchReview(planId: string): Promise<void> {
+    this.pruneMailReplyBatchReviewPlans();
+    if (typeof planId === 'string') this.mailReplyBatchReviewPlans.delete(planId);
+  }
+
+  async activateMailReplyBatch(input: { planId: string }): Promise<{ kind: 'created'; jobId: string; proposalId: string }> {
+    this.pruneMailReplyBatchReviewPlans();
+    const planId = input?.planId;
+    const plan = typeof planId === 'string' ? this.mailReplyBatchReviewPlans.get(planId) : undefined;
+    if (!plan) throw new Error('This reply review expired or was already used. Review the saved result again.');
+    this.mailReplyBatchReviewPlans.delete(planId);
+    const at = Date.now();
+    if (at < plan.preparedAtMs || at >= Date.parse(plan.expiresAt) ||
+        plan.bootstrapGeneration !== this.bootstrapGeneration || plan.privacyEpoch !== this.integration.privacySession?.epoch) {
+      throw new Error('This reply review expired or the workspace changed. Review the saved result again.');
+    }
+    if (this.activeMailReplyBatchReviews.has(plan.jobId)) throw new Error('A mail reply review is already being checked.');
+    this.activeMailReplyBatchReviews.add(plan.jobId);
+    try {
+      await this.load();
+      await this.assertPrivacySessionCurrent();
+      const job = this.assistantBatchLedger.jobs.find((item) => item.id === plan.jobId);
+      if (!job || !isOpenRouterMailReplyContentJob(job) || job.status !== 'completed' || job.proposalId || !job.resultText ||
+          job.resultSha256 !== plan.resultSha256 || job.mailReplyBinding.messageId !== plan.messageId || job.mailReplyBinding.mode !== plan.mode) {
+        throw new Error('This Batch result changed or was already activated. Review an available result again.');
+      }
+      const currentSource = await this.getMailReplySource(plan.messageId);
+      if (!currentSource.source || currentSource.status === 'unavailable') throw new Error('Refresh the original message before activating this reply.');
+      const latestSource = await this.getMailReplySource(plan.messageId);
+      const reviewedBody = this.snapshot.selectedMailTexts.find((item) => item.messageId === plan.messageId);
+      if (!latestSource.source || latestSource.status !== 'current' || !reviewedBody) {
+        throw new Error('The reviewed message cache is no longer current. Review the saved result again.');
+      }
+      const bindingDigest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, stableJson(job.mailReplyBinding), { encoding: Crypto.CryptoEncoding.HEX });
+      const bodyDigest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, stableJson(job.mailReplyBinding.body), { encoding: Crypto.CryptoEncoding.HEX });
+      if (bindingDigest !== plan.bindingDigest || bodyDigest !== plan.bodyDigest || this.bootstrapGeneration !== plan.bootstrapGeneration ||
+          this.integration.privacySession?.epoch !== plan.privacyEpoch || Date.now() < plan.preparedAtMs || Date.now() >= Date.parse(plan.expiresAt)) {
+        throw new Error('This reply review expired or its frozen inputs changed. Review the result again.');
+      }
+      const expectedState = this.state;
+      const expectedGeneration = this.bootstrapGeneration;
+      const proposalId = newId();
+      const result = await this.mutate(async (state) => {
+        if (this.state !== expectedState || this.bootstrapGeneration !== expectedGeneration || expectedGeneration !== plan.bootstrapGeneration ||
+            this.integration.privacySession?.epoch !== plan.privacyEpoch || this.mailAlertRefreshRequired || this.startupRecoveryPhase !== 'ready') {
+          throw new Error('The workspace changed before this reply was saved. Review the result again.');
+        }
+        const currentJob = this.assistantBatchLedger.jobs.find((item) => item.id === plan.jobId);
+        if (!currentJob || !isOpenRouterMailReplyContentJob(currentJob) || currentJob.status !== 'completed' || currentJob.proposalId ||
+            currentJob.resultSha256 !== plan.resultSha256 || currentJob.mailReplyBinding !== job.mailReplyBinding) throw new Error('This Batch result was already consumed or changed.');
+        await this.assertMailReplyBatchJobIntegrity(currentJob, true);
+        await this.assertMailReplyBatchInputsCurrent(state, job.mailReplyBinding, latestSource.source!, reviewedBody, job);
+        const freshSource = await this.currentMailReplySource(state, plan.messageId);
+        if (freshSource.status !== 'current' || !freshSource.source || canonicalMailReplySource(freshSource.source) !== canonicalMailReplySource(job.mailReplyBinding.source)) {
+          throw new Error('The original message changed before activation. Review a fresh Batch result.');
+        }
+        const activationAt = Date.now();
+        if (activationAt < plan.preparedAtMs || activationAt >= Date.parse(plan.expiresAt) || this.bootstrapGeneration !== plan.bootstrapGeneration ||
+            this.integration.privacySession?.epoch !== plan.privacyEpoch) throw new Error('This reply review expired while activation was queued. Review the saved result again.');
+        const proposal = this.buildMailReplyProposal(state, freshSource.source, { messageId: plan.messageId, mode: plan.mode,
+          sourceDigest: freshSource.source.sourceDigest, text: job.resultText!, to: job.mailReplyBinding.to, cc: job.mailReplyBinding.cc }, job.id);
+        proposal.id = proposalId;
+        state.proposals.unshift(proposal);
+        addActivity(state, 'proposal_created', 'Mail reply prepared from the explicitly reviewed Batch result.', { proposalId });
+        return { kind: 'created' as const, jobId: job.id, proposalId };
+      }, undefined, (_state, created) => validateOpenRouterBatchLedger({ version: 1, jobs: this.assistantBatchLedger.jobs.map((item) =>
+        item.id === created.jobId ? { ...item, proposalId: created.proposalId, updatedAt: now() } : item) }));
+      await this.assertPrivacySessionCurrent();
+      if (Date.now() < plan.preparedAtMs || Date.now() >= Date.parse(plan.expiresAt) || this.bootstrapGeneration !== plan.bootstrapGeneration ||
+          this.integration.privacySession?.epoch !== plan.privacyEpoch) throw new Error('This reply review expired while activation was saving. Review the saved result again.');
+      return result;
+    } finally { this.activeMailReplyBatchReviews.delete(plan.jobId); }
+  }
+
+  async deleteMailReplyBatch(jobId: string): Promise<void> {
+    if (typeof jobId !== 'string' || !jobId) throw new Error('Choose a saved mail reply Batch job.');
+    if (this.activeBatchJobInspections.has(jobId) || this.activeMailReplyBatchReviews.has(jobId)) {
+      throw new Error('This mail reply Batch job is still being checked. Try again when it settles.');
+    }
+    const activeJob = this.assistantBatchLedger.jobs.find((item) => item.id === jobId);
+    if (activeJob && isOpenRouterMailReplyContentJob(activeJob) && this.activeMailReplyBatchSubmissions.has(activeJob.mailReplyBinding.messageId)) {
+      throw new Error('This mail reply Batch request is still settling. Try again after it finishes.');
+    }
+    for (const [id, plan] of this.mailReplyBatchReviewPlans) if (plan.jobId === jobId) this.mailReplyBatchReviewPlans.delete(id);
+    await this.mutate((state) => {
+      this.assertBatchLedgerCanDropContent();
+      const job = this.assistantBatchLedger.jobs.find((item) => item.id === jobId);
+      if (!job || job.kind !== 'mail_reply') throw new Error('The saved mail reply Batch job was not found.');
+      if (isOpenRouterMailReplyContentJob(job)) this.assertMailBatchCleanupIsCertain(state, [job]);
+      const linked = job.proposalId ? state.proposals.find((proposal) => proposal.id === job.proposalId) : undefined;
+      if (linked && ['draft', 'approved', 'failed'].includes(linked.status)) {
+        this.invalidate(linked);
+        linked.requiresRebuild = true;
+      }
+      return undefined;
+    }, undefined, () => validateOpenRouterBatchLedger({ version: 1, jobs: this.assistantBatchLedger.jobs.map((job) =>
+      job.id === jobId ? tombstoneOpenRouterBatchJob(job, now()) : job) }));
+  }
+
   async createChatConversation(title?: string): Promise<ChatConversationDTO> {
     if (this.assistantChatLedgerMalformed || this.assistantBatchLedgerMalformed) throw new Error('Saved chat history could not be validated. Refresh local data before continuing.');
     const createdAt = now();
@@ -5050,8 +5493,52 @@ export class AppControllerImpl implements AppController {
     return this.dispatchPreparedBatch(staged, capturedBootstrapGeneration, this.state);
   }
 
-  private async dispatchPreparedBatch(staged: OpenRouterBatchContentJob, capturedBootstrapGeneration: number, preparedState: AppState, beforePersistSubmitting?: () => Promise<void>): Promise<AssistantBatchJobDTO> {
+  private async settleMailBatchDispatchPhase(
+    staged: OpenRouterMailReplyContentJob,
+    phase: OpenRouterBatchDispatchError['phase'],
+    capturedPrivacyEpoch: string | undefined,
+    capturedBootstrapGeneration: number,
+  ): Promise<void> {
+    if (capturedPrivacyEpoch !== this.integration.privacySession?.epoch || capturedBootstrapGeneration !== this.bootstrapGeneration ||
+        !this.loaded || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired) return;
+    await this.assertPrivacySessionCurrent();
+    await this.store.assertCurrent?.();
+    const ownsCurrentJob = (job: OpenRouterBatchJob | undefined): job is OpenRouterMailReplyContentJob =>
+      !!job && isOpenRouterMailReplyContentJob(job) && !job.sourceRemoved && job.batchId === undefined &&
+      (phase === 'pre_dispatch' ? job.status === 'preparing' || job.status === 'submitting' : job.status === 'submitting') &&
+      job.customId === staged.customId && job.requestSha256 === staged.requestSha256 && job.requestBody === staged.requestBody &&
+      stableJson(job.mailReplyBinding) === stableJson(staged.mailReplyBinding);
+    if (!ownsCurrentJob(this.assistantBatchLedger.jobs.find((job) => job.id === staged.id))) return;
+
+    let nextLedger: OpenRouterBatchLedger | undefined;
+    await this.mutate(async () => {
+      // Repeat privacy/session and durable ownership checks after admission to
+      // the serialized writer queue, immediately before committing the receipt.
+      if (capturedPrivacyEpoch !== this.integration.privacySession?.epoch || capturedBootstrapGeneration !== this.bootstrapGeneration ||
+          !this.loaded || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired) {
+        throw new Error('The mail Batch receipt belongs to an earlier privacy or workspace session.');
+      }
+      await this.assertPrivacySessionCurrent();
+      await this.store.assertCurrent?.();
+      if (capturedPrivacyEpoch !== this.integration.privacySession?.epoch || capturedBootstrapGeneration !== this.bootstrapGeneration ||
+          !this.loaded || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired) {
+        throw new Error('The mail Batch receipt belongs to an earlier privacy or workspace session.');
+      }
+      const job = this.assistantBatchLedger.jobs.find((item) => item.id === staged.id);
+      if (!ownsCurrentJob(job)) throw new Error('The owned mail Batch request changed before its receipt was saved.');
+      nextLedger = this.updatedBatchLedger(staged.id, (current) => {
+        if (!ownsCurrentJob(current)) throw new Error('The owned mail Batch request changed before its receipt was saved.');
+        return phase === 'pre_dispatch'
+          ? { ...current, status: 'failed', unknownCharge: false, failureCode: 'not_submitted', updatedAt: now() }
+          : { ...current, status: 'submission_unknown', unknownCharge: true, updatedAt: now() };
+      });
+      return undefined;
+    }, undefined, () => nextLedger);
+  }
+
+  private async dispatchPreparedBatch(staged: OpenRouterBatchContentJob | OpenRouterMailReplyContentJob, capturedBootstrapGeneration: number, preparedState: AppState, beforePersistSubmitting?: () => Promise<void>): Promise<AssistantBatchJobDTO> {
     if (!this.openRouterBatchClient) throw new Error('The OpenRouter Batch service is unavailable in this workspace.');
+    const capturedPrivacyEpoch = this.integration.privacySession?.epoch;
     let submittingState: AppState | undefined;
     const submittedContextIsCurrent = () => this.loaded && this.bootstrapGeneration === capturedBootstrapGeneration &&
       this.state === (submittingState ?? preparedState) && this.startupRecoveryPhase === 'ready' && !this.mailAlertRefreshRequired;
@@ -5069,10 +5556,51 @@ export class AppControllerImpl implements AppController {
         const current = this.assistantBatchLedger.jobs.find((job) => job.id === staged.id);
         if (!current || current.status !== 'submitting' || current.requestSha256 !== staged.requestSha256) throw new Error('The saved Batch request changed before submission.');
       });
-      if (!submittedContextIsCurrent() || !submittingState) throw new Error('The Batch acknowledgement belongs to an earlier workspace session.');
-      return await this.updateOpenRouterBatchJob(staged.id, (job) => ({ ...job, status: 'queued', batchId: ack.batchId, updatedAt: now() }), { state: submittingState, generation: capturedBootstrapGeneration });
+      if (!submittedContextIsCurrent() || !submittingState) {
+        if (!isOpenRouterMailReplyContentJob(staged) || capturedPrivacyEpoch !== this.integration.privacySession?.epoch ||
+            capturedBootstrapGeneration !== this.bootstrapGeneration || !this.loaded || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired) {
+          throw new Error('The Batch acknowledgement belongs to an earlier workspace session.');
+        }
+        await this.assertPrivacySessionCurrent();
+        await this.store.assertCurrent?.();
+        const currentState = this.state;
+        const currentJob = this.assistantBatchLedger.jobs.find((job) => job.id === staged.id);
+        if (!currentJob || !isOpenRouterMailReplyContentJob(currentJob) || currentJob.status !== 'submitting' ||
+            currentJob.customId !== staged.customId || currentJob.requestSha256 !== staged.requestSha256 || currentJob.requestBody !== staged.requestBody ||
+            stableJson(currentJob.mailReplyBinding) !== stableJson(staged.mailReplyBinding) || currentJob.batchId !== undefined) {
+          throw new Error('The acknowledged mail Batch request was no longer safely retained after account or workspace change.');
+        }
+        return await this.updateOpenRouterBatchJob(staged.id, (job) => {
+          if (capturedPrivacyEpoch !== this.integration.privacySession?.epoch || capturedBootstrapGeneration !== this.bootstrapGeneration ||
+              !this.loaded || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired) {
+            throw new Error('The mail Batch acknowledgement belongs to an earlier privacy or workspace session.');
+          }
+          if (!isOpenRouterMailReplyContentJob(job) || job.status !== 'submitting' || job.requestSha256 !== staged.requestSha256 ||
+              job.requestBody !== staged.requestBody || stableJson(job.mailReplyBinding) !== stableJson(staged.mailReplyBinding) || job.batchId !== undefined) {
+            throw new Error('The acknowledged mail Batch request changed before its receipt was saved.');
+          }
+          return { ...job, status: 'queued', batchId: ack.batchId, updatedAt: now() };
+        }, { state: currentState, generation: capturedBootstrapGeneration });
+      }
+      return await this.updateOpenRouterBatchJob(staged.id, (job) => {
+        if (isOpenRouterMailReplyContentJob(staged) && (capturedPrivacyEpoch !== this.integration.privacySession?.epoch ||
+            capturedBootstrapGeneration !== this.bootstrapGeneration || !this.loaded || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired)) {
+          throw new Error('The mail Batch acknowledgement belongs to an earlier privacy or workspace session.');
+        }
+        if (isOpenRouterMailReplyContentJob(staged) && (!isOpenRouterMailReplyContentJob(job) || job.status !== 'submitting' ||
+            job.customId !== staged.customId || job.requestSha256 !== staged.requestSha256 || job.requestBody !== staged.requestBody ||
+            stableJson(job.mailReplyBinding) !== stableJson(staged.mailReplyBinding) || job.batchId !== undefined)) {
+          throw new Error('The acknowledged mail Batch request changed before its receipt was saved.');
+        }
+        return { ...job, status: 'queued', batchId: ack.batchId, updatedAt: now() };
+      }, { state: submittingState, generation: capturedBootstrapGeneration });
     } catch (error) {
       if (this.assistantBatchCleanupRetries.has(staged.id) && submittedContextIsCurrent()) return this.batchDTO(staged.id);
+      if (isOpenRouterMailReplyContentJob(staged) && error instanceof OpenRouterBatchDispatchError) {
+        try { await this.settleMailBatchDispatchPhase(staged, error.phase, capturedPrivacyEpoch, capturedBootstrapGeneration); }
+        catch { /* Preserve the original provider error when its receipt cannot be safely committed. */ }
+        throw error;
+      }
       if (!submittedContextIsCurrent()) throw error;
       if (error instanceof OpenRouterBatchDispatchError && error.phase === 'pre_dispatch') {
         await this.updateOpenRouterBatchJob(staged.id, (job) => ({ ...job, status: 'failed', unknownCharge: false, failureCode: 'not_submitted', updatedAt: now() }), { state: this.state, generation: capturedBootstrapGeneration }).catch(() => undefined);
@@ -5102,7 +5630,7 @@ export class AppControllerImpl implements AppController {
     if (this.assistantBatchLedgerMalformed) throw new Error('Saved Batch history could not be validated. Refresh local data before continuing.');
     const job = this.assistantBatchLedger.jobs.find((candidate) => candidate.id === jobId);
     if (!job) throw new Error('The saved Batch job was not found.');
-    if (!isOpenRouterBatchContentJob(job)) {
+    if (!isOpenRouterBatchContentJob(job) && !isOpenRouterMailReplyContentJob(job)) {
       if (!job.batchId || job.accounting?.providerReportedCostUsd !== undefined || !this.openRouterBatchClient || this.assistantBatchCleanupRetries.has(job.id)) return this.batchDTO(job.id);
       const capturedState = this.state;
       const capturedGeneration = this.bootstrapGeneration;
@@ -5176,6 +5704,24 @@ export class AppControllerImpl implements AppController {
         ...current, unknownCharge: accounting?.providerReportedCostUsd === undefined,
         ...(accounting ? { accounting } : {}), updatedAt: now(),
       }), { state: capturedState, generation: capturedGeneration });
+    }
+    if (isOpenRouterMailReplyContentJob(job)) {
+      try {
+        requireInspectionContext();
+        await this.assertMailReplyBatchJobIntegrity(job, false);
+        requireInspectionContext();
+        const parsed = parseOpenRouterMailReplyResult(inspection, job.requestBody);
+        const resultSha256 = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, parsed.text, { encoding: Crypto.CryptoEncoding.HEX });
+        requireInspectionContext();
+        return this.updateOpenRouterBatchJob(job.id, (current) => ({ ...current, status: 'completed', resultText: parsed.text,
+          resultSha256, unknownCharge: accounting?.providerReportedCostUsd === undefined, ...(accounting ? { accounting } : {}), updatedAt: now() }),
+        { state: capturedState, generation: capturedGeneration });
+      } catch {
+        requireInspectionContext();
+        return this.updateOpenRouterBatchJob(job.id, (current) => ({ ...current, status: 'result_invalid', failureCode: 'invalid_result',
+          unknownCharge: accounting?.providerReportedCostUsd === undefined, ...(accounting ? { accounting } : {}), updatedAt: now() }),
+        { state: capturedState, generation: capturedGeneration });
+      }
     }
     let prepared: PreparedOpenRouterAnalysis | undefined;
     try {
@@ -5293,7 +5839,7 @@ export class AppControllerImpl implements AppController {
     expectedContext?: { readonly state: AppState; readonly generation: number },
   ): Promise<AssistantBatchJobDTO> {
     let nextLedger!: OpenRouterBatchLedger;
-    return this.mutate(() => {
+    await this.mutate(() => {
       if (expectedContext && (!this.loaded || this.state !== expectedContext.state || this.bootstrapGeneration !== expectedContext.generation ||
           this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired)) {
         throw new Error('The saved Batch operation belongs to an earlier workspace session.');
@@ -5301,13 +5847,41 @@ export class AppControllerImpl implements AppController {
       nextLedger = this.updatedBatchLedger(jobId, update);
       return assistantBatchJobDTO(nextLedger.jobs.find((job) => job.id === jobId)!);
     }, undefined, () => nextLedger);
+    // The transaction may replace an oversized completed result with a
+    // content-free billing receipt. Return the committed DTO, not the
+    // pre-capacity projection computed by the transaction callback.
+    return this.batchDTO(jobId);
   }
 
   private assertBatchLedgerCanDropContent(): void {
     if (this.assistantBatchLedgerMalformed) throw new Error('Saved Batch history is invalid. Refresh local data before changing or deleting content.');
   }
 
-  private sourceRemovalCommit(predicate: (job: OpenRouterBatchJob) => boolean): {
+  private assertMailBatchCleanupIsCertain(state: AppState, jobs: readonly OpenRouterMailReplyContentJob[]): void {
+    if (jobs.length && this.dispatchRecordQuarantine.length) {
+      throw new Error('Dispatch history failed integrity validation. Refresh local data before removing mail Batch content.');
+    }
+    if (this.mailBatchJobsWithUncertainCleanup(state, jobs).size) {
+      throw new Error('This reply has an uncertain or pending mailbox action. Reconcile its dispatch receipt before changing the Batch content.');
+    }
+  }
+
+  private mailBatchJobsWithUncertainCleanup(state: AppState, jobs: readonly OpenRouterMailReplyContentJob[]): Set<string> {
+    const ids = new Set(jobs.map((job) => job.id));
+    const proposalIds = new Set(jobs.flatMap((job) => job.proposalId ? [job.proposalId] : []));
+    const linked = state.proposals.filter((proposal) => proposalIds.has(proposal.id) ||
+      (proposal.provenance?.version === 2 && Boolean(proposal.provenance.batchJobId && ids.has(proposal.provenance.batchJobId))));
+    for (const proposal of linked) proposalIds.add(proposal.id);
+    const uncertainProposalIds = new Set(linked.filter((proposal) => proposal.status === 'dispatching' || proposal.status === 'unknown').map((proposal) => proposal.id));
+    for (const record of state.dispatchRecords) if (proposalIds.has(record.proposalId) && (record.outcome === 'pending' || record.outcome === 'unknown')) uncertainProposalIds.add(record.proposalId);
+    return new Set(jobs.filter((job) => Boolean(job.proposalId && uncertainProposalIds.has(job.proposalId)) ||
+      linked.some((proposal) => uncertainProposalIds.has(proposal.id) && proposal.provenance?.version === 2 && proposal.provenance.batchJobId === job.id)).map((job) => job.id));
+  }
+
+  private sourceRemovalCommit(predicate: (job: OpenRouterBatchJob) => boolean, options: {
+    ownActiveMailReviewJobId?: string;
+    retainUncertainMailObservation?: true;
+  } = {}): {
     batch: (draft: AppState) => OpenRouterBatchLedger | undefined;
     chat: () => ReadonlyChatLedger | undefined;
   } {
@@ -5315,8 +5889,21 @@ export class AppControllerImpl implements AppController {
     return {
       batch: (draft) => {
         this.assertBatchLedgerCanDropContent();
-        const directlyAffected = this.assistantBatchLedger.jobs.filter((job) => isOpenRouterBatchContentJob(job) && predicate(job));
+        const directlyAffected = this.assistantBatchLedger.jobs.filter((job) =>
+          (isOpenRouterBatchContentJob(job) || isOpenRouterMailReplyContentJob(job)) && predicate(job));
         if (!directlyAffected.length) return undefined;
+        if (directlyAffected.some(isOpenRouterMailReplyContentJob) && this.dispatchRecordQuarantine.length && !options.retainUncertainMailObservation) {
+          throw new Error('Dispatch history failed integrity validation. Refresh local data before removing mail Batch content.');
+        }
+
+        const affectedMailJobs = directlyAffected.filter(isOpenRouterMailReplyContentJob);
+        const retainedMailJobIds = new Set<string>();
+        if (options.retainUncertainMailObservation && affectedMailJobs.length) {
+          if (this.dispatchRecordQuarantine.length) for (const job of affectedMailJobs) retainedMailJobIds.add(job.id);
+          else for (const id of this.mailBatchJobsWithUncertainCleanup(draft, affectedMailJobs)) retainedMailJobIds.add(id);
+        } else this.assertMailBatchCleanupIsCertain(draft, affectedMailJobs);
+        const retireDirectlyAffected = directlyAffected.filter((job) => !retainedMailJobIds.has(job.id));
+        if (!retireDirectlyAffected.length) return undefined;
 
         if (this.assistantChatLedgerMalformed && (draft.notes.some((note) => note.origin === 'assistant_chat') ||
             this.assistantBatchLedger.jobs.some((job) => job.chatBinding))) {
@@ -5324,8 +5911,8 @@ export class AppControllerImpl implements AppController {
         }
 
         const affectedTurnIds = new Set<string>();
-        const affectedJobIds = new Set(directlyAffected.map((job) => job.id));
-        for (const job of directlyAffected) {
+        const affectedJobIds = new Set(retireDirectlyAffected.map((job) => job.id));
+        for (const job of retireDirectlyAffected) {
           if (job.chatBinding) affectedTurnIds.add(job.chatBinding.turnId);
           for (const turn of this.assistantChatLedger.conversations.flatMap((conversation) => conversation.turns)) {
             if (turn.jobId === job.id) affectedTurnIds.add(turn.id);
@@ -5351,7 +5938,9 @@ export class AppControllerImpl implements AppController {
         const affectedTurnRows = this.assistantChatLedger.conversations.flatMap((conversation) => conversation.turns
           .filter((turn) => affectedTurnIds.has(turn.id)).map((turn) => ({ conversation, turn })));
         const affectedNoteIds = new Set(affectedTurnRows.map(({ turn }) => turn.noteId));
-        if (Array.from(affectedJobIds).some((id) => this.activeBatchJobInspections.has(id)) ||
+        if (Array.from(affectedJobIds).some((id) => this.activeBatchJobInspections.has(id) ||
+            (id !== options.ownActiveMailReviewJobId && this.activeMailReplyBatchReviews.has(id))) ||
+            directlyAffected.some((job) => isOpenRouterMailReplyContentJob(job) && this.activeMailReplyBatchSubmissions.has(job.mailReplyBinding.messageId)) ||
             Array.from(affectedNoteIds).some((id) => this.activeBatchNoteOperations.has(id)) ||
             affectedTurnRows.some(({ conversation }) => this.activeChatConversationSubmissions.has(conversation.id))) {
           throw new Error('A Chat or Batch operation is still using this source. Try again after it finishes.');
@@ -5362,6 +5951,16 @@ export class AppControllerImpl implements AppController {
         if (directlyAffected.some((job) => job.chatBinding?.transcriptSource?.noteId &&
             this.activeBatchNoteOperations.has(job.chatBinding.transcriptSource.noteId))) {
           throw new Error('A Chat request is still using this source. Try again after it finishes.');
+        }
+
+        const retiringMailJobs = affectedMailJobs.filter((job) => !retainedMailJobIds.has(job.id));
+        const affectedMailJobIds = new Set(retiringMailJobs.map((job) => job.id));
+        for (const proposal of draft.proposals) {
+          if (proposal.provenance?.version === 2 && proposal.provenance.batchJobId && affectedMailJobIds.has(proposal.provenance.batchJobId) &&
+              ['draft', 'approved', 'failed'].includes(proposal.status)) {
+            this.invalidate(proposal);
+            proposal.requiresRebuild = true;
+          }
         }
 
         if (affectedTurnIds.size) {
@@ -5385,7 +5984,7 @@ export class AppControllerImpl implements AppController {
 
         const affectedIds = new Set([...affectedJobIds]);
         return validateOpenRouterBatchLedger({ version: 1, jobs: this.assistantBatchLedger.jobs.map((job) => {
-          if (!affectedIds.has(job.id) && !predicate(job)) return job;
+          if (!affectedIds.has(job.id)) return job;
           return tombstoneOpenRouterBatchJob(job, now(), Boolean(job.chatBinding || affectedJobIds.has(job.id)));
         }) });
       },
@@ -5394,7 +5993,7 @@ export class AppControllerImpl implements AppController {
   }
 
   private sourceTranscriptRevisionCommit(noteId: string) {
-    return this.sourceRemovalCommit((job) => job.chatBinding?.transcriptSource?.noteId === noteId);
+    return this.sourceRemovalCommit((job) => job.chatBinding?.transcriptSource?.noteId === noteId || job.mailReplyBinding?.note?.id === noteId);
   }
 
   private tombstoneOpenRouterBatchJobs(predicate: (job: OpenRouterBatchJob) => boolean): OpenRouterBatchLedger {
@@ -6273,6 +6872,8 @@ export class AppControllerImpl implements AppController {
         await this.enqueueLegacyReminderCancellation(state, proposal.id, revision);
       }
       if (proposal.provenance?.version === 2) {
+        const immutableBatchPayload = proposal.provenance.batchJobId ? stableJson({ title: proposal.title, body: proposal.body,
+          accountId: proposal.accountId, recipients: proposal.recipients, email: proposal.email }) : undefined;
         const locked = proposal.email?.reply;
         if (!locked || proposal.email?.operation !== 'draft' || (patch.accountId !== undefined && patch.accountId !== proposal.accountId) ||
             (patch.email && ((patch.email.operation !== undefined && patch.email.operation !== 'draft') || patch.email.subject !== proposal.provenance.source.subject ||
@@ -6283,6 +6884,11 @@ export class AppControllerImpl implements AppController {
         Object.assign(proposal, patch);
         if (updatedEmail) proposal.email = updatedEmail;
         else if (proposal.email) proposal.email.reply = clone(locked);
+        if (immutableBatchPayload && stableJson({ title: proposal.title, body: proposal.body, accountId: proposal.accountId,
+          recipients: proposal.recipients, email: proposal.email }) !== immutableBatchPayload) {
+          throw new Error('This Batch generated reply is immutable. Create a separate manual reply draft to change its title, body, account, or recipients.');
+        }
+        if (immutableBatchPayload) return proposal;
         await this.validateProposalProvenance(state, proposal);
       } else Object.assign(proposal, patch);
       if (patch.eventDestination) {
@@ -8167,9 +8773,11 @@ export class AppControllerImpl implements AppController {
     if (entityPath) this.assertKnowledgeWritable();
     if (entityPath && new TextEncoder().encode(content).length > 16 * 1024) throw new Error('Knowledge narrative is limited to 16 KiB.');
     let removesCapturedSource = false;
+    let changesMailReplyPolicy = false;
     let affectedKnowledgeSourceKey: string | undefined;
     const sourceRemoval = this.sourceRemovalCommit((job) =>
-      job.sourceVersions?.[`doc:${cleanPath}`] !== undefined || Boolean(affectedKnowledgeSourceKey && job.sourceVersions?.[affectedKnowledgeSourceKey] !== undefined));
+      job.sourceVersions?.[`doc:${cleanPath}`] !== undefined || Boolean(affectedKnowledgeSourceKey && job.sourceVersions?.[affectedKnowledgeSourceKey] !== undefined) ||
+      Boolean(changesMailReplyPolicy && job.kind === 'mail_reply' && job.mailReplyBinding));
     const document = await this.mutate((state) => {
       if (entityPath) this.assertKnowledgeWritable();
       const existing = state.documents.find((item) => item.path === cleanPath);
@@ -8186,12 +8794,14 @@ export class AppControllerImpl implements AppController {
       }
       if (existing?.content === content) return existing;
       const changed = existing?.content !== content;
+      changesMailReplyPolicy = changed && /^memory\/(?:RULES|ROUTINES)\.md$/i.test(cleanPath);
       if (existing && changed) {
         this.assertBatchLedgerCanDropContent();
         if (this.activeBatchNoteOperations.size) throw new Error('A Batch request is still using saved context. Try again after it finishes.');
       }
-      removesCapturedSource = Boolean(existing && changed && this.assistantBatchLedger.jobs.some((job) => isOpenRouterBatchContentJob(job) &&
-      (job.sourceVersions?.[`doc:${cleanPath}`] !== undefined || Boolean(affectedKnowledgeSourceKey && job.sourceVersions?.[affectedKnowledgeSourceKey] !== undefined))));
+      removesCapturedSource = Boolean(changed && this.assistantBatchLedger.jobs.some((job) =>
+        (isOpenRouterBatchContentJob(job) && (job.sourceVersions?.[`doc:${cleanPath}`] !== undefined || Boolean(affectedKnowledgeSourceKey && job.sourceVersions?.[affectedKnowledgeSourceKey] !== undefined))) ||
+        (changesMailReplyPolicy && isOpenRouterMailReplyContentJob(job))));
       const next: ContextDocument = { path: cleanPath, content, revision: (existing?.revision ?? 0) + 1, updatedAt: now() };
       if (existing) Object.assign(existing, next); else state.documents.unshift(next);
       if (entityMatch) {
@@ -8421,6 +9031,7 @@ export class AppControllerImpl implements AppController {
       const installed = priorRef
         ? await withCredentialLock(tokenStore, priorRef, commitInstall)
         : await commitInstall();
+      this.clearMailReplyBatchReviewPlansForAccount(installed.id);
       this.syncGeneration.set(installed.id, installed.connectionGeneration ?? 0);
       this.syncAbortControllers.get(installed.id)?.abort();
       this.installingTokenRefs.delete(tokenRef);
@@ -8465,6 +9076,7 @@ export class AppControllerImpl implements AppController {
       addActivity(state, 'local_action', `${current.displayName || current.email} was disconnected. Pending approvals were cleared.`);
       return current;
     });
+    this.clearMailReplyBatchReviewPlansForAccount(id);
     await this.retryCredentialCleanup();
     return account;
   }
@@ -8504,40 +9116,46 @@ export class AppControllerImpl implements AppController {
       const result = await this.currentMailReplySource(state, input.messageId);
       if (result.status !== 'current' || !result.source || !result.defaults) throw new Error('Refresh this message before creating a reply draft.');
       if (result.source.sourceDigest.toLowerCase() !== input.sourceDigest.toLowerCase()) throw new Error('The source message changed. Reopen the reply composer and review its current recipients.');
-      if (typeof input.text !== 'string' || input.text.length > 100_000 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(input.text)) throw new Error('Reply text is invalid or too long.');
-      const source = result.source;
-      const account = state.accounts.find((item) => item.id === source.accountId);
-      if (!account) throw new Error('The verified mail account is no longer available.');
-      const defaults = result.defaults[input.mode];
-      const to = input.to ? [...input.to] : [...defaults.to];
-      const cc = input.cc ? [...input.cc] : [...defaults.cc];
-      const provenance: MailReplyProvenance = {
-        version: 2, kind: 'mail_reply', sourceDigest: source.sourceDigest, source,
-        expiresAt: new Date(Date.parse(source.observedAt) + 15 * 60_000).toISOString(),
-      };
-      const reply = {
-        mode: input.mode, sourceDigest: source.sourceDigest, localMessageId: source.localMessageId,
-        providerMessageId: source.providerMessageId, idFormat: source.idFormat,
-        internetMessageId: source.internetMessageId, sourceSubject: source.subject,
-        ...(source.threadId ? { threadId: source.threadId } : {}),
-        ...(replyReferences(source) ? { references: replyReferences(source) } : {}),
-        inReplyTo: source.internetMessageId,
-      } as const;
-      const email = { operation: 'draft' as const, to, cc, bcc: [], subject: source.subject, text: input.text, attachments: [], reply };
-      validateReplyBinding(email, provenance);
-      const sourceActionKey = JSON.stringify(['mail-reply-v1', identityKey(account), source.providerMessageId, input.mode]);
-      const duplicate = state.proposals.some((proposal) => proposal.sourceActionKey === sourceActionKey && ['accepted', 'unknown', 'dispatching'].includes(proposal.status) && !proposal.simulated) ||
-        state.dispatchRecords.some((record) => record.sourceActionKey === sourceActionKey && ['pending', 'accepted', 'unknown'].includes(record.outcome));
-      if (duplicate) throw new Error('A reply draft attempt for this message and mode already exists. Review its history before creating another.');
-      const proposal: Proposal = {
-        id: newId(), kind: 'email', title: source.subject ? `Re: ${source.subject}` : 'Reply draft', body: input.text,
-        status: 'draft', revision: 1, accountId: account.id, recipients: [...to], evidence: [], sourceActionKey,
-        provenance, email,
-      };
+      const proposal = this.buildMailReplyProposal(state, result.source, { ...input,
+        to: input.to ?? result.defaults[input.mode].to, cc: input.cc ?? result.defaults[input.mode].cc });
       state.proposals.unshift(proposal);
       addActivity(state, 'proposal_created', 'Reply draft prepared from the selected mailbox message.', { proposalId: proposal.id });
       return proposal;
     });
+  }
+
+  private buildMailReplyProposal(state: AppState, source: MailReplySourceSnapshot,
+    input: { messageId: string; mode: 'reply' | 'reply_all'; sourceDigest: string; text: string; to: readonly string[]; cc: readonly string[] }, batchJobId?: string): Proposal {
+    if (input.messageId !== source.localMessageId || input.sourceDigest.toLowerCase() !== source.sourceDigest.toLowerCase() ||
+        typeof input.text !== 'string' || input.text.length > 100_000 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(input.text)) {
+      throw new Error('Reply text or source binding is invalid. Review the current message before creating a draft.');
+    }
+    const account = state.accounts.find((item) => item.id === source.accountId);
+    if (!account) throw new Error('The verified mail account is no longer available.');
+    const to = [...input.to];
+    const cc = [...input.cc];
+    if (!to.length || to.length > 100 || cc.length > 100 || [...to, ...cc].some((address) => !validEmail(address))) throw new Error('Check the reply recipients.');
+    const provenance: MailReplyProvenance = {
+      version: 2, kind: 'mail_reply', sourceDigest: source.sourceDigest, source,
+      expiresAt: new Date(Date.parse(source.observedAt) + 15 * 60_000).toISOString(),
+      ...(batchJobId ? { batchJobId } : {}),
+    };
+    const reply = {
+      mode: input.mode, sourceDigest: source.sourceDigest, localMessageId: source.localMessageId,
+      providerMessageId: source.providerMessageId, idFormat: source.idFormat,
+      internetMessageId: source.internetMessageId, sourceSubject: source.subject,
+      ...(source.threadId ? { threadId: source.threadId } : {}),
+      ...(replyReferences(source) ? { references: replyReferences(source) } : {}),
+      inReplyTo: source.internetMessageId,
+    } as const;
+    const email = { operation: 'draft' as const, to, cc, bcc: [], subject: source.subject, text: input.text, attachments: [], reply };
+    validateReplyBinding(email, provenance);
+    const sourceActionKey = JSON.stringify(['mail-reply-v1', identityKey(account), source.providerMessageId, input.mode]);
+    const duplicate = state.proposals.some((proposal) => proposal.sourceActionKey === sourceActionKey && ['accepted', 'unknown', 'dispatching'].includes(proposal.status) && !proposal.simulated) ||
+      state.dispatchRecords.some((record) => record.sourceActionKey === sourceActionKey && ['pending', 'accepted', 'unknown'].includes(record.outcome));
+    if (duplicate) throw new Error('A reply draft attempt for this message and mode already exists. Review its history before creating another.');
+    return { id: newId(), kind: 'email', title: source.subject ? `Re: ${source.subject}` : 'Reply draft', body: input.text,
+      status: 'draft', revision: 1, accountId: account.id, recipients: [...to], evidence: [], sourceActionKey, provenance, email };
   }
 
   private selectedMailFence(state: AppState, messageId: string): string | undefined {
@@ -8603,6 +9221,10 @@ export class AppControllerImpl implements AppController {
   }
 
   async loadMailReplyText(input: { messageId: string; sourceDigest: string }): Promise<MailReplyTextLoadResult> {
+    return this.loadMailReplyTextInternal(input);
+  }
+
+  private async loadMailReplyTextInternal(input: { messageId: string; sourceDigest: string }, ownActiveMailReviewJobId?: string): Promise<MailReplyTextLoadResult> {
     await this.load();
     if (!input || typeof input.messageId !== 'string' || !/^[a-f\d]{64}$/i.test(input.sourceDigest)) return { status: 'unavailable' };
     const captured = this.snapshot;
@@ -8701,6 +9323,9 @@ export class AppControllerImpl implements AppController {
       checkedAt, text, textDigest, bytes, extractionVersion, representation, completeness, omissionReasons,
     } : this.selectedMailTextUnavailable(baseMessage, account, sourceForCache.sourceDigest, omissionReasons[0] ?? 'text_unavailable', checkedAt,
       validUnavailablePair ? extractionVersion : 'mail-text-v2', validUnavailablePair ? omissionReasons : undefined);
+    const sourceChanged = Boolean(updatedSource && updatedSource.sourceDigest !== input.sourceDigest);
+    const sourceRemoval = this.sourceRemovalCommit((job) => isOpenRouterMailReplyContentJob(job) && job.mailReplyBinding.messageId === input.messageId,
+      { ...(ownActiveMailReviewJobId ? { ownActiveMailReviewJobId } : {}), retainUncertainMailObservation: true });
     await this.mutate((state) => {
       if (this.selectedMailFence(state, input.messageId) !== expectedFence) throw new Error('Selected message changed while text was being saved.');
       const messageIndex = state.mailbox.findIndex((item) => item.id === input.messageId);
@@ -8714,7 +9339,7 @@ export class AppControllerImpl implements AppController {
           this.invalidate(proposal); proposal.requiresRebuild = true;
         }
       }
-    });
+    }, undefined, (draft) => sourceChanged ? sourceRemoval.batch(draft) : undefined, () => sourceRemoval.chat());
     return {
       status: updatedSource && updatedSource.sourceDigest !== input.sourceDigest ? 'source_changed' : text ? 'current' : 'unavailable',
       snapshot: clone(bodySnapshot),
@@ -9094,6 +9719,10 @@ export class AppControllerImpl implements AppController {
           throw new Error('Account connection changed during mail sync; stale pages were discarded.');
         }
       };
+      const changedReplySourceIds = new Set<string>();
+      const sourceRemoval = this.sourceRemovalCommit(
+        (job) => job.kind === 'mail_reply' && Boolean(job.mailReplyBinding && changedReplySourceIds.has(job.mailReplyBinding.messageId)),
+        { retainUncertainMailObservation: true });
       const persistPage = async (items: MessageSummary[], cursor: string | undefined, metadata: MessageWindowPageMetadata) => this.mutate((state) => {
         ensureCurrent(state);
         if (metadata.window.from !== immutableWindow.from || metadata.window.to !== immutableWindow.through || metadata.queryFingerprint !== immutableWindow.queryFingerprint) {
@@ -9118,6 +9747,7 @@ export class AppControllerImpl implements AppController {
             observedAt: timestamp,
           };
           const changed = !prior || canonicalMailboxContent(prior) !== canonicalMailboxContent(value);
+          if (prior && changed) changedReplySourceIds.add(prior.id);
           if (prior) { Object.assign(prior, value); delete prior.providerDeletedAt; } else state.mailbox.push(value);
           if (changed) markAnalysesStale(state, [`mail:${encodeURIComponent(key)}:${encodeURIComponent(item.id)}`]);
         }
@@ -9133,7 +9763,7 @@ export class AppControllerImpl implements AppController {
             providerDeletedAt: deletedAt, observedAt: timestamp,
           };
           if (!prior || !prior.providerDeletedAt) markAnalysesStale(state, [`mail:${encodeURIComponent(key)}:${encodeURIComponent(id)}`]);
-          if (prior) Object.assign(prior, tombstone); else state.mailbox.push(tombstone);
+          if (prior) { changedReplySourceIds.add(prior.id); Object.assign(prior, tombstone); } else state.mailbox.push(tombstone);
           unavailableCount++;
         }
         const accountMessages = state.mailbox.filter((entry) => entry.accountId === accountId)
@@ -9149,8 +9779,16 @@ export class AppControllerImpl implements AppController {
           sync.mailBackfill.unavailableCount = (sync.mailBackfill.unavailableCount ?? 0) + unavailableCount;
         }
         state.syncStates[accountId] = sync;
+        if (changedReplySourceIds.size) {
+          state.selectedMailTexts = state.selectedMailTexts.filter((item) => !changedReplySourceIds.has(item.messageId));
+          for (const proposal of state.proposals.filter((item) => item.accountId === accountId && item.provenance?.version === 2 &&
+              changedReplySourceIds.has(item.provenance.source.localMessageId) && ['draft', 'approved', 'failed'].includes(item.status))) {
+            this.invalidate(proposal);
+            proposal.requiresRebuild = true;
+          }
+        }
         return timestamp;
-      });
+      }, undefined, (state) => changedReplySourceIds.size ? sourceRemoval.batch(state) : undefined, () => sourceRemoval.chat());
       const page = await this.connector.syncMessageWindow(immutableAccount, {
         timeMin: immutableWindow.from, timeMax: immutableWindow.through, cursor: immutableWindow.cursor,
         pageSize: immutableWindow.pageSize, guard, signal: abortController.signal,
@@ -9869,7 +10507,8 @@ export class AppControllerImpl implements AppController {
     if (this.state.notes.find((note) => note.id === id)?.origin === 'assistant_chat') throw new Error('Delete this message from its Chat conversation.');
     if (this.activeBatchNoteOperations.has(id)) throw new Error('A Batch request is still using this note. Try again after it finishes.');
     const audioUri = this.snapshot.notes.find((note) => note.id === id)?.audioUri;
-    const sourceRemoval = this.sourceRemovalCommit((job) => job.noteId === id || job.sourceVersions?.[`note:${id}`] !== undefined || job.chatBinding?.transcriptSource?.noteId === id);
+    const sourceRemoval = this.sourceRemovalCommit((job) => job.noteId === id || job.sourceVersions?.[`note:${id}`] !== undefined ||
+      job.chatBinding?.transcriptSource?.noteId === id || job.mailReplyBinding?.note?.id === id);
     await this.mutate(async (state) => {
       if (this.activeBatchNoteOperations.has(id)) throw new Error('A Batch request is still using this note. Try again after it finishes.');
       if (state.proposals.some((proposal) => proposal.noteId === id && (proposal.kind !== 'reminder' && ['dispatching', 'unknown'].includes(proposal.status)))) throw new Error('Wait for the in-progress external action result before deleting this note.');

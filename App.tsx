@@ -1,6 +1,7 @@
 import React, {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   useSyncExternalStore,
@@ -43,6 +44,7 @@ import type {
   ReviewKnowledgeSuggestionInput,
   EditKnowledgeSuggestionInput,
   StartupRecoveryStatus,
+  MailReplyBatchReviewPlan,
 } from "./src/core";
 import type {
   ProactiveRecoveryPlan,
@@ -63,6 +65,7 @@ import { loadAudioForUpload } from "./src/audio/readAudio";
 import { ConnectionsSection } from "./src/ui/ConnectionsSection";
 import { MailboxSection } from "./src/ui/MailboxSection";
 import { MailReplyComposer } from "./src/ui/MailReplyComposer";
+import { MailReplyBatchOwnership, mailReplyBatchIsBlocked, mailReplyBatchKeyIsReady, rethrowMailReplyBatchError, type MailReplyBatchKeyStatus, type MailReplyBatchOwner } from "./src/ui/mailReplyBatchOwnership";
 import { ProactiveCandidatesSection } from "./src/ui/ProactiveCandidatesSection";
 import { ProactiveRulesSection } from "./src/ui/ProactiveRulesSection";
 import { ProactiveMailAlertsSection, type EnableProactiveMailAlertsInput } from "./src/ui/ProactiveMailAlertsSection";
@@ -949,6 +952,9 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
   const [transcribingNoteId, setTranscribingNoteId] = useState<string | undefined>();
   const [review, setReview] = useState<Proposal | null>(null);
   const [replyMessageId, setReplyMessageId] = useState<string | null>(null);
+  const mailReplyBatchOwnershipRef = useRef<MailReplyBatchOwnership | null>(null);
+  if (mailReplyBatchOwnershipRef.current == null) mailReplyBatchOwnershipRef.current = new MailReplyBatchOwnership();
+  const [mailReplyOwnerGeneration, setMailReplyOwnerGeneration] = useState(0);
   const [reminderReviewId, setReminderReviewId] = useState<string | null>(null);
   const [reminderSourceAccountLabel, setReminderSourceAccountLabel] = useState<string | undefined>();
   const [notice, setNotice] = useState("");
@@ -2229,6 +2235,254 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
       setBusy(false);
     }
   };
+  const [mailReplyBatchActionBusy, setMailReplyBatchActionBusy] = useState(false);
+  const mailReplyBatchHardBlocked = mailReplyBatchIsBlocked({
+    startupReady,
+    loading,
+    demo: isIsolatedDemo,
+    previewFailed: isolatedPreviewFailed,
+    privacyReviewOpen,
+    privacyOutcomeUnknown,
+    busy,
+    ownActionBusy: mailReplyBatchActionBusy,
+    audioActive: audio.status !== "idle",
+    pendingCaptureLoading,
+    pendingCapturePending: Boolean(captureJournal && pendingCaptureStatus?.kind !== "empty"),
+    foregroundResumeRefreshing,
+    foregroundCatchupComplete,
+    proactiveRecoverySheetOpen,
+    proactiveRecoveryRequiresRefresh,
+    mailAlertRefreshRequired: Boolean(backgroundActionBlockedReason || state.mailAlertRefreshRequired),
+    assistantChatRecovery: Boolean(state.assistantChatRecoveryStatus),
+    assistantBatchRecovery: Boolean(state.assistantBatchRecoveryStatus),
+    proactiveMailAlertRecovery: Boolean(state.proactiveMailAlertRecoveryStatus),
+    backupRecovery: Boolean(state.backupRecoveryStatus),
+    knowledgeRecovery: Boolean(state.knowledgeRecoveryStatus),
+    reminderRecovery: Boolean(state.reminderRecoveryStatus),
+    competingReviewOpen: Boolean(review),
+    reminderReviewOpen: Boolean(reminderReviewId),
+    noteDetailOpen: Boolean(detail),
+    documentOpen: Boolean(doc),
+    recordingAttachmentOpen: Boolean(recordingAttachmentNoteId),
+    manualChatOpen: manualOpen,
+    settingsOpen,
+    mailAlertTapResolutionOpen: Boolean(mailAlertTapResolution),
+    mailAlertTapPending,
+    chatDeleteReviewOpen,
+    chatInteractionLocked,
+  });
+  const mailReplyBatchHardBlockedRef = useRef(mailReplyBatchHardBlocked);
+  useLayoutEffect(() => { mailReplyBatchHardBlockedRef.current = mailReplyBatchHardBlocked; }, [mailReplyBatchHardBlocked]);
+  const [mailReplyBatchKeyStatus, setMailReplyBatchKeyStatus] = useState<MailReplyBatchKeyStatus | null>(null);
+  const mailReplyBatchKeyReady = mailReplyBatchKeyIsReady(mailReplyBatchKeyStatus, {
+    generation: mailReplyOwnerGeneration,
+    mode: state.settings.mode,
+    provider: state.settings.llmProvider ?? "",
+    blocked: mailReplyBatchHardBlocked,
+  });
+  const ownsMailReplyOwner = useCallback((owner: MailReplyBatchOwner) =>
+    mailReplyBatchOwnershipRef.current!.owns(owner),
+  []);
+  useEffect(() => {
+    const owner = replyMessageId ? mailReplyBatchOwnershipRef.current!.captureOwner(replyMessageId) : undefined;
+    const mode = state.settings.mode;
+    const provider = state.settings.llmProvider;
+    if (!replyMessageId || !owner || mode !== "provider" || provider !== "openrouter" || mailReplyBatchHardBlocked) return;
+    let active = true;
+    void credentials.getCredentials().then((result) => {
+      const liveSettings = controller.getSnapshot().settings;
+      if (active && ownsMailReplyOwner(owner) &&
+          liveSettings.mode === mode && liveSettings.llmProvider === provider && !mailReplyBatchHardBlockedRef.current) {
+        setMailReplyBatchKeyStatus({ generation: owner.generation, mode, provider, ready: result.openRouterConfigured === true });
+      }
+    }).catch((cause) => {
+      if (isPrivacyBootstrapError(cause)) { onPrivacyInvalidated(); return; }
+      if (active && ownsMailReplyOwner(owner) && !mailReplyBatchHardBlockedRef.current) {
+        setMailReplyBatchKeyStatus({ generation: owner.generation, mode, provider, ready: false });
+      }
+    });
+    return () => { active = false; };
+  }, [controller, credentials, mailReplyBatchHardBlocked, mailReplyOwnerGeneration, onPrivacyInvalidated, ownsMailReplyOwner, replyMessageId, settingsOpen, state.settings.llmProvider, state.settings.mode]);
+  const cancelOwnedMailReplyBatchPlan = useCallback((planId: string, owner?: { messageId: string; generation: number }) => {
+    const ownership = mailReplyBatchOwnershipRef.current!;
+    if (!ownership.getPlan(planId) || (owner && !ownership.owns(owner))) return;
+    ownership.clearPlan(planId);
+    void controller.cancelMailReplyBatchReview(planId).catch(() => undefined);
+  }, [controller]);
+  useEffect(() => {
+    if (mailReplyBatchHardBlocked) {
+      const plan = mailReplyBatchOwnershipRef.current!.currentPlan();
+      if (plan) cancelOwnedMailReplyBatchPlan(plan.planId);
+    }
+  }, [cancelOwnedMailReplyBatchPlan, mailReplyBatchHardBlocked]);
+  const cancelMailReplyBatchReview = useCallback((planId: string, owner: { messageId: string; generation: number }) => {
+    cancelOwnedMailReplyBatchPlan(planId, owner);
+  }, [cancelOwnedMailReplyBatchPlan]);
+  const openMailReply = useCallback((messageId: string) => {
+    const previous = mailReplyBatchOwnershipRef.current!.currentPlan();
+    if (previous) cancelOwnedMailReplyBatchPlan(previous.planId);
+    const owner = mailReplyBatchOwnershipRef.current!.publishOwner(messageId)!;
+    setMailReplyOwnerGeneration(owner.generation);
+    setReplyMessageId(messageId);
+  }, [cancelOwnedMailReplyBatchPlan]);
+  const closeMailReply = useCallback(() => {
+    const previous = mailReplyBatchOwnershipRef.current!.currentPlan();
+    if (previous) cancelOwnedMailReplyBatchPlan(previous.planId);
+    mailReplyBatchOwnershipRef.current!.publishOwner(null);
+    setMailReplyOwnerGeneration(mailReplyBatchOwnershipRef.current!.currentGeneration);
+    setReplyMessageId(null);
+  }, [cancelOwnedMailReplyBatchPlan]);
+  const submitMailReplyBatch = useCallback(async (
+    input: Parameters<AppController["submitMailReplyBatch"]>[0],
+    owner: MailReplyBatchOwner,
+    isComposerCurrent: () => boolean,
+  ) => {
+    if (!ownsMailReplyOwner(owner) || mailReplyBatchHardBlockedRef.current || !isComposerCurrent() || busyLock.current) return undefined;
+    const settingsAtAdmission = controller.getSnapshot().settings;
+    if (settingsAtAdmission.mode !== "provider" || settingsAtAdmission.llmProvider !== "openrouter") {
+      openSettings();
+      throw new Error("Choose OpenRouter in Provider mode before submitting a Batch reply request.");
+    }
+    if (input.messageId !== owner.messageId) throw new Error("The selected message changed. Reopen its reply composer.");
+    busyLock.current = true;
+    setMailReplyBatchActionBusy(true);
+    setBusy(true);
+    try {
+      const outcome = await mailReplyBatchOwnershipRef.current!.runOwnedAction({
+        owner,
+        isCurrent: () => !mailReplyBatchHardBlockedRef.current && isComposerCurrent(),
+        readReadiness: async () => {
+          let keyReady = false;
+          try { keyReady = (await credentials.getCredentials()).openRouterConfigured === true; }
+          catch (cause) { if (isPrivacyBootstrapError(cause)) throw cause; }
+          return { keyReady, settings: controller.getSnapshot().settings };
+        },
+        action: async (readiness) => {
+          const settings = controller.getSnapshot().settings;
+          if (mailReplyBatchHardBlockedRef.current || !isComposerCurrent() || settings.mode !== settingsAtAdmission.mode || settings.llmProvider !== settingsAtAdmission.llmProvider ||
+              settings.openRouterModel !== settingsAtAdmission.openRouterModel || settings.openRouterReasoningEffort !== settingsAtAdmission.openRouterReasoningEffort ||
+              readiness.settings.mode !== settingsAtAdmission.mode || readiness.settings.llmProvider !== settingsAtAdmission.llmProvider ||
+              readiness.settings.openRouterModel !== settingsAtAdmission.openRouterModel || readiness.settings.openRouterReasoningEffort !== settingsAtAdmission.openRouterReasoningEffort) {
+            throw new Error("Workspace readiness or OpenRouter settings changed. Reopen the composer and review the request again.");
+          }
+          if (!readiness.keyReady) {
+            openSettings();
+            throw new Error("Save an OpenRouter API key in Settings before submitting a Batch reply request.");
+          }
+          if (input.messageId !== owner.messageId) throw new Error("The selected message changed. Reopen its reply composer.");
+          return controller.submitMailReplyBatch(input);
+        },
+      });
+      return outcome.kind === "complete" ? outcome.value : undefined;
+    } catch (cause) {
+      rethrowMailReplyBatchError(cause, isPrivacyBootstrapError, onPrivacyInvalidated);
+    } finally {
+      busyLock.current = false;
+      setMailReplyBatchActionBusy(false);
+      setBusy(false);
+    }
+  }, [controller, credentials, onPrivacyInvalidated, openSettings, ownsMailReplyOwner]);
+  const checkMailReplyBatch = useCallback(async (jobId: string, owner: MailReplyBatchOwner) => {
+    if (!ownsMailReplyOwner(owner) || mailReplyBatchHardBlockedRef.current || busyLock.current) return undefined;
+    const job = (controller.getSnapshot().assistantBatchJobs ?? []).find((item) => item.id === jobId && item.kind === "mail_reply" && item.mailMessageId === owner.messageId);
+    if (!job || !job.canCheck) return undefined;
+    busyLock.current = true;
+    setMailReplyBatchActionBusy(true);
+    setBusy(true);
+    try {
+      const outcome = await mailReplyBatchOwnershipRef.current!.runOwnedAction({
+        owner,
+        isCurrent: () => !mailReplyBatchHardBlockedRef.current,
+        readReadiness: async () => {
+          const settings = controller.getSnapshot().settings;
+          if (settings.mode !== "provider" || settings.llmProvider !== "openrouter") throw new Error("Select OpenRouter in Provider mode before checking this request.");
+          try { return (await credentials.getCredentials()).openRouterConfigured === true; }
+          catch (cause) { if (isPrivacyBootstrapError(cause)) throw cause; return false; }
+        },
+        action: async (keyReady) => {
+          if (!keyReady) {
+            openSettings();
+            throw new Error("Save an OpenRouter API key in Settings before checking this request.");
+          }
+          return controller.refreshAssistantBatch(jobId);
+        },
+      });
+      if (outcome.kind !== "complete") return undefined;
+      const updated = outcome.value;
+      return updated.id === jobId && updated.mailMessageId === owner.messageId ? updated : undefined;
+    } catch (cause) {
+      rethrowMailReplyBatchError(cause, isPrivacyBootstrapError, onPrivacyInvalidated);
+    } finally { busyLock.current = false; setMailReplyBatchActionBusy(false); setBusy(false); }
+  }, [controller, credentials, onPrivacyInvalidated, openSettings, ownsMailReplyOwner]);
+  const reviewMailReplyBatch = useCallback(async (jobId: string, owner: MailReplyBatchOwner, isComposerCurrent: () => boolean) => {
+    if (!ownsMailReplyOwner(owner) || mailReplyBatchHardBlockedRef.current || !isComposerCurrent() || busyLock.current) return undefined;
+    const job = (controller.getSnapshot().assistantBatchJobs ?? []).find((item) => item.id === jobId && item.kind === "mail_reply" && item.mailMessageId === owner.messageId && item.canReviewMailReply);
+    if (!job) return undefined;
+    busyLock.current = true;
+    setMailReplyBatchActionBusy(true);
+    setBusy(true);
+    try {
+      const outcome = await mailReplyBatchOwnershipRef.current!.prepareOwnedReview({
+        owner,
+        isCurrent: () => !mailReplyBatchHardBlockedRef.current && isComposerCurrent(),
+        prepare: () => controller.reviewMailReplyBatch(jobId),
+        cancelLatePlan: (plan) => controller.cancelMailReplyBatchReview(plan.planId),
+      });
+      if (outcome.kind === "stale") return undefined;
+      const plan: MailReplyBatchReviewPlan = outcome.plan;
+      if (plan.jobId !== jobId || plan.messageId !== owner.messageId || !Number.isFinite(Date.parse(plan.expiresAt)) || Date.parse(plan.expiresAt) <= Date.now()) {
+        void controller.cancelMailReplyBatchReview(plan.planId).catch(() => undefined);
+        return undefined;
+      }
+      const current = mailReplyBatchOwnershipRef.current!.currentPlan();
+      if (current) cancelOwnedMailReplyBatchPlan(current.planId);
+      if (!mailReplyBatchOwnershipRef.current!.publishPlan(plan, owner)) {
+        void controller.cancelMailReplyBatchReview(plan.planId).catch(() => undefined);
+        return undefined;
+      }
+      return plan;
+    } catch (cause) {
+      rethrowMailReplyBatchError(cause, isPrivacyBootstrapError, onPrivacyInvalidated);
+    } finally { busyLock.current = false; setMailReplyBatchActionBusy(false); setBusy(false); }
+  }, [cancelOwnedMailReplyBatchPlan, controller, onPrivacyInvalidated, ownsMailReplyOwner]);
+  const activateMailReplyBatch = useCallback(async (planId: string, jobId: string, owner: MailReplyBatchOwner, isComposerCurrent: () => boolean) => {
+    const live = mailReplyBatchOwnershipRef.current!.getPlan(planId);
+    if (!live || live.jobId !== jobId || live.messageId !== owner.messageId ||
+        !ownsMailReplyOwner(owner) || mailReplyBatchHardBlockedRef.current || !isComposerCurrent() || busyLock.current) return undefined;
+    const consumedPlan = mailReplyBatchOwnershipRef.current!.clearPlan(planId);
+    if (!consumedPlan) return undefined;
+    busyLock.current = true;
+    setMailReplyBatchActionBusy(true);
+    setBusy(true);
+    try {
+      const result = await controller.activateMailReplyBatch({ planId });
+      if (!ownsMailReplyOwner(owner) || !isComposerCurrent() || mailReplyBatchHardBlockedRef.current) return undefined;
+      if (result.kind !== "created" || result.jobId !== jobId) throw new Error("Draft creation could not be confirmed. Check saved request status before taking another action.");
+      const proposal = controller.getSnapshot().proposals.find((item) => item.id === result.proposalId);
+      if (!proposal || proposal.provenance?.version !== 2 || proposal.provenance.kind !== "mail_reply" || proposal.provenance.batchJobId !== jobId) throw new Error("The created reply draft could not be confirmed for this request. Check saved request status before taking another action.");
+      setInboxFilter("pending");
+      setReview(proposal);
+      closeMailReply();
+      return result;
+    } catch (cause) {
+      void controller.cancelMailReplyBatchReview(planId).catch(() => undefined);
+      rethrowMailReplyBatchError(cause, isPrivacyBootstrapError, onPrivacyInvalidated);
+    } finally { busyLock.current = false; setMailReplyBatchActionBusy(false); setBusy(false); }
+  }, [closeMailReply, controller, onPrivacyInvalidated, ownsMailReplyOwner]);
+  const deleteMailReplyBatch = useCallback(async (jobId: string, owner: MailReplyBatchOwner) => {
+    if (!ownsMailReplyOwner(owner) || mailReplyBatchHardBlockedRef.current || busyLock.current) return undefined;
+    const job = (controller.getSnapshot().assistantBatchJobs ?? []).find((item) => item.id === jobId && item.kind === "mail_reply" && item.mailMessageId === owner.messageId);
+    if (!job || job.sourceRemoved) return undefined;
+    busyLock.current = true;
+    setMailReplyBatchActionBusy(true);
+    setBusy(true);
+    try {
+      await controller.deleteMailReplyBatch(jobId);
+      return ownsMailReplyOwner(owner) ? true : undefined;
+    } catch (cause) {
+      rethrowMailReplyBatchError(cause, isPrivacyBootstrapError, onPrivacyInvalidated);
+    } finally { busyLock.current = false; setMailReplyBatchActionBusy(false); setBusy(false); }
+  }, [controller, onPrivacyInvalidated, ownsMailReplyOwner]);
   const saveInspectedPendingCapture = useCallback(async (receipt: PendingCaptureReceipt, durationSeconds: number): Promise<boolean> => {
     setPendingCaptureBusy(true);
     try {
@@ -3221,7 +3475,7 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
                 mailbox={state.mailbox}
                 deviceCalendars={state.deviceCalendars}
                 deviceCalendarAccess={state.deviceCalendarAccess.status}
-                onReplyMessage={(messageId) => setReplyMessageId(messageId)}
+                onReplyMessage={openMailReply}
                 proactive={state.proactive}
                 filter={inboxFilter}
                 setFilter={setInboxFilter}
@@ -3622,7 +3876,18 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
           demoMode={isMailSyncDemo}
           notes={notes}
           documents={state.documents}
-          onClose={() => setReplyMessageId(null)}
+          batchJobs={state.assistantBatchJobs ?? []}
+          batchEnabled={state.settings.mode === "provider" && state.settings.llmProvider === "openrouter" && mailReplyBatchKeyReady}
+          onOpenSettings={openSettings}
+          batchBlocked={mailReplyBatchHardBlocked}
+          ownerGeneration={mailReplyOwnerGeneration}
+          onSubmitBatch={submitMailReplyBatch}
+          onCheckBatch={checkMailReplyBatch}
+          onReviewBatch={reviewMailReplyBatch}
+          onActivateBatch={activateMailReplyBatch}
+          onCancelBatchReview={cancelMailReplyBatchReview}
+          onDeleteBatch={deleteMailReplyBatch}
+          onClose={closeMailReply}
           onSave={saveMailReply}
         />
         <MailAlertTapReviewSheet

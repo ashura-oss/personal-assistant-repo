@@ -1,5 +1,7 @@
 import type { AssistIntent, KnowledgeSelection } from '../core';
 import type { OpenRouterBatchInspection, OpenRouterBatchRequestProfileVersion, OpenRouterChatRefinementEffort } from './openRouter';
+import { validOpenRouterMailReplyBinding, type OpenRouterMailReplyBinding } from './openRouterMailReply';
+import { validReplyText } from './openRouterMailReply';
 import { isOpenRouterBatchRequestProfile, OPENROUTER_BATCH_MODEL } from './openRouter';
 
 export const OPENROUTER_BATCH_LEDGER_VERSION = 1 as const;
@@ -84,6 +86,11 @@ export interface OpenRouterBatchJob {
   readonly sourceVersions?: Readonly<Record<string, string>>;
   readonly appliedNoteRevision?: number;
   readonly chatBinding?: OpenRouterChatBinding;
+  readonly mailReplyBinding?: OpenRouterMailReplyBinding;
+  readonly resultText?: string;
+  readonly resultSha256?: string;
+  /** Permanent opaque link to the one draft activated from this job. */
+  readonly proposalId?: string;
 }
 
 export type OpenRouterBatchContentJob = OpenRouterBatchJob & {
@@ -133,6 +140,10 @@ export interface AssistantBatchJobDTO {
   readonly completionTokens?: number;
   readonly totalTokens?: number;
   readonly failureCode?: OpenRouterBatchJob['failureCode'];
+  readonly mailMessageId?: string;
+  readonly hasMailReplyResult?: boolean;
+  readonly canReviewMailReply?: boolean;
+  readonly proposalId?: string;
 }
 
 export function emptyOpenRouterBatchLedger(): OpenRouterBatchLedger {
@@ -227,6 +238,7 @@ function validChatBinding(value: unknown): value is OpenRouterChatBinding {
 
 function validJob(value: unknown): value is OpenRouterBatchJob {
   const row = record(value);
+  if (row?.kind === 'mail_reply') return validMailReplyJob(row);
   const commonRequired = ['id', 'customId', 'kind', 'status', 'createdAt', 'updatedAt', 'model', 'effort', 'requestSha256', 'unknownCharge'];
   const commonOptional = ['batchId', 'accounting', 'failureCode'];
   if (!row || !exactKeys(row, commonRequired, [...commonOptional, 'operation', 'reasoningEffort', 'parentTurnId', 'sourceRemoved', 'noteId', 'noteRevision', 'intent', 'question', 'knowledgeSelection', 'capturedAt', 'captureTimeZone', 'answeredAsOf', 'settingsFingerprint', 'sourceFingerprint', 'requestProfileVersion', 'requestBytes', 'omittedSourceCount', 'requestBody', 'sourceVersions', 'appliedNoteRevision', 'chatBinding'])) return false;
@@ -280,6 +292,49 @@ function validJob(value: unknown): value is OpenRouterBatchJob {
   if (!versions || Object.entries(versions).some(([key, version]) => !key || key.length > 512 || typeof version !== 'string' || version.length > 320)) return false;
   if (row.appliedNoteRevision !== undefined && (!Number.isSafeInteger(row.appliedNoteRevision) || (row.appliedNoteRevision as number) < 1)) return false;
   if ((row.status === 'queued' || row.status === 'processing' || row.status === 'completed' || row.status === 'expired' || row.status === 'cancelled' || row.status === 'result_stale' || row.status === 'result_invalid' || row.status === 'result_not_retained') && !row.batchId) return false;
+  if (row.status === 'failed' && !row.batchId && !(row.failureCode === 'not_submitted' && row.unknownCharge === false)) return false;
+  return true;
+}
+
+function validMailReplyJob(row: Record<string, unknown>): boolean {
+  const commonRequired = ['id', 'customId', 'kind', 'status', 'createdAt', 'updatedAt', 'model', 'effort', 'requestSha256', 'unknownCharge'];
+  const commonOptional = ['batchId', 'accounting', 'failureCode', 'proposalId'];
+  if (!exactKeys(row, commonRequired, [...commonOptional, 'sourceRemoved', 'requestProfileVersion', 'settingsFingerprint', 'sourceFingerprint',
+      'requestBytes', 'omittedSourceCount', 'requestBody', 'sourceVersions', 'mailReplyBinding', 'resultText', 'resultSha256']) ||
+      typeof row.id !== 'string' || row.id.length !== 36 || !UUID_V4.test(row.id) || row.customId !== row.id ||
+      row.kind !== 'mail_reply' || typeof row.status !== 'string' || !STATUSES.has(row.status) ||
+      !canonicalIso(row.createdAt) || !canonicalIso(row.updatedAt) || row.model !== OPENROUTER_BATCH_MODEL ||
+      typeof row.effort !== 'string' || !['none', 'low'].includes(row.effort) ||
+      typeof row.requestSha256 !== 'string' || row.requestSha256.length !== 64 || !SHA256.test(row.requestSha256) || typeof row.unknownCharge !== 'boolean' ||
+      (row.batchId !== undefined && (typeof row.batchId !== 'string' || row.batchId.length < 1 || row.batchId.length > 256 || /[^A-Za-z0-9_-]/.test(row.batchId))) ||
+      (row.accounting !== undefined && !validAccounting(row.accounting)) ||
+      (row.failureCode !== undefined && !['not_submitted', 'provider_failed', 'expired', 'invalid_result', 'stale_result', 'result_not_retained'].includes(String(row.failureCode))) ||
+      (row.proposalId !== undefined && (typeof row.proposalId !== 'string' || row.proposalId.length !== 36 || !UUID_V4.test(row.proposalId)))) return false;
+  if ((row.status === 'result_not_retained') !== (row.failureCode === 'result_not_retained')) return false;
+  if (row.sourceRemoved === true) {
+      return row.status === 'source_removed' && (row.requestProfileVersion === 1 || row.requestProfileVersion === 2) &&
+      exactKeys(row, [...commonRequired, 'sourceRemoved', 'requestProfileVersion'], [...commonOptional]);
+  }
+  if (row.sourceRemoved !== undefined || row.status === 'source_removed' || !validOpenRouterMailReplyBinding(row.mailReplyBinding) ||
+      typeof row.settingsFingerprint !== 'string' || row.settingsFingerprint.length !== 64 || !SHA256.test(row.settingsFingerprint) ||
+      typeof row.sourceFingerprint !== 'string' || row.sourceFingerprint.length !== 64 || !SHA256.test(row.sourceFingerprint) ||
+      (row.requestProfileVersion !== 1 && row.requestProfileVersion !== 2) ||
+      !Number.isSafeInteger(row.requestBytes) || (row.requestBytes as number) < 1 || (row.requestBytes as number) > 1024 * 1024 ||
+      !Number.isSafeInteger(row.omittedSourceCount) || (row.omittedSourceCount as number) < 0 ||
+      typeof row.requestBody !== 'string' || new TextEncoder().encode(row.requestBody).byteLength !== row.requestBytes ||
+      new TextEncoder().encode(row.requestBody).byteLength > 1024 * 1024 || !record(row.sourceVersions)) return false;
+  try {
+    const request = JSON.parse(row.requestBody) as Record<string, unknown>;
+    const responseFormat = record(request.response_format);
+    const schema = record(responseFormat?.json_schema);
+    if (!isOpenRouterBatchRequestProfile(request, row.requestProfileVersion, 'note_assistance') || schema?.name !== 'mail_reply_body') return false;
+  } catch { return false; }
+  const versions = record(row.sourceVersions)!;
+  if (Object.entries(versions).some(([key, version]) => !key || key.length > 512 || typeof version !== 'string' || version.length > 320)) return false;
+  const resultPair = row.resultText !== undefined || row.resultSha256 !== undefined;
+  if (resultPair && (typeof row.resultText !== 'string' || !validReplyText(row.resultText) || typeof row.resultSha256 !== 'string' || row.resultSha256.length !== 64 || !SHA256.test(row.resultSha256))) return false;
+  if ((row.status === 'completed') !== resultPair) return false;
+  if (['queued', 'processing', 'completed', 'expired', 'cancelled', 'result_stale', 'result_invalid', 'result_not_retained'].includes(String(row.status)) && !row.batchId) return false;
   if (row.status === 'failed' && !row.batchId && !(row.failureCode === 'not_submitted' && row.unknownCharge === false)) return false;
   return true;
 }
@@ -348,13 +403,35 @@ export function assistantBatchJobDTO(job: OpenRouterBatchJob, cleanupPending = f
     ...(job.accounting?.completionTokens !== undefined ? { completionTokens: job.accounting.completionTokens } : {}),
     ...(job.accounting?.totalTokens !== undefined ? { totalTokens: job.accounting.totalTokens } : {}),
     ...(job.failureCode ? { failureCode: job.failureCode } : {}),
+    ...(job.kind === 'mail_reply' && job.mailReplyBinding ? { mailMessageId: job.mailReplyBinding.messageId } : {}),
+    ...(job.kind === 'mail_reply' && job.resultText !== undefined ? { hasMailReplyResult: true, canReviewMailReply: !job.proposalId && job.status === 'completed' } : {}),
+    ...(job.kind === 'mail_reply' && job.proposalId ? { proposalId: job.proposalId } : {}),
   });
 }
 
 export function isOpenRouterBatchContentJob(job: OpenRouterBatchJob): job is OpenRouterBatchContentJob {
-  return job.sourceRemoved !== true && job.status !== 'source_removed' && typeof job.requestBody === 'string' &&
+  return job.kind === 'note_assistance' && job.sourceRemoved !== true && job.status !== 'source_removed' && typeof job.requestBody === 'string' &&
     typeof job.requestBytes === 'number' && typeof job.settingsFingerprint === 'string' &&
     typeof job.sourceFingerprint === 'string' && (job.requestProfileVersion === 1 || job.requestProfileVersion === 2) && !!job.sourceVersions;
+}
+
+export type OpenRouterMailReplyContentJob = OpenRouterBatchJob & {
+  readonly kind: 'mail_reply';
+  readonly sourceRemoved?: undefined;
+  readonly status: Exclude<AssistantBatchStatus, 'source_removed'>;
+  readonly settingsFingerprint: string;
+  readonly sourceFingerprint: string;
+  readonly requestProfileVersion: OpenRouterBatchRequestProfileVersion;
+  readonly requestBytes: number;
+  readonly omittedSourceCount: number;
+  readonly requestBody: string;
+  readonly sourceVersions: Readonly<Record<string, string>>;
+  readonly mailReplyBinding: OpenRouterMailReplyBinding;
+};
+
+export function isOpenRouterMailReplyContentJob(job: OpenRouterBatchJob): job is OpenRouterMailReplyContentJob {
+  return job.kind === 'mail_reply' && job.sourceRemoved !== true && job.status !== 'source_removed' &&
+    typeof job.requestBody === 'string' && typeof job.requestBytes === 'number' && Boolean(job.mailReplyBinding);
 }
 
 export function tombstoneOpenRouterBatchJob(job: OpenRouterBatchJob, updatedAt: string, stripChatBinding = false): OpenRouterBatchTombstone {
@@ -373,6 +450,7 @@ export function tombstoneOpenRouterBatchJob(job: OpenRouterBatchJob, updatedAt: 
     ...(job.batchId ? { batchId: job.batchId } : {}),
     unknownCharge: job.unknownCharge,
     ...(job.accounting ? { accounting: job.accounting } : {}),
+    ...(job.kind === 'mail_reply' && job.proposalId ? { proposalId: job.proposalId } : {}),
   });
 }
 

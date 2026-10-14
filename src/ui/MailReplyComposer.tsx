@@ -12,6 +12,8 @@ import type {
   AppController,
   ContextDocument,
   MailReplySourceSnapshot,
+  MailReplyBatchReviewPlan,
+  MailReplyTextGenerationInput,
   MailReplyTextGenerationResult,
   Note,
   Proposal,
@@ -19,6 +21,8 @@ import type {
 } from "../core";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Button, Field, IconButton } from "./primitives";
+import { MailReplyBatchSection } from "./MailReplyBatchSection";
+import type { AssistantBatchJobDTO } from "../services/openRouterBatchJobs";
 import { C, s } from "./theme";
 
 type ReplyMode = "reply" | "reply_all";
@@ -34,7 +38,18 @@ export function MailReplyComposer({
   notes,
   documents,
   onClose,
+  onOpenSettings,
   onSave,
+  batchJobs = [],
+  batchEnabled = false,
+  batchBlocked = false,
+  ownerGeneration = 0,
+  onSubmitBatch,
+  onCheckBatch,
+  onReviewBatch,
+  onActivateBatch,
+  onCancelBatchReview,
+  onDeleteBatch,
 }: {
   visible: boolean;
   messageId: string | null;
@@ -44,6 +59,7 @@ export function MailReplyComposer({
   notes: Note[];
   documents: ContextDocument[];
   onClose: () => void;
+  onOpenSettings?: () => void;
   onSave: (input: {
     messageId: string;
     mode: ReplyMode;
@@ -52,6 +68,16 @@ export function MailReplyComposer({
     to?: string[];
     cc?: string[];
   }) => Promise<Proposal | undefined>;
+  batchJobs?: readonly AssistantBatchJobDTO[];
+  batchEnabled?: boolean;
+  batchBlocked?: boolean;
+  ownerGeneration?: number;
+  onSubmitBatch?: (input: Omit<MailReplyTextGenerationInput, "forceRefresh">, owner: { messageId: string; generation: number }, isComposerCurrent: () => boolean) => Promise<AssistantBatchJobDTO | undefined>;
+  onCheckBatch?: (jobId: string, owner: { messageId: string; generation: number }) => Promise<unknown>;
+  onReviewBatch?: (jobId: string, owner: { messageId: string; generation: number }, isComposerCurrent: () => boolean) => Promise<MailReplyBatchReviewPlan | undefined>;
+  onActivateBatch?: (planId: string, jobId: string, owner: { messageId: string; generation: number }, isComposerCurrent: () => boolean) => Promise<unknown>;
+  onCancelBatchReview?: (planId: string, owner: { messageId: string; generation: number }) => void;
+  onDeleteBatch?: (jobId: string, owner: { messageId: string; generation: number }) => Promise<unknown>;
 }) {
   const [source, setSource] = useState<MailReplySourceSnapshot | null>(null);
   const [mode, setMode] = useState<ReplyMode>("reply");
@@ -62,6 +88,8 @@ export function MailReplyComposer({
   const [checking, setChecking] = useState(false);
   const [loadingText, setLoadingText] = useState(false);
   const [generating, setGenerating] = useState(false);
+  const [batchSubmittingOwner, setBatchSubmittingOwner] = useState<{ messageId: string; generation: number; sequence: number } | null>(null);
+  const [composerRevisionValue, setComposerRevisionValue] = useState(0);
   const [bodySnapshot, setBodySnapshot] =
     useState<SelectedMailTextSnapshot | null>(null);
   const [showFullBody, setShowFullBody] = useState(false);
@@ -75,17 +103,27 @@ export function MailReplyComposer({
   const requestSequence = useRef(0);
   const bodyLoadSequence = useRef(0);
   const generationSequence = useRef(0);
+  const batchSubmissionLock = useRef(false);
+  const batchSubmissionSequence = useRef(0);
+  const batchReviewInvalidator = useRef<() => void>(() => undefined);
   const composerRevision = useRef(0);
   const sourceRef = useRef<MailReplySourceSnapshot | null>(null);
   const modeRef = useRef<ReplyMode>("reply");
   const visibleRef = useRef(visible);
   const activeMessageId = useRef(messageId);
+  const batchSubmitting = Boolean(visible && batchSubmittingOwner?.messageId === messageId && batchSubmittingOwner.generation === ownerGeneration);
 
   const invalidatePendingGeneration = useCallback(() => {
     composerRevision.current += 1;
+    setComposerRevisionValue((current) => current + 1);
     generationSequence.current += 1;
     setGenerationNotice("");
     setGeneratedAt("");
+    batchReviewInvalidator.current();
+  }, []);
+  const registerBatchReviewInvalidator = useCallback((invalidate: () => void) => {
+    batchReviewInvalidator.current = invalidate;
+    return () => { if (batchReviewInvalidator.current === invalidate) batchReviewInvalidator.current = () => undefined; };
   }, []);
 
   const applySource = useCallback(
@@ -123,6 +161,7 @@ export function MailReplyComposer({
         }
         const previousSourceDigest = sourceRef.current?.sourceDigest;
         const previousMode = modeRef.current;
+        if (!initial && previousSourceDigest && previousSourceDigest !== result.source.sourceDigest) invalidatePendingGeneration();
         sourceRef.current = result.source;
         setSource(result.source);
         const defaults = result.defaults?.[nextMode];
@@ -176,6 +215,8 @@ export function MailReplyComposer({
   useEffect(() => {
     visibleRef.current = visible;
     activeMessageId.current = messageId;
+    batchSubmissionSequence.current += 1;
+    batchSubmissionLock.current = false;
     if (visible && messageId) {
       const timer = setTimeout(() => void applySource("reply", true), 0);
       return () => {
@@ -183,12 +224,14 @@ export function MailReplyComposer({
         requestSequence.current += 1;
         bodyLoadSequence.current += 1;
         generationSequence.current += 1;
+        batchSubmissionSequence.current += 1;
         setLoadingText(false);
       };
     }
     requestSequence.current += 1;
     bodyLoadSequence.current += 1;
     generationSequence.current += 1;
+    batchSubmissionSequence.current += 1;
   }, [applySource, messageId, visible]);
 
   const changeMode = (nextMode: ReplyMode) => {
@@ -311,6 +354,8 @@ export function MailReplyComposer({
       }
       setText(result.text);
       composerRevision.current += 1;
+      setComposerRevisionValue((current) => current + 1);
+      batchReviewInvalidator.current();
       generationSequence.current += 1;
       setGeneratedAt(result.generatedAt ?? "");
       setGenerationNotice(
@@ -331,6 +376,59 @@ export function MailReplyComposer({
     }
   };
 
+  const submitBatch = async () => {
+    if (!source || !bodySnapshot || !messageId || !onSubmitBatch || batchSubmissionLock.current || busy || batchBlocked) return;
+    if (bodySnapshot.completeness === "excerpt" && !useSavedExcerpt) {
+      setError("Choose “Use saved excerpt” before submitting from this text.");
+      return;
+    }
+    if (!bodySnapshot.textDigest || !bodySnapshot.text) {
+      setError("There is no checked message text to use. You can still write a reply manually.");
+      return;
+    }
+    if (selectedNoteTimeZoneUnconfirmed) {
+      setError("Confirm the imported note’s capture time zone before using it as reply context.");
+      return;
+    }
+    if (!parsedTo.length || combinedBriefBytes > BRIEF_LIMIT) {
+      setError(!parsedTo.length ? "Add at least one recipient before submitting." : "The reply brief and selected note together must stay under 4 KB.");
+      return;
+    }
+    const revision = composerRevision.current;
+    const sequence = ++batchSubmissionSequence.current;
+    const owner = { messageId, generation: ownerGeneration };
+    const isComposerCurrent = () => sequence === batchSubmissionSequence.current && revision === composerRevision.current &&
+      visibleRef.current && activeMessageId.current === messageId && owner.generation === ownerGeneration;
+    batchSubmissionLock.current = true;
+    setBatchSubmittingOwner({ messageId, generation: ownerGeneration, sequence });
+    setError("");
+    setGenerationNotice("");
+    try {
+      const result = await onSubmitBatch({
+        messageId,
+        sourceDigest: source.sourceDigest,
+        textDigest: bodySnapshot.textDigest,
+        mode,
+        to: parsedTo,
+        cc: parsedCc,
+        brief: brief.trim(),
+        composerRevision: revision,
+        ...(selectedNote ? { noteId: selectedNote.id, noteRevision: selectedNote.revision } : {}),
+      }, owner, isComposerCurrent);
+      if (!isComposerCurrent()) return;
+      setGenerationNotice(result
+        ? "Request submitted. Replies may be delayed; check its saved status when you choose. Actual provider cost appears only when reported."
+        : "The request was not confirmed. Check saved request status before taking another action.");
+    } catch (cause) {
+      if (isComposerCurrent()) {
+        setGenerationNotice(messageOf(cause, "The request status is uncertain. Check saved status before taking another action."));
+      }
+    } finally {
+      if (sequence === batchSubmissionSequence.current && owner.generation === ownerGeneration && owner.messageId === activeMessageId.current) setBatchSubmittingOwner(null);
+      if (sequence === batchSubmissionSequence.current) batchSubmissionLock.current = false;
+    }
+  };
+
   const sourceAt = source?.observedAt
     ? new Date(source.observedAt).toLocaleString()
     : "Unavailable";
@@ -342,6 +440,7 @@ export function MailReplyComposer({
     controller.getSnapshot().settings.mode === "provider" &&
     Boolean(controller.getSnapshot().settings.openAiEndpoint) &&
     Boolean(controller.getSnapshot().settings.openAiDeployment);
+  const openRouterSelected = controller.getSnapshot().settings.mode === "provider" && controller.getSnapshot().settings.llmProvider === "openrouter";
   const selectedTextUsable = Boolean(
     bodySnapshot?.text &&
       bodySnapshot.textDigest &&
@@ -351,13 +450,14 @@ export function MailReplyComposer({
   const selectedNoteTimeZoneUnconfirmed = Boolean(
     selectedNote?.importOrigin?.originalTimeZoneUnknown,
   );
+  const closeComposer = () => { batchReviewInvalidator.current(); onClose(); };
 
   return (
-    <Modal visible={visible} animationType="slide" onRequestClose={onClose} presentationStyle="fullScreen">
+    <Modal visible={visible} animationType="slide" onRequestClose={closeComposer} presentationStyle="fullScreen">
       <KeyboardAvoidingView style={styles.safe} behavior={Platform.OS === "ios" ? "padding" : undefined}>
         <SafeAreaView style={styles.safeArea}>
           <View style={styles.top}>
-            <IconButton name="chevron-back" label="Close reply composer" onPress={onClose} />
+            <IconButton name="chevron-back" label="Close reply composer" onPress={closeComposer} />
             <Text style={styles.topTitle}>Reply draft</Text>
             <View style={styles.topSpacer} />
           </View>
@@ -412,8 +512,41 @@ export function MailReplyComposer({
 
             {demoMode ? <Text style={styles.demoBadge}>SAMPLE AI REPLY · NO API USED</Text> : null}
             {selectedNoteTimeZoneUnconfirmed ? <Text style={styles.warning}>Confirm the imported note’s capture time zone before using it as reply context.</Text> : null}
-            <Button label={generating ? "Generating reply…" : "Generate reply"} disabled={busy || checking || loadingText || generating || selectedNoteTimeZoneUnconfirmed || !selectedTextUsable || !source || !parsedTo.length || combinedBriefBytes > BRIEF_LIMIT || (!demoMode && !aiReady)} onPress={() => void generate()} />
-            {!demoMode && !aiReady ? <Text style={styles.disclaimer}>Set provider mode, an Azure OpenAI endpoint, and a deployment in Settings to enable generation.</Text> : null}
+            {openRouterSelected && !demoMode ? (
+              <>
+                <Text style={styles.disclaimer}>Submitting creates a paid OpenRouter Batch request. Replies may be delayed. Nothing checks or resubmits it in the background; actual cost appears only when the provider reports it.</Text>
+                <Button label={batchSubmitting ? "Submitting reply request…" : "Submit reply request"} disabled={busy || batchBlocked || !batchEnabled || checking || loadingText || batchSubmitting || !selectedTextUsable || !source || !parsedTo.length || combinedBriefBytes > BRIEF_LIMIT || !onSubmitBatch} onPress={() => void submitBatch()} />
+                {!batchEnabled ? (
+                  <>
+                    <Text style={styles.disclaimer}>Save an OpenRouter API key in Settings to submit or check Batch requests. Existing history and completed replies remain available.</Text>
+                    {onOpenSettings ? <Button label="Open Settings" tone="quiet" disabled={busy || batchBlocked} onPress={onOpenSettings} /> : null}
+                  </>
+                ) : null}
+                {onSubmitBatch && onCheckBatch && onReviewBatch && onActivateBatch && onCancelBatchReview && onDeleteBatch && messageId ? (
+                  <MailReplyBatchSection
+                    jobs={batchJobs}
+                    messageId={messageId}
+                    ownerGeneration={ownerGeneration}
+                    composerRevision={composerRevisionValue}
+                    blocked={batchBlocked}
+                    busy={busy}
+                    submitting={batchSubmitting}
+                    checkReady={batchEnabled}
+                    onCheck={onCheckBatch}
+                    onReview={onReviewBatch}
+                    onActivate={onActivateBatch}
+                    onCancel={onCancelBatchReview}
+                    onDelete={onDeleteBatch}
+                    registerReviewInvalidator={registerBatchReviewInvalidator}
+                  />
+                ) : null}
+              </>
+            ) : (
+              <>
+                <Button label={generating ? "Generating reply…" : "Generate reply"} disabled={busy || checking || loadingText || generating || selectedNoteTimeZoneUnconfirmed || !selectedTextUsable || !source || !parsedTo.length || combinedBriefBytes > BRIEF_LIMIT || (!demoMode && !aiReady)} onPress={() => void generate()} />
+                {!demoMode && !aiReady && !openRouterSelected ? <Text style={styles.disclaimer}>Set provider mode, an Azure OpenAI endpoint, and a deployment in Settings to enable generation.</Text> : null}
+              </>
+            )}
             {!selectedTextUsable && !demoMode ? <Text style={styles.disclaimer}>Load checked message text and select any excerpt explicitly before generating.</Text> : null}
             {generatedAt ? <Text style={styles.contextMeta}>Generated · {new Date(generatedAt).toLocaleString()}</Text> : null}
             {generationNotice ? <Text style={styles.disclaimer}>{generationNotice}</Text> : null}
@@ -431,7 +564,7 @@ export function MailReplyComposer({
                 else setError("Another action is in progress. Try saving this reply again.");
               } catch (cause) { setError(messageOf(cause, "Could not save this reply for review.")); }
             }} />
-            <Button label="Cancel" tone="quiet" disabled={busy || generating} onPress={onClose} />
+            <Button label="Cancel" tone="quiet" disabled={busy || generating} onPress={closeComposer} />
           </ScrollView>
         </SafeAreaView>
       </KeyboardAvoidingView>

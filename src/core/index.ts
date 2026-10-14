@@ -156,6 +156,8 @@ export interface MailReplyProvenance {
   sourceDigest: string;
   source: MailReplySourceSnapshot;
   expiresAt: string;
+  /** Present only when this immutable reply text came from a retained Batch result. */
+  batchJobId?: string;
 }
 
 /** Backward-compatible name for note-derived provenance; new proposals use the explicit union. */
@@ -629,6 +631,18 @@ export interface MailReplyTextGenerationResult {
   };
 }
 
+export interface MailReplyBatchReviewPlan {
+  readonly planId: string;
+  readonly jobId: string;
+  readonly messageId: string;
+  readonly mode: 'reply' | 'reply_all';
+  readonly subject: string;
+  readonly to: readonly string[];
+  readonly cc: readonly string[];
+  readonly text: string;
+  readonly expiresAt: string;
+}
+
 export interface AppState {
   notes: Note[];
   proposals: Proposal[];
@@ -865,6 +879,11 @@ export interface AppController {
   submitChatFromTranscript(input: { planId: string; conversationId: string }): Promise<{ kind: 'accepted'; conversationId: string; turnId: string; jobId: string }>;
   deleteChatConversation(id: string): Promise<void>;
   refreshAssistantBatch(jobId: string): Promise<import('../services/openRouterBatchJobs').AssistantBatchJobDTO>;
+  submitMailReplyBatch(input: Omit<MailReplyTextGenerationInput, 'forceRefresh'>): Promise<import('../services/openRouterBatchJobs').AssistantBatchJobDTO>;
+  reviewMailReplyBatch(jobId: string): Promise<MailReplyBatchReviewPlan>;
+  activateMailReplyBatch(input: { planId: string }): Promise<{ kind: 'created'; jobId: string; proposalId: string }>;
+  cancelMailReplyBatchReview(planId: string): Promise<void>;
+  deleteMailReplyBatch(jobId: string): Promise<void>;
   retryAssistantBatchCleanup(jobId: string): Promise<import('../services/openRouterBatchJobs').AssistantBatchJobDTO>;
   refreshAnalysisStatus(noteId: string): Promise<NoteAssistResult | undefined>;
   checkProposalFreshness(id: string): Promise<{ current: boolean; reason?: string }>;

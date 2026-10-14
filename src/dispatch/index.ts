@@ -14,6 +14,7 @@ export type {
 const HASH = /^[a-f0-9]{64}$/i;
 const VERSION = /^(0|[1-9]\d*):[a-f0-9]{64}$/i;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const BATCH_JOB_UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 function fail(message: string): never { throw new Error(message); }
 function onlyKeys(value: unknown, allowed: readonly string[], label: string): void {
@@ -26,6 +27,14 @@ function cleanString(value: unknown, label: string, max: number, allowEmpty = fa
 function contentString(value: unknown, label: string, max: number, allowEmpty = false): string {
   if (typeof value !== 'string' || value.length > max || (!allowEmpty && !value.trim()) || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value)) fail(`${label} is invalid.`);
   return value;
+}
+function canonicalJson(value: unknown): string {
+  if (value === undefined) return 'null';
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).filter((key) => record[key] !== undefined).sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(',')}}`;
 }
 function email(value: unknown, label: string): string {
   const result = cleanString(value, label, 320);
@@ -103,7 +112,10 @@ function knowledgeSelection(value: unknown): NonNullable<NoteProposalProvenance[
 function snapshotProvenance(value: AnyProposalProvenance | undefined): AnyProposalProvenance {
   if (!value) return fail('Dispatch source provenance is missing or unsupported.');
   if (value.version === 2 && value.kind === 'mail_reply') {
-    onlyKeys(value, ['version', 'kind', 'sourceDigest', 'source', 'expiresAt'], 'Mail reply provenance');
+    onlyKeys(value, ['version', 'kind', 'sourceDigest', 'source', 'expiresAt', 'batchJobId'], 'Mail reply provenance');
+    if (value.batchJobId !== undefined && (typeof value.batchJobId !== 'string' || value.batchJobId.length !== 36 || !BATCH_JOB_UUID_V4.test(value.batchJobId))) {
+      fail('Mail reply Batch job reference is invalid.');
+    }
     const source = value.source;
     onlyKeys(source, ['version', 'accountId', 'accountEmail', 'verifiedSelfEmail', 'identity', 'connectionGeneration', 'localMessageId', 'providerMessageId', 'idFormat', 'providerVersion', 'threadId', 'internetMessageId', 'references', 'inReplyTo', 'subject', 'from', 'senderEmail', 'replyTo', 'to', 'cc', 'snippet', 'replyMetadataComplete', 'observedAt', 'sourceDigest'], 'Mail reply source');
     onlyKeys(source.identity, ['providerNamespace', 'clientId', 'subject', 'issuer', 'tenantId', 'resourceUserId'], 'Mail reply account identity');
@@ -235,7 +247,10 @@ export function createDispatchRecord(input: CreateDispatchRecordInput): Dispatch
   const title = cleanString(proposal.title, 'Approved title', 1000);
   const body = contentString(proposal.body, 'Approved body', 100_000, true);
   const common = { version: 1 as const, id, proposalId, approvedRevision: proposal.revision, ...(proposal.sourceRevision !== undefined ? { sourceRevision: proposal.sourceRevision } : {}), payloadDigest: payloadDigest.toLowerCase(), sourceActionKey,
-    duplicateKey: '', sourceProvenance, accountId: account.id, account: accountSnapshot, title, body, dispatchStartedAt,
+    duplicateKey: '', sourceProvenance,
+    ...(sourceProvenance.version === 2 && sourceProvenance.batchJobId ? { mailReplyBatchBinding: {
+      jobId: sourceProvenance.batchJobId, provenanceCanonical: canonicalJson(sourceProvenance),
+    } } : {}), accountId: account.id, account: accountSnapshot, title, body, dispatchStartedAt,
     outcome: 'pending' as const, reconciliations: [] as DispatchReconciliationAttestation[] };
   if (proposal.kind === 'email' && proposal.email?.operation && (proposal.email.operation === 'draft' || proposal.email.operation === 'send')) {
     if (calendar) fail('Email dispatch must not contain a calendar destination.');
@@ -304,7 +319,7 @@ export function appendDispatchReconciliation(record: DispatchRecord, attestation
 export function validateDispatchRecord(value: unknown): DispatchRecord {
   if (!value || typeof value !== 'object') fail('Dispatch record is invalid.');
   const record = value as DispatchRecord;
-  onlyKeys(record, ['version', 'id', 'proposalId', 'approvedRevision', 'sourceRevision', 'payloadDigest', 'sourceActionKey', 'duplicateKey', 'sourceProvenance', 'operation', 'accountId', 'account', 'calendar', 'title', 'body', 'payload', 'dispatchStartedAt', 'providerIdempotencyKey', 'outcome', 'outcomeAt', 'rejectionCode', 'replyDraftCheck', 'remoteId', 'reconciliations'], 'Dispatch record');
+  onlyKeys(record, ['version', 'id', 'proposalId', 'approvedRevision', 'sourceRevision', 'payloadDigest', 'sourceActionKey', 'duplicateKey', 'sourceProvenance', 'mailReplyBatchBinding', 'operation', 'accountId', 'account', 'calendar', 'title', 'body', 'payload', 'dispatchStartedAt', 'providerIdempotencyKey', 'outcome', 'outcomeAt', 'rejectionCode', 'replyDraftCheck', 'remoteId', 'reconciliations'], 'Dispatch record');
   if (record.version !== 1 || !HASH.test(record.payloadDigest) || !['draft', 'send', 'event'].includes(record.operation) || !['pending', 'accepted', 'unknown', 'rejected'].includes(record.outcome)) fail('Dispatch record version, digest, operation, or outcome is invalid.');
   onlyKeys(record.account, ['provider', 'identity', 'displayName', 'email'], 'Dispatch account snapshot');
   onlyKeys(record.account.identity, ['providerNamespace', 'clientId', 'subject', 'issuer', 'tenantId', 'resourceUserId'], 'Dispatch identity');
@@ -326,6 +341,13 @@ export function validateDispatchRecord(value: unknown): DispatchRecord {
   if (record.outcome === 'pending' && (record.outcomeAt || record.remoteId || record.rejectionCode)) fail('Pending dispatch cannot contain a provider outcome.');
 
   const provenance = snapshotProvenance(record.sourceProvenance);
+  const requiresBatchBinding = provenance.version === 2 && Boolean(provenance.batchJobId);
+  if (requiresBatchBinding) {
+    const proof = record.mailReplyBatchBinding;
+    if (!proof || typeof proof !== 'object' || Array.isArray(proof) || Object.keys(proof).some((key) => !['jobId', 'provenanceCanonical'].includes(key)) ||
+        proof.jobId !== provenance.batchJobId || typeof proof.provenanceCanonical !== 'string' ||
+        proof.provenanceCanonical !== canonicalJson(provenance)) fail('Dispatch Batch mail provenance consistency proof is invalid.');
+  } else if (record.mailReplyBatchBinding !== undefined) fail('Dispatch Batch mail provenance proof is unsupported for this receipt.');
   const proposal: Proposal = {
     id: record.proposalId, ...(provenance.version === 1 ? { noteId: provenance.noteId } : {}), kind: record.operation === 'event' ? 'event' : 'email',
     title: record.title, body: record.body, status: 'dispatching', revision: record.approvedRevision,
