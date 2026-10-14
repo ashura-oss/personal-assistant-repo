@@ -692,6 +692,7 @@ export interface MailReplyBatchReviewPlan {
   readonly jobId: string;
   readonly messageId: string;
   readonly mode: 'reply' | 'reply_all';
+  readonly operation?: 'draft' | 'send';
   readonly subject: string;
   readonly to: readonly string[];
   readonly cc: readonly string[];
@@ -937,7 +938,7 @@ export interface AppController {
   deleteChatConversation(id: string): Promise<void>;
   refreshAssistantBatch(jobId: string): Promise<import('../services/openRouterBatchJobs').AssistantBatchJobDTO>;
   submitMailReplyBatch(input: Omit<MailReplyTextGenerationInput, 'forceRefresh'>): Promise<import('../services/openRouterBatchJobs').AssistantBatchJobDTO>;
-  reviewMailReplyBatch(jobId: string): Promise<MailReplyBatchReviewPlan>;
+  reviewMailReplyBatch(jobId: string, options?: { operation?: 'draft' | 'send' }): Promise<MailReplyBatchReviewPlan>;
   activateMailReplyBatch(input: { planId: string }): Promise<{ kind: 'created'; jobId: string; proposalId: string }>;
   cancelMailReplyBatchReview(planId: string): Promise<void>;
   deleteMailReplyBatch(jobId: string): Promise<void>;

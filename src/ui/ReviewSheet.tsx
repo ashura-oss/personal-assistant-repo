@@ -222,16 +222,18 @@ function ReviewSheetContent({
       const refreshed = await onRefreshMailReplySources(jobId, proposalId, proposalRevision, isCurrent);
       if (isCurrent() && refreshed?.jobId === jobId && refreshed.status === 'current') {
         setRefreshedMailSources(refreshed.sources);
-        setMailSourcesNotice('The fixed target and selected messages were checked again. Review the saved draft before approving it.');
+        setMailSourcesNotice('The fixed target and selected messages were checked again. Review the saved proposal before approving it.');
       }
     } catch {
-      if (isCurrent()) setMailSourcesNotice('Selected sources could not be refreshed. This draft remains read-only until its source can be checked.');
+      if (isCurrent()) setMailSourcesNotice('Selected sources could not be refreshed. This proposal remains read-only until its source can be checked.');
     } finally {
       if (isCurrent()) setRefreshingMailSources(false);
       mailSourcesActionLock.current = false;
     }
   };
-  const effectiveEmailOperation = mailReply ? "draft" : emailOperation;
+  const effectiveEmailOperation = immutableBatchReply
+    ? proposal.email?.operation === "send" ? "send" : "draft"
+    : mailReply ? "draft" : emailOperation;
   const parsedDate =
     dueDate && dueTime ? new Date(`${dueDate}T${dueTime}`) : null;
   const dateValue =
@@ -241,7 +243,7 @@ function ReviewSheetContent({
   const localDue = localDateTime(proposal.dueAt);
   const scheduleInputInvalid = Boolean(dueDate) !== Boolean(dueTime);
   const emailPayload = {
-    operation: mailReply ? ("draft" as const) : emailOperation,
+    operation: effectiveEmailOperation,
     to: parseCsv(emailTo),
     cc: parseCsv(emailCc),
     bcc: parseCsv(emailBcc),
@@ -319,7 +321,7 @@ function ReviewSheetContent({
           ? mailReply
             ? "Create approved reply draft"
             : "Create approved draft"
-          : "Send approved email"
+          : mailReply ? "Send approved reply" : "Send approved email"
       : proposal.kind === "reminder"
         ? "Schedule reminder"
         : proposal.kind === "event"
@@ -360,7 +362,7 @@ function ReviewSheetContent({
     (!previewMode || (proposal.kind === "event" && eventDestination?.kind === "device_calendar")) &&
     (proposal.kind === "email"
       ? mailReply
-        ? !replyAccount?.capabilities?.includes("mail.draft")
+        ? !replyAccount?.capabilities?.includes(effectiveEmailOperation === "draft" ? "mail.draft" : "mail.send")
         : !chosenAccount?.connected ||
           !chosenAccount.capabilities?.includes(
             effectiveEmailOperation === "draft" ? "mail.draft" : "mail.send",
@@ -650,7 +652,7 @@ function ReviewSheetContent({
             ))}
           </View> : (
             <Text style={s.disclaimer}>
-              {proposal.email?.reply?.mode === "reply_all" ? "Reply all" : "Reply"} · Mailbox draft for separate review and approval.
+              {proposal.email?.reply?.mode === "reply_all" ? "Reply all" : "Reply"} · {effectiveEmailOperation === "draft" ? "Mailbox draft for separate review and approval." : "Send proposal for separate approval and sending."}
             </Text>
           )}
           {immutableBatchReply ? (
@@ -659,7 +661,12 @@ function ReviewSheetContent({
               {emailCc.trim() ? <Text style={s.analysisSource}>Cc · {emailCc}</Text> : null}
               <Text style={s.analysisSource}>Subject · {emailSubject}</Text>
               <Text selectable style={s.analysisText}>Message · {emailText}</Text>
-              <Text style={s.disclaimer}>This reply draft came from a completed Batch request and is immutable. To change it, write a separate manual reply in the message composer.</Text>
+              <Text style={s.disclaimer}>{effectiveEmailOperation === "send"
+                ? "This send proposal came from a completed Batch request and is immutable. Approval and sending are separate. To change it, write a separate manual reply in the message composer."
+                : "This reply draft came from a completed Batch request and is immutable. To change it, write a separate manual reply in the message composer."}</Text>
+              {effectiveEmailOperation === "send" && frozenReplySource?.identity.providerNamespace === "microsoft"
+                ? <Text style={s.disclaimer}>Outlook may display this reply outside the original conversation.</Text>
+                : null}
               {mailReply?.batchJobId && mailReplyContextCount > 0 ? <>
                 <Text style={s.analysisSource}>Selected conversation sources · {mailReplyContextCount} message{mailReplyContextCount === 1 ? '' : 's'} in addition to the fixed target</Text>
                 {mailReplySourcesStatus?.status === 'invalid' ? <Text style={s.errorText}>The saved source binding is invalid. Review a new reply request.</Text> : null}
@@ -701,6 +708,7 @@ function ReviewSheetContent({
               keyboardType="email-address"
             />
           ) : null}
+          {immutableBatchReply && emailBcc.trim() ? <Text style={s.analysisSource}>Bcc · {emailBcc}</Text> : null}
           {!immutableBatchReply && mailReply ? (
             <View style={s.fieldWrap}>
               <Text style={s.label}>Subject · {emailSubject}</Text>
@@ -1050,7 +1058,7 @@ function ReviewSheetContent({
           label={
             proposal.kind === "email"
               ? mailReply
-                ? "Approve reply draft"
+                ? immutableBatchReply && effectiveEmailOperation === "send" ? "Approve send proposal" : "Approve reply draft"
                 : effectiveEmailOperation === "draft"
                 ? "Approve email draft"
                 : "Approve email send"

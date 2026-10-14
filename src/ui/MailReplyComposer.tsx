@@ -84,8 +84,8 @@ export function MailReplyComposer({
   ownerGeneration?: number;
   onSubmitBatch?: (input: Omit<MailReplyTextGenerationInput, "forceRefresh">, owner: { messageId: string; generation: number }, isComposerCurrent: () => boolean) => Promise<AssistantBatchJobDTO | undefined>;
   onCheckBatch?: (jobId: string, owner: { messageId: string; generation: number }) => Promise<unknown>;
-  onReviewBatch?: (jobId: string, owner: { messageId: string; generation: number }, isComposerCurrent: () => boolean) => Promise<MailReplyBatchReviewPlan | undefined>;
-  onActivateBatch?: (planId: string, jobId: string, owner: { messageId: string; generation: number }, isComposerCurrent: () => boolean) => Promise<unknown>;
+  onReviewBatch?: (jobId: string, operation: 'draft' | 'send', owner: { messageId: string; generation: number }, isComposerCurrent: () => boolean) => Promise<MailReplyBatchReviewPlan | undefined>;
+  onActivateBatch?: (planId: string, jobId: string, operation: 'draft' | 'send', owner: { messageId: string; generation: number }, isComposerCurrent: () => boolean) => Promise<unknown>;
   onCancelBatchReview?: (planId: string, owner: { messageId: string; generation: number }) => void;
   onDeleteBatch?: (jobId: string, owner: { messageId: string; generation: number }) => Promise<unknown>;
   onDiscoverContext?: (input: { messageId: string; sourceDigest: string }, owner: { messageId: string; generation: number }, isComposerCurrent: () => boolean) => Promise<MailReplyConversationContextDiscovery | undefined>;

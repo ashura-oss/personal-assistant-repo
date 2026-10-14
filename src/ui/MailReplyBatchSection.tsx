@@ -4,6 +4,7 @@ import type { MailReplyBatchReviewPlan, MailReplyBatchSourcesRefreshResult } fro
 import type { AssistantBatchJobDTO } from '../services/openRouterBatchJobs';
 import { Button } from './primitives';
 import { batchCheckLabel, batchJobTokenSummary, formatReportedBatchCost } from './assistantBatchJobPresentation';
+import { mailReplyBatchPlanMatchesOperation } from './mailReplyBatchOwnership';
 import { C, s } from './theme';
 
 type Owner = { messageId: string; generation: number };
@@ -19,8 +20,8 @@ type Props = {
   submitting: boolean;
   checkReady: boolean;
   onCheck: (jobId: string, owner: Owner) => Promise<unknown>;
-  onReview: (jobId: string, owner: Owner, isComposerCurrent: () => boolean) => Promise<MailReplyBatchReviewPlan | undefined>;
-  onActivate: (planId: string, jobId: string, owner: Owner, isComposerCurrent: () => boolean) => Promise<unknown>;
+  onReview: (jobId: string, operation: 'draft' | 'send', owner: Owner, isComposerCurrent: () => boolean) => Promise<MailReplyBatchReviewPlan | undefined>;
+  onActivate: (planId: string, jobId: string, operation: 'draft' | 'send', owner: Owner, isComposerCurrent: () => boolean) => Promise<unknown>;
   onCancel: (planId: string, owner: Owner) => void;
   onDelete: (jobId: string, owner: Owner) => Promise<unknown>;
   onRefreshSources?: (jobId: string, owner: Owner, isComposerCurrent: () => boolean) => Promise<MailReplyBatchSourcesRefreshResult | undefined>;
@@ -119,8 +120,16 @@ export function MailReplyBatchSection({
     }
   };
 
-  const review = async (jobId: string) => {
+  const review = async (jobId: string, operation: 'draft' | 'send') => {
     if (actionLock.current || blocked || busy) return;
+    const previousPlan = planRef.current;
+    if (previousPlan) {
+      const previousOwner = planOwnerRef.current;
+      planRef.current = undefined;
+      planOwnerRef.current = undefined;
+      setPlan(undefined);
+      onCancel(previousPlan.planId, previousOwner ?? owner);
+    }
     const ticket = {};
     actionTicket.current = ticket;
     actionLock.current = true;
@@ -130,12 +139,12 @@ export function MailReplyBatchSection({
     const revision = revisionRef.current;
     const isComposerCurrent = () => stillOwns(owner) && revisionRef.current === revision;
     try {
-      const next = await onReview(jobId, owner, isComposerCurrent);
+      const next = await onReview(jobId, operation, owner, isComposerCurrent);
       if (!next) return;
       const expiry = Date.parse(next.expiresAt);
-      if (!isComposerCurrent() || next.jobId !== jobId || next.messageId !== owner.messageId || !Number.isFinite(expiry) || isExpired(next.expiresAt)) {
+      if (!isComposerCurrent() || next.jobId !== jobId || next.messageId !== owner.messageId || !mailReplyBatchPlanMatchesOperation(next, operation) || !Number.isFinite(expiry) || isExpired(next.expiresAt)) {
         onCancel(next.planId, owner);
-        if (stillOwns(owner)) setNotice('The source or review changed. Check the message and prepare a fresh review.');
+        if (stillOwns(owner)) setNotice('The source or requested action changed. Prepare a fresh review.');
         return;
       }
       planRef.current = next;
@@ -179,9 +188,15 @@ export function MailReplyBatchSection({
     setPlan(undefined);
     setNotice('');
     try {
-      await onActivate(captured.planId, captured.jobId, capturedOwner, isComposerCurrent);
+      const operation = captured.operation;
+      if (operation !== 'draft' && operation !== 'send') {
+        onCancel(captured.planId, capturedOwner);
+        if (stillOwns(capturedOwner)) setNotice('This review has no confirmed action. Prepare a fresh review.');
+        return;
+      }
+      await onActivate(captured.planId, captured.jobId, operation, capturedOwner, isComposerCurrent);
     } catch {
-      if (stillOwns(capturedOwner)) setNotice('Draft creation could not be confirmed. Check saved request status before taking another action.');
+      if (stillOwns(capturedOwner)) setNotice('The requested proposal could not be confirmed. Check saved request status before taking another action.');
     } finally {
       if (stillOwns(capturedOwner)) setActivating(false);
       if (actionTicket.current === ticket) { actionTicket.current = undefined; actionLock.current = false; setActionPending(false); }
@@ -249,7 +264,7 @@ export function MailReplyBatchSection({
             <Text style={styles.status}>{statusLabel(job.status)}</Text>
             <Text style={styles.meta}>Added {dateLabel(job.createdAt)} · {job.model} · {job.effort} reasoning</Text>
             {job.status === 'submission_unknown' ? <Text style={styles.warning}>The request may have been charged. Checking never submits it again.</Text> : null}
-            {job.status === 'completed' ? <Text style={styles.copy}>{job.proposalId ? 'A draft for review was created from this reply.' : job.hasMailReplyResult ? 'A completed reply is saved on this device. Review its current source before creating a draft.' : 'The completed reply is unavailable for review.'}</Text> : null}
+            {job.status === 'completed' ? <Text style={styles.copy}>{job.proposalId ? (job.mailReplyActivationOperation === 'send' ? 'A send proposal was created from this reply. Approval and sending are separate.' : 'A draft proposal was created from this reply.') : job.hasMailReplyResult ? 'A completed reply is saved on this device. Review its current source and choose a proposal type.' : 'The completed reply is unavailable for review.'}</Text> : null}
             {job.proposalId && (job.mailReplyContextCount ?? 0) > 0 ? (() => {
               const sourceStatus = getSourcesStatus?.(job.id).status;
               return sourceStatus === 'refresh_required'
@@ -263,7 +278,11 @@ export function MailReplyBatchSection({
             {cost !== undefined ? <Text style={styles.meta}>{job.billingScope === 'byok_fee_only' ? 'OpenRouter-reported BYOK fee' : 'OpenRouter-reported cost'} · {cost}</Text> : job.costStatus === 'waiting' ? <Text style={styles.meta}>Provider-reported usage is not available yet.</Text> : job.costStatus === 'unavailable' ? <Text style={styles.meta}>The provider did not report a cost for this request.</Text> : null}
             {tokens ? <Text style={styles.meta}>Provider-reported tokens · {tokens}</Text> : null}
             {job.canCheck ? <Button label={checkingId === job.id ? 'Checking request…' : batchCheckLabel(job)} tone="quiet" disabled={blocked || busy || !checkReady || actionPending} onPress={() => void check(job.id)} /> : null}
-            {job.canReviewMailReply ? <Button label={reviewingId === job.id ? 'Reviewing reply…' : 'Review completed reply'} tone="quiet" disabled={blocked || busy || actionPending} onPress={() => void review(job.id)} /> : null}
+            {job.canReviewMailReply ? <>
+              <Text style={styles.meta}>Choose what to prepare from this completed reply:</Text>
+              <Button label={reviewingId === job.id ? 'Preparing draft review…' : 'Prepare draft'} tone="quiet" disabled={blocked || busy || actionPending} onPress={() => void review(job.id, 'draft')} />
+              <Button label={reviewingId === job.id ? 'Preparing send review…' : 'Prepare send proposal'} tone="quiet" disabled={blocked || busy || actionPending} onPress={() => void review(job.id, 'send')} />
+            </> : null}
             {!job.sourceRemoved ? <Button label={deletingId === job.id ? 'Removing request content…' : 'Remove request content'} tone="quiet" disabled={blocked || busy || actionPending} onPress={() => setDeleteTarget(job.id)} /> : null}
             {deleteTarget === job.id ? (
               <View style={styles.review}>
@@ -279,7 +298,7 @@ export function MailReplyBatchSection({
       {notice ? <Text accessibilityRole="alert" style={styles.warning}>{notice}</Text> : null}
       {plan ? (
         <View style={styles.review}>
-          <Text style={s.sectionTitle}>Review completed reply</Text>
+          <Text style={s.sectionTitle}>{plan.operation === 'send' ? 'Review send proposal' : 'Review draft'}</Text>
           <Text style={styles.meta}>To · {plan.to.join(', ') || 'None'}</Text>
           {plan.cc.length ? <Text style={styles.meta}>Cc · {plan.cc.join(', ')}</Text> : null}
           <Text style={styles.meta}>Subject · {plan.subject}</Text>
@@ -293,8 +312,10 @@ export function MailReplyBatchSection({
               {item.omissionReasons.map((reason, index) => <Text key={`${item.selectionId}-${index}`} style={styles.warning}>Omitted · {reason.replaceAll('_', ' ')}</Text>)}
             </View>)}
           </View> : null}
-          <Text style={styles.copy}>This reply is read-only. Creating a draft is separate from approving or sending it.</Text>
-          <Button label={activating ? 'Creating draft…' : 'Create draft'} disabled={blocked || busy || activating} onPress={() => void activate()} />
+          <Text style={styles.copy}>{plan.operation === 'send'
+            ? 'This reply is read-only. Creating the send proposal is separate from approval and sending.'
+            : 'This reply is read-only. Creating a draft is separate from approving or sending it.'}</Text>
+          <Button label={activating ? (plan.operation === 'send' ? 'Preparing send proposal…' : 'Creating draft…') : (plan.operation === 'send' ? 'Create send proposal' : 'Create draft')} disabled={blocked || busy || activating} onPress={() => void activate()} />
           <Button label="Cancel review" tone="quiet" disabled={activating} onPress={cancelReview} />
         </View>
       ) : null}

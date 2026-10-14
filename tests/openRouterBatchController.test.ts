@@ -214,6 +214,75 @@ describe('OpenRouter Batch controller lifecycle', () => {
     await expect(restarted.refreshMailReplyBatchSources(queued.id)).resolves.toMatchObject({ status: 'current', jobId: queued.id });
   });
 
+  it('freezes an explicit Send choice into one immutable Batch activation and its permanent job link', async () => {
+    const base = conversationContextConnector();
+    const fixture = await completedContextFixture(base.connector);
+    await (fixture.app as unknown as { mutate(operation: (draft: AppState) => void): Promise<void> }).mutate((draft) => {
+      draft.accounts.find((item) => item.id === fixture.account.id)!.capabilities = ['mail.read', 'mail.send'];
+    });
+    const readsBeforeInvalidChoice = base.reads.length;
+    await expect(fixture.app.reviewMailReplyBatch(fixture.queued.id, { operation: 'send_now' as never })).rejects.toThrow(/draft or send/i);
+    await expect(fixture.app.reviewMailReplyBatch(fixture.queued.id, { operation: null as never })).rejects.toThrow(/draft or send/i);
+    await expect(fixture.app.reviewMailReplyBatch(fixture.queued.id, { operation: 'send', unexpected: true } as never)).rejects.toThrow(/draft or send/i);
+    expect(base.reads).toHaveLength(readsBeforeInvalidChoice);
+    const plan = await fixture.app.reviewMailReplyBatch(fixture.queued.id, { operation: 'send' });
+    expect(plan.operation).toBe('send');
+    const activated = await fixture.app.activateMailReplyBatch({ planId: plan.planId });
+    const proposal = fixture.app.getSnapshot().proposals.find((item) => item.id === activated.proposalId)!;
+    expect(proposal.email?.operation).toBe('send');
+    expect(fixture.app.getSnapshot().assistantBatchJobs?.find((item) => item.id === fixture.queued.id)).toMatchObject({
+      proposalId: activated.proposalId, mailReplyActivationOperation: 'send',
+    });
+    await expect(fixture.app.reviewMailReplyBatch(fixture.queued.id)).rejects.toThrow(/unclaimed|result/i);
+    await expect(fixture.app.editProposal(proposal.id, { email: { ...proposal.email!, operation: 'draft' } }))
+      .rejects.toThrow(/immutable|reviewed operation/i);
+    await fixture.app.deleteMailReplyBatch(fixture.queued.id);
+    expect(fixture.app.getSnapshot().assistantBatchJobs?.find((item) => item.id === fixture.queued.id)).toMatchObject({
+      status: 'source_removed', proposalId: activated.proposalId, mailReplyActivationOperation: 'send',
+    });
+  });
+
+  it('quarantines invalid persisted activation operations and keeps legacy missing operation as Draft', async () => {
+    const base = conversationContextConnector();
+    for (const invalid of [null, 'send_later', { operation: 'send' }] as const) {
+      const fixture = await completedContextFixture(base.connector);
+      const raw = fixture.store.value as AppState & { openRouterBatchLedger: { jobs: Record<string, unknown>[] } };
+      const job = raw.openRouterBatchLedger.jobs.find((item) => item.id === fixture.queued.id)!;
+      job.proposalId = 'c5064a38-1793-4fee-8c1e-c839ea46e2bc';
+      job.mailReplyActivationOperation = invalid;
+      await fixture.store.save(raw);
+      const malformed = new AppControllerImpl(fixture.store, {}, fixture.integration);
+      await malformed.load();
+      expect(malformed.getSnapshot().assistantBatchRecoveryStatus).toMatchObject({ blocked: true });
+      expect(malformed.getSnapshot().assistantBatchJobs).toEqual([]);
+      const inspectionsBefore = fixture.inspections.length;
+      await expect(malformed.refreshAssistantBatch(fixture.queued.id)).rejects.toThrow(/could not be validated/i);
+      expect(fixture.inspections).toHaveLength(inspectionsBefore);
+    }
+
+    const legacy = await completedContextFixture(base.connector);
+    const plan = await legacy.app.reviewMailReplyBatch(legacy.queued.id);
+    const activated = await legacy.app.activateMailReplyBatch({ planId: plan.planId });
+    const persisted = legacy.store.value as AppState & { openRouterBatchLedger: { jobs: Record<string, unknown>[] } };
+    const legacyJob = persisted.openRouterBatchLedger.jobs.find((item) => item.id === legacy.queued.id)!;
+    delete legacyJob.mailReplyActivationOperation;
+    await legacy.store.save(persisted);
+    const reopened = new AppControllerImpl(legacy.store, {}, legacy.integration);
+    await reopened.load();
+    const publicJob = reopened.getSnapshot().assistantBatchJobs?.find((item) => item.id === legacy.queued.id)!;
+    expect(publicJob).not.toHaveProperty('mailReplyActivationOperation');
+    expect(reopened.getSnapshot().proposals.find((item) => item.id === activated.proposalId)?.email?.operation).toBe('draft');
+    await reopened.refreshMailReplyBatchSources(legacy.queued.id);
+    const proposal = reopened.getSnapshot().proposals.find((item) => item.id === activated.proposalId)!;
+    await expect(reopened.approveProposal(proposal.id, { expectedRevision: proposal.revision })).resolves.toMatchObject({ status: 'approved' });
+    await reopened.deleteMailReplyBatch(legacy.queued.id);
+    const tombstone = (legacy.store.value as AppState & { openRouterBatchLedger: { jobs: Record<string, unknown>[] } })
+      .openRouterBatchLedger.jobs.find((item) => item.id === legacy.queued.id)!;
+    expect(tombstone).toMatchObject({ status: 'source_removed', proposalId: activated.proposalId });
+    expect(tombstone).not.toHaveProperty('mailReplyActivationOperation');
+    expect(reopened.getSnapshot().assistantBatchJobs?.find((item) => item.id === legacy.queued.id)).not.toHaveProperty('mailReplyActivationOperation');
+  });
+
   it('rejects selected context that becomes a draft during refresh and installs no freshness proof', async () => {
     const fakeClient = {
       submit: async (_input: unknown, before: () => Promise<void>, assert: () => void) => {
@@ -436,7 +505,7 @@ describe('OpenRouter Batch controller lifecycle', () => {
     await expect(second).resolves.toMatchObject({ status: 'current', jobId: fixture.queued.id });
   });
 
-  it('reviews and executes an aged context reply through the actual connector without changing its frozen observation window', async () => {
+  it('reviews and sends an aged context reply in one actual connector request without changing its frozen observation window', async () => {
     const base = conversationContextConnector();
     const fixture = await completedContextFixture(base.connector);
     const accountIdentity = fixture.account.identity!;
@@ -446,16 +515,16 @@ describe('OpenRouter Batch controller lifecycle', () => {
       googleClientId: accountIdentity.clientId,
       fetcher: async (input: RequestInfo | URL) => {
         const url = new URL(String(input)); writePaths.push(url.pathname);
-        return new Response(JSON.stringify({ id: 'fixture-created-draft', message: { id: 'fixture-message', threadId: fixture.message.threadId } }),
+        return new Response(JSON.stringify({ id: 'fixture-sent-message' }),
           { status: 200, headers: { 'content-type': 'application/json' } });
       },
     });
-    Object.assign(base.connector, { createDraft: (account: Parameters<ConnectorClient['createDraft']>[0], envelope: Parameters<ConnectorClient['createDraft']>[1], verifier: Parameters<ConnectorClient['createDraft']>[2]) =>
-      actualConnector.createDraft(account, envelope, verifier) });
+    Object.assign(base.connector, { sendEmail: (account: Parameters<ConnectorClient['sendEmail']>[0], envelope: Parameters<ConnectorClient['sendEmail']>[1], verifier: Parameters<ConnectorClient['sendEmail']>[2]) =>
+      actualConnector.sendEmail(account, envelope, verifier) });
     await (fixture.app as unknown as { mutate(operation: (draft: AppState) => void): Promise<void> }).mutate((draft) => {
       const account = draft.accounts.find((item) => item.id === fixture.account.id)!;
-      account.capabilities = ['mail.read', 'mail.draft'];
-      account.grantedScopes = ['openid', 'https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/gmail.compose'];
+      account.capabilities = ['mail.read', 'mail.send'];
+      account.grantedScopes = ['openid', 'https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/gmail.send'];
     });
     const stored = fixture.store.value as AppState & { openRouterBatchLedger: { jobs: { id: string; mailReplyBinding: { source: { observedAt: string } } }[] } };
     const frozenJob = stored.openRouterBatchLedger.jobs.find((item) => item.id === fixture.queued.id)!;
@@ -464,7 +533,7 @@ describe('OpenRouter Batch controller lifecycle', () => {
     vi.useFakeTimers();
     try {
       vi.setSystemTime(new Date(Date.parse(originalObservedAt) + 16 * 60_000));
-      const plan = await fixture.app.reviewMailReplyBatch(fixture.queued.id);
+      const plan = await fixture.app.reviewMailReplyBatch(fixture.queued.id, { operation: 'send' });
       const activated = await fixture.app.activateMailReplyBatch({ planId: plan.planId });
       const proposal = fixture.app.getSnapshot().proposals.find((item) => item.id === activated.proposalId)!;
       expect(proposal.provenance).toMatchObject({ version: 2, source: { observedAt: originalObservedAt }, expiresAt: originalExpiresAt });
@@ -480,9 +549,82 @@ describe('OpenRouter Batch controller lifecycle', () => {
       const reapproved = await fixture.app.approveProposal(expired.id, { expectedRevision: expired.revision });
       const executed = await fixture.app.executeProposal(reapproved.id, { expectedRevision: reapproved.revision });
       expect(reapproved.status).toBe('approved');
-      expect(executed).toMatchObject({ status: 'accepted', remoteId: 'fixture-created-draft' });
-      expect(writePaths.filter((path) => path.endsWith('/drafts'))).toHaveLength(1);
+      expect(executed).toMatchObject({ status: 'accepted', remoteId: 'fixture-sent-message' });
+      expect(writePaths.filter((path) => path.endsWith('/messages/send'))).toHaveLength(1);
+      await (fixture.app as unknown as { mutate(operation: (draft: AppState) => void): Promise<void> }).mutate((draft) => {
+        draft.mailbox.find((item) => item.id === fixture.message.id)!.observedAt = new Date().toISOString();
+      });
+      const currentSource = await fixture.app.getMailReplySource(fixture.message.id);
+      await expect(fixture.app.createMailReplyProposal({ messageId: fixture.message.id, mode: 'reply',
+        sourceDigest: currentSource.source!.sourceDigest, text: 'A second draft for the sent source.' })).rejects.toThrow(/already|duplicate/i);
+      expect(writePaths.filter((path) => path.endsWith('/messages/send'))).toHaveLength(1);
     } finally { vi.useRealTimers(); }
+  });
+
+  it('blocks a Batch Send after a precreated manual Draft for the same reply source already succeeded', async () => {
+    const writes: string[] = [];
+    const fakeClient = {
+      submit: async (_input: unknown, before: () => Promise<void>, assert: () => void) => {
+        await before(); assert();
+        return { batchId: 'batch-after-manual-draft', status: 'validating' as const, endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH,
+          model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h' as const, total: 1, completed: 0, failed: 0 };
+      },
+      inspect: async (batchId: string, customId: string) => ({ ...completedInspection(customId, JSON.stringify({ text: 'Batch send generated after the manual draft.' })), batchId }),
+    } as unknown as OpenRouterBatchClient;
+    const connector = {
+      async createDraft() { writes.push('draft'); return { status: 'accepted' as const, id: 'manual-draft-id' }; },
+      async sendEmail() { writes.push('send'); return { status: 'accepted' as const, id: 'batch-send-id' }; },
+      async readSelectedMessageText(_account: unknown, id: string) {
+        const message = { id: fixture.message.providerMessageId, idFormat: 'gmail' as const, threadId: fixture.message.threadId,
+          subject: fixture.message.subject, from: fixture.message.from, senderEmail: fixture.message.senderEmail, receivedAt: fixture.message.receivedAt,
+          sentAt: undefined, isDraft: false, replyMetadataComplete: true, internetMessageId: fixture.message.internetMessageId,
+          replyTo: fixture.message.replyTo, to: fixture.message.to, cc: fixture.message.cc };
+        const text = fixture.text;
+        return { status: 'available' as const, message: { ...message, id }, text, bytes: new TextEncoder().encode(text).length,
+          representation: 'plain' as const, completeness: 'complete_text' as const, reasons: [], checkedAt: new Date().toISOString(), extractionVersion: 'mail-text-v1' as const };
+      },
+    };
+    const fixture = await mailFixture(fakeClient, connector);
+    await (fixture.app as unknown as { mutate(operation: (draft: AppState) => void): Promise<void> }).mutate((draft) => {
+      draft.accounts.find((item) => item.id === fixture.account.id)!.capabilities = ['mail.read', 'mail.draft', 'mail.send'];
+    });
+    const manual = await fixture.app.createMailReplyProposal({ messageId: fixture.message.id, mode: 'reply',
+      sourceDigest: fixture.source.source!.sourceDigest, text: 'Manual draft approved first.' });
+    const queued = await fixture.app.submitMailReplyBatch({ messageId: fixture.message.id, sourceDigest: fixture.source.source!.sourceDigest,
+      textDigest: fixture.textDigest, mode: 'reply', to: ['sam@example.test'], cc: [], brief: 'Reply briefly.', composerRevision: 2 });
+    expect((await fixture.app.refreshAssistantBatch(queued.id)).status).toBe('completed');
+    const plan = await fixture.app.reviewMailReplyBatch(queued.id, { operation: 'send' });
+    const activated = await fixture.app.activateMailReplyBatch({ planId: plan.planId });
+    const batchProposal = fixture.app.getSnapshot().proposals.find((item) => item.id === activated.proposalId)!;
+    const manualApproved = await fixture.app.approveProposal(manual.id, { expectedRevision: manual.revision });
+    const batchApproved = await fixture.app.approveProposal(batchProposal.id, { expectedRevision: batchProposal.revision });
+    await expect(fixture.app.executeProposal(manualApproved.id, { expectedRevision: manualApproved.revision })).resolves.toMatchObject({ status: 'accepted' });
+    expect(writes).toEqual(['draft']);
+    await expect(fixture.app.executeProposal(batchApproved.id, { expectedRevision: batchApproved.revision })).rejects.toThrow(/already has a pending, accepted, or unknown/i);
+    expect(writes).toEqual(['draft']);
+  });
+
+  it('blocks a precreated manual Draft after the same-source Batch Send succeeds first', async () => {
+    const writes: string[] = [];
+    const base = conversationContextConnector();
+    const fixture = await completedContextFixture({ ...base.connector,
+      async createDraft() { writes.push('draft'); return { status: 'accepted' as const, id: 'manual-draft-id' }; },
+      async sendEmail() { writes.push('send'); return { status: 'accepted' as const, id: 'batch-send-id' }; },
+    });
+    await (fixture.app as unknown as { mutate(operation: (draft: AppState) => void): Promise<void> }).mutate((draft) => {
+      draft.accounts.find((item) => item.id === fixture.account.id)!.capabilities = ['mail.read', 'mail.draft', 'mail.send'];
+    });
+    const manual = await fixture.app.createMailReplyProposal({ messageId: fixture.message.id, mode: 'reply',
+      sourceDigest: fixture.source.source!.sourceDigest, text: 'Precreated manual draft.' });
+    const plan = await fixture.app.reviewMailReplyBatch(fixture.queued.id, { operation: 'send' });
+    const activated = await fixture.app.activateMailReplyBatch({ planId: plan.planId });
+    const batchProposal = fixture.app.getSnapshot().proposals.find((item) => item.id === activated.proposalId)!;
+    const manualApproved = await fixture.app.approveProposal(manual.id, { expectedRevision: manual.revision });
+    const batchApproved = await fixture.app.approveProposal(batchProposal.id, { expectedRevision: batchProposal.revision });
+    await expect(fixture.app.executeProposal(batchApproved.id, { expectedRevision: batchApproved.revision })).resolves.toMatchObject({ status: 'accepted' });
+    expect(writes).toEqual(['send']);
+    await expect(fixture.app.executeProposal(manualApproved.id, { expectedRevision: manualApproved.revision })).rejects.toThrow(/already has a pending, accepted, or unknown/i);
+    expect(writes).toEqual(['send']);
   });
 
   it('keeps a retired reply source fenced after proposal deletion and same-identity reconnect', async () => {

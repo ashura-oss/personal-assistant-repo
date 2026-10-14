@@ -4,6 +4,28 @@ export type MailReplyBatchOwner = Readonly<{ messageId: string; generation: numb
 export type MailReplyActionTicket = Readonly<{ id: number; owner: MailReplyBatchOwner }>;
 export type MailReplyBatchKeyStatus = Readonly<{ generation: number; mode: string; provider: string; ready: boolean }>;
 
+/** New Batch reviews must keep the user's explicit operation all the way to activation. */
+export function mailReplyBatchPlanMatchesOperation(
+  plan: Pick<MailReplyBatchReviewPlan, 'operation'>,
+  expected: 'draft' | 'send',
+): boolean {
+  return plan.operation === expected;
+}
+
+/** Missing operation is accepted only for legacy, already-activated draft history. */
+export function mailReplyBatchActivationMatchesOperation(
+  proposalOperation: 'draft' | 'send' | undefined,
+  jobOperation: 'draft' | 'send' | undefined,
+  expected: 'draft' | 'send',
+  legacyActivated: boolean,
+  linkedToSameProposal: boolean,
+): boolean {
+  if (!linkedToSameProposal) return false;
+  const proposalMatches = proposalOperation === expected || (legacyActivated && expected === 'draft' && proposalOperation === undefined);
+  const jobMatches = jobOperation === expected || (legacyActivated && expected === 'draft' && jobOperation === undefined);
+  return proposalMatches && jobMatches;
+}
+
 export type MailReplyBatchBlockState = Readonly<{
   startupReady: boolean;
   loading: boolean;

@@ -136,9 +136,9 @@ export function replyReferences(source: MailReplySourceSnapshot): string | undef
   return result || undefined;
 }
 
-export function validateReplyBinding(payload: EmailProposalPayload, provenance: MailReplyProvenance): void {
+export function validateReplyBinding(payload: EmailProposalPayload, provenance: MailReplyProvenance, expectedOperation: 'draft' | 'send' = 'draft'): void {
   const source = provenance.source;
-  if (payload.operation !== 'draft' || !payload.reply || payload.reply.mode !== 'reply' && payload.reply.mode !== 'reply_all') fail('Mail replies can only create a reply draft.');
+  if (payload.operation !== expectedOperation || !payload.reply || payload.reply.mode !== 'reply' && payload.reply.mode !== 'reply_all') fail('Mail reply operation does not match its reviewed operation.');
   if (!Array.isArray(payload.bcc) || !Array.isArray(payload.attachments) || payload.bcc.length || payload.attachments.length) fail('Reply drafts cannot add Bcc recipients or attachments.');
   if (provenance.version !== 2 || provenance.kind !== 'mail_reply' || source.sourceDigest !== provenance.sourceDigest ||
       payload.reply.sourceDigest !== source.sourceDigest || payload.reply.localMessageId !== source.localMessageId ||

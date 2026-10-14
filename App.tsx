@@ -71,7 +71,7 @@ import { ProviderCleanupNotice } from "./src/ui/ProviderCleanupNotice";
 import { OAuthConnectionIntentOwnership, oauthInstallFailureWithCleanupContext, runOwnedOAuthConnection, type OAuthConnectionIntentSnapshot } from "./src/ui/oauthConnectionIntent";
 import { MailboxSection } from "./src/ui/MailboxSection";
 import { MailReplyComposer } from "./src/ui/MailReplyComposer";
-import { MailReplyBatchOwnership, mailReplyBatchIsBlocked, mailReplyBatchReviewSourceIsBlocked, mailReplyBatchKeyIsReady, rethrowMailReplyBatchError, type MailReplyBatchBlockState, type MailReplyBatchKeyStatus, type MailReplyBatchOwner } from "./src/ui/mailReplyBatchOwnership";
+import { MailReplyBatchOwnership, mailReplyBatchActivationMatchesOperation, mailReplyBatchIsBlocked, mailReplyBatchPlanMatchesOperation, mailReplyBatchReviewSourceIsBlocked, mailReplyBatchKeyIsReady, rethrowMailReplyBatchError, type MailReplyBatchBlockState, type MailReplyBatchKeyStatus, type MailReplyBatchOwner } from "./src/ui/mailReplyBatchOwnership";
 import { ProactiveCandidatesSection } from "./src/ui/ProactiveCandidatesSection";
 import { ProactiveRulesSection } from "./src/ui/ProactiveRulesSection";
 import { ProactiveMailAlertsSection, type EnableProactiveMailAlertsInput } from "./src/ui/ProactiveMailAlertsSection";
@@ -2830,7 +2830,7 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
       rethrowMailReplyBatchError(cause, isPrivacyBootstrapError, onPrivacyInvalidated);
     } finally { busyLock.current = false; setMailReplyBatchActionBusy(false); setBusy(false); }
   }, [controller, credentials, onPrivacyInvalidated, openSettings, ownsMailReplyOwner]);
-  const reviewMailReplyBatch = useCallback(async (jobId: string, owner: MailReplyBatchOwner, isComposerCurrent: () => boolean) => {
+  const reviewMailReplyBatch = useCallback(async (jobId: string, operation: "draft" | "send", owner: MailReplyBatchOwner, isComposerCurrent: () => boolean) => {
     if (!ownsMailReplyOwner(owner) || mailReplyBatchHardBlockedRef.current || !isComposerCurrent() || busyLock.current) return undefined;
     const job = (controller.getSnapshot().assistantBatchJobs ?? []).find((item) => item.id === jobId && item.kind === "mail_reply" && item.mailMessageId === owner.messageId && item.canReviewMailReply);
     if (!job) return undefined;
@@ -2841,12 +2841,12 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
       const outcome = await mailReplyBatchOwnershipRef.current!.prepareOwnedReview({
         owner,
         isCurrent: () => !mailReplyBatchHardBlockedRef.current && isComposerCurrent(),
-        prepare: () => controller.reviewMailReplyBatch(jobId),
+        prepare: () => controller.reviewMailReplyBatch(jobId, { operation }),
         cancelLatePlan: (plan) => controller.cancelMailReplyBatchReview(plan.planId),
       });
       if (outcome.kind === "stale") return undefined;
       const plan: MailReplyBatchReviewPlan = outcome.plan;
-      if (plan.jobId !== jobId || plan.messageId !== owner.messageId || !Number.isFinite(Date.parse(plan.expiresAt)) || Date.parse(plan.expiresAt) <= Date.now()) {
+      if (plan.jobId !== jobId || plan.messageId !== owner.messageId || !mailReplyBatchPlanMatchesOperation(plan, operation) || !Number.isFinite(Date.parse(plan.expiresAt)) || Date.parse(plan.expiresAt) <= Date.now()) {
         void controller.cancelMailReplyBatchReview(plan.planId).catch(() => undefined);
         return undefined;
       }
@@ -2861,9 +2861,9 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
       rethrowMailReplyBatchError(cause, isPrivacyBootstrapError, onPrivacyInvalidated);
     } finally { busyLock.current = false; setMailReplyBatchActionBusy(false); setBusy(false); }
   }, [cancelOwnedMailReplyBatchPlan, controller, onPrivacyInvalidated, ownsMailReplyOwner]);
-  const activateMailReplyBatch = useCallback(async (planId: string, jobId: string, owner: MailReplyBatchOwner, isComposerCurrent: () => boolean) => {
+  const activateMailReplyBatch = useCallback(async (planId: string, jobId: string, operation: "draft" | "send", owner: MailReplyBatchOwner, isComposerCurrent: () => boolean) => {
     const live = mailReplyBatchOwnershipRef.current!.getPlan(planId);
-    if (!live || live.jobId !== jobId || live.messageId !== owner.messageId ||
+    if (!live || live.jobId !== jobId || live.messageId !== owner.messageId || !mailReplyBatchPlanMatchesOperation(live, operation) ||
         !ownsMailReplyOwner(owner) || mailReplyBatchHardBlockedRef.current || !isComposerCurrent() || busyLock.current) return undefined;
     const consumedPlan = mailReplyBatchOwnershipRef.current!.clearPlan(planId);
     if (!consumedPlan) return undefined;
@@ -2873,9 +2873,12 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
     try {
       const result = await controller.activateMailReplyBatch({ planId });
       if (!ownsMailReplyOwner(owner) || !isComposerCurrent() || mailReplyBatchHardBlockedRef.current) return undefined;
-      if (result.kind !== "created" || result.jobId !== jobId) throw new Error("Draft creation could not be confirmed. Check saved request status before taking another action.");
-      const proposal = controller.getSnapshot().proposals.find((item) => item.id === result.proposalId);
-      if (!proposal || proposal.provenance?.version !== 2 || proposal.provenance.kind !== "mail_reply" || proposal.provenance.batchJobId !== jobId) throw new Error("The created reply draft could not be confirmed for this request. Check saved request status before taking another action.");
+      const createdSnapshot = controller.getSnapshot();
+      const proposal = createdSnapshot.proposals.find((item) => item.id === result.proposalId);
+      const activatedJob = (createdSnapshot.assistantBatchJobs ?? []).find((item) => item.id === jobId && item.kind === "mail_reply");
+      if (result.kind !== "created" || result.jobId !== jobId || !proposal || proposal.provenance?.version !== 2 || proposal.provenance.kind !== "mail_reply" || proposal.provenance.batchJobId !== jobId || !activatedJob || activatedJob.proposalId !== proposal.id || !mailReplyBatchActivationMatchesOperation(proposal.email?.operation, activatedJob.mailReplyActivationOperation, operation, false, activatedJob.proposalId === proposal.id)) {
+        throw new Error(`${operation === "send" ? "Send proposal" : "Draft"} creation could not be confirmed for this request. Check saved request status before taking another action.`);
+      }
       setInboxFilter("pending");
       setReview(proposal);
       closeMailReply(owner);
@@ -2954,6 +2957,10 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
     const liveSnapshot = controller.getSnapshot();
     const liveProposal = liveSnapshot.proposals.find((item) => item.id === proposalId);
     const job = (liveSnapshot.assistantBatchJobs ?? []).find((item) => item.id === jobId && item.kind === 'mail_reply');
+    const operation = proposal?.email?.operation;
+    const normalizedOperation = operation === 'send' ? 'send' : 'draft';
+    const legacyDraftActivation = job?.mailReplyActivationOperation === undefined && job?.proposalId === proposalId &&
+      (operation === 'draft' || operation === undefined);
     const ownsExactLinkedReview = () => {
       const currentReview = reviewRef.current;
       const snapshot = controller.getSnapshot();
@@ -2962,15 +2969,20 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
       const currentBatchId = currentProvenance && 'kind' in currentProvenance && currentProvenance.kind === 'mail_reply' && currentProvenance.version === 2
         ? currentProvenance.batchJobId : undefined;
       const currentJob = (snapshot.assistantBatchJobs ?? []).find((item) => item.id === jobId && item.kind === 'mail_reply');
+      const currentOperation = currentProposal?.email?.operation;
+      const currentLegacyDraft = currentJob?.mailReplyActivationOperation === undefined && currentJob?.proposalId === proposalId &&
+        (currentOperation === 'draft' || currentOperation === undefined);
       return Boolean(currentReview?.id === proposalId && currentReview.revision === proposalRevision &&
         currentProposal?.revision === proposalRevision && currentBatchId === jobId && currentJob?.proposalId === proposalId &&
-        currentJob.status === 'completed' && currentJob.hasMailReplyResult);
+        currentJob.status === 'completed' && currentJob.hasMailReplyResult &&
+        mailReplyBatchActivationMatchesOperation(currentOperation, currentJob.mailReplyActivationOperation, normalizedOperation, currentLegacyDraft, currentJob.proposalId === proposalId));
     };
     const isCurrent = () => Boolean(owner && sourceOwnership.owns(owner) && ownsExactLinkedReview() &&
       !mailReplyBatchReviewSourceIsBlocked(mailReplyBatchBlockStateRef.current, true) && isReviewCurrent());
     if (!proposal || proposal.id !== proposalId || proposal.revision !== proposalRevision || !liveProposal || liveProposal.revision !== proposalRevision ||
-        proposal.kind !== 'email' || proposal.email?.operation !== 'draft' || batchId !== jobId ||
+        proposal.kind !== 'email' || (operation !== 'draft' && operation !== 'send' && !legacyDraftActivation) || batchId !== jobId ||
         !job || job.status !== 'completed' || !job.hasMailReplyResult || !job.proposalId || job.proposalId !== proposalId || (job.mailReplyContextCount ?? 0) < 1 ||
+        !mailReplyBatchActivationMatchesOperation(operation, job.mailReplyActivationOperation, normalizedOperation, legacyDraftActivation, job.proposalId === proposalId) ||
         controller.getMailReplyBatchSourcesStatus(jobId).status === 'invalid' ||
         !owner || !isCurrent() || busyLock.current) return undefined;
     const ticket = sourceOwnership.beginAction(owner);

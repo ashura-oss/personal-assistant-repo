@@ -73,6 +73,34 @@ describe('ReviewSheet Batch reply immutability', () => {
     expect([...host.querySelectorAll('button')].some((button) => button.textContent === 'Save edits')).toBe(false);
   });
 
+  it('shows a frozen Batch send proposal with mail.send capability and the Microsoft thread caveat', () => {
+    const sendProposal: Proposal = {
+      ...proposal,
+      email: { ...proposal.email!, operation: 'send' },
+      provenance: {
+        ...batchReplyProvenance,
+        source: { ...batchReplyProvenance.source, identity: { providerNamespace: 'microsoft' } as MailReplyProvenance['source']['identity'] },
+      },
+    };
+    const sendState = {
+      settings: { mode: 'provider' },
+      accounts: [{ id: 'account-1', email: 'me@example.com', connected: true, authStatus: 'connected', connectionGeneration: 1,
+        identity: { providerNamespace: 'microsoft' }, capabilities: ['mail.send'] }],
+      calendars: [], dispatchRecords: [], deviceCalendars: { enabled: false, calendars: [], selectedCalendarIds: [] },
+      deviceCalendarAccess: { status: 'unavailable' },
+    } as never;
+    act(() => root.render(React.createElement(ReviewSheet, {
+      state: sendState, proposal: sendProposal, dispatchRecords: [], busy: false,
+      onClose: vi.fn(), onEdit: vi.fn(), onApprove: vi.fn(), onExecute: vi.fn(), onDismiss: vi.fn(),
+    })));
+    expect(host.textContent).toContain('This send proposal came from a completed Batch request and is immutable.');
+    expect(host.textContent).toContain('Outlook may display this reply outside the original conversation.');
+    expect(host.textContent).toContain('Bcc · hidden@example.com');
+    expect(host.textContent).toContain('Approve send proposal');
+    expect(host.textContent).not.toContain('sent');
+    expect(host.querySelectorAll('input,textarea')).toHaveLength(0);
+  });
+
   it('keeps dispatch-recovery-retired proposals readable with their original status and no mutation actions', () => {
     const approve = vi.fn(); const execute = vi.fn(); const dismiss = vi.fn(); const edit = vi.fn();
     const retired: Proposal = { ...proposal, dispatchRecoveryRetired: true, provenance: undefined, status: 'draft' };

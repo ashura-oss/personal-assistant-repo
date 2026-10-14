@@ -34,7 +34,7 @@ const job = (id: string, mailMessageId: string, overrides: Partial<AssistantBatc
   costStatus: 'waiting', billingScope: 'openrouter_reported', ...overrides,
 });
 const plan: MailReplyBatchReviewPlan = {
-  planId: 'plan-1', jobId: 'job-a', messageId: 'message-a', mode: 'reply', subject: 'Hello',
+  planId: 'plan-1', jobId: 'job-a', messageId: 'message-a', mode: 'reply', operation: 'draft', subject: 'Hello',
   to: ['person@example.com'], cc: [], text: 'A generated answer.', expiresAt: new Date(Date.now() + 5 * 60_000).toISOString(),
 };
 const render = (props: Partial<React.ComponentProps<typeof MailReplyBatchSection>> = {}) => act(() => root.render(React.createElement(MailReplyBatchSection, {
@@ -54,14 +54,14 @@ describe('MailReplyBatchSection', () => {
     expect(onCheck).toHaveBeenCalledExactlyOnceWith('job-a', { messageId: 'message-a', generation: 1 });
   });
 
-  it('keeps a completed result read-only and passes the exact plan id to Create draft', async () => {
-    const onReview = vi.fn(async () => plan);
-    const onActivate = vi.fn(async (_planId: string, _jobId: string, _owner: { messageId: string; generation: number }, _isCurrent: () => boolean) => undefined);
+  it('prepares an explicit draft review and passes its operation with the exact plan id', async () => {
+    const onReview = vi.fn(async (_jobId: string, operation: 'draft' | 'send') => ({ ...plan, operation }));
+    const onActivate = vi.fn(async (_planId: string, _jobId: string, _operation: 'draft' | 'send', _owner: { messageId: string; generation: number }, _isCurrent: () => boolean) => undefined);
     render({
       jobs: [job('job-a', 'message-a', { status: 'completed', canCheck: false, hasMailReplyResult: true, canReviewMailReply: true })],
       onReview, onActivate,
     });
-    const review = [...host.querySelectorAll('button')].find((item) => item.textContent === 'Review completed reply')!;
+    const review = [...host.querySelectorAll('button')].find((item) => item.textContent === 'Prepare draft')!;
     await act(async () => { review.click(); await Promise.resolve(); });
     expect(host.textContent).toContain('A generated answer.');
     expect(host.textContent).toContain('person@example.com');
@@ -69,8 +69,46 @@ describe('MailReplyBatchSection', () => {
     const create = [...host.querySelectorAll('button')].find((item) => item.textContent === 'Create draft')!;
     await act(async () => { create.click(); await Promise.resolve(); });
     expect(onActivate).toHaveBeenCalledOnce();
-    expect(onActivate.mock.calls[0].slice(0, 3)).toEqual(['plan-1', 'job-a', { messageId: 'message-a', generation: 1 }]);
-    expect(onActivate.mock.calls[0][3]).toEqual(expect.any(Function));
+    expect(onReview.mock.calls[0].slice(0, 3)).toEqual(['job-a', 'draft', { messageId: 'message-a', generation: 1 }]);
+    expect(onActivate.mock.calls[0].slice(0, 4)).toEqual(['plan-1', 'job-a', 'draft', { messageId: 'message-a', generation: 1 }]);
+    expect(onActivate.mock.calls[0][4]).toEqual(expect.any(Function));
+  });
+
+  it('binds a send proposal review to send and cancels an old plan when the choice changes', async () => {
+    const onReview = vi.fn(async (_jobId: string, operation: 'draft' | 'send') => ({ ...plan, planId: `plan-${operation}`, operation }));
+    const onActivate = vi.fn(async () => undefined);
+    const onCancel = vi.fn();
+    render({
+      jobs: [job('job-a', 'message-a', { status: 'completed', canCheck: false, hasMailReplyResult: true, canReviewMailReply: true })],
+      onReview, onActivate, onCancel,
+    });
+    await act(async () => { [...host.querySelectorAll('button')].find((item) => item.textContent === 'Prepare draft')!.click(); await Promise.resolve(); });
+    await act(async () => { [...host.querySelectorAll('button')].find((item) => item.textContent === 'Prepare send proposal')!.click(); await Promise.resolve(); });
+    expect(onCancel).toHaveBeenCalledExactlyOnceWith('plan-draft', { messageId: 'message-a', generation: 1 });
+    expect(onReview.mock.calls.map((call) => call[1])).toEqual(['draft', 'send']);
+    expect(host.textContent).toContain('Review send proposal');
+    expect([...host.querySelectorAll('button')].find((item) => item.textContent === 'Create send proposal')).toBeDefined();
+    await act(async () => { [...host.querySelectorAll('button')].find((item) => item.textContent === 'Create send proposal')!.click(); await Promise.resolve(); });
+    expect(onActivate.mock.calls[0].slice(0, 3)).toEqual(['plan-send', 'job-a', 'send']);
+  });
+
+  it('cancels a fresh plan whose operation differs from the explicitly requested one', async () => {
+    const mismatched = { ...plan, planId: 'wrong-op-plan', operation: 'draft' as const };
+    const onCancel = vi.fn();
+    render({
+      jobs: [job('job-a', 'message-a', { status: 'completed', canCheck: false, hasMailReplyResult: true, canReviewMailReply: true })],
+      onReview: vi.fn(async () => mismatched), onCancel,
+    });
+    await act(async () => { [...host.querySelectorAll('button')].find((item) => item.textContent === 'Prepare send proposal')!.click(); await Promise.resolve(); });
+    expect(onCancel).toHaveBeenCalledExactlyOnceWith('wrong-op-plan', { messageId: 'message-a', generation: 1 });
+    expect(host.textContent).toContain('requested action changed');
+    expect(host.textContent).not.toContain('A generated answer.');
+  });
+
+  it('shows the activated safe DTO operation in request history', () => {
+    render({ jobs: [job('job-a', 'message-a', { status: 'completed', canCheck: false, proposalId: 'proposal-a', mailReplyActivationOperation: 'send' })] });
+    expect(host.textContent).toContain('A send proposal was created from this reply.');
+    expect(host.textContent).not.toContain('A draft proposal was created from this reply.');
   });
 
   it('requires a separate confirmation before content removal', async () => {
@@ -90,7 +128,7 @@ describe('MailReplyBatchSection', () => {
       jobs: [job('job-a', 'message-a', { status: 'completed', canCheck: false, hasMailReplyResult: true, canReviewMailReply: true })],
       onCancel,
     });
-    const review = [...host.querySelectorAll('button')].find((item) => item.textContent === 'Review completed reply')!;
+    const review = [...host.querySelectorAll('button')].find((item) => item.textContent === 'Prepare draft')!;
     await act(async () => { review.click(); await Promise.resolve(); });
     const cancel = [...host.querySelectorAll('button')].find((item) => item.textContent === 'Cancel review')!;
     act(() => cancel.click());

@@ -91,6 +91,8 @@ export interface OpenRouterBatchJob {
   readonly resultSha256?: string;
   /** Permanent opaque link to the one draft activated from this job. */
   readonly proposalId?: string;
+  /** Explicit operation for the permanently linked proposal; absent legacy jobs mean draft. */
+  readonly mailReplyActivationOperation?: 'draft' | 'send';
 }
 
 export type OpenRouterBatchContentJob = OpenRouterBatchJob & {
@@ -144,6 +146,7 @@ export interface AssistantBatchJobDTO {
   readonly hasMailReplyResult?: boolean;
   readonly canReviewMailReply?: boolean;
   readonly mailReplyContextCount?: number;
+  readonly mailReplyActivationOperation?: 'draft' | 'send';
   readonly proposalId?: string;
 }
 
@@ -299,7 +302,7 @@ function validJob(value: unknown): value is OpenRouterBatchJob {
 
 function validMailReplyJob(row: Record<string, unknown>): boolean {
   const commonRequired = ['id', 'customId', 'kind', 'status', 'createdAt', 'updatedAt', 'model', 'effort', 'requestSha256', 'unknownCharge'];
-  const commonOptional = ['batchId', 'accounting', 'failureCode', 'proposalId'];
+  const commonOptional = ['batchId', 'accounting', 'failureCode', 'proposalId', 'mailReplyActivationOperation'];
   if (!exactKeys(row, commonRequired, [...commonOptional, 'operation', 'sourceRemoved', 'requestProfileVersion', 'settingsFingerprint', 'sourceFingerprint',
       'requestBytes', 'omittedSourceCount', 'requestBody', 'sourceVersions', 'mailReplyBinding', 'resultText', 'resultSha256']) ||
       typeof row.id !== 'string' || row.id.length !== 36 || !UUID_V4.test(row.id) || row.customId !== row.id ||
@@ -310,7 +313,9 @@ function validMailReplyJob(row: Record<string, unknown>): boolean {
       (row.batchId !== undefined && (typeof row.batchId !== 'string' || row.batchId.length < 1 || row.batchId.length > 256 || /[^A-Za-z0-9_-]/.test(row.batchId))) ||
       (row.accounting !== undefined && !validAccounting(row.accounting)) ||
       (row.failureCode !== undefined && !['not_submitted', 'provider_failed', 'expired', 'invalid_result', 'stale_result', 'result_not_retained'].includes(String(row.failureCode))) ||
-      (row.proposalId !== undefined && (typeof row.proposalId !== 'string' || row.proposalId.length !== 36 || !UUID_V4.test(row.proposalId)))) return false;
+      (row.proposalId !== undefined && (typeof row.proposalId !== 'string' || row.proposalId.length !== 36 || !UUID_V4.test(row.proposalId))) ||
+      (row.mailReplyActivationOperation !== undefined && row.mailReplyActivationOperation !== 'draft' && row.mailReplyActivationOperation !== 'send') ||
+      (row.mailReplyActivationOperation !== undefined && row.proposalId === undefined)) return false;
   if ((row.status === 'result_not_retained') !== (row.failureCode === 'result_not_retained')) return false;
   if (row.sourceRemoved === true) {
       return row.status === 'source_removed' && (row.requestProfileVersion === 1 || row.requestProfileVersion === 2 || row.requestProfileVersion === 3) &&
@@ -411,6 +416,7 @@ export function assistantBatchJobDTO(job: OpenRouterBatchJob, cleanupPending = f
     ...(job.kind === 'mail_reply' && job.mailReplyBinding ? { mailMessageId: job.mailReplyBinding.messageId } : {}),
     ...(job.kind === 'mail_reply' && job.mailReplyBinding?.version === 2 ? { mailReplyContextCount: job.mailReplyBinding.context?.length ?? 0 } : {}),
     ...(job.kind === 'mail_reply' && job.resultText !== undefined ? { hasMailReplyResult: true, canReviewMailReply: !job.proposalId && job.status === 'completed' } : {}),
+    ...(job.kind === 'mail_reply' && job.mailReplyActivationOperation ? { mailReplyActivationOperation: job.mailReplyActivationOperation } : {}),
     ...(job.kind === 'mail_reply' && job.proposalId ? { proposalId: job.proposalId } : {}),
   });
 }
@@ -457,6 +463,7 @@ export function tombstoneOpenRouterBatchJob(job: OpenRouterBatchJob, updatedAt: 
     unknownCharge: job.unknownCharge,
     ...(job.accounting ? { accounting: job.accounting } : {}),
     ...(job.kind === 'mail_reply' && job.proposalId ? { proposalId: job.proposalId } : {}),
+    ...(job.kind === 'mail_reply' && job.mailReplyActivationOperation ? { mailReplyActivationOperation: job.mailReplyActivationOperation } : {}),
   });
 }
 

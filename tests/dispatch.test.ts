@@ -147,6 +147,41 @@ describe('immutable dispatch records', () => {
     expect(acceptedRestored).toMatchObject({ outcome: 'accepted', replyDraftCheck: 'matches_approved', remoteId: 'draft-1' });
   });
 
+  it('binds Batch reply sends to an explicit Send activation while keeping Draft receipts unchanged', () => {
+    const observedAt = '2026-10-12T01:00:00.000Z';
+    const digest = 'd'.repeat(64);
+    const source = {
+      version: 1 as const, accountId: 'account-1', accountEmail: 'me@example.test', verifiedSelfEmail: 'me@example.test',
+      identity: googleAccount().identity!, connectionGeneration: 7, localMessageId: 'local-message', providerMessageId: 'provider-message',
+      idFormat: 'gmail' as const, threadId: 'thread-1', internetMessageId: '<original@example.test>',
+      references: '<parent@example.test>', subject: 'Project update', from: 'Sam <sam@example.test>', senderEmail: 'sam@example.test',
+      replyTo: ['sam@example.test'], to: ['me@example.test'], cc: ['alex@example.test'], replyMetadataComplete: true as const,
+      observedAt, sourceDigest: digest,
+    };
+    const mailProvenance = { version: 2 as const, kind: 'mail_reply' as const, batchJobId: 'a314260e-a539-4dfd-85c7-696e2a1ab573', sourceDigest: digest,
+      source, expiresAt: '2026-10-12T01:15:00.000Z' };
+    const reply = { mode: 'reply' as const, sourceDigest: digest, localMessageId: source.localMessageId,
+      providerMessageId: source.providerMessageId, idFormat: source.idFormat, internetMessageId: source.internetMessageId,
+      sourceSubject: source.subject, threadId: source.threadId, references: '<parent@example.test> <original@example.test>', inReplyTo: source.internetMessageId };
+    const base = { ...emailProposal(), noteId: undefined, sourceRevision: undefined, provenance: mailProvenance,
+      sourceActionKey: 'mail-action', email: { operation: 'draft' as const, to: ['sam@example.test'], cc: [], bcc: [],
+        subject: source.subject, text: 'Approved reply.', attachments: [], reply } };
+    const draft = createDispatchRecord({ id: 'batch-reply-draft', dispatchStartedAt: startedAt, proposal: base, account: googleAccount() });
+    expect(draft.mailReplyBatchBinding).toEqual({ jobId: mailProvenance.batchJobId, provenanceCanonical: expect.any(String) });
+    expect(JSON.stringify(draft.mailReplyBatchBinding)).not.toContain('activationOperation');
+    expect(validateDispatchRecord(JSON.parse(JSON.stringify(draft)))).toMatchObject({ operation: 'draft' });
+
+    const sendProposal = { ...base, email: { ...base.email!, operation: 'send' as const } };
+    const send = createDispatchRecord({ id: 'batch-reply-send', dispatchStartedAt: startedAt, proposal: sendProposal,
+      account: googleAccount(), mailReplyActivationOperation: 'send' });
+    expect(send.mailReplyBatchBinding).toMatchObject({ jobId: mailProvenance.batchJobId, activationOperation: 'send' });
+    expect(validateDispatchRecord(JSON.parse(JSON.stringify(send)))).toMatchObject({ operation: 'send', mailReplyBatchBinding: { activationOperation: 'send' } });
+    expect(() => validateDispatchRecord({ ...send, mailReplyBatchBinding: { ...send.mailReplyBatchBinding!, activationOperation: undefined } }))
+      .toThrow(/consistency proof/i);
+    expect(() => validateDispatchRecord({ ...draft, mailReplyBatchBinding: { ...draft.mailReplyBatchBinding!, activationOperation: 'send' } }))
+      .toThrow(/consistency proof/i);
+  });
+
   it('captures real controller provenance with provider-sized fingerprints and multiline questions', async () => {
     const app = new AppControllerImpl(new MemoryStore());
     await app.load();

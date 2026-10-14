@@ -1,13 +1,27 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { MailReplyBatchReviewPlan } from '../src/core';
-import { MailReplyBatchOwnership, mailReplyBatchIsBlocked, mailReplyBatchReviewSourceIsBlocked, mailReplyBatchKeyIsReady, rethrowMailReplyBatchError, type MailReplyBatchBlockState } from '../src/ui/mailReplyBatchOwnership';
+import { MailReplyBatchOwnership, mailReplyBatchActivationMatchesOperation, mailReplyBatchIsBlocked, mailReplyBatchPlanMatchesOperation, mailReplyBatchReviewSourceIsBlocked, mailReplyBatchKeyIsReady, rethrowMailReplyBatchError, type MailReplyBatchBlockState } from '../src/ui/mailReplyBatchOwnership';
 
 const reviewPlan = (planId: string, messageId: string): MailReplyBatchReviewPlan => ({
-  planId, jobId: `job-${planId}`, messageId, mode: 'reply', subject: 'Subject',
+  planId, jobId: `job-${planId}`, messageId, mode: 'reply', operation: 'draft', subject: 'Subject',
   to: ['person@example.com'], cc: [], text: 'Read-only saved reply.', expiresAt: '2026-10-14T12:05:00.000Z',
 });
 
 describe('mail reply Batch ownership used by App', () => {
+  it('keeps fresh operation review and activation bindings exact, with legacy omission allowed only for drafts', () => {
+    expect(mailReplyBatchPlanMatchesOperation({ operation: 'draft' }, 'draft')).toBe(true);
+    expect(mailReplyBatchPlanMatchesOperation({ operation: 'draft' }, 'send')).toBe(false);
+    expect(mailReplyBatchPlanMatchesOperation({ operation: undefined }, 'draft')).toBe(false);
+    expect(mailReplyBatchActivationMatchesOperation('send', 'send', 'send', false, true)).toBe(true);
+    expect(mailReplyBatchActivationMatchesOperation('draft', 'send', 'draft', false, true)).toBe(false);
+    expect(mailReplyBatchActivationMatchesOperation(undefined, undefined, 'draft', false, true)).toBe(false);
+    expect(mailReplyBatchActivationMatchesOperation('draft', undefined, 'draft', true, true)).toBe(true);
+    expect(mailReplyBatchActivationMatchesOperation(undefined, undefined, 'draft', true, true)).toBe(true);
+    expect(mailReplyBatchActivationMatchesOperation(undefined, undefined, 'send', true, true)).toBe(false);
+    expect(mailReplyBatchActivationMatchesOperation('send', undefined, 'send', true, true)).toBe(false);
+    expect(mailReplyBatchActivationMatchesOperation('draft', undefined, 'draft', true, false)).toBe(false);
+    expect(mailReplyBatchActivationMatchesOperation(null as never, undefined, 'draft', true, true)).toBe(false);
+  });
   it('applies the production foreground, recovery, capture, and overlay hard block while allowing its own busy action', () => {
     const ready: MailReplyBatchBlockState = {
       startupReady: true, loading: false, demo: false, previewFailed: false, privacyReviewOpen: false, privacyOutcomeUnknown: false,

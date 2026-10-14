@@ -77,6 +77,7 @@ export interface ApprovedDispatch {
   calendarId?: string;
   payload: EmailProposalPayload | EventProposalPayload;
   replySource?: MailReplyProvenance;
+  mailReplyBatchBinding?: { jobId: string; provenanceCanonical: string; activationOperation?: 'send' };
 }
 
 export interface DispatchVerifier {
@@ -457,11 +458,11 @@ function graphReplyDraftCheck(message: Record<string, unknown> | undefined, payl
   return 'matches_approved';
 }
 
-function validateReplyPayload(account: Account, payload: EmailProposalPayload, replySource: ApprovedDispatch['replySource']): void {
+function validateReplyPayload(account: Account, payload: EmailProposalPayload, replySource: ApprovedDispatch['replySource'], expectedOperation: 'draft' | 'send' = 'draft'): void {
   const reply = payload.reply;
   if (!reply) return;
   if (!replySource) throw new Error('Reply source approval is missing.');
-  validateReplyBinding(payload, replySource);
+  validateReplyBinding(payload, replySource, expectedOperation);
   if (replySource.source.accountId !== account.id || !sameIdentity(replySource.source.identity, accountIdentity(account)) ||
       replySource.source.connectionGeneration !== (account.connectionGeneration ?? 0) || replySource.source.identity.providerNamespace !== account.provider) {
     throw new Error('Reply source does not match the current connected account.');
@@ -1335,9 +1336,24 @@ export class ConnectorClient {
   }
 
   async sendEmail(account: Account, envelope: ApprovedDispatch, verifier: DispatchVerifier): Promise<MutationReceipt> {
-    if (isRecord(envelope.payload) && 'reply' in envelope.payload && envelope.payload.reply) throw new Error('Reply proposals can only create a draft.');
     capability(account, 'mail.send');
     const payload = await this.verifiedEmail(account, envelope, verifier, 'send');
+    if (payload.reply) {
+      const reply = payload.reply;
+      if (account.provider === 'google') {
+        const raw = await this.gmailReplyRaw(payload, envelope.replySource!.source);
+        return this.writeJson(account, `${GOOGLE_API}/messages/send`, 'mail', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ raw, threadId: reply.threadId }) }, () => this.finalVerify(envelope, verifier));
+      }
+      const raw = await this.graphReplyMime(payload, envelope.replySource!.source);
+      let response: Response;
+      let dispatched = false;
+      try { response = await this.request(account, `${GRAPH_API}/me/sendMail`, 'mail', { method: 'POST', headers: { 'content-type': 'text/plain' }, body: raw }, true, undefined, () => { dispatched = true; }, undefined, () => this.finalVerify(envelope, verifier)); }
+      catch (error) { if (dispatched) return { status: 'unknown' }; throw error; }
+      if (response.status === 202 || response.ok) return { status: 'accepted' };
+      if (response.status >= 500) return { status: 'unknown' };
+      if (response.status >= 400 && response.status < 500) throw new ProviderWriteRejectedError(response.status);
+      return { status: 'unknown' };
+    }
     if (account.provider === 'google') {
       const raw = await this.gmailRaw(payload);
       return this.writeJson(account, `${GOOGLE_API}/messages/send`, 'mail', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ raw }) }, () => this.finalVerify(envelope, verifier));
@@ -1380,6 +1396,19 @@ export class ConnectorClient {
         throw new Error('Reply source verification failed. Review and approve the reply again.');
       }
       if (proofStatus === 'required_missing') throw new Error('Refresh the selected reply sources before dispatch.');
+      if (envelope.operation === 'send') {
+        const binding = envelope.mailReplyBatchBinding;
+        if (!envelope.replySource.batchJobId || !binding || binding.jobId !== envelope.replySource.batchJobId || binding.activationOperation !== 'send') {
+          throw new Error('Only an activated Batch reply can be sent; unlinked reply proposals can only create a draft.');
+        }
+      } else if (envelope.replySource.batchJobId) {
+        const binding = envelope.mailReplyBatchBinding;
+        if (!binding || binding.jobId !== envelope.replySource.batchJobId || binding.activationOperation !== undefined) {
+          throw new Error('The saved Batch reply operation does not match its approved dispatch. Review the result again.');
+        }
+      } else if (envelope.mailReplyBatchBinding !== undefined) {
+        throw new Error('Reply dispatch contains an unsupported Batch operation proof.');
+      }
       const now = this.now();
       const observedAt = Date.parse(envelope.replySource.source.observedAt);
       const expiresAt = Date.parse(envelope.replySource.expiresAt);
@@ -1415,8 +1444,12 @@ export class ConnectorClient {
     } else headerValue(p.subject, 'Subject');
     if (p.subject.length > 998 || p.text.length > 100_000 || p.attachments.length > 10) throw new Error('Email payload exceeds limits.');
     if (p.reply) {
-      if (operation !== 'draft' || envelope.operation !== 'draft') throw new Error('Reply proposals can only create a draft.');
-      validateReplyPayload(account, p, envelope.replySource);
+      if (operation !== 'draft' && operation !== 'send' || envelope.operation !== operation) throw new Error('Reply operation does not match its approved action.');
+      if (operation === 'send' && (!envelope.replySource?.batchJobId || envelope.mailReplyBatchBinding?.jobId !== envelope.replySource.batchJobId ||
+          envelope.mailReplyBatchBinding.activationOperation !== 'send')) {
+        throw new Error('Only an activated Batch reply can be sent; unlinked reply proposals can only create a draft.');
+      }
+      validateReplyPayload(account, p, envelope.replySource, operation);
     }
     return p;
   }
@@ -1492,6 +1525,22 @@ export class ConnectorClient {
       'MIME-Version: 1.0', 'Content-Type: text/plain; charset=UTF-8', 'Content-Transfer-Encoding: base64'];
     const message = `${headers.join('\r\n')}\r\n\r\n${foldBase64(utf8b64(payload.text))}`;
     return b64(new TextEncoder().encode(message)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+  }
+
+  /** Microsoft Graph accepts a raw MIME message on sendMail; this performs one send request without createReply/updateMessage. */
+  private async graphReplyMime(payload: EmailProposalPayload, source: MailReplyProvenance['source']): Promise<string> {
+    const reply = payload.reply!;
+    const tos = emailList(payload.to, 'To'), ccs = emailList(payload.cc, 'Cc');
+    if (!source.verifiedSelfEmail) throw new Error('A verified sender address is required for a Graph reply send.');
+    const from = emailList([source.verifiedSelfEmail], 'From')[0]!;
+    const subject = headerValue(payload.subject, 'Subject');
+    if (reply.internetMessageId.length + 'In-Reply-To: '.length > 998) throw new Error('In-Reply-To header exceeds the RFC line limit.');
+    const headers = [foldedHeader('From', from), foldedHeader('To', tos.join(', ')), ...(ccs.length ? [foldedHeader('Cc', ccs.join(', '))] : []),
+      subject === '' ? 'Subject: ' : `Subject: ${encodedSubject(subject)}`,
+      `In-Reply-To: ${reply.internetMessageId}`, foldedHeader('References', frozenReplyReferences(source) ?? reply.internetMessageId),
+      'MIME-Version: 1.0', 'Content-Type: text/plain; charset=UTF-8', 'Content-Transfer-Encoding: base64'];
+    const message = `${headers.join('\r\n')}\r\n\r\n${foldBase64(utf8b64(payload.text))}`;
+    return b64(new TextEncoder().encode(message));
   }
 
   private async checkedAttachments(payload: EmailProposalPayload): Promise<{ '@odata.type': '#microsoft.graph.fileAttachment'; name: string; contentType: string; contentBytes: string }[]> {

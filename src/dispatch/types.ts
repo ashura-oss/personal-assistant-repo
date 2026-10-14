@@ -51,7 +51,7 @@ export interface DispatchRecord {
   duplicateKey: string;
   sourceProvenance: AnyProposalProvenance;
   /** Private historical consistency proof for a reviewed Batch mail reply. */
-  mailReplyBatchBinding?: { jobId: string; provenanceCanonical: string };
+  mailReplyBatchBinding?: { jobId: string; provenanceCanonical: string; activationOperation?: 'send' };
   operation: DispatchOperation;
   accountId: string;
   account: DispatchAccountSnapshot;
@@ -75,6 +75,8 @@ export interface CreateDispatchRecordInput {
   proposal: Proposal;
   account: import('../core').Account;
   calendar?: import('../core').Calendar;
+  /** Private controller-confirmed operation selected on the linked Batch review; omitted means legacy/manual Draft. */
+  mailReplyActivationOperation?: 'draft' | 'send';
 }
 
 export interface DispatchOutcomeInput {

@@ -463,9 +463,13 @@ function assertNoDuplicateDispatch(state: AppState, candidate: DispatchRecord): 
     record.account.identity.subject === candidate.account.identity.subject &&
     (record.account.identity.resourceUserId ?? '') === (candidate.account.identity.resourceUserId ?? '');
   const candidateMail = candidate.operation === 'draft' || candidate.operation === 'send';
+  const candidateMailReply = candidateMail && candidate.sourceProvenance.version === 2 && candidate.sourceProvenance.kind === 'mail_reply';
   const recordDuplicate = state.dispatchRecords.some((record) => {
     if (!['pending', 'accepted', 'unknown'].includes(record.outcome)) return false;
     if (record.duplicateKey === candidate.duplicateKey) return true;
+    const recordMailReply = (record.operation === 'draft' || record.operation === 'send') && record.sourceProvenance.version === 2 &&
+      record.sourceProvenance.kind === 'mail_reply';
+    if (candidateMailReply && recordMailReply && sameSourceIdentity(record)) return true;
     return record.outcome === 'unknown' && candidateMail && (record.operation === 'draft' || record.operation === 'send') && sameSourceIdentity(record);
   });
   if (recordDuplicate) throw new Error('This source action already has a pending, accepted, or unknown provider attempt. Review its dispatch history; it will not be sent again.');
@@ -1491,6 +1495,7 @@ export class AppControllerImpl implements AppController {
   }>();
   private readonly mailReplyBatchReviewPlans = new Map<string, {
     readonly planId: string; readonly jobId: string; readonly messageId: string; readonly mode: 'reply' | 'reply_all';
+    readonly operation: 'draft' | 'send';
     readonly sourceDigest: string; readonly bodyDigest: string; readonly bindingDigest: string; readonly resultSha256: string;
     readonly settingsFingerprint: string; readonly expiresAt: string;
     readonly bootstrapGeneration: number; readonly privacyEpoch?: string; readonly preparedAtMs: number;
@@ -3187,7 +3192,8 @@ export class AppControllerImpl implements AppController {
   private async validateProposalProvenance(state: AppState, proposal: Proposal): Promise<string> {
     if (proposal.provenance?.version === 2) {
       const provenance = proposal.provenance;
-      if (proposal.requiresRebuild || proposal.kind !== 'email' || !proposal.email?.reply || proposal.email.operation !== 'draft') throw new Error('This mail reply needs a fresh, explicitly reviewed source before approval.');
+      const expectedOperation = this.mailReplyActivationOperationForProposal(proposal);
+      if (proposal.requiresRebuild || proposal.kind !== 'email' || !proposal.email?.reply || proposal.email.operation !== expectedOperation) throw new Error('This mail reply needs a fresh, explicitly reviewed source before approval.');
       const account = state.accounts.find((item) => item.id === proposal.accountId);
       const message = state.mailbox.find((item) => item.id === provenance.source.localMessageId && item.accountId === provenance.source.accountId);
       const linkedMailJob = provenance.batchJobId ? this.assistantBatchLedger.jobs.find((item) => item.id === provenance.batchJobId) : undefined;
@@ -3195,6 +3201,7 @@ export class AppControllerImpl implements AppController {
         linkedMailJob.operation === 'mail_reply_context' && linkedMailJob.mailReplyBinding.version === 2);
       if (!account || account.id !== provenance.source.accountId || account.provider !== provenance.source.identity.providerNamespace ||
           !account.connected || account.authStatus !== 'connected' || !account.capabilities?.includes('mail.read') ||
+          (expectedOperation === 'send' && !account.capabilities.includes('mail.send')) ||
           (account.connectionGeneration ?? 0) !== provenance.source.connectionGeneration || !sameAccountIdentity(account.identity, provenance.source.identity) ||
           (!refreshedContext && (!message || message.providerDeletedAt || !message.replyMetadataComplete || message.verifiedIdentityKey !== identityKey(account) ||
             message.connectionGeneration !== account.connectionGeneration))) throw new Error('The source message or verified mailbox connection is no longer available. Refresh the inbox and create a new reply draft.');
@@ -3212,7 +3219,7 @@ export class AppControllerImpl implements AppController {
         ? this.requireCurrentMailReplyContextProof(state, linkedMailJob as OpenRouterMailReplyContentJob).targetSource
         : this.mailReplySourceFromRow(message!, account, provenance.source.observedAt);
       if (canonicalMailReplySource(current) !== canonicalMailReplySource(provenance.source)) throw new Error('The source message changed. Refresh it and create a new reply draft.');
-      validateReplyBinding(proposal.email, provenance);
+      validateReplyBinding(proposal.email, provenance, expectedOperation);
       await this.validateMailReplyBatchIntegrity(state, proposal, provenance);
       return this.mailReplyDependencyProjection(state, proposal, provenance);
     }
@@ -3263,14 +3270,29 @@ export class AppControllerImpl implements AppController {
     };
   }
 
+  private mailReplyActivationOperationForProposal(proposal: Proposal): 'draft' | 'send' {
+    const provenance = proposal.provenance;
+    if (provenance?.version !== 2 || !provenance.batchJobId) return 'draft';
+    const job = this.assistantBatchLedger.jobs.find((item) => item.id === provenance.batchJobId);
+    if (!job || !isOpenRouterMailReplyContentJob(job) || job.proposalId !== proposal.id) {
+      throw new Error('The linked Batch reply operation cannot be verified. Review a fresh saved result.');
+    }
+    return job.mailReplyActivationOperation ?? 'draft';
+  }
+
   private mailReplyDependencyProjection(state: AppState, proposal: Proposal, provenance: MailReplyProvenance): string {
     const account = state.accounts.find((item) => item.id === provenance.source.accountId);
     const message = state.mailbox.find((item) => item.id === provenance.source.localMessageId && item.accountId === provenance.source.accountId);
     const linkedJob = provenance.batchJobId ? this.assistantBatchLedger.jobs.find((item) => item.id === provenance.batchJobId) : undefined;
+    const expectedOperation = provenance.batchJobId
+      ? linkedJob && isOpenRouterMailReplyContentJob(linkedJob) && linkedJob.proposalId === proposal.id
+        ? linkedJob.mailReplyActivationOperation ?? 'draft' : undefined
+      : 'draft';
     const contextJob = linkedJob && isOpenRouterMailReplyContentJob(linkedJob) && linkedJob.requestProfileVersion === 3 &&
       linkedJob.operation === 'mail_reply_context' && linkedJob.mailReplyBinding.version === 2 ? linkedJob : undefined;
     const contextProof = contextJob ? this.requireCurrentMailReplyContextProof(state, contextJob) : undefined;
     if (!account || !account.connected || account.authStatus !== 'connected' || !account.capabilities?.includes('mail.read') ||
+        (expectedOperation === 'send' && !account.capabilities.includes('mail.send')) ||
         account.connectionGeneration !== provenance.source.connectionGeneration || !sameAccountIdentity(account.identity, provenance.source.identity) ||
         (!contextProof && !message) || (message && (message.providerDeletedAt || !message.replyMetadataComplete || message.verifiedIdentityKey !== identityKey(account) ||
           message.connectionGeneration !== account.connectionGeneration || message.providerMessageId !== provenance.source.providerMessageId ||
@@ -3286,13 +3308,15 @@ export class AppControllerImpl implements AppController {
     const current = contextProof?.targetSource ?? this.mailReplySourceFromRow(message!, account, provenance.source.observedAt);
     if (canonicalMailReplySource(current) !== canonicalMailReplySource(provenance.source)) throw new Error('The source message changed. Refresh and approve the reply again.');
     if (!proposal.email) throw new Error('Reply payload is missing.');
-    validateReplyBinding(proposal.email, provenance);
+    if (!expectedOperation || proposal.email.operation !== expectedOperation) throw new Error('The reply operation no longer matches its activated Batch review.');
+    validateReplyBinding(proposal.email, provenance, expectedOperation);
     const base = { source: canonicalMailReplySource(current), sourceDigest: provenance.sourceDigest,
       expiry: provenance.expiresAt, accountGeneration: account.connectionGeneration ?? 0,
-      payload: proposal.email.reply ?? null, recipients: { to: proposal.email.to, cc: proposal.email.cc } };
+      operation: proposal.email.operation, payload: proposal.email.reply ?? null, recipients: { to: proposal.email.to, cc: proposal.email.cc } };
     if (!provenance.batchJobId) return stableJson(base);
-    const job = this.assistantBatchLedger.jobs.find((item) => item.id === provenance.batchJobId);
+    const job = linkedJob;
     if (!job || !isOpenRouterMailReplyContentJob(job) || job.status !== 'completed' || job.proposalId !== proposal.id ||
+        (job.mailReplyActivationOperation ?? 'draft') !== proposal.email.operation ||
         !job.resultText || job.resultText !== proposal.email.text || !job.resultSha256 || !job.mailReplyBinding ||
         job.mailReplyBinding.messageId !== provenance.source.localMessageId ||
         canonicalMailReplySource(job.mailReplyBinding.source) !== canonicalMailReplySource(provenance.source) ||
@@ -3339,6 +3363,7 @@ export class AppControllerImpl implements AppController {
     if (!provenance.batchJobId) return;
     const job = this.assistantBatchLedger.jobs.find((item) => item.id === provenance.batchJobId);
     if (!job || !isOpenRouterMailReplyContentJob(job) || job.status !== 'completed' || job.proposalId !== proposal.id ||
+        (job.mailReplyActivationOperation ?? 'draft') !== proposal.email?.operation ||
         !job.resultText || !job.resultSha256 || job.resultText !== proposal.email?.text || !job.mailReplyBinding) {
       throw new Error('The Batch result was removed or changed. A new explicit review is required.');
     }
@@ -5878,8 +5903,13 @@ export class AppControllerImpl implements AppController {
       settings: openRouterSettingsBinding(state.settings), accountId: account.id, generation: account.connectionGeneration });
   }
 
-  async reviewMailReplyBatch(jobId: string): Promise<MailReplyBatchReviewPlan> {
+  async reviewMailReplyBatch(jobId: string, options?: { operation?: 'draft' | 'send' }): Promise<MailReplyBatchReviewPlan> {
     this.pruneMailReplyBatchReviewPlans();
+    if (options !== undefined && (!isRecord(options) || Object.keys(options).some((key) => key !== 'operation'))) {
+      throw new Error('Choose whether this reviewed reply should create a draft or send.');
+    }
+    const operation = options === undefined || !Object.hasOwn(options, 'operation') || options.operation === undefined ? 'draft' : options.operation;
+    if (operation !== 'draft' && operation !== 'send') throw new Error('Choose whether this reviewed reply should create a draft or send.');
     const job = this.assistantBatchLedger.jobs.find((item) => item.id === jobId);
     if (!job || !isOpenRouterMailReplyContentJob(job) || job.status !== 'completed' || !job.resultText || !job.resultSha256 || job.proposalId) {
       throw new Error('This saved job has no unclaimed mail reply result to review.');
@@ -5889,6 +5919,10 @@ export class AppControllerImpl implements AppController {
     const generation = this.bootstrapGeneration;
     const epoch = this.integration.privacySession?.epoch;
     const binding = job.mailReplyBinding;
+    if (operation === 'send' && !this.snapshot.accounts.find((item) => item.id === binding.source.accountId)?.capabilities?.includes('mail.send')) {
+      this.activeMailReplyBatchReviews.delete(jobId);
+      throw new Error('This verified mailbox connection does not have permission to send replies.');
+    }
     try {
       await this.load();
       await this.assertPrivacySessionCurrent();
@@ -5947,7 +5981,7 @@ export class AppControllerImpl implements AppController {
       const preparedAtMs = Date.now();
       const expiresAt = new Date(preparedAtMs + 5 * 60_000).toISOString();
       const publicPlan: MailReplyBatchReviewPlan = Object.freeze({ planId: newId(), jobId, messageId: binding.messageId,
-        mode: binding.mode, subject: binding.subject, to: Object.freeze([...binding.to]), cc: Object.freeze([...binding.cc]),
+        mode: binding.mode, operation, subject: binding.subject, to: Object.freeze([...binding.to]), cc: Object.freeze([...binding.cc]),
         text: job.resultText, ...(binding.version === 2 ? { contextMessages: Object.freeze(binding.context!.map((item) => Object.freeze({
           selectionId: item.selectionId, subject: item.source.subject, ...(item.source.senderEmail ? { sender: item.source.senderEmail } : {}),
           ...(item.receivedAt ? { receivedAt: item.receivedAt } : {}), ...(item.sentAt ? { sentAt: item.sentAt } : {}), representation: item.body.representation,
@@ -5974,7 +6008,7 @@ export class AppControllerImpl implements AppController {
       this.pruneMailReplyBatchReviewPlans();
       for (const [id, plan] of this.mailReplyBatchReviewPlans) if (plan.jobId === jobId) this.mailReplyBatchReviewPlans.delete(id);
       this.mailReplyBatchReviewPlans.set(publicPlan.planId, Object.freeze({ planId: publicPlan.planId, jobId, messageId: binding.messageId,
-        mode: binding.mode, sourceDigest: binding.source.sourceDigest, bodyDigest, bindingDigest, resultSha256: job.resultSha256,
+        mode: binding.mode, operation, sourceDigest: binding.source.sourceDigest, bodyDigest, bindingDigest, resultSha256: job.resultSha256,
         settingsFingerprint: binding.settingsFingerprint, expiresAt, bootstrapGeneration: generation, ...(epoch ? { privacyEpoch: epoch } : {}), preparedAtMs }));
       return publicPlan;
     } finally { this.activeMailReplyBatchReviews.delete(jobId); }
@@ -6046,7 +6080,7 @@ export class AppControllerImpl implements AppController {
       await this.assertPrivacySessionCurrent();
       const job = this.assistantBatchLedger.jobs.find((item) => item.id === plan.jobId);
       if (!job || !isOpenRouterMailReplyContentJob(job) || job.status !== 'completed' || job.proposalId || !job.resultText ||
-          job.resultSha256 !== plan.resultSha256 || job.mailReplyBinding.messageId !== plan.messageId || job.mailReplyBinding.mode !== plan.mode) {
+          job.mailReplyActivationOperation !== undefined || job.resultSha256 !== plan.resultSha256 || job.mailReplyBinding.messageId !== plan.messageId || job.mailReplyBinding.mode !== plan.mode) {
         throw new Error('This Batch result changed or was already activated. Review an available result again.');
       }
       const currentProof = job.mailReplyBinding.version === 2 ? this.requireCurrentMailReplyContextProof(this.state, job) : undefined;
@@ -6073,7 +6107,7 @@ export class AppControllerImpl implements AppController {
         }
         const currentJob = this.assistantBatchLedger.jobs.find((item) => item.id === plan.jobId);
         if (!currentJob || !isOpenRouterMailReplyContentJob(currentJob) || currentJob.status !== 'completed' || currentJob.proposalId ||
-            currentJob.resultSha256 !== plan.resultSha256 || currentJob.mailReplyBinding !== job.mailReplyBinding) throw new Error('This Batch result was already consumed or changed.');
+            currentJob.mailReplyActivationOperation !== undefined || currentJob.resultSha256 !== plan.resultSha256 || currentJob.mailReplyBinding !== job.mailReplyBinding) throw new Error('This Batch result was already consumed or changed.');
         await this.assertMailReplyBatchJobIntegrity(currentJob, true);
         if (currentJob.mailReplyBinding.version === 2) this.requireCurrentMailReplyContextProof(state, currentJob);
         await this.assertMailReplyBatchInputsCurrent(state, job.mailReplyBinding, latestSource.source!, reviewedBody, job);
@@ -6088,13 +6122,13 @@ export class AppControllerImpl implements AppController {
         if (currentJob.mailReplyBinding.version === 2) this.requireCurrentMailReplyContextProof(state, currentJob);
         const proposalSource = currentJob.mailReplyBinding.version === 2 ? currentJob.mailReplyBinding.source : freshSource.source;
         const proposal = this.buildMailReplyProposal(state, proposalSource, { messageId: plan.messageId, mode: plan.mode,
-          sourceDigest: proposalSource.sourceDigest, text: job.resultText!, to: job.mailReplyBinding.to, cc: job.mailReplyBinding.cc }, job.id);
+          sourceDigest: proposalSource.sourceDigest, text: job.resultText!, to: job.mailReplyBinding.to, cc: job.mailReplyBinding.cc }, job.id, plan.operation);
         proposal.id = proposalId;
         state.proposals.unshift(proposal);
         addActivity(state, 'proposal_created', 'Mail reply prepared from the explicitly reviewed Batch result.', { proposalId });
         return { kind: 'created' as const, jobId: job.id, proposalId };
       }, undefined, (_state, created) => validateOpenRouterBatchLedger({ version: 1, jobs: this.assistantBatchLedger.jobs.map((item) =>
-        item.id === created.jobId ? { ...item, proposalId: created.proposalId, updatedAt: now() } : item) }));
+        item.id === created.jobId ? { ...item, proposalId: created.proposalId, mailReplyActivationOperation: plan.operation, updatedAt: now() } : item) }));
       await this.assertPrivacySessionCurrent();
       if (Date.now() < plan.preparedAtMs || Date.now() >= Date.parse(plan.expiresAt) || this.bootstrapGeneration !== plan.bootstrapGeneration ||
           this.integration.privacySession?.epoch !== plan.privacyEpoch) throw new Error('This reply review expired while activation was saving. Review the saved result again.');
@@ -8042,12 +8076,13 @@ export class AppControllerImpl implements AppController {
         const immutableBatchPayload = proposal.provenance.batchJobId ? stableJson({ title: proposal.title, body: proposal.body,
           accountId: proposal.accountId, recipients: proposal.recipients, email: proposal.email }) : undefined;
         const locked = proposal.email?.reply;
-        if (!locked || proposal.email?.operation !== 'draft' || (patch.accountId !== undefined && patch.accountId !== proposal.accountId) ||
-            (patch.email && ((patch.email.operation !== undefined && patch.email.operation !== 'draft') || patch.email.subject !== proposal.provenance.source.subject ||
+        const expectedOperation = proposal.provenance.batchJobId ? this.mailReplyActivationOperationForProposal(proposal) : 'draft';
+        if (!locked || proposal.email?.operation !== expectedOperation || (patch.accountId !== undefined && patch.accountId !== proposal.accountId) ||
+            (patch.email && ((patch.email.operation !== undefined && patch.email.operation !== expectedOperation) || patch.email.subject !== proposal.provenance.source.subject ||
               patch.email.bcc.length > 0 || patch.email.attachments.length > 0 || (patch.email.reply && stableJson(patch.email.reply) !== stableJson(locked))))) {
-          throw new Error('Reply source, subject, account, draft operation, Bcc, and attachments are locked. Only reply text and recipients can be edited.');
+          throw new Error('Reply source, subject, account, reviewed operation, Bcc, and attachments are locked.');
         }
-        const updatedEmail = patch.email ? { ...patch.email, operation: 'draft' as const, reply: clone(locked), subject: proposal.provenance.source.subject } : undefined;
+        const updatedEmail = patch.email ? { ...patch.email, operation: expectedOperation, reply: clone(locked), subject: proposal.provenance.source.subject } : undefined;
         Object.assign(proposal, patch);
         if (updatedEmail) proposal.email = updatedEmail;
         else if (proposal.email) proposal.email.reply = clone(locked);
@@ -8288,7 +8323,10 @@ export class AppControllerImpl implements AppController {
       let dispatchRecord: DispatchRecord | undefined;
       if (canDispatch && account) {
         if (this.dispatchRecordQuarantine.length) throw new Error('Dispatch history failed integrity validation. External writes are disabled until the receipt history is repaired.');
-        dispatchRecord = createDispatchRecord({ id: newId(), dispatchStartedAt: now(), proposal, account, calendar });
+        const mailReplyActivationOperation = proposal.provenance?.version === 2 && proposal.provenance.batchJobId
+          ? this.mailReplyActivationOperationForProposal(proposal) : undefined;
+        dispatchRecord = createDispatchRecord({ id: newId(), dispatchStartedAt: now(), proposal, account, calendar,
+          ...(mailReplyActivationOperation ? { mailReplyActivationOperation } : {}) });
         assertNoDuplicateDispatch(state, dispatchRecord);
         state.dispatchRecords.unshift(dispatchRecord);
         proposal.dispatchRecordId = dispatchRecord.id;
@@ -8404,6 +8442,7 @@ export class AppControllerImpl implements AppController {
           accountId: record.accountId, identity: clone(record.account.identity), payloadDigest: record.payloadDigest,
           title: record.title, body: record.body, calendarId: record.calendar?.providerId,
           ...(record.sourceProvenance.version === 2 ? { replySource: clone(record.sourceProvenance) } : {}),
+          ...(record.mailReplyBatchBinding ? { mailReplyBatchBinding: clone(record.mailReplyBatchBinding) } : {}),
           payload: record.payload.kind === 'email'
             ? { ...clone(record.payload.email), operation: record.operation === 'draft' || record.operation === 'send' ? record.operation : undefined }
             : clone(record.payload.event),
@@ -10537,13 +10576,15 @@ export class AppControllerImpl implements AppController {
   async cancelMailReplyContextDiscovery(sessionId: string): Promise<void> { this.mailReplyContextSessions.delete(sessionId); }
 
   private buildMailReplyProposal(state: AppState, source: MailReplySourceSnapshot,
-    input: { messageId: string; mode: 'reply' | 'reply_all'; sourceDigest: string; text: string; to: readonly string[]; cc: readonly string[] }, batchJobId?: string): Proposal {
+    input: { messageId: string; mode: 'reply' | 'reply_all'; sourceDigest: string; text: string; to: readonly string[]; cc: readonly string[] }, batchJobId?: string,
+    activationOperation: 'draft' | 'send' = 'draft'): Proposal {
     if (input.messageId !== source.localMessageId || input.sourceDigest.toLowerCase() !== source.sourceDigest.toLowerCase() ||
         typeof input.text !== 'string' || input.text.length > 100_000 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(input.text)) {
       throw new Error('Reply text or source binding is invalid. Review the current message before creating a draft.');
     }
     const account = state.accounts.find((item) => item.id === source.accountId);
     if (!account) throw new Error('The verified mail account is no longer available.');
+    if (activationOperation === 'send' && !account.capabilities?.includes('mail.send')) throw new Error('This verified mailbox connection does not have permission to send replies.');
     const to = [...input.to];
     const cc = [...input.cc];
     if (!to.length || to.length > 100 || cc.length > 100 || [...to, ...cc].some((address) => !validEmail(address))) throw new Error('Check the reply recipients.');
@@ -10560,8 +10601,8 @@ export class AppControllerImpl implements AppController {
       ...(replyReferences(source) ? { references: replyReferences(source) } : {}),
       inReplyTo: source.internetMessageId,
     } as const;
-    const email = { operation: 'draft' as const, to, cc, bcc: [], subject: source.subject, text: input.text, attachments: [], reply };
-    validateReplyBinding(email, provenance);
+    const email = { operation: activationOperation, to, cc, bcc: [], subject: source.subject, text: input.text, attachments: [], reply };
+    validateReplyBinding(email, provenance, activationOperation);
     const sourceActionKey = JSON.stringify(['mail-reply-v1', identityKey(account), source.providerMessageId, input.mode]);
     if (this.dispatchRecoveryFencesAction(sourceActionKey)) throw new Error('This mail source action was retired during dispatch recovery. Create a new independent reply from a different message.');
     const duplicate = state.proposals.some((proposal) => proposal.sourceActionKey === sourceActionKey && ['accepted', 'unknown', 'dispatching'].includes(proposal.status) && !proposal.simulated) ||

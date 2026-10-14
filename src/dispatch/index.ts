@@ -231,7 +231,9 @@ export function createDispatchRecord(input: CreateDispatchRecordInput): Dispatch
   }
   if (proposal.kind === 'email' && proposal.email?.reply) {
     if (sourceProvenance.version !== 2) fail('Reply draft is missing its original message provenance.');
-    validateReplyBinding(proposal.email, sourceProvenance);
+    const expectedReplyOperation = input.mailReplyActivationOperation ?? 'draft';
+    if (expectedReplyOperation === 'send' && !sourceProvenance.batchJobId) fail('Only an activated Batch reply can be sent.');
+    validateReplyBinding(proposal.email, sourceProvenance, expectedReplyOperation);
   } else if (sourceProvenance.version !== 1) fail('Mail reply provenance can only be used by reply drafts.');
   if (proposal.evidence.some((item) => (item.start !== undefined && (!Number.isFinite(item.start) || item.start < 0)) ||
       (item.end !== undefined && (!Number.isFinite(item.end) || item.end < 0)) ||
@@ -250,12 +252,13 @@ export function createDispatchRecord(input: CreateDispatchRecordInput): Dispatch
     duplicateKey: '', sourceProvenance,
     ...(sourceProvenance.version === 2 && sourceProvenance.batchJobId ? { mailReplyBatchBinding: {
       jobId: sourceProvenance.batchJobId, provenanceCanonical: canonicalJson(sourceProvenance),
+      ...(input.mailReplyActivationOperation === 'send' ? { activationOperation: 'send' as const } : {}),
     } } : {}), accountId: account.id, account: accountSnapshot, title, body, dispatchStartedAt,
     outcome: 'pending' as const, reconciliations: [] as DispatchReconciliationAttestation[] };
   if (proposal.kind === 'email' && proposal.email?.operation && (proposal.email.operation === 'draft' || proposal.email.operation === 'send')) {
     if (calendar) fail('Email dispatch must not contain a calendar destination.');
     const operation = proposal.email.operation;
-    if (sourceProvenance.version === 2 && (operation !== 'draft' || !proposal.email.reply || account.provider !== sourceProvenance.source.identity.providerNamespace ||
+    if (sourceProvenance.version === 2 && (!proposal.email.reply || operation !== (input.mailReplyActivationOperation ?? 'draft') || account.provider !== sourceProvenance.source.identity.providerNamespace ||
         account.id !== sourceProvenance.source.accountId || !sameIdentitySnapshot(identity, sourceProvenance.source.identity))) {
       fail('Mail reply dispatch account does not match the frozen source identity.');
     }
@@ -344,9 +347,11 @@ export function validateDispatchRecord(value: unknown): DispatchRecord {
   const requiresBatchBinding = provenance.version === 2 && Boolean(provenance.batchJobId);
   if (requiresBatchBinding) {
     const proof = record.mailReplyBatchBinding;
-    if (!proof || typeof proof !== 'object' || Array.isArray(proof) || Object.keys(proof).some((key) => !['jobId', 'provenanceCanonical'].includes(key)) ||
+    if (!proof || typeof proof !== 'object' || Array.isArray(proof) || Object.keys(proof).some((key) => !['jobId', 'provenanceCanonical', 'activationOperation'].includes(key)) ||
         proof.jobId !== provenance.batchJobId || typeof proof.provenanceCanonical !== 'string' ||
-        proof.provenanceCanonical !== canonicalJson(provenance)) fail('Dispatch Batch mail provenance consistency proof is invalid.');
+        proof.provenanceCanonical !== canonicalJson(provenance) ||
+        (proof.activationOperation !== undefined && proof.activationOperation !== 'send') ||
+        record.operation !== (proof.activationOperation ?? 'draft')) fail('Dispatch Batch mail provenance consistency proof is invalid.');
   } else if (record.mailReplyBatchBinding !== undefined) fail('Dispatch Batch mail provenance proof is unsupported for this receipt.');
   const proposal: Proposal = {
     id: record.proposalId, ...(provenance.version === 1 ? { noteId: provenance.noteId } : {}), kind: record.operation === 'event' ? 'event' : 'email',
@@ -363,7 +368,9 @@ export function validateDispatchRecord(value: unknown): DispatchRecord {
   const calendar: Calendar | undefined = record.calendar ? {
     id: record.calendar.localId, accountId: record.accountId, providerId: record.calendar.providerId, name: record.calendar.name, connected: true, writable: true,
   } : undefined;
-  let canonical = createDispatchRecord({ id: record.id, dispatchStartedAt: record.dispatchStartedAt, proposal, account, calendar });
+  let canonical = createDispatchRecord({ id: record.id, dispatchStartedAt: record.dispatchStartedAt, proposal, account, calendar,
+    ...(record.sourceProvenance.version === 2 && record.sourceProvenance.batchJobId
+      ? { mailReplyActivationOperation: record.mailReplyBatchBinding?.activationOperation ?? 'draft' } : {}) });
   if (canonical.duplicateKey !== record.duplicateKey) fail('Dispatch duplicate identity key is invalid.');
   if (record.outcome !== 'pending') {
     if (record.outcome === 'rejected' && !record.rejectionCode) fail('Rejected dispatch code is missing.');

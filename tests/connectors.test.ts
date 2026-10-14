@@ -790,6 +790,54 @@ describe('provider connector clients', () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
+  it('sends an activated Gmail Batch reply with one send request and frozen threading headers', async () => {
+    const fixtureData = replyFixture();
+    const source = { ...fixtureData.replySource.source, observedAt: new Date().toISOString() };
+    const replySource = { ...fixtureData.replySource, batchJobId: 'batch-send-1', source,
+      expiresAt: new Date(Date.parse(source.observedAt) + 15 * 60_000).toISOString() };
+    const sendPayload = { ...fixtureData.payload, operation: 'send' as const };
+    let requestUrl = '';
+    let requestBody: Record<string, unknown> | undefined;
+    const fetcher = vi.fn(async (url: RequestInfo | URL, init?: RequestInit) => {
+      requestUrl = String(url); requestBody = JSON.parse(String(init?.body));
+      return response({ id: 'sent-message' });
+    }) as typeof fetch;
+    const client = fixture({ fetcher }).client;
+    await expect(client.sendEmail(fixtureData.selectedAccount, { ...fixtureData.dispatch, operation: 'send', replySource,
+      mailReplyBatchBinding: { jobId: 'batch-send-1', provenanceCanonical: 'frozen-approved-provenance', activationOperation: 'send' },
+      payload: sendPayload }, verifier)).resolves.toMatchObject({ status: 'accepted' });
+    expect(requestUrl).toBe('https://gmail.googleapis.com/gmail/v1/users/me/messages/send');
+    expect(requestBody).toMatchObject({ threadId: 'gmail-thread-id' });
+    expect(requestBody?.raw).toEqual(expect.any(String));
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it('sends an activated Graph Batch reply in one MIME sendMail request', async () => {
+    const fixtureData = replyFixture('microsoft');
+    const source = { ...fixtureData.replySource.source, verifiedSelfEmail: 'verified-sender@example.test', observedAt: new Date().toISOString() };
+    const replySource = { ...fixtureData.replySource, batchJobId: 'batch-send-graph', source,
+      expiresAt: new Date(Date.parse(source.observedAt) + 15 * 60_000).toISOString() };
+    const sendPayload = { ...fixtureData.payload, operation: 'send' as const };
+    let requestUrl = '';
+    let requestBody = '';
+    const fetcher = vi.fn(async (url: RequestInfo | URL, init?: RequestInit) => {
+      requestUrl = String(url); requestBody = String(init?.body);
+      return new Response(null, { status: 202 });
+    }) as typeof fetch;
+    const client = fixture({ fetcher, token: token({ identity: microsoftIdentity }) }).client;
+    await expect(client.sendEmail(fixtureData.selectedAccount, { ...fixtureData.dispatch, operation: 'send', replySource,
+      mailReplyBatchBinding: { jobId: 'batch-send-graph', provenanceCanonical: 'frozen-approved-provenance', activationOperation: 'send' },
+      payload: sendPayload }, verifier)).resolves.toEqual({ status: 'accepted' });
+    expect(requestUrl).toBe('https://graph.microsoft.com/v1.0/me/sendMail');
+    const mime = atob(requestBody);
+    expect(mime).toContain('From: verified-sender@example.test');
+    expect(mime).not.toContain('From: ms@example.test');
+    expect(mime).toContain('In-Reply-To: <original@example.test>');
+    expect(mime).toContain('References: <prior@example.test> <original@example.test>');
+    expect(mime).toContain('To: reply@example.test');
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
   it('preserves an empty frozen source subject as an empty Gmail Subject header', async () => {
     const fixtureData = replyFixture();
     const source = { ...fixtureData.replySource.source, subject: '' };
