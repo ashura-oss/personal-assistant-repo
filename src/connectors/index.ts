@@ -13,6 +13,8 @@ const MAX_PAGE_SIZE = 50;
 const MAX_ATTACHMENT_BYTES = 3 * 1024 * 1024;
 const MAX_SELECTED_MESSAGE_BYTES = 256 * 1024;
 const MAX_SELECTED_RESPONSE_BYTES = 1024 * 1024;
+const MAX_CONVERSATION_RESPONSE_BYTES = 1024 * 1024;
+const MAX_CONVERSATION_PAGE_SIZE = 50;
 const SELECTED_SIZE_FRESH_MS = 15 * 60 * 1000;
 
 export interface StoredOAuthToken {
@@ -119,7 +121,9 @@ export interface MessageSummary {
   from?: string;
   senderEmail?: string;
   isRead?: boolean;
+  isDraft?: boolean;
   receivedAt?: string;
+  sentAt?: string;
   snippet?: string;
   replyMetadataComplete?: boolean;
   internetMessageId?: string;
@@ -144,6 +148,13 @@ export interface SelectedMessageTextResult {
   reasons: string[];
   checkedAt: string;
   extractionVersion: 'mail-text-v1' | 'mail-text-v2';
+}
+
+export interface ConversationMessagesResult {
+  messages: MessageSummary[];
+  nextCursor?: string;
+  coverage: 'complete_metadata' | 'partial';
+  omissionReasons: string[];
 }
 
 export interface MessageWindow {
@@ -391,8 +402,8 @@ function boundedHeaders(input: unknown): { name: string; value: string }[] {
 }
 
 function headersAreComplete(input: unknown): boolean {
-  if (!Array.isArray(input) || input.length > 8) return false;
-  const allowed = new Set(['subject', 'from', 'reply-to', 'to', 'cc', 'message-id', 'references', 'in-reply-to']);
+  if (!Array.isArray(input) || input.length > 9) return false;
+  const allowed = new Set(['subject', 'from', 'reply-to', 'to', 'cc', 'message-id', 'references', 'in-reply-to', 'date']);
   return input.every((item) => {
     if (!item || typeof item !== 'object') return false;
     const header = item as { name?: unknown; value?: unknown };
@@ -483,8 +494,59 @@ function safeSizeEstimate(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 }
 
+const CONVERSATION_HEADERS = ['From', 'Sender', 'Reply-To', 'To', 'Cc', 'Subject', 'Message-ID', 'References', 'In-Reply-To', 'Date'] as const;
+const CONVERSATION_HEADER_NAMES = new Set(CONVERSATION_HEADERS.map((name) => name.toLowerCase()));
+
+function conversationTimestamp(value: unknown): string | undefined {
+  if (typeof value !== 'string' || value.length > 128 || /[\r\n\0]/.test(value)) return undefined;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : undefined;
+}
+
+function conversationHeaders(value: unknown): { headers: { name: string; value: string }[]; values: Map<string, string>; malformed: boolean } {
+  const headers: { name: string; value: string }[] = [];
+  const values = new Map<string, string>();
+  let malformed = !Array.isArray(value);
+  if (!Array.isArray(value)) return { headers, values, malformed };
+  for (const item of value) {
+    if (!isRecord(item) || typeof item.name !== 'string') { malformed = true; continue; }
+    const name = item.name.trim().toLowerCase();
+    if (!CONVERSATION_HEADER_NAMES.has(name)) continue;
+    if (typeof item.value !== 'string' || item.value.length > 2000 || /[\r\n\0]/.test(item.value) || values.has(name)) { malformed = true; continue; }
+    values.set(name, item.value);
+    headers.push({ name, value: item.value });
+  }
+  return { headers, values, malformed };
+}
+
+function sortedConversationMessages(messages: MessageSummary[]): MessageSummary[] {
+  return [...messages].sort((left, right) => {
+    const leftTime = left.receivedAt ? Date.parse(left.receivedAt) : NaN;
+    const rightTime = right.receivedAt ? Date.parse(right.receivedAt) : NaN;
+    if (Number.isFinite(leftTime) && Number.isFinite(rightTime) && leftTime !== rightTime) return leftTime - rightTime;
+    if (Number.isFinite(leftTime) !== Number.isFinite(rightTime)) return Number.isFinite(leftTime) ? -1 : 1;
+    return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
+  });
+}
+
+function graphConversationCursor(raw: string, threadId: string): URL {
+  const expectedFilter = `conversationId eq '${threadId.replace(/'/g, "''")}'`;
+  const url = safeUrl(raw, 'microsoft', 'mail', `${GRAPH_API}/me/messages`);
+  const keys = [...url.searchParams.keys()];
+  if (new Set(keys).size !== keys.length || url.searchParams.get('$filter') !== expectedFilter ||
+      url.searchParams.get('$select') !== 'id,conversationId,changeKey,subject,from,sender,receivedDateTime,sentDateTime,internetMessageId,isDraft,parentFolderId' ||
+      url.searchParams.get('$top') !== String(MAX_CONVERSATION_PAGE_SIZE) ||
+      keys.some((key) => !['$filter', '$select', '$top', '$skiptoken', '$skip'].includes(key)) ||
+      (url.searchParams.has('$skip') && url.searchParams.has('$skiptoken')) ||
+      (url.searchParams.has('$skip') && !/^\d+$/.test(url.searchParams.get('$skip')!)) ||
+      (url.searchParams.has('$skiptoken') && !url.searchParams.get('$skiptoken'))) {
+    throw new Error('Graph conversation cursor does not match the selected conversation query.');
+  }
+  return url;
+}
+
 function selectedHeaderSet(value: unknown): { headers: { name: string; value: string }[]; complete: boolean } {
-  const allowed = new Set(['subject', 'from', 'reply-to', 'to', 'cc', 'message-id', 'references', 'in-reply-to']);
+  const allowed = new Set(['subject', 'from', 'reply-to', 'to', 'cc', 'message-id', 'references', 'in-reply-to', 'date']);
   if (!Array.isArray(value)) return { headers: [], complete: false };
   const headers: { name: string; value: string }[] = [];
   const seen = new Set<string>();
@@ -493,12 +555,12 @@ function selectedHeaderSet(value: unknown): { headers: { name: string; value: st
     if (!isRecord(item) || typeof item.name !== 'string') { complete = false; continue; }
     const name = item.name.trim().toLowerCase();
     if (!allowed.has(name)) continue;
-    if (typeof item.value !== 'string' || /[\r\n\0]/.test(item.value) || item.value.length > 2000) { complete = false; continue; }
-    if (seen.has(name)) complete = false;
+    if (typeof item.value !== 'string' || /[\r\n\0]/.test(item.value) || item.value.length > 2000) { if (name !== 'date') complete = false; continue; }
+    if (seen.has(name)) { if (name !== 'date') complete = false; continue; }
     seen.add(name);
     headers.push({ name, value: item.value });
   }
-  if (headers.length > 8) complete = false;
+  if (headers.length > 9) complete = false;
   return { headers, complete: complete && headersAreComplete(headers) };
 }
 
@@ -524,8 +586,9 @@ function gmailSelectedSummary(value: unknown, requestedId: string, checkedAt: st
     headers.complete && labelsKnown && sizeEstimate !== undefined && receivedAt && addressHeaders.every((header) => validAddressHeader(header.value)) &&
     (get('reply-to') === undefined || replyTo !== undefined) && (get('to') === undefined || to !== undefined) && (get('cc') === undefined || cc !== undefined));
   const summary: MessageSummary = { id: requestedId, idFormat: 'gmail', threadId, subject, from: from?.slice(0, 1000), senderEmail,
-    receivedAt, snippet: typeof value.snippet === 'string' ? value.snippet.slice(0, 500) : undefined,
+    receivedAt, sentAt: conversationTimestamp(get('date')), snippet: typeof value.snippet === 'string' ? value.snippet.slice(0, 500) : undefined,
     isRead: labelsKnown ? !(value.labelIds as string[]).includes('UNREAD') : undefined,
+    isDraft: labelsKnown ? (value.labelIds as string[]).includes('DRAFT') : undefined,
     replyMetadataComplete, internetMessageId, providerVersion, sizeEstimate, sizeCheckedAt: checkedAt,
     replyTo, to, cc, references: get('references'), inReplyTo: get('in-reply-to'), headers: headers.headers };
   return { message: summary, payload: value.payload, snippet: summary.snippet };
@@ -546,7 +609,8 @@ function graphSelectedSummary(value: unknown, requestedId: string): { message?: 
   const replyMetadataComplete = Boolean(threadId && providerVersion && receivedAt && subject !== undefined && senderEmail && internetMessageId && validMessageId(internetMessageId) &&
     headers.complete && replyTo.complete && to.complete && cc.complete && typeof value.isRead === 'boolean');
   const summary: MessageSummary = { id: requestedId, idFormat: 'graph-immutable', threadId, subject, from, senderEmail, isRead: typeof value.isRead === 'boolean' ? value.isRead : undefined,
-    receivedAt, snippet: typeof value.bodyPreview === 'string' ? value.bodyPreview.slice(0, 500) : undefined, replyMetadataComplete,
+    isDraft: typeof value.isDraft === 'boolean' ? value.isDraft : undefined,
+    receivedAt, sentAt: conversationTimestamp(value.sentDateTime), snippet: typeof value.bodyPreview === 'string' ? value.bodyPreview.slice(0, 500) : undefined, replyMetadataComplete,
     internetMessageId, providerVersion, replyTo: replyTo.addresses, to: to.addresses, cc: cc.addresses,
     references: headerMap.get('references'), inReplyTo: headerMap.get('in-reply-to'), headers: headers.headers };
   return { message: summary, body: isRecord(value.body) ? { contentType: value.body.contentType, content: value.body.content } : undefined, snippet: summary.snippet };
@@ -697,7 +761,7 @@ export class ConnectorClient {
     if (!allowTokenRefresh) throw new ProviderAccessTokenUnavailableError();
     if (!token.refreshToken) return this.reauth(account, 'reauth_required', 'Provider rejected the access token.');
     const refreshed = await this.refreshSingleflight(account, token, guard, true, signal);
-    return this.requestWithToken(url, refreshed, init, guard, signal, account.provider === 'microsoft' && kind === 'mail');
+    return this.requestWithToken(url, refreshed, init, guard, signal, account.provider === 'microsoft' && kind === 'mail', responseByteLimit);
   }
 
   private async refreshSingleflight(account: Account, token: StoredOAuthToken, guard?: RequestGuard, force = false, signal?: AbortSignal): Promise<StoredOAuthToken> {
@@ -720,15 +784,15 @@ export class ConnectorClient {
     finally { if (locks.get(lockKey) === operation) locks.delete(lockKey); }
   }
 
-  private async requestWithToken(url: URL, token: StoredOAuthToken, init: RequestInit, guard?: RequestGuard, signal?: AbortSignal, immutableMailId = false): Promise<Response> {
+  private async requestWithToken(url: URL, token: StoredOAuthToken, init: RequestInit, guard?: RequestGuard, signal?: AbortSignal, immutableMailId = false, responseByteLimit?: number): Promise<Response> {
     const headers = new Headers(init.headers);
-    if (immutableMailId && url.origin === GRAPH_API) {
+    if (immutableMailId && url.origin === new URL(GRAPH_API).origin) {
       const immutable = graphImmutableHeaders({ ...init, headers });
       immutable.set('authorization', `Bearer ${token.accessToken}`);
-      return this.boundedFetch(url.toString(), { ...init, redirect: 'error', headers: immutable }, guard, undefined, undefined, signal);
+      return this.boundedFetch(url.toString(), { ...init, redirect: 'error', headers: immutable }, guard, undefined, undefined, signal, responseByteLimit);
     }
     headers.set('authorization', `Bearer ${token.accessToken}`);
-    return this.boundedFetch(url.toString(), { ...init, redirect: 'error', headers }, guard, undefined, undefined, signal);
+    return this.boundedFetch(url.toString(), { ...init, redirect: 'error', headers }, guard, undefined, undefined, signal, responseByteLimit);
   }
 
   private async json<T>(account: Account, url: string, kind: 'mail' | 'calendar', init?: RequestInit, guard?: RequestGuard, signal?: AbortSignal, allowTokenRefresh = true): Promise<T> {
@@ -736,6 +800,146 @@ export class ConnectorClient {
     if (!response.ok) throw new ProviderHttpError(response.status);
     try { return await response.json() as T; }
     catch { throw new Error('Provider returned an invalid JSON response.'); }
+  }
+
+  private async boundedJson<T>(account: Account, url: string, guard?: RequestGuard, signal?: AbortSignal): Promise<T> {
+    const response = await this.request(account, url, 'mail', { method: 'GET' }, true, guard, undefined, signal, undefined, MAX_CONVERSATION_RESPONSE_BYTES);
+    if (!response.ok) throw new ProviderHttpError(response.status);
+    try { return await response.json() as T; }
+    catch { throw new Error('Provider returned an invalid conversation response.'); }
+  }
+
+  /** Reads one bounded metadata-only page of a selected conversation. Gmail returns the thread in one response. */
+  async listConversationMessages(account: Account, options: {
+    threadId: string; cursor?: string; guard?: RequestGuard; signal?: AbortSignal;
+  }): Promise<ConversationMessagesResult> {
+    capability(account, 'mail.read');
+    accountIdentity(account);
+    const threadId = options.threadId;
+    if (typeof threadId !== 'string' || !threadId || threadId.length > 512 || /[\u0000-\u001f\u007f]/.test(threadId)) {
+      throw new Error('Conversation identifier is invalid.');
+    }
+    let requestUrl: string;
+    let graphFilter: string | undefined;
+    if (account.provider === 'google') {
+      if (options.cursor !== undefined) throw new Error('Gmail conversation discovery does not accept a cursor.');
+      const url = new URL(`${GOOGLE_API}/threads/${encodeURIComponent(threadId)}`);
+      url.searchParams.set('format', 'metadata');
+      for (const header of CONVERSATION_HEADERS) url.searchParams.append('metadataHeaders', header);
+      url.searchParams.set('fields', 'id,historyId,messages(id,threadId,historyId,sizeEstimate,internalDate,labelIds,snippet,payload(headers))');
+      requestUrl = url.toString();
+    } else {
+      graphFilter = `conversationId eq '${threadId.replace(/'/g, "''")}'`;
+      if (options.cursor !== undefined) { graphConversationCursor(options.cursor, threadId); requestUrl = options.cursor; }
+      else {
+        const url = new URL(`${GRAPH_API}/me/messages`);
+        url.searchParams.set('$filter', graphFilter);
+        url.searchParams.set('$select', 'id,conversationId,changeKey,subject,from,sender,receivedDateTime,sentDateTime,internetMessageId,isDraft,parentFolderId');
+        url.searchParams.set('$top', String(MAX_CONVERSATION_PAGE_SIZE));
+        requestUrl = url.toString();
+      }
+    }
+
+    const data = await this.boundedJson<unknown>(account, requestUrl, options.guard, options.signal);
+    this.assertConnectionCurrent(account);
+    options.guard?.();
+    const messages: MessageSummary[] = [];
+    const omissionCounts = new Map<string, number>();
+    const omit = (reason: string) => omissionCounts.set(reason, (omissionCounts.get(reason) ?? 0) + 1);
+    const seen = new Set<string>();
+    let nextCursor: string | undefined;
+    let rows: unknown[];
+
+    if (account.provider === 'google') {
+      if (!isRecord(data)) throw new Error('Gmail returned an invalid conversation response.');
+      if (data.id !== undefined && data.id !== threadId) throw new Error('Gmail returned a different conversation.');
+      if (data.id === undefined) omit('conversation_id_unknown');
+      if (!Array.isArray(data.messages)) {
+        omit('messages_missing_or_invalid');
+        rows = [];
+      } else rows = data.messages;
+    } else {
+      if (!isRecord(data)) throw new Error('Graph returned an invalid conversation response.');
+      if (data.value !== undefined && !Array.isArray(data.value)) throw new Error('Graph returned an invalid conversation page.');
+      rows = Array.isArray(data.value) ? data.value : [];
+      if (!Array.isArray(data.value)) omit('messages_missing_or_invalid');
+      if (typeof data['@odata.nextLink'] === 'string') {
+        graphConversationCursor(data['@odata.nextLink'], threadId);
+        nextCursor = data['@odata.nextLink'];
+        omit('more_messages_available');
+      } else if (data['@odata.nextLink'] !== undefined) omit('invalid_continuation');
+      if (rows.length > MAX_CONVERSATION_PAGE_SIZE) {
+        omit(`rows_over_page_limit:${rows.length - MAX_CONVERSATION_PAGE_SIZE}`);
+        rows = rows.slice(0, MAX_CONVERSATION_PAGE_SIZE);
+      }
+    }
+
+    for (const row of rows) {
+      if (!isRecord(row) || typeof row.id !== 'string' || !row.id || row.id.length > 2048 || /[\u0000-\u001f\u007f]/.test(row.id)) {
+        omit('malformed_message_rows');
+        continue;
+      }
+      if (seen.has(row.id)) throw new Error('Provider returned duplicate conversation message IDs.');
+      seen.add(row.id);
+      const rowThreadId = account.provider === 'google' ? row.threadId : row.conversationId;
+      if (typeof rowThreadId !== 'string' || !rowThreadId) { omit('message_conversation_id_missing'); continue; }
+      if (rowThreadId !== threadId) throw new Error('Provider returned a message from a different conversation.');
+
+      let summary: MessageSummary;
+      if (account.provider === 'google') {
+        const payloadHeaders = isRecord(row.payload) ? row.payload.headers : undefined;
+        const parsed = conversationHeaders(payloadHeaders);
+        if (parsed.malformed) omit('malformed_message_headers');
+        const get = (name: string) => parsed.values.get(name);
+        const labelsKnown = Array.isArray(row.labelIds) && row.labelIds.every((label) => typeof label === 'string');
+        if (!labelsKnown) omit('draft_state_unknown');
+        const internalDate = typeof row.internalDate === 'string' && /^\d{1,16}$/.test(row.internalDate) ? Number(row.internalDate) : NaN;
+        const receivedAt = Number.isFinite(internalDate) && Number.isFinite(new Date(internalDate).getTime()) ? new Date(internalDate).toISOString() : undefined;
+        const from = get('from');
+        const sender = get('sender');
+        const labels = labelsKnown ? row.labelIds as string[] : [];
+        summary = {
+          id: row.id, idFormat: 'gmail', threadId, subject: get('subject')?.slice(0, 1000),
+          from: from?.slice(0, 1000), senderEmail: narrowEmail(sender ?? from), isRead: labelsKnown ? !labels.includes('UNREAD') : undefined,
+          isDraft: labelsKnown ? labels.includes('DRAFT') : undefined, receivedAt, sentAt: conversationTimestamp(get('date')),
+          snippet: typeof row.snippet === 'string' ? row.snippet.slice(0, 500) : undefined,
+          internetMessageId: get('message-id'), providerVersion: typeof row.historyId === 'string' ? row.historyId : undefined,
+          sizeEstimate: safeSizeEstimate(row.sizeEstimate), replyTo: parseAddressHeader(get('reply-to')),
+          to: parseAddressHeader(get('to')), cc: parseAddressHeader(get('cc')), references: get('references'), inReplyTo: get('in-reply-to'),
+          headers: parsed.headers, replyMetadataComplete: false,
+        };
+        if (!receivedAt) omit('received_date_unknown');
+        if (row.snippet !== undefined && typeof row.snippet !== 'string') omit('malformed_snippet');
+        if (row.historyId !== undefined && typeof row.historyId !== 'string') omit('malformed_provider_version');
+        if (row.sizeEstimate !== undefined && safeSizeEstimate(row.sizeEstimate) === undefined) omit('malformed_size_estimate');
+      } else {
+        if (typeof row.isDraft !== 'boolean') omit('draft_state_unknown');
+        if (row.subject !== undefined && typeof row.subject !== 'string') omit('malformed_subject');
+        if (row.from !== undefined && (!isRecord(row.from) || !isRecord(row.from.emailAddress) || typeof row.from.emailAddress.address !== 'string')) omit('malformed_from');
+        if (row.sender !== undefined && (!isRecord(row.sender) || !isRecord(row.sender.emailAddress) || typeof row.sender.emailAddress.address !== 'string')) omit('malformed_sender');
+        if (row.internetMessageId !== undefined && typeof row.internetMessageId !== 'string') omit('malformed_message_id');
+        if (row.changeKey !== undefined && typeof row.changeKey !== 'string') omit('malformed_provider_version');
+        const fromValue = isRecord(row.from) && isRecord(row.from.emailAddress) ? row.from.emailAddress.address : undefined;
+        const senderValue = isRecord(row.sender) && isRecord(row.sender.emailAddress) ? row.sender.emailAddress.address : undefined;
+        const receivedAt = conversationTimestamp(row.receivedDateTime);
+        const sentAt = conversationTimestamp(row.sentDateTime);
+        summary = {
+          id: row.id, idFormat: 'graph-immutable', threadId, subject: typeof row.subject === 'string' ? row.subject.slice(0, 1000) : undefined,
+          from: typeof fromValue === 'string' ? fromValue.slice(0, 1000) : undefined,
+          senderEmail: narrowEmail(senderValue ?? fromValue), isDraft: typeof row.isDraft === 'boolean' ? row.isDraft : undefined,
+          receivedAt, sentAt, internetMessageId: typeof row.internetMessageId === 'string' ? row.internetMessageId.slice(0, 998) : undefined,
+          providerVersion: typeof row.changeKey === 'string' ? row.changeKey.slice(0, 512) : undefined,
+          replyMetadataComplete: false,
+        };
+        if (!receivedAt) omit('received_date_unknown');
+        if (!sentAt) omit('sent_date_unknown');
+      }
+      messages.push(summary);
+    }
+
+    const omissionReasons = [...omissionCounts].map(([reason, count]) => count === 1 ? reason : `${reason}:${count}`);
+    return { messages: sortedConversationMessages(messages), ...(nextCursor ? { nextCursor } : {}),
+      coverage: omissionReasons.length ? 'partial' : 'complete_metadata', omissionReasons };
   }
 
   /** Reads exactly one hydrated INBOX page for a fixed half-open time window. */
@@ -929,7 +1133,7 @@ export class ConnectorClient {
     }
 
     const graphUrl = new URL(`${GRAPH_API}/me/messages/${encodeURIComponent(providerMessageId)}`);
-    graphUrl.searchParams.set('$select', 'id,conversationId,changeKey,subject,body,bodyPreview,from,replyTo,toRecipients,ccRecipients,internetMessageId,internetMessageHeaders,isRead,receivedDateTime');
+    graphUrl.searchParams.set('$select', 'id,conversationId,changeKey,subject,body,bodyPreview,from,replyTo,toRecipients,ccRecipients,internetMessageId,internetMessageHeaders,isRead,receivedDateTime,isDraft,sentDateTime');
     let graphResponse: Response;
     try {
       graphResponse = await this.request(account, graphUrl.toString(), 'mail', { method: 'GET', headers: { prefer: 'IdType="ImmutableId", outlook.body-content-type="text"' } }, false,

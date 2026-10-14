@@ -173,6 +173,43 @@ describe('provider connector clients', () => {
     expect(store.set).toHaveBeenCalledTimes(1);
   });
 
+  it('keeps the conversation metadata byte cap on a GET retried after token refresh', async () => {
+    let resourceCalls = 0;
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/token')) return response({ access_token: 'new-access', expires_in: 3600 });
+      if (url.includes('/userinfo')) return response({ sub: tokenIdentity.subject });
+      resourceCalls++;
+      if (resourceCalls === 1) return response({ error: 'expired' }, 401);
+      return new Response('{}', { status: 200, headers: { 'content-length': String(1024 * 1024 + 1) } });
+    }) as typeof fetch;
+    const { client } = fixture({ fetcher });
+    await expect(client.listConversationMessages(account, { threadId: 'thread-selected' })).rejects.toThrow(/response bound/i);
+    expect(resourceCalls).toBe(2);
+    expect(fetcher).toHaveBeenCalledTimes(4);
+  });
+
+  it('preserves immutable Graph message IDs on a conversation metadata GET retried after token refresh', async () => {
+    const graphPreferences: string[] = [];
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/token')) return response({ access_token: 'new-access', expires_in: 3600 });
+      if (url.includes('/userinfo')) return response({ sub: microsoftIdentity.subject });
+      if (url.includes('/v1.0/me?')) return response({ id: microsoftIdentity.resourceUserId });
+      if (url.includes('/v1.0/me/messages')) {
+        graphPreferences.push(new Headers(init?.headers).get('prefer') ?? '');
+        if (graphPreferences.length === 1) return response({ error: 'expired' }, 401);
+        return response({ value: [] });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    }) as typeof fetch;
+    const { store } = fixture({ token: token({ identity: microsoftIdentity }), fetcher });
+    const client = new ConnectorClient({ tokenStore: store, fetcher, microsoftClientId: 'test-ms-client', microsoftAuthority: 'common' });
+    await client.listConversationMessages(microsoftAccount, { threadId: 'conversation-selected' });
+    expect(graphPreferences).toHaveLength(2);
+    expect(graphPreferences.every((value) => value.includes('IdType="ImmutableId"'))).toBe(true);
+  });
+
   it('re-reads the secure store after a slow stale read before rotating a refresh token', async () => {
     let stored = token({ expiresAt: 0 });
     let reads = 0;
@@ -292,16 +329,26 @@ describe('provider connector clients', () => {
 
   it('loads a selected Gmail message once from a fresh bounded estimate and returns full-text metadata', async () => {
     const requested: URL[] = [];
-    const fetcher = vi.fn(async (input: RequestInfo | URL) => { const url = new URL(String(input)); requested.push(url); return response(gmailSelectedMessage()); }) as typeof fetch;
+    const sentAt = 'Mon, 12 Oct 2026 09:30:00 +0000';
+    const selected = gmailSelectedMessage();
+    selected.payload.headers.push({ name: 'Date', value: sentAt });
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => { const url = new URL(String(input)); requested.push(url); return response(selected); }) as typeof fetch;
     const { client } = fixture({ fetcher });
     const result = await client.readSelectedMessageText(account, 'gmail-selected', { sizeEstimate: 1234, sizeCheckedAt: new Date(Date.now() - 1000).toISOString() });
     expect(result).toMatchObject({ status: 'available', text: 'Selected message body', bytes: 21, representation: 'plain', completeness: 'complete_text', extractionVersion: 'mail-text-v2' });
-    expect(result.message).toMatchObject({ id: 'gmail-selected', idFormat: 'gmail', threadId: 'thread-selected', providerVersion: 'history-7', sizeEstimate: 1234, replyMetadataComplete: true });
+    expect(result.message).toMatchObject({ id: 'gmail-selected', idFormat: 'gmail', threadId: 'thread-selected', providerVersion: 'history-7', sizeEstimate: 1234, sentAt: new Date(sentAt).toISOString(), replyMetadataComplete: true });
     expect(requested).toHaveLength(1);
     expect(requested[0].searchParams.get('format')).toBe('full');
     expect(requested[0].searchParams.get('fields')).toContain('historyId,sizeEstimate');
+    expect(requested[0].searchParams.get('fields')).toContain('payload(');
     expect(requested[0].searchParams.get('fields')).toContain('attachmentId');
     expect(requested[0].searchParams.get('fields')?.match(/parts\(/g)?.length).toBe(12);
+  });
+
+  it('keeps Gmail reply eligibility when the optional Date header is absent', async () => {
+    const { client } = fixture({ fetcher: vi.fn(async () => response(gmailSelectedMessage())) as typeof fetch });
+    const result = await client.readSelectedMessageText(account, 'gmail-selected', { sizeEstimate: 1234, sizeCheckedAt: new Date().toISOString() });
+    expect(result).toMatchObject({ status: 'available', message: { sentAt: undefined, replyMetadataComplete: true } });
   });
 
   it('ignores unrelated malformed or long headers while still rejecting malformed selected headers', async () => {
@@ -409,13 +456,14 @@ describe('provider connector clients', () => {
   it('reads one Graph selected message with both preferences and full-body scope, then uses explicit snippet fallback for HTML', async () => {
     let requestedUrl = '';
     let prefer = '';
-    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => { requestedUrl = String(input); prefer = new Headers(init?.headers).get('prefer') ?? ''; return response(graphSelectedMessage()); }) as typeof fetch;
+    const sentAt = '2026-10-12T09:30:00Z';
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => { requestedUrl = String(input); prefer = new Headers(init?.headers).get('prefer') ?? ''; return response(graphSelectedMessage('AAMk-selected==', 'Selected Graph body', { isDraft: true, sentDateTime: sentAt })); }) as typeof fetch;
     const { client } = fixture({ fetcher, token: token({ identity: microsoftIdentity }) });
     const result = await client.readSelectedMessageText(microsoftAccount, 'AAMk-selected==');
     expect(result).toMatchObject({ status: 'available', text: 'Selected Graph body', representation: 'plain', completeness: 'complete_text', extractionVersion: 'mail-text-v2' });
-    expect(result.message).toMatchObject({ id: 'AAMk-selected==', idFormat: 'graph-immutable', providerVersion: 'change-7', replyMetadataComplete: true });
+    expect(result.message).toMatchObject({ id: 'AAMk-selected==', idFormat: 'graph-immutable', providerVersion: 'change-7', isDraft: true, sentAt: new Date(sentAt).toISOString(), replyMetadataComplete: true });
     expect(requestedUrl).toContain('/me/messages/AAMk-selected%3D%3D?');
-    expect(new URL(requestedUrl).searchParams.get('$select')).toBe('id,conversationId,changeKey,subject,body,bodyPreview,from,replyTo,toRecipients,ccRecipients,internetMessageId,internetMessageHeaders,isRead,receivedDateTime');
+    expect(new URL(requestedUrl).searchParams.get('$select')).toBe('id,conversationId,changeKey,subject,body,bodyPreview,from,replyTo,toRecipients,ccRecipients,internetMessageId,internetMessageHeaders,isRead,receivedDateTime,isDraft,sentDateTime');
     expect(prefer).toContain('IdType="ImmutableId"');
     expect(prefer).toContain('outlook.body-content-type="text"');
     expect(fetcher).toHaveBeenCalledTimes(1);
