@@ -5,11 +5,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MailReplyBatchReviewPlan } from '../src/core';
 import type { AssistantBatchJobDTO } from '../src/services/openRouterBatchJobs';
 import { MailReplyBatchSection } from '../src/ui/MailReplyBatchSection';
+import type { MoreComputeReviewActions } from '../src/ui/MoreComputeReview';
 
 vi.mock('react-native', async () => {
   const ReactModule = await import('react');
   const view = (tag: string) => ({ children, ...props }: Record<string, unknown> & { children?: React.ReactNode }) => ReactModule.createElement(tag, props, children);
-  return { Text: view('span'), View: view('div') };
+  return { Modal: ({ visible, children }: { visible: boolean; children?: React.ReactNode }) => visible ? ReactModule.createElement('div', { role: 'dialog' }, children) : null, ScrollView: view('div'), Text: view('span'), View: view('div') };
 });
 vi.mock('../src/ui/primitives', async () => {
   const ReactModule = await import('react');
@@ -143,7 +144,7 @@ describe('MailReplyBatchSection', () => {
       new Promise<{ status: 'current'; jobId: string; checkedAt: string; expiresAt: string; sources: [] }>((resolve) => { resolveRefresh = resolve; }));
     const getSourcesStatus = vi.fn(() => ({ status: 'refresh_required' as const }));
     render({
-      jobs: [job('job-a', 'message-a'), job('completed-job', 'message-a', { status: 'completed', canCheck: false, proposalId: 'proposal-1', mailReplyContextCount: 2 })],
+      jobs: [job('job-a', 'message-a'), job('truncated-context-job', 'message-a', { status: 'result_truncated', canCheck: false, mailReplyContextCount: 2, canRecoverMoreCompute: true })],
       checkReady: false,
       onRefreshSources,
       getSourcesStatus,
@@ -154,10 +155,36 @@ describe('MailReplyBatchSection', () => {
     expect(refresh.disabled).toBe(false);
     act(() => { refresh.click(); refresh.click(); });
     expect(onRefreshSources).toHaveBeenCalledOnce();
-    expect(onRefreshSources.mock.calls[0].slice(0, 2)).toEqual(['completed-job', { messageId: 'message-a', generation: 1 }]);
+    expect(onRefreshSources.mock.calls[0].slice(0, 2)).toEqual(['truncated-context-job', { messageId: 'message-a', generation: 1 }]);
     expect(onRefreshSources.mock.calls[0][2]()).toBe(true);
     expect([...host.querySelectorAll('button')].find((item) => item.textContent === 'Refreshing selected sources…')?.disabled).toBe(true);
-    await act(async () => { resolveRefresh({ status: 'current', jobId: 'completed-job', checkedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(), sources: [] }); await Promise.resolve(); });
+    await act(async () => { resolveRefresh({ status: 'current', jobId: 'truncated-context-job', checkedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(), sources: [] }); await Promise.resolve(); });
     expect(host.textContent).toContain('Selected conversation sources were checked.');
+  });
+
+  it('requires an explicit source refresh before preparing higher reasoning for an unactivated truncated context job', () => {
+    const onPrepare = vi.fn();
+    const moreCompute: MoreComputeReviewActions = {
+      ownerKey: 'mail-owner', blocked: false, submitReady: false,
+      onPrepare, onSubmit: vi.fn(), onCancel: vi.fn(),
+    };
+    render({
+      jobs: [job('truncated-job', 'message-a', { status: 'result_truncated', canCheck: false, mailReplyContextCount: 2, canRecoverMoreCompute: true, moreComputeEfforts: ['high'] })],
+      moreComputeActions: moreCompute,
+      onRefreshSources: vi.fn(async (_jobId: string, _owner: { messageId: string; generation: number }, _isCurrent: () => boolean) => undefined),
+      getSourcesStatus: () => ({ status: 'refresh_required' }),
+    });
+    const prepare = [...host.querySelectorAll('button')].find((button) => button.textContent === 'Review higher High')!;
+    expect(prepare.disabled).toBe(true);
+    expect(host.textContent).toContain('Refresh the selected conversation sources before reviewing higher reasoning.');
+    expect([...host.querySelectorAll('button')].find((button) => button.textContent === 'Refresh selected sources')?.disabled).toBe(false);
+    expect(onPrepare).not.toHaveBeenCalled();
+  });
+
+  it('explains a terminal truncated mail response at max and offers no paid recovery action', () => {
+    render({ jobs: [job('max-cutoff', 'message-a', { status: 'result_truncated', canCheck: false, effort: 'max', canRecoverMoreCompute: false, moreComputeEfforts: [] })] });
+    expect(host.textContent).toContain('Provider response was cut off; no output applied');
+    expect(host.textContent).toContain('No higher supported reasoning setting is available');
+    expect([...host.querySelectorAll('button')].some((button) => button.textContent?.includes('Review higher'))).toBe(false);
   });
 });

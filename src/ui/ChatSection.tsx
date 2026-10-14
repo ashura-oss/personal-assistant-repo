@@ -7,6 +7,7 @@ import { Button } from './primitives';
 import { isAcceptedChatSubmission } from './chatSubmission';
 import { chatMemoryReviewSuggestionIds } from './chatMemoryReview';
 import { C, s } from './theme';
+import type { MoreComputeReviewActions } from './MoreComputeReview';
 
 export type ChatConversation = ChatConversationDTO;
 export type ChatTurn = ChatTurnDTO;
@@ -22,6 +23,7 @@ type ChatRefinementReview = ChatRefinementRequest & Readonly<{ generation: numbe
 export type ChatSectionProps = {
   conversations: readonly ChatConversation[];
   selectedConversationId?: string;
+  focusTurnId?: string;
   turns: readonly ChatTurn[];
   busy: boolean;
   enabled: boolean;
@@ -40,6 +42,7 @@ export type ChatSectionProps = {
   onRetryJobCleanup: (jobId: string) => Promise<unknown> | unknown;
   onRefineTurn?: (request: ChatRefinementRequest) => Promise<unknown>;
   onReviewMemorySuggestion?: (suggestionId: string, conversation: ChatConversation, turn: ChatTurn) => void;
+  moreComputeActions?: MoreComputeReviewActions;
 };
 
 function dateLabel(value: string) {
@@ -120,6 +123,7 @@ function SuggestedActionsButton({
 export function ChatSection({
   conversations,
   selectedConversationId,
+  focusTurnId,
   turns,
   busy,
   enabled,
@@ -138,6 +142,7 @@ export function ChatSection({
   onRetryJobCleanup,
   onRefineTurn,
   onReviewMemorySuggestion,
+  moreComputeActions,
 }: ChatSectionProps) {
   const [draft, setDraft] = useState('');
   const [sending, setSending] = useState(false);
@@ -155,6 +160,7 @@ export function ChatSection({
   const deleteOperationLock = useRef(false);
   const refinementLock = useRef(false);
   const refinementReviewLock = useRef(false);
+  const messagesScrollRef = useRef<ScrollView | null>(null);
   const refinementReviewRef = useRef<ChatRefinementReview | undefined>(undefined);
   const refinementGeneration = useRef(0);
   const mounted = useRef(true);
@@ -164,6 +170,9 @@ export function ChatSection({
   const trimmedDraft = draft.trim();
   const navigationBlocked = busy || sending || deleting || refining || deleteReviewOpen || Boolean(refinementReview) || reviewBlocked || Boolean(recoveryMessage);
   const selectedConversation = conversations.find((conversation) => conversation.id === selectedConversationId);
+  useEffect(() => {
+    if (focusTurnId && turns.some((turn) => turn.id === focusTurnId)) messagesScrollRef.current?.scrollToEnd({ animated: true });
+  }, [focusTurnId, turns]);
   const reviewedParent = refinementReview && conversations.find((conversation) => conversation.id === refinementReview.conversationId)
     ?.turns.find((turn) => turn.id === refinementReview.parentTurnId);
   const refinementContextRef = useRef({ conversations, selectedConversationId, reviewBlocked, recoveryMessage, enabled });
@@ -376,7 +385,7 @@ export function ChatSection({
 
   return (
     <KeyboardAvoidingView style={styles.container} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-      <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
+      <ScrollView ref={messagesScrollRef} contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
         <View style={styles.heading}>
           <View style={{ flex: 1 }}>
             <Text style={s.kicker}>STILL</Text>
@@ -459,6 +468,7 @@ export function ChatSection({
                   blocked={Boolean(recoveryMessage)}
                   onCheck={onCheckJob}
                   onRetryCleanup={onRetryJobCleanup}
+                  moreCompute={moreComputeActions && selectedConversation ? { ...moreComputeActions, ownerKey: JSON.stringify(['chat', selectedConversation.id, turn.id, turn.job.id, turn.job.updatedAt, turn.job.status, moreComputeActions.ownerKey]) } : undefined}
                 />
               ) : null}
               {turn.noteId && turn.operation !== 'chat_refinement' ? (

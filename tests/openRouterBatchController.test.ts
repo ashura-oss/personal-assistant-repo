@@ -160,6 +160,19 @@ function completedInspection(customId: string, content = JSON.stringify({
   };
 }
 
+function truncatedInspection(customId: string, batchId = 'batch_truncated_fixture'): OpenRouterBatchInspection {
+  return {
+    batchId, status: 'completed', endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH,
+    model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h', total: 1, completed: 1, failed: 0,
+    metadataValidation: 'valid', resultValidation: 'truncated',
+    usage: { cost: 0.002, promptTokens: 20, completionTokens: 50, totalTokens: 70 },
+    result: { customId, statusCode: 200, finishReason: 'length', responseBody: {
+      model: OPENROUTER_BATCH_BODY_MODEL,
+      choices: [{ index: 0, finish_reason: 'length', message: { role: 'assistant', content: 'INCOMPLETE PARTIAL OUTPUT' } }],
+    } },
+  };
+}
+
 describe('OpenRouter Batch controller lifecycle', () => {
   it('submits only opaque, explicitly consented conversation excerpts and refreshes every frozen source before activation', async () => {
     const posted: { operationId: string; requestBody: string }[] = [];
@@ -1273,6 +1286,613 @@ describe('OpenRouter Batch controller lifecycle', () => {
     expect(result).toMatchObject({ status: 'completed', providerReportedCostUsd: 0.001 });
     expect(app.getSnapshot().notes.find((item) => item.id === note.id)?.analysis?.answer).toBe('READY');
     expect(app.getSnapshot().proposals).toHaveLength(0);
+  });
+
+  it('prepares and submits a separate higher-effort Note request after a verified length cutoff', async () => {
+    const requests: { operationId: string; requestBody: string }[] = [];
+    let inspections = 0;
+    const fakeClient = {
+      submit: async (input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => {
+        await before(); assert(); requests.push(input);
+        return { batchId: `batch_more_compute_${requests.length}`, status: 'validating' as const, endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH,
+          model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h' as const, total: 1, completed: 0, failed: 0 };
+      },
+      inspect: async (batchId: string, customId: string) => { inspections += 1; return truncatedInspection(customId, batchId); },
+    } as unknown as OpenRouterBatchClient;
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient });
+    await app.load();
+    await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
+    const note = await app.saveNote({ transcript: 'A complete original user request for more compute.' });
+    const parent = await app.submitNoteBatch(note.id, { intent: 'answer', question: 'Answer from the saved note.' });
+    const cutoff = await app.refreshAssistantBatch(parent.id);
+    expect(cutoff).toMatchObject({ status: 'result_truncated', failureCode: 'result_truncated', providerReportedCostUsd: 0.002,
+      promptTokens: 20, completionTokens: 50, totalTokens: 70, canRecoverMoreCompute: true });
+    expect(cutoff).not.toHaveProperty('resultText');
+    expect(inspections).toBe(1);
+
+    const forgedPrepare = Object.assign({ jobId: parent.id, effort: 'high' as const }, { operation: 'send' });
+    await expect(app.prepareMoreCompute(forgedPrepare)).rejects.toThrow(/higher reasoning effort/i);
+    expect(requests).toHaveLength(1);
+    const plan = await app.prepareMoreCompute({ jobId: parent.id, effort: 'high' });
+    expect(plan.preview.userText).toBe(note.transcript);
+    expect(plan.warning).toContain('new paid Batch request');
+    expect(requests).toHaveLength(1);
+    const forgedSubmit = Object.assign({ planId: plan.planId }, { requestBody: 'caller-supplied' });
+    await expect(app.submitMoreCompute(forgedSubmit)).rejects.toThrow(/review is no longer current/i);
+    expect(requests).toHaveLength(1);
+    const child = await app.submitMoreCompute({ planId: plan.planId });
+    const submitted = JSON.parse(requests[1]!.requestBody) as { reasoning: { effort: string } };
+    expect(submitted.reasoning.effort).toBe('high');
+    expect(child).toMatchObject({ status: 'queued' });
+    expect((store.value as AppState & { openRouterBatchLedger: { jobs: { id: string; requestProfileVersion: number; recoveryBinding?: { parentJobId: string }; resultText?: string }[] } })
+      .openRouterBatchLedger.jobs.find((job) => job.id === child.id)).toMatchObject({ requestProfileVersion: 4, recoveryBinding: { parentJobId: parent.id } });
+    expect(requests).toHaveLength(2);
+    await expect(app.submitMoreCompute({ planId: plan.planId })).rejects.toThrow(/review is no longer current/i);
+    expect(requests).toHaveLength(2);
+    const reloaded = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient });
+    await reloaded.load();
+    expect(reloaded.getSnapshot().assistantBatchRecoveryStatus?.blocked).not.toBe(true);
+    await reloaded.deleteNote(note.id);
+    const retired = (store.value as AppState & { openRouterBatchLedger: { jobs: { id: string; status: string; sourceRemoved?: boolean;
+      requestBody?: string; accounting?: { providerReportedCostUsd?: number } }[] } }).openRouterBatchLedger.jobs;
+    expect(retired.filter((job) => job.id === parent.id || job.id === child.id)).toHaveLength(2);
+    expect(retired.filter((job) => job.id === parent.id || job.id === child.id).every((job) => job.status === 'source_removed' && job.sourceRemoved && !job.requestBody)).toBe(true);
+    expect(retired.find((job) => job.id === parent.id)?.accounting).toMatchObject({ providerReportedCostUsd: 0.002 });
+    expect(reloaded.getSnapshot().notes.some((item) => item.id === note.id)).toBe(false);
+    expect(JSON.stringify(store.value)).not.toContain('A complete original user request for more compute.');
+  });
+
+  it('keeps a recovered Chat turn and hidden note anchored to the original creation time when capture metadata is absent', async () => {
+    const requests: { operationId: string; requestBody: string }[] = [];
+    const fakeClient = {
+      submit: async (input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => {
+        await before(); assert(); requests.push(input);
+        return { batchId: `batch_chat_more_compute_${requests.length}`, status: 'validating' as const, endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH,
+          model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h' as const, total: 1, completed: 0, failed: 0 };
+      },
+      inspect: async (batchId: string, customId: string) => truncatedInspection(customId, batchId),
+    } as unknown as OpenRouterBatchClient;
+    const store = new MemoryStore();
+    let app = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient });
+    await app.load();
+    await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
+    const conversation = await app.createChatConversation('Recovery timeline');
+    const accepted = await app.submitChatTurn({ conversationId: conversation.id, text: 'Keep the original capture anchor.' });
+    const saved = store.value as AppState & {
+      assistantChatLedger: { conversations: { turns: { id: string; noteId: string; createdAt: string; capturedAt?: string; captureTimeZone?: string }[] }[] };
+      openRouterBatchLedger: { jobs: { id: string; capturedAt?: string }[] };
+    };
+    const parentTurn = saved.assistantChatLedger.conversations[0]!.turns[0]!;
+    delete parentTurn.capturedAt;
+    await store.save(saved);
+    app = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient });
+    await app.load();
+    const cutoff = await app.refreshAssistantBatch(accepted.jobId);
+    expect(cutoff.status).toBe('result_truncated');
+    const plan = await app.prepareMoreCompute({ jobId: accepted.jobId, effort: 'medium' });
+    expect(plan.preview.chat?.recoveryParentTurnId).toBe(accepted.turnId);
+    const child = await app.submitMoreCompute({ planId: plan.planId });
+    expect(child).toMatchObject({ recoveredConversationId: conversation.id, recoveredTurnId: expect.any(String), status: 'queued' });
+    const persisted = store.value as AppState & {
+      notes: { id: string; createdAt: string; capturedAt?: string; captureTimeZone?: string }[];
+      assistantChatLedger: { conversations: { turns: { id: string; noteId: string; createdAt: string; capturedAt?: string; captureTimeZone?: string; recoveryParentTurnId?: string }[] }[] };
+    };
+    const turns = persisted.assistantChatLedger.conversations[0]!.turns;
+    const recoveredTurn = turns.find((turn) => turn.id === child.recoveredTurnId)!;
+    const note = persisted.notes.find((item) => item.id === recoveredTurn.noteId)!;
+    expect(recoveredTurn).toMatchObject({ capturedAt: parentTurn.createdAt, captureTimeZone: parentTurn.captureTimeZone,
+      recoveryParentTurnId: accepted.turnId });
+    expect(note).toMatchObject({ capturedAt: parentTurn.createdAt, captureTimeZone: parentTurn.captureTimeZone });
+    expect(requests).toHaveLength(2);
+  });
+
+  it('recovers a truncated refinement as a higher-effort answer-only profile-4 child', async () => {
+    const requests: { operationId: string; requestBody: string }[] = [];
+    const fakeClient = {
+      submit: async (input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => {
+        await before(); assert(); requests.push(input);
+        return { batchId: `batch_refinement_recovery_${requests.length}`, status: 'validating' as const, endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH,
+          model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h' as const, total: 1, completed: 0, failed: 0 };
+      },
+      inspect: async (batchId: string, customId: string) => batchId.endsWith('_2') || batchId.endsWith('_3')
+        ? truncatedInspection(customId, batchId)
+        : { ...completedInspection(customId, JSON.stringify({ summary: 'A short revised summary.', answer: 'A complete revised answer.', decisions: [],
+            citations: [], clarifications: [], proposals: [], memorySuggestions: [] })), batchId },
+    } as unknown as OpenRouterBatchClient;
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient });
+    await app.load();
+    await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
+    const conversation = await app.createChatConversation('Cutoff refinement');
+    const first = await app.submitChatTurn({ conversationId: conversation.id, text: 'Keep the original request exact.' });
+    await app.refreshAssistantBatch(first.jobId);
+    const refinement = await app.refineChatTurn({ conversationId: conversation.id, parentTurnId: first.turnId, effort: 'medium' });
+    const cutoff = await app.refreshAssistantBatch(refinement.jobId);
+    expect(cutoff).toMatchObject({ status: 'result_truncated', canRecoverMoreCompute: true });
+    expect(cutoff).not.toHaveProperty('resultText');
+    const plan = await app.prepareMoreCompute({ jobId: refinement.jobId, effort: 'high' });
+    expect(plan.preview.chat?.isRefinement).toBe(true);
+    expect(plan.preview.chat?.completedRefinementParent?.answer).toBeTruthy();
+    const recovered = await app.submitMoreCompute({ planId: plan.planId });
+    const childJob = (store.value as AppState & { openRouterBatchLedger: { jobs: { id: string; operation?: string; requestProfileVersion: number;
+      recoveryBinding?: { parentJobId: string; baseOperation: string }; requestBody: string }[] } }).openRouterBatchLedger.jobs.find((job) => job.id === recovered.id)!;
+    expect(childJob).toMatchObject({ requestProfileVersion: 4, operation: 'chat_refinement', recoveryBinding: {
+      parentJobId: refinement.jobId, baseOperation: 'chat_refinement' } });
+    const wire = JSON.parse(childJob.requestBody) as { reasoning: { effort: string }; response_format: { json_schema: { name: string } } };
+    expect(wire.reasoning.effort).toBe('high');
+    expect(wire.response_format.json_schema.name).toBe('chat_refinement');
+    const nestedCutoff = await app.refreshAssistantBatch(recovered.id);
+    expect(nestedCutoff).toMatchObject({ status: 'result_truncated', canRecoverMoreCompute: true });
+    const nestedPlan = await app.prepareMoreCompute({ jobId: recovered.id, effort: 'max' });
+    const nested = await app.submitMoreCompute({ planId: nestedPlan.planId });
+    const nestedJob = (store.value as AppState & { openRouterBatchLedger: { jobs: { id: string; requestProfileVersion: number;
+      recoveryBinding?: { parentJobId: string; parentRequestProfileVersion: number; baseOperation: string } }[] } })
+      .openRouterBatchLedger.jobs.find((job) => job.id === nested.id)!;
+    expect(nestedJob).toMatchObject({ requestProfileVersion: 4, recoveryBinding: { parentJobId: recovered.id, parentRequestProfileVersion: 4,
+      baseOperation: 'chat_refinement' } });
+    await app.refreshAssistantBatch(nested.id);
+    const restored = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient });
+    await restored.load();
+    expect(restored.getSnapshot().assistantBatchRecoveryStatus?.blocked).not.toBe(true);
+    expect(restored.getSnapshot().assistantChatRecoveryStatus?.blocked).not.toBe(true);
+    const turns = restored.getSnapshot().assistantChatConversations?.[0]?.turns ?? [];
+    const recoveredTurn = turns.find((turn) => turn.id === nested.recoveredTurnId)!;
+    expect(recoveredTurn.recoveryParentTurnId).toBe(recovered.recoveredTurnId);
+    expect(recoveredTurn.reply?.answer).toBe('A complete revised answer.');
+    expect(recoveredTurn.reply).not.toHaveProperty('proposals');
+    expect(recoveredTurn.reply).not.toHaveProperty('memorySuggestions');
+    expect(requests).toHaveLength(4);
+    expect(requests.map((request) => request.operationId)).toHaveLength(4);
+  });
+
+  it('recovers an ordinary Chat turn with its canonical transcript citations, actionable proposal, and current memory suggestion', async () => {
+    const store = new MemoryStore();
+    const requests: { operationId: string; requestBody: string }[] = [];
+    let personId = '';
+    const fakeClient = {
+      submit: async (input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => {
+        await before(); assert(); requests.push(input);
+        return { batchId: `batch_recovered_chat_actions_${requests.length}`, status: 'validating' as const,
+          endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH, model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h' as const,
+          total: 1, completed: 0, failed: 0 };
+      },
+      inspect: async (batchId: string, customId: string) => {
+        if (requests.length === 1) return truncatedInspection(customId, batchId);
+        const job = (store.value as (AppState & { openRouterBatchLedger?: { jobs: { id: string; sourceVersions?: Record<string, string> }[] } }) | undefined)
+          ?.openRouterBatchLedger?.jobs.find((item) => item.id === customId);
+        const content = JSON.stringify({ summary: 'Prepare a concise outline.', answer: 'Maya prefers brief weekly updates.', decisions: [],
+          citations: [], clarifications: [], proposals: [{ kind: 'task', title: 'Prepare a weekly outline', body: 'Bring a short outline to the meeting.',
+            recipients: [], dueAt: null, evidence: ['Please prepare a weekly outline.'] }],
+          memorySuggestions: [{ targetSourceId: `knowledge:person:${personId}`, targetRevision: 1, type: 'add_fact',
+            statement: 'Prefers brief weekly updates.', address: null, label: null, relatedSourceId: null, role: null,
+            evidence: [{ sourceId: 'transcript', revision: 1, sourceVersion: job?.sourceVersions?.transcript, quote: 'I prefer brief weekly updates.' }] }] });
+        return { ...completedInspection(customId, content), batchId };
+      },
+    } as unknown as OpenRouterBatchClient;
+    const app = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient, writeDocument: async () => undefined });
+    await app.load();
+    await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
+    const person = await app.savePerson({ name: 'Maya', aliases: [], narrative: '' });
+    personId = person.id;
+    const conversation = await app.createChatConversation('Recovered ordinary answer');
+    const turn = await app.submitChatTurn({ conversationId: conversation.id,
+      text: 'Please prepare a weekly outline. I prefer brief weekly updates.', knowledgeSelection: [{ kind: 'person', id: person.id }] });
+    expect((await app.refreshAssistantBatch(turn.jobId)).status).toBe('result_truncated');
+    const plan = await app.prepareMoreCompute({ jobId: turn.jobId, effort: 'medium' });
+    const child = await app.submitMoreCompute({ planId: plan.planId });
+    expect((await app.refreshAssistantBatch(child.id)).status).toBe('completed');
+    const saved = store.value as AppState & { openRouterBatchLedger: { jobs: { id: string; noteId?: string; sourceVersions: Record<string, string>;
+      recoveryBinding?: { noteRemap?: { fromNoteId: string; toNoteId: string } }; requestBody: string }[] } };
+    const childJob = saved.openRouterBatchLedger.jobs.find((job) => job.id === child.id)!;
+    const parentJob = saved.openRouterBatchLedger.jobs.find((job) => job.id === turn.jobId)!;
+    expect(childJob.sourceVersions).toHaveProperty('transcript');
+    expect(Object.keys(childJob.sourceVersions).some((id) => id.startsWith('transcript:'))).toBe(false);
+    expect(childJob.recoveryBinding?.noteRemap).toEqual({ fromNoteId: parentJob.noteId, toNoteId: childJob.noteId });
+    const suggestion = app.getSnapshot().knowledge.suggestions.find((item) => item.status === 'pending')!;
+    expect(suggestion.evidence).toMatchObject([{ sourceId: `note:${childJob.recoveryBinding?.noteRemap?.toNoteId}`, quote: 'I prefer brief weekly updates.' }]);
+    const review = await app.prepareKnowledgeSuggestionReview(suggestion.id, { expectedRevision: suggestion.revision });
+    expect(review).toMatchObject({ canAccept: true, canEdit: true });
+    const proposal = app.getSnapshot().proposals.find((item) => item.title === 'Prepare a weekly outline')!;
+    expect(proposal).toBeDefined();
+    const approved = await app.approveProposal(proposal.id, { expectedRevision: proposal.revision });
+    expect(approved.status).toBe('approved');
+    const executed = await app.executeProposal(approved.id, { expectedRevision: approved.revision });
+    expect(executed.status).toBe('executed');
+    expect(app.getSnapshot().tasks.some((task) => task.title === 'Prepare a weekly outline')).toBe(true);
+    const accepted = await app.reviewKnowledgeSuggestion(suggestion.id, { expectedRevision: suggestion.revision, decision: 'accept', targetRevision: person.revision });
+    expect(accepted.status).toBe('accepted');
+    expect(app.getSnapshot().knowledge.people.find((item) => item.id === person.id)?.facts.map((fact) => fact.statement)).toContain('Prefers brief weekly updates.');
+    expect(requests).toHaveLength(2);
+    const restored = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient, writeDocument: async () => undefined });
+    await restored.load();
+    expect(restored.getSnapshot().assistantBatchRecoveryStatus?.blocked).not.toBe(true);
+    expect(restored.getSnapshot().knowledge.people.find((item) => item.id === person.id)?.facts.map((fact) => fact.statement)).toContain('Prefers brief weekly updates.');
+  });
+
+  it('requires a separate explicit source refresh before recovering a truncated selected-context mail request', async () => {
+    const requests: { operationId: string; requestBody: string }[] = [];
+    const inspections: string[] = [];
+    const fakeClient = {
+      submit: async (input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => {
+        await before(); assert(); requests.push(input);
+        return { batchId: `batch_mail_cutoff_${requests.length}`, status: 'validating' as const, endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH,
+          model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h' as const, total: 1, completed: 0, failed: 0 };
+      },
+      inspect: async (batchId: string, customId: string) => { inspections.push(customId); return truncatedInspection(customId, batchId); },
+    } as unknown as OpenRouterBatchClient;
+    const connector = conversationContextConnector();
+    const fixture = await mailFixture(fakeClient, connector.connector);
+    const discovery = await fixture.app.discoverMailReplyContext({ messageId: fixture.message.id, sourceDigest: fixture.source.source!.sourceDigest });
+    const selected = await fixture.app.loadMailReplyContextMessage({ sessionId: discovery.sessionId, rowId: discovery.rows[0]!.rowId });
+    const parent = await fixture.app.submitMailReplyBatch({ messageId: fixture.message.id, sourceDigest: fixture.source.source!.sourceDigest,
+      textDigest: fixture.textDigest, mode: 'reply', to: ['sam@example.test'], cc: [], brief: 'Reply briefly.', composerRevision: 1,
+      contextSelectionIds: [selected.selectionId], contextExcerptSelectionIds: [selected.selectionId] });
+    const cutoff = await fixture.app.refreshAssistantBatch(parent.id);
+    expect(cutoff).toMatchObject({ status: 'result_truncated', canRecoverMoreCompute: true });
+    expect((fixture.app.getSnapshot().assistantBatchJobs ?? []).find((job) => job.id === parent.id)).not.toHaveProperty('resultText');
+    expect(fixture.app.getMailReplyBatchSourcesStatus(parent.id)).toMatchObject({ status: 'refresh_required' });
+    expect(requests).toHaveLength(1);
+    await fixture.app.refreshMailReplyBatchSources(parent.id);
+    const explicitReadCount = connector.reads.length;
+    const plan = await fixture.app.prepareMoreCompute({ jobId: parent.id, effort: 'medium' });
+    expect(plan.preview.mail?.brief).toBe('Reply briefly.');
+    expect(plan.preview.mail?.contextMessages[0]?.text).toContain('Prior thread context body');
+    const child = await fixture.app.submitMoreCompute({ planId: plan.planId });
+    expect(child.status).toBe('queued');
+    const childWire = JSON.parse(requests[1]!.requestBody) as { reasoning: { effort: string }; response_format: { json_schema: { name: string } } };
+    expect(childWire.reasoning.effort).toBe('medium');
+    expect(childWire.response_format.json_schema.name).toBe('mail_reply_body');
+    expect(requests).toHaveLength(2);
+    expect(connector.reads).toHaveLength(explicitReadCount);
+    const childCutoff = await fixture.app.refreshAssistantBatch(child.id);
+    expect(childCutoff.status).toBe('result_truncated');
+    expect(inspections).toEqual([parent.id, child.id]);
+    const restarted = new AppControllerImpl(fixture.store, {}, fixture.integration);
+    await restarted.load();
+    expect(restarted.getSnapshot().assistantBatchRecoveryStatus?.blocked).not.toBe(true);
+    expect(restarted.getMailReplyBatchSourcesStatus(child.id)).toMatchObject({ status: 'refresh_required' });
+    await restarted.refreshMailReplyBatchSources(child.id);
+    expect(restarted.getMailReplyBatchSourcesStatus(child.id).status).toBe('current');
+  });
+
+  it('recovers a truncated target-only mail request without changing legacy v1 request semantics', async () => {
+    const requests: { operationId: string; requestBody: string }[] = [];
+    const inspections: string[] = [];
+    const fakeClient = {
+      submit: async (input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => {
+        await before(); assert(); requests.push(input);
+        return { batchId: `batch_mail_target_cutoff_${requests.length}`, status: 'validating' as const, endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH,
+          model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h' as const, total: 1, completed: 0, failed: 0 };
+      },
+      inspect: async (batchId: string, customId: string) => {
+        inspections.push(customId);
+        return inspections.length === 1
+          ? truncatedInspection(customId, batchId)
+          : { ...completedInspection(customId, JSON.stringify({ text: 'A complete reviewed reply.' })), batchId };
+      },
+    } as unknown as OpenRouterBatchClient;
+    let targetReceivedAt = '';
+    const connector = {
+      async readSelectedMessageText(_account: unknown, _id: string) {
+        const text = 'Selected message body for a controlled mail Batch controller fixture.';
+        return { status: 'available' as const, message: { id: 'mail-fixture-provider', idFormat: 'gmail' as const,
+          threadId: 'mail-fixture-thread', subject: 'Fixture subject', from: 'Sam <sam@example.test>', senderEmail: 'sam@example.test',
+          receivedAt: targetReceivedAt, isDraft: false, replyMetadataComplete: true, internetMessageId: '<mail-fixture@example.test>',
+          replyTo: ['sam@example.test'], to: ['me@example.test'], cc: [] }, text, bytes: new TextEncoder().encode(text).length,
+          representation: 'plain' as const, completeness: 'complete_text' as const, reasons: [], checkedAt: new Date().toISOString(),
+          extractionVersion: 'mail-text-v1' as const };
+      },
+    };
+    const fixture = await mailFixture(fakeClient, connector);
+    targetReceivedAt = fixture.message.receivedAt;
+    const parent = await fixture.app.submitMailReplyBatch({ messageId: fixture.message.id, sourceDigest: fixture.source.source!.sourceDigest,
+      textDigest: fixture.textDigest, mode: 'reply', to: ['sam@example.test'], cc: [], brief: 'Reply briefly.', composerRevision: 1 });
+    expect((fixture.store.value as AppState & { openRouterBatchLedger: { jobs: { id: string; requestProfileVersion: number }[] } })
+      .openRouterBatchLedger.jobs.find((job) => job.id === parent.id)?.requestProfileVersion).toBe(1);
+    const cutoff = await fixture.app.refreshAssistantBatch(parent.id);
+    expect(cutoff.status).toBe('result_truncated');
+    const plan = await fixture.app.prepareMoreCompute({ jobId: parent.id, effort: 'medium' });
+    expect(plan.preview.mail?.targetMessage.text).toBe(fixture.text);
+    expect(plan.preview.mail?.brief).toBe('Reply briefly.');
+    const child = await fixture.app.submitMoreCompute({ planId: plan.planId });
+    const childJob = (fixture.store.value as AppState & { openRouterBatchLedger: { jobs: { id: string; requestProfileVersion: number;
+      recoveryBinding?: { parentJobId: string; baseRequestProfileVersion: number; baseOperation: string } }[] } }).openRouterBatchLedger.jobs.find((job) => job.id === child.id)!;
+    expect(childJob).toMatchObject({ requestProfileVersion: 4, recoveryBinding: { parentJobId: parent.id, baseRequestProfileVersion: 1,
+      baseOperation: 'mail_reply_body' } });
+    const originalWire = JSON.parse(requests[0]!.requestBody) as { response_format: { json_schema: { name: string } }; reasoning: { effort: string } };
+    const childWire = JSON.parse(requests[1]!.requestBody) as { response_format: { json_schema: { name: string } }; reasoning: { effort: string } };
+    expect(originalWire.response_format.json_schema.name).toBe('mail_reply_body');
+    expect(originalWire.reasoning.effort).toBe('low');
+    expect(childWire.response_format.json_schema.name).toBe('mail_reply_body');
+    expect(childWire.reasoning.effort).toBe('medium');
+    expect(requests).toHaveLength(2);
+    expect((await fixture.app.refreshAssistantBatch(child.id)).status).toBe('completed');
+    const review = await fixture.app.reviewMailReplyBatch(child.id);
+    expect(review.operation).toBe('draft');
+    expect(review.text).toBe('A complete reviewed reply.');
+    const activated = await fixture.app.activateMailReplyBatch({ planId: review.planId });
+    const proposal = fixture.app.getSnapshot().proposals.find((item) => item.id === activated.proposalId)!;
+    expect(proposal.email).toMatchObject({ operation: 'draft', text: 'A complete reviewed reply.' });
+    expect(fixture.app.getSnapshot().assistantBatchJobs?.find((item) => item.id === child.id)).toMatchObject({
+      proposalId: activated.proposalId, mailReplyActivationOperation: 'draft',
+    });
+    expect(requests).toHaveLength(2);
+  });
+
+  it.each([
+    { context: false, operation: 'draft' as const },
+    { context: false, operation: 'send' as const },
+    { context: true, operation: 'draft' as const },
+    { context: true, operation: 'send' as const },
+  ])('activates a recovered $context context mail reply as an explicit $operation without another model request', async ({ context, operation }) => {
+    const requests: { operationId: string; requestBody: string }[] = [];
+    const writes: string[] = [];
+    let inspectCount = 0;
+    const fakeClient = {
+      submit: async (input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => {
+        await before(); assert(); requests.push(input);
+        return { batchId: `batch_recovered_mail_activation_${requests.length}`, status: 'validating' as const,
+          endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH, model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h' as const,
+          total: 1, completed: 0, failed: 0 };
+      },
+      inspect: async (batchId: string, customId: string) => {
+        inspectCount += 1;
+        return inspectCount === 1
+          ? truncatedInspection(customId, batchId)
+          : { ...completedInspection(customId, JSON.stringify({ text: 'A complete recovered reply.' })), batchId };
+      },
+    } as unknown as OpenRouterBatchClient;
+
+    const base = context ? conversationContextConnector() : undefined;
+    let targetReceivedAt = '';
+    const targetConnector = {
+      async readSelectedMessageText(_account: unknown, _id: string) {
+        const text = 'Selected message body for a controlled mail Batch controller fixture.';
+        return { status: 'available' as const, message: { id: 'mail-fixture-provider', idFormat: 'gmail' as const,
+          threadId: 'mail-fixture-thread', subject: 'Fixture subject', from: 'Sam <sam@example.test>', senderEmail: 'sam@example.test',
+          receivedAt: targetReceivedAt, isDraft: false, replyMetadataComplete: true, internetMessageId: '<mail-fixture@example.test>',
+          replyTo: ['sam@example.test'], to: ['me@example.test'], cc: [] }, text, bytes: new TextEncoder().encode(text).length,
+          representation: 'plain' as const, completeness: 'complete_text' as const, reasons: [], checkedAt: new Date().toISOString(),
+          extractionVersion: 'mail-text-v1' as const };
+      },
+      async createDraft() { writes.push('draft'); return { status: 'accepted' as const, id: 'recovered-mail-draft' }; },
+      async sendEmail() { writes.push('send'); return { status: 'accepted' as const, id: 'recovered-mail-send' }; },
+    };
+    const connector = base ? {
+      ...base.connector,
+      ...targetConnector,
+      async readSelectedMessageText(account: unknown, id: string, options?: { guard?: () => void }) {
+        if (id === 'mail-fixture-provider') return targetConnector.readSelectedMessageText(account, id);
+        void options;
+        return base.connector.readSelectedMessageText(account, id);
+      },
+    } : targetConnector;
+    const fixture = await mailFixture(fakeClient, connector);
+    targetReceivedAt = fixture.message.receivedAt;
+    await (fixture.app as unknown as { mutate(operation: (draft: AppState) => void): Promise<void> }).mutate((draft) => {
+      draft.accounts.find((item) => item.id === fixture.account.id)!.capabilities = ['mail.read', 'mail.draft', 'mail.send'];
+    });
+
+    let contextSelection: { selectionId: string; completeness: string } | undefined;
+    if (base) {
+      const discovery = await fixture.app.discoverMailReplyContext({ messageId: fixture.message.id, sourceDigest: fixture.source.source!.sourceDigest });
+      const row = discovery.rows[0]!;
+      contextSelection = await fixture.app.loadMailReplyContextMessage({ sessionId: discovery.sessionId, rowId: row.rowId });
+    }
+    const parent = await fixture.app.submitMailReplyBatch({ messageId: fixture.message.id, sourceDigest: fixture.source.source!.sourceDigest,
+      textDigest: fixture.textDigest, mode: 'reply', to: ['sam@example.test'], cc: [], brief: 'Reply briefly.', composerRevision: 1,
+      ...(contextSelection ? { contextSelectionIds: [contextSelection.selectionId], contextExcerptSelectionIds: [contextSelection.selectionId] } : {}) });
+    expect((await fixture.app.refreshAssistantBatch(parent.id)).status).toBe('result_truncated');
+    if (contextSelection) await fixture.app.refreshMailReplyBatchSources(parent.id);
+    const recoveryPlan = await fixture.app.prepareMoreCompute({ jobId: parent.id, effort: 'medium' });
+    const child = await fixture.app.submitMoreCompute({ planId: recoveryPlan.planId });
+    expect((await fixture.app.refreshAssistantBatch(child.id)).status).toBe('completed');
+    if (contextSelection) {
+      expect(fixture.app.getMailReplyBatchSourcesStatus(child.id).status).toBe('refresh_required');
+      await fixture.app.refreshMailReplyBatchSources(child.id);
+    }
+    const review = await fixture.app.reviewMailReplyBatch(child.id, { operation });
+    expect(review.operation).toBe(operation);
+    expect(review.text).toBe('A complete recovered reply.');
+    const activated = await fixture.app.activateMailReplyBatch({ planId: review.planId });
+    const proposal = fixture.app.getSnapshot().proposals.find((item) => item.id === activated.proposalId)!;
+    expect(proposal.email).toMatchObject({ operation, text: 'A complete recovered reply.' });
+    expect(fixture.app.getSnapshot().assistantBatchJobs?.find((job) => job.id === child.id)).toMatchObject({
+      proposalId: activated.proposalId, mailReplyActivationOperation: operation,
+    });
+    expect(fixture.app.getSnapshot().assistantBatchJobs?.find((job) => job.id === parent.id)).not.toHaveProperty('proposalId');
+    let approved = await fixture.app.approveProposal(proposal.id, { expectedRevision: proposal.revision });
+    expect(approved.status).toBe('approved');
+    if (context && operation === 'draft') {
+      const raw = fixture.store.value as AppState & { openRouterBatchLedger: { jobs: Record<string, unknown>[] } };
+      const recovered = raw.openRouterBatchLedger.jobs.find((job) => job.id === child.id)!;
+      recovered.status = 'result_truncated';
+      recovered.failureCode = 'result_truncated';
+      delete recovered.resultText;
+      delete recovered.resultSha256;
+      await fixture.store.save(raw);
+      fixture.app = new AppControllerImpl(fixture.store, {}, fixture.integration);
+      await fixture.app.load();
+      await fixture.app.refreshMailReplyBatchSources(child.id);
+      expect(fixture.app.getMailReplyBatchSourcesStatus(child.id).status).toBe('current');
+      await expect(fixture.app.executeProposal(approved.id, { expectedRevision: approved.revision })).rejects.toThrow();
+      expect(writes).toHaveLength(0);
+      expect(requests).toHaveLength(2);
+      return;
+    }
+    let executed: Awaited<ReturnType<typeof fixture.app.executeProposal>>;
+    if (context && operation === 'send') {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date());
+        vi.setSystemTime(Date.now() + 16 * 60_000);
+        await expect(fixture.app.executeProposal(approved.id, { expectedRevision: approved.revision })).rejects.toThrow(/refresh.*approve/i);
+        expect(writes).toHaveLength(0);
+        expect(fixture.app.getMailReplyBatchSourcesStatus(child.id).status).toBe('refresh_required');
+        await fixture.app.refreshMailReplyBatchSources(child.id);
+        const refreshedProposal = fixture.app.getSnapshot().proposals.find((item) => item.id === proposal.id)!;
+        approved = await fixture.app.approveProposal(refreshedProposal.id, { expectedRevision: refreshedProposal.revision });
+        executed = await fixture.app.executeProposal(approved.id, { expectedRevision: approved.revision });
+        expect(fixture.app.getMailReplyBatchSourcesStatus(child.id).status).toBe('current');
+      } finally { vi.useRealTimers(); }
+    } else {
+      executed = await fixture.app.executeProposal(approved.id, { expectedRevision: approved.revision });
+    }
+    expect(executed.status).toBe('accepted');
+    expect(writes).toEqual([operation]);
+    expect(requests).toHaveLength(2);
+    if (context && operation !== 'send') expect(fixture.app.getMailReplyBatchSourcesStatus(child.id).status).toBe('current');
+  });
+
+  it('deletes a nested mail recovery chain as one uncertainty-checked content retirement while retaining accounting', async () => {
+    const requests: { operationId: string; requestBody: string }[] = [];
+    let inspections = 0;
+    const fakeClient = {
+      submit: async (input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => {
+        await before(); assert(); requests.push(input);
+        return { batchId: `batch_mail_delete_chain_${requests.length}`, status: 'validating' as const,
+          endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH, model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h' as const,
+          total: 1, completed: 0, failed: 0 };
+      },
+      inspect: async (batchId: string, customId: string) => ++inspections < 3
+        ? truncatedInspection(customId, batchId)
+        : { ...completedInspection(customId, JSON.stringify({ text: 'A complete nested reply.' })), batchId },
+    } as unknown as OpenRouterBatchClient;
+    let targetReceivedAt = '';
+    const connector = {
+      async readSelectedMessageText(_account: unknown, _id: string) {
+        const text = 'Selected message body for a controlled mail Batch controller fixture.';
+        return { status: 'available' as const, message: { id: 'mail-fixture-provider', idFormat: 'gmail' as const,
+          threadId: 'mail-fixture-thread', subject: 'Fixture subject', from: 'Sam <sam@example.test>', senderEmail: 'sam@example.test',
+          receivedAt: targetReceivedAt, isDraft: false, replyMetadataComplete: true, internetMessageId: '<mail-fixture@example.test>',
+          replyTo: ['sam@example.test'], to: ['me@example.test'], cc: [] }, text, bytes: new TextEncoder().encode(text).length,
+          representation: 'plain' as const, completeness: 'complete_text' as const, reasons: [], checkedAt: new Date().toISOString(),
+          extractionVersion: 'mail-text-v1' as const };
+      },
+    };
+    const fixture = await mailFixture(fakeClient, connector);
+    targetReceivedAt = fixture.message.receivedAt;
+    const input = { messageId: fixture.message.id, sourceDigest: fixture.source.source!.sourceDigest, textDigest: fixture.textDigest,
+      mode: 'reply' as const, to: ['sam@example.test'], cc: [], brief: 'Reply briefly.', composerRevision: 1 };
+    const parent = await fixture.app.submitMailReplyBatch(input);
+    await fixture.app.refreshAssistantBatch(parent.id);
+    const child = await fixture.app.submitMoreCompute({ planId: (await fixture.app.prepareMoreCompute({ jobId: parent.id, effort: 'medium' })).planId });
+    await fixture.app.refreshAssistantBatch(child.id);
+    const nested = await fixture.app.submitMoreCompute({ planId: (await fixture.app.prepareMoreCompute({ jobId: child.id, effort: 'high' })).planId });
+    await fixture.app.refreshAssistantBatch(nested.id);
+    const review = await fixture.app.reviewMailReplyBatch(nested.id);
+    const activation = await fixture.app.activateMailReplyBatch({ planId: review.planId });
+    const proposal = fixture.app.getSnapshot().proposals.find((item) => item.id === activation.proposalId)!;
+    const costById = new Map((fixture.store.value as AppState & { openRouterBatchLedger: { jobs: { id: string; accounting?: { providerReportedCostUsd?: number } }[] } })
+      .openRouterBatchLedger.jobs.map((job) => [job.id, job.accounting?.providerReportedCostUsd]));
+
+    await fixture.app.deleteMailReplyBatch(parent.id);
+    const saved = fixture.store.value as AppState & { openRouterBatchLedger: { jobs: { id: string; status: string; sourceRemoved?: boolean;
+      requestBody?: string; accounting?: { providerReportedCostUsd?: number }; proposalId?: string }[] } };
+    const jobs = saved.openRouterBatchLedger.jobs.filter((job) => [parent.id, child.id, nested.id].includes(job.id));
+    expect(jobs).toHaveLength(3);
+    expect(jobs.every((job) => job.status === 'source_removed' && job.sourceRemoved && !job.requestBody)).toBe(true);
+    expect(jobs.map((job) => job.accounting?.providerReportedCostUsd)).toEqual([costById.get(parent.id), costById.get(child.id), costById.get(nested.id)]);
+    expect(saved.proposals.find((item) => item.id === proposal.id)).toMatchObject({ requiresRebuild: true });
+    expect(saved.openRouterBatchLedger.jobs.find((job) => job.id === nested.id)?.proposalId).toBe(activation.proposalId);
+    fixture.app = new AppControllerImpl(fixture.store, {}, fixture.integration);
+    await fixture.app.load();
+    expect(fixture.app.getSnapshot().assistantBatchRecoveryStatus?.blocked).not.toBe(true);
+    expect(fixture.app.getSnapshot().assistantBatchJobs?.filter((job) => [parent.id, child.id, nested.id].includes(job.id)))
+      .toHaveLength(3);
+    expect(requests).toHaveLength(3);
+  });
+
+  it('blocks parent mail retirement when a recovery descendant has an unknown send receipt', async () => {
+    const requests: { operationId: string; requestBody: string }[] = [];
+    let inspections = 0;
+    const fakeClient = {
+      submit: async (input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => {
+        await before(); assert(); requests.push(input);
+        return { batchId: `batch_mail_unknown_child_${requests.length}`, status: 'validating' as const,
+          endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH, model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h' as const,
+          total: 1, completed: 0, failed: 0 };
+      },
+      inspect: async (batchId: string, customId: string) => ++inspections === 1
+        ? truncatedInspection(customId, batchId)
+        : { ...completedInspection(customId, JSON.stringify({ text: 'A recovered send reply.' })), batchId },
+    } as unknown as OpenRouterBatchClient;
+    let targetReceivedAt = '';
+    let targetSubject = 'Fixture subject';
+    const connector = {
+      async readSelectedMessageText(_account: unknown, _id: string) {
+        const text = 'Selected message body for a controlled mail Batch controller fixture.';
+        return { status: 'available' as const, message: { id: 'mail-fixture-provider', idFormat: 'gmail' as const,
+          threadId: 'mail-fixture-thread', subject: targetSubject, from: 'Sam <sam@example.test>', senderEmail: 'sam@example.test',
+          receivedAt: targetReceivedAt, isDraft: false, replyMetadataComplete: true, internetMessageId: '<mail-fixture@example.test>',
+          replyTo: ['sam@example.test'], to: ['me@example.test'], cc: [] }, text, bytes: new TextEncoder().encode(text).length,
+          representation: 'plain' as const, completeness: 'complete_text' as const, reasons: [], checkedAt: new Date().toISOString(),
+          extractionVersion: 'mail-text-v1' as const };
+      },
+      async sendEmail() { return { status: 'unknown' as const }; },
+    };
+    const fixture = await mailFixture(fakeClient, connector);
+    targetReceivedAt = fixture.message.receivedAt;
+    await (fixture.app as unknown as { mutate(operation: (draft: AppState) => void): Promise<void> }).mutate((draft) => {
+      draft.accounts.find((item) => item.id === fixture.account.id)!.capabilities = ['mail.read', 'mail.send'];
+    });
+    const parent = await fixture.app.submitMailReplyBatch({ messageId: fixture.message.id, sourceDigest: fixture.source.source!.sourceDigest,
+      textDigest: fixture.textDigest, mode: 'reply', to: ['sam@example.test'], cc: [], brief: 'Reply briefly.', composerRevision: 1 });
+    await fixture.app.refreshAssistantBatch(parent.id);
+    const child = await fixture.app.submitMoreCompute({ planId: (await fixture.app.prepareMoreCompute({ jobId: parent.id, effort: 'medium' })).planId });
+    await fixture.app.refreshAssistantBatch(child.id);
+    const review = await fixture.app.reviewMailReplyBatch(child.id, { operation: 'send' });
+    const activation = await fixture.app.activateMailReplyBatch({ planId: review.planId });
+    const proposal = fixture.app.getSnapshot().proposals.find((item) => item.id === activation.proposalId)!;
+    const approved = await fixture.app.approveProposal(proposal.id, { expectedRevision: proposal.revision });
+    await expect(fixture.app.executeProposal(approved.id, { expectedRevision: approved.revision })).resolves.toMatchObject({ status: 'unknown' });
+    const accountingBeforeObservation = new Map((fixture.store.value as AppState & { openRouterBatchLedger: { jobs: { id: string; accounting?: unknown }[] } })
+      .openRouterBatchLedger.jobs.filter((job) => job.id === parent.id || job.id === child.id).map((job) => [job.id, job.accounting]));
+    targetSubject = 'Observed changed subject';
+    await expect(fixture.app.loadMailReplyText({ messageId: fixture.message.id, sourceDigest: fixture.source.source!.sourceDigest }))
+      .resolves.toMatchObject({ status: 'source_changed' });
+    expect(fixture.app.getSnapshot().mailbox.find((item) => item.id === fixture.message.id)?.subject).toBe(targetSubject);
+    await expect(fixture.app.deleteMailReplyBatch(parent.id)).rejects.toThrow(/uncertain or pending/i);
+    const retained = (fixture.store.value as AppState & { openRouterBatchLedger: { jobs: { id: string; status: string; requestBody?: string; accounting?: unknown }[] } })
+      .openRouterBatchLedger.jobs.filter((job) => job.id === parent.id || job.id === child.id);
+    expect(retained).toHaveLength(2);
+    expect(retained.every((job) => typeof job.requestBody === 'string')).toBe(true);
+    expect(retained.find((job) => job.id === parent.id)?.status).toBe('result_truncated');
+    expect(retained.find((job) => job.id === child.id)?.status).toBe('completed');
+    expect(new Map(retained.map((job) => [job.id, job.accounting]))).toEqual(accountingBeforeObservation);
+    expect(fixture.app.getSnapshot().proposals.find((item) => item.id === proposal.id)?.status).toBe('unknown');
+    expect(requests).toHaveLength(2);
+  });
+
+  it('consumes an expired more-compute review without sending another request', async () => {
+    const requests: string[] = [];
+    const fakeClient = {
+      submit: async (input: { operationId: string }, before: () => Promise<void>, assert: () => void) => {
+        await before(); assert(); requests.push(input.operationId);
+        return { batchId: `batch_expiring_review_${requests.length}`, status: 'validating' as const, endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH,
+          model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h' as const, total: 1, completed: 0, failed: 0 };
+      },
+      inspect: async (batchId: string, customId: string) => truncatedInspection(customId, batchId),
+    } as unknown as OpenRouterBatchClient;
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient });
+    await app.load();
+    await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
+    const note = await app.saveNote({ transcript: 'An explicit review expires after five minutes.' });
+    const parent = await app.submitNoteBatch(note.id, { intent: 'answer', question: 'Return a complete answer.' });
+    await app.refreshAssistantBatch(parent.id);
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date());
+      const plan = await app.prepareMoreCompute({ jobId: parent.id, effort: 'medium' });
+      expect(requests).toHaveLength(1);
+      vi.setSystemTime(new Date(Date.parse(plan.expiresAt) + 1));
+      await expect(app.submitMoreCompute({ planId: plan.planId })).rejects.toThrow(/expired|no longer current/i);
+      expect(requests).toHaveLength(1);
+      await expect(app.submitMoreCompute({ planId: plan.planId })).rejects.toThrow(/no longer current/i);
+      expect(requests).toHaveLength(1);
+    } finally { vi.useRealTimers(); }
   });
 
   it.each(['', {}])('rejects a non-null refusal field and retains accounting without actions: %j', async (refusal) => {

@@ -3,9 +3,10 @@ import { Text, View } from 'react-native';
 import type { MailReplyBatchReviewPlan, MailReplyBatchSourcesRefreshResult } from '../core';
 import type { AssistantBatchJobDTO } from '../services/openRouterBatchJobs';
 import { Button } from './primitives';
-import { batchCheckLabel, batchJobTokenSummary, formatReportedBatchCost } from './assistantBatchJobPresentation';
+import { batchCheckLabel, batchJobTokenSummary, formatReportedBatchCost, hasNoHigherSupportedReasoning } from './assistantBatchJobPresentation';
 import { mailReplyBatchPlanMatchesOperation } from './mailReplyBatchOwnership';
 import { C, s } from './theme';
+import { MoreComputeReview, type MoreComputeReviewActions } from './MoreComputeReview';
 
 type Owner = { messageId: string; generation: number };
 const isExpired = (expiresAt: string) => Date.parse(expiresAt) <= Date.now();
@@ -27,11 +28,14 @@ type Props = {
   onRefreshSources?: (jobId: string, owner: Owner, isComposerCurrent: () => boolean) => Promise<MailReplyBatchSourcesRefreshResult | undefined>;
   getSourcesStatus?: (jobId: string) => { readonly status: 'missing' | 'refresh_required' | 'current' | 'invalid'; readonly expiresAt?: string };
   registerReviewInvalidator?: (invalidate: () => void) => () => void;
+  moreComputeActions?: MoreComputeReviewActions;
+  moreComputeSubmitReady?: boolean;
 };
 
 export function MailReplyBatchSection({
   jobs, messageId, ownerGeneration, composerRevision, blocked, busy, submitting, checkReady,
   onCheck, onReview, onActivate, onCancel, onDelete, onRefreshSources, getSourcesStatus, registerReviewInvalidator,
+  moreComputeActions, moreComputeSubmitReady = false,
 }: Props) {
   const [checkingId, setCheckingId] = useState<string>();
   const [reviewingId, setReviewingId] = useState<string>();
@@ -206,7 +210,9 @@ export function MailReplyBatchSection({
   const refreshSources = async (jobId: string) => {
     if (!onRefreshSources || actionLock.current || blocked || busy || !stillOwns(owner)) return;
     const job = messageJobs.find((item) => item.id === jobId);
-    if (!job || job.proposalId === undefined || job.mailReplyContextCount === undefined || getSourcesStatus?.(jobId).status !== 'refresh_required') return;
+    if (!job || job.sourceRemoved || (job.status !== 'completed' && job.status !== 'result_truncated') ||
+        (job.status === 'completed' && !job.hasMailReplyResult) || (job.mailReplyContextCount ?? 0) < 1 ||
+        getSourcesStatus?.(jobId).status !== 'refresh_required') return;
     const ticket = {};
     actionTicket.current = ticket;
     actionLock.current = true;
@@ -259,15 +265,17 @@ export function MailReplyBatchSection({
       {messageJobs.length ? messageJobs.map((job) => {
         const cost = job.costStatus === 'reported' ? formatReportedBatchCost(job.providerReportedCostUsd) : undefined;
         const tokens = batchJobTokenSummary(job);
+        const sourceStatus = getSourcesStatus?.(job.id).status;
         return (
           <View key={job.id} style={styles.job}>
             <Text style={styles.status}>{statusLabel(job.status)}</Text>
             <Text style={styles.meta}>Added {dateLabel(job.createdAt)} · {job.model} · {job.effort} reasoning</Text>
             {job.status === 'submission_unknown' ? <Text style={styles.warning}>The request may have been charged. Checking never submits it again.</Text> : null}
+            {job.status === 'result_truncated' && job.pendingRecoveryChildId ? <Text style={styles.copy}>A higher-reasoning request is already saved. Check its status in Batch history.</Text> : null}
+            {job.status === 'result_truncated' && hasNoHigherSupportedReasoning(job) ? <Text style={styles.copy}>No higher supported reasoning setting is available for this response.</Text> : null}
             {job.status === 'completed' ? <Text style={styles.copy}>{job.proposalId ? (job.mailReplyActivationOperation === 'send' ? 'A send proposal was created from this reply. Approval and sending are separate.' : 'A draft proposal was created from this reply.') : job.hasMailReplyResult ? 'A completed reply is saved on this device. Review its current source and choose a proposal type.' : 'The completed reply is unavailable for review.'}</Text> : null}
-            {job.proposalId && (job.mailReplyContextCount ?? 0) > 0 ? (() => {
-              const sourceStatus = getSourcesStatus?.(job.id).status;
-              return sourceStatus === 'refresh_required'
+            {(job.mailReplyContextCount ?? 0) > 0 ? (() => {
+              return sourceStatus === 'refresh_required' && (job.proposalId !== undefined || job.canRecoverMoreCompute)
                 ? <Button label={refreshingSourcesId === job.id ? 'Refreshing selected sources…' : 'Refresh selected sources'} tone="quiet" disabled={blocked || busy || actionPending || !onRefreshSources} onPress={() => void refreshSources(job.id)} />
                 : sourceStatus === 'current'
                   ? <Text style={styles.meta}>Selected conversation sources checked{getSourcesStatus?.(job.id).expiresAt ? ` · valid until ${dateLabel(getSourcesStatus(job.id).expiresAt!)}` : ''}.</Text>
@@ -277,6 +285,19 @@ export function MailReplyBatchSection({
             {job.sourceRemoved ? <Text style={styles.copy}>Request content was removed. This receipt remains for history.</Text> : null}
             {cost !== undefined ? <Text style={styles.meta}>{job.billingScope === 'byok_fee_only' ? 'OpenRouter-reported BYOK fee' : 'OpenRouter-reported cost'} · {cost}</Text> : job.costStatus === 'waiting' ? <Text style={styles.meta}>Provider-reported usage is not available yet.</Text> : job.costStatus === 'unavailable' ? <Text style={styles.meta}>The provider did not report a cost for this request.</Text> : null}
             {tokens ? <Text style={styles.meta}>Provider-reported tokens · {tokens}</Text> : null}
+            {moreComputeActions && job.canRecoverMoreCompute && sourceStatus === 'refresh_required' ? <Text style={styles.copy}>Refresh the selected conversation sources before reviewing higher reasoning.</Text> : null}
+            {moreComputeActions && job.canRecoverMoreCompute && !blocked && !moreComputeActions.blocked ? <MoreComputeReview
+              key={JSON.stringify(['mail', messageId, ownerGeneration, composerRevision, job.id, job.updatedAt, job.status, job.mailReplyContextCount, job.proposalId, job.sourceRemoved, moreComputeActions.ownerKey])}
+              job={job}
+              ownerKey={JSON.stringify(['mail', messageId, ownerGeneration, composerRevision, job.id, job.updatedAt, job.status, job.mailReplyContextCount, job.proposalId, job.sourceRemoved, moreComputeActions.ownerKey])}
+              blocked={false}
+              prepareReady={sourceStatus !== 'refresh_required'}
+              submitReady={moreComputeSubmitReady}
+              onPrepare={(jobId, effort, ownerKey, isOwnerCurrent) => moreComputeActions.onPrepare(jobId, effort, ownerKey, () => isOwnerCurrent() && stillOwns(owner) && revisionRef.current === composerRevision)}
+              onSubmit={(planId, jobId, ownerKey, isOwnerCurrent) => moreComputeActions.onSubmit(planId, jobId, ownerKey, () => isOwnerCurrent() && stillOwns(owner) && revisionRef.current === composerRevision)}
+              onCancel={moreComputeActions.onCancel}
+              onSubmitted={moreComputeActions.onSubmitted}
+            /> : null}
             {job.canCheck ? <Button label={checkingId === job.id ? 'Checking request…' : batchCheckLabel(job)} tone="quiet" disabled={blocked || busy || !checkReady || actionPending} onPress={() => void check(job.id)} /> : null}
             {job.canReviewMailReply ? <>
               <Text style={styles.meta}>Choose what to prepare from this completed reply:</Text>
@@ -286,7 +307,7 @@ export function MailReplyBatchSection({
             {!job.sourceRemoved ? <Button label={deletingId === job.id ? 'Removing request content…' : 'Remove request content'} tone="quiet" disabled={blocked || busy || actionPending} onPress={() => setDeleteTarget(job.id)} /> : null}
             {deleteTarget === job.id ? (
               <View style={styles.review}>
-                <Text style={styles.copy}>Remove the saved request and reply content for this job? A small accounting receipt remains.{job.proposalId ? ' A draft created from this reply will also be invalidated.' : ''} If the outcome is uncertain, check the receipt before taking another action.</Text>
+                <Text style={styles.copy}>Remove this request’s saved content and any recovered requests that depend on it? Accounting history is retained, and unexecuted linked proposals are invalidated. An in-flight or uncertain dependent request may prevent removal; check its status first.</Text>
                 <Button label={deletingId === job.id ? 'Removing content…' : 'Confirm removal'} disabled={blocked || busy || actionLock.current} onPress={() => void remove(job.id)} />
                 <Button label="Keep request" tone="quiet" disabled={deletingId === job.id} onPress={() => setDeleteTarget(undefined)} />
               </View>
@@ -329,6 +350,7 @@ function statusLabel(status: AssistantBatchJobDTO['status']) {
   if (status === 'source_removed') return 'Request content removed';
   if (status === 'result_stale') return 'Reply is stale';
   if (status === 'result_invalid') return 'Reply could not be validated';
+  if (status === 'result_truncated') return 'Provider response was cut off; no output applied';
   if (status === 'result_not_retained') return 'Reply could not be saved';
   if (status === 'completed') return 'Request completed';
   if (status === 'failed' || status === 'expired' || status === 'cancelled') return `Request ${status}`;

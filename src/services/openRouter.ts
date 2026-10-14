@@ -11,9 +11,11 @@ type OpenRouterBatchMetadataModel = typeof OPENROUTER_BATCH_BODY_MODEL | typeof 
 export const OPENROUTER_BATCH_LEGACY_REQUEST_PROFILE_VERSION = 1 as const;
 export const OPENROUTER_BATCH_REQUEST_PROFILE_VERSION = 1 as const;
 export const OPENROUTER_BATCH_NOTE_RESPONSE_PROFILE_VERSION = 2 as const;
-export type OpenRouterBatchRequestProfileVersion = 1 | 2 | 3;
+export type OpenRouterBatchRequestProfileVersion = 1 | 2 | 3 | 4;
 export type OpenRouterBatchOperation = 'note_assistance' | 'chat_refinement' | 'mail_reply_context';
+export type OpenRouterBatchBaseOperation = OpenRouterBatchOperation | 'mail_reply_body';
 export type OpenRouterChatRefinementEffort = 'medium' | 'high' | 'max';
+export type OpenRouterRecoveryEffort = 'medium' | 'high' | 'max';
 export const OPENROUTER_CHAT_COMPLETIONS_PATH = '/v1/chat/completions' as const;
 export const OPENROUTER_BATCH_ENDPOINT = 'https://openrouter.ai/api/v1/batches' as const;
 export const OPENROUTER_BATCH_PROVIDER = 'openai' as const;
@@ -57,8 +59,13 @@ export interface OpenRouterBatchClientDependencies {
 }
 
 /** Exact persisted-wire validator shared by submit and future saved-job inspection. */
-export function isOpenRouterBatchRequestProfile(value: unknown, profileVersion: OpenRouterBatchRequestProfileVersion = OPENROUTER_BATCH_REQUEST_PROFILE_VERSION, operation: OpenRouterBatchOperation = 'note_assistance'): value is OpenRouterBatchRequest {
-  if (profileVersion !== 1 && profileVersion !== 2 && profileVersion !== 3) return false;
+export function isOpenRouterBatchRequestProfile(value: unknown, profileVersion: OpenRouterBatchRequestProfileVersion = OPENROUTER_BATCH_REQUEST_PROFILE_VERSION, operation: OpenRouterBatchOperation = 'note_assistance', recoveryBase?: { profileVersion: 1 | 2 | 3; operation: OpenRouterBatchBaseOperation }): value is OpenRouterBatchRequest {
+  if (profileVersion !== 1 && profileVersion !== 2 && profileVersion !== 3 && profileVersion !== 4) return false;
+  if ((profileVersion === 4) !== Boolean(recoveryBase) || (recoveryBase &&
+      ((recoveryBase.profileVersion !== 1 && recoveryBase.profileVersion !== 2 && recoveryBase.profileVersion !== 3) ||
+       !['note_assistance', 'chat_refinement', 'mail_reply_context', 'mail_reply_body'].includes(recoveryBase.operation)))) return false;
+  const baseProfile = profileVersion === 4 ? recoveryBase!.profileVersion : profileVersion;
+  const baseOperation = profileVersion === 4 ? recoveryBase!.operation : operation;
   const body = safeObject(value);
   const requestKeys = body ? Object.keys(body).sort().join(',') : '';
   const reasoning = safeObject(body?.reasoning);
@@ -67,23 +74,58 @@ export function isOpenRouterBatchRequestProfile(value: unknown, profileVersion: 
   const messages = body?.messages;
   const systemMessage = Array.isArray(messages) ? safeObject(messages[0]) : undefined;
   const userMessage = Array.isArray(messages) ? safeObject(messages[1]) : undefined;
-  const expectedSchema = schemaEnvelope?.name === 'note_assistance' && operation === 'note_assistance' && profileVersion !== 3
-    ? profileVersion === 1 ? assistantResponseSchema : assistantResponseSchemaV2
-    : schemaEnvelope?.name === 'chat_refinement' && operation === 'chat_refinement' && profileVersion === 2
+  const expectedSchema = schemaEnvelope?.name === 'note_assistance' && baseOperation === 'note_assistance' && (baseProfile === 1 || baseProfile === 2)
+    ? baseProfile === 1 ? assistantResponseSchema : assistantResponseSchemaV2
+    : schemaEnvelope?.name === 'chat_refinement' && baseOperation === 'chat_refinement' && baseProfile === 2
       ? assistantChatRefinementSchemaV2
-      : schemaEnvelope?.name === 'mail_reply_body' && operation === 'note_assistance' && profileVersion !== 3 ? assistantReplyTextSchema
-        : schemaEnvelope?.name === 'mail_reply_body' && operation === 'mail_reply_context' && profileVersion === 3 ? assistantReplyTextSchema : undefined;
+      : schemaEnvelope?.name === 'mail_reply_body' && profileVersion !== 4 && operation === 'note_assistance' && (profileVersion === 1 || profileVersion === 2) ? assistantReplyTextSchema
+        : schemaEnvelope?.name === 'mail_reply_body' && profileVersion === 3 && operation === 'mail_reply_context' ? assistantReplyTextSchema
+          : schemaEnvelope?.name === 'mail_reply_body' && profileVersion === 4 && (baseOperation === 'mail_reply_body' && (baseProfile === 1 || baseProfile === 2) ||
+            baseOperation === 'mail_reply_context' && baseProfile === 3) ? assistantReplyTextSchema : undefined;
   const validMessages = Array.isArray(messages) && messages.length === 2 &&
     !!systemMessage && Object.keys(systemMessage).sort().join(',') === 'content,role' &&
     systemMessage.role === 'system' && typeof systemMessage.content === 'string' &&
     !!userMessage && Object.keys(userMessage).sort().join(',') === 'content,role' &&
     userMessage.role === 'user' && typeof userMessage.content === 'string';
-  const effortAllowed = operation === 'chat_refinement' ? ['medium', 'high', 'max'].includes(String(reasoning?.effort)) : ['none', 'low'].includes(String(reasoning?.effort));
+  const effortAllowed = operation === 'chat_refinement' || profileVersion === 4 ? ['medium', 'high', 'max'].includes(String(reasoning?.effort)) : ['none', 'low'].includes(String(reasoning?.effort));
   return !!body && requestKeys === 'messages,model,reasoning,response_format,stream' && body.model === OPENROUTER_BATCH_BODY_MODEL && body.stream === false &&
     validMessages && !!reasoning && Object.keys(reasoning).sort().join(',') === 'effort,exclude' && reasoning.exclude === true && typeof reasoning.effort === 'string' && effortAllowed &&
     !!format && Object.keys(format).sort().join(',') === 'json_schema,type' && format.type === 'json_schema' &&
     !!schemaEnvelope && Object.keys(schemaEnvelope).sort().join(',') === 'name,schema,strict' && schemaEnvelope.strict === true && !!expectedSchema &&
     canonicalJson(schemaEnvelope.schema) === canonicalJson(expectedSchema);
+}
+
+export function higherOpenRouterRecoveryEfforts(effort: OpenRouterBatchRequest['reasoning']['effort']): readonly OpenRouterRecoveryEffort[] {
+  if (effort === 'none' || effort === 'low') return Object.freeze(['medium', 'high', 'max']);
+  if (effort === 'medium') return Object.freeze(['high', 'max']);
+  if (effort === 'high') return Object.freeze(['max']);
+  return Object.freeze([]);
+}
+
+/** Reuses the exact reviewed schema and messages, changing only the explicit reasoning effort. */
+export function buildMoreComputeRequestBody(
+  originalBody: string,
+  parentProfileVersion: OpenRouterBatchRequestProfileVersion,
+  baseOperation: OpenRouterBatchBaseOperation,
+  operation: OpenRouterBatchOperation,
+  effort: OpenRouterRecoveryEffort,
+  parentRecoveryBase?: { profileVersion: 1 | 2 | 3; operation: OpenRouterBatchBaseOperation },
+): string {
+  let parsed: unknown;
+  try { parsed = JSON.parse(originalBody) as unknown; } catch { throw new Error('The saved parent request could not be rebuilt.'); }
+  const parentValid = parentProfileVersion === 4
+    ? Boolean(parentRecoveryBase && isOpenRouterBatchRequestProfile(parsed, 4, operation, parentRecoveryBase))
+    : isOpenRouterBatchRequestProfile(parsed, parentProfileVersion, operation) ||
+      (baseOperation === 'mail_reply_body' && isOpenRouterBatchRequestProfile(parsed, parentProfileVersion, 'note_assistance'));
+  if (!parentValid) {
+    throw new Error('The saved parent request could not be validated for recovery.');
+  }
+  const body = safeObject(parsed);
+  const reasoning = safeObject(body?.reasoning);
+  if (!body || !reasoning || !higherOpenRouterRecoveryEfforts(String(reasoning.effort) as OpenRouterBatchRequest['reasoning']['effort']).includes(effort)) {
+    throw new Error('Choose a higher supported reasoning effort.');
+  }
+  return JSON.stringify({ ...body, reasoning: { ...reasoning, effort } });
 }
 
 export interface OpenRouterBatchAck {
@@ -107,7 +149,7 @@ export interface OpenRouterBatchInspection {
   readonly completed: number;
   readonly failed: number;
   readonly metadataValidation: 'valid' | 'invalid';
-  readonly resultValidation: 'valid' | 'invalid' | 'unavailable';
+  readonly resultValidation: 'valid' | 'truncated' | 'invalid' | 'unavailable';
   readonly usage?: Readonly<{ cost?: number; isByok?: boolean; promptTokens?: number; completionTokens?: number; totalTokens?: number }>;
   /** Private result evidence for the controller's strict schema/provenance validator; never UI state. */
   readonly result?: Readonly<{ customId: string; statusCode: number; finishReason?: string; responseBody?: unknown; errorPresent?: true }>;
@@ -183,7 +225,7 @@ function parseBatchCounts(value: unknown): { total: number; completed: number; f
   return { total: row.total, completed: row.completed, failed: row.failed };
 }
 
-function parseInspectionResult(value: unknown, expectedCustomId: string): { result?: OpenRouterInspectionResult; validation: 'valid' | 'invalid' | 'unavailable' } {
+function parseInspectionResult(value: unknown, expectedCustomId: string): { result?: OpenRouterInspectionResult; validation: 'valid' | 'truncated' | 'invalid' | 'unavailable' } {
   if (value === null || value === undefined) return { validation: 'unavailable' };
   if (!Array.isArray(value) || value.length !== 1) return { validation: 'invalid' };
   const row = safeObject(value[0]);
@@ -199,8 +241,10 @@ function parseInspectionResult(value: unknown, expectedCustomId: string): { resu
     if (!Array.isArray(choices) || choices.length !== 1) return { validation: 'invalid' };
     const choice = safeObject(choices[0]);
     const message = safeObject(choice?.message);
-    if (message?.role !== 'assistant' || choice?.index !== 0 || typeof message.content !== 'string' || choice?.finish_reason !== 'stop') return { validation: 'invalid' };
-    return { validation: 'valid', result: Object.freeze({ customId: expectedCustomId, statusCode: response.status_code, finishReason: choice.finish_reason, responseBody: body }) };
+    if (message?.role !== 'assistant' || choice?.index !== 0 || typeof message.content !== 'string' ||
+        (message.refusal !== undefined && message.refusal !== null) || (choice?.finish_reason !== 'stop' && choice?.finish_reason !== 'length')) return { validation: 'invalid' };
+    return { validation: choice.finish_reason === 'length' ? 'truncated' : 'valid',
+      result: Object.freeze({ customId: expectedCustomId, statusCode: response.status_code, finishReason: choice.finish_reason, responseBody: body }) };
   }
   return { validation: 'invalid', result: Object.freeze({ customId: expectedCustomId, statusCode: 0, errorPresent: true as const }) };
 }

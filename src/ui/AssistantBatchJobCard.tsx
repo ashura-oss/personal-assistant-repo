@@ -3,6 +3,7 @@ import { Text, View } from 'react-native';
 import type { AssistantBatchJobDTO } from '../services/openRouterBatchJobs';
 import { Button } from './primitives';
 import { C, s } from './theme';
+import { MoreComputeReview, type MoreComputeReviewActions } from './MoreComputeReview';
 import {
   assistantBatchStatusLabel,
   batchCheckLabel,
@@ -10,6 +11,7 @@ import {
   canCheckBatchJob,
   canRetryBatchJobCleanup,
   formatReportedBatchCost,
+  hasNoHigherSupportedReasoning,
 } from './assistantBatchJobPresentation';
 
 type Props = {
@@ -18,6 +20,7 @@ type Props = {
   blocked?: boolean;
   onCheck?: (jobId: string) => Promise<unknown> | unknown;
   onRetryCleanup?: (jobId: string) => Promise<unknown> | unknown;
+  moreCompute?: MoreComputeReviewActions;
 };
 
 function dateLabel(value: string): string {
@@ -27,7 +30,7 @@ function dateLabel(value: string): string {
     : 'Time unavailable';
 }
 
-export function AssistantBatchJobCard({ job, busy = false, blocked = false, onCheck, onRetryCleanup }: Props) {
+export function AssistantBatchJobCard({ job, busy = false, blocked = false, onCheck, onRetryCleanup, moreCompute }: Props) {
   const [checking, setChecking] = useState(false);
   const [retryingCleanup, setRetryingCleanup] = useState(false);
   const [actionError, setActionError] = useState<string | undefined>();
@@ -85,6 +88,8 @@ export function AssistantBatchJobCard({ job, busy = false, blocked = false, onCh
       {job.status === 'result_not_retained' ? (
         <Text style={styles.helper}>The reply did not fit in local saved data. Reported usage is still shown.</Text>
       ) : null}
+      {job.status === 'result_truncated' && job.pendingRecoveryChildId ? <Text style={styles.helper}>A higher-reasoning request is already saved. Check its status in Batch history.</Text> : null}
+      {job.status === 'result_truncated' && hasNoHigherSupportedReasoning(job) ? <Text style={styles.helper}>No higher supported reasoning setting is available for this response.</Text> : null}
       {job.status === 'cleanup_pending' ? (
         <Text style={styles.helper}>Finish closing this local request. This does not submit another request.</Text>
       ) : null}
@@ -105,6 +110,7 @@ export function AssistantBatchJobCard({ job, busy = false, blocked = false, onCh
       ) : null}
       {tokenSummary ? <Text style={styles.meta}>Provider-reported tokens · {tokenSummary}</Text> : null}
       {actionError ? <Text accessibilityRole="alert" style={styles.warning}>{actionError}</Text> : null}
+      {moreCompute && job.canRecoverMoreCompute && !blocked && !moreCompute.blocked ? <MoreComputeReview key={moreCompute.ownerKey} job={job} {...moreCompute} blocked={false} /> : null}
       {canCheckBatchJob(job) && onCheck ? (
         <Button
           label={checking ? 'Checking status…' : batchCheckLabel(job)}

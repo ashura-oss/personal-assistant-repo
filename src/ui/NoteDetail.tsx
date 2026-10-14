@@ -17,6 +17,7 @@ import { TranscriptionPanel } from "./TranscriptionPanel";
 import { AssistantBatchJobCard } from "./AssistantBatchJobCard";
 import { VoiceChatTransferReview } from "./VoiceChatTransferReview";
 import { C, s } from "./theme";
+import type { MoreComputeReviewActions } from "./MoreComputeReview";
 
 function validTimeZone(value: string) {
   try {
@@ -72,6 +73,7 @@ type Props = {
   onRetryTranscriptionRequestCleanup?: (attemptId: string) => Promise<void>;
   onCheckAssistantBatch?: (jobId: string) => Promise<unknown> | unknown;
   onRetryAssistantBatchCleanup?: (jobId: string) => Promise<unknown> | unknown;
+  moreComputeActions?: MoreComputeReviewActions;
   voiceChatTransfer?: {
     plan?: ChatTranscriptTransferPlan;
     conversations: readonly ChatConversationDTO[];
@@ -134,6 +136,7 @@ export function NoteDetail({
   onRetryTranscriptionRequestCleanup,
   onCheckAssistantBatch,
   onRetryAssistantBatchCleanup,
+  moreComputeActions,
   voiceChatTransfer,
   onOpenSpeechSettings,
   onAttachRecording,
@@ -384,6 +387,7 @@ export function NoteDetail({
               blocked={assistantBatchActionsBlocked}
               onCheck={onCheckAssistantBatch}
               onRetryCleanup={onRetryAssistantBatchCleanup}
+              moreCompute={moreComputeActions ? { ...moreComputeActions, ownerKey: JSON.stringify(['note', note.id, note.revision, job.id, job.updatedAt, job.status, moreComputeActions.ownerKey]) } : undefined}
             />
           ))}
 

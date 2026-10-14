@@ -4,7 +4,7 @@ export type ChatReplySnapshot = Readonly<{
   clarifications: readonly string[];
   completedAt: string;
   requestSha256: string;
-  requestProfileVersion: 1 | 2;
+  requestProfileVersion: 1 | 2 | 4;
 }>;
 
 export type ChatTurn = Readonly<{
@@ -20,6 +20,7 @@ export type ChatTurn = Readonly<{
   operation?: 'chat_refinement';
   reasoningEffort?: 'medium' | 'high' | 'max';
   parentTurnId?: string;
+  recoveryParentTurnId?: string;
   reply?: ChatReplySnapshot;
   replySha256?: string;
 }>;
@@ -61,6 +62,7 @@ export type ChatTurnDTO = Readonly<{
   operation?: 'chat_refinement';
   reasoningEffort?: 'medium' | 'high' | 'max';
   parentTurnId?: string;
+  recoveryParentTurnId?: string;
   memorySuggestionIds?: readonly string[];
   reply?: Pick<ChatReplySnapshot, 'summary' | 'answer' | 'clarifications' | 'completedAt'>;
   job?: import('../services/openRouterBatchJobs').AssistantBatchJobDTO;

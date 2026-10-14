@@ -80,6 +80,8 @@ import { DispatchRecoverySection } from "./src/ui/DispatchRecoverySection";
 import { closeOwnedDispatchRecovery, DispatchRecoveryOwnership, openCurrentDispatchRecoveryAfterNotVerified, runOwnedDispatchRecoveryAction } from "./src/ui/dispatchRecoveryOwnership";
 import { useProactiveClock } from "./src/ui/useProactiveClock";
 import { ReviewSheet } from "./src/ui/ReviewSheet";
+import type { MoreComputeReviewActions } from "./src/ui/MoreComputeReview";
+import { moreComputeConfigurationFingerprint, moreComputeWorkspaceIsBlocked } from "./src/ui/moreComputeOwnership";
 import { NoteDetail as NoteDetailView } from "./src/ui/NoteDetail";
 import { BackupImportSheet } from "./src/ui/BackupImportSheet";
 import { ImportedBackupsSection } from "./src/ui/ImportedBackupsSection";
@@ -994,6 +996,8 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
   const oauthIntentOwnershipRef = useRef<OAuthConnectionIntentOwnership | null>(null);
   if (oauthIntentOwnershipRef.current == null) oauthIntentOwnershipRef.current = new OAuthConnectionIntentOwnership();
   const workspaceMountedRef = useRef(false);
+  const moreComputeRuntimeRef = useRef({ controller, resources, privacy, session, workspaceGeneration,
+    sessionEpoch: session?.epoch ?? null, sessionRuntimeId: session?.runtimeId ?? null });
   const [loading, setLoading] = useState(true);
   const [startupReady, setStartupReady] = useState(false);
   const oauthGateRef = useRef({ workspaceGeneration, privacyReviewOpen, privacyOutcomeUnknown, startupReady, loading, isolated: isIsolatedDemo });
@@ -1006,6 +1010,10 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
       workspaceMountedRef.current = false;
       oauthIntentOwnershipRef.current?.invalidate();
     };
+  }, [controller, resources, privacy, session, workspaceGeneration]);
+  useLayoutEffect(() => {
+    moreComputeRuntimeRef.current = { controller, resources, privacy, session, workspaceGeneration,
+      sessionEpoch: session?.epoch ?? null, sessionRuntimeId: session?.runtimeId ?? null };
   }, [controller, resources, privacy, session, workspaceGeneration]);
   const [startupRecoveryStatus, setStartupRecoveryStatus] = useState<StartupRecoveryStatus | undefined>();
   const [startupRecoveryPlan, setStartupRecoveryPlan] = useState<StartupRecoveryPlan | undefined>();
@@ -1038,6 +1046,7 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
   const dispatchRecoveryReadBlockedRef = useRef(true);
   const dispatchRecoveryMutationBlockedRef = useRef(true);
   const [selectedChatConversationId, setSelectedChatConversationId] = useState<string | undefined>();
+  const [moreComputeFocusTurnId, setMoreComputeFocusTurnId] = useState<string | undefined>();
   const [knowledgeReviewRequest, setKnowledgeReviewRequest] = useState<{ suggestionId: string; requestId: number } | undefined>();
   const knowledgeReviewRequestSequence = useRef(0);
   const [chatTranscriptTransferPlan, setChatTranscriptTransferPlan] = useState<ChatTranscriptTransferPlan | undefined>();
@@ -1139,6 +1148,9 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
   const [reviewFreshnessRetry, setReviewFreshnessRetry] = useState(0);
   const [answerWindowTick, setAnswerWindowTick] = useState(0);
   const busyLock = useRef(false);
+  const moreComputeTicketRef = useRef<object | undefined>(undefined);
+  const moreComputePlansRef = useRef(new Map<string, { planId: string; jobId: string; ownerKey: string; controller: AppController }>());
+  const moreComputeOwnerViewRef = useRef({ detail: null as Note | null, selectedConversationId: undefined as string | undefined, replyMessageId: null as string | null, mailGeneration: 0, tab: "record" as Tab, globalBlocked: true });
   const [dispatchRecoveryOwnership] = useState(() => new DispatchRecoveryOwnership());
   const speechTranscriptionAdmission = useRef<ReturnType<typeof createSpeechTranscriptionAdmission> | null>(null);
   if (speechTranscriptionAdmission.current == null) speechTranscriptionAdmission.current = createSpeechTranscriptionAdmission();
@@ -2650,6 +2662,163 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
       }
     }
   }, [onPrivacyInvalidated]);
+  const moreComputeGlobalBlocked = moreComputeWorkspaceIsBlocked({
+    startupReady, loading, demo: isIsolatedDemo, previewFailed: isolatedPreviewFailed,
+    privacyBlocked: privacyReviewOpen || privacyOutcomeUnknown, settingsOpen, backgroundActionBlocked: Boolean(backgroundActionBlockedReason),
+    audioActive: audio.status !== "idle", captureLoading: pendingCaptureLoading,
+    capturePending: Boolean(captureJournal && pendingCaptureStatus?.kind !== "empty"),
+    foregroundBlocked: foregroundResumeRefreshing || !foregroundCatchupComplete,
+    recoveryBlocked: proactiveRecoverySheetOpen || proactiveRecoveryRequiresRefresh || dispatchRecoverySheetOpen || Boolean(dispatchRecoveryPlan) ||
+      Boolean(state.mailAlertRefreshRequired || state.assistantChatRecoveryStatus || state.assistantBatchRecoveryStatus ||
+        state.proactiveMailAlertRecoveryStatus || state.backupRecoveryStatus || state.knowledgeRecoveryStatus || state.reminderRecoveryStatus),
+    proposalReviewOpen: Boolean(review), reminderReviewOpen: Boolean(reminderReviewId), documentOpen: Boolean(doc),
+    recordingAttachmentOpen: Boolean(recordingAttachmentNoteId), manualChatOpen: manualOpen,
+    mailAlertTapOpen: Boolean(mailAlertTapResolution || mailAlertTapPending || mailAlertTapReviewRequested),
+    chatDeleteReviewOpen, chatInteractionLocked, dispatchRecoveryOpen: dispatchRecoverySheetOpen || Boolean(dispatchRecoveryPlan),
+    knowledgeReviewOpen: Boolean(knowledgeReviewRequest), voiceTransferReviewOpen: Boolean(chatTranscriptTransferPlan),
+    startupRecoveryOpen: Boolean(startupRecoveryPlan),
+  });
+  useLayoutEffect(() => {
+    moreComputeOwnerViewRef.current = { detail, selectedConversationId: selectedChatConversationId, replyMessageId, mailGeneration: mailReplyOwnerGeneration, tab, globalBlocked: moreComputeGlobalBlocked };
+  });
+  const parseMoreComputeOwner = useCallback((ownerKey: string): unknown[] | undefined => {
+    try {
+      const parsed: unknown = JSON.parse(ownerKey);
+      return Array.isArray(parsed) ? parsed : undefined;
+    } catch { return undefined; }
+  }, []);
+  const moreComputeConfigKey = useCallback((snapshot: AppState = controller.getSnapshot()) =>
+    moreComputeConfigurationFingerprint(snapshot.settings, snapshot.accounts, {
+      workspaceGeneration, sessionEpoch: session?.epoch ?? null, sessionRuntimeId: session?.runtimeId ?? null,
+    }), [controller, session?.epoch, session?.runtimeId, workspaceGeneration]);
+  const isMoreComputeRuntimeCurrent = useCallback(() => {
+    const runtime = moreComputeRuntimeRef.current;
+    return workspaceMountedRef.current && runtime.controller === controller && runtime.resources === resources &&
+      runtime.privacy === privacy && runtime.session === session && runtime.workspaceGeneration === workspaceGeneration &&
+      runtime.sessionEpoch === (session?.epoch ?? null) && runtime.sessionRuntimeId === (session?.runtimeId ?? null);
+  }, [controller, privacy, resources, session, workspaceGeneration]);
+  const isMoreComputeOwnerCurrent = useCallback((ownerKey: string, jobId: string) => {
+    const view = moreComputeOwnerViewRef.current;
+    if (!isMoreComputeRuntimeCurrent() || view.globalBlocked) return false;
+    const owner = parseMoreComputeOwner(ownerKey);
+    const snapshot = controller.getSnapshot();
+    if (!owner || owner[owner.length - 1] !== moreComputeConfigKey(snapshot)) return false;
+    const jobs = snapshot.assistantBatchJobs ?? [];
+    if (owner[0] === "note" && typeof owner[1] === "string" && typeof owner[2] === "number" && owner[3] === jobId) {
+      const liveNote = snapshot.notes.find((item) => item.id === owner[1]);
+      return view.tab === "record" && view.detail?.id === owner[1] &&
+        liveNote?.revision === owner[2] && jobs.some((item) => item.id === jobId && item.kind === "note_assistance" && item.noteId === owner[1]);
+    }
+    if (owner[0] === "chat" && typeof owner[1] === "string" && typeof owner[2] === "string" && owner[3] === jobId) {
+      const conversation = snapshot.assistantChatConversations?.find((item) => item.id === owner[1]);
+      return view.tab === "chat" && !view.detail && view.selectedConversationId === owner[1] &&
+        Boolean(conversation?.turns.some((turn) => turn.id === owner[2] && turn.job?.id === jobId));
+    }
+    if (owner[0] === "mail" && typeof owner[1] === "string" && typeof owner[2] === "number" && typeof owner[3] === "number" && owner[4] === jobId) {
+      return view.tab === "inbox" && !view.detail && view.replyMessageId === owner[1] && view.mailGeneration === owner[2] &&
+        jobs.some((item) => item.id === jobId && item.kind === "mail_reply" && item.mailMessageId === owner[1]);
+    }
+    return false;
+  }, [controller, isMoreComputeRuntimeCurrent, moreComputeConfigKey, parseMoreComputeOwner]);
+  const moreComputePlans = moreComputePlansRef.current;
+  const moreComputeAction = useCallback(async <TValue,>(ownerKey: string, jobId: string, action: () => Promise<TValue>, cancelLate?: (value: TValue) => void, extraCurrent: () => boolean = () => true): Promise<TValue | undefined> => {
+    if (!isMoreComputeOwnerCurrent(ownerKey, jobId) || !extraCurrent() || busyLock.current) return undefined;
+    const mailAction = parseMoreComputeOwner(ownerKey)?.[0] === "mail";
+    const ticket = {};
+    moreComputeTicketRef.current = ticket;
+    busyLock.current = true;
+    if (mailAction) setMailReplyBatchActionBusy(true);
+    setBusy(true);
+    try {
+      const value = await action();
+      if (!isMoreComputeOwnerCurrent(ownerKey, jobId) || !extraCurrent()) {
+        cancelLate?.(value);
+        return undefined;
+      }
+      return value;
+    } catch (error) {
+      if (isPrivacyBootstrapError(error)) onPrivacyInvalidated();
+      else if (isMoreComputeOwnerCurrent(ownerKey, jobId) && extraCurrent()) setNotice(messageOf(error));
+      throw error;
+    } finally {
+      if (moreComputeTicketRef.current === ticket) {
+        moreComputeTicketRef.current = undefined;
+        busyLock.current = false;
+        if (mailAction) setMailReplyBatchActionBusy(false);
+        setBusy(false);
+      }
+    }
+  }, [isMoreComputeOwnerCurrent, onPrivacyInvalidated, parseMoreComputeOwner]);
+  const cancelMoreCompute = useCallback((planId: string, ownerKey: string) => {
+    const stored = moreComputePlans.get(ownerKey);
+    if (!stored || stored.planId !== planId) return;
+    moreComputePlans.delete(ownerKey);
+    stored.controller.cancelMoreCompute(planId);
+  }, [moreComputePlans]);
+  const moreComputeActions: MoreComputeReviewActions = {
+    ownerKey: moreComputeConfigKey(),
+    blocked: moreComputeGlobalBlocked,
+    submitReady: state.settings.mode === "provider" && state.settings.llmProvider === "openrouter",
+    onPrepare: async (jobId, effort, ownerKey, isOwnerCurrent) => {
+      const plan = await moreComputeAction(ownerKey, jobId, () => controller.prepareMoreCompute({ jobId, effort }), (late) => controller.cancelMoreCompute(late.planId), isOwnerCurrent);
+      if (!plan) return undefined;
+      if (plan.jobId !== jobId || plan.requestedEffort !== effort || !plan.planId || !isMoreComputeOwnerCurrent(ownerKey, jobId)) {
+        controller.cancelMoreCompute(plan.planId);
+        return undefined;
+      }
+      moreComputePlans.set(ownerKey, { planId: plan.planId, jobId, ownerKey, controller });
+      return plan;
+    },
+    onSubmit: async (planId, jobId, ownerKey, isOwnerCurrent) => {
+      const stored = moreComputePlans.get(ownerKey);
+      if (!stored || stored.planId !== planId || stored.jobId !== jobId || stored.controller !== controller || !isMoreComputeOwnerCurrent(ownerKey, jobId) || !isOwnerCurrent()) return undefined;
+      return moreComputeAction(ownerKey, jobId, async () => {
+        const discardPlan = () => {
+          const live = moreComputePlans.get(ownerKey);
+          if (live?.planId === planId) {
+            moreComputePlans.delete(ownerKey);
+            live.controller.cancelMoreCompute(planId);
+          }
+        };
+        const settingsAtAdmission = controller.getSnapshot().settings;
+        if (settingsAtAdmission.mode !== "provider" || settingsAtAdmission.llmProvider !== "openrouter") {
+          discardPlan();
+          openSettings();
+          setNotice("Choose OpenRouter in Provider mode before submitting this paid request.");
+          throw new Error("Choose OpenRouter in Provider mode before submitting this paid request.");
+        }
+        let keyReady = false;
+        try { keyReady = (await credentials.getCredentials()).openRouterConfigured === true; }
+        catch (error) { if (isPrivacyBootstrapError(error)) throw error; }
+        const currentSettings = controller.getSnapshot().settings;
+        if (!isOwnerCurrent() || !isMoreComputeOwnerCurrent(ownerKey, jobId) || currentSettings.mode !== settingsAtAdmission.mode || currentSettings.llmProvider !== settingsAtAdmission.llmProvider ||
+            currentSettings.openRouterModel !== settingsAtAdmission.openRouterModel || currentSettings.openRouterReasoningEffort !== settingsAtAdmission.openRouterReasoningEffort) {
+          discardPlan();
+          throw new Error("Workspace or OpenRouter settings changed. Prepare a fresh review.");
+        }
+        if (!keyReady) {
+          discardPlan();
+          openSettings();
+          setNotice("Save an OpenRouter API key in Settings before submitting this paid request.");
+          throw new Error("Save an OpenRouter API key in Settings before submitting this paid request.");
+        }
+        moreComputePlans.delete(ownerKey);
+        return controller.submitMoreCompute({ planId });
+      }, undefined, isOwnerCurrent);
+    },
+    onCancel: cancelMoreCompute,
+    onSubmitted: (result, ownerKey) => {
+      const owner = parseMoreComputeOwner(ownerKey);
+      const recovered = result as { recoveredConversationId?: unknown; recoveredTurnId?: unknown } | undefined;
+      const parentJobId = owner?.[0] === "chat" && typeof owner[3] === "string" ? owner[3] : undefined;
+      if (parentJobId && !isMoreComputeOwnerCurrent(ownerKey, parentJobId)) return;
+      if (owner?.[0] === "chat" && typeof recovered?.recoveredConversationId === "string" && typeof recovered.recoveredTurnId === "string" &&
+          controller.getSnapshot().assistantChatConversations?.some((conversation) => conversation.id === recovered.recoveredConversationId)) {
+        setSelectedChatConversationId(recovered.recoveredConversationId);
+        setMoreComputeFocusTurnId(recovered.recoveredTurnId);
+      }
+    },
+  };
   useEffect(() => {
     const owner = replyMessageId ? mailReplyBatchOwnershipRef.current!.captureOwner(replyMessageId) : undefined;
     const mode = state.settings.mode;
@@ -2916,7 +3085,7 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
     jobId: string, owner: MailReplyBatchOwner, isComposerCurrent: () => boolean,
   ): Promise<MailReplyBatchSourcesRefreshResult | undefined> => {
     const job = (controller.getSnapshot().assistantBatchJobs ?? []).find((item) => item.id === jobId && item.kind === 'mail_reply' && item.mailMessageId === owner.messageId);
-    if (!job || !job.proposalId) return undefined;
+    if (!job || job.sourceRemoved || (job.status !== 'completed' && job.status !== 'result_truncated') || (job.status === 'completed' && !job.hasMailReplyResult) || (job.mailReplyContextCount ?? 0) < 1) return undefined;
     const result = await runOwnedMailReplyContextAction({ owner, isCurrent: isComposerCurrent,
       action: () => controller.refreshMailReplyBatchSources(jobId) });
     return result?.jobId === jobId ? result : undefined;
@@ -3756,6 +3925,7 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
                 transcriptionAttempts={state.transcription.attempts.filter((attempt) => attempt.noteId === detail.id)}
                 assistantBatchJobs={state.assistantBatchJobs ?? []}
                 assistantBatchActionsBlocked={Boolean(state.assistantBatchRecoveryStatus)}
+                moreComputeActions={moreComputeActions}
                 cancelingTranscriptionId={cancelingTranscriptionId}
                 transcriptionRequestRunning={transcribingNoteId === detail.id}
                 transcriptionRequestCleanupAttemptIds={(state.transcriptionRequestCleanupPending ?? []).map(({ attemptId }) => attemptId)}
@@ -4003,6 +4173,7 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
               <ChatSection
                 conversations={chatConversations}
                 selectedConversationId={selectedChatConversationId}
+                focusTurnId={moreComputeFocusTurnId}
                 turns={selectedChatConversation?.turns ?? []}
                 busy={busy}
                 enabled={chatEnabled}
@@ -4030,6 +4201,7 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
                   return updated;
                 })}
                 onRetryJobCleanup={(jobId) => controller.retryAssistantBatchCleanup(jobId)}
+                moreComputeActions={moreComputeActions}
                 onRefineTurn={chatRefineTurn}
                 onReviewMemorySuggestion={openChatMemorySuggestion}
               />
@@ -4526,6 +4698,7 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
           onCancelContext={cancelMailReplyContext}
           onRefreshBatchSources={refreshComposerMailReplySources}
           getBatchSourcesStatus={(jobId) => controller.getMailReplyBatchSourcesStatus(jobId)}
+          moreComputeActions={moreComputeActions}
           onClose={closeMailReply}
           onSave={saveMailReply}
         />

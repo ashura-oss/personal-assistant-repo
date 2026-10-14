@@ -39,6 +39,24 @@ const queuedJob = (overrides: Partial<AssistantBatchJobDTO> = {}): AssistantBatc
 });
 
 describe('AssistantBatchJobCard action ownership', () => {
+  it('shows terminal cutoff and no-higher-effort copy without offering another paid action', () => {
+    act(() => root.render(React.createElement(AssistantBatchJobCard, { job: queuedJob({
+      status: 'result_truncated', canCheck: false, effort: 'max', canRecoverMoreCompute: false, moreComputeEfforts: [],
+    }) })));
+    expect(host.textContent).toContain('Provider response was cut off; no output applied');
+    expect(host.textContent).toContain('No higher supported reasoning setting is available');
+    expect([...host.querySelectorAll('button')].some((button) => button.textContent?.includes('Review higher'))).toBe(false);
+  });
+
+  it('does not describe an active higher-effort child as unavailable', () => {
+    act(() => root.render(React.createElement(AssistantBatchJobCard, { job: queuedJob({
+      status: 'result_truncated', canCheck: false, effort: 'low', canRecoverMoreCompute: false,
+      moreComputeEfforts: ['medium'], pendingRecoveryChildId: 'child-job',
+    }) })));
+    expect(host.textContent).toContain('A higher-reasoning request is already saved. Check its status in Batch history.');
+    expect(host.textContent).not.toContain('No higher supported reasoning setting is available');
+  });
+
   it('allows explicit cleanup while a status check is still pending', async () => {
     let resolveCheck!: () => void;
     const check = new Promise<void>((resolve) => { resolveCheck = resolve; });

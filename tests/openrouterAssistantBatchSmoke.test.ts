@@ -55,7 +55,7 @@ describe('closed assistant Batch smoke response validation', () => {
 
   it.each(['', {}])('rejects a non-null refusal value: %j', async (refusal) => {
     const result = await checkRefusal(refusal);
-    expect(result).toMatchObject({ status: 'completed', modelValidated: true, strictSchemaValidated: false,
-      assistantResultValidated: false, intendedReplyMatched: false });
+    expect(result).toMatchObject({ status: 'completed', modelValidated: false, strictSchemaValidated: false,
+      assistantResultValidated: false, intendedReplyMatched: false, usage: { cost: 0.0001, promptTokens: 10, completionTokens: 2 } });
   });
 });

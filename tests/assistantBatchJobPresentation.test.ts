@@ -7,6 +7,7 @@ import {
   canCheckBatchJob,
   canRetryBatchJobCleanup,
   formatReportedBatchCost,
+  hasNoHigherSupportedReasoning,
 } from '../src/ui/assistantBatchJobPresentation';
 
 const job = (overrides: Partial<AssistantBatchJobDTO> = {}): AssistantBatchJobDTO => ({
@@ -57,7 +58,14 @@ describe('assistant Batch job presentation', () => {
     expect(canRetryBatchJobCleanup(job({ status: 'queued' }))).toBe(false);
     expect(assistantBatchStatusLabel('submission_unknown')).toBe('Submission status uncertain');
     expect(assistantBatchStatusLabel('result_stale')).toContain('not applied');
+    expect(assistantBatchStatusLabel('result_truncated')).toBe('Provider response was cut off; no output applied');
     expect(assistantBatchStatusLabel('result_not_retained')).toBe('Reply could not be saved');
     expect(assistantBatchStatusLabel('source_removed')).toBe('Request content removed');
+  });
+
+  it('distinguishes no higher effort from an active higher-effort child', () => {
+    expect(hasNoHigherSupportedReasoning(job({ status: 'result_truncated', effort: 'max', moreComputeEfforts: [] }))).toBe(true);
+    expect(hasNoHigherSupportedReasoning(job({ status: 'result_truncated', effort: 'low', moreComputeEfforts: [] }))).toBe(true);
+    expect(hasNoHigherSupportedReasoning(job({ status: 'result_truncated', effort: 'low', moreComputeEfforts: ['medium'], pendingRecoveryChildId: 'child' }))).toBe(false);
   });
 });

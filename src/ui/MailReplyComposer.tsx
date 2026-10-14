@@ -27,6 +27,7 @@ import { MailReplyBatchSection } from "./MailReplyBatchSection";
 import { MailReplyConversationContext } from "./MailReplyConversationContext";
 import type { AssistantBatchJobDTO } from "../services/openRouterBatchJobs";
 import { C, s } from "./theme";
+import type { MoreComputeReviewActions } from "./MoreComputeReview";
 
 type ReplyMode = "reply" | "reply_all";
 const BRIEF_LIMIT = 4 * 1024;
@@ -59,6 +60,7 @@ export function MailReplyComposer({
   onCancelContext,
   onRefreshBatchSources,
   getBatchSourcesStatus,
+  moreComputeActions,
 }: {
   visible: boolean;
   messageId: string | null;
@@ -93,6 +95,7 @@ export function MailReplyComposer({
   onCancelContext?: (sessionId: string, owner: { messageId: string; generation: number }) => void;
   onRefreshBatchSources?: (jobId: string, owner: { messageId: string; generation: number }, isComposerCurrent: () => boolean) => Promise<MailReplyBatchSourcesRefreshResult | undefined>;
   getBatchSourcesStatus?: (jobId: string) => ReturnType<AppController["getMailReplyBatchSourcesStatus"]>;
+  moreComputeActions?: MoreComputeReviewActions;
 }) {
   const [source, setSource] = useState<MailReplySourceSnapshot | null>(null);
   const [mode, setMode] = useState<ReplyMode>("reply");
@@ -496,6 +499,8 @@ export function MailReplyComposer({
                     onRefreshSources={onRefreshBatchSources}
                     getSourcesStatus={getBatchSourcesStatus}
                     registerReviewInvalidator={registerBatchReviewInvalidator}
+                    moreComputeActions={moreComputeActions}
+                    moreComputeSubmitReady={batchEnabled}
                   />
                 ) : null}
               </>

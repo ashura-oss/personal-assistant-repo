@@ -84,7 +84,7 @@ function parseReply(value: unknown): ChatReplySnapshot {
   exactKeys(value, ['summary', 'answer', 'clarifications', 'completedAt', 'requestSha256', 'requestProfileVersion']);
   const clarifications = validArray(value.clarifications, 'Chat clarifications').map((item) => text(item, 'Chat clarification'));
   if (clarifications.length > 10 || clarifications.some((item) => item.length > 1000)) fail('Chat clarifications exceed the supported structure.');
-  if (value.requestProfileVersion !== 1 && value.requestProfileVersion !== 2) fail('Chat request profile is invalid.');
+  if (value.requestProfileVersion !== 1 && value.requestProfileVersion !== 2 && value.requestProfileVersion !== 4) fail('Chat request profile is invalid.');
   if (typeof value.requestSha256 !== 'string' || value.requestSha256.length !== 64 || !SHA256.test(value.requestSha256)) fail('Chat request digest is invalid.');
   return Object.freeze({
     summary: text(value.summary, 'Chat reply summary', true),
@@ -98,7 +98,7 @@ function parseReply(value: unknown): ChatReplySnapshot {
 
 function parseTurn(value: unknown): ChatTurn {
   if (!object(value)) fail('Chat turn is invalid.');
-  exactKeys(value, ['id', 'noteId', 'noteRevision', 'jobId', 'userText', 'createdAt', 'captureTimeZone'], ['capturedAt', 'messageOrigin', 'operation', 'reasoningEffort', 'parentTurnId', 'reply', 'replySha256']);
+  exactKeys(value, ['id', 'noteId', 'noteRevision', 'jobId', 'userText', 'createdAt', 'captureTimeZone'], ['capturedAt', 'messageOrigin', 'operation', 'reasoningEffort', 'parentTurnId', 'recoveryParentTurnId', 'reply', 'replySha256']);
   const base = {
     id: uuid(value.id, 'Chat turn ID'),
     noteId: uuid(value.noteId, 'Chat note ID'),
@@ -112,6 +112,7 @@ function parseTurn(value: unknown): ChatTurn {
     ...(value.operation !== undefined ? { operation: value.operation as 'chat_refinement' } : {}),
     ...(value.reasoningEffort !== undefined ? { reasoningEffort: value.reasoningEffort as 'medium' | 'high' | 'max' } : {}),
     ...(value.parentTurnId !== undefined ? { parentTurnId: uuid(value.parentTurnId, 'Chat parent turn ID') } : {}),
+    ...(value.recoveryParentTurnId !== undefined ? { recoveryParentTurnId: uuid(value.recoveryParentTurnId, 'Chat recovery parent turn ID') } : {}),
   };
   if (value.messageOrigin !== undefined && (value.messageOrigin !== 'saved_transcript' || value.capturedAt === undefined)) {
     fail('Saved transcript message binding is invalid.');

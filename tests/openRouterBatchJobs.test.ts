@@ -73,6 +73,23 @@ describe('private OpenRouter Batch ledger receipts', () => {
     expect(() => validateOpenRouterBatchLedger({ version: 1, jobs: [contentJob({ requestProfileVersion: 2, requestBody: bodyFor(1) })] })).toThrow(/integrity validation/i);
   });
 
+  it('requires every recovery edge to come from an intact cutoff and use strictly higher effort', () => {
+    const parentId = '20000000-0000-4000-8000-000000000011';
+    const childId = '20000000-0000-4000-8000-000000000012';
+    const parent = contentJob({ id: parentId, customId: parentId, status: 'result_truncated', failureCode: 'result_truncated', effort: 'low' });
+    const childBody = JSON.stringify({ ...JSON.parse(bodyFor(1)), reasoning: { effort: 'medium', exclude: true } });
+    const child: OpenRouterBatchJob = contentJob({ id: childId, customId: childId, effort: 'medium', status: 'queued',
+      requestProfileVersion: 4, requestBody: childBody, requestBytes: new TextEncoder().encode(childBody).byteLength,
+      requestSha256: 'f'.repeat(64), recoveryBinding: { version: 1, parentJobId: parentId, parentKind: 'note_assistance',
+        parentRequestProfileVersion: 1, parentEffort: 'low', parentRequestSha256: parent.requestSha256!, parentSourceFingerprint: parent.sourceFingerprint!,
+        baseRequestProfileVersion: 1, baseOperation: 'note_assistance', baseRequestSha256: parent.requestSha256!,
+        baseSourceFingerprint: parent.sourceFingerprint! } });
+    expect(validateOpenRouterBatchLedger({ version: 1, jobs: [parent, child] }).jobs).toHaveLength(2);
+    expect(() => validateOpenRouterBatchLedger({ version: 1, jobs: [{ ...parent, status: 'queued', failureCode: undefined }, child] })).toThrow(/integrity validation/i);
+    expect(() => validateOpenRouterBatchLedger({ version: 1, jobs: [parent, { ...child, effort: 'low', requestBody: bodyFor(1),
+      requestProfileVersion: 4, requestBytes: new TextEncoder().encode(bodyFor(1)).byteLength }] })).toThrow(/integrity validation/i);
+  });
+
   it('requires chat refinements to retain the exact profile-2 effort pair even after content is tombstoned', () => {
     const parentId = '20000000-0000-4000-8000-000000000006';
     const chatBinding = { conversationId: operationId, turnId: '20000000-0000-4000-8000-000000000005', context: [], omittedTurnCount: 0,

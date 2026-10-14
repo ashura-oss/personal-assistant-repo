@@ -1,7 +1,7 @@
 import * as Crypto from 'expo-crypto';
 import type {
   Account, AccountConfig, AccountSyncState, AccountCapability, ActivityItem, AppController, AppSettings, AppState,
-  ForegroundMailRefreshResult, MailCoverageInterval, MailLaneResult, MailSyncWindow,
+  ForegroundMailRefreshResult, MailCoverageInterval, MailLaneResult, MailSyncWindow, AssistantBatchMoreComputePlan,
   BackupImportPreview, Calendar, CalendarConfig, ContextDocument, Note, NoteAssistResult, AssistIntent, LocalTask, Proposal, ProposalPatch,
   ProposalProvenance, SaveNoteInput, SettingsPatch, MailboxSnapshotMessage, CalendarEventSnapshot, OAuthInstallResult,
   NoteProposalProvenance, MailReplyProvenance, MailReplySourceSnapshot, MailReplySourceResult,
@@ -99,7 +99,7 @@ import { credentialStore } from '../storage/credentials';
 import type { BackgroundTaskBackend } from '../background/backend.types';
 import {
   OPENROUTER_BATCH_MODEL, OPENROUTER_BATCH_BODY_MODEL, OPENROUTER_BATCH_RESPONSE_MAX_BYTES, OPENROUTER_BATCH_REQUEST_PROFILE_VERSION, OpenRouterBatchClient, OpenRouterBatchDispatchError,
-  OpenRouterBatchRequestBuilder, isOpenRouterBatchRequestProfile, type OpenRouterBatchInspection, type PreparedOpenRouterAnalysis,
+  OpenRouterBatchRequestBuilder, isOpenRouterBatchRequestProfile, buildMoreComputeRequestBody, higherOpenRouterRecoveryEfforts, type OpenRouterBatchBaseOperation, type OpenRouterBatchInspection, type PreparedOpenRouterAnalysis,
 } from './openRouter';
 import { OpenRouterSpeechClient } from './openRouterSpeech';
 import { OpenRouterSpeechAdapter } from './openRouterSpeechAdapter';
@@ -109,7 +109,7 @@ import type { KnowledgeSuggestionReview } from '../knowledge/types';
 import {
   emptyOpenRouterBatchLedger, validateOpenRouterBatchLedger, assistantBatchJobDTO, accountingFromInspection,
   isOpenRouterBatchContentJob, isOpenRouterMailReplyContentJob, tombstoneOpenRouterBatchJob,
-  type AssistantBatchJobDTO, type OpenRouterBatchJob, type OpenRouterBatchContentJob, type OpenRouterMailReplyContentJob, type OpenRouterBatchLedger, type OpenRouterBatchAccounting,
+  type AssistantBatchJobDTO, type OpenRouterBatchJob, type OpenRouterBatchContentJob, type OpenRouterMailReplyContentJob, type OpenRouterBatchLedger, type OpenRouterBatchAccounting, type OpenRouterBatchRecoveryBinding,
   type OpenRouterChatBinding,
 } from './openRouterBatchJobs';
 import { parseOpenRouterMailReplyResult, validOpenRouterMailReplyBinding, validReplyText, type OpenRouterMailReplyBinding, type OpenRouterMailReplyFrozenNote, type OpenRouterMailReplyFrozenPolicy, type OpenRouterMailReplyContextSource } from './openRouterMailReply';
@@ -521,6 +521,18 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value));
 }
 
+function hasExactPlainDataKeys(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
+  if (!isRecord(value)) return false;
+  try {
+    const prototype = Object.getPrototypeOf(value);
+    const ownKeys = Reflect.ownKeys(value);
+    return (prototype === Object.prototype || prototype === null) && ownKeys.length === keys.length &&
+      ownKeys.every((key) => typeof key === 'string' && keys.includes(key) &&
+        Object.getOwnPropertyDescriptor(value, key)?.enumerable === true &&
+        Object.prototype.hasOwnProperty.call(Object.getOwnPropertyDescriptor(value, key), 'value'));
+  } catch { return false; }
+}
+
 function normalizeKnowledgeSelection(value: unknown): KnowledgeSelection {
   if (!Array.isArray(value) || value.length > 5) throw new Error('Select no more than five people or projects for this Assist request.');
   const result: KnowledgeSelection = [];
@@ -753,10 +765,10 @@ function parseBatchAssistantResult(inspection: OpenRouterBatchInspection, prepar
   try { parsed = JSON.parse(choices[0].message.content); }
   catch { throw new Error('The Batch result was not valid structured analysis.'); }
   const response = operation === 'chat_refinement'
-    ? validateChatRefinementResponse(parsed, prepared.catalog, prepared.selection)
+    ? validateChatRefinementResponse(parsed, prepared.catalog, prepared.selection, 'transcript')
     : prepared.requestProfileVersion === 1
-      ? validateAssistantResponse(parsed, prepared.catalog, prepared.selection)
-      : validateAssistantResponseV2(parsed, prepared.catalog, prepared.selection);
+      ? validateAssistantResponse(parsed, prepared.catalog, prepared.selection, 'transcript')
+      : validateAssistantResponseV2(parsed, prepared.catalog, prepared.selection, 'transcript');
   const accounting = accountingFromInspection(inspection);
   const generated: DraftAnalysis = {
     summary: response.summary,
@@ -781,6 +793,21 @@ function parseBatchAssistantResult(inspection: OpenRouterBatchInspection, prepar
     usageEstimated: false,
   };
   return { response, generated };
+}
+
+function validBatchCutoffEnvelope(inspection: OpenRouterBatchInspection, profile: number): boolean {
+  const result = inspection.result;
+  const body = result?.responseBody;
+  if (inspection.status !== 'completed' || inspection.metadataValidation !== 'valid' || inspection.resultValidation !== 'truncated' ||
+      !result || result.statusCode !== 200 || result.errorPresent || result.finishReason !== 'length' || !isRecord(body) ||
+      ![OPENROUTER_BATCH_BODY_MODEL, 'openai/gpt-6-luna-20260922'].includes(String(body.model)) ||
+      !Array.isArray(body.choices) || body.choices.length !== 1 || !isRecord(body.choices[0]) || body.choices[0].index !== 0 ||
+      body.choices[0].finish_reason !== 'length' || !isRecord(body.choices[0].message) || body.choices[0].message.role !== 'assistant' ||
+      (body.choices[0].message.refusal !== undefined && body.choices[0].message.refusal !== null) ||
+      typeof body.choices[0].message.content !== 'string') return false;
+  const content = body.choices[0].message.content;
+  return profile === 1 ? content.length <= 128 * 1024 :
+    new TextEncoder().encode(content).byteLength <= OPENROUTER_BATCH_RESPONSE_MAX_BYTES;
 }
 
 function offlineAssistInputs(note: Note, intent: AssistIntent, question: string | undefined, additionalSources: AssistantSourceInput[], calendarAvailable: boolean): AssistantSourceInput[] {
@@ -1414,7 +1441,9 @@ interface MailReplyContextDiscoverySession {
 
 interface MailReplyContextFreshnessProof {
   readonly jobId: string;
-  readonly resultSha256: string;
+  readonly terminalStatus: 'completed' | 'result_truncated';
+  readonly resultSha256?: string;
+  readonly bindingDigest: string;
   readonly dependencyDigest: string;
   readonly localDependencyDigest: string;
   readonly accountId: string;
@@ -1429,6 +1458,15 @@ interface MailReplyContextFreshnessProof {
   readonly targetBody: SelectedMailTextSnapshot;
   readonly requestSha256: string;
   readonly sourceFingerprint: string;
+}
+
+interface MoreComputePlanState {
+  readonly publicPlan: AssistantBatchMoreComputePlan;
+  readonly parent: OpenRouterBatchJob;
+  readonly capturedState: AppState;
+  readonly bootstrapGeneration: number;
+  readonly privacyEpoch?: string;
+  readonly preparedAtMs: number;
 }
 
 class MailReplyContextRefreshRequiredError extends Error {
@@ -1500,6 +1538,9 @@ export class AppControllerImpl implements AppController {
     readonly settingsFingerprint: string; readonly expiresAt: string;
     readonly bootstrapGeneration: number; readonly privacyEpoch?: string; readonly preparedAtMs: number;
   }>();
+  private readonly moreComputePlans = new Map<string, MoreComputePlanState>();
+  private readonly preparingMoreComputeParents = new Map<string, object>();
+  private readonly activeMoreComputeParents = new Set<string>();
   private readonly activeMailReplyBatchReviews = new Set<string>();
   private readonly activeMailReplyBatchSubmissions = new Map<string, string | undefined>();
   private readonly mailReplyContextSessions = new Map<string, MailReplyContextDiscoverySession>();
@@ -1668,6 +1709,8 @@ export class AppControllerImpl implements AppController {
     this.assistantChatLedgerMalformed = false;
     this.chatTranscriptTransferPlans.clear();
     this.mailReplyBatchReviewPlans.clear();
+    this.moreComputePlans.clear();
+    this.preparingMoreComputeParents.clear();
     this.activeMailReplyBatchReviews.clear();
     this.mailReplyContextSessions.clear();
     this.mailReplyContextProofs.clear();
@@ -1722,6 +1765,7 @@ export class AppControllerImpl implements AppController {
     this.knowledgeActivationSessions.clear();
     this.chatTranscriptTransferPlans.clear();
     this.mailReplyBatchReviewPlans.clear();
+    this.moreComputePlans.clear();
     // Stop new provider-side admissions while retaining jobs and their leases
     // until each underlying request actually settles.
     for (const job of this.transcriptionJobs.values()) job.controller.abort();
@@ -2306,7 +2350,7 @@ export class AppControllerImpl implements AppController {
     delete result.assistantChatLedger;
     delete result.assistantChatConversations;
     delete result.assistantChatRecoveryStatus;
-    result.assistantBatchJobs = this.assistantBatchLedgerMalformed ? [] : this.assistantBatchLedger.jobs.map((job) => assistantBatchJobDTO(job, this.assistantBatchCleanupRetries.has(job.id)));
+    result.assistantBatchJobs = this.assistantBatchLedgerMalformed ? [] : this.assistantBatchLedger.jobs.map((job) => this.projectBatchJob(job));
     if (this.assistantBatchLedgerMalformed) result.assistantBatchRecoveryStatus = {
       blocked: true,
       message: 'Saved Batch history could not be validated and is held privately. Batch actions are disabled until local data is refreshed.',
@@ -2377,6 +2421,7 @@ export class AppControllerImpl implements AppController {
           ...(turn.operation ? { operation: turn.operation } : {}),
           ...(turn.reasoningEffort ? { reasoningEffort: turn.reasoningEffort } : {}),
           ...(turn.parentTurnId ? { parentTurnId: turn.parentTurnId } : {}),
+          ...(turn.recoveryParentTurnId ? { recoveryParentTurnId: turn.recoveryParentTurnId } : {}),
           ...(turn.reply ? { reply: Object.freeze({ summary: turn.reply.summary, answer: turn.reply.answer,
             clarifications: Object.freeze([...turn.reply.clarifications]), completedAt: turn.reply.completedAt }) } : {}),
           ...(dto ? { job: dto } : {}) });
@@ -2407,7 +2452,18 @@ export class AppControllerImpl implements AppController {
       if (!binding || job.noteId !== turn.noteId || job.noteRevision !== turn.noteRevision ||
           job.kind !== 'note_assistance' || job.intent !== 'answer' || job.question !== 'Respond to the current user message.' ||
           binding.conversationId !== conversation.id || binding.turnId !== turn.id || job.operation !== turn.operation ||
-          job.reasoningEffort !== turn.reasoningEffort || job.parentTurnId !== turn.parentTurnId) return false;
+          job.reasoningEffort !== turn.reasoningEffort || job.parentTurnId !== turn.parentTurnId ||
+          binding.recoveryParentTurnId !== turn.recoveryParentTurnId || Boolean(job.recoveryBinding) !== Boolean(turn.recoveryParentTurnId)) return false;
+      if (turn.recoveryParentTurnId) {
+        const recoveredFrom = turns.get(turn.recoveryParentTurnId);
+        const recoveredFromJob = recoveredFrom && this.assistantBatchLedger.jobs.find((candidate) => candidate.id === recoveredFrom.turn.jobId);
+        if (!recoveredFrom || recoveredFrom.conversation.id !== conversation.id || recoveredFrom.index >= index ||
+            recoveredFrom.turn.userText !== turn.userText || (recoveredFrom.turn.capturedAt ?? recoveredFrom.turn.createdAt) !== turn.capturedAt ||
+            recoveredFrom.turn.captureTimeZone !== turn.captureTimeZone || recoveredFrom.turn.jobId !== job.recoveryBinding?.parentJobId ||
+            !recoveredFromJob || recoveredFromJob.status !== 'result_truncated' || recoveredFromJob.sourceRemoved ||
+            job.recoveryBinding?.noteRemap?.fromNoteId !== recoveredFrom.turn.noteId ||
+            job.recoveryBinding?.noteRemap?.toNoteId !== turn.noteId) return false;
+      }
       if (turn.messageOrigin === 'saved_transcript') {
         const source = turn.operation === 'chat_refinement' ? undefined : binding.transcriptSource;
         if (turn.operation !== 'chat_refinement' && (!source || source.noteId === turn.noteId || source.capturedAt !== turn.capturedAt || source.captureTimeZone !== turn.captureTimeZone)) return false;
@@ -2429,7 +2485,8 @@ export class AppControllerImpl implements AppController {
             (parent.turn.capturedAt ?? parent.turn.createdAt) !== turn.capturedAt ||
             binding.transcriptSource !== undefined ||
             (turn.messageOrigin === 'saved_transcript' && !parentJob?.chatBinding)) return false;
-      } else if (binding.refinementParent || turn.parentTurnId || turn.reasoningEffort || (turn.capturedAt && turn.messageOrigin !== 'saved_transcript')) return false;
+      } else if (binding.refinementParent || turn.parentTurnId || turn.reasoningEffort ||
+          (turn.capturedAt && turn.messageOrigin !== 'saved_transcript' && !turn.recoveryParentTurnId)) return false;
       if (turn.reply && (!turn.replySha256 || job.requestSha256 !== turn.reply.requestSha256 || job.requestProfileVersion !== turn.reply.requestProfileVersion ||
           !['completed', 'result_stale', 'source_removed'].includes(job.status))) return false;
       const contextTurnIds = new Set<string>();
@@ -2633,13 +2690,15 @@ export class AppControllerImpl implements AppController {
       const context = assistContext(state, note, job.intent!, job.question, [...(job.knowledgeSelection ?? [])],
         transcriptSource ? new Set([transcriptSource.noteId]) : new Set());
       const chatSources = await this.chatSourcesForBinding(state, job.chatBinding!, memo);
-      const rebuilt = await new OpenRouterBatchRequestBuilder().prepareAnalysis(note, context.documents, state.settings, {
+      const baseProfile = job.requestProfileVersion === 4 ? job.recoveryBinding!.baseRequestProfileVersion : job.requestProfileVersion;
+      const rebuiltBase = await new OpenRouterBatchRequestBuilder().prepareAnalysis(note, context.documents, state.settings, {
         intent: job.intent, question: job.question, chatMode: true,
         ...(job.operation === 'chat_refinement' ? { chatRefinement: true as const, operation: 'chat_refinement' as const,
           reasoningEffortOverride: job.reasoningEffort } : {}),
         additionalSources: [...context.additionalSources, ...chatSources],
         preselection: { omittedSourceCount: context.omittedSourceCount + job.chatBinding!.omittedTurnCount, omittedSourceIds: context.omittedSourceIds },
-      }, job.requestProfileVersion);
+      }, baseProfile);
+      const rebuilt = job.requestProfileVersion === 4 ? { ...rebuiltBase, body: this.withBatchEffort(rebuiltBase.body, job.effort) } : rebuiltBase;
       const requestDigest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, rebuilt.body, { encoding: Crypto.CryptoEncoding.HEX });
       const sourceDigest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, stableJson(rebuilt.sourceVersions), { encoding: Crypto.CryptoEncoding.HEX });
       return rebuilt.body === job.requestBody && requestDigest === job.requestSha256 && sourceDigest === job.sourceFingerprint &&
@@ -3197,8 +3256,8 @@ export class AppControllerImpl implements AppController {
       const account = state.accounts.find((item) => item.id === proposal.accountId);
       const message = state.mailbox.find((item) => item.id === provenance.source.localMessageId && item.accountId === provenance.source.accountId);
       const linkedMailJob = provenance.batchJobId ? this.assistantBatchLedger.jobs.find((item) => item.id === provenance.batchJobId) : undefined;
-      const refreshedContext = Boolean(linkedMailJob && isOpenRouterMailReplyContentJob(linkedMailJob) && linkedMailJob.requestProfileVersion === 3 &&
-        linkedMailJob.operation === 'mail_reply_context' && linkedMailJob.mailReplyBinding.version === 2);
+      const refreshedContext = Boolean(linkedMailJob && linkedMailJob.status === 'completed' && linkedMailJob.resultText && linkedMailJob.resultSha256 &&
+        linkedMailJob.proposalId === proposal.id && this.isMailContextRefreshJob(linkedMailJob));
       if (!account || account.id !== provenance.source.accountId || account.provider !== provenance.source.identity.providerNamespace ||
           !account.connected || account.authStatus !== 'connected' || !account.capabilities?.includes('mail.read') ||
           (expectedOperation === 'send' && !account.capabilities.includes('mail.send')) ||
@@ -3288,8 +3347,8 @@ export class AppControllerImpl implements AppController {
       ? linkedJob && isOpenRouterMailReplyContentJob(linkedJob) && linkedJob.proposalId === proposal.id
         ? linkedJob.mailReplyActivationOperation ?? 'draft' : undefined
       : 'draft';
-    const contextJob = linkedJob && isOpenRouterMailReplyContentJob(linkedJob) && linkedJob.requestProfileVersion === 3 &&
-      linkedJob.operation === 'mail_reply_context' && linkedJob.mailReplyBinding.version === 2 ? linkedJob : undefined;
+    const contextJob = linkedJob && linkedJob.status === 'completed' && linkedJob.resultText && linkedJob.resultSha256 &&
+      linkedJob.proposalId === proposal.id && this.isMailContextRefreshJob(linkedJob) ? linkedJob : undefined;
     const contextProof = contextJob ? this.requireCurrentMailReplyContextProof(state, contextJob) : undefined;
     if (!account || !account.connected || account.authStatus !== 'connected' || !account.capabilities?.includes('mail.read') ||
         (expectedOperation === 'send' && !account.capabilities.includes('mail.send')) ||
@@ -3373,9 +3432,14 @@ export class AppControllerImpl implements AppController {
 
   private async assertMailReplyBatchJobIntegrity(job: OpenRouterMailReplyContentJob, requireResult: boolean): Promise<void> {
     const binding = job.mailReplyBinding;
+    const recovery = job.requestProfileVersion === 4 ? job.recoveryBinding : undefined;
+    const recoveryBaseProfile = recovery?.baseRequestProfileVersion;
     if (!binding || !validOpenRouterMailReplyBinding(binding) ||
-        (binding.version === 1 ? job.requestProfileVersion !== OPENROUTER_BATCH_REQUEST_PROFILE_VERSION || job.operation !== undefined :
-          job.requestProfileVersion !== 3 || job.operation !== 'mail_reply_context') ||
+        (binding.version === 1 ? (job.requestProfileVersion !== OPENROUTER_BATCH_REQUEST_PROFILE_VERSION &&
+          !(job.requestProfileVersion === 4 && recoveryBaseProfile !== undefined && recoveryBaseProfile <= 2 && recovery?.baseOperation === 'mail_reply_body')) ||
+          (job.requestProfileVersion !== 4 && job.operation !== undefined) :
+          !((job.requestProfileVersion === 3 && job.operation === 'mail_reply_context') ||
+            (job.requestProfileVersion === 4 && recovery?.baseRequestProfileVersion === 3 && recovery.baseOperation === 'mail_reply_context' && job.operation === 'mail_reply_context'))) ||
         !job.requestBody || utf8Bytes(job.requestBody) !== job.requestBytes) throw new Error('The saved Batch request failed integrity validation.');
     let settingsValue: unknown;
     try { settingsValue = JSON.parse(binding.settingsSnapshot) as unknown; } catch { throw new Error('The frozen reply settings are invalid.'); }
@@ -3385,18 +3449,21 @@ export class AppControllerImpl implements AppController {
         settingsValue.openRouterModel !== OPENROUTER_BATCH_MODEL || typeof settingsValue.openRouterReasoningEffort !== 'string' ||
         !['none', 'low'].includes(settingsValue.openRouterReasoningEffort) || settingsValue.llmRequestContractVersion !== OPENROUTER_BATCH_REQUEST_PROFILE_VERSION ||
         settingsValue.timezone !== binding.timeZone) throw new Error('The frozen reply settings are invalid.');
-    const frozenSettings = { ...this.state.settings, ...settingsValue } as AppSettings;
+    const frozenSettings = { ...this.state.settings, ...settingsValue, ...(job.requestProfileVersion === 4 ? { openRouterReasoningEffort: job.effort } : {}) } as AppSettings;
     const policyContext = binding.policy.map((item) => `### ${item.path} (revision ${item.revision})\n${item.content}`).join('\n\n');
     const requestInput = { sourceText: binding.body.text, sourceRepresentation: binding.body.representation,
       sourceCompleteness: binding.body.completeness, subject: binding.subject, to: [...binding.to], cc: [...binding.cc], brief: binding.brief,
       noteContext: binding.note?.text, policyContext, asOf: binding.requestAsOf, timeZone: binding.timeZone,
       noteCapture: binding.note ? { capturedAt: binding.note.capturedAt, timeZone: binding.note.captureTimeZone } : undefined };
-    const prepared = binding.version === 2
+    const basePrepared = binding.version === 2
       ? new OpenRouterBatchRequestBuilder().prepareReplyWithContext({ ...requestInput, contextMessages: binding.context!.map((item) => ({ text: item.body.text,
           subject: item.source.subject, ...(item.source.senderEmail ? { sender: item.source.senderEmail } : {}),
           ...(item.receivedAt ? { receivedAt: item.receivedAt } : {}), ...(item.sentAt ? { sentAt: item.sentAt } : {}),
           representation: item.body.representation, completeness: item.body.completeness, omissionReasons: item.body.omissionReasons })) }, frozenSettings)
       : new OpenRouterBatchRequestBuilder().prepareReply(requestInput, frozenSettings);
+    const prepared = job.requestProfileVersion === 4
+      ? Object.freeze({ ...basePrepared, body: this.withBatchEffort(basePrepared.body, job.effort), requestBytes: utf8Bytes(this.withBatchEffort(basePrepared.body, job.effort)) })
+      : basePrepared;
     const expectedFingerprint = stableJson({ source: canonicalMailReplySource(binding.source), body: { textDigest: binding.body.textDigest,
       representation: binding.body.representation, completeness: binding.body.completeness, extractionVersion: binding.body.extractionVersion,
       omissionReasons: binding.body.omissionReasons }, note: binding.note ?? null, policy: binding.policy, ...(binding.version === 2 ? { context: binding.context } : {}),
@@ -4534,7 +4601,10 @@ export class AppControllerImpl implements AppController {
           const bodyBytes = new TextEncoder().encode(job.requestBody).byteLength;
           const digest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, job.requestBody, { encoding: Crypto.CryptoEncoding.HEX });
           const parsedBody = JSON.parse(job.requestBody) as unknown;
-          if (bodyBytes !== job.requestBytes || digest !== job.requestSha256 || !isOpenRouterBatchRequestProfile(parsedBody, job.requestProfileVersion!, job.operation ?? 'note_assistance') ||
+          const recovery = job.requestProfileVersion === 4 ? job.recoveryBinding : undefined;
+          const recoveryBase = recovery ? { profileVersion: recovery.baseRequestProfileVersion, operation: recovery.baseOperation } : undefined;
+          if (bodyBytes !== job.requestBytes || digest !== job.requestSha256 ||
+              !isOpenRouterBatchRequestProfile(parsedBody, job.requestProfileVersion!, job.operation ?? 'note_assistance', recoveryBase) ||
               (parsedBody as { reasoning: { effort: string } }).reasoning.effort !== job.effort ||
               (parsedBody as { response_format: { json_schema: { name: string } } }).response_format.json_schema.name !==
                 (job.operation === 'chat_refinement' ? 'chat_refinement' : 'note_assistance')) {
@@ -5693,15 +5763,13 @@ export class AppControllerImpl implements AppController {
 
   getMailReplyBatchSourcesStatus(jobId: string): { readonly status: 'missing' | 'refresh_required' | 'current' | 'invalid'; readonly expiresAt?: string } {
     const job = this.assistantBatchLedger.jobs.find((item) => item.id === jobId);
-    if (!job || !isOpenRouterMailReplyContentJob(job) || job.requestProfileVersion !== 3 || job.operation !== 'mail_reply_context' ||
-        job.mailReplyBinding.version !== 2 || !job.mailReplyBinding.context?.length) return Object.freeze({ status: 'missing' });
-    if (!validOpenRouterMailReplyBinding(job.mailReplyBinding) || job.status !== 'completed' || !job.resultSha256 || !job.resultText) return Object.freeze({ status: 'invalid' });
+    if (!job || !this.isMailContextRefreshJob(job)) return Object.freeze({ status: 'missing' });
     const proof = this.mailReplyContextProofs.get(jobId);
     const at = Date.now();
     if (!proof) return Object.freeze({ status: 'refresh_required' });
     if (at < proof.admittedAtMs || at >= proof.expiresAtMs || proof.bootstrapGeneration !== this.bootstrapGeneration ||
-        proof.privacyEpoch !== this.integration.privacySession?.epoch || proof.resultSha256 !== job.resultSha256 ||
-        proof.requestSha256 !== job.requestSha256 || proof.sourceFingerprint !== job.sourceFingerprint) {
+        proof.privacyEpoch !== this.integration.privacySession?.epoch || proof.terminalStatus !== job.status || proof.resultSha256 !== job.resultSha256 ||
+        proof.bindingDigest !== stableJson(job.mailReplyBinding) || proof.requestSha256 !== job.requestSha256 || proof.sourceFingerprint !== job.sourceFingerprint) {
       return Object.freeze({ status: 'refresh_required' });
     }
     const account = this.snapshot.accounts.find((item) => item.id === proof.accountId);
@@ -5711,6 +5779,16 @@ export class AppControllerImpl implements AppController {
       if (this.mailReplyContextLocalDependencyDigest(this.snapshot, job.mailReplyBinding) !== proof.localDependencyDigest) return Object.freeze({ status: 'invalid' });
     } catch { return Object.freeze({ status: 'invalid' }); }
     return Object.freeze({ status: 'current', expiresAt: new Date(proof.expiresAtMs).toISOString() });
+  }
+
+  private isMailContextRefreshJob(job: OpenRouterBatchJob): job is OpenRouterMailReplyContentJob {
+    if (!isOpenRouterMailReplyContentJob(job) || !validOpenRouterMailReplyBinding(job.mailReplyBinding) ||
+        job.mailReplyBinding.version !== 2 || !job.mailReplyBinding.context?.length ||
+        !((job.requestProfileVersion === 3 && job.operation === 'mail_reply_context') ||
+          (job.requestProfileVersion === 4 && job.operation === 'mail_reply_context' && job.recoveryBinding?.baseRequestProfileVersion === 3 &&
+            job.recoveryBinding.baseOperation === 'mail_reply_context'))) return false;
+    if (job.status === 'completed') return Boolean(job.resultText && job.resultSha256 && !job.sourceRemoved);
+    return job.status === 'result_truncated' && job.failureCode === 'result_truncated' && !job.resultText && !job.resultSha256 && !job.sourceRemoved;
   }
 
   async refreshMailReplyBatchSources(jobId: string): Promise<MailReplyBatchSourcesRefreshResult> {
@@ -5725,12 +5803,11 @@ export class AppControllerImpl implements AppController {
       await this.load();
       await this.assertPrivacySessionCurrent();
       const job = this.assistantBatchLedger.jobs.find((item) => item.id === jobId);
-      if (!job || !isOpenRouterMailReplyContentJob(job) || job.requestProfileVersion !== 3 || job.operation !== 'mail_reply_context' ||
-          job.mailReplyBinding.version !== 2 || !job.mailReplyBinding.context?.length || job.status !== 'completed' || !job.resultSha256 || !job.resultText) {
+      if (!job || !this.isMailContextRefreshJob(job)) {
         throw new Error('This saved Batch job has no selected conversation sources to refresh.');
       }
       const binding = job.mailReplyBinding;
-      await this.assertMailReplyBatchJobIntegrity(job, true);
+      await this.assertMailReplyBatchJobIntegrity(job, job.status === 'completed');
       const account = this.snapshot.accounts.find((item) => item.id === binding.source.accountId);
       if (!account || !this.connector?.readSelectedMessageText) throw new Error('The verified mailbox connection is unavailable.');
       const capturedState = this.snapshot;
@@ -5844,7 +5921,8 @@ export class AppControllerImpl implements AppController {
       const localDependencyDigest = this.mailReplyContextLocalDependencyDigest(checkedState, binding);
       const expiresAtMs = Math.min(admittedAtMs + 15 * 60_000, Date.now() + 15 * 60_000);
       const checkedAt = new Date().toISOString();
-      const proof: MailReplyContextFreshnessProof = Object.freeze({ jobId, resultSha256: job.resultSha256!, dependencyDigest, accountId: account.id,
+      const proof: MailReplyContextFreshnessProof = Object.freeze({ jobId, terminalStatus: job.status as 'completed' | 'result_truncated',
+        ...(job.resultSha256 ? { resultSha256: job.resultSha256 } : {}), bindingDigest: stableJson(binding), dependencyDigest, accountId: account.id,
         connectionGeneration: account.connectionGeneration ?? 0, bootstrapGeneration: generation, ...(epoch ? { privacyEpoch: epoch } : {}),
         admittedAtMs, expiresAtMs, checkedAt, contextBySelection: Object.freeze(contextDigests), requestSha256: job.requestSha256,
         sourceFingerprint: job.sourceFingerprint, localDependencyDigest, targetSource: Object.freeze(targetSource), targetBody: Object.freeze(targetBody) });
@@ -5868,9 +5946,9 @@ export class AppControllerImpl implements AppController {
     if (at < admittedAtMs || at - admittedAtMs >= 15 * 60_000 || generation !== this.bootstrapGeneration || epoch !== this.integration.privacySession?.epoch ||
         !this.loaded || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired ||
         (ticket !== undefined && this.activeMailReplyContextRefreshes.get(job.id) !== ticket) ||
-        (expectedState && this.snapshot !== expectedState) || !current || !isOpenRouterMailReplyContentJob(current) ||
-        current.status !== 'completed' || current.resultSha256 !== job.resultSha256 || current.requestSha256 !== job.requestSha256 ||
-        current.sourceFingerprint !== job.sourceFingerprint || current.customId !== job.customId) {
+        (expectedState && this.snapshot !== expectedState) || !current || !this.isMailContextRefreshJob(current) ||
+        current.status !== job.status || current.resultSha256 !== job.resultSha256 || stableJson(current.mailReplyBinding) !== stableJson(binding) ||
+        current.requestSha256 !== job.requestSha256 || current.sourceFingerprint !== job.sourceFingerprint || current.customId !== job.customId) {
       throw new Error('The saved reply or workspace changed during source refresh. Start a new explicit refresh.');
     }
   }
@@ -6141,27 +6219,12 @@ export class AppControllerImpl implements AppController {
 
   async deleteMailReplyBatch(jobId: string): Promise<void> {
     if (typeof jobId !== 'string' || !jobId) throw new Error('Choose a saved mail reply Batch job.');
-    if (this.activeBatchJobInspections.has(jobId) || this.activeMailReplyBatchReviews.has(jobId)) {
-      throw new Error('This mail reply Batch job is still being checked. Try again when it settles.');
-    }
-    const activeJob = this.assistantBatchLedger.jobs.find((item) => item.id === jobId);
-    if (activeJob && isOpenRouterMailReplyContentJob(activeJob) && this.activeMailReplyBatchSubmissions.has(activeJob.mailReplyBinding.messageId)) {
-      throw new Error('This mail reply Batch request is still settling. Try again after it finishes.');
-    }
-    for (const [id, plan] of this.mailReplyBatchReviewPlans) if (plan.jobId === jobId) this.mailReplyBatchReviewPlans.delete(id);
-    await this.mutate((state) => {
-      this.assertBatchLedgerCanDropContent();
-      const job = this.assistantBatchLedger.jobs.find((item) => item.id === jobId);
-      if (!job || job.kind !== 'mail_reply') throw new Error('The saved mail reply Batch job was not found.');
-      if (isOpenRouterMailReplyContentJob(job)) this.assertMailBatchCleanupIsCertain(state, [job]);
-      const linked = job.proposalId ? state.proposals.find((proposal) => proposal.id === job.proposalId) : undefined;
-      if (linked && ['draft', 'approved', 'failed'].includes(linked.status)) {
-        this.invalidate(linked);
-        linked.requiresRebuild = true;
-      }
-      return undefined;
-    }, undefined, () => validateOpenRouterBatchLedger({ version: 1, jobs: this.assistantBatchLedger.jobs.map((job) =>
-      job.id === jobId ? tombstoneOpenRouterBatchJob(job, now()) : job) }));
+    const targetIds = this.batchRecoveryDescendantIds(jobId);
+    const roots = this.assistantBatchLedger.jobs.filter((item) => item.id === jobId);
+    if (!roots.length || !roots.every(isOpenRouterMailReplyContentJob)) throw new Error('The saved mail reply Batch job was not found.');
+    const removal = this.sourceRemovalCommit((job) => targetIds.has(job.id));
+    await this.mutate(() => undefined, undefined, (draft) => removal.batch(draft), () => removal.chat());
+    for (const [id, plan] of this.mailReplyBatchReviewPlans) if (targetIds.has(plan.jobId)) this.mailReplyBatchReviewPlans.delete(id);
   }
 
   async createChatConversation(title?: string): Promise<ChatConversationDTO> {
@@ -6782,6 +6845,364 @@ export class AppControllerImpl implements AppController {
     }
   }
 
+  private moreComputeChild(parentJobId: string): OpenRouterBatchJob | undefined {
+    return this.assistantBatchLedger.jobs.find((job) => job.recoveryBinding?.parentJobId === parentJobId &&
+      ['preparing', 'submitting', 'submission_unknown', 'queued', 'processing', 'cleanup_pending'].includes(job.status));
+  }
+
+  private pruneMoreComputePlans(): void {
+    const at = Date.now();
+    for (const [planId, plan] of this.moreComputePlans) {
+      if (at < plan.preparedAtMs || at >= Date.parse(plan.publicPlan.expiresAt) ||
+          plan.bootstrapGeneration !== this.bootstrapGeneration || plan.capturedState !== this.state ||
+          plan.privacyEpoch !== this.integration.privacySession?.epoch) this.moreComputePlans.delete(planId);
+    }
+  }
+
+  private moreComputeEfforts(job: OpenRouterBatchJob): readonly ('medium' | 'high' | 'max')[] {
+    return higherOpenRouterRecoveryEfforts(job.effort);
+  }
+
+  private projectBatchJob(job: OpenRouterBatchJob): AssistantBatchJobDTO {
+    const dto = assistantBatchJobDTO(job, this.assistantBatchCleanupRetries.has(job.id));
+    const child = this.moreComputeChild(job.id);
+    const available = job.status === 'result_truncated' && !job.sourceRemoved && !this.assistantBatchLedgerMalformed && !child;
+    return Object.freeze({ ...dto, canRecoverMoreCompute: available && this.moreComputeEfforts(job).length > 0,
+      moreComputeEfforts: this.moreComputeEfforts(job), ...(child ? { pendingRecoveryChildId: child.id } : {}) });
+  }
+
+  private withBatchEffort(body: string, effort: 'none' | 'low' | 'medium' | 'high' | 'max'): string {
+    const parsed = JSON.parse(body) as Record<string, unknown>;
+    const reasoning = parsed.reasoning as Record<string, unknown>;
+    return JSON.stringify({ ...parsed, reasoning: { ...reasoning, effort } });
+  }
+
+  private async rebuildMoreComputeNoteParent(job: OpenRouterBatchContentJob, state: AppState, allowCompleted = false): Promise<PreparedOpenRouterAnalysis> {
+    const note = state.notes.find((item) => item.id === job.noteId);
+    const settingsDigest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, stableJson(openRouterSettingsBinding(state.settings)), { encoding: Crypto.CryptoEncoding.HEX });
+    if (!note || note.revision !== job.noteRevision || !note.transcript.trim() || state.settings.mode !== 'provider' ||
+        state.settings.llmProvider !== 'openrouter' || (settingsDigest !== job.settingsFingerprint && !assistantSettingsFingerprintMatches(job.settingsFingerprint, state.settings))) {
+      throw new Error('The source or provider settings changed. Refresh the source before reviewing more compute.');
+    }
+    const baseProfile = job.requestProfileVersion === 4 ? job.recoveryBinding!.baseRequestProfileVersion : job.requestProfileVersion;
+    if (!job.chatBinding) {
+      if (note.origin === 'assistant_chat') throw new Error('The saved Chat request could not be validated.');
+      this.requireConfirmedCaptureTimeZone(note);
+      const context = assistContext(state, note, job.intent!, job.question, [...(job.knowledgeSelection ?? [])]);
+      const timezone = state.settings.timezone;
+      return new OpenRouterBatchRequestBuilder().prepareAnalysis(note, context.documents, state.settings, {
+        intent: job.intent, question: job.question,
+        ...(job.answeredAsOf ? { queryTimeAnchor: job.answeredAsOf, queryTimeZone: timezone } : {}),
+        additionalSources: context.additionalSources,
+        preselection: { omittedSourceCount: context.omittedSourceCount, omittedSourceIds: context.omittedSourceIds },
+      }, baseProfile);
+    }
+    if (note.origin !== 'assistant_chat' || this.assistantChatLedgerMalformed || !this.chatLedgerLinksAreValid(this.assistantChatLedger, state)) {
+      throw new Error('The saved Chat request could not be validated.');
+    }
+    const conversation = this.assistantChatLedger.conversations.find((item) => item.id === job.chatBinding!.conversationId);
+    const turn = conversation?.turns.find((item) => item.id === job.chatBinding!.turnId);
+    if (!conversation || !turn || turn.jobId !== job.id || turn.noteId !== note.id || turn.noteRevision !== note.revision ||
+        note.transcript !== turn.userText || (!allowCompleted && (turn.reply || turn.replySha256)) || turn.operation !== job.operation ||
+        (turn.capturedAt ?? turn.createdAt) !== (note.capturedAt ?? note.createdAt) || turn.captureTimeZone !== (note.captureTimeZone ?? state.settings.timezone)) {
+      throw new Error('The cutoff Chat turn or its capture details changed.');
+    }
+    const transcriptSource = this.chatTranscriptSourceForTurn(turn);
+    if (transcriptSource && !await this.transcriptSourceIsCurrent(state, transcriptSource)) throw new Error('The original saved transcript changed. Refresh it before reviewing more compute.');
+    const context = assistContext(state, note, job.intent!, job.question, [...(job.knowledgeSelection ?? [])],
+      transcriptSource ? new Set([transcriptSource.noteId]) : new Set());
+    const chatSources = await this.chatSourcesForBinding(state, job.chatBinding);
+    const baseOperation = job.requestProfileVersion === 4 ? job.recoveryBinding!.baseOperation : job.operation ?? 'note_assistance';
+    const refinement = baseOperation === 'chat_refinement';
+    if (refinement !== (job.operation === 'chat_refinement') || (refinement && baseProfile !== 2)) throw new Error('The saved Chat recovery profile is invalid.');
+    return new OpenRouterBatchRequestBuilder().prepareAnalysis(note, context.documents, state.settings, {
+      intent: job.intent, question: job.question, chatMode: true,
+      ...(refinement ? { chatRefinement: true as const, operation: 'chat_refinement' as const, reasoningEffortOverride: job.effort as 'medium' | 'high' | 'max' } : {}),
+      additionalSources: [...context.additionalSources, ...chatSources],
+      preselection: { omittedSourceCount: context.omittedSourceCount + job.chatBinding.omittedTurnCount, omittedSourceIds: context.omittedSourceIds },
+    }, baseProfile);
+  }
+
+  private async verifyMoreComputeParent(job: OpenRouterBatchJob, state: AppState): Promise<PreparedOpenRouterAnalysis | undefined> {
+    if (job.status !== 'result_truncated' || job.sourceRemoved || !job.batchId || this.assistantBatchLedgerMalformed ||
+        !job.requestBody || !job.requestProfileVersion || !job.requestSha256 || !job.sourceFingerprint) throw new Error('This job has no intact cutoff result to recover.');
+    if (job.kind === 'mail_reply') {
+      if (!isOpenRouterMailReplyContentJob(job)) throw new Error('The saved mail request could not be validated.');
+      await this.assertMailReplyBatchJobIntegrity(job, false);
+      if (job.mailReplyBinding.version === 2 && job.mailReplyBinding.context?.length) {
+        if (this.getMailReplyBatchSourcesStatus(job.id).status !== 'current') throw new Error('Refresh the selected mail sources before reviewing more compute.');
+      } else {
+        const current = await this.currentMailReplySource(state, job.mailReplyBinding.messageId);
+        if (current.status !== 'current' || !current.source || canonicalMailReplySource(current.source) !== canonicalMailReplySource(job.mailReplyBinding.source)) {
+          throw new Error('Refresh the target message before reviewing more compute.');
+        }
+      }
+      return undefined;
+    }
+    if (!isOpenRouterBatchContentJob(job)) throw new Error('The saved request could not be validated.');
+    const prepared = await this.rebuildMoreComputeNoteParent(job, state);
+    const actualBody = job.requestProfileVersion === 4 ? this.withBatchEffort(prepared.body, job.effort) : prepared.body;
+    const [requestDigest, sourceDigest, settingsDigest] = await Promise.all([
+      Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, actualBody, { encoding: Crypto.CryptoEncoding.HEX }),
+      Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, stableJson(prepared.sourceVersions), { encoding: Crypto.CryptoEncoding.HEX }),
+      Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, stableJson(openRouterSettingsBinding(state.settings)), { encoding: Crypto.CryptoEncoding.HEX }),
+    ]);
+    if (actualBody !== job.requestBody || requestDigest !== job.requestSha256 || sourceDigest !== job.sourceFingerprint ||
+        settingsDigest !== job.settingsFingerprint || !sameSourceVersions({ ...prepared.sourceVersions }, { ...job.sourceVersions })) {
+      throw new Error('The source, context, or request changed. Refresh the source before reviewing more compute.');
+    }
+    return prepared;
+  }
+
+  private async stageMoreComputeChild(plan: MoreComputePlanState, prepared?: PreparedOpenRouterAnalysis): Promise<{
+    job: OpenRouterBatchContentJob | OpenRouterMailReplyContentJob; conversationId?: string; turnId?: string; docs: ContextDocument[]; stagedState: AppState;
+  }> {
+    const parent = plan.parent;
+    const timestamp = now();
+    const jobId = newId();
+    const recoveryBase = parent.recoveryBinding;
+    const baseRequestProfileVersion = recoveryBase?.baseRequestProfileVersion ?? parent.requestProfileVersion! as 1 | 2 | 3;
+    const baseOperation: OpenRouterBatchBaseOperation = recoveryBase?.baseOperation ??
+      (parent.kind === 'mail_reply' ? parent.operation === 'mail_reply_context' ? 'mail_reply_context' : 'mail_reply_body' : parent.operation ?? 'note_assistance');
+    if (parent.kind === 'mail_reply') {
+      if (!isOpenRouterMailReplyContentJob(parent)) throw new Error('The saved mail request could not be validated.');
+      const effort = plan.publicPlan.requestedEffort;
+      const requestBody = buildMoreComputeRequestBody(parent.requestBody, parent.requestProfileVersion, baseOperation,
+        parent.operation ?? 'note_assistance', effort, recoveryBase ? { profileVersion: recoveryBase.baseRequestProfileVersion, operation: recoveryBase.baseOperation } : undefined);
+      const requestSha256 = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, requestBody, { encoding: Crypto.CryptoEncoding.HEX });
+      const child: OpenRouterBatchJob = Object.freeze({ id: jobId, customId: jobId, kind: 'mail_reply', status: 'preparing', createdAt: timestamp, updatedAt: timestamp,
+        model: OPENROUTER_BATCH_MODEL, effort, requestSha256, unknownCharge: false, ...(parent.mailReplyBinding.version === 2 ? { operation: 'mail_reply_context' as const } : {}),
+        settingsFingerprint: parent.settingsFingerprint, sourceFingerprint: parent.sourceFingerprint, requestProfileVersion: 4,
+        requestBytes: utf8Bytes(requestBody), omittedSourceCount: parent.omittedSourceCount, requestBody, sourceVersions: Object.freeze({}),
+        mailReplyBinding: parent.mailReplyBinding, recoveryBinding: Object.freeze({ version: 1, parentJobId: parent.id, parentKind: parent.kind,
+          parentRequestProfileVersion: parent.requestProfileVersion, ...(parent.operation ? { parentOperation: parent.operation } : {}), parentEffort: parent.effort,
+          parentRequestSha256: parent.requestSha256, parentSourceFingerprint: parent.sourceFingerprint,
+          baseRequestProfileVersion, baseOperation, baseRequestSha256: recoveryBase?.baseRequestSha256 ?? parent.requestSha256,
+          baseSourceFingerprint: recoveryBase?.baseSourceFingerprint ?? parent.sourceFingerprint }) });
+      await this.mutate((draft) => {
+        const at = Date.now();
+        if (this.state !== plan.capturedState || this.bootstrapGeneration !== plan.bootstrapGeneration || this.integration.privacySession?.epoch !== plan.privacyEpoch ||
+            at < plan.preparedAtMs || at >= Date.parse(plan.publicPlan.expiresAt) ||
+            this.assistantBatchLedger.jobs.find((item) => item.id === parent.id) !== parent || this.moreComputeChild(parent.id)) throw new Error('The cutoff request changed before it could be queued.');
+        return undefined;
+      }, undefined, () => validateOpenRouterBatchLedger({ version: 1, jobs: [...this.assistantBatchLedger.jobs, child] }));
+      const retained = this.assistantBatchLedger.jobs.find((item) => item.id === child.id);
+      if (!retained || !isOpenRouterMailReplyContentJob(retained)) throw new Error('The new Batch request could not be retained.');
+      return { job: retained, docs: [], stagedState: this.state };
+    }
+    if (!isOpenRouterBatchContentJob(parent) || !prepared) throw new Error('The saved request could not be validated.');
+    const note = this.state.notes.find((item) => item.id === parent.noteId);
+    if (!note) throw new Error('The saved source is missing.');
+    const childNoteId = parent.chatBinding ? newId() : note.id;
+    const childTurnId = parent.chatBinding ? newId() : undefined;
+    let childPrepared = prepared;
+    let childBinding = parent.chatBinding;
+    if (parent.chatBinding) {
+      const childNote: Note = { ...note, id: childNoteId, title: 'Chat message', createdAt: timestamp, capturedAt: note.capturedAt ?? note.createdAt,
+        captureTimeZone: note.captureTimeZone ?? parent.captureTimeZone, revision: 1,
+        transcript: note.transcript, durationSeconds: 0, status: 'recorded', origin: 'assistant_chat', audioUri: undefined, audioAttachment: undefined,
+        analysis: undefined, processingFingerprint: undefined };
+      const transcriptSource = this.chatTranscriptSourceForTurn(this.assistantChatLedger.conversations.flatMap((item) => item.turns).find((turn) => turn.id === parent.chatBinding!.turnId)!);
+      const context = assistContext(this.state, childNote, parent.intent!, parent.question, [...(parent.knowledgeSelection ?? [])],
+        transcriptSource ? new Set([transcriptSource.noteId]) : new Set());
+      const sources = await this.chatSourcesForBinding(this.state, parent.chatBinding);
+      childPrepared = await new OpenRouterBatchRequestBuilder().prepareAnalysis(childNote, context.documents, this.state.settings, {
+        intent: parent.intent, question: parent.question, chatMode: true,
+        ...(parent.operation === 'chat_refinement' ? { chatRefinement: true as const, operation: 'chat_refinement' as const, reasoningEffortOverride: plan.publicPlan.requestedEffort } : {}),
+        additionalSources: [...context.additionalSources, ...sources],
+        preselection: { omittedSourceCount: context.omittedSourceCount + parent.chatBinding.omittedTurnCount, omittedSourceIds: context.omittedSourceIds },
+      }, baseRequestProfileVersion as 1 | 2);
+      childBinding = Object.freeze({ ...parent.chatBinding, turnId: childTurnId!, recoveryParentTurnId: parent.chatBinding.turnId });
+    }
+    const requestBody = parent.operation === 'chat_refinement'
+      ? childPrepared.body
+      : this.withBatchEffort(childPrepared.body, plan.publicPlan.requestedEffort);
+    const [requestSha256, sourceFingerprint, settingsFingerprint] = await Promise.all([
+      Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, requestBody, { encoding: Crypto.CryptoEncoding.HEX }),
+      Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, stableJson(childPrepared.sourceVersions), { encoding: Crypto.CryptoEncoding.HEX }),
+      Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, stableJson(openRouterSettingsBinding(this.state.settings)), { encoding: Crypto.CryptoEncoding.HEX }),
+    ]);
+    const noteRemap = parent.chatBinding ? Object.freeze({ fromNoteId: parent.noteId!, toNoteId: childNoteId }) : undefined;
+    const binding: OpenRouterBatchRecoveryBinding = Object.freeze({ version: 1, parentJobId: parent.id, parentKind: parent.kind,
+      parentRequestProfileVersion: parent.requestProfileVersion, ...(parent.operation ? { parentOperation: parent.operation } : {}), parentEffort: parent.effort,
+      parentRequestSha256: parent.requestSha256, parentSourceFingerprint: parent.sourceFingerprint, baseRequestProfileVersion,
+      baseOperation, baseRequestSha256: recoveryBase?.baseRequestSha256 ?? parent.requestSha256,
+      baseSourceFingerprint: recoveryBase?.baseSourceFingerprint ?? parent.sourceFingerprint, ...(noteRemap ? { noteRemap } : {}) });
+    const childJob: OpenRouterBatchJob = Object.freeze({ id: jobId, customId: jobId, kind: 'note_assistance', ...(parent.operation ? { operation: parent.operation } : {}),
+      ...(parent.operation === 'chat_refinement' ? { reasoningEffort: plan.publicPlan.requestedEffort, parentTurnId: parent.parentTurnId } : {}),
+      status: 'preparing', createdAt: timestamp, updatedAt: timestamp, model: OPENROUTER_BATCH_MODEL,
+      effort: plan.publicPlan.requestedEffort, requestSha256, unknownCharge: false, noteId: childNoteId, noteRevision: parent.chatBinding ? 1 : parent.noteRevision,
+      intent: parent.intent, ...(parent.question ? { question: parent.question } : {}), knowledgeSelection: parent.knowledgeSelection,
+      capturedAt: parent.chatBinding ? note.capturedAt ?? note.createdAt : parent.capturedAt,
+      captureTimeZone: parent.chatBinding ? note.captureTimeZone ?? parent.captureTimeZone : parent.captureTimeZone,
+      ...(parent.answeredAsOf ? { answeredAsOf: parent.answeredAsOf } : {}),
+      settingsFingerprint, sourceFingerprint, requestProfileVersion: 4, requestBytes: utf8Bytes(requestBody), omittedSourceCount: childPrepared.omittedSourceCount,
+      requestBody, sourceVersions: Object.freeze({ ...childPrepared.sourceVersions }), ...(childBinding ? { chatBinding: childBinding } : {}), recoveryBinding: binding });
+    let nextChatLedger: ReadonlyChatLedger | undefined;
+    let childTurn: ChatConversation['turns'][number] | undefined;
+    if (parent.chatBinding) {
+      const conversation = this.assistantChatLedger.conversations.find((item) => item.id === parent.chatBinding!.conversationId);
+      if (!conversation || !childTurnId) throw new Error('The parent Chat conversation changed.');
+      const parentTurn = conversation.turns.find((item) => item.id === parent.chatBinding!.turnId);
+      if (!parentTurn) throw new Error('The parent Chat turn is missing.');
+      childTurn = Object.freeze({ id: childTurnId, noteId: childNoteId, noteRevision: 1, jobId, userText: parentTurn.userText, createdAt: timestamp,
+        capturedAt: parentTurn.capturedAt ?? parentTurn.createdAt, captureTimeZone: parentTurn.captureTimeZone ?? note.captureTimeZone ?? parent.captureTimeZone,
+        ...(parentTurn.messageOrigin ? { messageOrigin: parentTurn.messageOrigin } : {}), ...(parentTurn.operation ? { operation: parentTurn.operation } : {}),
+        ...(parentTurn.reasoningEffort ? { reasoningEffort: plan.publicPlan.requestedEffort } : {}), ...(parentTurn.parentTurnId ? { parentTurnId: parentTurn.parentTurnId } : {}),
+        recoveryParentTurnId: parentTurn.id });
+      const nextConversation = Object.freeze({ ...conversation, updatedAt: timestamp, turns: Object.freeze([...conversation.turns, childTurn]) });
+      nextChatLedger = validateChatLedger({ version: 1, conversations: this.assistantChatLedger.conversations.map((item) => item.id === conversation.id ? nextConversation : item) });
+    }
+    const docs = await this.mutate((draft) => {
+      const at = Date.now();
+      if (this.state !== plan.capturedState || this.bootstrapGeneration !== plan.bootstrapGeneration || this.integration.privacySession?.epoch !== plan.privacyEpoch ||
+          at < plan.preparedAtMs || at >= Date.parse(plan.publicPlan.expiresAt) ||
+          this.assistantBatchLedger.jobs.find((item) => item.id === parent.id) !== parent || this.moreComputeChild(parent.id)) throw new Error('The cutoff request changed before it could be queued.');
+      if (parent.chatBinding) {
+        const cloned: Note = { ...note, id: childNoteId, title: 'Chat message', createdAt: timestamp, capturedAt: note.capturedAt ?? note.createdAt,
+          captureTimeZone: note.captureTimeZone ?? parent.captureTimeZone, revision: 1, durationSeconds: 0, status: 'recorded', origin: 'assistant_chat',
+          audioUri: undefined, audioAttachment: undefined, analysis: undefined, processingFingerprint: undefined };
+        draft.notes.unshift(cloned);
+        return recordJournal(draft, `saved-chat:${childTurnId}:${jobId}`, `Saved recovered Chat turn ${childTurnId} in conversation ${parent.chatBinding!.conversationId} (job ${jobId}).`);
+      }
+      return [] as ContextDocument[];
+    }, undefined, () => validateOpenRouterBatchLedger({ version: 1, jobs: [...this.assistantBatchLedger.jobs, childJob] }),
+    nextChatLedger ? () => nextChatLedger! : undefined);
+    const retained = this.assistantBatchLedger.jobs.find((item) => item.id === childJob.id);
+    if (!retained || !isOpenRouterBatchContentJob(retained)) throw new Error('The new Batch request could not be retained.');
+    const stagedState = this.state;
+    return { job: retained, docs, stagedState, ...(parent.chatBinding ? { conversationId: parent.chatBinding.conversationId, turnId: childTurnId } : {}) };
+  }
+
+  async prepareMoreCompute(input: { jobId: string; effort: 'medium' | 'high' | 'max' }): Promise<AssistantBatchMoreComputePlan> {
+    if (!hasExactPlainDataKeys(input, ['jobId', 'effort']) || typeof input.jobId !== 'string' || !input.jobId || !['medium', 'high', 'max'].includes(input.effort)) {
+      throw new Error('Choose a supported higher reasoning effort.');
+    }
+    this.pruneMoreComputePlans();
+    await this.transactionQueue;
+    await this.assertPrivacySessionCurrent();
+    if (!this.loaded || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired || this.assistantBatchLedgerMalformed) throw new Error('Refresh local data before reviewing a cutoff request.');
+    const capturedState = this.state;
+    const generation = this.bootstrapGeneration;
+    const privacyEpoch = this.integration.privacySession?.epoch;
+    if (this.store.assertCurrent) await this.store.assertCurrent();
+    const parent = this.assistantBatchLedger.jobs.find((job) => job.id === input.jobId);
+    if (!parent || parent.status !== 'result_truncated' || parent.sourceRemoved || this.moreComputeChild(parent.id) || this.activeMoreComputeParents.has(parent.id)) throw new Error('This cutoff request is not available for another attempt.');
+    if (!this.moreComputeEfforts(parent).includes(input.effort)) throw new Error('Choose a higher supported reasoning effort.');
+    const preparationTicket = {};
+    this.preparingMoreComputeParents.set(parent.id, preparationTicket);
+    for (const [planId, plan] of this.moreComputePlans) if (plan.parent.id === parent.id) this.moreComputePlans.delete(planId);
+    try {
+      const prepared = await this.verifyMoreComputeParent(parent, capturedState);
+      await this.assertPrivacySessionCurrent();
+      if (this.store.assertCurrent) await this.store.assertCurrent();
+      if (!this.loaded || this.state !== capturedState || this.bootstrapGeneration !== generation || this.integration.privacySession?.epoch !== privacyEpoch ||
+          this.mailAlertRefreshRequired || this.assistantBatchLedger.jobs.find((job) => job.id === parent.id) !== parent || this.moreComputeChild(parent.id) ||
+          this.preparingMoreComputeParents.get(parent.id) !== preparationTicket) {
+        throw new Error('The cutoff request or workspace changed. Review it again.');
+      }
+      const preparedAtMs = Date.now();
+      const id = newId();
+      const expiresAt = new Date(preparedAtMs + 5 * 60_000).toISOString();
+      const preview = await this.moreComputePreview(parent, capturedState, prepared);
+      await this.assertPrivacySessionCurrent();
+      if (this.store.assertCurrent) await this.store.assertCurrent();
+      if (!this.loaded || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired || this.assistantBatchLedgerMalformed ||
+          this.state !== capturedState || this.bootstrapGeneration !== generation || this.integration.privacySession?.epoch !== privacyEpoch ||
+          this.assistantBatchLedger.jobs.find((job) => job.id === parent.id) !== parent || this.moreComputeChild(parent.id) ||
+          this.preparingMoreComputeParents.get(parent.id) !== preparationTicket || Date.now() < preparedAtMs || Date.now() >= Date.parse(expiresAt)) {
+        throw new Error('The cutoff request or workspace changed. Review it again.');
+      }
+      const publicPlan: AssistantBatchMoreComputePlan = Object.freeze({ planId: id, jobId: parent.id, kind: parent.kind,
+      parentProfile: parent.requestProfileVersion!, ...(parent.operation ? { parentOperation: parent.operation } : {}), priorEffort: parent.effort,
+      requestedEffort: input.effort, expiresAt, priorAccounting: Object.freeze({ costStatus: parent.accounting?.providerReportedCostUsd !== undefined ? 'reported' : 'unavailable',
+        ...(parent.accounting?.providerReportedCostUsd !== undefined ? { providerReportedCostUsd: parent.accounting.providerReportedCostUsd } : {}),
+        ...(parent.accounting?.byok !== undefined ? { byok: parent.accounting.byok } : {}),
+        ...(parent.accounting?.promptTokens !== undefined ? { promptTokens: parent.accounting.promptTokens } : {}),
+        ...(parent.accounting?.completionTokens !== undefined ? { completionTokens: parent.accounting.completionTokens } : {}),
+        ...(parent.accounting?.totalTokens !== undefined ? { totalTokens: parent.accounting.totalTokens } : {}), unknownCharge: parent.unknownCharge }),
+        warning: 'Submitting creates a new paid Batch request. The incomplete response is not reused, and higher effort does not guarantee a complete result.', preview });
+      this.moreComputePlans.set(id, { publicPlan, parent, capturedState, bootstrapGeneration: generation, ...(privacyEpoch ? { privacyEpoch } : {}), preparedAtMs });
+      return publicPlan;
+    } finally {
+      if (this.preparingMoreComputeParents.get(parent.id) === preparationTicket) this.preparingMoreComputeParents.delete(parent.id);
+    }
+  }
+
+  private async moreComputePreview(job: OpenRouterBatchJob, state: AppState, prepared?: PreparedOpenRouterAnalysis): Promise<AssistantBatchMoreComputePlan['preview']> {
+    if (job.kind === 'mail_reply' && job.mailReplyBinding) {
+      const binding = job.mailReplyBinding;
+      const proof = this.mailReplyContextProofs.get(job.id);
+      const targetRow = state.mailbox.find((item) => item.accountId === binding.source.accountId && item.providerMessageId === binding.source.providerMessageId);
+      return Object.freeze({ userText: binding.brief, sourceLabels: Object.freeze([]), omittedSourceCount: 0, asOf: binding.requestAsOf,
+        mail: Object.freeze({ messageId: binding.messageId, mode: binding.mode, subject: binding.subject, to: Object.freeze([...binding.to]), cc: Object.freeze([...binding.cc]),
+          brief: binding.brief, ...(binding.note ? { selectedNoteContext: binding.note.text } : {}),
+          targetMessage: Object.freeze({ text: proof?.targetBody.text ?? binding.body.text, ...(binding.source.senderEmail ? { sender: binding.source.senderEmail } : {}),
+            ...(targetRow?.receivedAt ? { receivedAt: targetRow.receivedAt } : {}),
+            representation: binding.body.representation, completeness: binding.body.completeness, omissionReasons: Object.freeze([...binding.body.omissionReasons]) }),
+          contextMessages: Object.freeze((binding.context ?? []).map((item) => Object.freeze({ text: item.body.text, subject: item.source.subject,
+            ...(item.source.senderEmail ? { sender: item.source.senderEmail } : {}), ...(item.receivedAt ? { receivedAt: item.receivedAt } : {}),
+            ...(item.sentAt ? { sentAt: item.sentAt } : {}), representation: item.body.representation, completeness: item.body.completeness,
+            omissionReasons: Object.freeze([...item.body.omissionReasons]) }))) }) });
+    }
+    const note = state.notes.find((item) => item.id === job.noteId);
+    if (!note) throw new Error('The saved source is missing.');
+    const context = assistContext(state, note, job.intent ?? 'assist', job.question, [...(job.knowledgeSelection ?? [])],
+      job.chatBinding?.transcriptSource ? new Set([job.chatBinding.transcriptSource.noteId]) : new Set());
+    const chatSources = job.chatBinding ? await this.chatSourcesForBinding(state, job.chatBinding) : [];
+    const sourceTextById = new Map<string, string>();
+    for (const document of context.documents) sourceTextById.set(`doc:${document.path}`, document.content);
+    for (const source of [...context.additionalSources, ...chatSources]) sourceTextById.set(source.id, source.text);
+    const sourceLabels = (prepared?.includedSources ?? []).map((item) => Object.freeze({ id: item.id, label: item.title,
+      ...(sourceTextById.get(item.id) ?? item.excerpt ? { text: sourceTextById.get(item.id) ?? item.excerpt } : {}) }));
+    const base = { userText: note.transcript, sourceLabels: Object.freeze(sourceLabels), omittedSourceCount: prepared?.omittedSourceCount ?? job.omittedSourceCount ?? 0,
+      capturedAt: note.capturedAt ?? note.createdAt, captureTimeZone: note.captureTimeZone ?? job.captureTimeZone, ...(job.answeredAsOf ? { asOf: job.answeredAsOf } : {}) };
+    if (!job.chatBinding) return Object.freeze(base);
+    const conversation = this.assistantChatLedger.conversations.find((item) => item.id === job.chatBinding!.conversationId);
+    const turn = conversation?.turns.find((item) => item.id === job.chatBinding!.turnId);
+    const selectedContext = job.chatBinding.context.map((reference) => {
+      const prior = conversation?.turns.find((item) => item.id === reference.turnId);
+      if (!prior?.reply) throw new Error('The selected Chat context is no longer complete.');
+      return Object.freeze({ userText: prior.userText, assistantText: prior.reply.answer, completedAt: prior.reply.completedAt });
+    });
+    const parentReference = job.chatBinding.refinementParent;
+    const completedRefinementParent = parentReference ? conversation?.turns.find((item) => item.id === parentReference.turnId)?.reply : undefined;
+    return Object.freeze({ ...base, chat: Object.freeze({ conversationId: job.chatBinding.conversationId, parentTurnId: turn?.id ?? job.chatBinding.turnId,
+      recoveryParentTurnId: job.chatBinding.recoveryParentTurnId ?? job.chatBinding.turnId, isRefinement: job.operation === 'chat_refinement',
+      selectedContext: Object.freeze(selectedContext), ...(completedRefinementParent ? { completedRefinementParent: Object.freeze({ answer: completedRefinementParent.answer,
+        summary: completedRefinementParent.summary, completedAt: completedRefinementParent.completedAt }) } : {}) }) });
+  }
+
+  cancelMoreCompute(planId: string): void { this.moreComputePlans.delete(planId); }
+
+  async submitMoreCompute(input: { planId: string }): Promise<AssistantBatchJobDTO & { recoveredConversationId?: string; recoveredTurnId?: string }> {
+    if (!hasExactPlainDataKeys(input, ['planId']) || typeof input.planId !== 'string' || !input.planId) throw new Error('The more-compute review is no longer current. Prepare a new review.');
+    this.pruneMoreComputePlans();
+    const plan = input && this.moreComputePlans.get(input.planId);
+    if (!plan || this.activeMoreComputeParents.has(plan.parent.id)) throw new Error('The more-compute review is no longer current. Prepare a new review.');
+    const at = Date.now();
+    if (at < plan.preparedAtMs || at >= Date.parse(plan.publicPlan.expiresAt)) { this.moreComputePlans.delete(input.planId); throw new Error('The more-compute review expired. Prepare a new review.'); }
+    this.moreComputePlans.delete(input.planId);
+    this.activeMoreComputeParents.add(plan.parent.id);
+    try {
+      await this.transactionQueue;
+      await this.assertPrivacySessionCurrent();
+      if (!this.loaded || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired || this.assistantBatchLedgerMalformed ||
+          this.state !== plan.capturedState || this.bootstrapGeneration !== plan.bootstrapGeneration || this.integration.privacySession?.epoch !== plan.privacyEpoch) {
+        throw new Error('The workspace changed. Prepare a new more-compute review.');
+      }
+      const parent = this.assistantBatchLedger.jobs.find((job) => job.id === plan.parent.id);
+      if (parent !== plan.parent || parent.status !== 'result_truncated' || this.moreComputeChild(parent.id)) throw new Error('The cutoff request changed. Prepare a new review.');
+      const prepared = await this.verifyMoreComputeParent(parent, this.state);
+      if (this.state !== plan.capturedState || this.bootstrapGeneration !== plan.bootstrapGeneration || this.integration.privacySession?.epoch !== plan.privacyEpoch ||
+          Date.now() < plan.preparedAtMs || Date.now() >= Date.parse(plan.publicPlan.expiresAt)) throw new Error('The review expired or the workspace changed. Prepare a new review.');
+      const child = await this.stageMoreComputeChild(plan, prepared);
+      await Promise.all(child.docs.map((document) => this.mirrorDocument(document)));
+      const dto = await this.dispatchPreparedBatch(child.job, plan.bootstrapGeneration, child.stagedState);
+      return Object.freeze({ ...dto, ...(child.conversationId ? { recoveredConversationId: child.conversationId } : {}), ...(child.turnId ? { recoveredTurnId: child.turnId } : {}) });
+    } finally { this.activeMoreComputeParents.delete(plan.parent.id); }
+  }
+
   async refreshAssistantBatch(jobId: string): Promise<AssistantBatchJobDTO> {
     if (this.activeBatchJobInspections.has(jobId)) throw new Error('A Batch status check for this job is already settling. Try again after it finishes.');
     const initial = this.assistantBatchLedger.jobs.find((candidate) => candidate.id === jobId);
@@ -6820,7 +7241,7 @@ export class AppControllerImpl implements AppController {
         updatedAt: now(),
       }), { state: capturedState, generation: capturedGeneration });
     }
-    const accountingOnly = ['failed', 'expired', 'cancelled', 'result_stale', 'result_invalid', 'result_not_retained'].includes(job.status);
+    const accountingOnly = ['failed', 'expired', 'cancelled', 'result_stale', 'result_invalid', 'result_truncated', 'result_not_retained'].includes(job.status);
     if (!job.batchId || (!accountingOnly && !['queued', 'processing', 'completed'].includes(job.status)) ||
         (job.status === 'completed' && job.accounting?.providerReportedCostUsd !== undefined) ||
         (accountingOnly && job.accounting?.providerReportedCostUsd !== undefined)) return this.batchDTO(job.id);
@@ -6875,7 +7296,7 @@ export class AppControllerImpl implements AppController {
         ...(accounting ? { accounting } : {}), updatedAt: now(),
       }), { state: capturedState, generation: capturedGeneration });
     }
-    if (inspection.metadataValidation !== 'valid' || inspection.resultValidation !== 'valid') {
+    if (inspection.metadataValidation !== 'valid' || (inspection.resultValidation !== 'valid' && inspection.resultValidation !== 'truncated')) {
       return this.updateOpenRouterBatchJob(job.id, (current) => ({
         ...current, status: 'result_invalid', failureCode: 'invalid_result',
         unknownCharge: accounting?.providerReportedCostUsd === undefined,
@@ -6893,6 +7314,12 @@ export class AppControllerImpl implements AppController {
         requireInspectionContext();
         await this.assertMailReplyBatchJobIntegrity(job, false);
         requireInspectionContext();
+        if (inspection.resultValidation === 'truncated') {
+          if (!validBatchCutoffEnvelope(inspection, job.requestProfileVersion)) throw new Error('The truncated Batch envelope was invalid.');
+          return this.updateOpenRouterBatchJob(job.id, (current) => { const { resultText: _resultText, resultSha256: _resultSha256, ...withoutResult } = current;
+            return { ...withoutResult, status: 'result_truncated', failureCode: 'result_truncated', unknownCharge: accounting?.providerReportedCostUsd === undefined,
+              ...(accounting ? { accounting } : {}), updatedAt: now() }; }, { state: capturedState, generation: capturedGeneration });
+        }
         const parsed = parseOpenRouterMailReplyResult(inspection, job.requestBody);
         const resultSha256 = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, parsed.text, { encoding: Crypto.CryptoEncoding.HEX });
         requireInspectionContext();
@@ -6919,7 +7346,8 @@ export class AppControllerImpl implements AppController {
       const context = assistContext(fresh, note, job.intent!, job.question, [...(job.knowledgeSelection ?? [])],
         transcriptSource ? new Set([transcriptSource.noteId]) : new Set());
       const chatSources = job.chatBinding ? await this.chatSourcesForBinding(fresh, job.chatBinding) : [];
-      prepared = await new OpenRouterBatchRequestBuilder().prepareAnalysis(note, context.documents, fresh.settings, {
+      const baseProfile = job.requestProfileVersion === 4 ? job.recoveryBinding!.baseRequestProfileVersion : job.requestProfileVersion;
+      const preparedBase = await new OpenRouterBatchRequestBuilder().prepareAnalysis(note, context.documents, fresh.settings, {
         intent: job.intent, question: job.question,
         ...(job.chatBinding ? { chatMode: true as const } : {}),
         ...(job.operation === 'chat_refinement' ? { chatRefinement: true as const, operation: 'chat_refinement' as const,
@@ -6927,7 +7355,8 @@ export class AppControllerImpl implements AppController {
         ...(!job.chatBinding && job.answeredAsOf ? { queryTimeAnchor: job.answeredAsOf, queryTimeZone: fresh.settings.timezone } : {}),
         additionalSources: [...context.additionalSources, ...chatSources],
         preselection: { omittedSourceCount: context.omittedSourceCount + (job.chatBinding?.omittedTurnCount ?? 0), omittedSourceIds: context.omittedSourceIds },
-      }, job.requestProfileVersion);
+      }, baseProfile);
+      prepared = job.requestProfileVersion === 4 ? { ...preparedBase, body: this.withBatchEffort(preparedBase.body, job.effort) } : preparedBase;
       requireInspectionContext();
       const digest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, prepared.body, { encoding: Crypto.CryptoEncoding.HEX });
       const sourceDigest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, stableJson(prepared.sourceVersions), { encoding: Crypto.CryptoEncoding.HEX });
@@ -6940,6 +7369,12 @@ export class AppControllerImpl implements AppController {
     requireInspectionContext();
     let generated: DraftAnalysis;
     try {
+      if (inspection.resultValidation === 'truncated') {
+        if (!validBatchCutoffEnvelope(inspection, job.requestProfileVersion)) throw new Error('The truncated Batch envelope was invalid.');
+        return this.updateOpenRouterBatchJob(job.id, (current) => { const { resultText: _resultText, resultSha256: _resultSha256, ...withoutResult } = current;
+          return { ...withoutResult, status: 'result_truncated', failureCode: 'result_truncated', unknownCharge: accounting?.providerReportedCostUsd === undefined,
+            ...(accounting ? { accounting } : {}), updatedAt: now() }; }, { state: capturedState, generation: capturedGeneration });
+      }
       generated = parseBatchAssistantResult(inspection, prepared, job.operation === 'chat_refinement' ? 'chat_refinement' : undefined).generated;
     } catch {
       requireInspectionContext();
@@ -6951,7 +7386,7 @@ export class AppControllerImpl implements AppController {
       try {
         chatReply = Object.freeze({ summary: generated.summary, answer: generated.answer,
           clarifications: Object.freeze([...generated.clarifications]), completedAt: now(),
-          requestSha256: job.requestSha256, requestProfileVersion: job.requestProfileVersion === 2 ? 2 : 1 });
+          requestSha256: job.requestSha256, requestProfileVersion: job.requestProfileVersion === 4 ? 4 : job.requestProfileVersion === 2 ? 2 : 1 });
         chatReplySha256 = await this.chatReplyDigest(chatReply);
         this.chatLedgerWithReply(job.chatBinding, chatReply, chatReplySha256);
       } catch {
@@ -6995,7 +7430,7 @@ export class AppControllerImpl implements AppController {
   private batchDTO(jobId: string): AssistantBatchJobDTO {
     const job = this.assistantBatchLedger.jobs.find((candidate) => candidate.id === jobId);
     if (!job) throw new Error('The saved Batch job was not found.');
-    return assistantBatchJobDTO(job, this.assistantBatchCleanupRetries.has(jobId));
+    return this.projectBatchJob(job);
   }
 
   private mergeBatchAccounting(previous?: OpenRouterBatchAccounting, incoming?: OpenRouterBatchAccounting): OpenRouterBatchAccounting | undefined {
@@ -7065,6 +7500,28 @@ export class AppControllerImpl implements AppController {
       linked.some((proposal) => uncertainProposalIds.has(proposal.id) && proposal.provenance?.version === 2 && proposal.provenance.batchJobId === job.id)).map((job) => job.id));
   }
 
+  private batchRecoveryDescendantIds(rootJobId: string): Set<string> {
+    const childrenByParent = new Map<string, string[]>();
+    for (const job of this.assistantBatchLedger.jobs) {
+      const parentId = job.recoveryBinding?.parentJobId;
+      if (!parentId) continue;
+      const children = childrenByParent.get(parentId) ?? [];
+      children.push(job.id);
+      childrenByParent.set(parentId, children);
+    }
+    const descendants = new Set<string>([rootJobId]);
+    const queue = [rootJobId];
+    while (queue.length) {
+      const parentId = queue.shift()!;
+      for (const childId of childrenByParent.get(parentId) ?? []) {
+        if (descendants.has(childId)) continue;
+        descendants.add(childId);
+        queue.push(childId);
+      }
+    }
+    return descendants;
+  }
+
   private sourceRemovalCommit(predicate: (job: OpenRouterBatchJob) => boolean, options: {
     ownActiveMailReviewJobId?: string;
     retainUncertainMailObservation?: true;
@@ -7079,64 +7536,78 @@ export class AppControllerImpl implements AppController {
         const directlyAffected = this.assistantBatchLedger.jobs.filter((job) =>
           (isOpenRouterBatchContentJob(job) || isOpenRouterMailReplyContentJob(job)) && predicate(job));
         if (!directlyAffected.length) return undefined;
-        for (const job of directlyAffected) this.mailReplyContextProofs.delete(job.id);
-        if (directlyAffected.some(isOpenRouterMailReplyContentJob) && this.hasUnresolvedDispatchRecoveryEvidence() && !options.retainUncertainMailObservation) {
+        const affectedJobIds = new Set(directlyAffected.map((job) => job.id));
+        const affectedTurnIds = new Set<string>();
+        const addTurnIds = (job: OpenRouterBatchJob) => {
+          if (job.chatBinding) affectedTurnIds.add(job.chatBinding.turnId);
+          for (const turn of this.assistantChatLedger.conversations.flatMap((conversation) => conversation.turns)) {
+            if (turn.jobId === job.id) affectedTurnIds.add(turn.id);
+          }
+        };
+        for (const job of directlyAffected) addTurnIds(job);
+        let expanded = true;
+        while (expanded) {
+          expanded = false;
+          for (const job of this.assistantBatchLedger.jobs) {
+            if (affectedJobIds.has(job.id) || !(isOpenRouterBatchContentJob(job) || isOpenRouterMailReplyContentJob(job))) continue;
+            const recoveryParentAffected = job.recoveryBinding && affectedJobIds.has(job.recoveryBinding.parentJobId);
+            const chatParentAffected = isOpenRouterBatchContentJob(job) && job.chatBinding &&
+              (Boolean(job.chatBinding.recoveryParentTurnId && affectedTurnIds.has(job.chatBinding.recoveryParentTurnId)) ||
+                job.chatBinding.context.some((reference) => affectedTurnIds.has(reference.turnId)) ||
+                Boolean(job.chatBinding.refinementParent && affectedTurnIds.has(job.chatBinding.refinementParent.turnId)));
+            if (recoveryParentAffected || chatParentAffected) {
+              affectedJobIds.add(job.id);
+              addTurnIds(job);
+              expanded = true;
+            }
+          }
+        }
+        const affectedJobs = this.assistantBatchLedger.jobs.filter((job) => affectedJobIds.has(job.id));
+        const affectedMailJobs = affectedJobs.filter(isOpenRouterMailReplyContentJob);
+        for (const job of affectedMailJobs) this.mailReplyContextProofs.delete(job.id);
+        if (affectedMailJobs.length && this.hasUnresolvedDispatchRecoveryEvidence() && !options.retainUncertainMailObservation) {
           throw new Error('Dispatch history failed integrity validation. Refresh local data before removing mail Batch content.');
         }
 
-        const affectedMailJobs = directlyAffected.filter(isOpenRouterMailReplyContentJob);
         const retainedMailJobIds = new Set<string>();
         if (options.retainUncertainMailObservation && affectedMailJobs.length) {
           if (this.hasUnresolvedDispatchRecoveryEvidence()) for (const job of affectedMailJobs) retainedMailJobIds.add(job.id);
           else for (const id of this.mailBatchJobsWithUncertainCleanup(draft, affectedMailJobs)) retainedMailJobIds.add(id);
+          // Keep every mail recovery ancestor when an uncertain descendant remains live.
+          // The ledger requires a retained child to have a retained, non-removed parent.
+          const jobsById = new Map(this.assistantBatchLedger.jobs.map((job) => [job.id, job]));
+          const pendingAncestors = [...retainedMailJobIds];
+          while (pendingAncestors.length) {
+            const child = jobsById.get(pendingAncestors.pop()!);
+            const parentId = child?.recoveryBinding?.parentJobId;
+            const parent = parentId ? jobsById.get(parentId) : undefined;
+            if (!parent || !isOpenRouterMailReplyContentJob(parent) || retainedMailJobIds.has(parent.id)) continue;
+            retainedMailJobIds.add(parent.id);
+            pendingAncestors.push(parent.id);
+          }
         } else this.assertMailBatchCleanupIsCertain(draft, affectedMailJobs);
-        const retireDirectlyAffected = directlyAffected.filter((job) => !retainedMailJobIds.has(job.id));
-        if (!retireDirectlyAffected.length) return undefined;
+        const retireAffectedJobs = affectedJobs.filter((job) => !retainedMailJobIds.has(job.id));
+        if (!retireAffectedJobs.length) return undefined;
 
         if (this.assistantChatLedgerMalformed && (draft.notes.some((note) => note.origin === 'assistant_chat') ||
             this.assistantBatchLedger.jobs.some((job) => job.chatBinding))) {
           throw new Error('Saved chat history could not be validated. Refresh local data before changing captured sources.');
         }
 
-        const affectedTurnIds = new Set<string>();
-        const affectedJobIds = new Set(retireDirectlyAffected.map((job) => job.id));
-        for (const job of retireDirectlyAffected) {
-          if (job.chatBinding) affectedTurnIds.add(job.chatBinding.turnId);
-          for (const turn of this.assistantChatLedger.conversations.flatMap((conversation) => conversation.turns)) {
-            if (turn.jobId === job.id) affectedTurnIds.add(turn.id);
-          }
-        }
-        // A later request may quote an earlier reply without sharing its original
-        // document fingerprint. Follow the persisted context DAG to redact only
-        // that reply and its actual descendants.
-        let expanded = true;
-        while (expanded) {
-          expanded = false;
-          for (const job of this.assistantBatchLedger.jobs) {
-            if (!isOpenRouterBatchContentJob(job) || !job.chatBinding || affectedJobIds.has(job.id)) continue;
-            if (job.chatBinding.context.some((reference) => affectedTurnIds.has(reference.turnId)) ||
-                (job.chatBinding.refinementParent && affectedTurnIds.has(job.chatBinding.refinementParent.turnId))) {
-              affectedJobIds.add(job.id);
-              affectedTurnIds.add(job.chatBinding.turnId);
-              expanded = true;
-            }
-          }
-        }
-
         const affectedTurnRows = this.assistantChatLedger.conversations.flatMap((conversation) => conversation.turns
           .filter((turn) => affectedTurnIds.has(turn.id)).map((turn) => ({ conversation, turn })));
         const affectedNoteIds = new Set(affectedTurnRows.map(({ turn }) => turn.noteId));
-        if (Array.from(affectedJobIds).some((id) => this.activeBatchJobInspections.has(id) ||
+        if (Array.from(affectedJobIds).some((id) => this.activeBatchJobInspections.has(id) || this.activeMoreComputeParents.has(id) ||
             (id !== options.ownActiveMailReviewJobId && this.activeMailReplyBatchReviews.has(id))) ||
-            directlyAffected.some((job) => isOpenRouterMailReplyContentJob(job) && this.activeMailReplyBatchSubmissions.has(job.mailReplyBinding.messageId)) ||
+            affectedMailJobs.some((job) => this.activeMailReplyBatchSubmissions.has(job.mailReplyBinding.messageId)) ||
             Array.from(affectedNoteIds).some((id) => this.activeBatchNoteOperations.has(id)) ||
             affectedTurnRows.some(({ conversation }) => this.activeChatConversationSubmissions.has(conversation.id))) {
           throw new Error('A Chat or Batch operation is still using this source. Try again after it finishes.');
         }
-        if (directlyAffected.some((job) => job.noteId && this.activeBatchNoteOperations.has(job.noteId))) {
+        if (affectedJobs.some((job) => job.noteId && this.activeBatchNoteOperations.has(job.noteId))) {
           throw new Error('A Batch operation is still using this source. Try again after it finishes.');
         }
-        if (directlyAffected.some((job) => job.chatBinding?.transcriptSource?.noteId &&
+        if (affectedJobs.some((job) => job.chatBinding?.transcriptSource?.noteId &&
             this.activeBatchNoteOperations.has(job.chatBinding.transcriptSource.noteId))) {
           throw new Error('A Chat request is still using this source. Try again after it finishes.');
         }
@@ -7170,7 +7641,7 @@ export class AppControllerImpl implements AppController {
           })) });
         }
 
-        const affectedIds = new Set([...affectedJobIds]);
+        const affectedIds = new Set(retireAffectedJobs.map((job) => job.id));
         return validateOpenRouterBatchLedger({ version: 1, jobs: this.assistantBatchLedger.jobs.map((job) => {
           if (!affectedIds.has(job.id)) return job;
           return tombstoneOpenRouterBatchJob(job, now(), Boolean(job.chatBinding || affectedJobIds.has(job.id)));
@@ -8498,8 +8969,7 @@ export class AppControllerImpl implements AppController {
               candidate.replySource?.sourceDigest !== linked.mailReplyBinding.source.sourceDigest ||
               stableJson(candidate) !== stableJson(envelope)) return 'required_missing';
           if (linked.mailReplyBinding.version === 1 && linked.requestProfileVersion !== 3) return 'not_required';
-          if (linked.mailReplyBinding.version !== 2 || linked.requestProfileVersion !== 3 || linked.operation !== 'mail_reply_context' ||
-              this.getMailReplyBatchSourcesStatus(linkedId).status !== 'current') return 'required_missing';
+          if (!this.isMailContextRefreshJob(linked) || this.getMailReplyBatchSourcesStatus(linkedId).status !== 'current') return 'required_missing';
           const proof = this.mailReplyContextProofs.get(linkedId);
           if (!proof || proof.requestSha256 !== linked.requestSha256 || proof.sourceFingerprint !== linked.sourceFingerprint || proof.resultSha256 !== linked.resultSha256 ||
               proof.bootstrapGeneration !== this.bootstrapGeneration || proof.privacyEpoch !== this.integration.privacySession?.epoch ||

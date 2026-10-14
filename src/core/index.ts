@@ -701,6 +701,46 @@ export interface MailReplyBatchReviewPlan {
   readonly expiresAt: string;
 }
 
+export interface AssistantBatchMoreComputePlan {
+  readonly planId: string;
+  readonly jobId: string;
+  readonly kind: import('../services/openRouterBatchJobs').AssistantBatchKind;
+  readonly parentProfile: import('../services/openRouter').OpenRouterBatchRequestProfileVersion;
+  readonly parentOperation?: 'chat_refinement' | 'mail_reply_context';
+  readonly priorEffort: 'none' | 'low' | 'medium' | 'high' | 'max';
+  readonly requestedEffort: 'medium' | 'high' | 'max';
+  readonly expiresAt: string;
+  readonly priorAccounting: Readonly<{
+    readonly costStatus: 'reported' | 'unavailable';
+    readonly providerReportedCostUsd?: number;
+    readonly byok?: boolean;
+    readonly promptTokens?: number;
+    readonly completionTokens?: number;
+    readonly totalTokens?: number;
+    readonly unknownCharge: boolean;
+  }>;
+  readonly warning: 'Submitting creates a new paid Batch request. The incomplete response is not reused, and higher effort does not guarantee a complete result.';
+  readonly preview: Readonly<{
+    readonly userText: string;
+    readonly sourceLabels: readonly Readonly<{ id: string; label: string; text?: string }>[];
+    readonly omittedSourceCount: number;
+    readonly capturedAt?: string;
+    readonly captureTimeZone?: string;
+    readonly asOf?: string;
+    readonly chat?: Readonly<{
+      conversationId: string; parentTurnId: string; recoveryParentTurnId: string; isRefinement: boolean;
+      readonly selectedContext: readonly Readonly<{ userText: string; assistantText: string; completedAt: string }>[];
+      readonly completedRefinementParent?: Readonly<{ answer: string; summary: string; completedAt: string }>;
+    }>;
+    readonly mail?: Readonly<{
+      messageId: string; mode: 'reply' | 'reply_all'; subject: string; to: readonly string[]; cc: readonly string[];
+      brief: string; selectedNoteContext?: string;
+      targetMessage: Readonly<{ text: string; sender?: string; receivedAt?: string; sentAt?: string; representation: string; completeness: string; omissionReasons: readonly string[] }>;
+      readonly contextMessages: readonly Readonly<{ text: string; subject: string; sender?: string; receivedAt?: string; sentAt?: string; representation: string; completeness: string; omissionReasons: readonly string[] }>[];
+    }>;
+  }>;
+}
+
 export interface AppState {
   notes: Note[];
   proposals: Proposal[];
@@ -937,6 +977,9 @@ export interface AppController {
   submitChatFromTranscript(input: { planId: string; conversationId: string }): Promise<{ kind: 'accepted'; conversationId: string; turnId: string; jobId: string }>;
   deleteChatConversation(id: string): Promise<void>;
   refreshAssistantBatch(jobId: string): Promise<import('../services/openRouterBatchJobs').AssistantBatchJobDTO>;
+  prepareMoreCompute(input: { jobId: string; effort: 'medium' | 'high' | 'max' }): Promise<AssistantBatchMoreComputePlan>;
+  cancelMoreCompute(planId: string): void;
+  submitMoreCompute(input: { planId: string }): Promise<import('../services/openRouterBatchJobs').AssistantBatchJobDTO & { recoveredConversationId?: string; recoveredTurnId?: string }>;
   submitMailReplyBatch(input: Omit<MailReplyTextGenerationInput, 'forceRefresh'>): Promise<import('../services/openRouterBatchJobs').AssistantBatchJobDTO>;
   reviewMailReplyBatch(jobId: string, options?: { operation?: 'draft' | 'send' }): Promise<MailReplyBatchReviewPlan>;
   activateMailReplyBatch(input: { planId: string }): Promise<{ kind: 'created'; jobId: string; proposalId: string }>;
