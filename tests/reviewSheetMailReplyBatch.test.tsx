@@ -2,7 +2,7 @@
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Proposal, MailReplyProvenance } from '../src/core';
+import type { Proposal, MailReplyProvenance, MailReplyBatchSourcesRefreshResult } from '../src/core';
 import { ReviewSheet } from '../src/ui/ReviewSheet';
 
 vi.mock('react-native', async () => {
@@ -108,5 +108,45 @@ describe('ReviewSheet Batch reply immutability', () => {
     expect(host.textContent).toContain('ORIGINAL STATUS UNKNOWN');
     expect([...host.querySelectorAll('button')].map((button) => button.textContent)).toEqual(['Close review', 'Close review']);
     expect(edit).not.toHaveBeenCalled(); expect(approve).not.toHaveBeenCalled(); expect(execute).not.toHaveBeenCalled(); expect(dismiss).not.toHaveBeenCalled();
+  });
+
+  it('refreshes and displays the fixed target plus selected subset in the immutable draft review', async () => {
+    let resolveRefresh!: (result: MailReplyBatchSourcesRefreshResult) => void;
+    const refresh = vi.fn((_jobId: string, _proposalId: string, _revision: number, _isCurrent: () => boolean) =>
+      new Promise<MailReplyBatchSourcesRefreshResult>((resolve) => { resolveRefresh = resolve; }));
+    act(() => root.render(React.createElement(ReviewSheet, {
+      state, proposal, dispatchRecords: [], busy: false, mailReplyContextCount: 1,
+      mailReplySourcesStatus: { status: 'refresh_required' }, onRefreshMailReplySources: refresh,
+      onClose: vi.fn(), onEdit: vi.fn(), onApprove: vi.fn(), onExecute: vi.fn(), onDismiss: vi.fn(),
+    })));
+    const refreshButton = [...host.querySelectorAll('button')].find((button) => button.textContent === 'Refresh fixed target and selected messages')!;
+    expect(refreshButton.disabled).toBe(false);
+    act(() => { refreshButton.click(); refreshButton.click(); });
+    expect(refresh).toHaveBeenCalledOnce();
+    expect(refresh.mock.calls[0].slice(0, 3)).toEqual(['mail-job', 'proposal-1', 1]);
+    expect(refresh.mock.calls[0][3]()).toBe(true);
+    const item = { selectionId: 'opaque-target', isReplyTarget: true, subject: 'Original subject', sender: 'me@example.com', sentAt: '2026-10-14T09:00:00Z', representation: 'plain' as const, completeness: 'complete_text' as const, bytes: 100, omissionReasons: [] };
+    await act(async () => { resolveRefresh({ status: 'current', jobId: 'mail-job', checkedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(), sources: [item] }); await Promise.resolve(); });
+    expect(host.textContent).toContain('The fixed target and selected messages were checked again.');
+    expect(host.textContent).toContain('Fixed reply target · Original subject');
+    expect(host.textContent).toContain('complete text · 100 bytes');
+  });
+
+  it('does not publish a source refresh result after the proposal review closes', async () => {
+    let resolveRefresh!: (result: MailReplyBatchSourcesRefreshResult) => void;
+    const refresh = vi.fn((_jobId: string, _proposalId: string, _revision: number, _isCurrent: () => boolean) =>
+      new Promise<MailReplyBatchSourcesRefreshResult>((resolve) => { resolveRefresh = resolve; }));
+    act(() => root.render(React.createElement(ReviewSheet, {
+      state, proposal, dispatchRecords: [], busy: false, mailReplyContextCount: 1,
+      mailReplySourcesStatus: { status: 'refresh_required' }, onRefreshMailReplySources: refresh,
+      onClose: vi.fn(), onEdit: vi.fn(), onApprove: vi.fn(), onExecute: vi.fn(), onDismiss: vi.fn(),
+    })));
+    act(() => [...host.querySelectorAll('button')].find((button) => button.textContent === 'Refresh fixed target and selected messages')!.click());
+    act(() => root.render(React.createElement(ReviewSheet, {
+      state, proposal: null, dispatchRecords: [], onClose: vi.fn(), onEdit: vi.fn(), onApprove: vi.fn(), onExecute: vi.fn(), onDismiss: vi.fn(),
+    })));
+    const item = { selectionId: 'opaque-target', isReplyTarget: true, subject: 'Original subject', representation: 'plain' as const, completeness: 'complete_text' as const, bytes: 100, omissionReasons: [] };
+    await act(async () => { resolveRefresh({ status: 'current', jobId: 'mail-job', checkedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(), sources: [item] }); await Promise.resolve(); });
+    expect(host.textContent).not.toContain('Fixed reply target · Original subject');
   });
 });

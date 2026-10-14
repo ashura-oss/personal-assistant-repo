@@ -69,6 +69,7 @@ command -v pod >/dev/null
 
 npm ci
 npm run check:ios-config
+bash scripts/test-expo-fetch-lifetime.sh
 npm run typecheck
 npm test
 npm run lint

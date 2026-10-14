@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { MailReplyBatchReviewPlan } from '../src/core';
-import { MailReplyBatchOwnership, mailReplyBatchIsBlocked, mailReplyBatchKeyIsReady, rethrowMailReplyBatchError, type MailReplyBatchBlockState } from '../src/ui/mailReplyBatchOwnership';
+import { MailReplyBatchOwnership, mailReplyBatchIsBlocked, mailReplyBatchReviewSourceIsBlocked, mailReplyBatchKeyIsReady, rethrowMailReplyBatchError, type MailReplyBatchBlockState } from '../src/ui/mailReplyBatchOwnership';
 
 const reviewPlan = (planId: string, messageId: string): MailReplyBatchReviewPlan => ({
   planId, jobId: `job-${planId}`, messageId, mode: 'reply', subject: 'Subject',
@@ -28,6 +28,9 @@ describe('mail reply Batch ownership used by App', () => {
     expect(mailReplyBatchIsBlocked({ ...ready, assistantChatRecovery: true })).toBe(true);
     expect(mailReplyBatchIsBlocked({ ...ready, competingReviewOpen: true })).toBe(true);
     expect(mailReplyBatchIsBlocked({ ...ready, settingsOpen: true })).toBe(true);
+    expect(mailReplyBatchReviewSourceIsBlocked({ ...ready, competingReviewOpen: true }, true)).toBe(false);
+    expect(mailReplyBatchReviewSourceIsBlocked({ ...ready, competingReviewOpen: true, settingsOpen: true }, true)).toBe(true);
+    expect(mailReplyBatchReviewSourceIsBlocked({ ...ready, competingReviewOpen: true }, false)).toBe(true);
   });
 
   it('requires a ready credential result matching the current provider and owner', () => {
@@ -141,5 +144,21 @@ describe('mail reply Batch ownership used by App', () => {
     expect(ownership.getPlan(newPlan.planId)).toBe(newPlan);
     expect(ownership.clearPlan(newPlan.planId)).toBe(newPlan);
     expect(ownership.getPlan(newPlan.planId)).toBeUndefined();
+  });
+
+  it('admits one synchronous action ticket and prevents late release from unlocking a newer owner action', () => {
+    const ownership = new MailReplyBatchOwnership();
+    const ownerA = ownership.publishOwner('message-a')!;
+    const first = ownership.beginAction(ownerA)!;
+    expect(ownership.beginAction(ownerA)).toBeUndefined();
+    expect(ownership.actionIsCurrent(first)).toBe(true);
+
+    const ownerB = ownership.publishOwner('message-b')!;
+    const second = ownership.beginAction(ownerB)!;
+    expect(ownership.finishAction(first)).toBe(false);
+    expect(ownership.actionIsCurrent(second)).toBe(true);
+    expect(ownership.beginAction(ownerB)).toBeUndefined();
+    expect(ownership.finishAction(second)).toBe(true);
+    expect(ownership.beginAction(ownerB)).toBeDefined();
   });
 });

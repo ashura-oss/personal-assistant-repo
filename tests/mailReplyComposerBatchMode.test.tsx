@@ -2,13 +2,13 @@
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { AppController, MailReplySourceSnapshot, SelectedMailTextSnapshot } from '../src/core';
+import type { AppController, MailReplyContextSelection, MailReplyConversationContextDiscovery, MailReplySourceSnapshot, MailReplyTextGenerationInput, SelectedMailTextSnapshot } from '../src/core';
 import type { AssistantBatchJobDTO } from '../src/services/openRouterBatchJobs';
 import { MailReplyComposer } from '../src/ui/MailReplyComposer';
 
 vi.mock('react-native', async () => {
   const ReactModule = await import('react');
-  const view = (tag: string) => ({ children, style: _style, ...props }: Record<string, unknown> & { children?: React.ReactNode; style?: unknown }) => ReactModule.createElement(tag, props, children);
+  const view = (tag: string) => ({ children, style: _style, onPress, accessibilityLabel, accessibilityRole: _accessibilityRole, accessibilityState, ...props }: Record<string, unknown> & { children?: React.ReactNode; style?: unknown; onPress?: () => void; accessibilityLabel?: string; accessibilityRole?: string; accessibilityState?: { checked?: boolean; disabled?: boolean } }) => ReactModule.createElement(tag, { ...props, ...(accessibilityLabel ? { 'aria-label': accessibilityLabel } : {}), ...(accessibilityState?.checked !== undefined ? { 'aria-checked': accessibilityState.checked } : {}), disabled: accessibilityState?.disabled, onClick: onPress }, children);
   return { KeyboardAvoidingView: view('div'), Modal: view('div'), Pressable: view('button'), ScrollView: view('div'), Text: view('span'), View: view('div'), Platform: { OS: 'web' } };
 });
 vi.mock('react-native-safe-area-context', async () => {
@@ -60,6 +60,7 @@ function mockController(provider: 'openrouter' | 'azure'): AppController {
     getSnapshot: () => ({ settings } as never),
     getMailReplySource: vi.fn(async () => ({ status: 'current', source, defaults: { reply: { to: ['person@example.com'], cc: [] }, reply_all: { to: ['person@example.com'], cc: [] } } })),
     getMailReplyText: vi.fn(async () => ({ status: 'current', snapshot })),
+    loadMailReplyText: vi.fn(async () => ({ status: 'current', snapshot })),
     generateMailReplyText: vi.fn(), submitMailReplyBatch: vi.fn(),
   } as unknown as AppController;
 }
@@ -92,5 +93,36 @@ describe('MailReplyComposer Batch mode', () => {
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 5)); });
     expect([...host.querySelectorAll('button')].some((button) => button.textContent === 'Generate reply')).toBe(true);
     expect(host.textContent).not.toContain('OpenRouter Batch requests for this message');
+  });
+
+  it('submits only the selected opaque context ID and the exact excerpt consent on the OpenRouter path', async () => {
+    const controller = mockController('openrouter');
+    const conversation: MailReplyConversationContextDiscovery = {
+      sessionId: 'opaque-session', targetMessageId: 'message-a', rows: [{ rowId: 'opaque-row', subject: 'Earlier sent', isDraft: false }],
+      coverage: 'complete_metadata', omissionReasons: [], hasMore: false, expiresAt: '2026-10-14T10:00:00Z',
+    };
+    const selection: MailReplyContextSelection = {
+      selectionId: 'opaque-selection', subject: 'Earlier sent', text: 'User-selected excerpt', bytes: 22,
+      representation: 'plain', completeness: 'excerpt', omissionReasons: ['provider_excerpt'],
+    };
+    const onSubmitBatch = vi.fn(async (_input: Omit<MailReplyTextGenerationInput, 'forceRefresh'>, _owner: { messageId: string; generation: number }, _isCurrent: () => boolean) => mailJob);
+    act(() => root.render(React.createElement(MailReplyComposer, {
+      visible: true, messageId: 'message-a', controller, busy: false, notes: [], documents: [], batchEnabled: true,
+      batchBlocked: false, ownerGeneration: 9, batchJobs: [mailJob], onClose: vi.fn(), onSave: vi.fn(async () => undefined),
+      onSubmitBatch, onCheckBatch: vi.fn(async () => undefined), onReviewBatch: vi.fn(async () => undefined),
+      onActivateBatch: vi.fn(async () => undefined), onCancelBatchReview: vi.fn(), onDeleteBatch: vi.fn(async () => undefined),
+      onDiscoverContext: vi.fn(async () => conversation), onLoadContextMessage: vi.fn(async () => selection),
+      onCancelContext: vi.fn(),
+    })));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 5)); });
+    await act(async () => { [...host.querySelectorAll('button')].find((button) => button.textContent === 'Load message text')!.click(); await Promise.resolve(); });
+    await act(async () => { [...host.querySelectorAll('button')].find((button) => button.textContent === 'Load conversation metadata')!.click(); await Promise.resolve(); });
+    await act(async () => { [...host.querySelectorAll('button')].find((button) => button.textContent === 'Load this message text')!.click(); await Promise.resolve(); });
+    act(() => [...host.querySelectorAll('button')].find((button) => button.getAttribute('aria-label')?.startsWith('Include'))!.click());
+    act(() => [...host.querySelectorAll('button')].find((button) => button.textContent === 'Use this excerpt')!.click());
+    await act(async () => { [...host.querySelectorAll('button')].find((button) => button.textContent === 'Submit reply request')!.click(); await Promise.resolve(); });
+    expect(onSubmitBatch).toHaveBeenCalledOnce();
+    expect(onSubmitBatch.mock.calls[0][0]).toMatchObject({ contextSelectionIds: ['opaque-selection'], contextExcerptSelectionIds: ['opaque-selection'] });
+    expect(onSubmitBatch.mock.calls[0][0]).not.toHaveProperty('providerMessageIds');
   });
 });

@@ -98,4 +98,28 @@ describe('MailReplyBatchSection', () => {
     expect(host.textContent).toContain('Review cancelled.');
     expect(host.textContent).not.toContain('No request was sent.');
   });
+
+  it('refreshes selected sources without requiring the OpenRouter key and admits only one refresh', async () => {
+    let resolveRefresh!: (value: { status: 'current'; jobId: string; checkedAt: string; expiresAt: string; sources: [] }) => void;
+    const onRefreshSources = vi.fn((_jobId: string, _owner: { messageId: string; generation: number }, _isCurrent: () => boolean) =>
+      new Promise<{ status: 'current'; jobId: string; checkedAt: string; expiresAt: string; sources: [] }>((resolve) => { resolveRefresh = resolve; }));
+    const getSourcesStatus = vi.fn(() => ({ status: 'refresh_required' as const }));
+    render({
+      jobs: [job('job-a', 'message-a'), job('completed-job', 'message-a', { status: 'completed', canCheck: false, proposalId: 'proposal-1', mailReplyContextCount: 2 })],
+      checkReady: false,
+      onRefreshSources,
+      getSourcesStatus,
+    });
+    const check = [...host.querySelectorAll('button')].find((item) => item.textContent === 'Check for reply')!;
+    const refresh = [...host.querySelectorAll('button')].find((item) => item.textContent === 'Refresh selected sources')!;
+    expect(check.disabled).toBe(true);
+    expect(refresh.disabled).toBe(false);
+    act(() => { refresh.click(); refresh.click(); });
+    expect(onRefreshSources).toHaveBeenCalledOnce();
+    expect(onRefreshSources.mock.calls[0].slice(0, 2)).toEqual(['completed-job', { messageId: 'message-a', generation: 1 }]);
+    expect(onRefreshSources.mock.calls[0][2]()).toBe(true);
+    expect([...host.querySelectorAll('button')].find((item) => item.textContent === 'Refreshing selected sources…')?.disabled).toBe(true);
+    await act(async () => { resolveRefresh({ status: 'current', jobId: 'completed-job', checkedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(), sources: [] }); await Promise.resolve(); });
+    expect(host.textContent).toContain('Selected conversation sources were checked.');
+  });
 });

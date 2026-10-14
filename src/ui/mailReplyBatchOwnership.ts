@@ -1,6 +1,7 @@
 import type { MailReplyBatchReviewPlan } from '../core';
 
 export type MailReplyBatchOwner = Readonly<{ messageId: string; generation: number }>;
+export type MailReplyActionTicket = Readonly<{ id: number; owner: MailReplyBatchOwner }>;
 export type MailReplyBatchKeyStatus = Readonly<{ generation: number; mode: string; provider: string; ready: boolean }>;
 
 export type MailReplyBatchBlockState = Readonly<{
@@ -50,6 +51,14 @@ export function mailReplyBatchIsBlocked(state: MailReplyBatchBlockState): boolea
     state.mailAlertTapResolutionOpen || state.mailAlertTapPending || state.chatDeleteReviewOpen || state.chatInteractionLocked;
 }
 
+/** Keeps unrelated workspace gates active while allowing a mail-source read in its own exact review. */
+export function mailReplyBatchReviewSourceIsBlocked(
+  state: MailReplyBatchBlockState,
+  ownsExactReview: boolean,
+): boolean {
+  return mailReplyBatchIsBlocked({ ...state, competingReviewOpen: state.competingReviewOpen && !ownsExactReview });
+}
+
 export function mailReplyBatchKeyIsReady(
   status: MailReplyBatchKeyStatus | null,
   expected: Readonly<{ generation: number; mode: string; provider: string; blocked: boolean }>,
@@ -72,10 +81,13 @@ export class MailReplyBatchOwnership {
   private owner: MailReplyBatchOwner | undefined;
   private plan: { value: MailReplyBatchReviewPlan; owner: MailReplyBatchOwner } | undefined;
   private generation = 0;
+  private actionSequence = 0;
+  private actionTicket: MailReplyActionTicket | undefined;
 
   publishOwner(messageId: string | null): MailReplyBatchOwner | undefined {
     const nextGeneration = ++this.generation;
     this.plan = undefined;
+    this.actionTicket = undefined;
     this.owner = messageId ? Object.freeze({ messageId, generation: nextGeneration }) : undefined;
     return this.owner;
   }
@@ -89,6 +101,25 @@ export class MailReplyBatchOwnership {
   owns(owner: MailReplyBatchOwner): boolean {
     return this.owner?.messageId === owner.messageId && this.owner.generation === owner.generation;
   }
+
+  beginAction(owner: MailReplyBatchOwner): MailReplyActionTicket | undefined {
+    if (!this.owns(owner) || this.actionTicket) return undefined;
+    const ticket = Object.freeze({ id: ++this.actionSequence, owner });
+    this.actionTicket = ticket;
+    return ticket;
+  }
+
+  actionIsCurrent(ticket: MailReplyActionTicket): boolean {
+    return this.actionTicket === ticket && this.owns(ticket.owner);
+  }
+
+  finishAction(ticket: MailReplyActionTicket): boolean {
+    if (this.actionTicket !== ticket) return false;
+    this.actionTicket = undefined;
+    return true;
+  }
+
+  currentAction(): MailReplyActionTicket | undefined { return this.actionTicket; }
 
   async runOwnedAction<TReady, TValue>(input: {
     owner: MailReplyBatchOwner;

@@ -45,6 +45,9 @@ import type {
   EditKnowledgeSuggestionInput,
   StartupRecoveryStatus,
   MailReplyBatchReviewPlan,
+  MailReplyBatchSourcesRefreshResult,
+  MailReplyContextSelection,
+  MailReplyConversationContextDiscovery,
 } from "./src/core";
 import type {
   ProactiveRecoveryPlan,
@@ -66,7 +69,7 @@ import { loadAudioForUpload } from "./src/audio/readAudio";
 import { ConnectionsSection } from "./src/ui/ConnectionsSection";
 import { MailboxSection } from "./src/ui/MailboxSection";
 import { MailReplyComposer } from "./src/ui/MailReplyComposer";
-import { MailReplyBatchOwnership, mailReplyBatchIsBlocked, mailReplyBatchKeyIsReady, rethrowMailReplyBatchError, type MailReplyBatchKeyStatus, type MailReplyBatchOwner } from "./src/ui/mailReplyBatchOwnership";
+import { MailReplyBatchOwnership, mailReplyBatchIsBlocked, mailReplyBatchReviewSourceIsBlocked, mailReplyBatchKeyIsReady, rethrowMailReplyBatchError, type MailReplyBatchBlockState, type MailReplyBatchKeyStatus, type MailReplyBatchOwner } from "./src/ui/mailReplyBatchOwnership";
 import { ProactiveCandidatesSection } from "./src/ui/ProactiveCandidatesSection";
 import { ProactiveRulesSection } from "./src/ui/ProactiveRulesSection";
 import { ProactiveMailAlertsSection, type EnableProactiveMailAlertsInput } from "./src/ui/ProactiveMailAlertsSection";
@@ -956,9 +959,17 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
   const transcriptionCleanupActionRef = useRef<string | undefined>(undefined);
   const [transcribingNoteId, setTranscribingNoteId] = useState<string | undefined>();
   const [review, setReview] = useState<Proposal | null>(null);
+  const reviewRef = useRef<Proposal | null>(review);
+  const reviewedMailSourceOwnershipRef = useRef(new MailReplyBatchOwnership());
+  const reviewedMailSourceBusyTicketRef = useRef<object | undefined>(undefined);
+  useLayoutEffect(() => {
+    reviewRef.current = review;
+    reviewedMailSourceOwnershipRef.current.publishOwner(review ? JSON.stringify([review.id, review.revision]) : null);
+  }, [review]);
   const [replyMessageId, setReplyMessageId] = useState<string | null>(null);
   const mailReplyBatchOwnershipRef = useRef<MailReplyBatchOwnership | null>(null);
   if (mailReplyBatchOwnershipRef.current == null) mailReplyBatchOwnershipRef.current = new MailReplyBatchOwnership();
+  const mailReplyContextSessionsRef = useRef(new Map<string, MailReplyBatchOwner>());
   const [mailReplyOwnerGeneration, setMailReplyOwnerGeneration] = useState(0);
   const [reminderReviewId, setReminderReviewId] = useState<string | null>(null);
   const [reminderSourceAccountLabel, setReminderSourceAccountLabel] = useState<string | undefined>();
@@ -1408,6 +1419,9 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
   const currentReviewProposal = review
     ? (state.proposals.find((proposal) => proposal.id === review.id) ?? review)
     : null;
+  const reviewMailReplyBatchJobId = currentReviewProposal?.provenance && 'kind' in currentReviewProposal.provenance &&
+    currentReviewProposal.provenance.kind === 'mail_reply' && currentReviewProposal.provenance.version === 2 &&
+    'batchJobId' in currentReviewProposal.provenance ? currentReviewProposal.provenance.batchJobId : undefined;
   const reviewProposalId = currentReviewProposal?.id;
   const reviewProposalRevision = currentReviewProposal?.revision;
   const reviewProposalStatus = currentReviewProposal?.status;
@@ -2522,7 +2536,7 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
     }
   };
   const [mailReplyBatchActionBusy, setMailReplyBatchActionBusy] = useState(false);
-  const mailReplyBatchHardBlocked = mailReplyBatchIsBlocked({
+  const mailReplyBatchBlockState: MailReplyBatchBlockState = {
     startupReady,
     loading,
     demo: isIsolatedDemo,
@@ -2556,7 +2570,10 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
     mailAlertTapPending,
     chatDeleteReviewOpen,
     chatInteractionLocked,
-  });
+  };
+  const mailReplyBatchHardBlocked = mailReplyBatchIsBlocked(mailReplyBatchBlockState);
+  const mailReplyBatchBlockStateRef = useRef(mailReplyBatchBlockState);
+  useLayoutEffect(() => { mailReplyBatchBlockStateRef.current = mailReplyBatchBlockState; });
   const mailReplyBatchHardBlockedRef = useRef(mailReplyBatchHardBlocked);
   useLayoutEffect(() => { mailReplyBatchHardBlockedRef.current = mailReplyBatchHardBlocked; }, [mailReplyBatchHardBlocked]);
   const [mailReplyBatchKeyStatus, setMailReplyBatchKeyStatus] = useState<MailReplyBatchKeyStatus | null>(null);
@@ -2569,6 +2586,41 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
   const ownsMailReplyOwner = useCallback((owner: MailReplyBatchOwner) =>
     mailReplyBatchOwnershipRef.current!.owns(owner),
   []);
+  const runOwnedMailReplyContextAction = useCallback(async <TValue,>(input: {
+    owner: MailReplyBatchOwner;
+    isCurrent: () => boolean;
+    action: () => Promise<TValue>;
+    cancelLateValue?: (value: TValue) => Promise<unknown> | unknown;
+  }): Promise<TValue | undefined> => {
+    const ownership = mailReplyBatchOwnershipRef.current!;
+    if (!ownership.owns(input.owner) || mailReplyBatchHardBlockedRef.current || !input.isCurrent() || busyLock.current) return undefined;
+    const ticket = ownership.beginAction(input.owner);
+    if (!ticket) return undefined;
+    busyLock.current = true;
+    setMailReplyBatchActionBusy(true);
+    setBusy(true);
+    try {
+      const outcome = await ownership.runOwnedAction({
+        owner: input.owner,
+        isCurrent: () => ownership.actionIsCurrent(ticket) && !mailReplyBatchHardBlockedRef.current && input.isCurrent(),
+        readReadiness: async () => undefined,
+        action: async () => {
+          if (!ownership.actionIsCurrent(ticket) || mailReplyBatchHardBlockedRef.current || !input.isCurrent()) throw new Error("The selected message or workspace changed. Reopen the reply composer.");
+          return input.action();
+        },
+        cancelLateValue: input.cancelLateValue,
+      });
+      return outcome.kind === "complete" ? outcome.value : undefined;
+    } catch (cause) {
+      rethrowMailReplyBatchError(cause, isPrivacyBootstrapError, onPrivacyInvalidated);
+    } finally {
+      if (ownership.finishAction(ticket)) {
+        busyLock.current = false;
+        setMailReplyBatchActionBusy(false);
+        setBusy(false);
+      }
+    }
+  }, [onPrivacyInvalidated]);
   useEffect(() => {
     const owner = replyMessageId ? mailReplyBatchOwnershipRef.current!.captureOwner(replyMessageId) : undefined;
     const mode = state.settings.mode;
@@ -2604,20 +2656,45 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
   const cancelMailReplyBatchReview = useCallback((planId: string, owner: { messageId: string; generation: number }) => {
     cancelOwnedMailReplyBatchPlan(planId, owner);
   }, [cancelOwnedMailReplyBatchPlan]);
+  const releaseMailReplyContextAction = useCallback((owner: MailReplyBatchOwner | undefined) => {
+    if (!owner) return;
+    const ownership = mailReplyBatchOwnershipRef.current!;
+    const ticket = ownership.currentAction();
+    if (ticket?.owner.messageId === owner.messageId && ticket.owner.generation === owner.generation && ownership.finishAction(ticket)) {
+      busyLock.current = false;
+      setMailReplyBatchActionBusy(false);
+      setBusy(false);
+    }
+  }, []);
+  const cancelMailReplyContextOwnerSessions = useCallback((owner: MailReplyBatchOwner | undefined) => {
+    if (!owner) return;
+    for (const [sessionId, sessionOwner] of mailReplyContextSessionsRef.current) {
+      if (sessionOwner.messageId !== owner.messageId || sessionOwner.generation !== owner.generation) continue;
+      mailReplyContextSessionsRef.current.delete(sessionId);
+      void controller.cancelMailReplyContextDiscovery(sessionId).catch(() => undefined);
+    }
+  }, [controller]);
   const openMailReply = useCallback((messageId: string) => {
+    const previousOwner = replyMessageId ? mailReplyBatchOwnershipRef.current!.captureOwner(replyMessageId) : undefined;
+    releaseMailReplyContextAction(previousOwner);
+    cancelMailReplyContextOwnerSessions(previousOwner);
     const previous = mailReplyBatchOwnershipRef.current!.currentPlan();
     if (previous) cancelOwnedMailReplyBatchPlan(previous.planId);
     const owner = mailReplyBatchOwnershipRef.current!.publishOwner(messageId)!;
     setMailReplyOwnerGeneration(owner.generation);
     setReplyMessageId(messageId);
-  }, [cancelOwnedMailReplyBatchPlan]);
-  const closeMailReply = useCallback(() => {
+  }, [cancelMailReplyContextOwnerSessions, cancelOwnedMailReplyBatchPlan, releaseMailReplyContextAction, replyMessageId]);
+  const closeMailReply = useCallback((expectedOwner?: MailReplyBatchOwner) => {
+    const liveOwner = replyMessageId ? mailReplyBatchOwnershipRef.current!.captureOwner(replyMessageId) : undefined;
+    if (expectedOwner && (!liveOwner || !mailReplyBatchOwnershipRef.current!.owns(expectedOwner))) return;
+    releaseMailReplyContextAction(liveOwner);
+    cancelMailReplyContextOwnerSessions(liveOwner);
     const previous = mailReplyBatchOwnershipRef.current!.currentPlan();
     if (previous) cancelOwnedMailReplyBatchPlan(previous.planId);
     mailReplyBatchOwnershipRef.current!.publishOwner(null);
     setMailReplyOwnerGeneration(mailReplyBatchOwnershipRef.current!.currentGeneration);
     setReplyMessageId(null);
-  }, [cancelOwnedMailReplyBatchPlan]);
+  }, [cancelMailReplyContextOwnerSessions, cancelOwnedMailReplyBatchPlan, releaseMailReplyContextAction, replyMessageId]);
   const submitMailReplyBatch = useCallback(async (
     input: Parameters<AppController["submitMailReplyBatch"]>[0],
     owner: MailReplyBatchOwner,
@@ -2748,7 +2825,7 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
       if (!proposal || proposal.provenance?.version !== 2 || proposal.provenance.kind !== "mail_reply" || proposal.provenance.batchJobId !== jobId) throw new Error("The created reply draft could not be confirmed for this request. Check saved request status before taking another action.");
       setInboxFilter("pending");
       setReview(proposal);
-      closeMailReply();
+      closeMailReply(owner);
       return result;
     } catch (cause) {
       void controller.cancelMailReplyBatchReview(planId).catch(() => undefined);
@@ -2769,6 +2846,123 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
       rethrowMailReplyBatchError(cause, isPrivacyBootstrapError, onPrivacyInvalidated);
     } finally { busyLock.current = false; setMailReplyBatchActionBusy(false); setBusy(false); }
   }, [controller, onPrivacyInvalidated, ownsMailReplyOwner]);
+  const discoverMailReplyContext = useCallback(async (
+    input: { messageId: string; sourceDigest: string }, owner: MailReplyBatchOwner, isComposerCurrent: () => boolean,
+  ): Promise<MailReplyConversationContextDiscovery | undefined> => {
+    if (input.messageId !== owner.messageId) return undefined;
+    const result = await runOwnedMailReplyContextAction({ owner, isCurrent: isComposerCurrent,
+      action: () => controller.discoverMailReplyContext(input),
+      cancelLateValue: (value) => controller.cancelMailReplyContextDiscovery(value.sessionId) });
+    if (!result || !ownsMailReplyOwner(owner) || !isComposerCurrent()) return undefined;
+    mailReplyContextSessionsRef.current.set(result.sessionId, owner);
+    return result;
+  }, [controller, ownsMailReplyOwner, runOwnedMailReplyContextAction]);
+  const continueMailReplyContext = useCallback(async (
+    sessionId: string, owner: MailReplyBatchOwner, isComposerCurrent: () => boolean,
+  ): Promise<MailReplyConversationContextDiscovery | undefined> => {
+    const sessionOwner = mailReplyContextSessionsRef.current.get(sessionId);
+    if (!sessionOwner || sessionOwner.messageId !== owner.messageId || sessionOwner.generation !== owner.generation) return undefined;
+    return runOwnedMailReplyContextAction({ owner, isCurrent: isComposerCurrent,
+      action: () => controller.continueMailReplyContextDiscovery({ sessionId }),
+      cancelLateValue: () => controller.cancelMailReplyContextDiscovery(sessionId) });
+  }, [controller, runOwnedMailReplyContextAction]);
+  const loadMailReplyContextMessage = useCallback(async (
+    sessionId: string, rowId: string, owner: MailReplyBatchOwner, isComposerCurrent: () => boolean,
+  ): Promise<MailReplyContextSelection | undefined> => {
+    const sessionOwner = mailReplyContextSessionsRef.current.get(sessionId);
+    if (!sessionOwner || sessionOwner.messageId !== owner.messageId || sessionOwner.generation !== owner.generation) return undefined;
+    return runOwnedMailReplyContextAction({ owner, isCurrent: isComposerCurrent,
+      action: () => controller.loadMailReplyContextMessage({ sessionId, rowId }) });
+  }, [controller, runOwnedMailReplyContextAction]);
+  const cancelMailReplyContext = useCallback((sessionId: string, owner: MailReplyBatchOwner) => {
+    const sessionOwner = mailReplyContextSessionsRef.current.get(sessionId);
+    if (!sessionOwner || sessionOwner.messageId !== owner.messageId || sessionOwner.generation !== owner.generation) return;
+    mailReplyContextSessionsRef.current.delete(sessionId);
+    void controller.cancelMailReplyContextDiscovery(sessionId).catch(() => undefined);
+  }, [controller]);
+  const refreshComposerMailReplySources = useCallback(async (
+    jobId: string, owner: MailReplyBatchOwner, isComposerCurrent: () => boolean,
+  ): Promise<MailReplyBatchSourcesRefreshResult | undefined> => {
+    const job = (controller.getSnapshot().assistantBatchJobs ?? []).find((item) => item.id === jobId && item.kind === 'mail_reply' && item.mailMessageId === owner.messageId);
+    if (!job || !job.proposalId) return undefined;
+    const result = await runOwnedMailReplyContextAction({ owner, isCurrent: isComposerCurrent,
+      action: () => controller.refreshMailReplyBatchSources(jobId) });
+    return result?.jobId === jobId ? result : undefined;
+  }, [controller, runOwnedMailReplyContextAction]);
+  const refreshReviewedMailReplySources = useCallback(async (
+    jobId: string, proposalId: string, proposalRevision: number, isReviewCurrent: () => boolean,
+  ): Promise<MailReplyBatchSourcesRefreshResult | undefined> => {
+    const proposal = reviewRef.current;
+    const provenance = proposal?.provenance;
+    const batchId = provenance && 'kind' in provenance && provenance.kind === 'mail_reply' && provenance.version === 2
+      ? provenance.batchJobId : undefined;
+    const sourceOwnership = reviewedMailSourceOwnershipRef.current;
+    const owner = sourceOwnership.captureOwner(JSON.stringify([proposalId, proposalRevision]));
+    const liveSnapshot = controller.getSnapshot();
+    const liveProposal = liveSnapshot.proposals.find((item) => item.id === proposalId);
+    const job = (liveSnapshot.assistantBatchJobs ?? []).find((item) => item.id === jobId && item.kind === 'mail_reply');
+    const ownsExactLinkedReview = () => {
+      const currentReview = reviewRef.current;
+      const snapshot = controller.getSnapshot();
+      const currentProposal = snapshot.proposals.find((item) => item.id === proposalId);
+      const currentProvenance = currentProposal?.provenance;
+      const currentBatchId = currentProvenance && 'kind' in currentProvenance && currentProvenance.kind === 'mail_reply' && currentProvenance.version === 2
+        ? currentProvenance.batchJobId : undefined;
+      const currentJob = (snapshot.assistantBatchJobs ?? []).find((item) => item.id === jobId && item.kind === 'mail_reply');
+      return Boolean(currentReview?.id === proposalId && currentReview.revision === proposalRevision &&
+        currentProposal?.revision === proposalRevision && currentBatchId === jobId && currentJob?.proposalId === proposalId &&
+        currentJob.status === 'completed' && currentJob.hasMailReplyResult);
+    };
+    const isCurrent = () => Boolean(owner && sourceOwnership.owns(owner) && ownsExactLinkedReview() &&
+      !mailReplyBatchReviewSourceIsBlocked(mailReplyBatchBlockStateRef.current, true) && isReviewCurrent());
+    if (!proposal || proposal.id !== proposalId || proposal.revision !== proposalRevision || !liveProposal || liveProposal.revision !== proposalRevision ||
+        proposal.kind !== 'email' || proposal.email?.operation !== 'draft' || batchId !== jobId ||
+        !job || job.status !== 'completed' || !job.hasMailReplyResult || !job.proposalId || job.proposalId !== proposalId || (job.mailReplyContextCount ?? 0) < 1 ||
+        controller.getMailReplyBatchSourcesStatus(jobId).status === 'invalid' ||
+        !owner || !isCurrent() || busyLock.current) return undefined;
+    const ticket = sourceOwnership.beginAction(owner);
+    if (!ticket) return undefined;
+    const appTicket = {};
+    reviewedMailSourceBusyTicketRef.current = appTicket;
+    busyLock.current = true;
+    setMailReplyBatchActionBusy(true);
+    setBusy(true);
+    try {
+      const outcome = await sourceOwnership.runOwnedAction({
+        owner,
+        isCurrent: () => sourceOwnership.actionIsCurrent(ticket) && isCurrent(),
+        readReadiness: async () => undefined,
+        action: async () => {
+          if (!sourceOwnership.actionIsCurrent(ticket) || !isCurrent()) throw new Error('The selected proposal changed. Reopen its review before refreshing sources.');
+          const sources = await controller.refreshMailReplyBatchSources(jobId);
+          if (sources.jobId !== jobId || sources.status !== 'current') return { sources };
+          if (!sourceOwnership.actionIsCurrent(ticket) || !isCurrent()) throw new Error('The selected proposal changed. Reopen its review before checking it.');
+          const freshness = await controller.checkProposalFreshness(proposalId);
+          return { sources, freshness };
+        },
+      });
+      if (outcome.kind !== 'complete' || !isCurrent() || !('freshness' in outcome.value) || !outcome.value.freshness ||
+          outcome.value.sources.jobId !== jobId || outcome.value.sources.status !== 'current') return undefined;
+      const latest = controller.getSnapshot().proposals.find((item) => item.id === proposalId);
+      if (!latest || latest.revision !== proposalRevision || !isCurrent()) return undefined;
+      setReview(latest);
+      setReviewFreshnessResult({ key: reviewFreshnessKey, current: outcome.value.freshness.current, reason: outcome.value.freshness.reason });
+      setReviewFreshnessError(null);
+      setReviewFreshnessCheckedKey(reviewFreshnessKey);
+      checkedReviewFreshnessKey.current = reviewFreshnessKey;
+      return outcome.value.sources;
+    } catch (cause) {
+      rethrowMailReplyBatchError(cause, isPrivacyBootstrapError, onPrivacyInvalidated);
+    } finally {
+      sourceOwnership.finishAction(ticket);
+      if (reviewedMailSourceBusyTicketRef.current === appTicket) {
+        reviewedMailSourceBusyTicketRef.current = undefined;
+        busyLock.current = false;
+        setMailReplyBatchActionBusy(false);
+        setBusy(false);
+      }
+    }
+  }, [controller, onPrivacyInvalidated, reviewFreshnessKey]);
   const saveInspectedPendingCapture = useCallback(async (receipt: PendingCaptureReceipt, durationSeconds: number): Promise<boolean> => {
     setPendingCaptureBusy(true);
     try {
@@ -4066,6 +4260,11 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
                 proposal={currentReviewProposal}
                 dispatchRecords={state.dispatchRecords}
                 deviceEventDispatchRecords={state.deviceCalendars.dispatchRecords}
+                mailReplyContextCount={reviewMailReplyBatchJobId
+                  ? (state.assistantBatchJobs ?? []).find((job) => job.kind === 'mail_reply' && job.id === reviewMailReplyBatchJobId)?.mailReplyContextCount ?? 0
+                  : 0}
+                mailReplySourcesStatus={reviewMailReplyBatchJobId ? controller.getMailReplyBatchSourcesStatus(reviewMailReplyBatchJobId) : undefined}
+                onRefreshMailReplySources={refreshReviewedMailReplySources}
                 busy={busy}
                 demoMode={isDeviceCalendarsDemo}
                 onInspectDeviceEvent={(recordId) => controller.inspectDeviceEventDispatch(recordId)}
@@ -4198,6 +4397,12 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
           onActivateBatch={activateMailReplyBatch}
           onCancelBatchReview={cancelMailReplyBatchReview}
           onDeleteBatch={deleteMailReplyBatch}
+          onDiscoverContext={discoverMailReplyContext}
+          onContinueContext={continueMailReplyContext}
+          onLoadContextMessage={loadMailReplyContextMessage}
+          onCancelContext={cancelMailReplyContext}
+          onRefreshBatchSources={refreshComposerMailReplySources}
+          getBatchSourcesStatus={(jobId) => controller.getMailReplyBatchSourcesStatus(jobId)}
           onClose={closeMailReply}
           onSave={saveMailReply}
         />

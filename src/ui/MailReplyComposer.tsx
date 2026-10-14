@@ -13,6 +13,9 @@ import type {
   ContextDocument,
   MailReplySourceSnapshot,
   MailReplyBatchReviewPlan,
+  MailReplyBatchSourcesRefreshResult,
+  MailReplyContextSelection,
+  MailReplyConversationContextDiscovery,
   MailReplyTextGenerationInput,
   MailReplyTextGenerationResult,
   Note,
@@ -22,6 +25,7 @@ import type {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Button, Field, IconButton } from "./primitives";
 import { MailReplyBatchSection } from "./MailReplyBatchSection";
+import { MailReplyConversationContext } from "./MailReplyConversationContext";
 import type { AssistantBatchJobDTO } from "../services/openRouterBatchJobs";
 import { C, s } from "./theme";
 
@@ -50,6 +54,12 @@ export function MailReplyComposer({
   onActivateBatch,
   onCancelBatchReview,
   onDeleteBatch,
+  onDiscoverContext,
+  onContinueContext,
+  onLoadContextMessage,
+  onCancelContext,
+  onRefreshBatchSources,
+  getBatchSourcesStatus,
 }: {
   visible: boolean;
   messageId: string | null;
@@ -58,7 +68,7 @@ export function MailReplyComposer({
   demoMode?: boolean;
   notes: Note[];
   documents: ContextDocument[];
-  onClose: () => void;
+  onClose: (owner: { messageId: string; generation: number }) => void;
   onOpenSettings?: () => void;
   onSave: (input: {
     messageId: string;
@@ -78,6 +88,12 @@ export function MailReplyComposer({
   onActivateBatch?: (planId: string, jobId: string, owner: { messageId: string; generation: number }, isComposerCurrent: () => boolean) => Promise<unknown>;
   onCancelBatchReview?: (planId: string, owner: { messageId: string; generation: number }) => void;
   onDeleteBatch?: (jobId: string, owner: { messageId: string; generation: number }) => Promise<unknown>;
+  onDiscoverContext?: (input: { messageId: string; sourceDigest: string }, owner: { messageId: string; generation: number }, isComposerCurrent: () => boolean) => Promise<MailReplyConversationContextDiscovery | undefined>;
+  onContinueContext?: (sessionId: string, owner: { messageId: string; generation: number }, isComposerCurrent: () => boolean) => Promise<MailReplyConversationContextDiscovery | undefined>;
+  onLoadContextMessage?: (sessionId: string, rowId: string, owner: { messageId: string; generation: number }, isComposerCurrent: () => boolean) => Promise<MailReplyContextSelection | undefined>;
+  onCancelContext?: (sessionId: string, owner: { messageId: string; generation: number }) => void;
+  onRefreshBatchSources?: (jobId: string, owner: { messageId: string; generation: number }, isComposerCurrent: () => boolean) => Promise<MailReplyBatchSourcesRefreshResult | undefined>;
+  getBatchSourcesStatus?: (jobId: string) => ReturnType<AppController["getMailReplyBatchSourcesStatus"]>;
 }) {
   const [source, setSource] = useState<MailReplySourceSnapshot | null>(null);
   const [mode, setMode] = useState<ReplyMode>("reply");
@@ -95,6 +111,8 @@ export function MailReplyComposer({
   const [showFullBody, setShowFullBody] = useState(false);
   const [bodyStatus, setBodyStatus] = useState("");
   const [useSavedExcerpt, setUseSavedExcerpt] = useState(false);
+  const [contextSelectionIds, setContextSelectionIds] = useState<readonly string[]>([]);
+  const [contextExcerptSelectionIds, setContextExcerptSelectionIds] = useState<readonly string[]>([]);
   const [selectedNote, setSelectedNote] = useState<Note | null>(null);
   const [notePicker, setNotePicker] = useState(false);
   const [error, setError] = useState("");
@@ -125,6 +143,11 @@ export function MailReplyComposer({
     batchReviewInvalidator.current = invalidate;
     return () => { if (batchReviewInvalidator.current === invalidate) batchReviewInvalidator.current = () => undefined; };
   }, []);
+  const updateConversationContext = useCallback((selectionIds: readonly string[], excerptIds: readonly string[]) => {
+    setContextSelectionIds(selectionIds);
+    setContextExcerptSelectionIds(excerptIds);
+    invalidatePendingGeneration();
+  }, [invalidatePendingGeneration]);
 
   const applySource = useCallback(
     async (nextMode: ReplyMode, initial: boolean, deliberateRebind = false) => {
@@ -138,6 +161,8 @@ export function MailReplyComposer({
         setBrief("");
         setSelectedNote(null);
         setMode("reply");
+        setContextSelectionIds([]);
+        setContextExcerptSelectionIds([]);
       }
       if (deliberateRebind) {
         invalidatePendingGeneration();
@@ -413,6 +438,8 @@ export function MailReplyComposer({
         cc: parsedCc,
         brief: brief.trim(),
         composerRevision: revision,
+        ...(contextSelectionIds.length ? { contextSelectionIds } : {}),
+        ...(contextExcerptSelectionIds.length ? { contextExcerptSelectionIds } : {}),
         ...(selectedNote ? { noteId: selectedNote.id, noteRevision: selectedNote.revision } : {}),
       }, owner, isComposerCurrent);
       if (!isComposerCurrent()) return;
@@ -450,7 +477,7 @@ export function MailReplyComposer({
   const selectedNoteTimeZoneUnconfirmed = Boolean(
     selectedNote?.importOrigin?.originalTimeZoneUnknown,
   );
-  const closeComposer = () => { batchReviewInvalidator.current(); onClose(); };
+  const closeComposer = () => { batchReviewInvalidator.current(); onClose({ messageId: messageId ?? '', generation: ownerGeneration }); };
 
   return (
     <Modal visible={visible} animationType="slide" onRequestClose={closeComposer} presentationStyle="fullScreen">
@@ -500,6 +527,21 @@ export function MailReplyComposer({
             {bodySnapshot?.completeness === "excerpt" && !useSavedExcerpt ? <Button label="Use this excerpt" tone="quiet" disabled={busy || generating} onPress={() => { invalidatePendingGeneration(); setUseSavedExcerpt(true); setBodyStatus("Excerpt selected. Review it before generating."); }} /> : null}
             {bodyStatus ? <Text style={styles.disclaimer}>{bodyStatus}</Text> : null}
 
+            {visible && !batchBlocked && openRouterSelected && !demoMode && source && messageId ? <MailReplyConversationContext
+              key={`${messageId}:${ownerGeneration}:${source.sourceDigest}`}
+              visible={visible}
+              messageId={messageId}
+              sourceDigest={source.sourceDigest}
+              ownerGeneration={ownerGeneration}
+              blocked={false}
+              busy={busy || checking || generating || loadingText}
+              onChange={updateConversationContext}
+              onDiscover={onDiscoverContext}
+              onContinue={onContinueContext}
+              onLoadMessage={onLoadContextMessage}
+              onCancel={onCancelContext}
+            /> : null}
+
             <Field label="What should the reply say?" value={brief} onChangeText={(value) => { if (utf8Bytes(value.trim()) + (selectedNote ? utf8Bytes(selectedNote.transcript) : 0) <= BRIEF_LIMIT) { invalidatePendingGeneration(); setBrief(value); setError(""); } else setError("The reply brief and selected note together must stay under 4 KB."); }} placeholder="Optional guidance for the reply" multiline />
             <Text style={styles.limitText}>{combinedBriefBytes.toLocaleString()} / 4,096 combined bytes</Text>
             <Button label={selectedNote ? `Source note · ${selectedNote.title}` : "Choose a saved note"} tone="quiet" disabled={busy || generating} onPress={() => setNotePicker(true)} />
@@ -537,6 +579,8 @@ export function MailReplyComposer({
                     onActivate={onActivateBatch}
                     onCancel={onCancelBatchReview}
                     onDelete={onDeleteBatch}
+                    onRefreshSources={onRefreshBatchSources}
+                    getSourcesStatus={getBatchSourcesStatus}
                     registerReviewInvalidator={registerBatchReviewInvalidator}
                   />
                 ) : null}
@@ -560,7 +604,7 @@ export function MailReplyComposer({
               setError("");
               try {
                 const proposal = await onSave({ messageId, mode, sourceDigest: source.sourceDigest, text, to: parsedTo, cc: parsedCc });
-                if (proposal) onClose();
+                if (proposal) closeComposer();
                 else setError("Another action is in progress. Try saving this reply again.");
               } catch (cause) { setError(messageOf(cause, "Could not save this reply for review.")); }
             }} />

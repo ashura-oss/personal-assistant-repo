@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { Text, View } from 'react-native';
-import type { MailReplyBatchReviewPlan } from '../core';
+import type { MailReplyBatchReviewPlan, MailReplyBatchSourcesRefreshResult } from '../core';
 import type { AssistantBatchJobDTO } from '../services/openRouterBatchJobs';
 import { Button } from './primitives';
 import { batchCheckLabel, batchJobTokenSummary, formatReportedBatchCost } from './assistantBatchJobPresentation';
@@ -23,22 +23,26 @@ type Props = {
   onActivate: (planId: string, jobId: string, owner: Owner, isComposerCurrent: () => boolean) => Promise<unknown>;
   onCancel: (planId: string, owner: Owner) => void;
   onDelete: (jobId: string, owner: Owner) => Promise<unknown>;
+  onRefreshSources?: (jobId: string, owner: Owner, isComposerCurrent: () => boolean) => Promise<MailReplyBatchSourcesRefreshResult | undefined>;
+  getSourcesStatus?: (jobId: string) => { readonly status: 'missing' | 'refresh_required' | 'current' | 'invalid'; readonly expiresAt?: string };
   registerReviewInvalidator?: (invalidate: () => void) => () => void;
 };
 
 export function MailReplyBatchSection({
   jobs, messageId, ownerGeneration, composerRevision, blocked, busy, submitting, checkReady,
-  onCheck, onReview, onActivate, onCancel, onDelete, registerReviewInvalidator,
+  onCheck, onReview, onActivate, onCancel, onDelete, onRefreshSources, getSourcesStatus, registerReviewInvalidator,
 }: Props) {
   const [checkingId, setCheckingId] = useState<string>();
   const [reviewingId, setReviewingId] = useState<string>();
   const [deletingId, setDeletingId] = useState<string>();
+  const [refreshingSourcesId, setRefreshingSourcesId] = useState<string>();
   const [deleteTarget, setDeleteTarget] = useState<string>();
   const [activating, setActivating] = useState(false);
   const [actionPending, setActionPending] = useState(false);
   const [plan, setPlan] = useState<MailReplyBatchReviewPlan>();
   const [notice, setNotice] = useState('');
   const actionLock = useRef(false);
+  const actionTicket = useRef<object | undefined>(undefined);
   const planRef = useRef<MailReplyBatchReviewPlan | undefined>(undefined);
   const planOwnerRef = useRef<Owner | undefined>(undefined);
   const planRevisionRef = useRef(-1);
@@ -101,17 +105,24 @@ export function MailReplyBatchSection({
     .slice().sort((left, right) => right.createdAt.localeCompare(left.createdAt));
   const check = async (jobId: string) => {
     if (actionLock.current || blocked || busy) return;
+    const ticket = {};
+    actionTicket.current = ticket;
     actionLock.current = true;
     setActionPending(true);
     setCheckingId(jobId);
     setNotice('');
     try { await onCheck(jobId, owner); }
     catch { if (stillOwns(owner)) setNotice('Request status is uncertain. Check again when you are ready; this never submits another request.'); }
-    finally { if (stillOwns(owner)) setCheckingId(undefined); actionLock.current = false; setActionPending(false); }
+    finally {
+      if (stillOwns(owner)) setCheckingId(undefined);
+      if (actionTicket.current === ticket) { actionTicket.current = undefined; actionLock.current = false; setActionPending(false); }
+    }
   };
 
   const review = async (jobId: string) => {
     if (actionLock.current || blocked || busy) return;
+    const ticket = {};
+    actionTicket.current = ticket;
     actionLock.current = true;
     setActionPending(true);
     setReviewingId(jobId);
@@ -133,7 +144,10 @@ export function MailReplyBatchSection({
       setPlan(next);
     } catch {
       if (stillOwns(owner)) setNotice('The completed reply could not be reviewed. Check the saved message, then try again.');
-    } finally { if (stillOwns(owner)) setReviewingId(undefined); actionLock.current = false; setActionPending(false); }
+    } finally {
+      if (stillOwns(owner)) setReviewingId(undefined);
+      if (actionTicket.current === ticket) { actionTicket.current = undefined; actionLock.current = false; setActionPending(false); }
+    }
   };
 
   const cancelReview = () => {
@@ -155,6 +169,8 @@ export function MailReplyBatchSection({
     const revision = planRevisionRef.current;
     const isComposerCurrent = () => stillOwns(capturedOwner) && revisionRef.current === revision;
     if (!isComposerCurrent()) { invalidateReview(); return; }
+    const ticket = {};
+    actionTicket.current = ticket;
     actionLock.current = true;
     setActionPending(true);
     setActivating(true);
@@ -166,12 +182,42 @@ export function MailReplyBatchSection({
       await onActivate(captured.planId, captured.jobId, capturedOwner, isComposerCurrent);
     } catch {
       if (stillOwns(capturedOwner)) setNotice('Draft creation could not be confirmed. Check saved request status before taking another action.');
-    } finally { if (stillOwns(capturedOwner)) setActivating(false); actionLock.current = false; setActionPending(false); }
+    } finally {
+      if (stillOwns(capturedOwner)) setActivating(false);
+      if (actionTicket.current === ticket) { actionTicket.current = undefined; actionLock.current = false; setActionPending(false); }
+    }
+  };
+
+  const refreshSources = async (jobId: string) => {
+    if (!onRefreshSources || actionLock.current || blocked || busy || !stillOwns(owner)) return;
+    const job = messageJobs.find((item) => item.id === jobId);
+    if (!job || job.proposalId === undefined || job.mailReplyContextCount === undefined || getSourcesStatus?.(jobId).status !== 'refresh_required') return;
+    const ticket = {};
+    actionTicket.current = ticket;
+    actionLock.current = true;
+    setActionPending(true);
+    setRefreshingSourcesId(jobId);
+    setNotice('');
+    const revision = revisionRef.current;
+    const isComposerCurrent = () => stillOwns(owner) && revisionRef.current === revision;
+    try {
+      const result = await onRefreshSources(jobId, owner, isComposerCurrent);
+      if (isComposerCurrent() && result?.jobId === jobId && result.status === 'current') {
+        setNotice('Selected conversation sources were checked. Review the saved proposal again before approving it.');
+      }
+    } catch {
+      if (stillOwns(owner)) setNotice('Saved conversation sources could not be refreshed. The proposal remains unavailable for action until a fresh source check succeeds.');
+    } finally {
+      if (stillOwns(owner)) setRefreshingSourcesId(undefined);
+      if (actionTicket.current === ticket) { actionTicket.current = undefined; actionLock.current = false; setActionPending(false); }
+    }
   };
 
   const remove = async (jobId: string) => {
     if (actionLock.current || blocked || busy) return;
     const deletedJob = messageJobs.find((item) => item.id === jobId);
+    const ticket = {};
+    actionTicket.current = ticket;
     actionLock.current = true;
     setActionPending(true);
     setDeletingId(jobId);
@@ -184,7 +230,10 @@ export function MailReplyBatchSection({
       }
     }
     catch { if (stillOwns(owner)) setNotice('The content removal outcome is uncertain. Check the request receipt before taking another action.'); }
-    finally { if (stillOwns(owner)) setDeletingId(undefined); actionLock.current = false; setActionPending(false); }
+    finally {
+      if (stillOwns(owner)) setDeletingId(undefined);
+      if (actionTicket.current === ticket) { actionTicket.current = undefined; actionLock.current = false; setActionPending(false); }
+    }
   };
 
   return (
@@ -201,6 +250,15 @@ export function MailReplyBatchSection({
             <Text style={styles.meta}>Added {dateLabel(job.createdAt)} · {job.model} · {job.effort} reasoning</Text>
             {job.status === 'submission_unknown' ? <Text style={styles.warning}>The request may have been charged. Checking never submits it again.</Text> : null}
             {job.status === 'completed' ? <Text style={styles.copy}>{job.proposalId ? 'A draft for review was created from this reply.' : job.hasMailReplyResult ? 'A completed reply is saved on this device. Review its current source before creating a draft.' : 'The completed reply is unavailable for review.'}</Text> : null}
+            {job.proposalId && (job.mailReplyContextCount ?? 0) > 0 ? (() => {
+              const sourceStatus = getSourcesStatus?.(job.id).status;
+              return sourceStatus === 'refresh_required'
+                ? <Button label={refreshingSourcesId === job.id ? 'Refreshing selected sources…' : 'Refresh selected sources'} tone="quiet" disabled={blocked || busy || actionPending || !onRefreshSources} onPress={() => void refreshSources(job.id)} />
+                : sourceStatus === 'current'
+                  ? <Text style={styles.meta}>Selected conversation sources checked{getSourcesStatus?.(job.id).expiresAt ? ` · valid until ${dateLabel(getSourcesStatus(job.id).expiresAt!)}` : ''}.</Text>
+                  : sourceStatus === 'invalid' ? <Text style={styles.warning}>Selected sources no longer match this saved reply. Review a new request.</Text>
+                    : null;
+            })() : null}
             {job.sourceRemoved ? <Text style={styles.copy}>Request content was removed. This receipt remains for history.</Text> : null}
             {cost !== undefined ? <Text style={styles.meta}>{job.billingScope === 'byok_fee_only' ? 'OpenRouter-reported BYOK fee' : 'OpenRouter-reported cost'} · {cost}</Text> : job.costStatus === 'waiting' ? <Text style={styles.meta}>Provider-reported usage is not available yet.</Text> : job.costStatus === 'unavailable' ? <Text style={styles.meta}>The provider did not report a cost for this request.</Text> : null}
             {tokens ? <Text style={styles.meta}>Provider-reported tokens · {tokens}</Text> : null}
@@ -226,6 +284,15 @@ export function MailReplyBatchSection({
           {plan.cc.length ? <Text style={styles.meta}>Cc · {plan.cc.join(', ')}</Text> : null}
           <Text style={styles.meta}>Subject · {plan.subject}</Text>
           <Text selectable style={styles.result}>{plan.text}</Text>
+          {plan.contextMessages?.length ? <View style={styles.contextReview}>
+            <Text style={styles.status}>Selected conversation messages</Text>
+            {plan.contextMessages.map((item) => <View key={item.selectionId} style={styles.contextItem}>
+              <Text style={styles.meta}>{item.subject || '(no subject)'}{item.isReplyTarget ? ' · fixed reply target' : ''}</Text>
+              <Text style={styles.copy}>{item.sender || 'Sender unknown'} · {item.sentAt || item.receivedAt ? dateLabel(item.sentAt ?? item.receivedAt!) : 'Time unknown'}</Text>
+              <Text style={styles.copy}>{item.representation.replaceAll('_', ' ')} · {item.completeness.replaceAll('_', ' ')} · {item.bytes.toLocaleString()} bytes</Text>
+              {item.omissionReasons.map((reason, index) => <Text key={`${item.selectionId}-${index}`} style={styles.warning}>Omitted · {reason.replaceAll('_', ' ')}</Text>)}
+            </View>)}
+          </View> : null}
           <Text style={styles.copy}>This reply is read-only. Creating a draft is separate from approving or sending it.</Text>
           <Button label={activating ? 'Creating draft…' : 'Create draft'} disabled={blocked || busy || activating} onPress={() => void activate()} />
           <Button label="Cancel review" tone="quiet" disabled={activating} onPress={cancelReview} />
@@ -256,6 +323,8 @@ const styles = {
   section: { gap: 10, padding: 14, borderWidth: 1, borderColor: C.border, borderRadius: 16, backgroundColor: C.card },
   job: { gap: 7, paddingTop: 10, borderTopWidth: 1, borderTopColor: C.border },
   review: { gap: 9, paddingTop: 12, borderTopWidth: 1, borderTopColor: C.border },
+  contextReview: { gap: 7, paddingTop: 10, borderTopWidth: 1, borderTopColor: C.border },
+  contextItem: { gap: 3, paddingVertical: 6 },
   status: { color: C.text, fontSize: 13, fontWeight: '600' as const },
   copy: { color: C.muted, fontSize: 11, lineHeight: 17 },
   meta: { color: C.sage, fontSize: 11, lineHeight: 16 },

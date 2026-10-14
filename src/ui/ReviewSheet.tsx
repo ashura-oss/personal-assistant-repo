@@ -1,6 +1,6 @@
 import React, { useState } from "react";
 import { Pressable, ScrollView, Text, View } from "react-native";
-import type { AppController, EventProposalDestination, Proposal } from "../core";
+import type { AppController, EventProposalDestination, MailReplyBatchContextReviewItem, MailReplyBatchSourcesRefreshResult, Proposal } from "../core";
 import type { DispatchRecord, DispatchReconciliation } from "../dispatch";
 import type { DeviceEventDispatchRecord, DeviceEventReconciliation } from "../deviceCalendars/types";
 import { resolveReminderLocalDateTime } from "../reminders/time";
@@ -53,6 +53,9 @@ type ReviewSheetProps = {
   sourceCheckReason?: string;
   onRetrySourceCheck?: () => void;
   onReassist?: () => void;
+  mailReplyContextCount?: number;
+  mailReplySourcesStatus?: { readonly status: 'missing' | 'refresh_required' | 'current' | 'invalid'; readonly expiresAt?: string };
+  onRefreshMailReplySources?: (jobId: string, proposalId: string, proposalRevision: number, isCurrent: () => boolean) => Promise<MailReplyBatchSourcesRefreshResult | undefined>;
 };
 export function ReviewSheet(props: ReviewSheetProps) {
   if (!props.proposal) return null;
@@ -132,6 +135,9 @@ function ReviewSheetContent({
   sourceCheckReason,
   onRetrySourceCheck,
   onReassist,
+  mailReplyContextCount = 0,
+  mailReplySourcesStatus,
+  onRefreshMailReplySources,
 }: Omit<ReviewSheetProps, "proposal"> & { proposal: Proposal }) {
   const previewMode = demoMode || state.settings.mode === "preview";
   const [title, setTitle] = useState(proposal.title);
@@ -154,6 +160,19 @@ function ReviewSheetContent({
   const [emailText, setEmailText] = useState(
     proposal.email?.text ?? proposal.body,
   );
+  const [refreshedMailSources, setRefreshedMailSources] = useState<readonly MailReplyBatchContextReviewItem[]>([]);
+  const [refreshingMailSources, setRefreshingMailSources] = useState(false);
+  const [mailSourcesNotice, setMailSourcesNotice] = useState("");
+  const mailSourcesActionLock = React.useRef(false);
+  const mailSourcesMounted = React.useRef(true);
+  const mailSourcesOwner = React.useRef({ proposalId: proposal.id, revision: proposal.revision, busy });
+  React.useLayoutEffect(() => {
+    mailSourcesOwner.current = { proposalId: proposal.id, revision: proposal.revision, busy };
+  }, [busy, proposal.id, proposal.revision]);
+  React.useEffect(() => {
+    mailSourcesMounted.current = true;
+    return () => { mailSourcesMounted.current = false; };
+  }, []);
   const [emailOperation, setEmailOperation] = useState<"draft" | "send">(
     proposal.email?.operation ?? "draft",
   );
@@ -189,6 +208,29 @@ function ReviewSheetContent({
       : null;
   const immutableBatchReply = mailReply?.version === 2 && Boolean(mailReply.batchJobId?.trim());
   const frozenReplySource = mailReply?.source;
+  const refreshMailReplySources = async () => {
+    const jobId = mailReply?.batchJobId;
+    if (!immutableBatchReply || !jobId || !onRefreshMailReplySources || mailSourcesActionLock.current || busy) return;
+    const proposalId = proposal.id;
+    const proposalRevision = proposal.revision;
+    mailSourcesActionLock.current = true;
+    setRefreshingMailSources(true);
+    setMailSourcesNotice("");
+    const isCurrent = () => mailSourcesMounted.current && mailSourcesOwner.current.proposalId === proposalId &&
+      mailSourcesOwner.current.revision === proposalRevision && (!mailSourcesOwner.current.busy || mailSourcesActionLock.current);
+    try {
+      const refreshed = await onRefreshMailReplySources(jobId, proposalId, proposalRevision, isCurrent);
+      if (isCurrent() && refreshed?.jobId === jobId && refreshed.status === 'current') {
+        setRefreshedMailSources(refreshed.sources);
+        setMailSourcesNotice('The fixed target and selected messages were checked again. Review the saved draft before approving it.');
+      }
+    } catch {
+      if (isCurrent()) setMailSourcesNotice('Selected sources could not be refreshed. This draft remains read-only until its source can be checked.');
+    } finally {
+      if (isCurrent()) setRefreshingMailSources(false);
+      mailSourcesActionLock.current = false;
+    }
+  };
   const effectiveEmailOperation = mailReply ? "draft" : emailOperation;
   const parsedDate =
     dueDate && dueTime ? new Date(`${dueDate}T${dueTime}`) : null;
@@ -618,6 +660,19 @@ function ReviewSheetContent({
               <Text style={s.analysisSource}>Subject · {emailSubject}</Text>
               <Text selectable style={s.analysisText}>Message · {emailText}</Text>
               <Text style={s.disclaimer}>This reply draft came from a completed Batch request and is immutable. To change it, write a separate manual reply in the message composer.</Text>
+              {mailReply?.batchJobId && mailReplyContextCount > 0 ? <>
+                <Text style={s.analysisSource}>Selected conversation sources · {mailReplyContextCount} message{mailReplyContextCount === 1 ? '' : 's'} in addition to the fixed target</Text>
+                {mailReplySourcesStatus?.status === 'invalid' ? <Text style={s.errorText}>The saved source binding is invalid. Review a new reply request.</Text> : null}
+                {mailReplySourcesStatus?.status === 'current' && mailReplySourcesStatus.expiresAt ? <Text style={s.analysisSource}>Last checked source proof expires {new Date(mailReplySourcesStatus.expiresAt).toLocaleString()}</Text> : null}
+                <Button label={refreshingMailSources ? 'Refreshing fixed target and selected messages…' : 'Refresh fixed target and selected messages'} tone="quiet" disabled={busy || refreshingMailSources || mailReplySourcesStatus?.status === 'invalid' || !onRefreshMailReplySources} onPress={() => void refreshMailReplySources()} />
+                {mailSourcesNotice ? <Text style={s.disclaimer}>{mailSourcesNotice}</Text> : null}
+                {refreshedMailSources.map((item) => <View key={item.selectionId} style={s.analysisBlock}>
+                  <Text style={s.analysisSource}>{item.isReplyTarget ? 'Fixed reply target' : 'Selected conversation message'} · {item.subject || '(no subject)'}</Text>
+                  <Text style={s.analysisSource}>{item.sender || 'Sender unknown'} · {item.sentAt || item.receivedAt ? new Date(item.sentAt ?? item.receivedAt!).toLocaleString() : 'Time unknown'}</Text>
+                  <Text style={s.analysisSource}>{item.representation.replaceAll('_', ' ')} · {item.completeness.replaceAll('_', ' ')} · {item.bytes.toLocaleString()} bytes</Text>
+                  {item.omissionReasons.map((reason, index) => <Text key={`${item.selectionId}-${index}`} style={s.disclaimer}>Omitted · {reason.replaceAll('_', ' ')}</Text>)}
+                </View>)}
+              </> : null}
             </View>
           ) : (
             <>
