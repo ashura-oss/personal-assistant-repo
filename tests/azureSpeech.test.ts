@@ -1,12 +1,20 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { AppSettings, Note } from '../src/core';
 import { AzureSpeechClient } from '../src/services/azure';
-import { currentSpeechCredentialGeneration, readSpeechCredentialSnapshot, setCredentials } from '../src/services/credentials';
+import { SpeechCredentialChangedError as SharedSpeechCredentialChangedError } from '../src/services/speechCredentialChangedError';
+import { currentSpeechCredentialGeneration, readSpeechCredentialSnapshot, setCredentials,
+  SpeechCredentialChangedError as CredentialServiceSpeechCredentialChangedError } from '../src/services/credentials';
 import { credentialStore } from '../src/storage/credentials';
 import { SpeechTranscriptionError } from '../src/transcription';
 import type { PreparedSpeechAudio, SpeechAudioService } from '../src/audio/speechUpload.types';
 
 const leaseId = '11111111-1111-4111-8111-111111111111';
+
+describe('shared Speech credential error identity', () => {
+  it('reexports the same constructor through the native credential service', () => {
+    expect(CredentialServiceSpeechCredentialChangedError).toBe(SharedSpeechCredentialChangedError);
+  });
+});
 const blob = new Blob([new Uint8Array([0, 0, 0, 0, 102, 116, 121, 112, 77, 52, 65, 32, 0, 0, 0, 0])], { type: 'audio/mp4' });
 const prepared: PreparedSpeechAudio = Object.freeze({
   leaseId, platform: 'web', format: 'm4a', mimeType: 'audio/mp4', byteLength: blob.size,
@@ -46,6 +54,34 @@ describe('Azure Speech single-dispatch client', () => {
     const stale = client(fetcher as unknown as typeof fetch, { assertCredentialGeneration: () => { throw new Error('changed'); } });
     await expect(stale.transcribe(note, settings)).rejects.toMatchObject({ code: 'stale_credential', dispatched: false });
     expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it('preserves snapshot precedence and captures generation before the legacy key read', async () => {
+    const fetcher = vi.fn(async () => response({ durationMilliseconds: 1000, combinedPhrases: [{ text: 'x' }] }));
+    const readSnapshot = vi.fn(async () => ({ key: 'snapshot-key', generation: 3 }));
+    const readLegacyKey = vi.fn(async () => 'legacy-key');
+    const preferred = new AzureSpeechClient({ audio, fetcher: fetcher as unknown as typeof fetch,
+      readKeySnapshot: readSnapshot, readKey: readLegacyKey, currentCredentialGeneration: () => 3,
+      assertCredentialGeneration: () => undefined, randomUUID: () => leaseId });
+    await preferred.transcribe(note, settings);
+    expect(readSnapshot).toHaveBeenCalledTimes(1);
+    expect(readLegacyKey).not.toHaveBeenCalled();
+
+    let generation = 3;
+    let releaseKey!: (value: string) => void;
+    let enteredKeyRead!: () => void;
+    const keyReadStarted = new Promise<void>((resolve) => { enteredKeyRead = resolve; });
+    const keyGate = new Promise<string>((resolve) => { releaseKey = resolve; });
+    const fallbackFetcher = vi.fn(async () => response({ durationMilliseconds: 1000, combinedPhrases: [{ text: 'x' }] }));
+    const fallback = new AzureSpeechClient({ audio, fetcher: fallbackFetcher as unknown as typeof fetch,
+      readKey: () => { enteredKeyRead(); return keyGate; }, currentCredentialGeneration: () => generation,
+      assertCredentialGeneration: (captured) => { if (captured !== generation) throw new Error('changed'); }, randomUUID: () => leaseId });
+    const request = fallback.transcribe(note, settings);
+    await keyReadStarted;
+    generation = 4;
+    releaseKey('legacy-key');
+    await expect(request).rejects.toMatchObject({ code: 'stale_credential', dispatched: false });
+    expect(fallbackFetcher).not.toHaveBeenCalled();
   });
 
   it('cancels a stalled credential read before POST or reservation and does not wait for lease cleanup', async () => {

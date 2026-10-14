@@ -1,4 +1,7 @@
 import { credentialStore, type CredentialStore } from '../storage/credentials';
+import { SpeechCredentialChangedError } from './speechCredentialChangedError';
+
+export { SpeechCredentialChangedError } from './speechCredentialChangedError';
 
 const SPEECH_KEY = 'azure.speech.subscription-key';
 const OPENAI_KEY = 'azure.openai.api-key';
@@ -10,11 +13,6 @@ const KEY_BY_KIND: Record<ProviderCredentialKind, string> = {
   openai: OPENAI_KEY,
   openrouter: OPENROUTER_KEY,
 };
-
-export class SpeechCredentialChangedError extends Error {
-  readonly name = 'SpeechCredentialChangedError';
-  constructor() { super('The Azure Speech credential changed while the request was being prepared.'); }
-}
 
 class ProviderCredentialOperationError extends Error {
   readonly name = 'ProviderCredentialOperationError';
