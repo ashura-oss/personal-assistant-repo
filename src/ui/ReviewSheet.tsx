@@ -1,39 +1,76 @@
 import React, { useState } from "react";
 import { Pressable, ScrollView, Text, View } from "react-native";
-import type { AppController, EventProposalDestination, MailReplyBatchContextReviewItem, MailReplyBatchSourcesRefreshResult, Proposal } from "../core";
-import type { DispatchRecord, DispatchReconciliation } from "../dispatch";
-import type { DeviceEventDispatchRecord, DeviceEventReconciliation } from "../deviceCalendars/types";
+import type { MailReplyBatchContextReviewItem, MailReplyBatchSourcesRefreshResult } from "../core";
+import type { DispatchReconciliation } from "../dispatch";
+import type { DeviceEventReconciliation } from "../deviceCalendars/types";
+import type { WorkspaceSnapshotDTO } from "../cloud/workspaceDto";
 import { resolveReminderLocalDateTime } from "../reminders/time";
-import { controller } from "../services/controller";
 import { DispatchHistory } from "./DispatchHistory";
-import { DeviceEventDispatchHistory } from "./DeviceEventDispatchHistory";
+import { DeviceEventDispatchHistory, type DeviceEventHistoryDisplay } from "./DeviceEventDispatchHistory";
 import { Button, Field, IconButton } from "./primitives";
 import { s } from "./theme";
 
+export type ReviewProposalDisplay = WorkspaceSnapshotDTO["state"]["proposals"][number];
+export type ReviewDispatchDisplay = WorkspaceSnapshotDTO["state"]["dispatchRecords"][number];
+export type ReviewDeviceEventDisplay = DeviceEventHistoryDisplay;
+type EmailOperation = "draft" | "send";
+export type ReviewEditCommand = Readonly<{
+  title?: string;
+  body?: string;
+  accountId?: string;
+  recipients?: readonly string[];
+  calendarId?: string;
+  eventDestination?: EventProposalDisplayDestination;
+  dueAt?: string;
+  email?: ReviewProposalDisplay["email"];
+  event?: ReviewProposalDisplay["event"];
+}>;
+type EventProposalDisplayDestination = ReviewProposalDisplay["eventDestination"];
+type ReviewAccountChoice = Readonly<{
+  id: string;
+  provider: "google" | "microsoft" | "local";
+  displayName: string;
+  email: string;
+  connected: boolean;
+  allowedEmailOperations: readonly EmailOperation[];
+}>;
+type ReviewCalendarChoice = Readonly<{
+  id: string;
+  accountId: string;
+  name: string;
+  accountEmail: string;
+  writable: boolean;
+  unavailableReason?: string;
+}>;
+type ReviewDeviceCalendarChoice = Readonly<{
+  localId: string;
+  title: string;
+  sourceName?: string;
+  allowsModifications: boolean;
+  selected: boolean;
+}>;
 type ReviewSheetProps = {
-  state: ReturnType<typeof controller.getSnapshot>;
-  proposal: Proposal | null;
-  dispatchRecords: DispatchRecord[];
-  deviceEventDispatchRecords?: DeviceEventDispatchRecord[];
+  settingsMode: "preview" | "provider";
+  accounts: readonly ReviewAccountChoice[];
+  calendars: readonly ReviewCalendarChoice[];
+  deviceCalendars: Readonly<{
+    enabled: boolean;
+    selectedCalendarIds: readonly string[];
+    choices: readonly ReviewDeviceCalendarChoice[];
+    accessStatus: "needs_check" | "full_access" | "write_only" | "denied" | "undetermined" | "unavailable";
+    writeAvailable: boolean;
+    unavailableReason?: string;
+  }>;
+  proposal: ReviewProposalDisplay | null;
+  dispatchRecords: readonly ReviewDispatchDisplay[];
+  currentDispatchRecord?: ReviewDispatchDisplay;
+  deviceEventDispatchRecords?: readonly ReviewDeviceEventDisplay[];
+  currentDeviceEventDispatchRecord?: ReviewDeviceEventDisplay;
+  replyAllowedOperations?: readonly EmailOperation[];
   busy?: boolean;
   demoMode?: boolean;
   onClose: () => void;
-  onEdit: (
-    p: Partial<
-      Pick<
-        Proposal,
-        | "title"
-        | "body"
-        | "accountId"
-        | "recipients"
-        | "calendarId"
-        | "eventDestination"
-        | "dueAt"
-        | "email"
-        | "event"
-      >
-    >,
-  ) => void;
+  onEdit: (command: ReviewEditCommand) => void;
   onApprove: () => void;
   onExecute: () => void;
   onDismiss: () => void;
@@ -45,8 +82,8 @@ type ReviewSheetProps = {
       remoteId?: string;
     },
   ) => Promise<unknown>;
-  onInspectDeviceEvent?: (recordId: string) => Promise<Awaited<ReturnType<AppController["inspectDeviceEventDispatch"]>>>;
-  onReconcileDeviceEvent?: (recordId: string, input: { disposition: DeviceEventReconciliation; note: string; nativeEventId?: string }) => Promise<unknown>;
+  onInspectDeviceEvent?: (recordId: string) => Promise<Readonly<{ lookup: Readonly<{ candidates: readonly Readonly<{ title: string; start: string; timeZone?: string }> []; partial: boolean; identity: "unverified" | "native_id_match" }> }>>;
+  onReconcileDeviceEvent?: (recordId: string, input: { disposition: DeviceEventReconciliation; note: string }) => Promise<unknown>;
   sourceStale?: boolean;
   sourceChecking?: boolean;
   sourceCheckError?: string;
@@ -76,10 +113,9 @@ export function ReviewSheet(props: ReviewSheetProps) {
     />
   );
 }
-
 function RetiredProposalReview({ proposal, dispatchRecords, onClose }: {
-  proposal: Proposal;
-  dispatchRecords: DispatchRecord[];
+  proposal: ReviewProposalDisplay;
+  dispatchRecords: readonly ReviewDispatchDisplay[];
   onClose: () => void;
 }) {
   const records = dispatchRecords.filter((record) => record.proposalId === proposal.id);
@@ -115,10 +151,16 @@ function RetiredProposalReview({ proposal, dispatchRecords, onClose }: {
 }
 
 function ReviewSheetContent({
-  state,
+  settingsMode,
+  accounts,
+  calendars: allCalendars,
+  deviceCalendars,
   proposal,
   dispatchRecords,
   deviceEventDispatchRecords = [],
+  currentDispatchRecord,
+  currentDeviceEventDispatchRecord,
+  replyAllowedOperations = [],
   busy = false,
   demoMode = false,
   onClose,
@@ -138,8 +180,8 @@ function ReviewSheetContent({
   mailReplyContextCount = 0,
   mailReplySourcesStatus,
   onRefreshMailReplySources,
-}: Omit<ReviewSheetProps, "proposal"> & { proposal: Proposal }) {
-  const previewMode = demoMode || state.settings.mode === "preview";
+}: Omit<ReviewSheetProps, "proposal"> & { proposal: ReviewProposalDisplay }) {
+  const previewMode = demoMode || settingsMode === "preview";
   const [title, setTitle] = useState(proposal.title);
   const [body, setBody] = useState(proposal.body);
   const [recipients] = useState(proposal.recipients.join(", "));
@@ -193,7 +235,7 @@ function ReviewSheetContent({
   const initialDestination = proposal.eventDestination ?? (proposal.accountId && proposal.calendarId
     ? { kind: "remote_calendar" as const, accountId: proposal.accountId, calendarId: proposal.calendarId }
     : undefined);
-  const [eventDestination, setEventDestination] = useState<EventProposalDestination | undefined>(initialDestination);
+  const [eventDestination, setEventDestination] = useState<EventProposalDisplayDestination>(initialDestination);
   const [eventAttendees, setEventAttendees] = useState(
     proposal.event?.attendees.join(", ") ?? "",
   );
@@ -305,8 +347,8 @@ function ReviewSheetContent({
         )) ||
     (proposal.kind === "event" &&
       (JSON.stringify(eventPayload) !== JSON.stringify(proposal.event ?? {}) || JSON.stringify(eventDestination) !== JSON.stringify(initialDestination)));
-  const chosenAccount = state.accounts.find((a) => a.id === accountId);
-  const calendars = state.calendars.filter(
+  const chosenAccount = accounts.find((a) => a.id === accountId);
+  const calendars = allCalendars.filter(
     (c) => !accountId || c.accountId === accountId,
   );
   const actionLabel =
@@ -333,48 +375,25 @@ function ReviewSheetContent({
           : proposal.kind === "memory"
             ? "Save memory"
             : "Save task";
-  const chosenCalendar = state.calendars.find(
-    (calendar) => calendar.id === calendarId,
-  );
-  const chosenDeviceCalendar = state.deviceCalendars.calendars.find(
-    (calendar) => calendar.localId === eventDestination?.calendarId,
-  );
+  const chosenCalendar = calendars.find((calendar) => calendar.id === calendarId && calendar.accountId === accountId);
+  const chosenDeviceCalendar = deviceCalendars.choices.find((calendar) => calendar.localId === eventDestination?.calendarId);
   const deviceCalendarWritable = Boolean(
     eventDestination?.kind === "device_calendar" &&
-    state.deviceCalendars.enabled &&
-    state.deviceCalendarAccess.status === "full_access" &&
-    state.deviceCalendars.selectedCalendarIds.includes(eventDestination.calendarId) &&
-    chosenDeviceCalendar?.allowsModifications,
+    deviceCalendars.writeAvailable &&
+    chosenDeviceCalendar?.selected && chosenDeviceCalendar.allowsModifications,
   );
-  const replyAccount = frozenReplySource
-    ? state.accounts.find(
-        (account) =>
-          account.id === frozenReplySource.accountId &&
-          account.email === frozenReplySource.accountEmail &&
-          account.connected &&
-          account.authStatus === "connected" &&
-          account.connectionGeneration ===
-            frozenReplySource.connectionGeneration &&
-          sameIdentity(account.identity, frozenReplySource.identity),
-      )
-    : undefined;
   const blocked =
     (!previewMode || (proposal.kind === "event" && eventDestination?.kind === "device_calendar")) &&
     (proposal.kind === "email"
       ? mailReply
-        ? !replyAccount?.capabilities?.includes(effectiveEmailOperation === "draft" ? "mail.draft" : "mail.send")
-        : !chosenAccount?.connected ||
-          !chosenAccount.capabilities?.includes(
-            effectiveEmailOperation === "draft" ? "mail.draft" : "mail.send",
-          )
+        ? !replyAllowedOperations.includes(effectiveEmailOperation)
+        : !chosenAccount?.allowedEmailOperations.includes(effectiveEmailOperation)
       : proposal.kind === "event"
         ? eventDestination?.kind === "device_calendar"
           ? !deviceCalendarWritable || parseCsv(eventAttendees).length > 0 || invitePolicy !== "none"
           : eventDestination?.kind !== "remote_calendar" ||
             !chosenAccount?.connected ||
-            !chosenCalendar?.connected ||
-            !chosenCalendar.writable ||
-            !chosenAccount.capabilities?.includes("calendar.write")
+            !chosenCalendar?.writable
         : false);
   const invalidPayload =
     scheduleInputInvalid ||
@@ -392,17 +411,14 @@ function ReviewSheetContent({
   const proposalDispatches = dispatchRecords.filter(
     (record) => record.proposalId === proposal.id,
   );
-  const receiptRecord = proposal.dispatchRecordId
-    ? dispatchRecords.find((record) => record.id === proposal.dispatchRecordId)
-    : proposalDispatches.find((record) => record.outcome !== "pending");
+  const receiptRecord = currentDispatchRecord?.proposalId === proposal.id ? currentDispatchRecord : undefined;
   const isExternalHistory =
     (proposal.kind === "email" || proposal.kind === "event") &&
     !proposal.simulated && proposal.eventDestination?.kind !== "device_calendar";
-  const deviceEventRecord = proposal.deviceEventDispatchRecordId
-    ? deviceEventDispatchRecords.find((record) => record.id === proposal.deviceEventDispatchRecordId)
-    : deviceEventDispatchRecords.find((record) => record.proposalId === proposal.id);
+  const proposalDeviceEventRecords = deviceEventDispatchRecords.filter((record) => record.proposalId === proposal.id);
+  const deviceEventRecord = currentDeviceEventDispatchRecord?.proposalId === proposal.id ? currentDeviceEventDispatchRecord : undefined;
   const isDeviceEventHistory = proposal.kind === "event" && (
-    proposal.eventDestination?.kind === "device_calendar" || Boolean(deviceEventRecord)
+    proposal.eventDestination?.kind === "device_calendar" || proposalDeviceEventRecords.length > 0
   );
   const historyIncomplete =
     isExternalHistory &&
@@ -449,15 +465,17 @@ function ReviewSheetContent({
                   ? "OUTCOME UNKNOWN"
                   : receiptStatus.toUpperCase()}
         </Text>
-        {isDeviceEventHistory && deviceEventRecord && onInspectDeviceEvent && onReconcileDeviceEvent ? (
+        {isDeviceEventHistory ? proposalDeviceEventRecords.length ? proposalDeviceEventRecords.map((record) => (
           <DeviceEventDispatchHistory
-            record={deviceEventRecord}
+            key={record.id}
+            record={record}
             busy={busy}
             demoMode={demoMode}
+            unavailableReason="This device calendar history is read-only here. Check the event directly in Calendar on this iPhone."
             onInspect={onInspectDeviceEvent}
             onReconcile={onReconcileDeviceEvent}
           />
-        ) : null}
+        )) : <Text style={s.disclaimer}>Device event history is incomplete. The saved action will not be repeated.</Text> : null}
         {isExternalHistory && !isDeviceEventHistory ? (
           <DispatchHistory
             records={proposalDispatches}
@@ -603,7 +621,7 @@ function ReviewSheetContent({
               <Text style={s.accountSub}>Frozen to the verified source account</Text>
             </View>
           ) : (
-            state.accounts
+            accounts
               .filter(
                 (a) => a.provider === "google" || a.provider === "microsoft",
               )
@@ -745,7 +763,7 @@ function ReviewSheetContent({
                 accessibilityState={{ selected: eventDestination?.kind === kind }}
                 onPress={() => {
                   if (kind === "remote_calendar") {
-                    const fallback = state.calendars.find((item) => item.id === calendarId && item.accountId === accountId) ?? calendars[0];
+                    const fallback = allCalendars.find((item) => item.id === calendarId && item.accountId === accountId) ?? calendars[0];
                     if (fallback) {
                       setAccountId(fallback.accountId);
                       setCalendarId(fallback.id);
@@ -754,8 +772,8 @@ function ReviewSheetContent({
                   } else {
                     setAccountId("");
                     setCalendarId("");
-                    const selectedLocalId = state.deviceCalendars.selectedCalendarIds.find((id) => state.deviceCalendars.calendars.some((calendar) => calendar.localId === id && calendar.allowsModifications));
-                    const writableId = selectedLocalId ?? state.deviceCalendars.calendars.find((calendar) => calendar.allowsModifications)?.localId;
+                    const selectedLocalId = deviceCalendars.choices.find((calendar) => calendar.selected && calendar.allowsModifications)?.localId;
+                    const writableId = selectedLocalId ?? deviceCalendars.choices.find((calendar) => calendar.allowsModifications)?.localId;
                     setEventDestination({ kind: "device_calendar", calendarId: writableId ?? "" });
                   }
                 }}
@@ -765,6 +783,23 @@ function ReviewSheetContent({
               </Pressable>
             ))}
           </View>
+          {eventDestination?.kind === "remote_calendar" ? (
+            <>
+              <Text style={s.label}>Online calendar account</Text>
+              {accounts.filter((account) => account.provider === "google" || account.provider === "microsoft").map((account) => (
+                <Pressable key={account.id} accessibilityRole="radio" accessibilityLabel={`Use online calendar account ${account.email}`}
+                  accessibilityState={{ selected: accountId === account.id }} onPress={() => {
+                    const fallback = allCalendars.find((calendar) => calendar.accountId === account.id && calendar.writable) ??
+                      allCalendars.find((calendar) => calendar.accountId === account.id);
+                    setAccountId(account.id); setCalendarId(fallback?.id ?? "");
+                    setEventDestination(fallback ? { kind: "remote_calendar", accountId: account.id, calendarId: fallback.id } : undefined);
+                  }} style={[s.accountChoice, accountId === account.id && s.accountChoiceSelected]}>
+                  <Text style={s.accountName}>{account.displayName || account.email}</Text>
+                  <Text style={s.accountSub}>{account.email} · {account.connected ? "Verified" : "Configured · not connected"}</Text>
+                </Pressable>
+              ))}
+            </>
+          ) : null}
           {eventDestination?.kind === "remote_calendar" ? calendars.map((c) => (
             <Pressable
               key={c.id}
@@ -783,20 +818,18 @@ function ReviewSheetContent({
             >
               <Text style={s.accountName}>{c.name}</Text>
               <Text style={s.accountSub}>
-                {state.accounts.find((a) => a.id === c.accountId)?.email ??
+                {c.accountEmail ||
                   "Account unavailable"}{" "}
                 ·{" "}
-                {c.connected && c.writable
+                {c.writable
                   ? "Writable"
-                  : "Not connected for changes"}
+                  : c.unavailableReason}
               </Text>
             </Pressable>
           )) : null}
           {eventDestination?.kind === "device_calendar" ? (
             <>
-              {state.deviceCalendars.calendars.filter((calendar) =>
-                state.deviceCalendars.selectedCalendarIds.includes(calendar.localId) && calendar.allowsModifications,
-              ).map((calendar) => (
+              {deviceCalendars.choices.filter((calendar) => calendar.selected && calendar.allowsModifications).map((calendar) => (
                 <Pressable
                   key={calendar.localId}
                   accessibilityRole="radio"
@@ -809,8 +842,8 @@ function ReviewSheetContent({
                   <Text style={s.accountSub}>{calendar.sourceName || "On this iPhone"} · Writable</Text>
                 </Pressable>
               ))}
-              {state.deviceCalendarAccess.status !== "full_access" ? <Text style={s.disclaimer}>Full Calendar access is required to create an event on this iPhone.</Text> : null}
-              {!state.deviceCalendars.selectedCalendarIds.some((id) => state.deviceCalendars.calendars.some((calendar) => calendar.localId === id && calendar.allowsModifications)) ? <Text style={s.disclaimer}>Choose a selected writable calendar in Settings first.</Text> : null}
+              {!deviceCalendars.writeAvailable ? <Text style={s.disclaimer}>{deviceCalendars.unavailableReason ?? "Full Calendar access is required to create an event on this iPhone."}</Text> : null}
+              {!deviceCalendars.choices.some((calendar) => calendar.selected && calendar.allowsModifications) ? <Text style={s.disclaimer}>Choose a selected writable calendar in Settings first.</Text> : null}
               <Text style={s.disclaimer}>No invitations are sent. Calendar may sync the event according to its account settings.</Text>
             </>
           ) : null}
@@ -1082,11 +1115,15 @@ function ReviewSheetContent({
           {blocked ? (
             <Text style={s.disclaimer}>
               {proposal.kind === "event" && eventDestination?.kind === "device_calendar"
-                ? !state.deviceCalendars.enabled || state.deviceCalendarAccess.status !== "full_access"
-                  ? "Connect device calendars and allow full access before creating this event."
+                ? !deviceCalendars.writeAvailable
+                  ? deviceCalendars.unavailableReason ?? "Connect device calendars and allow full access before creating this event."
                   : parseCsv(eventAttendees).length > 0 || invitePolicy !== "none"
                     ? "Remove attendees and choose “Do not invite” to create this event on this iPhone."
                     : "Choose a selected writable calendar in Settings before creating this event."
+                : proposal.kind === "event" && eventDestination?.kind === "remote_calendar" && !chosenAccount?.connected
+                  ? "Connect and verify this exact account before this action is available."
+                  : proposal.kind === "event" && eventDestination?.kind === "remote_calendar" && !chosenCalendar?.writable
+                    ? chosenCalendar?.unavailableReason ?? "Choose a writable calendar connected to an account with calendar write access."
                 : "Connect and verify this exact account before this action is available."}
             </Text>
           ) : null}
@@ -1154,19 +1191,4 @@ function parseCsv(value: string): string[] {
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean);
-}
-
-function sameIdentity(
-  current: import("../core").Account["identity"] | undefined,
-  frozen: NonNullable<import("../core").Account["identity"]>,
-) {
-  return Boolean(
-    current &&
-      current.providerNamespace === frozen.providerNamespace &&
-      current.clientId === frozen.clientId &&
-      current.subject === frozen.subject &&
-      current.issuer === frozen.issuer &&
-      current.tenantId === frozen.tenantId &&
-      current.resourceUserId === frozen.resourceUserId,
-  );
 }

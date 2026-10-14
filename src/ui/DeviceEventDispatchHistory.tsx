@@ -1,17 +1,27 @@
 import React, { useState } from "react";
 import { Text, View } from "react-native";
-import type { AppController } from "../core";
-import type { DeviceEventDispatchRecord, DeviceEventReconciliation } from "../deviceCalendars/types";
+import type { WorkspaceSnapshotDTO } from "../cloud/workspaceDto";
+import type { DeviceEventReconciliation } from "../deviceCalendars/types";
 import { Button, Field } from "./primitives";
 import { C, s } from "./theme";
 
-type Inspection = Awaited<ReturnType<AppController["inspectDeviceEventDispatch"]>>;
+type Inspection = Readonly<{ lookup: Readonly<{
+  candidates: readonly Readonly<{ title: string; start: string; timeZone?: string }>[];
+  partial: boolean;
+  identity: "unverified" | "native_id_match";
+}> }>;
+type DeviceEventHistoryDTO = WorkspaceSnapshotDTO["state"]["deviceCalendars"]["dispatchHistory"][number];
+export type DeviceEventHistoryDisplay = Omit<DeviceEventHistoryDTO, "reconciliations"> & Readonly<{
+  targetLabel: string;
+  reconciliations: readonly (DeviceEventHistoryDTO["reconciliations"][number] & Readonly<{ nativeReferenceRecorded?: boolean }>)[];
+}>;
 type Props = {
-  record: DeviceEventDispatchRecord;
+  record: DeviceEventHistoryDisplay;
   busy: boolean;
   demoMode?: boolean;
-  onInspect: (recordId: string) => Promise<Inspection>;
-  onReconcile: (recordId: string, input: { disposition: DeviceEventReconciliation; note: string }) => Promise<unknown>;
+  unavailableReason?: string;
+  onInspect?: (recordId: string) => Promise<Inspection>;
+  onReconcile?: (recordId: string, input: { disposition: DeviceEventReconciliation; note: string }) => Promise<unknown>;
 };
 
 function localTime(value: string, zone: string) {
@@ -28,7 +38,7 @@ function localTime(value: string, zone: string) {
   } catch { return `${value} · ${zone}`; }
 }
 
-export function DeviceEventDispatchHistory({ record, busy, demoMode = false, onInspect, onReconcile }: Props) {
+export function DeviceEventDispatchHistory({ record, busy, demoMode = false, unavailableReason, onInspect, onReconcile }: Props) {
   const [inspection, setInspection] = useState<Inspection>();
   const [checkBusy, setCheckBusy] = useState(false);
   const [note, setNote] = useState("");
@@ -36,14 +46,14 @@ export function DeviceEventDispatchHistory({ record, busy, demoMode = false, onI
   const [error, setError] = useState("");
   const terminal = record.outcome !== "unknown";
   const check = async () => {
-    if (checkBusy || busy) return;
+    if (!onInspect || checkBusy || busy) return;
     setCheckBusy(true); setError("");
     try { setInspection(await onInspect(record.id)); }
     catch (value) { setError(value instanceof Error ? value.message : "Calendar check failed."); }
     finally { setCheckBusy(false); }
   };
   const saveCheck = async () => {
-    if (!choice || !note.trim() || busy) return;
+    if (!onReconcile || !choice || !note.trim() || busy) return;
     setError("");
     try {
       await onReconcile(record.id, { disposition: choice, note: note.trim() });
@@ -55,36 +65,37 @@ export function DeviceEventDispatchHistory({ record, busy, demoMode = false, onI
     <View style={styles.card}>
       <Text style={s.label}>{demoMode ? "SAMPLE DEVICE EVENT · SIMULATED" : "APPROVED DEVICE EVENT"}</Text>
       <Text style={styles.title}>{record.payload.title}</Text>
-      <Text style={styles.meta}>{status} · {record.target.title} · {record.target.sourceLabel}</Text>
+      <Text style={styles.meta}>{status} · {record.targetLabel}</Text>
       {demoMode ? <Text style={styles.meta}>No iPhone calendar was changed.</Text> : null}
       {record.outcomeAt ? <Text style={styles.meta}>Outcome recorded · {localTime(record.outcomeAt, record.payload.timeZone)}</Text> : null}
       <Text style={styles.meta}>{localTime(record.payload.start, record.payload.timeZone)} – {localTime(record.payload.end, record.payload.timeZone)}</Text>
       <Text style={styles.body}>{record.payload.notes || "No event notes."}</Text>
-      {record.reconciliations.map((entry) => (
-        <View key={entry.id} style={styles.attestation}>
+      {record.reconciliations.map((entry, index) => (
+        <View key={`${entry.at}-${index}`} style={styles.attestation}>
           <Text style={styles.meta}>{entry.disposition === "confirmed_present" ? "You found the event" : entry.disposition === "not_found" ? "You could not find it" : "You stopped checking"} · {new Date(entry.at).toLocaleString()}</Text>
           {entry.note ? <Text style={styles.body}>{entry.note}</Text> : null}
-          {entry.nativeEventId ? <Text style={styles.meta}>Native event reference recorded</Text> : null}
+          {entry.nativeReferenceRecorded ? <Text style={styles.meta}>Native event reference recorded</Text> : null}
         </View>
       ))}
       {record.outcome === "unknown" ? (
         <>
           <Text style={styles.meta}>Check Calendar on this iPhone before recording what you found. This does not create the event again.</Text>
-          <Button label={checkBusy ? "Checking calendar…" : "Check this iPhone calendar"} tone="quiet" disabled={busy || checkBusy} onPress={() => void check()} />
+          <Button label={checkBusy ? "Checking calendar…" : "Check this iPhone calendar"} tone="quiet" disabled={busy || checkBusy || !onInspect} onPress={() => void check()} />
+          {!onInspect || !onReconcile ? <Text style={styles.meta}>{unavailableReason ?? "Calendar check actions are unavailable here. Review the saved event directly in Calendar."}</Text> : null}
           {inspection?.lookup ? (
             <View style={styles.attestation}>
               <Text style={styles.meta}>{inspection.lookup.candidates.length ? `${inspection.lookup.candidates.length} possible match${inspection.lookup.candidates.length === 1 ? "" : "es"}; review them in Calendar.` : inspection.lookup.partial ? "The check was incomplete; inspect Calendar manually." : "No possible match was found in the checked calendar."}</Text>
               <Text style={styles.meta}>{inspection.lookup.identity === "native_id_match" ? "The saved event reference matches. Review the event in Calendar before recording your check." : "Details only; these possible matches are unverified. Review them in Calendar before recording your check."}</Text>
-              {inspection.lookup.candidates.slice(0, 5).map((event) => <Text key={event.id} style={styles.body}>{event.title} · {localTime(event.start, event.timeZone || record.payload.timeZone)}</Text>)}
+              {inspection.lookup.candidates.slice(0, 5).map((event, index) => <Text key={`${event.start}-${index}`} style={styles.body}>{event.title} · {localTime(event.start, event.timeZone || record.payload.timeZone)}</Text>)}
             </View>
           ) : null}
           <View style={styles.choices}>
             {(["confirmed_present", "not_found", "abandoned"] as const).map((item) => {
               const label = item === "confirmed_present" ? "I found the event" : item === "not_found" ? "I could not find it" : "Stop checking";
-              return <Button key={item} label={label} tone={choice === item ? "light" : "quiet"} disabled={busy} onPress={() => setChoice(item)} />;
+              return <Button key={item} label={label} tone={choice === item ? "light" : "quiet"} disabled={busy || !onReconcile} onPress={() => setChoice(item)} />;
             })}
           </View>
-          {choice ? <>
+          {choice && onReconcile ? <>
             <Field label="What did you check?" value={note} onChangeText={setNote} multiline placeholder="Add a short note" />
             <Text style={styles.meta}>This records your check. It does not resend the action or confirm delivery.</Text>
             <Button label="Save check result" disabled={busy || !note.trim()} onPress={() => void saveCheck()} />

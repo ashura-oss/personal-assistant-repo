@@ -65,6 +65,8 @@ import type { PickedBackupFile } from "./src/backupFiles";
 import type { ProviderCleanupRegistry } from "./src/services/providerResponseLifetime";
 import type { ReminderIntent, ReminderRecord } from "./src/reminders";
 import { deriveReminderAlertDisplay, toReminderDisplayRecord, type ReminderAlertChannel } from "./src/ui/reminderDisplay";
+import type { ReviewProposalDisplay, ReviewDispatchDisplay, ReviewDeviceEventDisplay } from "./src/ui/ReviewSheet";
+import { projectDeviceEventReconciliationDisplayFacts, resolveLinkedDeviceEventRecord, resolveLinkedDispatchRecord, resolveReviewReplyAllowedOperations } from "./src/ui/reviewSheetAuthority";
 import type { PrivacyService, PrivacyWorkspaceSession } from "./src/privacy/service";
 import type { PrivacyResourceBoundary } from "./src/privacy/resourceBoundary";
 import type { PrivacyAudioBoundary } from "./src/privacy/audioBoundary";
@@ -109,6 +111,64 @@ export function resolveTextAssistanceRoute(
 export function buildSpeechProviderSettingsPatch(provider: "azure" | "openrouter"): Partial<AppSettings> {
   return { speechProvider: provider };
 }
+
+function reviewProposalDisplay(value: Proposal): ReviewProposalDisplay {
+  const provenance = value.provenance && "kind" in value.provenance
+    ? { version: 2 as const, kind: "mail_reply" as const, sourceDigest: value.provenance.sourceDigest,
+        source: { ...value.provenance.source, identity: { ...value.provenance.source.identity },
+          ...(value.provenance.source.replyTo ? { replyTo: [...value.provenance.source.replyTo] } : {}),
+          ...(value.provenance.source.to ? { to: [...value.provenance.source.to] } : {}),
+          ...(value.provenance.source.cc ? { cc: [...value.provenance.source.cc] } : {}) },
+        expiresAt: value.provenance.expiresAt, ...(value.provenance.batchJobId ? { batchJobId: value.provenance.batchJobId } : {}) }
+    : value.provenance ? { ...value.provenance,
+        ...(value.provenance.knowledgeSelection ? { knowledgeSelection: value.provenance.knowledgeSelection.map((item) => ({ ...item })) } : {}),
+        sources: value.provenance.sources.map((item) => ({ ...item })), policySources: value.provenance.policySources.map((item) => ({ ...item })) }
+      : undefined;
+  const email = value.email ? { ...(value.email.operation ? { operation: value.email.operation } : {}), to: [...value.email.to], cc: [...value.email.cc], bcc: [...value.email.bcc],
+    subject: value.email.subject, text: value.email.text,
+    attachments: value.email.attachments.map((item) => ({ id: item.id, fileName: item.fileName, mimeType: item.mimeType, sizeBytes: item.sizeBytes, sha256: item.sha256 })),
+    ...(value.email.reply ? { reply: { ...value.email.reply } } : {}) } : undefined;
+  const event = value.event ? { ...(value.event.title !== undefined ? { title: value.event.title } : {}), ...(value.event.description !== undefined ? { description: value.event.description } : {}),
+    start: value.event.start, end: value.event.end, timeZone: value.event.timeZone, attendees: [...value.event.attendees], invitePolicy: value.event.invitePolicy } : undefined;
+  return { id: value.id, ...(value.noteId ? { noteId: value.noteId } : {}), kind: value.kind, title: value.title, body: value.body, status: value.status, revision: value.revision,
+    ...(value.approvedRevision !== undefined ? { approvedRevision: value.approvedRevision } : {}), ...(value.lastError !== undefined ? { lastError: value.lastError } : {}),
+    ...(value.notificationRevision !== undefined ? { notificationRevision: value.notificationRevision } : {}), ...(value.reminderId ? { reminderId: value.reminderId } : {}),
+    ...(value.eventDestination ? { eventDestination: { ...value.eventDestination } } : {}), ...(provenance ? { provenance } : {}),
+    ...(value.requiresRebuild !== undefined ? { requiresRebuild: value.requiresRebuild } : {}),
+    ...(value.dispatchHistoryIncomplete !== undefined ? { dispatchHistoryIncomplete: value.dispatchHistoryIncomplete } : {}), ...(value.dispatchRecoveryRetired ? { dispatchRecoveryRetired: true as const } : {}),
+    ...(value.accountId ? { accountId: value.accountId } : {}), recipients: [...value.recipients], ...(value.calendarId ? { calendarId: value.calendarId } : {}),
+    ...(value.sourceRevision !== undefined ? { sourceRevision: value.sourceRevision } : {}), evidence: value.evidence.map((item) => ({ ...item })), ...(value.dueAt ? { dueAt: value.dueAt } : {}),
+    ...(email ? { email } : {}), ...(event ? { event } : {}), ...(value.simulated !== undefined ? { simulated: value.simulated } : {}),
+    ...(value.remoteOperation ? { remoteOperation: value.remoteOperation } : {}), ...(value.remoteId ? { remoteId: value.remoteId } : {}), ...(value.remoteAcceptedAt ? { remoteAcceptedAt: value.remoteAcceptedAt } : {}) };
+}
+
+function reviewDispatchDisplay(value: AppState["dispatchRecords"][number]): ReviewDispatchDisplay {
+  const payload = value.payload.kind === "email"
+    ? { kind: "email" as const, email: { to: [...value.payload.email.to], cc: [...value.payload.email.cc], bcc: [...value.payload.email.bcc],
+        subject: value.payload.email.subject, text: value.payload.email.text, attachments: value.payload.email.attachments.map((item) => ({ ...item })), ...(value.payload.email.reply ? { reply: { ...value.payload.email.reply } } : {}) } }
+    : { kind: "event" as const, event: { ...(value.payload.event.title !== undefined ? { title: value.payload.event.title } : {}), ...(value.payload.event.description !== undefined ? { description: value.payload.event.description } : {}),
+        start: value.payload.event.start, end: value.payload.event.end, timeZone: value.payload.event.timeZone, attendees: [...value.payload.event.attendees], invitePolicy: value.payload.event.invitePolicy } };
+  return { version: value.version, id: value.id, proposalId: value.proposalId, approvedRevision: value.approvedRevision,
+    ...(value.sourceRevision !== undefined ? { sourceRevision: value.sourceRevision } : {}), payloadDigest: value.payloadDigest,
+    sourceProvenance: { ...value.sourceProvenance }, operation: value.operation, accountId: value.accountId,
+    account: { provider: value.account.provider, identity: { ...value.account.identity }, displayName: value.account.displayName, email: value.account.email },
+    ...(value.calendar ? { calendar: { localId: value.calendar.localId, providerId: value.calendar.providerId, name: value.calendar.name } } : {}),
+    title: value.title, body: value.body, payload, dispatchStartedAt: value.dispatchStartedAt, outcome: value.outcome,
+    ...(value.outcomeAt ? { outcomeAt: value.outcomeAt } : {}), ...(value.rejectionCode ? { rejectionCode: value.rejectionCode } : {}),
+    ...(value.replyDraftCheck ? { replyDraftCheck: value.replyDraftCheck } : {}), ...(value.remoteId ? { remoteId: value.remoteId } : {}),
+    reconciliations: value.reconciliations.map((item) => ({ id: item.id, disposition: item.disposition, at: item.at, note: item.note, ...(item.remoteId ? { remoteId: item.remoteId } : {}) })) };
+}
+
+function reviewDeviceEventDisplay(value: AppState["deviceCalendars"]["dispatchRecords"][number]): ReviewDeviceEventDisplay {
+  return { id: value.id, proposalId: value.proposalId, revision: value.revision, ...(value.sourceRevision !== undefined ? { sourceRevision: value.sourceRevision } : {}),
+    title: value.payload.title, body: value.payload.notes, payload: { title: value.payload.title, notes: value.payload.notes, start: value.payload.start,
+      end: value.payload.end, timeZone: value.payload.timeZone, allDay: value.payload.allDay, attendees: [], invitePolicy: value.payload.invitePolicy, alarms: [] },
+    claimAt: value.claimAt, outcome: value.outcome, ...(value.outcomeAt ? { outcomeAt: value.outcomeAt } : {}), ...(value.errorCode ? { errorCode: value.errorCode } : {}),
+    reconciliations: projectDeviceEventReconciliationDisplayFacts(value.reconciliations),
+    targetLabel: `${value.target.title} · ${value.target.sourceLabel}`,
+  };
+}
+
 
 export function buildProviderCredentialInput(
   speechSubscriptionKey: string,
@@ -4018,10 +4078,37 @@ export function WorkspaceView({ controller, credentials, platform, workspaceGene
             <View style={s.sheet}>
               <View style={s.sheetHandle} />
               <ReviewSheet
-                state={state}
-                proposal={currentReviewProposal}
-                dispatchRecords={state.dispatchRecords}
-                deviceEventDispatchRecords={state.deviceCalendars.dispatchRecords}
+                settingsMode={state.settings.mode}
+                accounts={state.accounts.map((account) => ({ id: account.id, provider: account.provider, displayName: account.displayName, email: account.email,
+                  connected: account.connected && account.authStatus === "connected",
+                  allowedEmailOperations: [
+                    ...(account.connected && account.authStatus === "connected" && account.capabilities?.includes("mail.draft") ? ["draft" as const] : []),
+                    ...(account.connected && account.authStatus === "connected" && account.capabilities?.includes("mail.send") ? ["send" as const] : []),
+                  ] } ))}
+                calendars={state.calendars.map((calendar) => {
+                  const account = state.accounts.find((item) => item.id === calendar.accountId);
+                  const writable = Boolean(account?.connected && account.authStatus === "connected" && account.capabilities?.includes("calendar.write") && calendar.connected && calendar.writable);
+                  return { id: calendar.id, accountId: calendar.accountId, name: calendar.name, accountEmail: account?.email ?? "",
+                    writable,
+                    ...(!writable ? { unavailableReason: !account?.connected || account.authStatus !== "connected"
+                      ? "Account not connected" : !account.capabilities?.includes("calendar.write")
+                        ? "Account does not allow calendar changes" : !calendar.connected ? "Calendar not connected" : "Read only" } : {}) };
+                })}
+                deviceCalendars={{ enabled: state.deviceCalendars.enabled, selectedCalendarIds: state.deviceCalendars.selectedCalendarIds,
+                  choices: state.deviceCalendars.calendars.map((calendar) => ({ localId: calendar.localId, title: calendar.title, sourceName: calendar.sourceName,
+                    allowsModifications: calendar.allowsModifications, selected: state.deviceCalendars.selectedCalendarIds.includes(calendar.localId) })),
+                  accessStatus: state.deviceCalendarAccess.status,
+                  writeAvailable: state.deviceCalendars.enabled && state.deviceCalendarAccess.status === "full_access",
+                  unavailableReason: !state.deviceCalendars.enabled || state.deviceCalendarAccess.status !== "full_access"
+                    ? "Connect device calendars and allow full access before creating this event."
+                    : !state.deviceCalendars.selectedCalendarIds.some((id) => state.deviceCalendars.calendars.some((calendar) => calendar.localId === id && calendar.allowsModifications))
+                      ? "Choose a selected writable calendar in Settings first." : undefined }}
+                proposal={currentReviewProposal ? reviewProposalDisplay(currentReviewProposal) : null}
+                dispatchRecords={state.dispatchRecords.map(reviewDispatchDisplay)}
+                currentDispatchRecord={(() => { const linked = resolveLinkedDispatchRecord(currentReviewProposal, state.dispatchRecords); return linked ? reviewDispatchDisplay(linked) : undefined; })()}
+                deviceEventDispatchRecords={state.deviceCalendars.dispatchRecords.map(reviewDeviceEventDisplay)}
+                currentDeviceEventDispatchRecord={(() => { const linked = resolveLinkedDeviceEventRecord(currentReviewProposal, state.deviceCalendars.dispatchRecords); return linked ? reviewDeviceEventDisplay(linked) : undefined; })()}
+                replyAllowedOperations={resolveReviewReplyAllowedOperations(currentReviewProposal, state.accounts)}
                 mailReplyContextCount={reviewMailReplyBatchJobId
                   ? (state.assistantBatchJobs ?? []).find((job) => job.kind === 'mail_reply' && job.id === reviewMailReplyBatchJobId)?.mailReplyContextCount ?? 0
                   : 0}
@@ -4029,7 +4116,11 @@ export function WorkspaceView({ controller, credentials, platform, workspaceGene
                 onRefreshMailReplySources={refreshReviewedMailReplySources}
                 busy={busy}
                 demoMode={isDeviceCalendarsDemo}
-                onInspectDeviceEvent={(recordId) => controller.inspectDeviceEventDispatch(recordId)}
+                onInspectDeviceEvent={async (recordId) => {
+                  const inspection = await controller.inspectDeviceEventDispatch(recordId);
+                  return { lookup: { candidates: inspection.lookup.candidates.map((event) => ({ title: event.title, start: event.start, timeZone: event.timeZone })),
+                    partial: inspection.lookup.partial, identity: inspection.lookup.identity } };
+                }}
                 onReconcileDeviceEvent={(recordId, input) =>
                   run(async () => {
                     const saved = await controller.reconcileDeviceEventDispatch(recordId, input);
@@ -4108,9 +4199,19 @@ export function WorkspaceView({ controller, credentials, platform, workspaceGene
                   setReviewFreshnessRetry((retry) => retry + 1);
                 }}
                 onClose={() => setReview(null)}
-                onEdit={(patch) =>
+                onEdit={(command) =>
                   run(async () => {
                     if (!currentReviewProposal) return;
+                    const { recipients, email, event, eventDestination, ...basic } = command;
+                    const patch: Partial<Pick<Proposal, "title" | "body" | "accountId" | "recipients" | "calendarId" | "eventDestination" | "dueAt" | "email" | "event">> = {
+                      ...basic,
+                      ...(recipients ? { recipients: [...recipients] } : {}),
+                      ...(email ? { email: { ...(email.operation ? { operation: email.operation } : {}), to: [...email.to], cc: [...email.cc], bcc: [...email.bcc], subject: email.subject, text: email.text,
+                        attachments: email.attachments.map((item) => ({ ...item })), ...(email.reply ? { reply: { ...email.reply } } : {}) } } : {}),
+                      ...(event ? { event: { ...(event.title !== undefined ? { title: event.title } : {}), ...(event.description !== undefined ? { description: event.description } : {}),
+                        start: event.start, end: event.end, timeZone: event.timeZone, attendees: [...event.attendees], invitePolicy: event.invitePolicy } } : {}),
+                      ...(eventDestination ? { eventDestination: { ...eventDestination } } : {}),
+                    };
                     setReview(await controller.editProposal(currentReviewProposal.id, patch, { expectedRevision: currentReviewProposal.revision }));
                   })
                 }
