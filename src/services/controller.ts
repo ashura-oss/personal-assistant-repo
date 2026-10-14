@@ -1314,12 +1314,13 @@ export interface ControllerIntegrationDependencies {
   writeDocument?: (path: string, content: string) => Promise<void>;
   tokenStore?: OAuthTokenStore;
   deleteToken?: (tokenRef: string) => Promise<void>;
-  verifyOAuthResult?: (result: OAuthBridgeResult, stored: StoredOAuthToken) => Promise<boolean>;
+  verifyOAuthResult?: (result: OAuthBridgeResult, stored: StoredOAuthToken, assertCurrent?: () => void) => Promise<boolean>;
   clientIds?: Partial<Record<'google' | 'microsoft', string>>;
   connectorFactory?: (
     tokenStore: OAuthTokenStore,
     onAuthStatus: (accountId: string, status: Account['authStatus']) => Promise<void>,
     withProviderOwnership?: <T>(actual: () => Promise<T>) => Promise<T>,
+    withResponseLifetime?: import('./providerResponseLifetime').ProviderResponseLifetime,
   ) => ConnectorClient;
   recordingRecovery?: RecordingRecoveryService;
   speechAudioService?: SpeechAudioService;
@@ -1499,7 +1500,7 @@ export class AppControllerImpl implements AppController {
   private readonly mailReplyContextSessions = new Map<string, MailReplyContextDiscoverySession>();
   private readonly mailReplyContextProofs = new Map<string, MailReplyContextFreshnessProof>();
   private readonly activeMailReplyContextRefreshes = new Map<string, object>();
-  private assistantBatchCleanupRetries = new Map<string, () => Promise<void>>();
+  private assistantBatchCleanupRetries = new Map<string, import('./providerResponseLifetime').ProviderCancellationRetry>();
   private activeBatchNoteOperations = new Set<string>();
   private activeBatchJobInspections = new Set<string>();
   private activeChatConversationSubmissions = new Set<string>();
@@ -1565,7 +1566,7 @@ export class AppControllerImpl implements AppController {
   private transcriptionQuarantine: unknown[] = [];
   private transcriptionJobs = new Map<string, { attemptId: string; sourceRevision: number; leaseId: string; controller: AbortController; promise: Promise<Note> }>();
   private transcriptionCleanupJob?: Promise<void>;
-  private readonly speechRequestCleanupRetries = new Map<string, () => Promise<void>>();
+  private readonly speechRequestCleanupRetries = new Map<string, import('./providerResponseLifetime').ProviderCancellationRetry>();
   private readonly speechRequestCleanupAttemptIds = new Map<string, string>();
   private readonly speechRequestCleanupRuns = new Map<string, Promise<void>>();
   private readonly reminderBackend: NotificationBackend;
@@ -2179,12 +2180,19 @@ export class AppControllerImpl implements AppController {
     });
   }
 
-  rememberSpeechRequestCleanup(leaseId: string, retryCancel: () => Promise<void>): void {
+  rememberSpeechRequestCleanup(leaseId: string, retryCancel: import('./providerResponseLifetime').ProviderCancellationRetry): void {
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(leaseId)) return;
     const attempt = this.snapshot.transcription.attempts.find((item) => item.leaseId === leaseId && item.provider === 'openrouter');
     if (!attempt || !this.transcriptionJobs.has(attempt.noteId)) return;
     this.speechRequestCleanupRetries.set(leaseId, retryCancel);
     this.speechRequestCleanupAttemptIds.set(leaseId, attempt.id);
+    retryCancel.subscribeSettled?.(() => {
+      if (this.speechRequestCleanupRetries.get(leaseId) !== retryCancel) return;
+      this.speechRequestCleanupRetries.delete(leaseId);
+      this.speechRequestCleanupAttemptIds.delete(leaseId);
+      this.snapshot = deepFreeze(this.publicState(this.state));
+      this.emit();
+    });
     this.snapshot = deepFreeze(this.publicState(this.state));
     this.emit();
   }
@@ -5367,9 +5375,15 @@ export class AppControllerImpl implements AppController {
     return job;
   }
 
-  rememberOpenRouterBatchCleanup(operationId: string, retry: () => Promise<void>): void {
+  rememberOpenRouterBatchCleanup(operationId: string, retry: import('./providerResponseLifetime').ProviderCancellationRetry): void {
     if (operationId.length !== 36 || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(operationId)) return;
     this.assistantBatchCleanupRetries.set(operationId, retry);
+    retry.subscribeSettled?.(() => {
+      if (this.assistantBatchCleanupRetries.get(operationId) !== retry) return;
+      this.assistantBatchCleanupRetries.delete(operationId);
+      this.snapshot = deepFreeze(this.publicState(this.state));
+      this.emit();
+    });
     this.snapshot = deepFreeze(this.publicState(this.state));
     this.emit();
   }
@@ -10144,10 +10158,13 @@ export class AppControllerImpl implements AppController {
     });
   }
 
-  async installVerifiedAccount(config: AccountConfig, result: OAuthInstallResult): Promise<Account> {
+  async installVerifiedAccount(config: AccountConfig, result: OAuthInstallResult, options: { assertCurrent?: () => void } = {}): Promise<Account> {
     const tokenStore = this.integration.tokenStore;
     if (!tokenStore || !this.integration.verifyOAuthResult || !this.connector) throw new Error('Verified account connection is unavailable until the OAuth and connector services are configured.');
+    const assertCurrent = options.assertCurrent ?? (() => undefined);
+    assertCurrent();
     await this.load();
+    assertCurrent();
     if (result.provider !== config.provider || !['google', 'microsoft'].includes(result.provider)) throw new Error('The verified sign-in does not match this account configuration.');
     const expectedClientId = this.integration.clientIds?.[result.provider];
     if (!expectedClientId || result.identity.providerNamespace !== result.provider || result.identity.clientId !== expectedClientId ||
@@ -10166,15 +10183,25 @@ export class AppControllerImpl implements AppController {
     let staged = false;
     try {
       // Register before writing so a crash or verification failure leaves a durable orphan cleanup record.
+      assertCurrent();
       await this.queueCredentialCleanup(tokenRef, 'orphan');
+      assertCurrent();
       await tokenStore.set(tokenRef, { accessToken: result.accessToken, refreshToken: result.refreshToken, expiresAt: result.expiresAt, identity: result.identity });
       staged = true;
+      assertCurrent();
       let stored = await tokenStore.get(tokenRef);
+      assertCurrent();
       if (!stored || stored.accessToken !== result.accessToken || stored.expiresAt !== result.expiresAt || !sameAccountIdentity(stored.identity, result.identity)) {
         throw new Error('The staged token does not match the verified sign-in result.');
       }
       if (stored.refreshToken !== result.refreshToken) throw new Error('The staged refresh credential does not match the verified sign-in result.');
-      if (!await this.integration.verifyOAuthResult(result as OAuthBridgeResult, stored) || !await this.connector.verifyOAuthIdentity(result as OAuthBridgeResult, stored)) {
+      assertCurrent();
+      const bridgeResult = result as OAuthBridgeResult;
+      const resultVerified = await this.integration.verifyOAuthResult(bridgeResult, stored, assertCurrent);
+      assertCurrent();
+      const resourceIdentityVerified = resultVerified && await this.connector.verifyOAuthIdentity(bridgeResult, stored, assertCurrent);
+      assertCurrent();
+      if (!resultVerified || !resourceIdentityVerified) {
         throw new Error('The provider could not verify this account identity and granted access.');
       }
       const email = (result.email || config.email).trim().toLowerCase();
@@ -10182,21 +10209,28 @@ export class AppControllerImpl implements AppController {
       const scopeCapabilities = grantedCapabilities(result.provider, result.grantedScopes);
       const effectiveCapabilities = intersectCapabilities(result.requestedCapabilities, result.capabilities, scopeCapabilities);
       const commitInstall = async (): Promise<Account> => {
+        assertCurrent();
         let expectedRefreshToken = result.refreshToken;
         if (expectedLifecycle?.tokenRef && expectedLifecycle.connected && expectedLifecycle.authStatus === 'connected' &&
             expectedLifecycle.identity && sameAccountIdentity(expectedLifecycle.identity, result.identity) && !result.refreshToken) {
           const priorForRefresh = await tokenStore.get(expectedLifecycle.tokenRef);
+          assertCurrent();
           if (priorForRefresh && sameAccountIdentity(priorForRefresh.identity, result.identity) && priorForRefresh.refreshToken) {
             expectedRefreshToken = priorForRefresh.refreshToken;
+            assertCurrent();
             await tokenStore.set(tokenRef, { accessToken: result.accessToken, refreshToken: expectedRefreshToken, expiresAt: result.expiresAt, identity: result.identity });
+            assertCurrent();
           }
         }
         const verifiedReadback = await tokenStore.get(tokenRef);
+        assertCurrent();
         if (!verifiedReadback || verifiedReadback.accessToken !== result.accessToken || verifiedReadback.refreshToken !== expectedRefreshToken ||
             verifiedReadback.expiresAt !== result.expiresAt || !sameAccountIdentity(verifiedReadback.identity, result.identity)) {
         throw new Error('The secure account credential could not be verified after storage.');
         }
-        return this.mutate((state) => {
+        assertCurrent();
+      return this.mutate((state) => {
+        assertCurrent();
         const existing = state.accounts.find((account) => sameAccountIdentity(account.identity, result.identity));
         const configured = config.id ? state.accounts.find((account) => account.id === config.id) : undefined;
         if (config.id) {
@@ -10241,9 +10275,10 @@ export class AppControllerImpl implements AppController {
         interruptMailLanes(state.syncStates[account.id], 'Account identity changed during mail sync. Refresh the inbox or continue backfill explicitly.');
         addActivity(state, 'local_action', `${account.displayName || account.email} was connected after provider identity verification.`);
         return account;
-        });
+        }, () => { assertCurrent(); return undefined; });
       };
       const priorRef = expectedLifecycle?.tokenRef;
+      assertCurrent();
       const installed = priorRef
         ? await withCredentialLock(tokenStore, priorRef, commitInstall)
         : await commitInstall();
@@ -11956,8 +11991,10 @@ const defaultIntegration: ControllerIntegrationDependencies = {
     });
     return defaultConnector;
   },
-  verifyOAuthResult: async (result, stored) => {
-    if (!defaultConnector || !await defaultConnector.verifyOAuthIdentity(result, stored)) return false;
+  verifyOAuthResult: async (result, stored, assertCurrent) => {
+    assertCurrent?.();
+    if (!defaultConnector || !await defaultConnector.verifyOAuthIdentity(result, stored, assertCurrent)) return false;
+    assertCurrent?.();
     const known: AccountCapability[] = ['mail.read', 'mail.draft', 'mail.send', 'calendar.read', 'calendar.write'];
     if (result.requestedCapabilities.some((item) => !known.includes(item)) || result.capabilities.some((item) => !result.requestedCapabilities.includes(item))) return false;
     if (result.requestedCapabilities.includes('calendar.write') && !result.requestedCapabilities.includes('calendar.read')) return false;
@@ -12027,9 +12064,8 @@ export async function createProductionWorkspace(options: ProductionWorkspaceOpti
   const rawTokenStore = options.integration?.tokenStore ?? oauthTokenStore;
   const tokenStore = resources.oauthTokenStore(rawTokenStore);
   const providerCredentials = options.credentials ?? options.integration?.credentials ?? createProviderCredentialService(resources.credentialStore(credentialStore));
-  const batchTransport = await import('./openRouterTransport');
   const openRouterBatchClient = options.integration?.openRouterBatchClient ?? new OpenRouterBatchClient({
-    withResponseLifetime: batchTransport.openRouterTransportWithResponseLifetime,
+    withResponseLifetime: resources.withResponseLifetimeFor('openrouter_batch'),
     withRequestOwnership: resources.withProviderOwnership,
     readCredentialSnapshot: () => providerCredentials.readProviderCredentialSnapshot('openrouter'),
     assertCredentialGeneration: (generation) => providerCredentials.assertProviderCredentialGeneration('openrouter', generation),
@@ -12050,11 +12086,11 @@ export async function createProductionWorkspace(options: ProductionWorkspaceOpti
   const openRouterSpeechAdapter = options.integration?.openRouterSpeechAdapter ?? (() => {
     const client = new OpenRouterSpeechClient({
       withRequestOwnership: (actual) => privacy.withWriter(session.epoch, { kind: 'speech_upload', namespace: 'speech_staging' }, actual),
-      withResponseLifetime: batchTransport.openRouterTransportWithResponseLifetime,
+      withResponseLifetime: resources.withResponseLifetimeFor('openrouter_speech'),
       readCredentialSnapshot: () => providerCredentials.readProviderCredentialSnapshot('openrouter'),
       assertCredentialGeneration: (generation) => providerCredentials.assertProviderCredentialGeneration('openrouter', generation),
       assertBeforeStart: () => undefined,
-      onCancelPending: (leaseId) => implementation?.rememberSpeechRequestCleanup(leaseId, () => client.retryPendingCleanup(leaseId)),
+      onCancelPending: (leaseId, retryCancel) => implementation?.rememberSpeechRequestCleanup(leaseId, retryCancel),
     });
     return new OpenRouterSpeechAdapter({ audio: speechAudioService, client });
   })();
@@ -12086,9 +12122,10 @@ export async function createProductionWorkspace(options: ProductionWorkspaceOpti
     tokenStore,
     deleteToken: tokenStore.delete,
     connectorFactory: (store, onAuthStatus) => {
-      const connector = configuredConnectorFactory?.(store, onAuthStatus, resources.withProviderOwnership) ?? new ConnectorClient({
+      const connector = configuredConnectorFactory?.(store, onAuthStatus, resources.withProviderOwnership, resources.withResponseLifetimeFor('connector')) ?? new ConnectorClient({
         tokenStore: store, googleClientId, microsoftClientId, microsoftAuthority, onAuthStatus,
         withProviderOwnership: resources.withProviderOwnership,
+        withResponseLifetime: resources.withResponseLifetimeFor('connector'),
         isConnectionCurrent: (account) => {
           const current = implementation?.getSnapshot().accounts.find((item) => item.id === account.id);
           return Boolean(!implementation?.getSnapshot().mailAlertRefreshRequired && current && current.connected && current.authStatus === 'connected' && current.tokenRef === account.tokenRef &&
@@ -12098,8 +12135,10 @@ export async function createProductionWorkspace(options: ProductionWorkspaceOpti
       if (connector instanceof ConnectorClient) factoryConnector = connector;
       return connector;
     },
-    verifyOAuthResult: options.integration?.verifyOAuthResult ?? (async (result, stored) => {
-      if (!factoryConnector || !await factoryConnector.verifyOAuthIdentity(result, stored)) return false;
+    verifyOAuthResult: options.integration?.verifyOAuthResult ?? (async (result, stored, assertCurrent) => {
+      assertCurrent?.();
+      if (!factoryConnector || !await factoryConnector.verifyOAuthIdentity(result, stored, assertCurrent)) return false;
+      assertCurrent?.();
       const known: AccountCapability[] = ['mail.read', 'mail.draft', 'mail.send', 'calendar.read', 'calendar.write'];
       if (result.requestedCapabilities.some((item) => !known.includes(item)) || result.capabilities.some((item) => !result.requestedCapabilities.includes(item))) return false;
       if (result.requestedCapabilities.includes('calendar.write') && !result.requestedCapabilities.includes('calendar.read')) return false;
@@ -12113,9 +12152,11 @@ export async function createProductionWorkspace(options: ProductionWorkspaceOpti
       currentCredentialGeneration: () => providerCredentials.currentSpeechCredentialGeneration(),
       assertCredentialGeneration: (generation) => providerCredentials.assertSpeechCredentialGeneration(generation),
       withRequestOwnership: (actualRequest) => privacy.withWriter(session.epoch, { kind: 'speech_upload', namespace: 'speech_staging' }, actualRequest),
+      withResponseLifetime: resources.withResponseLifetimeFor('azure_speech'),
     }),
     speechOpenRouter: options.providers?.speechOpenRouter ?? openRouterSpeechAdapter,
-    openAi: options.providers?.openAi ?? new AzureOpenAIClient(fetch, () => providerCredentials.readProviderCredential('openai'), resources.withProviderOwnership),
+    openAi: options.providers?.openAi ?? new AzureOpenAIClient(fetch, () => providerCredentials.readProviderCredential('openai'), resources.withProviderOwnership,
+      resources.withResponseLifetimeFor('azure_ai')),
   };
   implementation = new AppControllerImpl(boundStore, providers, integration, pendingCaptureController);
   return { controller: createPrivacyBoundController(implementation, privacy, session), backgroundTasks: boundBackgroundTasks.backend, mailAlertTaps, ...(captureJournal ? { captureJournal } : {}) };

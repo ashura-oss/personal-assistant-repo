@@ -1,5 +1,6 @@
 import type { Account, AccountCapability } from '../core';
 import type { OAuthBridgeResult, StoredOAuthToken } from './index';
+import type { ProviderResponseLifetime } from '../services/providerResponseLifetime';
 
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const GOOGLE_USERINFO_URL = 'https://openidconnect.googleapis.com/v1/userinfo';
@@ -27,6 +28,9 @@ export interface OAuthClientConfig {
 
 export interface OAuthExchangeDependencies {
   fetcher?: typeof fetch;
+  withProviderOwnership?: <T>(actual: () => Promise<T>) => Promise<T>;
+  withResponseLifetime?: ProviderResponseLifetime;
+  beforeStart?: () => void;
   now?: () => number;
   timeoutMs?: number;
 }
@@ -70,15 +74,30 @@ function validateInput(config: OAuthClientConfig, input: AuthorizationCodeInput)
   return requested;
 }
 
-async function fetchJson(fetcher: typeof fetch, url: string, init: RequestInit, timeoutMs: number): Promise<{ response: Response; data: Record<string, unknown> }> {
+async function fetchJson(fetcher: typeof fetch, url: string, init: RequestInit, timeoutMs: number,
+  dependencies: OAuthExchangeDependencies): Promise<{ response: Response; data: Record<string, unknown> }> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), Math.max(1_000, Math.min(timeoutMs, 30_000)));
   try {
-    const response = await fetcher(url, { ...init, redirect: 'error', signal: controller.signal });
-    const bytes = await response.arrayBuffer();
-    const bounded = new Response(response.status === 204 || response.status === 205 || response.status === 304 ? null : bytes, { status: response.status, statusText: response.statusText, headers: response.headers });
-    const data = await bounded.json().catch(() => ({})) as Record<string, unknown>;
-    return { response: bounded, data };
+    const actual = async () => {
+      const consume = async (response: Response) => {
+        const bytes = await response.arrayBuffer();
+        const bounded = new Response(response.status === 204 || response.status === 205 || response.status === 304 ? null : bytes,
+          { status: response.status, statusText: response.statusText, headers: response.headers });
+        const data = await bounded.clone().json().catch(() => ({})) as Record<string, unknown>;
+        return { response: bounded, data };
+      };
+      const beforeStart = () => {
+        if (controller.signal.aborted) throw new Error('OAuth request was cancelled before dispatch.');
+        dependencies.beforeStart?.();
+      };
+      const lifetime = dependencies.withResponseLifetime ?? (async (input, requestInit, consumeResponse, _onCancelPending, beforeRequestStart) => {
+        beforeRequestStart?.();
+        return consumeResponse(await fetcher(input, requestInit));
+      });
+      return lifetime(url, { ...init, redirect: 'error', signal: controller.signal }, consume, undefined, beforeStart);
+    };
+    return dependencies.withProviderOwnership ? await dependencies.withProviderOwnership(actual) : await actual();
   } finally { clearTimeout(timer); }
 }
 
@@ -121,14 +140,14 @@ export async function exchangeAuthorizationCode(config: OAuthClientConfig, input
   const timeoutMs = dependencies.timeoutMs ?? 15_000;
   const tokenUrl = config.provider === 'google' ? GOOGLE_TOKEN_URL : `https://login.microsoftonline.com/${authority}/oauth2/v2.0/token`;
   const form = new URLSearchParams({ grant_type: 'authorization_code', client_id: config.clientId, code: input.authorizationCode, redirect_uri: redirectUri, code_verifier: input.codeVerifier });
-  const { response: tokenResponse, data: tokenData } = await fetchJson(fetcher, tokenUrl, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: form }, timeoutMs);
+  const { response: tokenResponse, data: tokenData } = await fetchJson(fetcher, tokenUrl, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: form }, timeoutMs, dependencies);
   if (!tokenResponse.ok) throw new Error('Provider rejected the authorization code.');
   if (typeof tokenData.access_token !== 'string' || !tokenData.access_token || !Number.isFinite(Number(tokenData.expires_in)) || Number(tokenData.expires_in) <= 0) throw new Error('Provider returned an invalid token response.');
   const scopes = grantedScopes(tokenData.scope);
   const accessToken = tokenData.access_token;
   const authorization = { authorization: `Bearer ${accessToken}` };
   const userinfoUrl = config.provider === 'google' ? GOOGLE_USERINFO_URL : GRAPH_USERINFO_URL;
-  const { response: userResponse, data: user } = await fetchJson(fetcher, userinfoUrl, { method: 'GET', headers: authorization }, timeoutMs);
+  const { response: userResponse, data: user } = await fetchJson(fetcher, userinfoUrl, { method: 'GET', headers: authorization }, timeoutMs, dependencies);
   if (!userResponse.ok || typeof user.sub !== 'string' || !user.sub) throw new Error('Provider account identity could not be verified.');
 
   let displayName = typeof user.name === 'string' ? user.name.slice(0, 200) : '';
@@ -136,7 +155,7 @@ export async function exchangeAuthorizationCode(config: OAuthClientConfig, input
   let resourceUserId: string | undefined;
   if (config.provider === 'microsoft') {
     if (!scopes.some((s) => s.toLowerCase() === 'user.read')) throw new Error('Microsoft User.Read is required to bind the account to its Graph identity.');
-    const { response: meResponse, data: me } = await fetchJson(fetcher, GRAPH_ME_URL, { method: 'GET', headers: authorization }, timeoutMs);
+    const { response: meResponse, data: me } = await fetchJson(fetcher, GRAPH_ME_URL, { method: 'GET', headers: authorization }, timeoutMs, dependencies);
     if (!meResponse.ok || typeof me.id !== 'string' || !me.id) throw new Error('Microsoft Graph account identity could not be verified.');
     resourceUserId = me.id;
     if (typeof me.displayName === 'string') displayName = me.displayName.slice(0, 200);
@@ -150,11 +169,11 @@ export async function exchangeAuthorizationCode(config: OAuthClientConfig, input
   for (const cap of authorized) {
     if (cap === 'mail.read') {
       const probeUrl = config.provider === 'google' ? GOOGLE_MAIL_PROBE : GRAPH_MAIL_PROBE;
-      const { response: probe } = await fetchJson(fetcher, probeUrl, { method: 'GET', headers: authorization }, timeoutMs);
+      const { response: probe } = await fetchJson(fetcher, probeUrl, { method: 'GET', headers: authorization }, timeoutMs, dependencies);
       if (probe.ok) capabilities.push(cap);
     } else if (cap === 'calendar.read') {
       const probeUrl = config.provider === 'google' ? GOOGLE_CALENDAR_PROBE : GRAPH_CALENDAR_PROBE;
-      const { response: probe } = await fetchJson(fetcher, probeUrl, { method: 'GET', headers: authorization }, timeoutMs);
+      const { response: probe } = await fetchJson(fetcher, probeUrl, { method: 'GET', headers: authorization }, timeoutMs, dependencies);
       if (probe.ok) capabilities.push(cap);
     } else {
       // Scopes express provider authorization; write operations remain subject to provider acceptance.

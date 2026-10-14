@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { buildOpenRouterSpeechWireRequest } from '../src/services/openRouterSpeechWire';
 import { OpenRouterSpeechClient, OpenRouterSpeechError, type OpenRouterSpeechClientDependencies } from '../src/services/openRouterSpeech';
+import { createProviderCleanupRegistry, createTrackedProviderResponseLifetime } from '../src/services/providerResponseLifetime';
 
 const operationId = '00000000-0000-4000-8000-000000000001';
 const request = buildOpenRouterSpeechWireRequest({ bytes: new Uint8Array([1, 2, 3, 4]), format: 'm4a' });
@@ -42,6 +43,21 @@ describe('OpenRouterSpeechClient', () => {
     expect(events).toEqual(['credential', 'durable-intent', 'provider-owner', 'final-fence', 'http']);
     expect(fetcher).toHaveBeenCalledOnce();
     expect(result).toEqual({ kind: 'transcript', transcript: 'exact transcript', usage: { costUsd: 0.0004, inputTokens: 8, outputTokens: 3, totalTokens: 11 } });
+  });
+
+  it('clears its pending cancellation handle when the tracked speech request settles naturally', async () => {
+    const registry = createProviderCleanupRegistry();
+    const retryRaw = vi.fn(async () => undefined);
+    const lifetime = createTrackedProviderResponseLifetime(async (_input, _init, consume, onCancel, beforeStart) => {
+      beforeStart?.();
+      onCancel?.(retryRaw);
+      return consume(new Response(JSON.stringify({ text: 'naturally settled', usage: { cost: 0.001 } }), { status: 200 }));
+    }, 'openrouter_speech', registry);
+    const client = new OpenRouterSpeechClient(dependencies({ withResponseLifetime: lifetime }));
+    await expect(client.transcribe(call())).resolves.toMatchObject({ kind: 'transcript', transcript: 'naturally settled' });
+    expect(registry.getPending()).toEqual([]);
+    await client.retryPendingCleanup(operationId);
+    expect(retryRaw).not.toHaveBeenCalled();
   });
 
   it('rejects a changed credential at the last synchronous fence without starting HTTP', async () => {
@@ -136,7 +152,7 @@ describe('OpenRouterSpeechClient', () => {
         finally { insideOwner = false; releaseOwner(); }
       },
       withResponseLifetime: async <T>(
-        _url: string,
+        _url: RequestInfo | URL,
         init: RequestInit,
         _consume: (response: Response) => Promise<T>,
         onCancelPending: ((retryCancel: () => Promise<void>) => void) | undefined,

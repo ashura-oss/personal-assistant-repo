@@ -45,6 +45,7 @@ export function createBackgroundMailRefreshRuntime(dependencies: BackgroundMailR
         createStateStore: dependencies.createStateStore,
         tokenStore: resources.oauthTokenStore(dependencies.tokenStore),
         withProviderOwnership: resources.withProviderOwnership,
+        withResponseLifetime: resources.withResponseLifetimeFor('connector'),
         mailAlerts: {
           backend: mailAlertBackend,
           notificationWriter: {

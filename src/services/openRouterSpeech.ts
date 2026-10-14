@@ -7,6 +7,7 @@ import {
   type OpenRouterSpeechWireRequest,
 } from './openRouterSpeechWire';
 import { getOpenRouterSpeechProfile, isOpenRouterSpeechModelProfile } from '../transcription/openRouterSpeechProfiles';
+import type { ProviderCancellationRetry, ProviderResponseLifetime } from './providerResponseLifetime';
 
 export const OPENROUTER_SPEECH_REQUEST_DEADLINE_MS = 120_000;
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -36,20 +37,14 @@ export interface OpenRouterSpeechClientDependencies {
   /** Owns the complete request and response callback until it actually settles. */
   readonly withRequestOwnership: <T>(actualRequest: () => Promise<T>) => Promise<T>;
   /** Production transports keep their response private and await actual cancellation acknowledgement. */
-  readonly withResponseLifetime?: <T>(
-    input: string,
-    init: RequestInit,
-    consumeResponse: (response: Response) => Promise<T>,
-    onCancelPending?: (retryCancel: () => Promise<void>) => void,
-    beforeStart?: () => void,
-  ) => Promise<T>;
+  readonly withResponseLifetime?: ProviderResponseLifetime;
   /** Closed tests and non-native platforms may provide an ordinary fetcher. */
   readonly fetcher?: typeof fetch;
   readonly readCredentialSnapshot: () => Promise<OpenRouterSpeechCredentialSnapshot>;
   readonly assertCredentialGeneration: (expectedGeneration: number) => void;
   /** Synchronous, source-and-workspace fence immediately before the one POST. */
   readonly assertBeforeStart: () => void;
-  readonly onCancelPending?: (operationId: string, retryCancel: () => Promise<void>) => void;
+  readonly onCancelPending?: (operationId: string, retryCancel: ProviderCancellationRetry) => void;
   readonly deadlineMs?: number;
 }
 
@@ -65,7 +60,7 @@ export interface OpenRouterSpeechCall {
 
 /** One fixed OpenRouter transcription POST. This client never retries, chunks, or estimates duration/cost. */
 export class OpenRouterSpeechClient {
-  private readonly pendingCleanup = new Map<string, () => Promise<void>>();
+  private readonly pendingCleanup = new Map<string, ProviderCancellationRetry>();
   private readonly cleanupRuns = new Map<string, Promise<void>>();
 
   constructor(private readonly dependencies: OpenRouterSpeechClientDependencies) {}
@@ -207,8 +202,11 @@ export class OpenRouterSpeechClient {
     return run;
   }
 
-  private rememberCleanup(operationId: string, retryCancel: () => Promise<void>): void {
+  private rememberCleanup(operationId: string, retryCancel: ProviderCancellationRetry): void {
     this.pendingCleanup.set(operationId, retryCancel);
+    retryCancel.subscribeSettled?.(() => {
+      if (this.pendingCleanup.get(operationId) === retryCancel) this.pendingCleanup.delete(operationId);
+    });
     try { this.dependencies.onCancelPending?.(operationId, retryCancel); } catch { /* The same retry handle remains available locally. */ }
   }
 

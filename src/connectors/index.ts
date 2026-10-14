@@ -2,6 +2,7 @@ import type { Account, AccountCapability, EmailProposalPayload, EventProposalPay
 import { canonicalMailReplySource, replyReferences as frozenReplyReferences, validateReplyBinding, type MailReplyProvenance } from '../mailReply';
 import { boundGraphText, extractGmailMessageText, extractGraphHtmlText, type MailTextCompleteness, type MailTextRepresentation } from './mailText';
 import { scopeGrantsCapability } from './oauth';
+import type { ProviderResponseLifetime } from '../services/providerResponseLifetime';
 
 const GOOGLE_API = 'https://gmail.googleapis.com/gmail/v1/users/me';
 const GOOGLE_CALENDAR = 'https://www.googleapis.com/calendar/v3';
@@ -60,6 +61,7 @@ export interface ConnectorDependencies {
   isConnectionCurrent?: (account: Account) => boolean;
   /** Holds the independent privacy writer lease through the raw provider request and full response read. */
   withProviderOwnership?: <T>(actual: () => Promise<T>) => Promise<T>;
+  withResponseLifetime?: ProviderResponseLifetime;
 }
 
 export interface ApprovedDispatch {
@@ -637,24 +639,34 @@ export class ConnectorClient {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const forwardAbort = () => controller.abort(outerSignal?.reason);
     try {
+      // Reject a caller-cancelled request before asking the platform transport to admit it.
       if (outerSignal?.aborted) throw new Error('Provider request was cancelled.');
       outerSignal?.addEventListener('abort', forwardAbort, { once: true });
-      guard?.();
-      beforeDispatch?.();
-      onDispatched?.();
-      if (outerSignal?.aborted) throw new Error('Provider request was cancelled.');
       timer = setTimeout(() => controller.abort(), timeout);
-      const response = await this.fetcher(input, { ...init, signal: controller.signal });
-      const declaredLength = response.headers.get('content-length');
-      if (responseByteLimit && declaredLength && /^\d+$/.test(declaredLength) && Number(declaredLength) > responseByteLimit) {
-        // Keep provider ownership until the response stream has actually settled its cancellation.
-        try { await response.body?.cancel(); } catch { /* Cancellation rejection is still a bounded oversized response. */ }
-        throw new ProviderResponseTooLargeError();
-      }
-      // Fetch has already buffered native response bytes when arrayBuffer resolves; this is an application parsing bound, not a network-memory cap.
-      const bytes = await response.arrayBuffer();
-      if (responseByteLimit && bytes.byteLength > responseByteLimit) throw new ProviderResponseTooLargeError();
-      return new Response(response.status === 204 || response.status === 205 || response.status === 304 ? null : bytes, { status: response.status, statusText: response.statusText, headers: response.headers });
+      const consume = async (response: Response): Promise<Response> => {
+        const declaredLength = response.headers.get('content-length');
+        if (responseByteLimit && declaredLength && /^\d+$/.test(declaredLength) && Number(declaredLength) > responseByteLimit) {
+          // Keep the platform lifetime and provider writer until stream cancellation settles.
+          try { await response.body?.cancel(); } catch { /* Preserve the bounded oversized-response error. */ }
+          throw new ProviderResponseTooLargeError();
+        }
+        // Fetch may buffer native response bytes before arrayBuffer resolves; this remains a parse bound.
+        const bytes = await response.arrayBuffer();
+        if (responseByteLimit && bytes.byteLength > responseByteLimit) throw new ProviderResponseTooLargeError();
+        return new Response(response.status === 204 || response.status === 205 || response.status === 304 ? null : bytes,
+          { status: response.status, statusText: response.statusText, headers: response.headers });
+      };
+      const beforeStart = () => {
+        if (outerSignal?.aborted) throw new Error('Provider request was cancelled.');
+        guard?.();
+        beforeDispatch?.();
+        onDispatched?.();
+      };
+      const lifetime = this.deps.withResponseLifetime ?? (async (requestInput, requestInit, consumeResponse, _onCancelPending, beforeRequestStart) => {
+        beforeRequestStart?.();
+        return consumeResponse(await this.fetcher(requestInput, requestInit));
+      });
+      return await lifetime(input, { ...init, signal: controller.signal }, consume, undefined, beforeStart);
     }
     finally { if (timer) clearTimeout(timer); outerSignal?.removeEventListener('abort', forwardAbort); }
   }
@@ -720,7 +732,7 @@ export class ConnectorClient {
   }
 
   /** Verifies provider resource identity before an OAuth result is persisted by the caller. */
-  async verifyOAuthIdentity(result: OAuthBridgeResult, token: StoredOAuthToken): Promise<boolean> {
+  async verifyOAuthIdentity(result: OAuthBridgeResult, token: StoredOAuthToken, assertCurrent?: RequestGuard): Promise<boolean> {
     const clientId = result.provider === 'google' ? this.deps.googleClientId : this.deps.microsoftClientId;
     const known = new Set<AccountCapability>(['mail.read', 'mail.draft', 'mail.send', 'calendar.read', 'calendar.write']);
     const requested = new Set(result.requestedCapabilities);
@@ -733,7 +745,8 @@ export class ConnectorClient {
     if (requested.has('calendar.write') && !requested.has('calendar.read')) return false;
     const temporaryAccount: Account = { id: 'oauth-verification', provider: result.provider, displayName: '', email: '', connected: true,
       authStatus: 'connected', identity: result.identity, tokenRef: 'oauth-verification' };
-    return this.verifyIdentity(temporaryAccount, token);
+    assertCurrent?.();
+    return this.verifyIdentity(temporaryAccount, token, assertCurrent);
   }
 
   private async reauth(account: Account, status: Account['authStatus'], message: string): Promise<never> {

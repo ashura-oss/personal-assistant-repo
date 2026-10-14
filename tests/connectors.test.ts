@@ -1037,7 +1037,7 @@ describe('provider connector clients', () => {
   });
 
   it('exchanges mocked PKCE codes only at fixed endpoints and intersects requested and granted capabilities', async () => {
-    const fetcherMock = vi.fn(async (url: RequestInfo | URL) => {
+    const fetcherMock = vi.fn(async (url: RequestInfo | URL, _init?: RequestInit) => {
       const path = String(url);
       if (path === 'https://oauth2.googleapis.com/token') return response({ access_token: 'fresh', refresh_token: 'refresh', expires_in: 3600, scope: 'openid profile email https://www.googleapis.com/auth/gmail.compose' });
       if (path === 'https://openidconnect.googleapis.com/v1/userinfo') return response({ sub: 'stable-user', name: 'Test Person', email: 'test@example.test', email_verified: true });
@@ -1053,6 +1053,41 @@ describe('provider connector clients', () => {
     expect(fetcherMock.mock.calls.map(([url]) => String(url))).toEqual([
       'https://oauth2.googleapis.com/token', 'https://openidconnect.googleapis.com/v1/userinfo',
     ]);
+  });
+
+  it('holds OAuth provider ownership and response lifetime separately for each HTTP exchange', async () => {
+    const fetcherMock = vi.fn(async (url: RequestInfo | URL, _init?: RequestInit) => {
+      const path = String(url);
+      if (path === 'https://oauth2.googleapis.com/token') return response({ access_token: 'fresh', refresh_token: 'refresh', expires_in: 3600, scope: 'openid profile email' });
+      if (path === 'https://openidconnect.googleapis.com/v1/userinfo') return response({ sub: 'stable-user', name: 'Test Person' });
+      throw new Error('Unexpected endpoint');
+    });
+    let activeOwnership = 0;
+    let maximumOwnership = 0;
+    let ownershipCalls = 0;
+    let lifetimeCalls = 0;
+    const ownership = async <T>(actual: () => Promise<T>) => {
+      ownershipCalls += 1;
+      activeOwnership += 1;
+      maximumOwnership = Math.max(maximumOwnership, activeOwnership);
+      try { return await actual(); }
+      finally { activeOwnership -= 1; }
+    };
+    const exchange = await exchangeAuthorizationCode({ provider: 'google', clientId: '123.apps.googleusercontent.com', redirectUri: 'com.googleusercontent.apps.123:/oauthredirect',
+      requestedCapabilities: [] }, { authorizationCode: 'temporary-code', codeVerifier: 'A'.repeat(43), requestedScopes: ['openid', 'profile', 'email'] }, {
+      fetcher: fetcherMock as typeof fetch,
+      withProviderOwnership: ownership,
+      withResponseLifetime: async (input, init, consume, _onCancel, beforeStart) => {
+        lifetimeCalls += 1;
+        beforeStart?.();
+        return consume(await fetcherMock(input, init));
+      },
+    });
+    expect(exchange.result.identity.subject).toBe('stable-user');
+    expect(ownershipCalls).toBe(2);
+    expect(lifetimeCalls).toBe(2);
+    expect(maximumOwnership).toBe(1);
+    expect(activeOwnership).toBe(0);
   });
 
   it('fails before network access for malformed PKCE and fails closed when providers omit granted scopes', async () => {

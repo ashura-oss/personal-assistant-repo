@@ -7,6 +7,11 @@ import type { BackgroundTaskBackend, BackgroundTaskExpirationSubscription } from
 import type { LegacyReminderCancellation, ReminderIntent } from '../reminders';
 import type { PrivacyService, PrivacyWorkspaceSession } from './service';
 import type { PrivacyWriterDescriptor, PrivacyWriterScope } from './types';
+import { providerTransportWithResponseLifetime } from '../services/providerTransport';
+import {
+  createTrackedProviderResponseLifetime, providerCleanupRegistry,
+  type ProviderCleanupItem, type ProviderPurpose, type ProviderResponseLifetime,
+} from '../services/providerResponseLifetime';
 
 const CREDENTIAL_KEYS = new Set(['azure.speech.subscription-key', 'azure.openai.api-key', 'openrouter.api-key']);
 
@@ -170,11 +175,22 @@ export interface PrivacyResourceBoundary extends PrivacyResourceBinding {
   /** Holds one notifications writer through the supplied raw mail-alert I/O and its scoped receipt updates. */
   withMailAlertNotificationWriter<T>(actual: (scope: PrivacyWriterScope) => Promise<T>): Promise<T>;
   withProviderOwnership<T>(actual: () => Promise<T>): Promise<T>;
+  withResponseLifetimeFor(purpose: ProviderPurpose): ProviderResponseLifetime;
+  readonly providerCleanup: Readonly<{
+    getPending(): readonly ProviderCleanupItem[];
+    subscribe(listener: (pending: readonly ProviderCleanupItem[]) => void): () => void;
+    retryCancellation(id: string): Promise<void>;
+  }>;
 }
 
 /** Creates narrow adapters over the independent privacy control service and one opened workspace. */
 export function createPrivacyResourceBoundary(input: PrivacyResourceBinding): PrivacyResourceBoundary {
   const binding = snapshotBinding(input);
+  const cleanup = Object.freeze({
+    getPending: providerCleanupRegistry.getPending,
+    subscribe: providerCleanupRegistry.subscribe,
+    retryCancellation: providerCleanupRegistry.retryCancellation,
+  });
   return Object.freeze({
     ...binding,
     credentialStore: (raw: CredentialStore) => createPrivacyBoundCredentialStore(raw, binding),
@@ -190,5 +206,7 @@ export function createPrivacyResourceBoundary(input: PrivacyResourceBinding): Pr
         return result;
       }),
     withProviderOwnership: <T>(actual: () => Promise<T>) => underWriter(binding, { kind: 'provider_credential', namespace: 'provider_credentials' }, actual),
+    withResponseLifetimeFor: (purpose: ProviderPurpose) => createTrackedProviderResponseLifetime(providerTransportWithResponseLifetime, purpose),
+    providerCleanup: cleanup,
   });
 }

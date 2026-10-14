@@ -10,6 +10,8 @@ import {
 } from '../src/services/openRouter';
 import type { PrivacyControlState, PrivacyControlStore, PrivacyEraseAdapter, PrivacyOwner } from '../src/privacy/types';
 import type { AppSettings, Note } from '../src/core';
+import { AppControllerImpl } from '../src/services/controller';
+import { createProviderCleanupRegistry, createTrackedProviderResponseLifetime } from '../src/services/providerResponseLifetime';
 
 vi.mock('expo', () => ({ requireOptionalNativeModule: () => null }));
 
@@ -72,6 +74,28 @@ describe('OpenRouter Batch client', () => {
     expect(envelope.completion_window).toBe('24h');
     expect(envelope.requests).toEqual([{ custom_id: operationId, body: JSON.parse(requestBody) }]);
     expect(result).toEqual({ batchId: 'batch_fixture_1', status: 'validating', endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH, model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h', total: 1, completed: 0, failed: 0 });
+  });
+
+  it('clears the controller Batch cleanup view when its tracked request settles naturally', async () => {
+    const app = new AppControllerImpl();
+    const registry = createProviderCleanupRegistry();
+    const retryRaw = vi.fn(async () => undefined);
+    const lifetime = createTrackedProviderResponseLifetime(async (_input, _init, consume, onCancel, beforeStart) => {
+      beforeStart?.();
+      onCancel?.(retryRaw);
+      return consume(acceptedBatch('batch_natural_settlement'));
+    }, 'openrouter_batch', registry);
+    const client = new OpenRouterBatchClient({
+      withRequestOwnership: async (work) => work(), withResponseLifetime: lifetime,
+      readCredentialSnapshot: async () => ({ key: 'fictional-key', generation: 3 }),
+      assertCredentialGeneration: (generation) => { if (generation !== 3) throw new Error('stale'); },
+      assertBeforeStart: () => undefined,
+      onCancelPending: (id, retry) => app.rememberOpenRouterBatchCleanup(id, retry),
+    });
+    await expect(client.submit({ operationId, requestBody }, async () => undefined)).resolves.toMatchObject({ batchId: 'batch_natural_settlement' });
+    expect(registry.getPending()).toEqual([]);
+    await expect(app.retryAssistantBatchCleanup(operationId)).rejects.toThrow(/saved Batch job was not found/i);
+    expect(retryRaw).not.toHaveBeenCalled();
   });
 
   it('accepts a profile-2 note body through the actual client and sends one fixed POST', async () => {

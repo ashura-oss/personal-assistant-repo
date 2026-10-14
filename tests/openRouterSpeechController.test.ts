@@ -1,10 +1,30 @@
 import { describe, expect, it, vi } from 'vitest';
+import { createHash, randomUUID } from 'node:crypto';
 import type { AppState, Note } from '../src/core';
 import type { PreparedSpeechAudio, SpeechAudioService } from '../src/audio/speechUpload.types';
 import { AppControllerImpl } from '../src/services/controller';
 import { OpenRouterSpeechAdapter } from '../src/services/openRouterSpeechAdapter';
 import { OpenRouterSpeechClient } from '../src/services/openRouterSpeech';
 import type { StateStore } from '../src/storage/contracts';
+
+const transportHarness = vi.hoisted(() => ({
+  run: undefined as ((...args: unknown[]) => Promise<unknown>) | undefined,
+}));
+vi.mock('../src/services/providerTransport', () => ({
+  providerTransportFetch: (...args: unknown[]) => globalThis.fetch(...args as [RequestInfo | URL, RequestInit?]),
+  providerTransportWithResponseLifetime: (...args: unknown[]) => transportHarness.run?.(...args),
+}));
+vi.mock('expo', () => ({ requireOptionalNativeModule: () => undefined }));
+vi.mock('expo-crypto', async () => ({
+  CryptoDigestAlgorithm: { SHA256: 'SHA-256' },
+  randomUUID,
+  async digest(_algorithm: unknown, data: ArrayBuffer) {
+    const bytes = createHash('sha256').update(Buffer.from(data)).digest();
+    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+  },
+  async digestStringAsync(_algorithm: unknown, value: string) { return createHash('sha256').update(value).digest('hex'); },
+}));
+vi.mock('react-native', () => ({ Platform: { OS: 'web' } }));
 
 class MemoryStore implements StateStore {
   value?: AppState;
@@ -35,6 +55,62 @@ function makeAudio(): SpeechAudioService {
 }
 
 describe('OpenRouter speech controller integration', () => {
+  it('clears production speech cleanup status when its tracked response settles naturally', async () => {
+    const { createProductionWorkspace } = await import('../src/services/controller');
+    const { createEmptyPrivacyControlState } = await import('../src/privacy/schema');
+    const { createPrivacyService } = await import('../src/privacy/service');
+    const { createNativePrivacyArbitration } = await import('../src/privacy/arbitration');
+    let control = createEmptyPrivacyControlState('00000000-0000-4000-8000-000000000011');
+    const privacy = createPrivacyService({
+      controlStore: {
+        async read() { return structuredClone(control); },
+        async compareAndSwap(revision, next) {
+          if (revision !== control.revision) throw new Error('privacy revision conflict');
+          control = structuredClone(next);
+        },
+      },
+      arbitration: createNativePrivacyArbitration({ getRuntimeOwner: async () => ({ platform: 'web', runtimeId: '00000000-0000-4000-8000-000000000012' }) }),
+      eraseAdapter: { async erase() {}, async verifyGone() { return true; } },
+    });
+    const session = await privacy.openWorkspace();
+    const store = new MemoryStore();
+    const audio = makeAudio();
+    audio.prepare = vi.fn(async (_note, options): Promise<PreparedSpeechAudio> => ({
+      leaseId: options.leaseId, platform: 'web', format: 'm4a', mimeType: 'audio/mp4', byteLength: audioBytes.byteLength,
+      sha256: createHash('sha256').update(Buffer.from(audioBytes)).digest('hex'), durationSeconds: 4.125,
+      upload: { blob: new Blob([audioBytes], { type: 'audio/mp4' }), fileName: 'clip.m4a' },
+    }));
+    const credentials = {
+      currentSpeechCredentialGeneration: () => 0,
+      assertSpeechCredentialGeneration: () => undefined,
+      readSpeechCredentialSnapshot: async () => ({ key: null, generation: 0 }),
+      currentProviderCredentialGeneration: () => 0,
+      assertProviderCredentialGeneration: () => undefined,
+      readProviderCredentialSnapshot: async () => ({ key: 'fictional-key', generation: 1 }),
+      getCredentials: async () => ({ speechConfigured: false, openAiConfigured: false, openRouterConfigured: true }),
+      readProviderCredential: async () => 'fictional-key',
+      setCredentials: async () => ({ speechConfigured: false, openAiConfigured: false, openRouterConfigured: true }),
+      deleteCredentials: async () => ({ speechConfigured: false, openAiConfigured: false, openRouterConfigured: false }),
+    };
+    transportHarness.run = async (_input, _init, consume, onCancelPending, beforeStart) => {
+      (beforeStart as (() => void) | undefined)?.();
+      (onCancelPending as ((retry: () => Promise<void>) => void) | undefined)?.(async () => undefined);
+      return (consume as (response: Response) => Promise<unknown>)(response({ text: 'Production speech response.', usage: { cost: 0, total_tokens: 3 } }));
+    };
+    try {
+      const workspace = await createProductionWorkspace({ privacy, session, store, credentials, integration: { speechAudioService: audio, writeDocument: async () => undefined } });
+      await workspace.controller.load();
+      const note = await workspace.controller.saveNote({ transcript: 'Captured audio.', audioUri: 'file:///private/documents/recording-production.m4a', durationSeconds: 4.125 });
+      await workspace.controller.saveSettings({ speechEnabled: true, speechProvider: 'openrouter' });
+
+      await expect(workspace.controller.transcribeNote(note.id, { expectedRevision: note.revision }))
+        .resolves.toMatchObject({ transcript: 'Production speech response.' });
+      expect(workspace.controller.getSnapshot()).not.toHaveProperty('transcriptionRequestCleanupPending');
+    } finally {
+      transportHarness.run = undefined;
+    }
+  });
+
   it('persists one provider-specific attempt before POST and keeps actual zero cost without Azure estimates', async () => {
     const store = new MemoryStore();
     const audio = makeAudio();

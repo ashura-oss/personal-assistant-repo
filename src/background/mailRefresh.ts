@@ -81,8 +81,8 @@ function fixedOutcome(status: BackgroundMailRefreshOutcome['status'], attempted:
 export function createBackgroundMailRefreshEngine(dependencies: BackgroundMailRefreshEngineDependencies) {
   const session: PrivacyWorkspaceSession = Object.freeze({ epoch: dependencies.session.epoch, runtimeId: dependencies.session.runtimeId });
   const now = dependencies.now ?? (() => new Date());
-  const createConnector = dependencies.connectorFactory ?? ((tokenStore: OAuthTokenStore, withProviderOwnership) =>
-    new ConnectorClient({ tokenStore, withProviderOwnership }));
+  const createConnector = dependencies.connectorFactory ?? ((tokenStore: OAuthTokenStore, withProviderOwnership, withResponseLifetime) =>
+    new ConnectorClient({ tokenStore, withProviderOwnership, withResponseLifetime }));
 
   return Object.freeze({
     async run(parentSignal?: AbortSignal): Promise<BackgroundMailRefreshOutcome> {
@@ -196,7 +196,7 @@ export function createBackgroundMailRefreshEngine(dependencies: BackgroundMailRe
           assertActive();
           await store.save(reservation);
         });
-        const connector = createConnector(dependencies.tokenStore, dependencies.withProviderOwnership);
+        const connector = createConnector(dependencies.tokenStore, dependencies.withProviderOwnership, dependencies.withResponseLifetime);
         for (const candidate of selected) {
           if (controller.signal.aborted) { skipped += selected.length - completed - failed; break; }
           const guard = () => {

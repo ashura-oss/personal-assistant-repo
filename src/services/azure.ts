@@ -5,6 +5,7 @@ import { assertSpeechCredentialGeneration, currentSpeechCredentialGeneration, re
 import { speechAudioService } from '../audio/speechUpload';
 import type { PreparedSpeechAudio, SpeechAudioService } from '../audio/speechUpload.types';
 import { SPEECH_MAX_AUDIO_BYTES, SPEECH_MAX_AUDIO_SECONDS, SPEECH_MAX_RESPONSE_BYTES, SPEECH_MAX_TRANSCRIPT_BYTES, SpeechTranscriptionError, validateSpeechAudioSnapshot, type SpeechTranscriptionResult } from '../transcription';
+import type { ProviderResponseLifetime } from './providerResponseLifetime';
 
 export type FetchLike = typeof fetch;
 const SPEECH_API_VERSION = '2025-10-15';
@@ -79,6 +80,8 @@ class HttpProviderError extends Error {
   constructor(message: string, readonly retryable: boolean, readonly retryAfterMs?: number) { super(message); }
 }
 
+class HttpProviderResponseParseError extends Error {}
+
 export interface AzureSpeechClientOptions {
   fetcher?: FetchLike;
   readKey?: () => Promise<string | null>;
@@ -88,6 +91,8 @@ export interface AzureSpeechClientOptions {
   audio?: SpeechAudioService;
   /** Holds the actual upload/response promise, not the UI deadline race. */
   withRequestOwnership?: <T>(actualRequest: () => Promise<T>) => Promise<T>;
+  /** Holds native fetch and complete response consumption under the shared transport lifetime. */
+  withResponseLifetime?: ProviderResponseLifetime;
   randomUUID?: () => string;
   deadlineMs?: number;
 }
@@ -196,34 +201,42 @@ export class AzureSpeechClient {
       const onSignalAbort = () => { abort(); rejectAbort?.(signal?.reason ?? new Error('Speech transcription was cancelled.')); };
       const aborted = signal ? new Promise<never>((_, reject) => { rejectAbort = reject; }) : new Promise<never>(() => undefined);
       const deadline = new Promise<never>((_, reject) => { rejectDeadline = reject; });
-      const rawPromise = (this.options.withRequestOwnership ?? (async (actual: () => Promise<{ transcript: string; durationMilliseconds: number | null }>) => actual()))(async () => {
-        // Final synchronous fence runs after ownership is acquired and immediately before fetch.
-        if (signal?.aborted) fail('Speech transcription was cancelled before upload.', 'cancelled');
-        try { beforeDispatch?.(prepared!); }
-        catch (error) { throw new SpeechTranscriptionError('The note, audio, settings, or claim changed before upload. No audio was sent.', 'pre_dispatch', false, undefined, { cause: error }); }
-        try { (this.options.assertCredentialGeneration ?? assertSpeechCredentialGeneration)(credentialSnapshot.generation); }
-        catch { fail('The Azure Speech credential changed before upload.', 'stale_credential'); }
+      const responseLifetime = this.options.withResponseLifetime ?? (async (input, init, consume, _onCancelPending, beforeStart) => {
+        beforeStart?.();
+        return consume(await this.fetcher(input, init));
+      });
+      const rawPromise = (this.options.withRequestOwnership ?? (async (actualRequest: () => Promise<{ transcript: string; durationMilliseconds: number | null }>) => actualRequest()))(async () => {
+        // Reserve this client before platform normalization so parallel calls cannot race into admission.
         if (this.rawPostInFlight) fail('Another speech upload started before this request could be dispatched.', 'pre_dispatch');
         this.rawPostInFlight = true;
         this.activeRawLeaseId = leaseId;
         signal?.addEventListener('abort', onSignalAbort, { once: true });
         if (signal?.aborted) onSignalAbort();
         timer = setTimeout(() => { controller.abort(new Error('Speech transcription timed out.')); rejectDeadline?.(new SpeechDeadlineError()); }, deadlineMs);
-        try {
-          let response: Response;
-          try {
-            // Calling fetch is the dispatch boundary. Ownership stays held through body parsing.
-            dispatched = true;
-            response = await this.fetcher(`${endpoint}/speechtotext/transcriptions:transcribe?api-version=${SPEECH_API_VERSION}`, {
-              method: 'POST', headers: { 'Ocp-Apim-Subscription-Key': credentialSnapshot.key! }, body: form, signal: controller.signal, redirect: 'error',
-            });
-          } catch { throw new SpeechNetworkError('Speech request could not be completed.'); }
+        const beforeStart = () => {
+          if (signal?.aborted) fail('Speech transcription was cancelled before upload.', 'cancelled');
+          try { beforeDispatch?.(prepared!); }
+          catch (error) { throw new SpeechTranscriptionError('The note, audio, settings, or claim changed before upload. No audio was sent.', 'pre_dispatch', false, undefined, { cause: error }); }
+          try { (this.options.assertCredentialGeneration ?? assertSpeechCredentialGeneration)(credentialSnapshot.generation); }
+          catch { fail('The Azure Speech credential changed before upload.', 'stale_credential'); }
+          dispatched = true;
+        };
+        const consume = async (response: Response): Promise<{ transcript: string; durationMilliseconds: number | null }> => {
           if (!response.ok) {
             try { await response.body?.cancel(); } catch { /* The actual request still settles before ownership is released. */ }
             throw new SpeechHttpResponseError(response.status);
           }
           try { return await readSpeechResponse(response); }
           catch (error) { if (error instanceof SpeechResponseError) throw error; throw new SpeechResponseError('Speech response could not be parsed.', undefined, { cause: error }); }
+        };
+        try {
+          return await responseLifetime(`${endpoint}/speechtotext/transcriptions:transcribe?api-version=${SPEECH_API_VERSION}`, {
+            method: 'POST', headers: { 'Ocp-Apim-Subscription-Key': credentialSnapshot.key! }, body: form, signal: controller.signal, redirect: 'error',
+          }, consume, undefined, beforeStart);
+        } catch (error) {
+          if (error instanceof SpeechTranscriptionError || error instanceof SpeechHttpResponseError || error instanceof SpeechResponseError) throw error;
+          if (!dispatched) throw error;
+          throw new SpeechNetworkError('Speech request could not be completed.');
         } finally {
           if (timer !== undefined) clearTimeout(timer);
           signal?.removeEventListener('abort', onSignalAbort);
@@ -489,6 +502,7 @@ export class AzureOpenAIClient {
     fetcher: FetchLike = fetch,
     private readonly readKey: () => Promise<string | null> = () => readProviderCredential('openai'),
     private readonly withRequestOwnership: <T>(actualRequest: () => Promise<T>) => Promise<T> = async (actualRequest) => actualRequest(),
+    private readonly withResponseLifetime?: ProviderResponseLifetime,
   ) { this.fetcher = fetcher; }
 
   /** One explicit Generate call. It preflights the whole request before reading credentials or reserving usage. */
@@ -528,51 +542,59 @@ export class AzureOpenAIClient {
     let fetchStarted = false;
     try {
       responseData = await this.withRequestOwnership(() => withTimeout(60_000, undefined, async (signal) => {
-        try { beforeDispatch?.(); }
-        catch (error) { throw new ReplyGenerationPreDispatchError(error instanceof Error ? error.message : 'The selected context changed before sending.'); }
-        fetchStarted = true;
-        const response = await this.fetcher(`${endpoint}/openai/v1/responses?api-version=v1`, {
+        const beforeStart = () => {
+          try { beforeDispatch?.(); }
+          catch (error) { throw new ReplyGenerationPreDispatchError(error instanceof Error ? error.message : 'The selected context changed before sending.'); }
+          fetchStarted = true;
+        };
+        const consume = async (response: Response): Promise<{ response: Response; result?: unknown; parseError?: boolean }> => {
+          if (!response.ok) {
+            try { await response.body?.cancel(); } catch { /* Keep ownership through the cancellation attempt. */ }
+            return { response };
+          }
+          const contentLength = Number(response.headers.get('content-length'));
+          if (Number.isFinite(contentLength) && contentLength > 256 * 1024) {
+            try { await response.body?.cancel(); } catch { /* Keep the fixed response-size result. */ }
+            return { response, parseError: true };
+          }
+          const chunks: Uint8Array[] = [];
+          let totalBytes = 0;
+          if (response.body) {
+            const reader = response.body.getReader();
+            try {
+              while (true) {
+                const chunk = await reader.read();
+                if (chunk.done) break;
+                totalBytes += chunk.value.byteLength;
+                if (totalBytes > 256 * 1024) {
+                  await reader.cancel();
+                  return { response, parseError: true };
+                }
+                chunks.push(chunk.value);
+              }
+            } finally { reader.releaseLock(); }
+          } else {
+            const bytes = new Uint8Array(await response.arrayBuffer());
+            totalBytes = bytes.byteLength;
+            if (totalBytes > 256 * 1024) return { response, parseError: true };
+            chunks.push(bytes);
+          }
+          const bytes = new Uint8Array(totalBytes);
+          let offset = 0;
+          for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+          try {
+            const decoded = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+            return { response, result: JSON.parse(decoded) as unknown };
+          } catch { return { response, parseError: true }; }
+        };
+        const lifetime = this.withResponseLifetime ?? (async (requestInput, requestInit, consumeResponse, _onCancelPending, beforeRequestStart) => {
+          beforeRequestStart?.();
+          return consumeResponse(await this.fetcher(requestInput, requestInit));
+        });
+        return lifetime(`${endpoint}/openai/v1/responses?api-version=v1`, {
           // Fetch invocation is the provider dispatch boundary; ownership remains held through body parsing.
           method: 'POST', headers: { 'api-key': key, 'Content-Type': 'application/json' }, body, signal, redirect: 'error',
-        });
-        if (!response.ok) {
-          try { await response.body?.cancel(); } catch { /* Hold request ownership through the cancellation attempt. */ }
-          return { response };
-        }
-        const contentLength = Number(response.headers.get('content-length'));
-        if (Number.isFinite(contentLength) && contentLength > 256 * 1024) {
-          try { await response.body?.cancel(); } catch { /* Keep the fixed response-size result. */ }
-          return { response, parseError: true };
-        }
-        const chunks: Uint8Array[] = [];
-        let totalBytes = 0;
-        if (response.body) {
-          const reader = response.body.getReader();
-          try {
-            while (true) {
-              const chunk = await reader.read();
-              if (chunk.done) break;
-              totalBytes += chunk.value.byteLength;
-              if (totalBytes > 256 * 1024) {
-                await reader.cancel();
-                return { response, parseError: true };
-              }
-              chunks.push(chunk.value);
-            }
-          } finally { reader.releaseLock(); }
-        } else {
-          const bytes = new Uint8Array(await response.arrayBuffer());
-          totalBytes = bytes.byteLength;
-          if (totalBytes > 256 * 1024) return { response, parseError: true };
-          chunks.push(bytes);
-        }
-        const bytes = new Uint8Array(totalBytes);
-        let offset = 0;
-        for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
-        try {
-          const decoded = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-          return { response, result: JSON.parse(decoded) as unknown };
-        } catch { return { response, parseError: true }; }
+        }, consume, undefined, beforeStart);
       }));
     } catch (error) {
       if (error instanceof ReplyGenerationPreDispatchError) throw error;
@@ -650,20 +672,32 @@ export class AzureOpenAIClient {
     const result = await retry(settings.maxAttempts, signal, onAttempt, async (requestSignal) => this.withRequestOwnership(async () => {
       attempts += 1;
       if (requestSignal.aborted) throw requestSignal.reason ?? new Error('Provider request cancelled.');
-      let response: Response;
       try {
-        response = await this.fetcher(`${endpoint}/openai/v1/responses?api-version=v1`, {
-          method: 'POST', headers: { 'api-key': key, 'Content-Type': 'application/json' }, body, signal: requestSignal, redirect: 'error',
+        const consume = async (received: Response) => {
+          if (!received.ok) {
+            try { await received.body?.cancel(); } catch { /* Keep the provider status while owning cancellation. */ }
+            throw new HttpProviderError(`Azure OpenAI returned HTTP ${received.status}.`, received.status === 429 || received.status >= 500, retryDelay(received.headers.get('retry-after')));
+          }
+          let result: { output?: { type?: string; content?: { type?: string; text?: string }[] }[]; usage?: { input_tokens?: number; output_tokens?: number } };
+          try { result = await received.json() as typeof result; }
+          catch { throw new HttpProviderResponseParseError('Azure OpenAI returned malformed JSON.'); }
+          return { response: received, result };
+        };
+        const lifetime = this.withResponseLifetime ?? (async (requestInput, requestInit, consumeResponse, _onCancelPending, beforeRequestStart) => {
+          beforeRequestStart?.();
+          return consumeResponse(await this.fetcher(requestInput, requestInit));
         });
+        const responseData = await lifetime(`${endpoint}/openai/v1/responses?api-version=v1`, {
+          method: 'POST', headers: { 'api-key': key, 'Content-Type': 'application/json' }, body, signal: requestSignal, redirect: 'error',
+        }, consume, undefined, () => {
+          if (requestSignal.aborted) throw requestSignal.reason ?? new Error('Provider request cancelled.');
+        });
+        return responseData.result;
       } catch (error) {
         if (requestSignal.aborted) throw error;
+        if (error instanceof HttpProviderError || error instanceof HttpProviderResponseParseError) throw error;
         throw new HttpProviderError('Azure OpenAI network request failed; its charge status is unknown.', true);
       }
-      if (!response.ok) {
-        try { await response.body?.cancel(); } catch { /* Keep the provider status while owning the cancellation attempt. */ }
-        throw new HttpProviderError(`Azure OpenAI returned HTTP ${response.status}.`, response.status === 429 || response.status >= 500, retryDelay(response.headers.get('retry-after')));
-      }
-      return await response.json() as { output?: { type?: string; content?: { type?: string; text?: string }[] }[]; usage?: { input_tokens?: number; output_tokens?: number } };
     }));
     const responseText = result.output?.flatMap((item) => item.content ?? []).find((part) => part.type === 'output_text')?.text;
     if (!responseText) throw new Error('Azure OpenAI returned no structured analysis.');

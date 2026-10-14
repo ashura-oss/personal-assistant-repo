@@ -26,6 +26,29 @@ async function saveDocumentCurrent(app: AppControllerImpl, path: string, content
 }
 
 describe('application state controller', () => {
+  it('does not retry Azure OpenAI on a successful HTTP response with malformed JSON', async () => {
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store);
+    await app.load();
+    await app.saveSettings({ mode: 'provider', openAiEndpoint: 'https://example.openai.azure.com', openAiDeployment: 'gpt-6-luna', maxAttempts: 2 });
+    const note = await app.saveNote({ transcript: 'Prepare a short summary.' });
+    const fetcher = vi.fn(async () => new Response('{malformed', { status: 200, headers: { 'content-type': 'application/json' } }));
+    const client = new AzureOpenAIClient(fetcher as typeof fetch, async () => 'test-key');
+    const settings = app.getSnapshot().settings;
+    const prepared = await client.prepare(note, [], settings);
+    await expect(client.analyze(note, [], settings, undefined, undefined, {}, prepared)).rejects.toThrow(/malformed JSON/i);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+
+    const replyFetcher = vi.fn(async () => new Response('{malformed', { status: 200, headers: { 'content-type': 'application/json' } }));
+    const replyClient = new AzureOpenAIClient(replyFetcher as typeof fetch, async () => 'test-key');
+    await expect(replyClient.generateReply({
+      sourceText: 'Please review the notes.', sourceRepresentation: 'plain', sourceCompleteness: 'complete_text',
+      subject: 'Notes', to: ['sam@example.test'], cc: [], brief: 'Acknowledge the update.', policyContext: '',
+      asOf: new Date().toISOString(), timeZone: 'UTC',
+    }, settings)).rejects.toThrow(/unreadable|invalid JSON/i);
+    expect(replyFetcher).toHaveBeenCalledTimes(1);
+  });
+
   it('keeps background mailbox refresh consent disabled for malformed legacy state and owns its generation', async () => {
     const store = new MemoryStore();
     const app = new AppControllerImpl(store);
@@ -990,6 +1013,100 @@ describe('application state controller', () => {
     await app.retryCredentialCleanup();
     expect(deleted).toEqual([oldRef]);
     expect(tokens.has(oldRef)).toBe(false);
+    expect(app.getSnapshot().pendingCredentialCleanup).toEqual([]);
+  });
+
+  it('rejects a stale OAuth install intent after workspace load before staging credentials', async () => {
+    const store = new MemoryStore();
+    const tokenSets = vi.fn();
+    const verify = vi.fn(async () => true);
+    const app = new AppControllerImpl(store, {}, {
+      tokenStore: { async get() { return null; }, async set() { tokenSets(); } },
+      clientIds: { google: 'google-client' }, verifyOAuthResult: verify,
+      connectorFactory: () => ({ async verifyOAuthIdentity() { return true; } }) as never,
+    });
+    const result: OAuthBridgeResult = {
+      provider: 'google', accessToken: 'intent-access', refreshToken: 'intent-refresh', expiresAt: Date.now() + 600_000,
+      grantedScopes: ['openid'], requestedCapabilities: [], capabilities: [],
+      identity: { providerNamespace: 'google', clientId: 'google-client', subject: 'intent-subject' }, displayName: 'Intent', email: 'intent@example.test',
+    };
+    let checks = 0;
+    await expect(app.installVerifiedAccount({ provider: 'google', displayName: '', email: '' }, result, {
+      assertCurrent() { checks += 1; if (checks === 2) throw new Error('OAuth install intent is stale.'); },
+    })).rejects.toThrow(/intent is stale/i);
+    expect(tokenSets).not.toHaveBeenCalled();
+    expect(verify).not.toHaveBeenCalled();
+    expect(app.getSnapshot().accounts).toEqual([]);
+    expect(app.getSnapshot().pendingCredentialCleanup).toEqual([]);
+  });
+
+  it('cleans a staged OAuth token when the install intent expires during the secure-store write', async () => {
+    const store = new MemoryStore();
+    const tokens = new Map<string, StoredOAuthToken>();
+    const deleted: string[] = [];
+    let setEntered!: () => void;
+    let releaseSet!: () => void;
+    const entered = new Promise<void>((resolve) => { setEntered = resolve; });
+    const gate = new Promise<void>((resolve) => { releaseSet = resolve; });
+    const verify = vi.fn(async () => true);
+    const app = new AppControllerImpl(store, {}, {
+      tokenStore: {
+        async get(ref: string) { return tokens.get(ref) ? structuredClone(tokens.get(ref)!) : null; },
+        async set(ref: string, token: StoredOAuthToken) { tokens.set(ref, structuredClone(token)); setEntered(); await gate; },
+      },
+      deleteToken: async (ref) => { deleted.push(ref); tokens.delete(ref); },
+      clientIds: { google: 'google-client' }, verifyOAuthResult: verify,
+      connectorFactory: () => ({ async verifyOAuthIdentity() { return true; } }) as never,
+    });
+    await app.load();
+    const result: OAuthBridgeResult = {
+      provider: 'google', accessToken: 'intent-access', refreshToken: 'intent-refresh', expiresAt: Date.now() + 600_000,
+      grantedScopes: ['openid'], requestedCapabilities: [], capabilities: [],
+      identity: { providerNamespace: 'google', clientId: 'google-client', subject: 'intent-subject' }, displayName: 'Intent', email: 'intent@example.test',
+    };
+    let current = true;
+    const pending = app.installVerifiedAccount({ provider: 'google', displayName: '', email: '' }, result, { assertCurrent() { if (!current) throw new Error('OAuth install intent is stale.'); } });
+    await entered;
+    current = false;
+    releaseSet();
+    await expect(pending).rejects.toThrow(/intent is stale/i);
+    expect(verify).not.toHaveBeenCalled();
+    expect(deleted).toHaveLength(1);
+    expect(tokens).toEqual(new Map());
+    expect(app.getSnapshot().accounts).toEqual([]);
+    expect(app.getSnapshot().pendingCredentialCleanup).toEqual([]);
+  });
+
+  it('does not classify its own successful add or reconnect as a stale install intent', async () => {
+    const store = new MemoryStore();
+    const tokens = new Map<string, StoredOAuthToken>();
+    const identity = { providerNamespace: 'google' as const, clientId: 'google-client', subject: 'commit-subject' };
+    const app = new AppControllerImpl(store, {}, {
+      tokenStore: {
+        async get(ref: string) { return tokens.get(ref) ? structuredClone(tokens.get(ref)!) : null; },
+        async set(ref: string, token: StoredOAuthToken) { tokens.set(ref, structuredClone(token)); },
+      },
+      deleteToken: async (ref) => { tokens.delete(ref); },
+      clientIds: { google: 'google-client' }, verifyOAuthResult: async () => true,
+      connectorFactory: () => ({ async verifyOAuthIdentity() { return true; } }) as never,
+    });
+    await app.load();
+    let expectedTokenRef: string | undefined;
+    const assertCapturedAccount = () => {
+      expect(app.getSnapshot().accounts.find((account) => account.identity?.subject === identity.subject)?.tokenRef).toBe(expectedTokenRef);
+    };
+    const makeResult = (accessToken: string): OAuthBridgeResult => ({
+      provider: 'google', accessToken, refreshToken: `${accessToken}-refresh`, expiresAt: Date.now() + 600_000,
+      grantedScopes: ['openid'], requestedCapabilities: [], capabilities: [], identity, displayName: 'Commit', email: 'commit@example.test',
+    });
+    const added = await app.installVerifiedAccount({ provider: 'google', displayName: '', email: '' }, makeResult('first-access'), { assertCurrent: assertCapturedAccount });
+    expect(added.connected).toBe(true);
+    expect(tokens.has(added.tokenRef!)).toBe(true);
+    expectedTokenRef = added.tokenRef;
+    const reconnected = await app.installVerifiedAccount({ id: added.id, provider: 'google', displayName: '', email: '' }, makeResult('second-access'), { assertCurrent: assertCapturedAccount });
+    expect(reconnected.connected).toBe(true);
+    expect(reconnected.tokenRef).not.toBe(expectedTokenRef);
+    expect(tokens.has(reconnected.tokenRef!)).toBe(true);
     expect(app.getSnapshot().pendingCredentialCleanup).toEqual([]);
   });
 

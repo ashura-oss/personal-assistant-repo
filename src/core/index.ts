@@ -981,7 +981,7 @@ export interface AppController {
   activateImportedKnowledgeEntity(input: { sessionId: string; planHash: string; expectedDocumentRevision?: number }): Promise<{ entity: import('../knowledge/types').Person | import('../knowledge/types').Project; document: ContextDocument }>;
   saveSettings(patch: SettingsPatch): Promise<AppSettings>;
   saveAccount(config: AccountConfig): Promise<Account>;
-  installVerifiedAccount(config: AccountConfig, result: OAuthInstallResult): Promise<Account>;
+  installVerifiedAccount(config: AccountConfig, result: OAuthInstallResult, options?: { assertCurrent?: () => void }): Promise<Account>;
   retryCredentialCleanup(): Promise<void>;
   disconnectAccount(id: string): Promise<Account>;
   saveCalendar(config: CalendarConfig): Promise<Calendar>;

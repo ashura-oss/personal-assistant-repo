@@ -1,6 +1,7 @@
 import type { AppSettings, ContextDocument, Note } from '../core';
 import { assistantChatRefinementSchemaV2, assistantResponseSchema, assistantResponseSchemaV2 } from '../assistant';
 import { assistantReplyTextSchema, prepareAssistantWireRequest, type AssistantPrepareRequest, type PreparedAnalysis, type ReplyGenerationInput } from './azure';
+import type { ProviderCancellationRetry, ProviderResponseLifetime } from './providerResponseLifetime';
 
 /** Settings select the fixed Batch listing; each JSONL request uses the base model slug. */
 export const OPENROUTER_BATCH_MODEL = 'openai/gpt-6-luna:batch' as const;
@@ -45,14 +46,8 @@ export interface OpenRouterBatchClientDependencies {
   /** Injected platform transport. Production must supply the platform fetch implementation. */
   readonly fetcher?: typeof fetch;
   /** Keeps the platform request owner open through body parsing and terminal cleanup. */
-  readonly withResponseLifetime?: <T>(
-    input: string,
-    init: RequestInit,
-    consumeResponse: (response: Response) => Promise<T>,
-    onCancelPending?: (retryCancel: () => Promise<void>) => void,
-    beforeStart?: () => void
-  ) => Promise<T>;
-  readonly onCancelPending?: (operationId: string, retryCancel: () => Promise<void>) => void;
+  readonly withResponseLifetime?: ProviderResponseLifetime;
+  readonly onCancelPending?: (operationId: string, retryCancel: ProviderCancellationRetry) => void;
   /** Owns the actual fetch and complete response-body read, including late native settlement. */
   readonly withRequestOwnership: <T>(actualRequest: () => Promise<T>) => Promise<T>;
   readonly readCredentialSnapshot: () => Promise<OpenRouterBatchCredentialSnapshot>;

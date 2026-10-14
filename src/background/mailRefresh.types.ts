@@ -4,6 +4,7 @@ import type { StateStore } from '../storage/contracts';
 import type { PrivacyWriterScope } from '../privacy/types';
 import type { MailAlertNotificationBackend } from '../services/mailAlertNotificationBackend';
 import type { ExistingWorkspaceWriterStore } from '../privacy/workspaceStorage';
+import type { ProviderResponseLifetime } from '../services/providerResponseLifetime';
 
 export type BackgroundMailRefreshOutcome = Readonly<{
   status: 'refreshed' | 'partial' | 'skipped' | 'failed';
@@ -39,6 +40,7 @@ export type BackgroundMailRefreshEngineDependencies = Readonly<{
   createStateStore: () => StateStore;
   tokenStore: OAuthTokenStore;
   withProviderOwnership: <T>(actual: () => Promise<T>) => Promise<T>;
+  withResponseLifetime?: ProviderResponseLifetime;
   /** Optional headless alert execution; automatic runs never request permission. */
   mailAlerts?: Readonly<{
     backend: MailAlertNotificationBackend;
@@ -46,7 +48,7 @@ export type BackgroundMailRefreshEngineDependencies = Readonly<{
     /** Closed deterministic test seam; production leaves this as the platform SHA-256 digest. */
     digest?: (text: string) => Promise<string>;
   }>;
-  connectorFactory?: (tokenStore: OAuthTokenStore, withProviderOwnership: <T>(actual: () => Promise<T>) => Promise<T>) => BackgroundMailConnector;
+  connectorFactory?: (tokenStore: OAuthTokenStore, withProviderOwnership: <T>(actual: () => Promise<T>) => Promise<T>, withResponseLifetime?: ProviderResponseLifetime) => BackgroundMailConnector;
   now?: () => Date;
   uuid?: () => string;
   deadlineMs?: number;
