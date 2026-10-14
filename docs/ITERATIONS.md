@@ -410,3 +410,13 @@ No Phase 44 provider request/API POST occurred; earlier two text and two Speech 
 ## Phase 45 · app icon source/config
 
 Commit `baf4114` adds an editable SVG source and opaque 1024×1024 RGB PNG, referenced by Expo configuration. Root visually approved the render; PNG header/dimensions/opacity, Expo config resolution, and the Phase44 static iOS gate with the icon were checked. Native installation and on-device icon rendering remain unverified.
+
+## Phase 46 · orphan repair and conversation metadata discovery · 2026-10-14
+
+Commits `dd13fe8` and `fd89050` contain the orphan-record repair and connector discovery changes. Orphan repair keeps raw evidence private and non-authoritative, preserves unexpected quarantine-envelope fields, excludes only exact synthetic marker observations from deduplication, and validates true JSON round trips for idempotency. Privacy gates continue to hold remote actions and evidence-destructive cleanup where required. These are automated source/controller checks; no live provider, model, or Speech request was made.
+
+The connector discovery seam reads one bounded Gmail thread metadata response or one Microsoft Graph conversation page. Graph continuation is explicit. The response contains message metadata, optional sent/draft state, and omissions; it does not fetch message bodies. Selected-body reads now return optional Gmail Date and Graph draft/sent-date fields; missing optional dates do not change reply eligibility. A 401 retry preserves the response byte cap and Graph immutable-ID preference. This metadata API is not yet wired into the selected-context composer or Batch submission, so conversation context remains partial and no selection has been submitted to a model.
+
+Root's full suite passed 1,171 tests across 115 files at 15:33:54 SGT in 12.09 seconds; TypeScript and full lint passed with zero errors or warnings. Static iOS configuration passed 10/10 at 15:29, before the final connector-only query change; that change does not affect static configuration. Astra's orphan-repair review passed 17/17 at 15:27:05, and connector review passed 70 tests across two files at 15:33:57. These are distinct scopes, not additive counts. No full Workspace interaction, live provider/OAuth behavior, model usage, native compile/sign/install, or device behavior is claimed.
+
+The existing Mac source ZIP `b4d0e15` predates Phase 46 and does not contain these changes. No updated handoff ZIP is claimed. User-provided model keys used in earlier smokes are not a pending prerequisite for those completed checks; real on-device provider flows still require device credential installation and OAuth app registration. No additional provider/model/Speech call or usage/cost result was produced in this phase.

@@ -204,3 +204,11 @@ Core's focused review passed 126 tests/four files. Earlier Astra backend review 
 ## Phase 45 · app icon source/config
 
 Commit `baf4114` adds an editable SVG and opaque 1024×1024 RGB PNG referenced from Expo configuration. Root visually approved the render; PNG header/dimensions/opacity, config resolution, and the Phase44 static iOS gate with the icon present were checked. This does not establish native installation or on-device icon rendering.
+
+## Phase 46 · orphan repair and conversation metadata seam · 2026-10-14
+
+The orphan repair preserves private raw evidence without granting authority, preserves unexpected quarantine-envelope fields, excludes only exact synthetic marker observations from deduplication, and verifies idempotency through a true JSON save/load round trip. Remote actions and evidence-destructive cleanup remain subject to privacy and quarantine gates. The bounded dispatch-history retirement described in Phase 44 is implemented in source; native persistence and device behavior remain unverified.
+
+Connector discovery returns one bounded Gmail thread metadata response or one explicitly continued Microsoft Graph page. It does not load bodies or issue model requests. Selected-message body reads can now report optional Gmail Date and Graph draft/sent date values; their absence does not change reply-metadata eligibility. Auth-refresh retries preserve the original byte limit, and Graph retries retain immutable message IDs. The discovery seam is not yet integrated with the composer or Batch request, so selected conversation context remains incomplete.
+
+Root's full suite passed 1,171 tests across 115 files at 15:33:54 SGT; TypeScript and full lint passed with zero errors or warnings. Static iOS configuration passed 10/10 at 15:29, before the final connector-only query change. Astra's orphan-repair review passed 17/17 at 15:27:05; connector review passed 70 tests across two files at 15:33:57. Scope counts are separate and are not added together. No live provider, OAuth, model/Speech request, full Workspace interaction, native build/sign/install, or device test was performed. The existing Mac ZIP `b4d0e15` predates these changes and is not a Phase 46 handoff artifact.
