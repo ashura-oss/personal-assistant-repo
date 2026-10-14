@@ -188,9 +188,7 @@ export function TranscriptionPanel({
           {originalDurationLabel(latest, note) ? <Text style={styles.meta}>Original audio duration · {originalDurationLabel(latest, note)}</Text> : null}
           {latest.provider !== "openrouter" && latest.durationMilliseconds !== undefined ? <Text style={styles.meta}>Provider-reported duration · {durationLabel(latest.durationMilliseconds / 1000)}</Text> : null}
           {latest.provider === "openrouter" ? openRouterUsageLines(latest) : null}
-          {latest.provider !== "openrouter" && latest.billedEstimateSeconds !== undefined ? (
-            <Text style={styles.meta}>Provider billing duration estimate · {durationLabel(latest.billedEstimateSeconds)}</Text>
-          ) : null}
+          {latest.provider !== "openrouter" ? <Text style={styles.meta}>Azure Speech cost is not reported here.</Text> : null}
           {retryAfterUnknown ? (
             <Text style={styles.warning}>{demoMode
               ? `Sample uncertain result. In real use, ${attemptProviderLabel(latest)} may have received the recording and charged for it; another upload starts a new request.`
@@ -255,7 +253,7 @@ export function TranscriptionPanel({
               <Text style={styles.outcome}>{outcomeLabel(attempt)}</Text>
               <Text style={styles.meta}>{attemptProviderLabel(attempt)} · {dateLabel(attempt.createdAt)}</Text>
               {attempt.provider === "openrouter" ? openRouterUsageLines(attempt) : null}
-              {attempt.provider !== "openrouter" && attempt.billedEstimateSeconds !== undefined ? <Text style={styles.meta}>Provider billing duration estimate · {durationLabel(attempt.billedEstimateSeconds)}</Text> : null}
+              {attempt.provider !== "openrouter" ? <Text style={styles.meta}>Azure Speech cost is not reported here.</Text> : null}
               {(attempt.provider === "openrouter"
                 ? attempt.unknownCharge === true
                 : attempt.dispatchStarted && ["unknown", "failed", "cancelled", "discarded"].includes(attempt.outcome)) ? (

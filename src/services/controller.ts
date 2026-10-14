@@ -5387,6 +5387,9 @@ export class AppControllerImpl implements AppController {
   }
 
   async assistNote(id: string, options: { intent?: AssistIntent; question?: string; forceRefresh?: boolean; knowledgeSelection?: KnowledgeSelection } = {}): Promise<NoteAssistResult> {
+    if (this.snapshot.settings.mode === 'provider') {
+      throw new Error('Paid text analysis is available through the explicit Batch workflow.');
+    }
     const intent = options.intent ?? 'assist';
     const question = options.question?.trim() || undefined;
     const requestedAt = new Date();
@@ -7203,6 +7206,9 @@ export class AppControllerImpl implements AppController {
       }
     };
     requireBatchContext();
+    if (!batch && this.snapshot.settings.mode === 'provider') {
+      throw new Error('Paid text analysis is available through the explicit Batch workflow.');
+    }
     const intent = options.intent ?? 'assist';
     const question = options.question?.trim() || undefined;
     if (!['assist', 'summarize', 'answer', 'extract'].includes(intent)) throw new Error('Choose a supported assist action.');
@@ -7446,23 +7452,23 @@ export class AppControllerImpl implements AppController {
       if (settings.inputUsdPerMillionTokens === undefined || settings.outputUsdPerMillionTokens === undefined) return 0;
       return (settings.maxRequestBytes + 256) * settings.inputUsdPerMillionTokens / 1_000_000 + settings.maxOutputTokens * settings.outputUsdPerMillionTokens / 1_000_000;
     }
-    if (settings.speechUsdPerMinute === undefined) return 0;
-    return settings.maxAudioSeconds / 60 * settings.speechUsdPerMinute;
+    // Azure Speech does not return a price. Duration remains recorded, while
+    // the charge stays unknown even when a legacy local rate is configured.
+    return 0;
   }
 
   private reserveProviderAttemptDraft(state: AppState, kind: 'model' | 'speech', requestSettings: AppSettings, guard?: (state: AppState) => void): { month: string; day: string; reserve: number } {
     this.rollUsage(state);
     guard?.(state);
-    if (state.usage.attemptsToday >= state.settings.maxCallsPerDay) throw new Error('Daily provider call limit reached. Try again tomorrow or adjust the limit in Settings.');
+    if (kind === 'model' && state.usage.attemptsToday >= state.settings.maxCallsPerDay) throw new Error('Daily provider call limit reached. Try again tomorrow or adjust the limit in Settings.');
     const reserve = this.providerReserve(requestSettings, kind);
-    const knownRates = kind === 'model'
-      ? requestSettings.inputUsdPerMillionTokens !== undefined && requestSettings.outputUsdPerMillionTokens !== undefined
-      : requestSettings.speechUsdPerMinute !== undefined;
+    const knownRates = kind === 'model' && requestSettings.inputUsdPerMillionTokens !== undefined && requestSettings.outputUsdPerMillionTokens !== undefined;
     if (knownRates && (state.settings.monthlyBudgetUsd === 0 || state.usage.estimatedCostUsd + state.usage.reservedUsd + reserve > state.settings.monthlyBudgetUsd)) throw new Error('The configured monthly estimate limit does not have room for this bounded provider request.');
     state.usage.reservedUsd += reserve;
     state.usage.attemptsToday += 1;
     state.usage.attempts += 1;
     state.usage.unknownCharges += 1;
+    state.usage.priceKnown = false;
     state.usage.lastRequestAt = now();
     return { month: state.usage.month, day: state.usage.day, reserve };
   }
@@ -7479,7 +7485,7 @@ export class AppControllerImpl implements AppController {
       }
       if (state.usage.day === reservation.day) state.usage.attemptsToday = Math.max(0, state.usage.attemptsToday - 1);
       state.usage.attempts = Math.max(0, state.usage.attempts - 1);
-      state.usage.priceKnown = state.usage.unknownCharges === 0 && state.settings.inputUsdPerMillionTokens !== undefined && state.settings.outputUsdPerMillionTokens !== undefined;
+      state.usage.priceKnown = false;
     });
   }
 
@@ -7506,19 +7512,14 @@ export class AppControllerImpl implements AppController {
     });
   }
 
-  private settleSpeechUsageDraft(state: AppState, seconds: number, requestSettings: AppSettings, reservation: { month: string; day: string; reserve: number }): void {
+  private settleSpeechUsageDraft(state: AppState, seconds: number, _requestSettings: AppSettings, reservation: { month: string; day: string; reserve: number }): void {
     if (!Number.isFinite(seconds) || seconds <= 0) throw new Error('Provider duration is invalid.');
     if (state.usage.month !== reservation.month) return;
     state.usage.requests += 1;
     state.usage.transcriptionSeconds += seconds;
     state.usage.lastRequestAt = now();
-    const rate = requestSettings.speechUsdPerMinute;
-    if (rate !== undefined) {
-      state.usage.reservedUsd = Math.max(0, state.usage.reservedUsd - reservation.reserve);
-      state.usage.estimatedCostUsd += seconds / 60 * rate;
-      state.usage.unknownCharges = Math.max(0, state.usage.unknownCharges - 1);
-    }
-    state.usage.priceKnown = state.usage.unknownCharges === 0 && rate !== undefined;
+    state.usage.reservedUsd = Math.max(0, state.usage.reservedUsd - reservation.reserve);
+    state.usage.priceKnown = false;
   }
 
   private finishTranscriptionReservationDraft(state: AppState, reservation: { month: string; day: string; reserve: number }): void {
@@ -7528,7 +7529,7 @@ export class AppControllerImpl implements AppController {
     }
     if (state.usage.day === reservation.day) state.usage.attemptsToday = Math.max(0, state.usage.attemptsToday - 1);
     state.usage.attempts = Math.max(0, state.usage.attempts - 1);
-    state.usage.priceKnown = state.usage.unknownCharges === 0 && state.settings.speechUsdPerMinute !== undefined;
+    state.usage.priceKnown = false;
   }
 
   private async recoverOrphanedTranscriptions(noteId: string, excludeAttemptId?: string): Promise<number> {
@@ -10833,6 +10834,9 @@ export class AppControllerImpl implements AppController {
   }
 
   async generateMailReplyText(input: MailReplyTextGenerationInput): Promise<MailReplyTextGenerationResult> {
+    if (this.snapshot.settings.mode === 'provider') {
+      throw new Error('Paid mail reply generation is available through the explicit Batch workflow.');
+    }
     if ((input.contextSelectionIds?.length ?? 0) > 0 || (input.contextExcerptSelectionIds?.length ?? 0) > 0) {
       throw new Error('Selected conversation context is available only through the queued mail reply review flow.');
     }

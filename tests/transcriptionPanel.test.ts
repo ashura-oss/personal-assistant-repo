@@ -87,7 +87,7 @@ describe('transcription provider history and request cleanup UI', () => {
     expect(host.textContent).toContain('OpenRouter-reported cost · US$0.00000000');
   });
 
-  it('does not invent missing OpenRouter usage and keeps Azure attempt labels historical', () => {
+  it('does not invent missing OpenRouter usage or Azure Speech charges', () => {
     render({ speechProvider: 'openrouter', attempts: [openRouterAttempt({ actualUsage: undefined })] });
     expect(host.textContent).toContain('OpenRouter did not report usage for this request.');
     expect(host.textContent).not.toContain('US$');
@@ -95,7 +95,8 @@ describe('transcription provider history and request cleanup UI', () => {
 
     render({ speechProvider: 'openrouter', attempts: [azureAttempt()] });
     expect(host.textContent).toContain('Azure Speech rejected the request');
-    expect(host.textContent).toContain('Provider billing duration estimate · 5 seconds');
+    expect(host.textContent).toContain('Azure Speech cost is not reported here.');
+    expect(host.textContent).not.toContain('Provider billing duration estimate');
   });
 
   it('keeps explicit local request cleanup available during other busy work and single-flights it', async () => {

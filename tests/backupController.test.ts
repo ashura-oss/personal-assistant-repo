@@ -10,6 +10,7 @@ import { createProactiveMailAlertConsent } from '../src/proactiveMailAlerts/plan
 import type { ControllerIntegrationDependencies } from '../src/services/controller';
 import type { PrivacyWriterScope } from '../src/privacy/types';
 import type { ExistingWorkspaceWriterStore } from '../src/privacy/workspaceStorage';
+import { createCompletedAssistantBatchClient } from './helpers/assistantBatchFixture';
 
 class MemoryStore implements StateStore {
   value?: AppState;
@@ -166,17 +167,18 @@ describe('controller portable backup workflow', () => {
 
   it('requires explicit original time zone confirmation before paid note or selected-note reply assistance', async () => {
     const store = new MemoryStore();
-    const app = new AppControllerImpl(store);
+    const batch = createCompletedAssistantBatchClient();
+    const app = new AppControllerImpl(store, {}, { openRouterBatchClient: batch.client });
     await app.load();
     const preview = await app.prepareBackupImport(JSON.stringify(fixture()));
     const archive = await app.applyBackupImport({ sessionId: preview.sessionId, planHash: preview.planHash });
     const imported = app.getSnapshot().notes.find((note) => note.importOrigin?.archiveId === archive.id)!;
-    await app.saveSettings({ mode: 'provider', openAiEndpoint: 'https://example.openai.azure.com', openAiDeployment: 'gpt-6-luna' });
+    await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
     const internal = app as unknown as { openAiClient: { prepare: (...args: unknown[]) => Promise<unknown> } };
     const prepareSpy = vi.spyOn(internal.openAiClient, 'prepare');
     const attemptsBefore = app.getSnapshot().usage.attemptsToday;
-    await expect(app.processNote(imported.id)).rejects.toThrow(/confirm this imported note/i);
-    await expect(app.assistNote(imported.id)).rejects.toThrow(/confirm this imported note/i);
+    await expect(app.submitNoteBatch(imported.id)).rejects.toThrow(/confirm this imported note/i);
+    await expect(app.assistNote(imported.id)).rejects.toThrow(/explicit Batch workflow/i);
     expect(prepareSpy).not.toHaveBeenCalled();
     expect(app.getSnapshot().usage.attemptsToday).toBe(attemptsBefore);
     const internalState = app as unknown as { mutate: (operation: (draft: AppState) => void) => Promise<void> };

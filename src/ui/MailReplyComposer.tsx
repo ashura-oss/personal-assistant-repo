@@ -17,7 +17,6 @@ import type {
   MailReplyContextSelection,
   MailReplyConversationContextDiscovery,
   MailReplyTextGenerationInput,
-  MailReplyTextGenerationResult,
   Note,
   Proposal,
   SelectedMailTextSnapshot,
@@ -103,7 +102,6 @@ export function MailReplyComposer({
   const [brief, setBrief] = useState("");
   const [checking, setChecking] = useState(false);
   const [loadingText, setLoadingText] = useState(false);
-  const [generating, setGenerating] = useState(false);
   const [batchSubmittingOwner, setBatchSubmittingOwner] = useState<{ messageId: string; generation: number; sequence: number } | null>(null);
   const [composerRevisionValue, setComposerRevisionValue] = useState(0);
   const [bodySnapshot, setBodySnapshot] =
@@ -117,10 +115,8 @@ export function MailReplyComposer({
   const [notePicker, setNotePicker] = useState(false);
   const [error, setError] = useState("");
   const [generationNotice, setGenerationNotice] = useState("");
-  const [generatedAt, setGeneratedAt] = useState("");
   const requestSequence = useRef(0);
   const bodyLoadSequence = useRef(0);
-  const generationSequence = useRef(0);
   const batchSubmissionLock = useRef(false);
   const batchSubmissionSequence = useRef(0);
   const batchReviewInvalidator = useRef<() => void>(() => undefined);
@@ -134,9 +130,7 @@ export function MailReplyComposer({
   const invalidatePendingGeneration = useCallback(() => {
     composerRevision.current += 1;
     setComposerRevisionValue((current) => current + 1);
-    generationSequence.current += 1;
     setGenerationNotice("");
-    setGeneratedAt("");
     batchReviewInvalidator.current();
   }, []);
   const registerBatchReviewInvalidator = useCallback((invalidate: () => void) => {
@@ -198,7 +192,7 @@ export function MailReplyComposer({
           setBodySnapshot(null);
           setShowFullBody(false);
           setUseSavedExcerpt(false);
-          setBodyStatus("The source changed. Load its text again before generating.");
+          setBodyStatus("The source changed. Load its text again before preparing a request.");
         } else if (deliberateRebind) {
           setBodyStatus("Updated recipients from the checked message. Your typed reply was kept.");
         }
@@ -248,19 +242,17 @@ export function MailReplyComposer({
         clearTimeout(timer);
         requestSequence.current += 1;
         bodyLoadSequence.current += 1;
-        generationSequence.current += 1;
         batchSubmissionSequence.current += 1;
         setLoadingText(false);
       };
     }
     requestSequence.current += 1;
     bodyLoadSequence.current += 1;
-    generationSequence.current += 1;
     batchSubmissionSequence.current += 1;
   }, [applySource, messageId, visible]);
 
   const changeMode = (nextMode: ReplyMode) => {
-    if (nextMode !== mode && !checking && !busy && !generating) {
+    if (nextMode !== mode && !checking && !busy) {
       void applySource(nextMode, false);
     }
   };
@@ -328,79 +320,6 @@ export function MailReplyComposer({
     await applySource(mode, false, true);
   };
 
-  const generate = async () => {
-    if (!source || !bodySnapshot || !messageId || generating || busy) return;
-    if (bodySnapshot.completeness === "excerpt" && !useSavedExcerpt) {
-      setError("Choose “Use saved excerpt” before generating from this text.");
-      return;
-    }
-    if (!bodySnapshot.textDigest || !bodySnapshot.text) {
-      setError("There is no checked message text to use. You can still write manually.");
-      return;
-    }
-    const combinedBriefBytes = utf8Bytes(brief.trim()) + (selectedNote ? utf8Bytes(selectedNote.transcript) : 0);
-    if (combinedBriefBytes > BRIEF_LIMIT) {
-      setError("The reply brief and selected note together must stay under 4 KB.");
-      return;
-    }
-    const revision = composerRevision.current;
-    const sequence = ++generationSequence.current;
-    setGenerating(true);
-    setError("");
-    setGenerationNotice("");
-    try {
-      const result: MailReplyTextGenerationResult =
-        await controller.generateMailReplyText({
-          messageId,
-          sourceDigest: source.sourceDigest,
-          textDigest: bodySnapshot.textDigest,
-          mode,
-          to: parseAddresses(to),
-          cc: parseAddresses(cc),
-          brief: brief.trim(),
-          composerRevision: revision,
-          ...(selectedNote
-            ? { noteId: selectedNote.id, noteRevision: selectedNote.revision }
-            : {}),
-        });
-      if (sequence !== generationSequence.current || revision !== composerRevision.current || result.composerRevision !== revision) {
-        setGenerationNotice("Reply wasn’t applied because the source or reply details changed.");
-        return;
-      }
-      if (result.status !== "current" || !result.text) {
-        setGenerationNotice(
-          result.status === "source_changed"
-            ? "The saved message changed. Check the updated message, then generate again."
-            : result.status === "stale"
-              ? "The checked message text is stale. Load it again before generating."
-              : "Reply generation is unavailable. Your manually written text is unchanged.",
-        );
-        return;
-      }
-      setText(result.text);
-      composerRevision.current += 1;
-      setComposerRevisionValue((current) => current + 1);
-      batchReviewInvalidator.current();
-      generationSequence.current += 1;
-      setGeneratedAt(result.generatedAt ?? "");
-      setGenerationNotice(
-        result.fromCache
-          ? demoMode
-            ? "Using saved sample reply · no API used. Review and edit this text before saving."
-            : "Using saved reply · no new API call. Review and edit this text before saving."
-          : demoMode
-            ? "Sample AI reply · no API used. Review and edit this text before saving."
-            : "Generated once from the selected text and context. Review and edit before saving.",
-      );
-    } catch (cause) {
-      if (sequence === generationSequence.current) {
-        setGenerationNotice(messageOf(cause, "Reply generation failed. Your typed text was kept."));
-      }
-    } finally {
-      setGenerating(false);
-    }
-  };
-
   const submitBatch = async () => {
     if (!source || !bodySnapshot || !messageId || !onSubmitBatch || batchSubmissionLock.current || busy || batchBlocked) return;
     if (bodySnapshot.completeness === "excerpt" && !useSavedExcerpt) {
@@ -463,10 +382,6 @@ export function MailReplyComposer({
   const parsedCc = parseAddresses(cc);
   const combinedBriefBytes = utf8Bytes(brief.trim()) + (selectedNote ? utf8Bytes(selectedNote.transcript) : 0);
   const includedGuidance = documents.filter((doc) => /^memory\/(?:RULES|ROUTINES)\.md$/i.test(doc.path));
-  const aiReady =
-    controller.getSnapshot().settings.mode === "provider" &&
-    Boolean(controller.getSnapshot().settings.openAiEndpoint) &&
-    Boolean(controller.getSnapshot().settings.openAiDeployment);
   const openRouterSelected = controller.getSnapshot().settings.mode === "provider" && controller.getSnapshot().settings.llmProvider === "openrouter";
   const selectedTextUsable = Boolean(
     bodySnapshot?.text &&
@@ -498,14 +413,14 @@ export function MailReplyComposer({
                 <Text style={styles.sourceLine}>Source last checked · {sourceAt}</Text>
                 <Text style={styles.excerptLabel}>SAVED EXCERPT</Text>
                 <Text style={styles.excerpt}>{source.snippet || "No message excerpt was saved."}</Text>
-                <Text style={styles.disclaimer}>This reply uses saved message details and selected text only. It does not load the full conversation.</Text>
+                <Text style={styles.disclaimer}>Conversation messages are loaded only when you choose them below. The recipient and reply target remain this saved message.</Text>
               </View>
             ) : null}
 
             <Text style={s.label}>Reply type</Text>
             <View style={styles.modeRow}>
               {([ ["reply", "Reply"], ["reply_all", "Reply all"] ] as const).map(([value, label]) => (
-                <Pressable key={value} accessibilityRole="radio" accessibilityLabel={label} accessibilityState={{ selected: mode === value, disabled: checking || busy || generating }} disabled={checking || busy || generating} onPress={() => changeMode(value)} style={[styles.mode, mode === value && styles.modeSelected]}>
+                <Pressable key={value} accessibilityRole="radio" accessibilityLabel={label} accessibilityState={{ selected: mode === value, disabled: checking || busy }} disabled={checking || busy} onPress={() => changeMode(value)} style={[styles.mode, mode === value && styles.modeSelected]}>
                   <Text style={[styles.modeText, mode === value && styles.modeTextSelected]}>{label}</Text>
                 </Pressable>
               ))}
@@ -518,13 +433,13 @@ export function MailReplyComposer({
               <Text style={s.label}>Message context</Text>
               <Text style={styles.limitText}>Selected text is capped at 16 KB</Text>
             </View>
-            <Button label={loadingText ? "Loading message text…" : "Load message text"} disabled={!source || checking || loadingText || busy || generating} tone="quiet" onPress={() => void loadMessageText()} />
+            <Button label={loadingText ? "Loading message text…" : "Load message text"} disabled={!source || checking || loadingText || busy} tone="quiet" onPress={() => void loadMessageText()} />
             {bodySnapshot ? <Text style={styles.contextMeta}>{bodyTextLabel(bodySnapshot.representation)} · {bodySnapshot.completeness.replaceAll("_", " ")} · {bodySnapshot.bytes.toLocaleString()} bytes · checked {new Date(bodySnapshot.checkedAt).toLocaleString()}</Text> : null}
             {bodySnapshot?.text ? <Text selectable numberOfLines={showFullBody ? undefined : 8} style={styles.contextText}>{bodySnapshot.text}</Text> : null}
             {bodySnapshot?.representation === "converted_html" ? <Text style={styles.disclaimer}>Layout and hidden-content rules may differ from the original email.</Text> : null}
             {bodySnapshot?.text && bodySnapshot.bytes > 1200 ? <Button label={showFullBody ? "Show less selected text" : "Show full selected text"} tone="quiet" onPress={() => setShowFullBody((current) => !current)} /> : null}
             {bodySnapshot?.omissionReasons.length ? <View style={styles.omissions}>{friendlyOmissionReasons(bodySnapshot.omissionReasons).map(({ label, prefix }) => <Text key={`${prefix}-${label}`} style={styles.disclaimer}>{prefix}: {label}</Text>)}</View> : null}
-            {bodySnapshot?.completeness === "excerpt" && !useSavedExcerpt ? <Button label="Use this excerpt" tone="quiet" disabled={busy || generating} onPress={() => { invalidatePendingGeneration(); setUseSavedExcerpt(true); setBodyStatus("Excerpt selected. Review it before generating."); }} /> : null}
+            {bodySnapshot?.completeness === "excerpt" && !useSavedExcerpt ? <Button label="Use this excerpt" tone="quiet" disabled={busy} onPress={() => { invalidatePendingGeneration(); setUseSavedExcerpt(true); setBodyStatus("Excerpt selected. Review it before preparing a request."); }} /> : null}
             {bodyStatus ? <Text style={styles.disclaimer}>{bodyStatus}</Text> : null}
 
             {visible && !batchBlocked && openRouterSelected && !demoMode && source && messageId ? <MailReplyConversationContext
@@ -534,7 +449,7 @@ export function MailReplyComposer({
               sourceDigest={source.sourceDigest}
               ownerGeneration={ownerGeneration}
               blocked={false}
-              busy={busy || checking || generating || loadingText}
+              busy={busy || checking || loadingText}
               onChange={updateConversationContext}
               onDiscover={onDiscoverContext}
               onContinue={onContinueContext}
@@ -544,23 +459,22 @@ export function MailReplyComposer({
 
             <Field label="What should the reply say?" value={brief} onChangeText={(value) => { if (utf8Bytes(value.trim()) + (selectedNote ? utf8Bytes(selectedNote.transcript) : 0) <= BRIEF_LIMIT) { invalidatePendingGeneration(); setBrief(value); setError(""); } else setError("The reply brief and selected note together must stay under 4 KB."); }} placeholder="Optional guidance for the reply" multiline />
             <Text style={styles.limitText}>{combinedBriefBytes.toLocaleString()} / 4,096 combined bytes</Text>
-            <Button label={selectedNote ? `Source note · ${selectedNote.title}` : "Choose a saved note"} tone="quiet" disabled={busy || generating} onPress={() => setNotePicker(true)} />
+            <Button label={selectedNote ? `Source note · ${selectedNote.title}` : "Choose a saved note"} tone="quiet" disabled={busy} onPress={() => setNotePicker(true)} />
             {selectedNote ? <View style={styles.contextCard}><Text style={styles.sourceLine}>Selected transcript · current version {selectedNote.revision}</Text><Text selectable style={styles.contextText}>{selectedNote.transcript}</Text><Button label="Remove selected note" tone="quiet" onPress={() => { invalidatePendingGeneration(); setSelectedNote(null); }} /></View> : <Text style={styles.disclaimer}>No note is included unless you choose one.</Text>}
             <View style={styles.contextCard}>
               <Text style={styles.sourceLine}>Saved guidance included · {includedGuidance.length ? includedGuidance.map((doc) => doc.path).join(", ") : "none"}</Text>
               {includedGuidance.map((doc) => <View key={doc.path} style={styles.guidanceItem}><Text style={styles.contextMeta}>{doc.path} · version {doc.revision}</Text><Text selectable style={styles.contextText}>{doc.content}</Text></View>)}
             </View>
-            <Text style={styles.disclaimer}>Before Generate, the request uses the checked text shown above, recipients, this brief, the note you selected, and the saved guidance shown here. The brief and selected note together are limited to 4 KB; message text is limited to 16 KB, within the app&apos;s request byte limit.</Text>
+            <Text style={styles.disclaimer}>Before you submit a Batch request, it uses the checked text shown above, recipients, this brief, the note you selected, selected conversation messages, and the saved guidance shown here. The brief and selected note together are limited to 4 KB; message text is limited to 16 KB.</Text>
 
-            {demoMode ? <Text style={styles.demoBadge}>SAMPLE AI REPLY · NO API USED</Text> : null}
             {selectedNoteTimeZoneUnconfirmed ? <Text style={styles.warning}>Confirm the imported note’s capture time zone before using it as reply context.</Text> : null}
-            {openRouterSelected && !demoMode ? (
+            {!demoMode ? (
               <>
                 <Text style={styles.disclaimer}>Submitting creates a paid OpenRouter Batch request. Replies may be delayed. Nothing checks or resubmits it in the background; actual cost appears only when the provider reports it.</Text>
                 <Button label={batchSubmitting ? "Submitting reply request…" : "Submit reply request"} disabled={busy || batchBlocked || !batchEnabled || checking || loadingText || batchSubmitting || !selectedTextUsable || !source || !parsedTo.length || combinedBriefBytes > BRIEF_LIMIT || !onSubmitBatch} onPress={() => void submitBatch()} />
                 {!batchEnabled ? (
                   <>
-                    <Text style={styles.disclaimer}>Save an OpenRouter API key in Settings to submit or check Batch requests. Existing history and completed replies remain available.</Text>
+                    <Text style={styles.disclaimer}>{openRouterSelected ? "Save an OpenRouter API key in Settings to submit or check Batch requests. Existing history, source review, and completed replies remain available." : "Save OpenRouter Batch settings in Settings before submitting or checking requests. Existing history, source review, and completed replies remain available."}</Text>
                     {onOpenSettings ? <Button label="Open Settings" tone="quiet" disabled={busy || batchBlocked} onPress={onOpenSettings} /> : null}
                   </>
                 ) : null}
@@ -585,21 +499,15 @@ export function MailReplyComposer({
                   />
                 ) : null}
               </>
-            ) : (
-              <>
-                <Button label={generating ? "Generating reply…" : "Generate reply"} disabled={busy || checking || loadingText || generating || selectedNoteTimeZoneUnconfirmed || !selectedTextUsable || !source || !parsedTo.length || combinedBriefBytes > BRIEF_LIMIT || (!demoMode && !aiReady)} onPress={() => void generate()} />
-                {!demoMode && !aiReady && !openRouterSelected ? <Text style={styles.disclaimer}>Set provider mode, an Azure OpenAI endpoint, and a deployment in Settings to enable generation.</Text> : null}
-              </>
-            )}
-            {!selectedTextUsable && !demoMode ? <Text style={styles.disclaimer}>Load checked message text and select any excerpt explicitly before generating.</Text> : null}
-            {generatedAt ? <Text style={styles.contextMeta}>Generated · {new Date(generatedAt).toLocaleString()}</Text> : null}
+            ) : <Text style={styles.demoBadge}>Sample preview only · no paid text request is made.</Text>}
+            {!selectedTextUsable && !demoMode ? <Text style={styles.disclaimer}>Load checked message text and select any excerpt explicitly before submitting a Batch request.</Text> : null}
             {generationNotice ? <Text style={styles.disclaimer}>{generationNotice}</Text> : null}
 
-            <Field label="Your reply" value={text} onChangeText={(value) => { invalidatePendingGeneration(); setText(value); }} placeholder="Write or generate a reply…" multiline />
+            <Field label="Your reply" value={text} onChangeText={(value) => { invalidatePendingGeneration(); setText(value); }} placeholder="Write a reply…" multiline />
             {checking ? <Text style={s.disclaimer}>Checking saved message…</Text> : null}
             {error ? <Text style={styles.error}>{error}</Text> : null}
             {(!source || bodyStatus.toLowerCase().includes("changed") || generationNotice.toLowerCase().includes("message changed")) && !checking && messageId ? <Button label="Check updated message" tone="quiet" disabled={busy} onPress={() => void sourceChanged()} /> : null}
-            <Button label="Save for review" disabled={busy || checking || generating || !source || !text.trim() || !parsedTo.length} onPress={async () => {
+            <Button label="Save for review" disabled={busy || checking || !source || !text.trim() || !parsedTo.length} onPress={async () => {
               if (!source || !messageId) return;
               setError("");
               try {
@@ -608,7 +516,7 @@ export function MailReplyComposer({
                 else setError("Another action is in progress. Try saving this reply again.");
               } catch (cause) { setError(messageOf(cause, "Could not save this reply for review.")); }
             }} />
-            <Button label="Cancel" tone="quiet" disabled={busy || generating} onPress={closeComposer} />
+            <Button label="Cancel" tone="quiet" disabled={busy} onPress={closeComposer} />
           </ScrollView>
         </SafeAreaView>
       </KeyboardAvoidingView>
@@ -624,7 +532,7 @@ function NotePicker({ visible, notes, selectedId, onClose, onChoose }: { visible
       <View style={styles.pickerBackdrop}>
         <View style={styles.pickerCard}>
           <Text style={styles.pickerTitle}>Choose one saved note</Text>
-          <Text style={styles.disclaimer}>Only the selected current transcript is included with a later Generate request.</Text>
+          <Text style={styles.disclaimer}>Only the selected current transcript is included in a later Batch request.</Text>
           <ScrollView showsVerticalScrollIndicator={false}>
             {eligible.length ? eligible.map((note) => {
               const timezoneUnconfirmed = note.importOrigin?.originalTimeZoneUnknown === true;
@@ -666,18 +574,18 @@ function bodyTextLabel(representation: SelectedMailTextSnapshot["representation"
 function bodyTextStatus(snapshot: SelectedMailTextSnapshot, cached: boolean) {
   if (snapshot.representation === "converted_html") {
     return cached
-      ? "Converted HTML text is ready for review. Choose it explicitly before generating."
-      : "Converted HTML text needs review. Choose this excerpt explicitly before generating.";
+      ? "Converted HTML text is ready for review. Choose it explicitly before submitting."
+      : "Converted HTML text needs review. Choose this excerpt explicitly before submitting.";
   }
   if (snapshot.completeness === "complete_text") {
     return cached
       ? "Previously loaded message text is ready to use."
-      : "Message text loaded. Review the exact text below before generating.";
+      : "Message text loaded. Review the exact text below before submitting.";
   }
   if (snapshot.completeness === "excerpt") {
     return cached
-      ? "A saved excerpt is available. Choose it explicitly before generating."
-      : "Only an excerpt is available. Choose it explicitly before generating.";
+      ? "A saved excerpt is available. Choose it explicitly before submitting."
+      : "Only an excerpt is available. Choose it explicitly before submitting.";
   }
   return "No usable message text was returned. You can still write a reply manually.";
 }

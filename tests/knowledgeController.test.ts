@@ -1,10 +1,10 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import type { AppState } from '../src/core';
 import * as Crypto from 'expo-crypto';
-import { AzureOpenAIClient } from '../src/services/azure';
 import { AppControllerImpl } from '../src/services/controller';
 import type { StateStore } from '../src/storage/contracts';
 import { buildLocalSourceSet, createSourceCatalog } from '../src/assistant';
+import { completeNoteBatch, createCompletedAssistantBatchClient } from './helpers/assistantBatchFixture';
 
 class MemoryStore implements StateStore {
   value?: AppState;
@@ -14,18 +14,13 @@ class MemoryStore implements StateStore {
   async clear() { this.value = undefined; }
 }
 
-function createController(store = new MemoryStore()) {
-  const fetcher = async () => new Response(JSON.stringify({
-    status: 'completed',
-    output: [{ content: [{ type: 'output_text', text: JSON.stringify({ summary: 'Reviewed local context.', answer: '', decisions: [], citations: [], clarifications: [], proposals: [], memorySuggestions: [] }) }] }],
-    usage: { input_tokens: 20, output_tokens: 5 },
-  }), { status: 200, headers: { 'content-type': 'application/json' } });
-  const openAi = new AzureOpenAIClient(fetcher as typeof fetch, async () => 'test-key');
-  return { store, app: new AppControllerImpl(store, { openAi }, { writeDocument: async () => undefined }) };
+function createController(store = new MemoryStore(), responseForRequest?: Parameters<typeof createCompletedAssistantBatchClient>[0]) {
+  const transport = createCompletedAssistantBatchClient(responseForRequest);
+  return { store, app: new AppControllerImpl(store, {}, { writeDocument: async () => undefined, openRouterBatchClient: transport.client }), calls: transport.calls };
 }
 
 async function enableProvider(app: AppControllerImpl) {
-  await app.saveSettings({ mode: 'provider', openAiEndpoint: 'https://example.openai.azure.com', openAiDeployment: 'gpt-6-luna' });
+  await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
 }
 
 describe('knowledge controller integration', () => {
@@ -49,7 +44,7 @@ describe('knowledge controller integration', () => {
     await app.saveKnowledgeSourceLink({ entityKind: 'project', entityId: archived.id, expectedEntityRevision: archived.revision, reference: { kind: 'task', id: 'task-archived' }, label: 'Old task' });
     await app.setKnowledgeEntityArchived({ kind: 'project', id: archived.id, expectedRevision: archived.revision + 1, archived: true });
 
-    const analysis = await app.assistNote(note.id, { intent: 'summarize' });
+    const { analysis } = await completeNoteBatch(app, note.id, { intent: 'summarize' });
     expect(analysis.includedSourceIds).toContain(`knowledge:project:${selected.id}`);
     expect(Object.keys(analysis.sourceVersions)).toContain('task:task-selected');
     expect(Object.keys(analysis.sourceVersions)).not.toContain('task:task-archived');
@@ -80,7 +75,7 @@ describe('knowledge controller integration', () => {
       }
     });
 
-    const result = await app.assistNote(note.id, { intent: 'summarize', knowledgeSelection: people.map((person) => ({ kind: 'person' as const, id: person.id })) });
+    const { analysis: result } = await completeNoteBatch(app, note.id, { intent: 'summarize', knowledgeSelection: people.map((person) => ({ kind: 'person' as const, id: person.id })) });
     expect(result.source).toBe('provider');
     expect(Object.keys(result.sourceVersions).length).toBeLessThanOrEqual(200);
     expect(result.omittedSourceCount).toBeGreaterThan(0);
@@ -108,7 +103,7 @@ describe('knowledge controller integration', () => {
       reference: { kind: 'person', id: anchor.id }, label: 'Cycle back' });
     expect(linkedToNote.reference).toMatchObject({ kind: 'note', id: note.id });
 
-    const analysis = await app.assistNote(note.id, { intent: 'summarize' });
+    const { analysis } = await completeNoteBatch(app, note.id, { intent: 'summarize' });
     expect(Object.keys(analysis.sourceVersions)).toContain(`knowledge:person:${anchor.id}`);
     expect(Object.keys(analysis.sourceVersions)).toContain(`knowledge:person:${linked.id}`);
     expect(Object.keys(analysis.sourceVersions)).not.toContain(`knowledge:person:${beyond.id}`);
@@ -166,7 +161,7 @@ describe('knowledge controller integration', () => {
       state.documents.push({ path: legacyPath, content: 'Legacy launch owner: Maya coordinates the checklist.', revision: 1, updatedAt: note.createdAt });
     });
 
-    const analysis = await app.assistNote(note.id, { intent: 'summarize' });
+    const { analysis } = await completeNoteBatch(app, note.id, { intent: 'summarize' });
     expect(Object.keys(analysis.sourceVersions)).not.toContain(`doc:${legacyPath}`);
   });
 
@@ -188,7 +183,7 @@ describe('knowledge controller integration', () => {
       stored.evidence = [{ sourceId: `doc:${path}`, revision: 1, sourceVersion, quote: 'Maya coordinates the launch checklist.' }];
     });
 
-    await app.assistNote(note.id, { intent: 'summarize', knowledgeSelection: [] });
+    await completeNoteBatch(app, note.id, { intent: 'summarize', knowledgeSelection: [] });
     const reviewed = await app.reviewKnowledgeSuggestion(suggestion.id, { expectedRevision: suggestion.revision, decision: 'accept', targetRevision: person.revision });
     expect(reviewed.status).toBe('accepted');
     expect(app.getSnapshot().knowledge.people[0].facts[0].statement).toBe('Coordinates the launch checklist.');
@@ -197,29 +192,24 @@ describe('knowledge controller integration', () => {
   it('saves a grounded provider memory suggestion atomically with a bounded fingerprint', async () => {
     const text = 'Maya prefers concise weekly updates.';
     const store = new MemoryStore();
-    let calls = 0;
     let targetSourceId = '';
-    const fetcher = async () => {
-      calls += 1;
-      const sourceVersion = `1:${await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, text.normalize('NFC'))}`;
-      return new Response(JSON.stringify({ status: 'completed', output: [{ content: [{ type: 'output_text', text: JSON.stringify({
+    const sourceVersion = `1:${await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, text.normalize('NFC'))}`;
+    const transport = createCompletedAssistantBatchClient(() => ({
         summary: 'Maya prefers concise weekly updates.', answer: '', decisions: [],
         citations: [{ sourceId: 'transcript', revision: 1, sourceVersion, quote: text }], clarifications: [], proposals: [],
         memorySuggestions: [{ targetSourceId, targetRevision: 1, type: 'add_fact', statement: 'Prefers concise weekly updates.', address: null, label: null, relatedSourceId: null, role: null,
           evidence: [{ sourceId: 'transcript', revision: 1, sourceVersion, quote: text }] }],
-      }) }] }], usage: { input_tokens: 50, output_tokens: 20 } }), { status: 200, headers: { 'content-type': 'application/json' } });
-    };
-    const openAi = new AzureOpenAIClient(fetcher as typeof fetch, async () => 'test-key');
-    const app = new AppControllerImpl(store, { openAi }, { writeDocument: async () => undefined });
+      }));
+    const app = new AppControllerImpl(store, {}, { writeDocument: async () => undefined, openRouterBatchClient: transport.client });
     await app.load();
     await enableProvider(app);
     const note = await app.saveNote({ transcript: text });
     const person = await app.savePerson({ name: 'Maya', aliases: [], narrative: '' });
     targetSourceId = `knowledge:person:${person.id}`;
-    const responseSourceVersion = `1:${await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, text.normalize('NFC'))}`;
-    const response = await app.assistNote(note.id, { intent: 'summarize', knowledgeSelection: [{ kind: 'person', id: person.id }] });
+    const responseSourceVersion = sourceVersion;
+    const { analysis: response } = await completeNoteBatch(app, note.id, { intent: 'summarize', knowledgeSelection: [{ kind: 'person', id: person.id }] });
     const suggestion = app.getSnapshot().knowledge.suggestions.find((item) => item.status === 'pending');
-    expect(calls).toBe(1);
+    expect(transport.calls.map((call) => call.method)).toEqual(['POST', 'GET']);
     expect(response.memorySuggestionIds).toEqual([suggestion?.id]);
     expect(suggestion).toMatchObject({ sourceNoteId: note.id, evidence: [{ sourceId: `note:${note.id}`, sourceVersion: responseSourceVersion }] });
     expect(suggestion?.sourceAnalysisFingerprint).toMatch(/^[a-f0-9]{64}$/);
@@ -295,61 +285,45 @@ describe('knowledge controller integration', () => {
     const corrupted = structuredClone(store.value!);
     (corrupted as unknown as { knowledge: unknown }).knowledge = { schemaVersion: 1, people: [{ id: 'invalid-knowledge-row' }], projects: [], suggestions: [] };
     store.value = corrupted;
-    const recovering = createController(store).app;
+    const { app: recovering, calls } = createController(store);
     await recovering.load();
     expect(recovering.getSnapshot().knowledge.people).toEqual([]);
     expect(recovering.getSnapshot().knowledge.projects).toEqual([]);
 
-    const client = (recovering as unknown as { openAiClient: AzureOpenAIClient }).openAiClient;
-    const prepare = vi.spyOn(client, 'prepare');
-    await recovering.assistNote(note.id, { intent: 'summarize' });
-    expect(prepare).toHaveBeenCalled();
-    for (const call of prepare.mock.calls) {
-      const [ , documents, , request ] = call;
-      expect(documents.some((document) => document.path.startsWith('people/') || document.path.startsWith('projects/'))).toBe(false);
-      expect(documents.some((document) => document.path === 'research/SAFE.md' && document.content.includes('GENERIC_RESEARCH_CONTEXT_CANARY'))).toBe(true);
-      expect(JSON.stringify(request?.additionalSources ?? [])).not.toContain('ORPHAN_');
-      expect(JSON.stringify(documents)).not.toContain('ORPHAN_');
-    }
-    expect(JSON.stringify(prepare.mock.calls)).not.toContain(person.id);
-    expect(JSON.stringify(prepare.mock.calls)).not.toContain(project.id);
+    await completeNoteBatch(recovering, note.id, { intent: 'summarize' });
+    const batchRequest = calls.find((call) => call.method === 'POST')?.requestBody ?? '';
+    expect(batchRequest).toContain('GENERIC_RESEARCH_CONTEXT_CANARY');
+    expect(batchRequest).not.toContain('ORPHAN_');
+    expect(batchRequest).not.toContain(person.id);
+    expect(batchRequest).not.toContain(project.id);
   });
 
   it('keeps valid knowledge narratives available as knowledge sources, not generic documents', async () => {
-    const { app } = createController();
+    const { app, calls } = createController();
     await app.load();
     await enableProvider(app);
     const note = await app.saveNote({ transcript: 'Summarize VALID_KNOWLEDGE_NARRATIVE_CANARY and GENERIC_RESEARCH_CONTEXT_CANARY.' });
     const person = await app.savePerson({ name: 'Maya', aliases: [], narrative: 'VALID_KNOWLEDGE_NARRATIVE_CANARY' });
     await app.saveDocument('research/SAFE.md', 'GENERIC_RESEARCH_CONTEXT_CANARY');
-    const client = (app as unknown as { openAiClient: AzureOpenAIClient }).openAiClient;
-    const prepare = vi.spyOn(client, 'prepare');
-
-    await app.assistNote(note.id, { intent: 'summarize', knowledgeSelection: [{ kind: 'person', id: person.id }] });
-    expect(prepare).toHaveBeenCalled();
-    const [, documents, , request] = prepare.mock.calls[0]!;
-    expect(documents.some((document) => document.path === person.narrativePath)).toBe(false);
-    expect(documents.some((document) => document.path === 'research/SAFE.md')).toBe(true);
-    expect(request?.additionalSources).toContainEqual(expect.objectContaining({
-      id: `knowledge:person:${person.id}`, text: expect.stringContaining('VALID_KNOWLEDGE_NARRATIVE_CANARY'),
-    }));
+    await completeNoteBatch(app, note.id, { intent: 'summarize', knowledgeSelection: [{ kind: 'person', id: person.id }] });
+    const batchRequest = calls.find((call) => call.method === 'POST')?.requestBody ?? '';
+    expect(batchRequest).toContain('GENERIC_RESEARCH_CONTEXT_CANARY');
+    expect(batchRequest).toContain(`knowledge:person:${person.id}`);
+    expect(batchRequest).toContain('VALID_KNOWLEDGE_NARRATIVE_CANARY');
+    expect(batchRequest).not.toContain(person.narrativePath);
   });
 
   it('excludes reserved knowledge namespaces when valid knowledge is empty without quarantine', async () => {
-    const { app } = createController();
+    const { app, calls } = createController();
     await app.load();
     await enableProvider(app);
     const note = await app.saveNote({ transcript: 'Summarize GENERIC_RESEARCH_CONTEXT_CANARY and the local reference.' });
     await app.saveDocument('people/orphan/nested.md', 'EMPTY_STATE_ORPHAN_CANARY');
     await app.saveDocument('projects/orphan/nested.md', 'EMPTY_STATE_PROJECT_CANARY');
     await app.saveDocument('research/SAFE.md', 'GENERIC_RESEARCH_CONTEXT_CANARY');
-    const client = (app as unknown as { openAiClient: AzureOpenAIClient }).openAiClient;
-    const prepare = vi.spyOn(client, 'prepare');
-
-    await app.assistNote(note.id, { intent: 'summarize' });
-    const [, documents] = prepare.mock.calls[0]!;
-    expect(documents.some((document) => document.path.startsWith('people/') || document.path.startsWith('projects/'))).toBe(false);
-    expect(JSON.stringify(documents)).not.toContain('EMPTY_STATE_');
-    expect(documents.some((document) => document.path === 'research/SAFE.md')).toBe(true);
+    await completeNoteBatch(app, note.id, { intent: 'summarize' });
+    const batchRequest = calls.find((call) => call.method === 'POST')?.requestBody ?? '';
+    expect(batchRequest).toContain('GENERIC_RESEARCH_CONTEXT_CANARY');
+    expect(batchRequest).not.toContain('EMPTY_STATE_');
   });
 });

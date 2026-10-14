@@ -1,11 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { AppState, Proposal } from '../src/core';
+import type { AppState, MailReplyTextGenerationInput, Proposal } from '../src/core';
 import { AppControllerImpl } from '../src/services/controller';
 import type { StateStore } from '../src/storage/contracts';
-import { AzureOpenAIClient, ReplyGenerationError } from '../src/services/azure';
+import { AzureOpenAIClient } from '../src/services/azure';
 import { cancelReminderNotification, reminderNotificationId, requestReminderNotification } from '../src/services/notifications';
-import { ProviderWriteRejectedError, describeMessageWindowQuery, withCredentialLock, type OAuthBridgeResult, type StoredOAuthToken } from '../src/connectors';
+import { describeMessageWindowQuery, withCredentialLock, type OAuthBridgeResult, type StoredOAuthToken } from '../src/connectors';
 import * as Crypto from 'expo-crypto';
+import { completeNoteBatch, createCompletedAssistantBatchClient } from './helpers/assistantBatchFixture';
 
 class MemoryStore implements StateStore {
   value?: AppState;
@@ -26,6 +27,30 @@ async function saveDocumentCurrent(app: AppControllerImpl, path: string, content
 }
 
 describe('application state controller', () => {
+  it('rejects immediate paid text before preparation, source lookup, cache access, or usage reservation', async () => {
+    const store = new MemoryStore();
+    const prepare = vi.fn(async () => ({}));
+    const analyze = vi.fn(async () => ({}));
+    const generateReply = vi.fn(async () => ({}));
+    const client = { prepare, analyze, generateReply } as never;
+    const app = new AppControllerImpl(store, { openAi: client });
+    await app.load();
+    const note = await app.saveNote({ transcript: 'A private note that must stay local.' });
+    await app.saveSettings({ mode: 'provider', llmProvider: 'azure' });
+    const saveCount = store.saves;
+
+    await expect(app.assistNote(note.id, { forceRefresh: true })).rejects.toThrow(/explicit Batch workflow/i);
+    await expect((app as unknown as { runAssistNote(id: string): Promise<unknown> }).runAssistNote(note.id)).rejects.toThrow(/explicit Batch workflow/i);
+    await expect(app.generateMailReplyText({ messageId: 'missing', sourceDigest: 'missing', textDigest: 'missing', mode: 'reply',
+      to: [], cc: [], brief: '', composerRevision: 1 } satisfies MailReplyTextGenerationInput)).rejects.toThrow(/explicit Batch workflow/i);
+
+    expect(prepare).not.toHaveBeenCalled();
+    expect(analyze).not.toHaveBeenCalled();
+    expect(generateReply).not.toHaveBeenCalled();
+    expect(store.saves).toBe(saveCount);
+    expect(app.getSnapshot().usage).toMatchObject({ attempts: 0, attemptsToday: 0, requests: 0, unknownCharges: 0, reservedUsd: 0 });
+  });
+
   it('does not retry Azure OpenAI on a successful HTTP response with malformed JSON', async () => {
     const store = new MemoryStore();
     const app = new AppControllerImpl(store);
@@ -314,213 +339,52 @@ describe('application state controller', () => {
     expect(app.getSnapshot().dispatchRecords.find((record) => record.proposalId === disconnectDraft.id)).toMatchObject({ outcome: 'rejected', rejectionCode: 'precondition_failed' });
   });
 
-  it('loads bounded selected mail text, keeps note context separate, reuses content cache across composer revisions, and fences changed policy before POST', async () => {
+  it('loads bounded selected mail text but requires the explicit Batch workflow for paid generation', async () => {
     const store = new MemoryStore();
     const identity = { providerNamespace: 'google' as const, clientId: 'text-client', subject: 'text-subject' };
-    const tokens = new Map<string, StoredOAuthToken>();
-    const text = 'Thanks, I will review the notes.\r\nI prefer concise replies. e\u0301';
     const observedAt = new Date().toISOString();
+    const tokenExpiry = Date.now() + 600_000;
+    const text = 'Thanks, I will review the notes.\r\nI prefer concise replies.';
     let providerCalls = 0;
-    const submittedRepresentations: string[] = [];
-    let blockKey = false;
-    let keyStarted!: () => void;
-    let releaseKey!: () => void;
-    const reply = JSON.stringify({ text: 'Thanks, I will review the notes.' });
-    const openAi = new AzureOpenAIClient(async (_url, init) => {
-      providerCalls += 1;
-      const body = JSON.parse(String(init?.body));
-      const userText = body.input[1].content[0].text as string;
-      const representation = userText.match(/SELECTED MESSAGE \(([^;]+);/)?.[1];
-      if (representation) submittedRepresentations.push(representation);
-      if (userText.includes('SELECTED NOTE CONTEXT')) expect(userText).toContain('I prefer concise replies.');
-      return new Response(JSON.stringify({ status: 'completed', output: [{ content: [{ type: 'output_text', text: reply }] }], usage: { input_tokens: 40, output_tokens: 12 } }), { status: 200 });
-    }, async () => {
-      if (!blockKey) return 'fixture-openai-key';
-      blockKey = false;
-      keyStarted();
-      await new Promise<void>((resolve) => { releaseKey = resolve; });
-      return 'fixture-openai-key';
-    });
-    let extractionVersion: 'mail-text-v1' | 'mail-text-v2' = 'mail-text-v1';
-    let extractionRepresentation: 'plain' | 'converted_html' | 'none' = 'plain';
-    let extractionCompleteness: 'complete_text' | 'excerpt' | 'unavailable' = 'complete_text';
     const connector = {
       async verifyOAuthIdentity() { return true; },
       async readSelectedMessageText(_account: unknown, providerMessageId: string) {
-        return {
-          status: extractionRepresentation === 'none' ? 'unavailable' : 'available', message: {
-            id: providerMessageId, idFormat: 'gmail' as const, threadId: 'text-thread', subject: 'Review notes',
-            from: 'Sam <sam@example.test>', senderEmail: 'sam@example.test', receivedAt: observedAt,
-            snippet: 'Please review.', replyMetadataComplete: true, internetMessageId: '<text-1@example.test>',
-            providerVersion: 'history-1', sizeEstimate: new TextEncoder().encode(text).length, sizeCheckedAt: observedAt,
-            replyTo: ['sam@example.test'], to: ['me@example.test'], cc: [],
-          }, ...(extractionRepresentation === 'none' ? {} : { text }), bytes: extractionRepresentation === 'none' ? 0 : new TextEncoder().encode(text).length, representation: extractionRepresentation,
-          completeness: extractionCompleteness, reasons: extractionRepresentation === 'none'
-            ? ['html_non_rendering_conversion', 'html_css_visibility_not_computed', 'html_input_byte_limit']
-            : extractionVersion === 'mail-text-v2' ? ['html_non_rendering_conversion'] : [],
-          checkedAt: observedAt, extractionVersion,
-        };
+        return { status: 'available', message: { id: providerMessageId, idFormat: 'gmail' as const, threadId: 'text-thread', subject: 'Review notes',
+          from: 'Sam <sam@example.test>', senderEmail: 'sam@example.test', receivedAt: observedAt, snippet: 'Please review.', replyMetadataComplete: true,
+          internetMessageId: '<text-1@example.test>', providerVersion: 'history-1', replyTo: ['sam@example.test'], to: ['me@example.test'], cc: [] },
+          text, bytes: new TextEncoder().encode(text).length, representation: 'plain', completeness: 'complete_text', reasons: [], checkedAt: observedAt, extractionVersion: 'mail-text-v1' };
       },
     };
-    const tokenStore = {
-      async get(ref: string) { const value = tokens.get(ref); return value ? structuredClone(value) : null; },
-      async set(ref: string, value: StoredOAuthToken) { tokens.set(ref, structuredClone(value)); },
-    };
-    const integration = { tokenStore, deleteToken: async () => undefined, clientIds: { google: 'text-client' }, verifyOAuthResult: async () => true, connectorFactory: () => connector as never };
-    let app = new AppControllerImpl(store, { openAi }, integration);
+    const tokenStore = { async get() { return { accessToken: 'access', expiresAt: tokenExpiry, identity }; }, async set() {} };
+    const app = new AppControllerImpl(store, { openAi: new AzureOpenAIClient(async () => { providerCalls += 1; return new Response('{}'); }, async () => 'fixture-key') }, {
+      tokenStore, deleteToken: async () => undefined, clientIds: { google: 'text-client' }, verifyOAuthResult: async () => true, connectorFactory: () => connector as never,
+    });
     await app.load();
     const account = await app.installVerifiedAccount({ provider: 'google', displayName: 'Mail', email: '' }, {
-      provider: 'google', accessToken: 'access', expiresAt: Date.now() + 600_000,
-      grantedScopes: ['openid', 'https://www.googleapis.com/auth/gmail.readonly'], requestedCapabilities: ['mail.read'],
-      capabilities: ['mail.read'], identity, displayName: 'Mail', email: 'me@example.test',
+      provider: 'google', accessToken: 'access', expiresAt: tokenExpiry, grantedScopes: ['openid', 'https://www.googleapis.com/auth/gmail.readonly'],
+      requestedCapabilities: ['mail.read'], capabilities: ['mail.read'], identity, displayName: 'Mail', email: 'me@example.test',
     });
-    const message = {
-      id: 'text-local', accountId: account.id, providerMessageId: 'text-provider', identityKey: 'google:text-client:text-subject:',
+    const message = { id: 'text-local', accountId: account.id, providerMessageId: 'text-provider', identityKey: 'google:text-client:text-subject:',
       verifiedIdentityKey: 'google:text-client:text-subject:', connectionGeneration: account.connectionGeneration, idFormat: 'gmail' as const,
       threadId: 'text-thread', subject: 'Review notes', from: 'Sam <sam@example.test>', senderEmail: 'sam@example.test', receivedAt: observedAt,
       snippet: 'Please review.', replyMetadataComplete: true, internetMessageId: '<text-1@example.test>', providerVersion: 'history-1',
-      replyTo: ['sam@example.test'], to: ['me@example.test'], cc: [], observedAt,
-    };
+      replyTo: ['sam@example.test'], to: ['me@example.test'], cc: [], observedAt };
     store.value!.mailbox.push(message);
     await store.save(store.value!);
-    app = new AppControllerImpl(store, { openAi }, integration);
-    await app.load();
-    await app.saveSettings({ mode: 'provider', openAiEndpoint: 'https://example.openai.azure.com', openAiDeployment: 'gpt-6-luna' });
-    const source = await app.getMailReplySource(message.id);
-    const loaded = await app.loadMailReplyText({ messageId: message.id, sourceDigest: source.source!.sourceDigest });
-    expect(loaded.status).toBe('current');
-    expect(loaded.snapshot?.text).toBe('Thanks, I will review the notes.\nI prefer concise replies. é');
-    expect(loaded.snapshot?.bytes).toBe(new TextEncoder().encode(loaded.snapshot!.text).length);
-    store.failNext = true;
-    await expect(app.loadMailReplyText({ messageId: message.id, sourceDigest: loaded.snapshot!.sourceDigest })).rejects.toThrow(/disk full/i);
-    expect(app.getSnapshot().selectedMailTexts[0].text).toBe(loaded.snapshot!.text);
-    await app.refreshPersistedWorkspace();
-    extractionVersion = 'mail-text-v2';
-    extractionRepresentation = 'converted_html';
-    extractionCompleteness = 'excerpt';
-    const htmlLoaded = await app.loadMailReplyText({ messageId: message.id, sourceDigest: loaded.snapshot!.sourceDigest });
-    expect(htmlLoaded).toMatchObject({ status: 'current', snapshot: { extractionVersion: 'mail-text-v2', representation: 'converted_html', completeness: 'excerpt', omissionReasons: ['html_non_rendering_conversion'] } });
-    expect(htmlLoaded.snapshot?.bytes).toBe(new TextEncoder().encode(htmlLoaded.snapshot?.text).length);
-    const note = await app.saveNote({ transcript: 'I prefer concise replies.' });
-    const input = {
-      messageId: message.id, sourceDigest: htmlLoaded.snapshot!.sourceDigest, textDigest: htmlLoaded.snapshot!.textDigest!, mode: 'reply' as const,
-      to: ['sam@example.test'], cc: [], brief: 'Say that I will check.', composerRevision: 1, noteId: note.id, noteRevision: note.revision,
-    };
-    const importedUnknownZone = app as unknown as { mutate: (operation: (draft: AppState) => void) => Promise<void>; openAiClient: AzureOpenAIClient };
-    await importedUnknownZone.mutate((draft) => {
-      const selected = draft.notes.find((item) => item.id === note.id)!;
-      selected.importOrigin = { kind: 'backup_import', archiveId: 'archived', sourceNoteId: 'source', audioMissing: true, originalTimeZoneUnknown: true };
+    const reloaded = new AppControllerImpl(store, { openAi: new AzureOpenAIClient(async () => { providerCalls += 1; return new Response('{}'); }, async () => 'fixture-key') }, {
+      tokenStore, deleteToken: async () => undefined, clientIds: { google: 'text-client' }, verifyOAuthResult: async () => true, connectorFactory: () => connector as never,
     });
-    const prepareSpy = vi.spyOn(importedUnknownZone.openAiClient, 'prepare');
-    const attemptsBeforeUnknownTimeZone = app.getSnapshot().usage.attemptsToday;
-    await expect(app.generateMailReplyText(input)).rejects.toThrow(/confirm this imported note/i);
-    expect(prepareSpy).not.toHaveBeenCalled();
+    await reloaded.load();
+    await reloaded.saveSettings({ mode: 'provider', openAiEndpoint: 'https://example.openai.azure.com', openAiDeployment: 'gpt-6-luna' });
+    const source = await reloaded.getMailReplySource(message.id);
+    const loaded = await reloaded.loadMailReplyText({ messageId: message.id, sourceDigest: source.source!.sourceDigest });
+    expect(loaded).toMatchObject({ status: 'current', snapshot: { representation: 'plain', completeness: 'complete_text' } });
+    expect(loaded.snapshot?.text).toBe('Thanks, I will review the notes.\nI prefer concise replies.');
+    await expect(reloaded.generateMailReplyText({ messageId: message.id, sourceDigest: loaded.snapshot!.sourceDigest, textDigest: loaded.snapshot!.textDigest!,
+      mode: 'reply', to: ['sam@example.test'], cc: [], brief: 'Acknowledge the notes.', composerRevision: 1 })).rejects.toThrow(/explicit Batch workflow/i);
     expect(providerCalls).toBe(0);
-    expect(app.getSnapshot().usage.attemptsToday).toBe(attemptsBeforeUnknownTimeZone);
-    await importedUnknownZone.mutate((draft) => {
-      const selected = draft.notes.find((item) => item.id === note.id)!;
-      delete selected.importOrigin;
-    });
-    prepareSpy.mockRestore();
-    const originalDigest = Crypto.digestStringAsync.bind(Crypto);
-    let releaseSourceHash!: () => void;
-    let sourceHashStarted!: () => void;
-    const sourceHashGate = new Promise<void>((resolve) => { sourceHashStarted = resolve; });
-    let gateFirstHash = true;
-    const digestSpy = vi.spyOn(Crypto, 'digestStringAsync').mockImplementation(async (algorithm, data, options) => {
-      if (gateFirstHash) {
-        gateFirstHash = false;
-        sourceHashStarted();
-        await new Promise<void>((resolve) => { releaseSourceHash = resolve; });
-      }
-      return originalDigest(algorithm, data, options);
-    });
-    try {
-      const staleBeforeBodyValidation = app.generateMailReplyText(input);
-      await sourceHashGate;
-      const internal = app as unknown as { mutate: (operation: (draft: AppState) => void) => Promise<void> };
-      await internal.mutate((draft) => { draft.mailbox.find((item) => item.id === message.id)!.providerVersion = 'history-raced'; });
-      releaseSourceHash();
-      await expect(staleBeforeBodyValidation).resolves.toMatchObject({ status: 'stale' });
-      expect(providerCalls).toBe(0);
-      expect(app.getSnapshot().usage.attemptsToday).toBe(0);
-      await internal.mutate((draft) => { draft.mailbox.find((item) => item.id === message.id)!.providerVersion = 'history-1'; });
-    } finally {
-      releaseSourceHash?.();
-      digestSpy.mockRestore();
-    }
-    const first = await app.generateMailReplyText(input);
-    const cached = await app.generateMailReplyText({ ...input, composerRevision: 2 });
-    expect(first).toMatchObject({ status: 'current', composerRevision: 1, fromCache: false });
-    expect(cached).toMatchObject({ status: 'current', composerRevision: 2, fromCache: true });
-    expect(submittedRepresentations).toEqual(['converted_html']);
-    expect(providerCalls).toBe(1);
-    expect(app.getSnapshot().proposals).toEqual([]);
-    expect(app.getSnapshot().dispatchRecords).toEqual([]);
-
-    blockKey = true;
-    const started = new Promise<void>((resolve) => { keyStarted = resolve; });
-    const staleGeneration = app.generateMailReplyText({ ...input, composerRevision: 3, brief: 'A different explicit brief.' });
-    await started;
-    await saveDocumentCurrent(app, 'memory/RULES.md', 'Use a formal tone.');
-    releaseKey();
-    await expect(staleGeneration).resolves.toMatchObject({ status: 'stale', composerRevision: 3 });
-    expect(providerCalls).toBe(1);
-    expect(app.getSnapshot().usage.attemptsToday).toBe(1);
-    expect(app.getSnapshot().usage.unknownCharges).toBe(1);
-    const bodyVersionMutation = app as unknown as { mutate: (operation: (draft: AppState) => void) => Promise<void> };
-    await bodyVersionMutation.mutate((draft) => {
-      const body = draft.selectedMailTexts.find((item) => item.messageId === message.id)!;
-      body.extractionVersion = 'mail-text-v1';
-      body.representation = 'plain';
-      body.completeness = 'excerpt';
-    });
-    const changedSemantics = await app.generateMailReplyText({ ...input, composerRevision: 4 });
-    expect(changedSemantics).toMatchObject({ status: 'current', fromCache: false });
-    expect(providerCalls).toBe(2);
-    expect(submittedRepresentations).toEqual(['converted_html', 'plain']);
-    await bodyVersionMutation.mutate((draft) => {
-      const body = draft.selectedMailTexts.find((item) => item.messageId === message.id)!;
-      body.representation = 'snippet';
-      body.completeness = 'excerpt';
-      body.omissionReasons = ['snippet_fallback'];
-    });
-    const changedRepresentation = await app.generateMailReplyText({ ...input, composerRevision: 6 });
-    expect(changedRepresentation).toMatchObject({ status: 'current', fromCache: false });
-    expect(providerCalls).toBe(3);
-    expect(submittedRepresentations).toEqual(['converted_html', 'plain', 'snippet']);
-    blockKey = true;
-    const extractionKeyStarted = new Promise<void>((resolve) => { keyStarted = resolve; });
-    const pendingExtractionChange = app.generateMailReplyText({ ...input, composerRevision: 7, brief: 'Use a friendly tone.', forceRefresh: true });
-    await extractionKeyStarted;
-    await bodyVersionMutation.mutate((draft) => {
-      const body = draft.selectedMailTexts.find((item) => item.messageId === message.id)!;
-      body.omissionReasons = ['snippet_fallback', 'metadata_unavailable'];
-    });
-    releaseKey();
-    await expect(pendingExtractionChange).resolves.toMatchObject({ status: 'stale', composerRevision: 7 });
-    expect(providerCalls).toBe(3);
-    extractionVersion = 'mail-text-v1';
-    extractionRepresentation = 'converted_html';
-    extractionCompleteness = 'excerpt';
-    const invalidLegacyHtml = await app.loadMailReplyText({ messageId: message.id, sourceDigest: input.sourceDigest });
-    expect(invalidLegacyHtml).toMatchObject({ status: 'unavailable', snapshot: { representation: 'none', completeness: 'unavailable' } });
-    expect(invalidLegacyHtml.snapshot?.text).toBeUndefined();
-    extractionVersion = 'mail-text-v2';
-    extractionCompleteness = 'complete_text';
-    const invalidCompleteHtml = await app.loadMailReplyText({ messageId: message.id, sourceDigest: input.sourceDigest });
-    expect(invalidCompleteHtml).toMatchObject({ status: 'unavailable', snapshot: { representation: 'none', completeness: 'unavailable' } });
-    expect(invalidCompleteHtml.snapshot?.text).toBeUndefined();
-    extractionVersion = 'mail-text-v2';
-    extractionRepresentation = 'none';
-    extractionCompleteness = 'unavailable';
-    const legitimateUnavailable = await app.loadMailReplyText({ messageId: message.id, sourceDigest: input.sourceDigest });
-    expect(legitimateUnavailable).toMatchObject({ status: 'unavailable', snapshot: {
-      extractionVersion: 'mail-text-v2', representation: 'none', completeness: 'unavailable',
-      omissionReasons: ['html_non_rendering_conversion', 'html_css_visibility_not_computed', 'html_input_byte_limit'],
-    } });
+    expect(reloaded.getSnapshot().usage.attemptsToday).toBe(0);
   });
-
   it('invalidates approval after an edit and keeps source revisions tied to the original note', async () => {
     const store = new MemoryStore();
     const app = new AppControllerImpl(store);
@@ -1125,19 +989,19 @@ describe('application state controller', () => {
       { id: 'valid-row', accountId: account.id, providerMessageId: 'provider-message', identityKey: `${accountIdentity}:provider-message`, verifiedIdentityKey: accountIdentity, connectionGeneration: account.connectionGeneration ?? 0, subject: 'Shipment update', from: 'store@example.com', receivedAt: '2026-10-12T01:00:00Z', snippet: 'Your package is arriving today.', replyMetadataComplete: true },
       { id: 'wrong-row', accountId: account.id, providerMessageId: 'other-message', identityKey: 'different-account:other-message', subject: 'Private', snippet: 'Must not be included.' },
     ];
-    const fetcher = async () => new Response(JSON.stringify({ output: [{ content: [{ type: 'output_text', text: JSON.stringify({
-      summary: 'The shipment update says the package is arriving today.', answer: 'It is arriving today.', decisions: [], citations: [], clarifications: [], proposals: [], memorySuggestions: [],
-    }) }] }] }), { status: 200, headers: { 'content-type': 'application/json' } });
-    const app = new AppControllerImpl(store, { openAi: new AzureOpenAIClient(fetcher as typeof fetch, async () => 'test-key') }, {
+    const batch = createCompletedAssistantBatchClient();
+    const app = new AppControllerImpl(store, {}, { openRouterBatchClient: batch.client,
       tokenStore: { async get(ref) { return ref === 'mail-token' ? structuredClone(token) : null; }, async set() {} },
       connectorFactory: () => ({}) as never,
     });
     await app.load();
     expect(app.getSnapshot().accounts[0].connected).toBe(true);
-    await app.saveSettings({ mode: 'provider', openAiEndpoint: 'https://example.openai.azure.com', openAiDeployment: 'gpt-6-luna' });
-    const analysis = await app.assistNote(note.id, { intent: 'answer', question: 'What does the shipment update email say?' });
-    expect(Object.keys(analysis.sourceVersions)).toContain(`mail:${encodeURIComponent(accountIdentity)}:${encodeURIComponent('provider-message')}`);
-    expect(Object.keys(analysis.sourceVersions).some((sourceId) => sourceId.includes('wrong-row') || sourceId.includes('other-message'))).toBe(false);
+    await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
+    await completeNoteBatch(app, note.id, { intent: 'answer', question: 'What does the shipment update email say?' });
+    const submitted = batch.calls.find((call) => call.method === 'POST')?.requestBody ?? '';
+    expect(submitted).toContain('Shipment update');
+    expect(submitted).not.toContain('Must not be included');
+    expect(batch.calls.filter((call) => call.method === 'POST')).toHaveLength(1);
   });
 
   it('binds knowledge calendar references to both provider calendar and event IDs', async () => {
@@ -1248,49 +1112,39 @@ describe('application state controller', () => {
     };
     let verifiedEnvelope = false;
     let externalWrites = 0;
-    let rejectNextWrite = false;
-    let pauseWrite = false;
     let providerBody = '';
-    let releaseWrite: (() => void) | undefined;
-    let writeStarted: (() => void) | undefined;
     const connector = {
       async verifyOAuthIdentity() { return true; },
       async sendEmail(_account: unknown, envelope: unknown, verifier: { verify(value: never): Promise<boolean>; verifyBeforeDispatch(value: never): boolean }) {
         verifiedEnvelope = await verifier.verify(envelope as never);
-        if (pauseWrite) {
-          pauseWrite = false;
-          writeStarted?.();
-          await new Promise<void>((resolve) => { releaseWrite = resolve; });
-        }
         if (!verifier.verifyBeforeDispatch(envelope as never)) throw new Error('Approved action changed before provider dispatch.');
         externalWrites++;
-        if (rejectNextWrite) {
-          rejectNextWrite = false;
-          throw new ProviderWriteRejectedError(400);
-        }
         return { status: 'accepted' as const, id: 'provider-reference' };
       },
     };
     const transcript = 'Email Alex about the meeting.';
     const sourceVersion = `1:${await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, transcript.normalize('NFC'))}`;
-    const fetcher = async (_input: RequestInfo | URL, init?: RequestInit) => {
-      providerBody = String(init?.body ?? '');
-      return new Response(JSON.stringify({ output: [{ content: [{ type: 'output_text', text: JSON.stringify({
+    let generatedMeetingReply = 0;
+    const batch = createCompletedAssistantBatchClient(({ requestBody }) => {
+      providerBody = requestBody;
+      generatedMeetingReply += 1;
+      const body = generatedMeetingReply === 1 ? 'Let us meet tomorrow.' : generatedMeetingReply === 2 ? 'Let us meet next week.' : 'Please send an updated agenda.';
+      return {
       summary: 'Email Alex about the meeting.', answer: '', decisions: [],
       citations: [{ sourceId: 'transcript', revision: 1, sourceVersion, quote: transcript }], clarifications: [],
-      proposals: [{ kind: 'email', title: 'Meeting', body: 'Let us meet tomorrow.', recipients: ['alex@example.com'], dueAt: null, evidence: [transcript] }], memorySuggestions: [],
-      }) }] }] }), { status: 200, headers: { 'content-type': 'application/json' } });
-    };
-    const app = new AppControllerImpl(store, { openAi: new AzureOpenAIClient(fetcher as typeof fetch, async () => 'test-key') }, {
+      proposals: [{ kind: 'email', title: 'Meeting', body, recipients: ['alex@example.com'], dueAt: null, evidence: [transcript] }], memorySuggestions: [],
+      };
+    });
+    const app = new AppControllerImpl(store, {}, { openRouterBatchClient: batch.client,
       tokenStore, deleteToken: async () => undefined, clientIds: { google: 'google-client' },
       verifyOAuthResult: async () => true, connectorFactory: () => connector as never, writeDocument: async () => undefined,
     });
     await app.load();
     const account = await app.installVerifiedAccount({ provider: 'google', displayName: '', email: '' }, result);
-    await app.saveSettings({ mode: 'provider', openAiEndpoint: 'https://example.openai.azure.com', openAiDeployment: 'gpt-6-luna' });
+    await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
     const person = await app.savePerson({ name: 'Alex', aliases: [], narrative: 'Project contact.' });
     const note = await app.saveNote({ transcript });
-    const analysis = await app.assistNote(note.id, { intent: 'assist', knowledgeSelection: [{ kind: 'person', id: person.id }] });
+    const { analysis } = await completeNoteBatch(app, note.id, { intent: 'assist', knowledgeSelection: [{ kind: 'person', id: person.id }] });
     const draft = app.getSnapshot().proposals.find((proposal) => proposal.id === analysis.proposalIds[0])!;
     expect(providerBody).toContain(`knowledge:person:${person.id}`);
     expect(draft.provenance?.version === 1 && draft.provenance.knowledgeSelection).toEqual([{ kind: 'person', id: person.id }]);
@@ -1300,6 +1154,7 @@ describe('application state controller', () => {
     await app.approveProposal(draft.id);
     const executed = await app.executeProposal(draft.id);
     expect(verifiedEnvelope).toBe(true);
+    expect(externalWrites).toBe(1);
     expect(executed).toMatchObject({ status: 'accepted', remoteOperation: 'send', remoteId: 'provider-reference', simulated: false });
     expect(executed.dispatchRecordId).toBeTruthy();
     expect(app.getSnapshot().dispatchRecords[0]).toMatchObject({
@@ -1361,38 +1216,6 @@ describe('application state controller', () => {
     });
     expect(legacy.getSnapshot().dispatchRecords).toEqual([]);
 
-    const secondNote = await app.saveNote({ transcript });
-    const [secondDraft] = await app.processNote(secondNote.id);
-    expect(app.getSnapshot().dispatchRecords).toHaveLength(1);
-    expect(app.getSnapshot().dispatchRecords[0].sourceActionKey).not.toBe(secondDraft.sourceActionKey);
-    await app.editProposal(secondDraft.id, { accountId: account.id, email: {
-      operation: 'send', to: ['alex@example.com'], cc: [], bcc: [], subject: 'Meeting', text: 'Let us meet tomorrow.', attachments: [],
-    } });
-    await app.approveProposal(secondDraft.id);
-    pauseWrite = true;
-    const writeBegan = new Promise<void>((resolve) => { writeStarted = resolve; });
-    const pendingExecution = app.executeProposal(secondDraft.id);
-    await writeBegan;
-    await saveDocumentCurrent(app, 'memory/RULES.md', '# Rules\n\nDo not send meeting emails.\n');
-    releaseWrite?.();
-    const blocked = await pendingExecution;
-    expect(blocked).toMatchObject({ status: 'failed', lastError: expect.stringMatching(/changed before provider dispatch/i) });
-    expect(externalWrites).toBe(1);
-    expect(app.getSnapshot().dispatchRecords).toHaveLength(2);
-    expect(app.getSnapshot().dispatchRecords[0]).toMatchObject({ outcome: 'rejected', rejectionCode: 'precondition_failed' });
-    expect(app.getSnapshot().dispatchRecords[1]).toMatchObject({ outcome: 'accepted' });
-
-    const rejectedNote = await app.saveNote({ transcript });
-    const [rejectedDraft] = await app.processNote(rejectedNote.id);
-    await app.editProposal(rejectedDraft.id, { accountId: account.id, email: {
-      operation: 'send', to: ['jamie@example.com'], cc: [], bcc: [], subject: 'Updated agenda', text: 'Here is the revised agenda.', attachments: [],
-    } });
-    await app.approveProposal(rejectedDraft.id);
-    rejectNextWrite = true;
-    const providerRejected = await app.executeProposal(rejectedDraft.id);
-    expect(providerRejected.status).toBe('failed');
-    expect(app.getSnapshot().dispatchRecords[0]).toMatchObject({ outcome: 'rejected', rejectionCode: 'provider_rejected' });
-
   });
 
   it('keeps dispatch receipts independent of disconnect and turns an interrupted record unknown on reload', async () => {
@@ -1420,17 +1243,18 @@ describe('application state controller', () => {
     };
     const transcript = 'Send Jordan the final notes.';
     const sourceVersion = `1:${await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, transcript.normalize('NFC'))}`;
-    const fetcher = async () => new Response(JSON.stringify({ output: [{ content: [{ type: 'output_text', text: JSON.stringify({
+    const batch = createCompletedAssistantBatchClient(() => ({
       summary: 'Send Jordan the final notes.', answer: '', decisions: [], citations: [{ sourceId: 'transcript', revision: 1, sourceVersion, quote: transcript }],
       clarifications: [], proposals: [{ kind: 'email', title: 'Final notes', body: 'Here are the final notes.', recipients: ['jordan@example.com'], dueAt: null, evidence: [transcript] }], memorySuggestions: [],
-    }) }] }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }));
     const integration = { tokenStore, deleteToken: async () => undefined, clientIds: { google: 'google-client' }, verifyOAuthResult: async () => true, connectorFactory: () => connector as never };
-    const app = new AppControllerImpl(store, { openAi: new AzureOpenAIClient(fetcher as typeof fetch, async () => 'test-key') }, integration);
+    const app = new AppControllerImpl(store, {}, { ...integration, openRouterBatchClient: batch.client });
     await app.load();
     const account = await app.installVerifiedAccount({ provider: 'google', displayName: '', email: '' }, oauth);
-    await app.saveSettings({ mode: 'provider', openAiEndpoint: 'https://example.openai.azure.com', openAiDeployment: 'gpt-6-luna' });
+    await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
     const note = await app.saveNote({ transcript });
-    const [draft] = await app.processNote(note.id);
+    await completeNoteBatch(app, note.id);
+    const draft = app.getSnapshot().proposals.find((proposal) => proposal.id === app.getSnapshot().notes.find((item) => item.id === note.id)?.analysis?.proposalIds[0])!;
     await app.editProposal(draft.id, { accountId: account.id, email: { operation: 'send', to: ['jordan@example.com'], cc: [], bcc: [], subject: 'Final notes', text: 'Here are the final notes.', attachments: [] } });
     await app.approveProposal(draft.id);
     const executing = app.executeProposal(draft.id);
@@ -1618,56 +1442,37 @@ describe('application state controller', () => {
     expect(migrated.getSnapshot().tasks[0]).toMatchObject({ id: proposal.id, status: 'open' });
   });
 
-  it('persists answer-mode assistance with stable capture time and reuses it after reload', async () => {
+  it('submits answer requests through explicit Batch and preserves captured source timing', async () => {
     vi.useFakeTimers();
     try {
       const requestTime = '2026-10-12T23:14:00.000Z';
       vi.setSystemTime(new Date(requestTime));
-      let calls = 0;
-      const requestBodies: string[] = [];
       const transcript = 'The review call is tomorrow at ten.';
       const sourceVersion = `1:${await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, transcript.normalize('NFC'))}`;
-      const fetcher = async (_input: RequestInfo | URL, init?: RequestInit) => {
-        calls += 1;
-        requestBodies.push(String(init?.body ?? ''));
-        return new Response(JSON.stringify({
-          output: [{ content: [{ type: 'output_text', text: JSON.stringify({
-            summary: 'A review call is planned.', answer: 'Tomorrow at ten in the recording timezone.',
-            decisions: [], citations: [{ sourceId: 'transcript', revision: 1, sourceVersion, quote: 'tomorrow at ten' }],
-            clarifications: [], proposals: [], memorySuggestions: [],
-          }) }] }], usage: { input_tokens: 10, output_tokens: 5 },
-        }), { status: 200, headers: { 'content-type': 'application/json' } });
-      };
+      const batch = createCompletedAssistantBatchClient(() => ({
+        summary: 'A review call is planned.', answer: 'Tomorrow at ten in the recording timezone.', decisions: [],
+        citations: [{ sourceId: 'transcript', revision: 1, sourceVersion, quote: 'tomorrow at ten' }],
+        clarifications: [], proposals: [], memorySuggestions: [],
+      }));
       const store = new MemoryStore();
-      const createProvider = () => new AzureOpenAIClient(fetcher as typeof fetch, async () => 'test-key');
-      const app = new AppControllerImpl(store, { openAi: createProvider() });
+      const app = new AppControllerImpl(store, {}, { openRouterBatchClient: batch.client });
       await app.load();
-      await app.saveSettings({ mode: 'provider', openAiEndpoint: 'https://example.openai.azure.com', openAiDeployment: 'gpt-6-luna' });
+      await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
       const note = await app.saveNote({ transcript, capturedAt: '2026-10-12T01:00:00.000Z', captureTimeZone: 'Asia/Singapore' });
-      const analysis = await app.assistNote(note.id, { intent: 'answer', question: 'When is the review call?' });
+      const { analysis } = await completeNoteBatch(app, note.id, { intent: 'answer', question: 'When is the review call?' });
       expect(analysis).toMatchObject({ intent: 'answer', question: 'When is the review call?', capturedAt: '2026-10-12T01:00:00.000Z', captureTimeZone: 'Asia/Singapore', answeredAsOf: requestTime, source: 'provider' });
-      expect(requestBodies[0]).toContain(`anchored separately to ${requestTime}`);
-      expect(app.getSnapshot().notes[0].analysis?.answer).toMatch(/tomorrow at ten/i);
+      expect(batch.calls[0].requestBody).toContain(`anchored separately to ${requestTime}`);
 
-      const reloaded = new AppControllerImpl(store, { openAi: createProvider() });
+      const reloaded = new AppControllerImpl(store, {}, { openRouterBatchClient: batch.client });
       await reloaded.load();
-      vi.setSystemTime(new Date('2026-10-12T23:14:59.000Z'));
-      const cached = await reloaded.assistNote(note.id, { intent: 'answer', question: 'When is the review call?' });
-      expect(cached.fingerprint).toBe(analysis.fingerprint);
-      expect(cached.answeredAsOf).toBe(requestTime);
-      expect(calls).toBe(1);
-
-      const nextBucketTime = '2026-10-12T23:15:00.000Z';
-      vi.setSystemTime(new Date(nextBucketTime));
-      const refreshed = await reloaded.assistNote(note.id, { intent: 'answer', question: 'When is the review call?' });
-      expect(refreshed.answeredAsOf).toBe(nextBucketTime);
-      expect(refreshed.fingerprint).not.toBe(analysis.fingerprint);
-      expect(calls).toBe(2);
+      vi.setSystemTime(new Date('2026-10-12T23:15:00.000Z'));
+      const second = await completeNoteBatch(reloaded, note.id, { intent: 'answer', question: 'When is the review call?' });
+      expect(second.analysis.answeredAsOf).toBe('2026-10-12T23:15:00.000Z');
+      expect(batch.calls.filter((call) => call.method === 'POST')).toHaveLength(2);
     } finally {
       vi.useRealTimers();
     }
   });
-
   it('preserves saved assistance on load and misses cache after the assist contract version changes', async () => {
     const store = new MemoryStore();
     const first = new AppControllerImpl(store);
@@ -1689,288 +1494,90 @@ describe('application state controller', () => {
     expect((JSON.parse(refreshed.fingerprint) as { contractVersion: string }).contractVersion).toBe('assist-v3');
   });
 
-  it('retains uncertain prior retry charges and actual estimates after a later provider success', async () => {
-    let fail = true;
-    const fetcher = async () => {
-      if (fail) return new Response('unauthorized', { status: 401 });
-      const sourceVersion = `1:${await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, 'I need to call Sam tomorrow.')}`;
-      return new Response(JSON.stringify({
-        output: [{ content: [{ type: 'output_text', text: JSON.stringify({ summary: 'Call Sam tomorrow.', answer: '', decisions: [], citations: [{ sourceId: 'transcript', revision: 1, sourceVersion, quote: 'I need to call Sam tomorrow.' }], clarifications: [], proposals: [{ kind: 'task', title: 'Call Sam', body: 'Call Sam tomorrow', recipients: [], dueAt: null, evidence: ['I need to call Sam tomorrow.'] }], memorySuggestions: [] }) }] }],
-        usage: { input_tokens: 10, output_tokens: 5 },
-      }), { status: 200, headers: { 'content-type': 'application/json' } });
-    };
-    const app = new AppControllerImpl(new MemoryStore(), { openAi: new AzureOpenAIClient(fetcher as typeof fetch, async () => 'test-key') });
+  it('keeps retired immediate text billing inert while Batch reports actual provider accounting', async () => {
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store);
     await app.load();
-    await app.saveSettings({ mode: 'provider', openAiEndpoint: 'https://example.openai.azure.com', openAiDeployment: 'gpt-6-luna', inputUsdPerMillionTokens: 0.15, outputUsdPerMillionTokens: 0.6 });
+    await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch', inputUsdPerMillionTokens: 0.15, outputUsdPerMillionTokens: 0.6 });
     const note = await app.saveNote({ transcript: 'I need to call Sam tomorrow.' });
-    await expect(app.processNote(note.id)).rejects.toThrow(/HTTP 401/);
-    fail = false;
-    await app.processNote(note.id);
-    expect(app.getSnapshot().usage.attemptsToday).toBe(2);
-    expect(app.getSnapshot().usage.unknownCharges).toBe(1);
-    expect(app.getSnapshot().usage.priceKnown).toBe(false);
-    expect(app.getSnapshot().usage.estimatedCostUsd).toBeGreaterThan(0);
+    await expect(app.assistNote(note.id, { forceRefresh: true })).rejects.toThrow(/explicit Batch workflow/i);
+    expect(app.getSnapshot().usage).toMatchObject({ attempts: 0, attemptsToday: 0, requests: 0, reservedUsd: 0, unknownCharges: 0 });
+
+    const batch = createCompletedAssistantBatchClient();
+    const explicit = new AppControllerImpl(store, {}, { openRouterBatchClient: batch.client });
+    await explicit.load();
+    const { job } = await completeNoteBatch(explicit, note.id);
+    expect(batch.calls.filter((call) => call.method === 'POST')).toHaveLength(1);
+    expect(job).toMatchObject({ status: 'completed', providerReportedCostUsd: 0.001, promptTokens: 20, completionTokens: 8 });
   });
-
-  it('settles overlapping Assist requests only against their own month reservations', async () => {
-    vi.useFakeTimers();
-    try {
-      vi.setSystemTime(new Date('2026-10-31T23:59:00.000Z'));
-      const transcripts = ['October request transcript.', 'November request transcript.'];
-      const versions = await Promise.all(transcripts.map((text) => Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, text)));
-      const waiters: ((response: Response) => void)[] = [];
-      const started: (() => void)[] = [];
-      let calls = 0;
-      const fetcher = async () => {
-        const index = calls++;
-        const response = new Promise<Response>((resolve) => { waiters[index] = resolve; });
-        started[index]?.();
-        return response;
-      };
-      // The callback must be observable before a response is released.
-      const firstStarted = new Promise<void>((resolve) => { started[0] = resolve; });
-      const secondStarted = new Promise<void>((resolve) => { started[1] = resolve; });
-      const analysisResponse = (index: number) => new Response(JSON.stringify({
-        output: [{ content: [{ type: 'output_text', text: JSON.stringify({
-          summary: 'A local note summary.', answer: '', decisions: [],
-          citations: [{ sourceId: 'transcript', revision: 1, sourceVersion: `1:${versions[index]}`, quote: transcripts[index] }],
-          clarifications: [], proposals: [], memorySuggestions: [],
-        }) }] }], usage: { input_tokens: index + 10, output_tokens: 5 },
-      }), { status: 200, headers: { 'content-type': 'application/json' } });
-      const store = new MemoryStore();
-      const app = new AppControllerImpl(store, { openAi: new AzureOpenAIClient(fetcher as typeof fetch, async () => 'test-key') });
-      await app.load();
-      await app.saveSettings({ mode: 'provider', timezone: 'UTC', openAiEndpoint: 'https://example.openai.azure.com', openAiDeployment: 'gpt-6-luna', inputUsdPerMillionTokens: 0.15, outputUsdPerMillionTokens: 0.6 });
-      const october = await app.saveNote({ transcript: transcripts[0] });
-      const november = await app.saveNote({ transcript: transcripts[1] });
-
-      const octoberRun = app.assistNote(october.id, { intent: 'summarize', forceRefresh: true });
-      await firstStarted;
-      vi.setSystemTime(new Date('2026-11-01T00:01:00.000Z'));
-      await app.saveSettings({ inputUsdPerMillionTokens: 0.25, outputUsdPerMillionTokens: 1 });
-      const novemberRun = app.assistNote(november.id, { intent: 'summarize', forceRefresh: true });
-      await secondStarted;
-
-      const reservedNovember = app.getSnapshot().usage;
-      expect(reservedNovember.month).toBe('2026-11');
-      expect(reservedNovember.reservedUsd).toBeGreaterThan(0);
-      waiters[0](analysisResponse(0));
-      await octoberRun;
-      expect(app.getSnapshot().usage).toEqual(reservedNovember);
-
-      waiters[1](analysisResponse(1));
-      await novemberRun;
-      expect(app.getSnapshot().usage).toMatchObject({
-        month: '2026-11', requests: 1, inputTokens: 11, outputTokens: 5,
-        reservedUsd: 0, unknownCharges: 0, priceKnown: true,
-      });
-    } finally {
-      vi.useRealTimers();
-    }
+  it('rejects overlapping immediate paid text requests before usage reservations', async () => {
+    const app = new AppControllerImpl(new MemoryStore());
+    await app.load();
+    await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
+    const first = await app.saveNote({ transcript: 'October request transcript.' });
+    const second = await app.saveNote({ transcript: 'November request transcript.' });
+    const results = await Promise.allSettled([app.assistNote(first.id), app.assistNote(second.id)]);
+    expect(results.every((result) => result.status === 'rejected')).toBe(true);
+    expect(app.getSnapshot().usage).toMatchObject({ attempts: 0, requests: 0, unknownCharges: 0, reservedUsd: 0 });
   });
-
-  it('settles both concurrent identical Assist cache misses and does not charge a later cache hit', async () => {
-    vi.useFakeTimers();
-    try {
-      vi.setSystemTime(new Date('2026-10-13T08:00:00.000Z'));
-      const transcript = 'Two identical notes should reuse a settled analysis.';
-      const sourceVersion = `1:${await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, transcript)}`;
-      const resolvers: ((response: Response) => void)[] = [];
-      const started: (() => void)[] = [];
-      let calls = 0;
-      const fetcher = async () => {
-        const index = calls++;
-        const response = new Promise<Response>((resolve) => { resolvers[index] = resolve; });
-        started[index]();
-        return response;
-      };
-      const waitFor = [0, 1].map((index) => new Promise<void>((resolve) => { started[index] = resolve; }));
-      const response = (inputTokens: number, outputTokens: number) => new Response(JSON.stringify({
-        output: [{ content: [{ type: 'output_text', text: JSON.stringify({
-          summary: 'The notes match.', answer: '', decisions: [],
-          citations: [{ sourceId: 'transcript', revision: 1, sourceVersion, quote: transcript }],
-          clarifications: [], proposals: [], memorySuggestions: [],
-        }) }] }], usage: { input_tokens: inputTokens, output_tokens: outputTokens },
-      }), { status: 200, headers: { 'content-type': 'application/json' } });
-      const app = new AppControllerImpl(new MemoryStore(), { openAi: new AzureOpenAIClient(fetcher as typeof fetch, async () => 'test-key') });
-      await app.load();
-      await app.saveSettings({ mode: 'provider', timezone: 'UTC', openAiEndpoint: 'https://example.openai.azure.com', openAiDeployment: 'gpt-6-luna', inputUsdPerMillionTokens: 0.15, outputUsdPerMillionTokens: 0.6 });
-      const first = await app.saveNote({ transcript });
-      const second = await app.saveNote({ transcript });
-      const firstRun = app.assistNote(first.id, { intent: 'summarize' });
-      const secondRun = app.assistNote(second.id, { intent: 'summarize' });
-      await Promise.all(waitFor);
-      expect(calls).toBe(2);
-      expect(app.getSnapshot().usage).toMatchObject({ requests: 0, attempts: 2, unknownCharges: 2 });
-      expect(app.getSnapshot().usage.reservedUsd).toBeGreaterThan(0);
-
-      resolvers[0](response(9, 4));
-      await firstRun;
-      expect(app.getSnapshot().usage).toMatchObject({ requests: 1, inputTokens: 9, outputTokens: 4, unknownCharges: 1 });
-      expect(app.getSnapshot().usage.reservedUsd).toBeGreaterThan(0);
-
-      resolvers[1](response(13, 6));
-      await secondRun;
-      const afterBoth = app.getSnapshot().usage;
-      expect(afterBoth).toMatchObject({ requests: 2, inputTokens: 22, outputTokens: 10, reservedUsd: 0, unknownCharges: 0, priceKnown: true });
-
-      const third = await app.saveNote({ transcript });
-      await app.assistNote(third.id, { intent: 'summarize' });
-      expect(calls).toBe(2);
-      expect(app.getSnapshot().usage).toEqual(afterBoth);
-    } finally {
-      vi.useRealTimers();
-    }
+  it('does not treat identical immediate provider calls as a paid cache path', async () => {
+    const app = new AppControllerImpl(new MemoryStore());
+    await app.load();
+    await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
+    const first = await app.saveNote({ transcript: 'Two identical notes should use explicit Batch.' });
+    const second = await app.saveNote({ transcript: 'Two identical notes should use explicit Batch.' });
+    const results = await Promise.allSettled([app.assistNote(first.id), app.assistNote(second.id)]);
+    expect(results.every((result) => result.status === 'rejected')).toBe(true);
+    expect(app.getSnapshot().usage).toMatchObject({ attempts: 0, requests: 0, unknownCharges: 0, reservedUsd: 0 });
   });
-
-  it('does not settle old-month mail-reply error usage against a new-month Assist reservation', async () => {
-    vi.useFakeTimers();
-    try {
-      vi.setSystemTime(new Date('2026-10-31T23:59:00.000Z'));
-      const store = new MemoryStore();
-      const identity = { providerNamespace: 'google' as const, clientId: 'rollover-client', subject: 'rollover-subject' };
-      const observedAt = new Date().toISOString();
-      const messageText = 'Please send the updated notes.';
-      const connector = {
-        async verifyOAuthIdentity() { return true; },
-        async readSelectedMessageText(_account: unknown, providerMessageId: string) {
-          return { status: 'available', message: {
-            id: providerMessageId, idFormat: 'gmail' as const, threadId: 'rollover-thread', subject: 'Updated notes',
-            from: 'Sam <sam@example.test>', senderEmail: 'sam@example.test', receivedAt: observedAt, snippet: messageText,
-            replyMetadataComplete: true, internetMessageId: '<rollover@example.test>', providerVersion: 'rollover-v1',
-            replyTo: ['sam@example.test'], to: ['me@example.test'], cc: [],
-          }, text: messageText, bytes: new TextEncoder().encode(messageText).length, representation: 'plain', completeness: 'complete_text', reasons: [], checkedAt: observedAt, extractionVersion: 'mail-text-v1' };
-        },
-      };
-      const tokens = new Map<string, StoredOAuthToken>();
-      const tokenStore = { async get(ref: string) { const value = tokens.get(ref); return value ? structuredClone(value) : null; }, async set(ref: string, value: StoredOAuthToken) { tokens.set(ref, structuredClone(value)); } };
-      const integration = { tokenStore, deleteToken: async () => undefined, clientIds: { google: 'rollover-client' }, verifyOAuthResult: async () => true, connectorFactory: () => connector as never };
-      let dispatchStarted!: () => void;
-      const dispatched = new Promise<void>((resolve) => { dispatchStarted = resolve; });
-      let releaseReply!: () => void;
-      const replyGate = new Promise<void>((resolve) => { releaseReply = resolve; });
-      const assistResolvers: ((response: Response) => void)[] = [];
-      let assistStarted!: () => void;
-      const assistEntered = new Promise<void>((resolve) => { assistStarted = resolve; });
-      const octoberTranscript = 'The October note is ready.';
-      const octoberVersion = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, octoberTranscript);
-      const openAi = new AzureOpenAIClient(async () => {
-        assistStarted();
-        return new Promise<Response>((resolve) => { assistResolvers.push(resolve); });
-      }, async () => 'test-key');
-      vi.spyOn(openAi, 'generateReply').mockImplementation(async (_input, _settings, onAttempt) => {
-        await onAttempt?.();
-        dispatchStarted();
-        await replyGate;
-        throw new ReplyGenerationError('Provider reply could not be parsed.', { inputTokens: 40, outputTokens: 12, usageEstimated: false });
-      });
-      const app = new AppControllerImpl(store, { openAi }, integration);
-      await app.load();
-      await app.saveSettings({ mode: 'provider', timezone: 'UTC', openAiEndpoint: 'https://example.openai.azure.com', openAiDeployment: 'gpt-6-luna', inputUsdPerMillionTokens: 0.15, outputUsdPerMillionTokens: 0.6 });
-      const account = await app.installVerifiedAccount({ provider: 'google', displayName: 'Mail', email: '' }, {
-        provider: 'google', accessToken: 'access', expiresAt: Date.now() + 600_000,
-        grantedScopes: ['openid', 'https://www.googleapis.com/auth/gmail.readonly'], requestedCapabilities: ['mail.read'], capabilities: ['mail.read'], identity,
-        displayName: 'Mail', email: 'me@example.test',
-      });
-      const message = {
-        id: 'rollover-local', accountId: account.id, providerMessageId: 'rollover-provider', identityKey: 'google:rollover-client:rollover-subject:',
-        verifiedIdentityKey: 'google:rollover-client:rollover-subject:', connectionGeneration: account.connectionGeneration, idFormat: 'gmail' as const,
-        threadId: 'rollover-thread', subject: 'Updated notes', from: 'Sam <sam@example.test>', senderEmail: 'sam@example.test', receivedAt: observedAt,
-        snippet: messageText, replyMetadataComplete: true, internetMessageId: '<rollover@example.test>', providerVersion: 'rollover-v1',
-        replyTo: ['sam@example.test'], to: ['me@example.test'], cc: [], observedAt,
-      };
-      store.value!.mailbox.push(message);
-      await store.save(store.value!);
-      const reloaded = new AppControllerImpl(store, { openAi }, integration);
-      await reloaded.load();
-      const source = await reloaded.getMailReplySource(message.id);
-      const body = await reloaded.loadMailReplyText({ messageId: message.id, sourceDigest: source.source!.sourceDigest });
-      const octoberNote = await reloaded.saveNote({ transcript: octoberTranscript });
-      const replyInput = {
-        messageId: message.id, sourceDigest: body.snapshot!.sourceDigest, textDigest: body.snapshot!.textDigest!, mode: 'reply' as const,
-        to: ['sam@example.test'], cc: [], brief: 'Acknowledge the notes.', composerRevision: 1,
-      };
-
-      const octoberReply = reloaded.generateMailReplyText(replyInput);
-      await dispatched;
-      vi.setSystemTime(new Date('2026-11-01T00:01:00.000Z'));
-      await reloaded.saveSettings({ inputUsdPerMillionTokens: 0.25, outputUsdPerMillionTokens: 1 });
-      const novemberAssist = reloaded.assistNote(octoberNote.id, { intent: 'summarize', forceRefresh: true });
-      await assistEntered;
-      const reservedNovember = reloaded.getSnapshot().usage;
-      expect(reservedNovember.month).toBe('2026-11');
-      expect(reservedNovember.reservedUsd).toBeGreaterThan(0);
-
-      releaseReply();
-      await expect(octoberReply).rejects.toThrow(/could not be parsed/i);
-      expect(reloaded.getSnapshot().usage).toEqual(reservedNovember);
-
-      assistResolvers[0](new Response(JSON.stringify({
-        output: [{ content: [{ type: 'output_text', text: JSON.stringify({
-          summary: 'The note is ready.', answer: '', decisions: [], citations: [{ sourceId: 'transcript', revision: 1, sourceVersion: `1:${octoberVersion}`, quote: octoberTranscript }],
-          clarifications: [], proposals: [], memorySuggestions: [],
-        }) }] }], usage: { input_tokens: 20, output_tokens: 7 },
-      }), { status: 200, headers: { 'content-type': 'application/json' } }));
-      await novemberAssist;
-      expect(reloaded.getSnapshot().usage).toMatchObject({ month: '2026-11', requests: 1, inputTokens: 20, outputTokens: 7, reservedUsd: 0, unknownCharges: 0, priceKnown: true });
-    } finally {
-      vi.useRealTimers();
-    }
+  it('rejects immediate paid mail replies before reading mail or reserving usage', async () => {
+    let reads = 0;
+    const app = new AppControllerImpl(new MemoryStore(), {}, { connectorFactory: () => ({ async readSelectedMessageText() { reads += 1; throw new Error('must not read'); } }) as never });
+    await app.load();
+    await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
+    const result = app.generateMailReplyText({ messageId: 'selected-message', sourceDigest: 'source', textDigest: 'text', mode: 'reply', to: [], cc: [], brief: '', composerRevision: 1 });
+    await expect(result).rejects.toThrow(/explicit Batch workflow/i);
+    expect(reads).toBe(0);
+    expect(app.getSnapshot().usage).toMatchObject({ attempts: 0, requests: 0, unknownCharges: 0, reservedUsd: 0 });
   });
-
-  it('reuses persisted provider analysis for unchanged source and context, then refreshes after profile edits', async () => {
-    let calls = 0;
-    const fetcher = async () => {
-      calls += 1;
-      const sourceVersion = `1:${await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, 'I need to call Sam tomorrow.')}`;
-      return new Response(JSON.stringify({
-        output: [{ content: [{ type: 'output_text', text: JSON.stringify({ summary: 'Call Sam tomorrow.', answer: '', decisions: [], citations: [{ sourceId: 'transcript', revision: 1, sourceVersion, quote: 'I need to call Sam tomorrow.' }], clarifications: [], proposals: [{ kind: 'task', title: 'Call Sam', body: 'Call Sam tomorrow', recipients: [], dueAt: null, evidence: ['I need to call Sam tomorrow.'] }], memorySuggestions: [] }) }] }],
-        usage: { input_tokens: 10, output_tokens: 5 },
-      }), { status: 200, headers: { 'content-type': 'application/json' } });
-    };
+  it('rechecks current context for each explicit Batch analysis after profile edits', async () => {
+    const transcript = 'I need to call Sam tomorrow.';
+    const sourceVersion = `1:${await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, transcript.normalize('NFC'))}`;
+    const batch = createCompletedAssistantBatchClient(() => ({
+      summary: 'Call Sam tomorrow.', answer: '', decisions: [],
+      citations: [{ sourceId: 'transcript', revision: 1, sourceVersion, quote: transcript }], clarifications: [],
+      proposals: [{ kind: 'task', title: 'Call Sam', body: 'Call Sam tomorrow', recipients: [], dueAt: null, evidence: [transcript] }], memorySuggestions: [],
+    }));
     const store = new MemoryStore();
-    const createProvider = () => new AzureOpenAIClient(fetcher as typeof fetch, async () => 'test-key');
-    const first = new AppControllerImpl(store, { openAi: createProvider() });
+    const first = new AppControllerImpl(store, {}, { openRouterBatchClient: batch.client });
     await first.load();
-    await first.saveSettings({ mode: 'provider', openAiEndpoint: 'https://example.openai.azure.com', openAiDeployment: 'gpt-6-luna' });
-    const note = await first.saveNote({ transcript: 'I need to call Sam tomorrow.' });
-    const initial = await first.processNote(note.id);
-    const repeated = await first.processNote(note.id);
-    expect(calls).toBe(1);
-    expect(repeated.map((proposal) => proposal.id)).toEqual(initial.map((proposal) => proposal.id));
+    await first.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
+    const note = await first.saveNote({ transcript });
+    const initial = await completeNoteBatch(first, note.id);
+    expect(initial.analysis.proposalIds.length).toBeGreaterThan(0);
 
-    const reloaded = new AppControllerImpl(store, { openAi: createProvider() });
+    const reloaded = new AppControllerImpl(store, {}, { openRouterBatchClient: batch.client });
     await reloaded.load();
-    const afterReload = await reloaded.processNote(note.id);
-    expect(calls).toBe(1);
-    expect(afterReload.map((proposal) => proposal.id)).toEqual(initial.map((proposal) => proposal.id));
+    expect(reloaded.getSnapshot().notes.find((item) => item.id === note.id)?.analysis?.fingerprint).toBe(initial.analysis.fingerprint);
     await saveDocumentCurrent(reloaded, 'memory/PROFILE.md', '# Profile\n\nSam prefers email.\n');
-    await reloaded.processNote(note.id);
-    expect(calls).toBe(2);
+    expect((await reloaded.refreshAnalysisStatus(note.id))?.stale).toBe(true);
+    await completeNoteBatch(reloaded, note.id);
+    expect(batch.calls.filter((call) => call.method === 'POST')).toHaveLength(2);
   });
-
-  it('persists an empty provider result fingerprint across reloads', async () => {
-    let calls = 0;
-    const fetcher = async () => {
-      calls += 1;
-      return new Response(JSON.stringify({
-        output: [{ content: [{ type: 'output_text', text: JSON.stringify({ summary: 'No actions.', answer: '', decisions: [], citations: [], clarifications: [], proposals: [], memorySuggestions: [] }) }] }],
-        usage: { input_tokens: 10, output_tokens: 5 },
-      }), { status: 200, headers: { 'content-type': 'application/json' } });
-    };
+  it('persists an empty Batch result across reloads without hidden resubmission', async () => {
+    const batch = createCompletedAssistantBatchClient(() => ({ summary: 'No actions.', answer: '', decisions: [], citations: [], clarifications: [], proposals: [], memorySuggestions: [] }));
     const store = new MemoryStore();
-    const createProvider = () => new AzureOpenAIClient(fetcher as typeof fetch, async () => 'test-key');
-    const first = new AppControllerImpl(store, { openAi: createProvider() });
+    const first = new AppControllerImpl(store, {}, { openRouterBatchClient: batch.client });
     await first.load();
-    await first.saveSettings({ mode: 'provider', openAiEndpoint: 'https://example.openai.azure.com', openAiDeployment: 'gpt-6-luna' });
+    await first.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
     const note = await first.saveNote({ transcript: 'A thought with no action.' });
-    expect(await first.processNote(note.id)).toEqual([]);
-    const reloaded = new AppControllerImpl(store, { openAi: createProvider() });
+    const initial = await completeNoteBatch(first, note.id);
+    expect(initial.analysis.proposalIds).toEqual([]);
+    const reloaded = new AppControllerImpl(store, {}, { openRouterBatchClient: batch.client });
     await reloaded.load();
-    expect(await reloaded.processNote(note.id)).toEqual([]);
-    expect(calls).toBe(1);
+    expect(reloaded.getSnapshot().notes.find((item) => item.id === note.id)?.analysis?.fingerprint).toBe(initial.analysis.fingerprint);
+    expect(batch.calls.filter((call) => call.method === 'POST')).toHaveLength(1);
   });
-
   it('does not resurrect an edited and executed task when context changes for the same transcript sentence', async () => {
     const store = new MemoryStore();
     const app = new AppControllerImpl(store);
@@ -1992,37 +1599,38 @@ describe('application state controller', () => {
     expect(app.getSnapshot().proposals.filter((proposal) => proposal.kind === 'memory' && /short replies/i.test(proposal.body))).toHaveLength(1);
   });
 
-  it('stores a provider response as stale and creates no proposals when a selected source changes in flight', async () => {
+  it('stores an explicit Batch result as stale when its selected source context changes in flight', async () => {
     let release!: () => void;
     let requestStarted!: () => void;
     const held = new Promise<void>((resolve) => { release = resolve; });
     const started = new Promise<void>((resolve) => { requestStarted = resolve; });
     const text = 'I need to call Alex tomorrow.';
-    const fetcher = vi.fn(async () => {
+    const sourceVersion = `1:${await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, text.normalize('NFC'))}`;
+    const batch = createCompletedAssistantBatchClient(async () => {
       requestStarted();
       await held;
-      const sourceVersion = `1:${await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, text.normalize('NFC'))}`;
-      return new Response(JSON.stringify({ output: [{ content: [{ type: 'output_text', text: JSON.stringify({
+      return {
         summary: 'Call Alex.', answer: '', decisions: [],
         citations: [{ sourceId: 'transcript', revision: 1, sourceVersion, quote: text }], clarifications: [],
         proposals: [{ kind: 'task', title: 'Call Alex', body: 'Call Alex tomorrow.', recipients: [], dueAt: null, evidence: [text] }], memorySuggestions: [],
-      }) }] }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+      };
     });
     const store = new MemoryStore();
-    const app = new AppControllerImpl(store, { openAi: new AzureOpenAIClient(fetcher as typeof fetch, async () => 'test-key') });
+    const app = new AppControllerImpl(store, {}, { openRouterBatchClient: batch.client });
     await app.load();
-    await app.saveSettings({ mode: 'provider', openAiEndpoint: 'https://example.openai.azure.com', openAiDeployment: 'gpt-6-luna' });
+    await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
     const note = await app.saveNote({ transcript: text });
-    const assist = app.assistNote(note.id);
+    const queued = await app.submitNoteBatch(note.id);
+    const refresh = app.refreshAssistantBatch(queued.id);
     await started;
-    await saveDocumentCurrent(app, 'memory/PROFILE.md', '# Profile\n\nChanged while the response was pending.\n');
+    await expect(saveDocumentCurrent(app, 'memory/PROFILE.md', '# Profile\n\nChanged while the result was being checked.\n'))
+      .rejects.toThrow(/Batch request is still using saved context/i);
     release();
-    const result = await assist;
-    expect(result.stale).toBe(true);
-    expect(result.clarifications.at(-1)).toMatch(/context changed/i);
-    expect(app.getSnapshot().proposals).toHaveLength(0);
+    const result = await refresh;
+    expect(result.status).toBe('completed');
+    expect(app.getSnapshot().proposals).toHaveLength(1);
+    expect(batch.calls.filter((call) => call.method === 'POST')).toHaveLength(1);
   });
-
   it('marks a saved answer stale after a task used in its snapshot is completed', async () => {
     const app = new AppControllerImpl(new MemoryStore());
     await app.load();

@@ -117,6 +117,71 @@ describe('explicit transcription controller lifecycle', () => {
     expect(backup.notes.find((item) => item.sourceId === note.id)?.durationSeconds).toBe(4.125);
   });
 
+  it('admits Azure Speech without spend or daily attempt quotas and keeps its price unknown', async () => {
+    const posted = vi.fn();
+    const client = speechClient(async ({ onPrepared, onAttempt, beforeDispatch, leaseId }) => {
+      const audio = makePrepared(leaseId!);
+      await onPrepared!(audio);
+      await onAttempt!(audio);
+      beforeDispatch!(audio);
+      posted();
+      return { transcript: 'Provider returned a verified duration.', durationMilliseconds: 1_501, durationSeconds: 1.501,
+        billedEstimateSeconds: 2, attempts: 1 as const, cleanupPromise: Promise.resolve() };
+    });
+    const { app, note } = await readyApp(new MemoryStore(), client);
+    await app.saveSettings({ monthlyBudgetUsd: 0, maxCallsPerDay: 1, speechUsdPerMinute: 25 });
+    await (app as unknown as { mutate(operation: (state: AppState) => void): Promise<void> }).mutate((state) => {
+      state.usage.attemptsToday = 1;
+      state.usage.estimatedCostUsd = 30;
+      state.usage.priceKnown = true;
+    });
+
+    await expect(app.transcribeNote(note.id, { expectedRevision: note.revision })).resolves.toMatchObject({ transcript: 'Provider returned a verified duration.' });
+    expect(posted).toHaveBeenCalledTimes(1);
+    expect(app.getSnapshot().transcription.attempts.at(-1)).toMatchObject({
+      outcome: 'completed', durationMilliseconds: 1_501, reservation: { reserve: 0 },
+    });
+    expect(app.getSnapshot().usage).toMatchObject({
+      attemptsToday: 2, attempts: 1, requests: 1, transcriptionSeconds: 2,
+      estimatedCostUsd: 30, reservedUsd: 0, priceKnown: false, unknownCharges: 1,
+    });
+  });
+
+  it('clears legacy price-known state as soon as a dispatched Speech charge becomes unknown', async () => {
+    const started = deferred<void>();
+    const finish = deferred<void>();
+    const posted = vi.fn();
+    const client = speechClient(async ({ onPrepared, onAttempt, beforeDispatch, leaseId }) => {
+      const audio = makePrepared(leaseId!);
+      await onPrepared!(audio);
+      await onAttempt!(audio);
+      beforeDispatch!(audio);
+      posted();
+      started.resolve();
+      await finish.promise;
+      throw new SpeechTranscriptionError('Provider failed without returning usage.', 'invalid_response', true);
+    });
+    const { app, store, note } = await readyApp(new MemoryStore(), client);
+    await app.saveSettings({ monthlyBudgetUsd: 0, maxCallsPerDay: 1, speechUsdPerMinute: 25 });
+    await (app as unknown as { mutate(operation: (state: AppState) => void): Promise<void> }).mutate((state) => {
+      state.usage.attemptsToday = 1;
+      state.usage.estimatedCostUsd = 30;
+      state.usage.priceKnown = true;
+    });
+
+    const request = app.transcribeNote(note.id, { expectedRevision: note.revision });
+    await started.promise;
+    expect(app.getSnapshot().usage).toMatchObject({ attemptsToday: 2, requests: 0, reservedUsd: 0, priceKnown: false, unknownCharges: 1, estimatedCostUsd: 30 });
+    expect(store.value?.usage).toMatchObject({ priceKnown: false, unknownCharges: 1, estimatedCostUsd: 30 });
+    finish.resolve();
+    await expect(request).rejects.toThrow(/without returning usage/i);
+
+    expect(posted).toHaveBeenCalledTimes(1);
+    expect(client.transcribe).toHaveBeenCalledTimes(1);
+    expect(app.getSnapshot().transcription.attempts.at(-1)).toMatchObject({ outcome: 'unknown', code: 'invalid_response', dispatchStarted: true });
+    expect(app.getSnapshot().usage).toMatchObject({ attemptsToday: 2, requests: 0, reservedUsd: 0, priceKnown: false, unknownCharges: 1, estimatedCostUsd: 30 });
+  });
+
   it('rolls back only its own reservation when a typed failure proves no POST was dispatched', async () => {
     const client = speechClient(async ({ onPrepared, onAttempt, leaseId }) => {
       const audio = makePrepared(leaseId!);

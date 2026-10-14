@@ -88,11 +88,31 @@ describe('MailReplyComposer Batch mode', () => {
     expect(submit.disabled).toBe(true);
   });
 
-  it('keeps the Azure Generate action for Azure settings', async () => {
-    render(mockController('azure'), [], false);
+  it('keeps manual reply saving for legacy Azure settings without exposing an immediate paid route', async () => {
+    const controller = mockController('azure');
+    const onSave = vi.fn(async () => undefined);
+    act(() => root.render(React.createElement(MailReplyComposer, {
+      visible: true, messageId: 'message-a', controller, busy: false, notes: [], documents: [], batchEnabled: false,
+      batchBlocked: false, ownerGeneration: 1, batchJobs: [], onClose: vi.fn(), onSave,
+      onSubmitBatch: vi.fn(async () => mailJob), onCheckBatch: vi.fn(async () => undefined),
+      onReviewBatch: vi.fn(async () => undefined), onActivateBatch: vi.fn(async () => undefined),
+      onCancelBatchReview: vi.fn(), onDeleteBatch: vi.fn(async () => undefined),
+    })));
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 5)); });
-    expect([...host.querySelectorAll('button')].some((button) => button.textContent === 'Generate reply')).toBe(true);
-    expect(host.textContent).not.toContain('OpenRouter Batch requests for this message');
+    expect([...host.querySelectorAll('button')].some((button) => button.textContent === 'Generate reply')).toBe(false);
+    expect([...host.querySelectorAll('button')].find((button) => button.textContent === 'Submit reply request')?.disabled).toBe(true);
+    const replyInput = [...host.querySelectorAll('input')].find((input) => input.parentElement?.textContent?.includes('Your reply'))!;
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+      setter?.call(replyInput, 'A manually written reply.');
+      replyInput.dispatchEvent(new Event('input', { bubbles: true }));
+      replyInput.dispatchEvent(new Event('change', { bubbles: true }));
+      await Promise.resolve();
+    });
+    await act(async () => { [...host.querySelectorAll('button')].find((button) => button.textContent === 'Save for review')!.click(); await Promise.resolve(); });
+    expect(onSave).toHaveBeenCalledOnce();
+    expect(controller.generateMailReplyText).not.toHaveBeenCalled();
+    expect(controller.submitMailReplyBatch).not.toHaveBeenCalled();
   });
 
   it('submits only the selected opaque context ID and the exact excerpt consent on the OpenRouter path', async () => {

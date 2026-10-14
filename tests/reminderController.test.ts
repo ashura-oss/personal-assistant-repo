@@ -4,8 +4,8 @@ import { AppControllerImpl } from '../src/services/controller';
 import type { NotificationBackend, PendingNotificationRequest } from '../src/services/notificationBackend';
 import type { StateStore } from '../src/storage/contracts';
 import { notificationContentForIntent } from '../src/reminders';
-import { AzureOpenAIClient } from '../src/services/azure';
 import * as Crypto from 'expo-crypto';
+import { createCompletedAssistantBatchClient } from './helpers/assistantBatchFixture';
 
 class MemoryStore implements StateStore {
   value?: AppState;
@@ -481,23 +481,22 @@ describe('reminder controller integrity', () => {
     const transcriptDueAt = dueAt.replace('.000Z', 'Z');
     const transcript = `Remind me to call Sam at ${transcriptDueAt}.`;
     const sourceVersion = `1:${await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, transcript.normalize('NFC'))}`;
-    const fetcher = async () => new Response(JSON.stringify({
-      output: [{ content: [{ type: 'output_text', text: JSON.stringify({
+    const batch = createCompletedAssistantBatchClient(() => ({
         summary: 'Call Sam.', answer: '', decisions: [],
         citations: [{ sourceId: 'transcript', revision: 1, sourceVersion, quote: transcript }], clarifications: [],
         proposals: [{ kind: 'reminder', title: 'Call Sam', body: 'Call Sam about the appointment.', recipients: [], dueAt, evidence: [transcript] }],
         memorySuggestions: [],
-      }) }] }], usage: { input_tokens: 10, output_tokens: 5 },
-    }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }));
     const store = new MemoryStore();
     const schedule = vi.fn(async () => 'must-not-schedule');
-    const app = new AppControllerImpl(store, { openAi: new AzureOpenAIClient(fetcher as typeof fetch, async () => 'local-test-key') }, {
+    const app = new AppControllerImpl(store, {}, { openRouterBatchClient: batch.client,
       reminderBackend: backend({ getPermission: async () => 'denied', schedule }),
     });
     await app.load();
-    await app.saveSettings({ mode: 'provider', openAiEndpoint: 'https://test.openai.azure.com', openAiDeployment: 'gpt-6-luna' });
+    await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
     const note = await app.saveNote({ transcript });
-    const [proposal] = await app.processNote(note.id);
+    await app.refreshAssistantBatch((await app.submitNoteBatch(note.id)).id);
+    const proposal = app.getSnapshot().proposals.find((item) => item.noteId === note.id)!;
     expect(proposal.kind).toBe('reminder');
     await app.approveProposal(proposal.id);
     const executed = await app.executeProposal(proposal.id);

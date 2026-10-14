@@ -31,43 +31,43 @@ vi.mock("expo-file-system/legacy", () => ({}));
 vi.mock("expo-file-system", () => ({}));
 vi.mock("expo-sharing", () => ({}));
 vi.mock("react-native-safe-area-context", () => ({ SafeAreaProvider: ({ children }: { children?: unknown }) => children, SafeAreaView: ({ children }: { children?: unknown }) => children }));
-const { buildLlmProviderSettingsPatch, buildSpeechProviderSettingsPatch, buildProviderCredentialInput } = await import("../App");
-
-const values = {
-  endpoint: "https://azure.example.test/openai/v1/",
-  deployment: "legacy-deployment",
-  model: "gpt-6-luna",
-  azureEffort: "none" as const,
-  openRouterEffort: "low" as const,
-  maxRequestBytes: 24_000,
-  maxOutputTokens: 600,
-  monthlyBudgetUsd: 3,
-  maxAttempts: 1,
-  maxCallsPerDay: 20,
-};
+const { buildLlmProviderSettingsPatch, buildSpeechProviderSettingsPatch, buildProviderCredentialInput, resolveTextAssistanceRoute } = await import("../App");
 
 describe("assistant provider Settings UI contracts", () => {
-  it("keeps OpenRouter batch profile fields separate from saved Azure settings and limits", () => {
-    expect(buildLlmProviderSettingsPatch("openrouter", values)).toEqual({
-      llmProvider: "openrouter",
-      openRouterModel: "openai/gpt-6-luna:batch",
-      openRouterReasoningEffort: "low",
-    });
-  });
-
-  it("retains the legacy Azure profile and controls when Azure remains selected", () => {
-    expect(buildLlmProviderSettingsPatch("azure", values)).toEqual({
-      llmProvider: "azure",
-      openAiEndpoint: values.endpoint,
-      openAiDeployment: values.deployment,
-      model: values.model,
-      reasoningEffort: "none",
-      maxRequestBytes: 24_000,
+  it("routes only newly saved text settings to Batch and leaves legacy Azure fields untouched", () => {
+    const legacy = {
+      llmProvider: "azure" as const,
+      openAiEndpoint: "https://legacy.example.test/",
+      openAiDeployment: "legacy-deployment",
+      model: "legacy-model",
       maxOutputTokens: 600,
       monthlyBudgetUsd: 3,
       maxAttempts: 1,
       maxCallsPerDay: 20,
+    };
+    const patch = buildLlmProviderSettingsPatch({ openRouterEffort: "low" });
+    expect(patch).toEqual({
+      llmProvider: "openrouter",
+      openRouterModel: "openai/gpt-6-luna:batch",
+      openRouterReasoningEffort: "low",
     });
+    expect({ ...legacy, ...patch }).toMatchObject({
+      llmProvider: "openrouter",
+      openAiEndpoint: legacy.openAiEndpoint,
+      openAiDeployment: legacy.openAiDeployment,
+      model: legacy.model,
+      maxOutputTokens: legacy.maxOutputTokens,
+      monthlyBudgetUsd: legacy.monthlyBudgetUsd,
+      maxAttempts: legacy.maxAttempts,
+      maxCallsPerDay: legacy.maxCallsPerDay,
+    });
+  });
+
+  it("does not silently route legacy or missing providers to a model request", () => {
+    expect(resolveTextAssistanceRoute("provider", "azure")).toBe("setup_required");
+    expect(resolveTextAssistanceRoute("provider", undefined)).toBe("setup_required");
+    expect(resolveTextAssistanceRoute("provider", "openrouter")).toBe("batch");
+    expect(resolveTextAssistanceRoute("preview", "azure")).toBe("preview");
   });
 
   it("keeps Speech provider selection independent from the AI provider", () => {
@@ -75,18 +75,15 @@ describe("assistant provider Settings UI contracts", () => {
     expect(buildSpeechProviderSettingsPatch("azure")).toEqual({ speechProvider: "azure" });
   });
 
-  it("saves only the selected provider key while keeping Azure Speech independent", () => {
-    expect(buildProviderCredentialInput("openrouter", " speech-test ", "azure-test", " router-test ")).toEqual({
+  it("saves OpenRouter and Azure Speech keys independently without routing credentials through legacy Azure text", () => {
+    expect(buildProviderCredentialInput(" speech-test ", " router-test ")).toEqual({
       speechSubscriptionKey: "speech-test",
       openRouterApiKey: "router-test",
     });
-    expect(buildProviderCredentialInput("azure", "", " azure-test ", "router-test")).toEqual({
-      openAiApiKey: "azure-test",
-    });
-    expect(buildProviderCredentialInput("azure", "", " azure-test ", " router-test ", true)).toEqual({
-      openAiApiKey: "azure-test",
+    expect(buildProviderCredentialInput("", " router-test ")).toEqual({
       openRouterApiKey: "router-test",
     });
+    expect(buildProviderCredentialInput(" speech-test ", " ")).toEqual({ speechSubscriptionKey: "speech-test" });
   });
 
 });

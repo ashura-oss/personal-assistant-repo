@@ -156,42 +156,22 @@ const isOpenRouterChatDemo = previewScenario === "openrouter-chat" && Platform.O
 const isIsolatedDemo = isDispatchHistoryDemo || isMailSyncDemo || isBackupImportDemo || isKnowledgeDemo || isReminderDemo || isDeviceCalendarsDemo || isTranscriptionDemo || isStartupRecoveryDemo || isPrivacyCleanupDemo || isPendingRecoveryDemo || isBackgroundRefreshDemo || isMailAlertDemo || isMailAlertTapsDemo || isProactiveRecoveryDemo || isOpenRouterBatchDemo || isOpenRouterChatDemo;
 const productionChatSubmissionEnabled = true;
 
-type LlmProviderChoice = "azure" | "openrouter";
-
 export function buildLlmProviderSettingsPatch(
-  provider: LlmProviderChoice,
-  values: {
-    endpoint: string;
-    deployment: string;
-    model: string;
-    azureEffort: "none" | "low";
-    openRouterEffort: "none" | "low";
-    maxRequestBytes: number;
-    maxOutputTokens: number;
-    monthlyBudgetUsd: number;
-    maxAttempts: number;
-    maxCallsPerDay: number;
-  },
+  values: { openRouterEffort: "none" | "low" },
 ): Partial<AppSettings> {
-  if (provider === "openrouter") {
-    return {
-      llmProvider: "openrouter",
-      openRouterModel: "openai/gpt-6-luna:batch",
-      openRouterReasoningEffort: values.openRouterEffort,
-    };
-  }
   return {
-    llmProvider: "azure",
-    openAiEndpoint: values.endpoint,
-    openAiDeployment: values.deployment,
-    model: values.model,
-    reasoningEffort: values.azureEffort,
-    maxRequestBytes: values.maxRequestBytes,
-    maxOutputTokens: values.maxOutputTokens,
-    monthlyBudgetUsd: values.monthlyBudgetUsd,
-    maxAttempts: values.maxAttempts,
-    maxCallsPerDay: values.maxCallsPerDay,
+    llmProvider: "openrouter",
+    openRouterModel: "openai/gpt-6-luna:batch",
+    openRouterReasoningEffort: values.openRouterEffort,
   };
+}
+
+export function resolveTextAssistanceRoute(
+  mode: AppSettings["mode"],
+  savedProvider: AppSettings["llmProvider"],
+): "preview" | "batch" | "setup_required" {
+  if (mode !== "provider") return "preview";
+  return savedProvider === "openrouter" ? "batch" : "setup_required";
 }
 
 export function buildSpeechProviderSettingsPatch(provider: "azure" | "openrouter"): Partial<AppSettings> {
@@ -199,17 +179,13 @@ export function buildSpeechProviderSettingsPatch(provider: "azure" | "openrouter
 }
 
 export function buildProviderCredentialInput(
-  provider: LlmProviderChoice,
   speechSubscriptionKey: string,
-  openAiApiKey: string,
   openRouterApiKey: string,
-  openRouterSelectedForSpeech = false,
-): { speechSubscriptionKey?: string; openAiApiKey?: string; openRouterApiKey?: string } {
+): { speechSubscriptionKey?: string; openRouterApiKey?: string } {
   const speech = speechSubscriptionKey.trim();
   return {
     ...(speech ? { speechSubscriptionKey: speech } : {}),
-    ...(provider === "azure" && openAiApiKey.trim() ? { openAiApiKey: openAiApiKey.trim() } : {}),
-    ...((provider === "openrouter" || openRouterSelectedForSpeech) && openRouterApiKey.trim()
+    ...(openRouterApiKey.trim()
       ? { openRouterApiKey: openRouterApiKey.trim() }
       : {}),
   };
@@ -3846,9 +3822,13 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
                 }}
                 onAssist={(options) => {
                   void run(async () => {
-                    const useOpenRouterBatch = (!isIsolatedDemo || isOpenRouterBatchDemo) &&
-                      state.settings.mode === "provider" &&
-                      state.settings.llmProvider === "openrouter";
+                    const route = resolveTextAssistanceRoute(state.settings.mode, state.settings.llmProvider);
+                    if (route === "setup_required") {
+                      openSettings();
+                      setNotice("Text assistance uses OpenRouter Batch. Save its Settings before submitting; immediate model requests are unavailable.");
+                      return;
+                    }
+                    const useOpenRouterBatch = (!isIsolatedDemo || isOpenRouterBatchDemo) && route === "batch";
                     if (useOpenRouterBatch) {
                       const configured = isOpenRouterBatchDemo
                         ? true
@@ -3870,6 +3850,7 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
                         : "Request queued with OpenRouter Batch. Check for a reply when you choose.");
                       return;
                     }
+                    if (route !== "preview") return;
                     const result = await controller.assistNote(
                       detail.id,
                       options,
@@ -5769,39 +5750,16 @@ function SettingsScreen({
                 : proactiveRecoveryStatus?.status === "unavailable"
                   ? "Recovery is unavailable. Existing saved data has not been reset."
                   : "";
-  const [endpoint, setEndpoint] = useState(state.settings.openAiEndpoint ?? "");
-  const [llmProvider, setLlmProvider] = useState<"azure" | "openrouter">(
-    state.settings.llmProvider ?? "azure",
-  );
-  const [deployment, setDeployment] = useState(
-    state.settings.openAiDeployment ?? "",
-  );
   const [speechEndpoint, setSpeechEndpoint] = useState(
     state.settings.speechEndpoint ?? "",
   );
   const [speechProvider, setSpeechProvider] = useState<"azure" | "openrouter">(
     state.settings.speechProvider ?? "azure",
   );
-  const [model, setModel] = useState(state.settings.model ?? "gpt-6-luna");
   const [effort, setEffort] = useState<"none" | "low">(
-    state.settings.llmProvider === "openrouter"
-      ? state.settings.openRouterReasoningEffort ?? "low"
-      : state.settings.reasoningEffort ?? "none",
+    state.settings.openRouterReasoningEffort ?? "low",
   );
-  const [maxRequestKb, setMaxRequestKb] = useState(
-    String(Math.round((state.settings.maxRequestBytes ?? 24000) / 1000)),
-  );
-  const [maxOutput, setMaxOutput] = useState(
-    String(state.settings.maxOutputTokens),
-  );
-  const [budget, setBudget] = useState(String(state.settings.monthlyBudgetUsd));
   const [localRefreshMessage, setLocalRefreshMessage] = useState("");
-  const [maxAttempts, setMaxAttempts] = useState(
-    String(state.settings.maxAttempts),
-  );
-  const [dailyLimit, setDailyLimit] = useState(
-    String(state.settings.maxCallsPerDay),
-  );
   const [maxAudioSeconds, setMaxAudioSeconds] = useState(
     String(state.settings.maxAudioSeconds),
   );
@@ -5813,7 +5771,6 @@ function SettingsScreen({
     state.settings.speechEnabled === true,
   );
   const [speechKey, setSpeechKey] = useState("");
-  const [openAiKey, setOpenAiKey] = useState("");
   const [openRouterKey, setOpenRouterKey] = useState("");
   const [credentialStatus, setCredentialStatus] = useState({
     speechConfigured: false,
@@ -5838,30 +5795,10 @@ function SettingsScreen({
       .catch((e) => onNotice(messageOf(e)));
   }, [credentialService, demoMode, onNotice]);
   const saveSettings = async () => {
-    const azure = llmProvider === "azure";
-    const requestKb = Number(maxRequestKb);
-    if (azure && (!Number.isFinite(requestKb) || requestKb < 4 || requestKb > 96)) {
-      onNotice("Set the request size from 4 to 96 KB.");
-      return;
-    }
-    const outputTokens = Number(maxOutput);
-    if (azure && (!Number.isFinite(outputTokens) || outputTokens < 1 || outputTokens > 2400)) {
-      onNotice("Set the output limit from 1 to 2,400 tokens.");
-      return;
-    }
     const result = await onSave({
       mode: providerEnabled ? "provider" : "preview",
-      ...buildLlmProviderSettingsPatch(llmProvider, {
-        endpoint,
-        deployment,
-        model,
-        azureEffort: effort,
+      ...buildLlmProviderSettingsPatch({
         openRouterEffort: effort,
-        maxRequestBytes: Math.round(requestKb * 1000),
-        maxOutputTokens: outputTokens,
-        monthlyBudgetUsd: Number(budget),
-        maxAttempts: Number(maxAttempts),
-        maxCallsPerDay: Number(dailyLimit),
       }),
       speechEnabled,
       ...buildSpeechProviderSettingsPatch(speechProvider),
@@ -5877,12 +5814,9 @@ function SettingsScreen({
       );
   };
   const saveKeys = async () => {
-    const result = await onSaveCredentials(
-      buildProviderCredentialInput(llmProvider, speechKey, openAiKey, openRouterKey, speechProvider === "openrouter"),
-    );
+    const result = await onSaveCredentials(buildProviderCredentialInput(speechKey, openRouterKey));
     if (result) {
       setSpeechKey("");
-      setOpenAiKey("");
       setOpenRouterKey("");
       setCredentialStatus(result as typeof credentialStatus);
       onNotice(
@@ -5986,9 +5920,7 @@ function SettingsScreen({
           <View style={{ flex: 1 }}>
             <Text style={s.accountName}>Enable provider analysis</Text>
             <Text style={s.accountSub}>
-              {llmProvider === "azure"
-                ? "Your saved transcript and selected context will be sent to Azure when you request analysis."
-                : "Your saved transcript and selected context will be sent to OpenRouter when you request analysis."}
+              New text requests use delayed OpenRouter Batch. Nothing is sent until you submit a request.
             </Text>
           </View>
           <Switch
@@ -6047,62 +5979,14 @@ function SettingsScreen({
             </Text>
           </View>
         ) : null}
-        <Text style={s.sectionTitle}>AI provider</Text>
-        <View style={s.pills}>
-          {(["azure", "openrouter"] as const).map((value) => (
-            <Pressable
-              key={value}
-              accessibilityRole="radio"
-              accessibilityState={{ checked: llmProvider === value }}
-              accessibilityLabel={`Use ${value === "azure" ? "Azure" : "OpenRouter"}`}
-              onPress={() => {
-                setLlmProvider(value);
-                setEffort(value === "openrouter"
-                  ? state.settings.openRouterReasoningEffort ?? "low"
-                  : state.settings.reasoningEffort ?? "none");
-              }}
-              style={[s.pill, llmProvider === value && s.pillActive]}
-            >
-              <Text style={[s.pillText, llmProvider === value && s.pillTextActive]}>
-                {value === "azure" ? "Azure" : "OpenRouter"}
-              </Text>
-            </Pressable>
-          ))}
+        <Text style={s.sectionTitle}>Text provider</Text>
+        <View style={s.analysisStale}>
+          <Text style={s.accountName}>OpenRouter Batch · openai/gpt-6-luna:batch</Text>
+          <Text style={s.disclaimer}>
+            Requests may take up to 24 hours. OpenRouter retains batch inputs and results for 30 days or until the batch is deleted. Provider cost appears only when reported; no cost is estimated.
+          </Text>
+          {state.settings.llmProvider !== "openrouter" ? <Text style={s.disclaimer}>Legacy text-provider settings are inactive. Saving these Settings explicitly switches new text requests to OpenRouter Batch.</Text> : null}
         </View>
-        {llmProvider === "azure" ? (
-          <>
-            <Text style={s.disclaimer}>Azure OpenAI · optional</Text>
-            <Field
-              label="Azure OpenAI endpoint"
-              value={endpoint}
-              onChangeText={setEndpoint}
-              placeholder="https://your-resource.openai.azure.com/openai/v1/"
-              keyboardType="url"
-            />
-            <Field
-              label="Azure deployment name"
-              value={deployment}
-              onChangeText={setDeployment}
-              placeholder="Your Azure deployment"
-            />
-            <Field
-              label="Azure model"
-              value={model}
-              onChangeText={setModel}
-              placeholder="gpt-6-luna"
-            />
-          </>
-        ) : (
-          <View style={s.analysisStale}>
-            <Text style={s.accountName}>OpenRouter model</Text>
-            <Text accessibilityLabel="OpenRouter batch model openai/gpt-6-luna:batch" style={s.analysisText}>
-              openai/gpt-6-luna:batch
-            </Text>
-            <Text style={s.disclaimer}>
-              Batch requests may take up to 24 hours. OpenRouter retains batch inputs and results for 30 days or until the batch is deleted. No running token or cost estimate is shown; cost appears only when OpenRouter reports it.
-            </Text>
-          </View>
-        )}
         {speechProvider === "azure" ? <Field
           label="Speech endpoint"
           value={speechEndpoint}
@@ -6125,7 +6009,7 @@ function SettingsScreen({
           ))}
         </View>
         <Button
-          label="Save provider settings"
+          label="Save OpenRouter Batch settings"
           disabled={demoMode || busy}
           onPress={() => void saveSettings()}
         />
@@ -6144,36 +6028,19 @@ function SettingsScreen({
                   : "Not configured"
               }
             /> : null}
-            {llmProvider === "azure" ? (
-              <Field
-                label="Azure OpenAI API key"
-                secureTextEntry
-                value={openAiKey}
-                onChangeText={setOpenAiKey}
-                placeholder={
-                  credentialStatus.openAiConfigured
-                    ? Platform.OS === "web"
-                      ? "Saved in this session · enter to replace"
-                      : "Saved securely · enter to replace"
-                    : "Not configured"
-                }
-              />
-            ) : null}
-            {llmProvider === "openrouter" || speechProvider === "openrouter" ? (
-              <Field
-                label="OpenRouter API key"
-                secureTextEntry
-                value={openRouterKey}
-                onChangeText={setOpenRouterKey}
-                placeholder={
-                  credentialStatus.openRouterConfigured
-                    ? Platform.OS === "web"
-                      ? "Saved in this session · enter to replace"
-                      : "Saved securely · enter to replace"
-                    : "Not configured"
-                }
-              />
-            ) : null}
+            <Field
+              label="OpenRouter API key"
+              secureTextEntry
+              value={openRouterKey}
+              onChangeText={setOpenRouterKey}
+              placeholder={
+                credentialStatus.openRouterConfigured
+                  ? Platform.OS === "web"
+                    ? "Saved in this session · enter to replace"
+                    : "Saved securely · enter to replace"
+                  : "Not configured"
+              }
+            />
             <Text style={s.disclaimer}>
               Native credentials use platform secure storage. Browser preview
               keeps credentials in memory only. No provider request is made by
@@ -6188,8 +6055,7 @@ function SettingsScreen({
               tone="quiet"
               disabled={
                 !speechKey.trim() &&
-                !(llmProvider === "azure" && openAiKey.trim()) &&
-                !(openRouterKey.trim() && (llmProvider === "openrouter" || speechProvider === "openrouter"))
+                !openRouterKey.trim()
               }
               onPress={() => void saveKeys()}
             />
@@ -6211,47 +6077,7 @@ function SettingsScreen({
             ) : null}
           </>
         )}
-        <Text style={s.sectionTitle}>{llmProvider === "openrouter" ? "Retention" : "Limits & retention"}</Text>
-        {llmProvider === "azure" ? <>
-        <Field
-          label="Maximum request size · KB"
-          value={maxRequestKb}
-          onChangeText={setMaxRequestKb}
-          keyboardType="numeric"
-        />
-        <Text style={s.disclaimer}>
-          24 KB is roughly 6,000 English tokens. Token counts vary by content;
-          the enforced limit is the serialized request size in bytes.
-        </Text>
-        <Field
-          label="Output limit · tokens"
-          value={maxOutput}
-          onChangeText={setMaxOutput}
-          keyboardType="numeric"
-        />
-        <Field
-          label="Estimated cost ceiling · USD"
-          value={budget}
-          onChangeText={setBudget}
-          keyboardType="numeric"
-        />
-        <Text style={s.disclaimer}>
-          This guard applies only when provider rates are known. Until then,
-          actual charges are reported as unknown.
-        </Text>
-        <Field
-          label="Provider attempts per action"
-          value={maxAttempts}
-          onChangeText={setMaxAttempts}
-          keyboardType="numeric"
-        />
-        <Field
-          label="Provider attempts per day"
-          value={dailyLimit}
-          onChangeText={setDailyLimit}
-          keyboardType="numeric"
-        />
-        </> : null}
+        <Text style={s.sectionTitle}>Recording limits & retention</Text>
         <Field
           label="Maximum recording length · seconds"
           value={maxAudioSeconds}
@@ -6274,21 +6100,7 @@ function SettingsScreen({
             </Pressable>
           ))}
         </View>
-        {llmProvider === "azure" ? <LimitRow
-          label="Usage cost estimate"
-          value={
-            state.usage.priceKnown
-              ? `$${state.usage.estimatedCostUsd.toFixed(2)}`
-              : "Unknown · no verified rate card"
-          }
-        /> : null}
-        {llmProvider === "azure" ? (
-          <LimitRow
-            label="Recorded requests this month"
-            value={String(state.usage.requests)}
-          />
-        ) : null}
-        {llmProvider === "openrouter" || assistantBatchJobs.length > 0 || assistantBatchRecoveryMessage ? (
+        {assistantBatchJobs.length > 0 || assistantBatchRecoveryMessage ? (
           <AssistantBatchHistorySection
             jobs={assistantBatchJobs}
             recoveryMessage={assistantBatchRecoveryMessage}

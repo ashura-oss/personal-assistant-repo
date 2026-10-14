@@ -5,8 +5,8 @@ import type { StateStore } from '../src/storage/contracts';
 import type { PrivacyPublicStatus } from '../src/privacy/types';
 import { createDispatchRecord, recordDispatchOutcome } from '../src/dispatch';
 import * as Crypto from 'expo-crypto';
-import { AzureOpenAIClient } from '../src/services/azure';
 import type { OAuthBridgeResult, StoredOAuthToken } from '../src/connectors';
+import { createCompletedAssistantBatchClient } from './helpers/assistantBatchFixture';
 
 type RawState = AppState & { dispatchRecoveryArchives?: unknown; dispatchRecoveryRawEvidence?: unknown; dispatchRecordQuarantine?: unknown };
 
@@ -538,18 +538,17 @@ describe('selective dispatch recovery', () => {
       verifyOAuthResult: async () => true, connectorFactory: () => connector as never, privacySession };
     const transcript = 'Email Sam the reviewed update.';
     const sourceVersion = `1:${await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, transcript.normalize('NFC'))}`;
-    const fetcher = async () => new Response(JSON.stringify({ output: [{ content: [{ type: 'output_text', text: JSON.stringify({
+    const batch = createCompletedAssistantBatchClient(() => ({
       summary: transcript, answer: '', decisions: [], citations: [{ sourceId: 'transcript', revision: 1, sourceVersion, quote: transcript }],
       clarifications: [], proposals: [{ kind: 'email', title: 'Reviewed update', body: 'Here is the update.', recipients: ['sam@example.test'], dueAt: null, evidence: [transcript] }], memorySuggestions: [],
-    }) }] }] }), { status: 200, headers: { 'content-type': 'application/json' } });
-    const client = { openAi: new AzureOpenAIClient(fetcher as typeof fetch, async () => 'test-key') };
-    const app = new AppControllerImpl(store, client, integration);
+    }));
+    const app = new AppControllerImpl(store, {}, { ...integration, openRouterBatchClient: batch.client });
     await app.load();
     const account = await app.installVerifiedAccount({ provider: 'google', displayName: '', email: '' }, oauth);
-    await app.saveSettings({ mode: 'provider', openAiEndpoint: 'https://example.openai.azure.com', openAiDeployment: 'gpt-6-luna' });
+    await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
     const note = await app.saveNote({ transcript });
-    const result = await app.assistNote(note.id, { intent: 'assist' });
-    const draft = app.getSnapshot().proposals.find((proposal) => proposal.id === result.proposalIds[0])!;
+    await app.refreshAssistantBatch((await app.submitNoteBatch(note.id, { intent: 'assist' })).id);
+    const draft = app.getSnapshot().proposals.find((proposal) => proposal.noteId === note.id)!;
     await app.editProposal(draft.id, { accountId: account.id, email: { operation: 'draft', to: ['sam@example.test'], cc: [], bcc: [],
       subject: 'Reviewed update', text: 'Here is the update.', attachments: [] } });
     await app.approveProposal(draft.id);
