@@ -1,6 +1,9 @@
 node_modules/
 .expo/
 dist/
+dist-web/
+server/data/
+server/dist/
 coverage/
 *.log
 .env

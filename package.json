@@ -9,12 +9,14 @@
     "ios": "expo run:ios",
     "web": "expo start --web",
     "export:web": "expo export --platform web",
+    "export:pwa": "node scripts/export-pwa.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run",
     "test:watch": "vitest",
     "postinstall": "patch-package --error-on-fail",
-    "check:ios-config": "node scripts/check-ios-config.mjs"
+    "check:ios-config": "node scripts/check-ios-config.mjs",
+    "check:server": "npm --prefix server run check"
   },
   "dependencies": {
     "@expo/vector-icons": "^15.0.3",
