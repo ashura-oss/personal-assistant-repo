@@ -12,6 +12,7 @@ const BACKGROUND_TASK_SOURCE_LIMIT_BYTES = 64 * 1024;
 const EXPECTED_BACKGROUND_TASK_VERSION = '57.0.21';
 const EXPECTED_EXPO_VERSION = '57.0.28';
 const FETCH_SOURCE_LIMIT_BYTES = 64 * 1024;
+const FETCH_SWIFT_SOURCE_LIMIT_BYTES = 64 * 1024;
 
 const CHECK_LABELS = Object.freeze({
   bundle: 'iOS bundle identifier and portrait/dark phone settings',
@@ -19,7 +20,7 @@ const CHECK_LABELS = Object.freeze({
   permissions: 'microphone and full-calendar permissions; no reminders permission',
   background: 'SDK 57 TaskManager fetch and BackgroundTask processing modes only',
   expiryBridge: 'pinned Expo task-expiry event bridge matches the patched iOS notification contract',
-  nativeFetchLifetime: 'pinned Expo native fetch lifetime helper awaits explicit cancellation acknowledgement',
+  nativeFetchLifetime: 'pinned Expo fetch lifetime waits for processed URLSession task completion',
   transport: 'restricted App Transport Security policy',
   schemes: 'configured URL schemes are registered',
   module: 'StillPrivacy is uniquely autolinked with its native callback',
@@ -47,7 +48,7 @@ function podspecHasAssignment(source, field, valuePattern) {
   return new RegExp(`^\\s*s\\.${escaped}\\s*=\\s*${valuePattern}\\s*$`, 'm').test(source);
 }
 
-export function validateIosConfiguration({ config, autolink, podspecContent, projectRoot, backgroundTaskVersion, backgroundTaskSource, expoFetchVersion, expoFetchSource, expoRequestTypeSource }) {
+export function validateIosConfiguration({ config, autolink, podspecContent, projectRoot, backgroundTaskVersion, backgroundTaskSource, expoFetchVersion, expoFetchSource, expoRequestTypeSource, expoFetchModuleSwiftSource, expoNativeRequestSwiftSource, expoURLSessionTaskSwiftSource, expoNativeResponseSwiftSource, expoFetchTaskLifetimeSwiftSource, expoFetchExceptionsSwiftSource }) {
   const failures = [];
   const passed = [];
   const mark = (key, valid, failure) => (valid ? passed.push(CHECK_LABELS[key]) : failures.push(failure));
@@ -96,19 +97,57 @@ export function validateIosConfiguration({ config, autolink, podspecContent, pro
   const boundedExpoFetchSource = typeof expoFetchSource === 'string' && Buffer.byteLength(expoFetchSource, 'utf8') <= FETCH_SOURCE_LIMIT_BYTES
     ? expoFetchSource
     : '';
+  const boundedSwift = (source) => typeof source === 'string' && Buffer.byteLength(source, 'utf8') <= FETCH_SWIFT_SOURCE_LIMIT_BYTES ? source : '';
   const lifetimeHelper = boundedExpoFetchSource.match(/export async function withFetchLifetime[\s\S]*?\n}\n/)?.[0] ?? '';
+  const boundedRequestType = boundedExpoFetchSource ? expoRequestTypeSource : '';
+  const boundedFetchModule = boundedSwift(expoFetchModuleSwiftSource);
+  const boundedNativeRequest = boundedSwift(expoNativeRequestSwiftSource);
+  const boundedURLSessionTask = boundedSwift(expoURLSessionTaskSwiftSource);
+  const boundedNativeResponse = boundedSwift(expoNativeResponseSwiftSource);
+  const boundedLifetime = boundedSwift(expoFetchTaskLifetimeSwiftSource);
+  const boundedExceptions = boundedSwift(expoFetchExceptionsSwiftSource);
   const abortBeforeCancel = lifetimeHelper.indexOf('response.abort();') >= 0 &&
     lifetimeHelper.indexOf('response.abort();') < lifetimeHelper.indexOf('await retryCancel()');
   const normalizedBeforeFence = lifetimeHelper.indexOf('normalizeBodyInitAsync(body)') >= 0 &&
     lifetimeHelper.indexOf('normalizeBodyInitAsync(body)') < lifetimeHelper.indexOf('beforeStart?.();');
   const finalFenceBeforeStart = lifetimeHelper.indexOf('beforeStart?.();') >= 0 &&
     lifetimeHelper.indexOf('beforeStart?.();') < lifetimeHelper.indexOf('request.start(');
+  const cancelAndWaitBody = boundedURLSessionTask.match(/func cancelAndWait[\s\S]*?\n  }/)?.[0] ?? '';
+  const startHandler = boundedFetchModule.match(/AsyncFunction\("start"\)[\s\S]*?\.runOnQueue\(fetchRequestQueue\)/)?.[0] ?? '';
+  const requestCancelAndWaitBody = boundedNativeRequest.match(/func cancelAndWait\(promise: Promise\)[\s\S]*?\n  }/)?.[0] ?? '';
+  const nativeRequestStart = boundedNativeRequest.match(/func start\([\s\S]*?\n  }/)?.[0] ?? '';
+  const lifecycleCancelAndWaitBody = boundedLifetime.match(/func cancelAndWait[\s\S]*?\n  }/)?.[0] ?? '';
+  const responseTerminalHandler = boundedNativeResponse.match(/private func handleDidCompleteWithError[\s\S]*?\n  }/)?.[0] ?? '';
   mark('nativeFetchLifetime', expoFetchVersion === EXPECTED_EXPO_VERSION &&
     boundedExpoFetchSource.includes('export async function fetch(') &&
     lifetimeHelper.includes('await cancelAcknowledgement') && lifetimeHelper.includes('onCancelPending?.(retryCancel)') &&
+    lifetimeHelper.includes('request.cancelAndWait()') && !/request\.cancel\(\)/.test(lifetimeHelper) &&
+    lifetimeHelper.includes('}, 1000)') && lifetimeHelper.includes('clearTimeout(cancelPendingDiagnosticTimer)') &&
     abortBeforeCancel && normalizedBeforeFence && finalFenceBeforeStart && typeof expoRequestTypeSource === 'string' &&
     Buffer.byteLength(expoRequestTypeSource, 'utf8') <= FETCH_SOURCE_LIMIT_BYTES &&
-    /public\s+cancel\(\):\s*Promise<void>/.test(expoRequestTypeSource),
+    /public\s+cancel\(\):\s*Promise<void>/.test(boundedRequestType) &&
+    /public\s+cancelAndWait\(\):\s*Promise<void>/.test(boundedRequestType) &&
+    /AsyncFunction\("cancelAndWait"\)[\s\S]*?request\.cancelAndWait\(promise: promise\)[\s\S]*?\.runOnQueue\(fetchRequestQueue\)/.test(boundedFetchModule) &&
+    startHandler.includes('let startResult = request.start(') &&
+    /startResult == \.alreadyStarted[\s\S]*?FetchRequestAlreadyStartedException\(\)[\s\S]*?return[\s\S]*?response\.waitFor/.test(startHandler) &&
+    nativeRequestStart.indexOf('let started = self.task.start(') >= 0 &&
+    nativeRequestStart.indexOf('let started = self.task.start(') < nativeRequestStart.indexOf('case .started:') &&
+    nativeRequestStart.indexOf('case .started:') < nativeRequestStart.indexOf('self.response.redirectMode = requestInit.redirect') &&
+    nativeRequestStart.includes('case .alreadyStarted:\n      break') &&
+    /internal final class FetchRequestAlreadyStartedException: Exception[\s\S]*?already been started/.test(boundedExceptions) &&
+    /func cancelAndWait\(promise: Promise\)[\s\S]*?task\.cancelAndWait[\s\S]*?promise\.resolve\(\)/.test(boundedNativeRequest) &&
+    requestCancelAndWaitBody.includes('response.emitRequestCanceled()') &&
+    /private let lifetime = FetchTaskLifetime\(\)/.test(boundedURLSessionTask) &&
+    /lifetime\.didComplete\(\)/.test(boundedURLSessionTask) &&
+    cancelAndWaitBody.includes('lifetime.cancelAndWait') && !cancelAndWaitBody.includes('removeDelegate') &&
+    /didCompleteWithError error: \(any Error\)\?,[\s\S]*?onProcessed: @escaping @Sendable/.test(boundedNativeResponse) &&
+    responseTerminalHandler.includes('onProcessed') &&
+    (responseTerminalHandler.match(/dispatchQueue\.async\(execute: onProcessed\)/g) ?? []).length >= 2 &&
+    responseTerminalHandler.includes('handleDidCompleteWithError(session: session, task: task, error: error, onProcessed: onProcessed)') &&
+    boundedLifetime.includes('case notStarted') && boundedLifetime.includes('case running') && boundedLifetime.includes('case terminal') &&
+    boundedLifetime.includes('func didComplete()') && !boundedLifetime.includes('Timer.scheduledTimer') &&
+    lifecycleCancelAndWaitBody.indexOf('waiters.append(completion)') >= 0 &&
+    lifecycleCancelAndWaitBody.indexOf('waiters.append(completion)') < lifecycleCancelAndWaitBody.indexOf('cancelTask()'),
   'The pinned Expo fetch lifetime/cancellation helper is missing or changed.');
 
   const ats = info?.NSAppTransportSecurity;
@@ -230,6 +269,12 @@ async function runCheck() {
   let expoFetchVersion = '';
   let expoFetchSource = '';
   let expoRequestTypeSource = '';
+  let expoFetchModuleSwiftSource = '';
+  let expoNativeRequestSwiftSource = '';
+  let expoURLSessionTaskSwiftSource = '';
+  let expoNativeResponseSwiftSource = '';
+  let expoFetchTaskLifetimeSwiftSource = '';
+  let expoFetchExceptionsSwiftSource = '';
   try {
     const expoPackage = require.resolve('expo/package.json');
     const parsedPackage = JSON.parse(readFileSync(expoPackage, 'utf8'));
@@ -238,14 +283,25 @@ async function runCheck() {
       const expoRoot = path.dirname(expoPackage);
       const fetchPath = path.join(expoRoot, 'src/winter/fetch/fetch.ts');
       const requestTypePath = path.join(expoRoot, 'src/winter/fetch/NativeRequest.ts');
+      const swiftRoot = path.join(expoRoot, 'ios/Fetch');
       const fetchStat = statSync(fetchPath);
       const requestTypeStat = statSync(requestTypePath);
+      const readBounded = (filePath, limit) => {
+        const sourceStat = statSync(filePath);
+        return sourceStat.isFile() && sourceStat.size <= limit ? readFileSync(filePath, 'utf8') : '';
+      };
       if (fetchStat.isFile() && fetchStat.size <= FETCH_SOURCE_LIMIT_BYTES) expoFetchSource = readFileSync(fetchPath, 'utf8');
       if (requestTypeStat.isFile() && requestTypeStat.size <= FETCH_SOURCE_LIMIT_BYTES) expoRequestTypeSource = readFileSync(requestTypePath, 'utf8');
+      expoFetchModuleSwiftSource = readBounded(path.join(swiftRoot, 'ExpoFetchModule.swift'), FETCH_SWIFT_SOURCE_LIMIT_BYTES);
+      expoNativeRequestSwiftSource = readBounded(path.join(swiftRoot, 'NativeRequest.swift'), FETCH_SWIFT_SOURCE_LIMIT_BYTES);
+      expoURLSessionTaskSwiftSource = readBounded(path.join(swiftRoot, 'ExpoURLSessionTask.swift'), FETCH_SWIFT_SOURCE_LIMIT_BYTES);
+      expoNativeResponseSwiftSource = readBounded(path.join(swiftRoot, 'NativeResponse.swift'), FETCH_SWIFT_SOURCE_LIMIT_BYTES);
+      expoFetchTaskLifetimeSwiftSource = readBounded(path.join(swiftRoot, 'FetchTaskLifetime.swift'), FETCH_SWIFT_SOURCE_LIMIT_BYTES);
+      expoFetchExceptionsSwiftSource = readBounded(path.join(swiftRoot, 'FetchExceptions.swift'), FETCH_SWIFT_SOURCE_LIMIT_BYTES);
     }
   } catch { /* The fixed pinned-source check below reports absence without exposing paths. */ }
 
-  const result = validateIosConfiguration({ config, autolink, podspecContent, projectRoot, backgroundTaskVersion, backgroundTaskSource, expoFetchVersion, expoFetchSource, expoRequestTypeSource });
+  const result = validateIosConfiguration({ config, autolink, podspecContent, projectRoot, backgroundTaskVersion, backgroundTaskSource, expoFetchVersion, expoFetchSource, expoRequestTypeSource, expoFetchModuleSwiftSource, expoNativeRequestSwiftSource, expoURLSessionTaskSwiftSource, expoNativeResponseSwiftSource, expoFetchTaskLifetimeSwiftSource, expoFetchExceptionsSwiftSource });
   for (const label of result.passed) console.log(`OK ${label}`);
   for (const failure of result.failures) console.error(`FAIL ${failure}`);
   if (!result.ok) process.exitCode = 1;

@@ -1,28 +1,323 @@
+diff --git a/node_modules/expo/ios/Fetch/ExpoFetchModule.swift b/node_modules/expo/ios/Fetch/ExpoFetchModule.swift
+index 026948f..530b3f8 100644
+--- a/node_modules/expo/ios/Fetch/ExpoFetchModule.swift
++++ b/node_modules/expo/ios/Fetch/ExpoFetchModule.swift
+@@ -93,13 +93,17 @@ public final class ExpoFetchModule: Module {
+       }
+ 
+       AsyncFunction("start") { (request: NativeRequest, url: URL, requestInit: NativeRequestInit, requestBody: Data?, promise: Promise) in
+-        request.start(
++        let startResult = request.start(
+           urlSession: urlSession,
+           urlSessionDelegate: urlSessionDelegate,
+           url: url,
+           requestInit: requestInit,
+           requestBody: requestBody
+         )
++        if startResult == .alreadyStarted {
++          promise.reject(FetchRequestAlreadyStartedException())
++          return
++        }
+         request.response.waitFor(states: [.responseReceived, .errorReceived]) { state in
+           if state == .responseReceived {
+             promise.resolve()
+@@ -112,6 +116,10 @@ public final class ExpoFetchModule: Module {
+       AsyncFunction("cancel") { (request: NativeRequest) in
+         request.cancel(urlSessionDelegate: self.urlSessionDelegate)
+       }.runOnQueue(fetchRequestQueue)
++
++      AsyncFunction("cancelAndWait") { (request: NativeRequest, promise: Promise) in
++        request.cancelAndWait(promise: promise)
++      }.runOnQueue(fetchRequestQueue)
+     }
+   }
+ 
+diff --git a/node_modules/expo/ios/Fetch/ExpoURLSessionTask.swift b/node_modules/expo/ios/Fetch/ExpoURLSessionTask.swift
+index 8f31e93..3e98364 100644
+--- a/node_modules/expo/ios/Fetch/ExpoURLSessionTask.swift
++++ b/node_modules/expo/ios/Fetch/ExpoURLSessionTask.swift
+@@ -8,6 +8,7 @@ import ExpoModulesCore
+ internal final class ExpoURLSessionTask: NSObject, URLSessionTaskDelegate, URLSessionDataDelegate, @unchecked Sendable {
+   private let delegate: ExpoURLSessionTaskDelegate
+   private var task: URLSessionDataTask?
++  private let lifetime = FetchTaskLifetime()
+ 
+   init(delegate: ExpoURLSessionTaskDelegate) {
+     self.delegate = delegate
+@@ -20,7 +21,11 @@ internal final class ExpoURLSessionTask: NSObject, URLSessionTaskDelegate, URLSe
+     url: URL,
+     requestInit: NativeRequestInit,
+     requestBody: Data?
+-  ) {
++  ) -> FetchTaskLifetime.StartResult {
++    let startResult = lifetime.start()
++    guard startResult == .started else {
++      return startResult
++    }
+     let request = NSMutableURLRequest(url: url)
+     URLProtocol.setProperty(requestInit.redirect == .follow, forKey: "shouldFollowRedirects", in: request)
+     request.httpMethod = requestInit.method
+@@ -43,6 +48,7 @@ internal final class ExpoURLSessionTask: NSObject, URLSessionTaskDelegate, URLSe
+     self.task = task
+     task.resume()
+     self.delegate.urlSessionDidStart(self)
++    return .started
+   }
+ 
+   func cancel(urlSessionDelegate: URLSessionSessionDelegateProxy) {
+@@ -52,6 +58,18 @@ internal final class ExpoURLSessionTask: NSObject, URLSessionTaskDelegate, URLSe
+     }
+   }
+ 
++  func cancelAndWait(cancelResponse: () -> Void, completion: @escaping @Sendable () -> Void) {
++    lifetime.cancelAndWait(cancelTask: { [weak self] in
++      guard let self, let task = self.task else {
++        // A started lifecycle always has a URLSession task. If that invariant
++        // is broken, remain pending rather than inventing terminal evidence.
++        return
++      }
++      cancelResponse()
++      task.cancel()
++    }, completion: completion)
++  }
++
+   // MARK: - URLSessionTaskDelegate/URLSessionDataDelegate implementations
+ 
+   func urlSession(
+@@ -84,7 +102,9 @@ internal final class ExpoURLSessionTask: NSObject, URLSessionTaskDelegate, URLSe
+   }
+ 
+   func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+-    self.delegate.urlSession(self, task: task, didCompleteWithError: error)
++    self.delegate.urlSession(self, task: task, didCompleteWithError: error) {
++      self.lifetime.didComplete()
++    }
+   }
+ }
+ 
+@@ -99,5 +119,10 @@ internal protocol ExpoURLSessionTaskDelegate: AnyObject, Sendable {
+     newRequest request: URLRequest,
+     completionHandler: @escaping (URLRequest?) -> Void
+   )
+-  func urlSession(_ session: ExpoURLSessionTask, task: URLSessionTask, didCompleteWithError error: Error?)
++  func urlSession(
++    _ session: ExpoURLSessionTask,
++    task: URLSessionTask,
++    didCompleteWithError error: Error?,
++    onProcessed: @escaping @Sendable () -> Void
++  )
+ }
+diff --git a/node_modules/expo/ios/Fetch/FetchExceptions.swift b/node_modules/expo/ios/Fetch/FetchExceptions.swift
+index bd5981d..a8086f4 100644
+--- a/node_modules/expo/ios/Fetch/FetchExceptions.swift
++++ b/node_modules/expo/ios/Fetch/FetchExceptions.swift
+@@ -14,6 +14,12 @@ internal final class FetchRequestCanceledException: Exception {
+   }
+ }
+ 
++internal final class FetchRequestAlreadyStartedException: Exception {
++  override var reason: String {
++    "Fetch request has already been started"
++  }
++}
++
+ internal final class FetchRedirectException: Exception {
+   override var reason: String {
+     "Redirect is not allowed when redirect mode is 'error'"
+diff --git a/node_modules/expo/ios/Fetch/FetchTaskLifetime.swift b/node_modules/expo/ios/Fetch/FetchTaskLifetime.swift
+new file mode 100644
+index 0000000..f4d348b
+--- /dev/null
++++ b/node_modules/expo/ios/Fetch/FetchTaskLifetime.swift
+@@ -0,0 +1,66 @@
++// Copyright 2015-present 650 Industries. All rights reserved.
++
++import Foundation
++
++/// Serial-queue-owned lifecycle for one URLSession task. Call every method on
++/// Expo's fetch request queue; completion means the delegate's terminal work
++/// has been processed, not merely that cancellation was requested.
++internal final class FetchTaskLifetime {
++  enum StartResult: Equatable {
++    case started
++    case alreadyStarted
++    case cancelledBeforeStart
++  }
++
++  private enum State: Equatable {
++    case notStarted
++    case running
++    case terminal
++  }
++
++  private var state: State = .notStarted
++  private var wasStarted = false
++  private var cancellationRequested = false
++  private var waiters: [@Sendable () -> Void] = []
++
++  func start() -> StartResult {
++    switch state {
++    case .notStarted:
++      wasStarted = true
++      state = .running
++      return .started
++    case .running:
++      return .alreadyStarted
++    case .terminal:
++      return wasStarted ? .alreadyStarted : .cancelledBeforeStart
++    }
++  }
++
++  func cancelAndWait(cancelTask: () -> Void, completion: @escaping @Sendable () -> Void) {
++    switch state {
++    case .terminal:
++      completion()
++    case .notStarted:
++      state = .terminal
++      cancellationRequested = true
++      completion()
++    case .running:
++      waiters.append(completion)
++      guard !cancellationRequested else {
++        return
++      }
++      cancellationRequested = true
++      cancelTask()
++    }
++  }
++
++  func didComplete() {
++    guard state != .terminal else {
++      return
++    }
++    state = .terminal
++    let completions = waiters
++    waiters.removeAll(keepingCapacity: false)
++    completions.forEach { $0() }
++  }
++}
+diff --git a/node_modules/expo/ios/Fetch/NativeRequest.swift b/node_modules/expo/ios/Fetch/NativeRequest.swift
+index 9b40b43..444212c 100644
+--- a/node_modules/expo/ios/Fetch/NativeRequest.swift
++++ b/node_modules/expo/ios/Fetch/NativeRequest.swift
+@@ -20,15 +20,31 @@ internal final class NativeRequest: SharedObject, @unchecked Sendable {
+     url: URL,
+     requestInit: NativeRequestInit,
+     requestBody: Data?
+-  ) {
+-    self.response.redirectMode = requestInit.redirect
+-    self.task.start(
++  ) -> FetchTaskLifetime.StartResult {
++    let started = self.task.start(
+       urlSession: urlSession,
+       urlSessionDelegate: urlSessionDelegate,
+       url: url,
+       requestInit: requestInit,
+       requestBody: requestBody
+     )
++    switch started {
++    case .started:
++      self.response.redirectMode = requestInit.redirect
++    case .cancelledBeforeStart:
++      self.response.emitRequestCanceled()
++    case .alreadyStarted:
++      break
++    }
++    return started
++  }
++
++  func cancelAndWait(promise: Promise) {
++    task.cancelAndWait(cancelResponse: { [weak self] in
++      self?.response.emitRequestCanceled()
++    }) {
++      promise.resolve()
++    }
+   }
+ 
+   func cancel(urlSessionDelegate: URLSessionSessionDelegateProxy) {
+diff --git a/node_modules/expo/ios/Fetch/NativeResponse.swift b/node_modules/expo/ios/Fetch/NativeResponse.swift
+index c2531d8..255f96f 100644
+--- a/node_modules/expo/ios/Fetch/NativeResponse.swift
++++ b/node_modules/expo/ios/Fetch/NativeResponse.swift
+@@ -203,17 +203,29 @@ internal final class NativeResponse: SharedObject, ExpoURLSessionTaskDelegate, @
+     }
+   }
+ 
+-  func urlSession(_ session: ExpoURLSessionTask, task: URLSessionTask, didCompleteWithError error: (any Error)?) {
++  func urlSession(
++    _ session: ExpoURLSessionTask,
++    task: URLSessionTask,
++    didCompleteWithError error: (any Error)?,
++    onProcessed: @escaping @Sendable () -> Void
++  ) {
+     dispatchQueue.async { [weak self] in
+       guard let self else {
++        onProcessed()
+         return
+       }
+-      self.handleDidCompleteWithError(session: session, task: task, error: error)
++      self.handleDidCompleteWithError(session: session, task: task, error: error, onProcessed: onProcessed)
+     }
+   }
+ 
+-  private func handleDidCompleteWithError(session: ExpoURLSessionTask, task: URLSessionTask, error: (any Error)?) {
++  private func handleDidCompleteWithError(
++    session: ExpoURLSessionTask,
++    task: URLSessionTask,
++    error: (any Error)?,
++    onProcessed: @escaping @Sendable () -> Void
++  ) {
+     if isInvalidState(.started, .responseReceived, .bodyStreamingStarted, .bodyStreamingCanceled) {
++      dispatchQueue.async(execute: onProcessed)
+       return
+     }
+ 
+@@ -233,9 +245,10 @@ internal final class NativeResponse: SharedObject, ExpoURLSessionTaskDelegate, @
+       state = .responseReceived
+       dispatchQueue.async { [weak self] in
+         guard let self else {
++          onProcessed()
+           return
+         }
+-        self.handleDidCompleteWithError(session: session, task: task, error: error)
++        self.handleDidCompleteWithError(session: session, task: task, error: error, onProcessed: onProcessed)
+       }
+       return
+     }
+@@ -256,5 +269,6 @@ internal final class NativeResponse: SharedObject, ExpoURLSessionTaskDelegate, @
+     }
+ 
+     emit(event: "readyForJSFinalization")
++    dispatchQueue.async(execute: onProcessed)
+   }
+ }
 diff --git a/node_modules/expo/src/winter/fetch/NativeRequest.ts b/node_modules/expo/src/winter/fetch/NativeRequest.ts
-index 8f348d4..0030cb6 100644
+index 8f348d4..ae0ee9e 100644
 --- a/node_modules/expo/src/winter/fetch/NativeRequest.ts
 +++ b/node_modules/expo/src/winter/fetch/NativeRequest.ts
-@@ -8,7 +8,7 @@ export declare class NativeRequest extends SharedObject {
+@@ -8,7 +8,8 @@ export declare class NativeRequest extends SharedObject {
      requestInit: NativeRequestInit,
      requestBody: Uint8Array | null
    ): Promise<NativeResponse>;
 -  public cancel(): void;
 +  public cancel(): Promise<void>;
++  public cancelAndWait(): Promise<void>;
  }
  
  export interface NativeRequestInit {
 diff --git a/node_modules/expo/src/winter/fetch/fetch.ts b/node_modules/expo/src/winter/fetch/fetch.ts
-index cbe3222..6a37334 100644
+index cbe3222..350b52d 100644
 --- a/node_modules/expo/src/winter/fetch/fetch.ts
 +++ b/node_modules/expo/src/winter/fetch/fetch.ts
-@@ -95,6 +95,101 @@ export async function fetch(
+@@ -95,6 +95,114 @@ export async function fetch(
    return response;
  }
  
 +/**
 + * Runs a response consumer while retaining ownership of Expo's native request.
-+ * Unlike fetch(), this helper closes the JS response and awaits native cancel
-+ * acknowledgement before returning, including when the consumer throws.
++ * Unlike fetch(), this helper closes the JS response and awaits native task
++ * completion before returning, including when the consumer throws. Calling
++ * cancel() alone only requests cancellation.
 + */
 +export async function withFetchLifetime<T>(
 +  input: string | URL | FetchRequestLike,
@@ -49,18 +344,30 @@ index cbe3222..6a37334 100644
 +  let cancelFailed = false;
 +  let activeCancel: Promise<void> | undefined;
 +  let cancelPendingNotified = false;
++  let cancelPendingDiagnosticTimer: ReturnType<typeof setTimeout> | undefined;
 +  let resolveCancelAcknowledged!: () => void;
 +  const cancelAcknowledgement = new Promise<void>((resolve) => { resolveCancelAcknowledged = resolve; });
 +  const retryCancel = (): Promise<void> => {
 +    if (cancelAcknowledged) return Promise.resolve();
 +    if (activeCancel) return activeCancel;
-+    const pending = Promise.resolve().then(() => request.cancel());
++    const pending = Promise.resolve().then(() => request.cancelAndWait());
 +    activeCancel = pending;
++    cancelPendingDiagnosticTimer = setTimeout(() => {
++      cancelPendingDiagnosticTimer = undefined;
++      if (activeCancel === pending && !cancelAcknowledged && !cancelPendingNotified) {
++        cancelPendingNotified = true;
++        try { onCancelPending?.(retryCancel); } catch { /* Ownership remains held; observers cannot cancel cleanup. */ }
++      }
++    }, 1000);
 +    void pending.then(() => {
++      if (cancelPendingDiagnosticTimer !== undefined) clearTimeout(cancelPendingDiagnosticTimer);
++      cancelPendingDiagnosticTimer = undefined;
 +      cancelAcknowledged = true;
 +      activeCancel = undefined;
 +      resolveCancelAcknowledged();
 +    }, () => {
++      if (cancelPendingDiagnosticTimer !== undefined) clearTimeout(cancelPendingDiagnosticTimer);
++      cancelPendingDiagnosticTimer = undefined;
 +      activeCancel = undefined;
 +      cancelFailed = true;
 +      if (!cancelPendingNotified) {

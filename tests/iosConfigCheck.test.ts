@@ -5,6 +5,8 @@ import { validateIosConfiguration } from '../scripts/check-ios-config.mjs';
 
 const projectRoot = process.cwd();
 const podspecDir = path.join(projectRoot, 'modules/still-privacy/ios');
+const expoFetchSwiftDir = path.join(projectRoot, 'node_modules/expo/ios/Fetch');
+const expoFetchTypeDir = path.join(projectRoot, 'node_modules/expo/src/winter/fetch');
 const podspecContent = `Pod::Spec.new do |s|
   s.name = 'StillPrivacy'
   s.version = '1.0.0'
@@ -23,19 +25,8 @@ const backgroundTaskSource = `
     self.sendEvent(onTasksExpired, [:])
   }
 `;
-const expoFetchSource = `
-export async function fetch(input, init) { return response; }
-export async function withFetchLifetime<T>() {
-  const normalized = await normalizeBodyInitAsync(body);
-  response.abort();
-  beforeStart?.();
-  request.start();
-  if (!cancelAcknowledged) await retryCancel();
-  if (!cancelAcknowledged) await cancelAcknowledgement;
-  onCancelPending?.(retryCancel);
-}
-`;
-const expoRequestTypeSource = 'public cancel(): Promise<void>;';
+const expoFetchSource = readFileSync(path.join(expoFetchTypeDir, 'fetch.ts'), 'utf8');
+const expoRequestTypeSource = readFileSync(path.join(expoFetchTypeDir, 'NativeRequest.ts'), 'utf8');
 
 function validFixture() {
   const configuredPlist = {
@@ -76,6 +67,12 @@ function validFixture() {
     expoFetchVersion: '57.0.28',
     expoFetchSource,
     expoRequestTypeSource,
+    expoFetchModuleSwiftSource: readFileSync(path.join(expoFetchSwiftDir, 'ExpoFetchModule.swift'), 'utf8'),
+    expoNativeRequestSwiftSource: readFileSync(path.join(expoFetchSwiftDir, 'NativeRequest.swift'), 'utf8'),
+    expoURLSessionTaskSwiftSource: readFileSync(path.join(expoFetchSwiftDir, 'ExpoURLSessionTask.swift'), 'utf8'),
+    expoNativeResponseSwiftSource: readFileSync(path.join(expoFetchSwiftDir, 'NativeResponse.swift'), 'utf8'),
+    expoFetchTaskLifetimeSwiftSource: readFileSync(path.join(expoFetchSwiftDir, 'FetchTaskLifetime.swift'), 'utf8'),
+    expoFetchExceptionsSwiftSource: readFileSync(path.join(expoFetchSwiftDir, 'FetchExceptions.swift'), 'utf8'),
     projectRoot,
   };
 }
@@ -190,6 +187,35 @@ describe('read-only iOS config validation', () => {
     const wrongVersion = validFixture();
     wrongVersion.expoFetchVersion = '57.0.29';
     expect(validateIosConfiguration(wrongVersion).failures).toContain('The pinned Expo fetch lifetime/cancellation helper is missing or changed.');
+
+    const missingTerminalMethod = validFixture();
+    missingTerminalMethod.expoRequestTypeSource = 'public cancel(): Promise<void>;';
+    expect(validateIosConfiguration(missingTerminalMethod).failures).toContain('The pinned Expo fetch lifetime/cancellation helper is missing or changed.');
+
+    const immediateCancelAck = validFixture();
+    immediateCancelAck.expoURLSessionTaskSwiftSource = immediateCancelAck.expoURLSessionTaskSwiftSource.replace(
+      /func cancelAndWait[\s\S]*?\n  }/,
+      'func cancelAndWait(completion: @escaping @Sendable () -> Void) { urlSessionDelegate.removeDelegate(task: task!); completion() }'
+    );
+    expect(validateIosConfiguration(immediateCancelAck).failures).toContain('The pinned Expo fetch lifetime/cancellation helper is missing or changed.');
+
+    const missingProcessedTerminal = validFixture();
+    missingProcessedTerminal.expoNativeResponseSwiftSource = missingProcessedTerminal.expoNativeResponseSwiftSource.replaceAll('dispatchQueue.async(execute: onProcessed)', 'dispatchQueue.async {}');
+    expect(validateIosConfiguration(missingProcessedTerminal).failures).toContain('The pinned Expo fetch lifetime/cancellation helper is missing or changed.');
+
+    const duplicateStartCanHang = validFixture();
+    duplicateStartCanHang.expoFetchModuleSwiftSource = duplicateStartCanHang.expoFetchModuleSwiftSource.replace(
+      /if startResult == \.alreadyStarted \{[\s\S]*?\n        }/,
+      ''
+    );
+    expect(validateIosConfiguration(duplicateStartCanHang).failures).toContain('The pinned Expo fetch lifetime/cancellation helper is missing or changed.');
+
+    const duplicateStartChangesRedirect = validFixture();
+    duplicateStartChangesRedirect.expoNativeRequestSwiftSource = duplicateStartChangesRedirect.expoNativeRequestSwiftSource.replace(
+      'case .started:\n      self.response.redirectMode = requestInit.redirect',
+      'self.response.redirectMode = requestInit.redirect\n    case .started:'
+    );
+    expect(validateIosConfiguration(duplicateStartChangesRedirect).failures).toContain('The pinned Expo fetch lifetime/cancellation helper is missing or changed.');
   });
 
   it('rejects a podspec without its required homepage metadata', () => {
