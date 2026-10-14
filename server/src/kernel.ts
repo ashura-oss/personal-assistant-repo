@@ -26,6 +26,13 @@ export interface WorkspaceSnapshot {
   readonly snapshot: JsonValue;
 }
 
+export interface OwnedWorkspaceIdentity {
+  readonly workspaceId: string;
+  readonly ownerId: string;
+  readonly revision: number;
+  readonly privacyEpoch: number;
+}
+
 export interface CommandInput {
   readonly expectedRevision: number;
   readonly expectedPrivacyEpoch: number;
@@ -452,6 +459,13 @@ export class DurableKernel {
   getOwnedSnapshot(sessionToken: string): WorkspaceSnapshot {
     const { workspace } = this.authenticate(sessionToken);
     return this.loadWorkspaceSnapshot(workspace);
+  }
+
+  /** Authenticated metadata only; avoids parsing the potentially large application snapshot. */
+  getOwnedIdentity(sessionToken: string): OwnedWorkspaceIdentity {
+    const { session, workspace } = this.authenticate(sessionToken);
+    return Object.freeze({ workspaceId: workspace.id, ownerId: session.owner_id,
+      revision: workspace.revision, privacyEpoch: workspace.privacy_epoch });
   }
 
   /**
