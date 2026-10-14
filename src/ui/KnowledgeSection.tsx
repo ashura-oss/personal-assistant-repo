@@ -1,17 +1,19 @@
 import React, { useMemo, useState } from 'react';
 import { Pressable, Text, View } from 'react-native';
-import type { Person, Project } from '../knowledge/types';
+import type { KnowledgeEntityDisplay, KnowledgePersonDisplay, KnowledgeProjectDisplay } from './knowledgeDisplayTypes';
 import { Button } from './primitives';
 import { s } from './theme';
 
+type PersonDisplay = KnowledgePersonDisplay;
+type ProjectDisplay = KnowledgeProjectDisplay;
 type Props = {
   kind: 'person' | 'project';
-  people: Person[];
-  projects: Project[];
+  people: readonly PersonDisplay[];
+  projects: readonly ProjectDisplay[];
   query: string;
   busy: boolean;
   onCreate: () => void;
-  onOpen: (entity: Person | Project) => void;
+  onOpen: (entity: KnowledgeEntityDisplay) => void;
   onArchive: (kind: 'person' | 'project', id: string, revision: number, archived: boolean) => void;
 };
 
@@ -22,9 +24,8 @@ export function KnowledgeSection({ kind, people, projects, query, busy, onCreate
     const source = kind === 'person' ? people : projects;
     return source.filter((entity) => {
       if (Boolean(entity.archivedAt) !== showArchived) return false;
-      const project = entity as Project;
       return !normalizedQuery || [entity.name, ...entity.aliases,
-        ...(kind === 'project' ? [project.goal, project.status] : []),
+        ...('goal' in entity ? [entity.goal, entity.status] : []),
       ].some((value) => value.toLocaleLowerCase().includes(normalizedQuery));
     }).sort((a, b) => a.name.localeCompare(b.name));
   }, [kind, people, projects, showArchived, normalizedQuery]);
@@ -39,14 +40,12 @@ export function KnowledgeSection({ kind, people, projects, query, busy, onCreate
         <Text style={s.knowledgeFilterText}>{showArchived ? 'Showing archived' : 'Show archived'}</Text>
       </Pressable>
       {entities.length ? entities.map((entity) => {
-        const project = entity as Project;
-        const person = entity as Person;
         return (
           <View key={`${kind}:${entity.id}`} style={s.knowledgeCard}>
             <Pressable accessibilityRole="button" accessibilityLabel={`Open ${kind} ${entity.name}`} onPress={() => onOpen(entity)} style={{ flex: 1, minHeight: 56, justifyContent: 'center', gap: 4 }}>
               <Text style={s.knowledgeName}>{entity.name}</Text>
               <Text style={s.knowledgeMeta} numberOfLines={2}>
-                {kind === 'project' ? `${project.status} · ${project.goal || 'No goal added'}` : person.aliases.length ? `Also known as ${person.aliases.join(', ')}` : `${person.facts.length} saved facts · ${person.contacts.length} contact claims`}
+                {'goal' in entity ? `${entity.status} · ${entity.goal || 'No goal added'}` : entity.aliases.length ? `Also known as ${entity.aliases.join(', ')}` : `${entity.facts.length} saved facts · ${'contacts' in entity ? entity.contacts.length : 0} contact claims`}
                 {entity.archivedAt ? ' · Archived' : ''}
               </Text>
               {entity.importOrigin?.kind === 'backup_knowledge' ? <Text style={s.knowledgeFootnote}>Imported separate copy</Text> : null}

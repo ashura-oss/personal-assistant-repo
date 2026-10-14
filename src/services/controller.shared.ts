@@ -12071,6 +12071,11 @@ export class AppControllerImpl implements AppController {
     return clone(preview);
   }
 
+  async cancelImportedKnowledgeActivation(sessionId: string): Promise<void> {
+    if (typeof sessionId !== 'string') throw new Error('Invalid activation preview session.');
+    this.knowledgeActivationSessions.delete(sessionId);
+  }
+
   async activateImportedKnowledgeEntity(input: { sessionId: string; planHash: string; expectedDocumentRevision?: number }): Promise<{ entity: Person | Project; document: ContextDocument }> {
     this.assertKnowledgeWritable();
     const session = this.knowledgeActivationSessions.get(input.sessionId);

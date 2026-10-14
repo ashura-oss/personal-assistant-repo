@@ -1,37 +1,37 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { Modal, Pressable, ScrollView, Text, View } from 'react-native';
-import type { KnowledgeChange, KnowledgeReference, KnowledgeSuggestion, KnowledgeSuggestionReview, Person, Project } from '../knowledge/types';
-import type { EditKnowledgeSuggestionInput, ReviewKnowledgeSuggestionInput } from '../core';
+import type { KnowledgeChangeDisplay, KnowledgePersonDisplay, KnowledgeProjectDisplay, KnowledgeReferenceDisplay, KnowledgeSuggestionDisplay, KnowledgeSuggestionEditCommand, KnowledgeSuggestionReviewCommand, KnowledgeSuggestionReviewDisplay } from './knowledgeDisplayTypes';
 import { KnowledgeSuggestionReviewOwnership, type KnowledgeSuggestionReviewOwner } from './knowledgeSuggestionReviewOwnership';
 import { Button, Field, IconButton } from './primitives';
 import { s } from './theme';
 
 type Props = {
-  suggestions: KnowledgeSuggestion[];
-  people: Person[];
-  projects: Project[];
-  sourceLabels: Record<string, string>;
+  suggestions: readonly KnowledgeSuggestionDisplay[];
+  people: readonly KnowledgePersonDisplay[];
+  projects: readonly KnowledgeProjectDisplay[];
+  sourceLabels: Readonly<Record<string, string>>;
   busy: boolean;
   blocked?: boolean;
   openRequest?: Readonly<{ suggestionId: string; requestId: number }>;
   onRequestHandled?: (requestId: number) => void;
-  onPrepareReview: (id: string, input: { expectedRevision: number }) => Promise<KnowledgeSuggestionReview>;
-  onReview: (id: string, input: ReviewKnowledgeSuggestionInput) => Promise<unknown>;
-  onEdit: (id: string, input: EditKnowledgeSuggestionInput) => Promise<KnowledgeSuggestion | undefined>;
+  onPrepareReview: (id: string, input: { expectedRevision: number }) => Promise<KnowledgeSuggestionReviewDisplay>;
+  onReview: (id: string, input: KnowledgeSuggestionReviewCommand) => Promise<unknown>;
+  onEdit: (id: string, input: KnowledgeSuggestionEditCommand) => Promise<KnowledgeSuggestionDisplay | undefined>;
 };
+
 
 type Filter = 'pending' | 'accepted' | 'dismissed' | 'stale';
 type OpenSnapshot = {
-  suggestion: KnowledgeSuggestion;
-  entity?: Person | Project;
+  suggestion: KnowledgeSuggestionDisplay;
+  entity?: KnowledgePersonDisplay | KnowledgeProjectDisplay;
   entityRevision?: number;
-  memberPerson?: Person;
+  memberPerson?: KnowledgePersonDisplay;
   memberRevision?: number;
-  referencedEntity?: Person | Project;
+  referencedEntity?: KnowledgePersonDisplay | KnowledgeProjectDisplay;
   referenceRevision?: number;
-  people: Person[];
-  projects: Project[];
-  sourceLabels: Record<string, string>;
+  people: readonly KnowledgePersonDisplay[];
+  projects: readonly KnowledgeProjectDisplay[];
+  sourceLabels: Readonly<Record<string, string>>;
 };
 
 export function KnowledgeSuggestionSheet({ suggestions, people, projects, sourceLabels, busy, blocked = false, openRequest, onRequestHandled, onPrepareReview, onReview, onEdit }: Props) {
@@ -43,11 +43,11 @@ export function KnowledgeSuggestionSheet({ suggestions, people, projects, source
   const [editPersonId, setEditPersonId] = useState('');
   const [message, setMessage] = useState('');
   const [successMessage, setSuccessMessage] = useState('');
-  const [preparedReview, setPreparedReview] = useState<KnowledgeSuggestionReview>();
+  const [preparedReview, setPreparedReview] = useState<KnowledgeSuggestionReviewDisplay>();
   const [preparingReview, setPreparingReview] = useState(false);
   const [preflightReason, setPreflightReason] = useState('');
   const [selectedOwnerGeneration, setSelectedOwnerGeneration] = useState<number | undefined>(undefined);
-  const ownerRef = useRef(new KnowledgeSuggestionReviewOwnership());
+  const ownerRef = useRef(new KnowledgeSuggestionReviewOwnership<KnowledgeSuggestionReviewDisplay>());
   const selectedOwnerRef = useRef<KnowledgeSuggestionReviewOwner | undefined>(undefined);
   const actionLock = useRef(false);
   const actionTokenSequence = useRef(0);
@@ -57,7 +57,7 @@ export function KnowledgeSuggestionSheet({ suggestions, people, projects, source
   const [waitingEditedRevision, setWaitingEditedRevision] = useState(false);
   const requestIdRef = useRef<number | undefined>(openRequest?.requestId);
   const requestRef = useRef(openRequest);
-  const openSuggestionRef = useRef<(suggestion: KnowledgeSuggestion) => void>(() => undefined);
+  const openSuggestionRef = useRef<(suggestion: KnowledgeSuggestionDisplay) => void>(() => undefined);
   const contextRef = useRef({ suggestions, people, projects, blocked, busy, onPrepareReview, onRequestHandled });
   useLayoutEffect(() => { contextRef.current = { suggestions, people, projects, blocked, busy, onPrepareReview, onRequestHandled }; }, [suggestions, people, projects, blocked, busy, onPrepareReview, onRequestHandled]);
   useLayoutEffect(() => {
@@ -116,7 +116,7 @@ export function KnowledgeSuggestionSheet({ suggestions, people, projects, source
     }
   }, [isOwnerCurrent]);
 
-  const openSuggestion = (suggestion: KnowledgeSuggestion) => {
+  const openSuggestion = (suggestion: KnowledgeSuggestionDisplay) => {
     if (blocked || busy || actionLock.current) return;
     pendingEditedPreflightRef.current = undefined;
     const entity = findTarget(suggestion, people, projects);
@@ -124,7 +124,7 @@ export function KnowledgeSuggestionSheet({ suggestions, people, projects, source
     const person = personId ? people.find((item) => item.id === personId) : undefined;
     const reference = suggestion.change.type === 'add_source_link' ? suggestion.change.reference : undefined;
     const referencedEntity = reference ? findReferencedEntity(reference, people, projects) : undefined;
-    setOpened({ suggestion, entity: entity ? cloneValue(entity) : undefined, entityRevision: entity?.revision, memberPerson: person ? cloneValue(person) : undefined, memberRevision: person?.revision, referencedEntity: referencedEntity ? cloneValue(referencedEntity) : undefined, referenceRevision: referencedEntity?.revision, people: cloneValue(people), projects: cloneValue(projects), sourceLabels: { ...sourceLabels } });
+    setOpened({ suggestion, entity, entityRevision: entity?.revision, memberPerson: person, memberRevision: person?.revision, referencedEntity, referenceRevision: referencedEntity?.revision, people, projects, sourceLabels });
     setEditing(false); setMessage(''); setSuccessMessage('');
     setPreparedReview(undefined); setPreflightReason('');
     const owner = ownerRef.current.publish(suggestion.id, suggestion.revision)!;
@@ -236,7 +236,7 @@ export function KnowledgeSuggestionSheet({ suggestions, people, projects, source
       const person = personId ? people.find((item) => item.id === personId) : undefined;
       const reference = result.change.type === 'add_source_link' ? result.change.reference : undefined;
       const referencedEntity = reference ? findReferencedEntity(reference, people, projects) : undefined;
-      setOpened({ suggestion: result, entity: entity ? cloneValue(entity) : undefined, entityRevision: entity?.revision, memberPerson: person ? cloneValue(person) : undefined, memberRevision: person?.revision, referencedEntity: referencedEntity ? cloneValue(referencedEntity) : undefined, referenceRevision: referencedEntity?.revision, people: cloneValue(people), projects: cloneValue(projects), sourceLabels: { ...sourceLabels } });
+      setOpened({ suggestion: result, entity, entityRevision: entity?.revision, memberPerson: person, memberRevision: person?.revision, referencedEntity, referenceRevision: referencedEntity?.revision, people, projects, sourceLabels });
       const nextOwner = ownerRef.current.publish(result.id, result.revision)!;
       selectedOwnerRef.current = nextOwner;
       setSelectedOwnerGeneration(nextOwner.generation);
@@ -309,19 +309,19 @@ export function KnowledgeSuggestionSheet({ suggestions, people, projects, source
   </View>;
 }
 
-function findTarget(suggestion: KnowledgeSuggestion, people: Person[], projects: Project[]) {
+function findTarget(suggestion: KnowledgeSuggestionDisplay, people: readonly KnowledgePersonDisplay[], projects: readonly KnowledgeProjectDisplay[]) {
   return suggestion.change.entityKind === 'person'
     ? people.find((item) => item.id === suggestion.change.entityId)
     : projects.find((item) => item.id === suggestion.change.entityId);
 }
 
-function findReferencedEntity(reference: KnowledgeReference, people: Person[], projects: Project[]) {
+function findReferencedEntity(reference: KnowledgeReferenceDisplay, people: readonly KnowledgePersonDisplay[], projects: readonly KnowledgeProjectDisplay[]) {
   if (reference.kind === 'person') return people.find((item) => item.id === reference.id);
   if (reference.kind === 'project') return projects.find((item) => item.id === reference.id);
   return undefined;
 }
 
-function changeLabel(item: KnowledgeSuggestion) {
+function changeLabel(item: KnowledgeSuggestionDisplay) {
   switch (item.change.type) {
     case 'add_fact': return 'Add a fact';
     case 'add_contact': return 'Add a contact claim';
@@ -330,7 +330,7 @@ function changeLabel(item: KnowledgeSuggestion) {
   }
 }
 
-function changeDescription(item: KnowledgeSuggestion, people: Person[], projects: Project[], sourceLabels: Record<string, string>) {
+function changeDescription(item: KnowledgeSuggestionDisplay, people: readonly KnowledgePersonDisplay[], projects: readonly KnowledgeProjectDisplay[], sourceLabels: Readonly<Record<string, string>>) {
   switch (item.change.type) {
     case 'add_fact': return item.change.statement;
     case 'add_contact': return `${item.change.label}: ${item.change.address} · entered as a claim, not verified`;
@@ -339,7 +339,7 @@ function changeDescription(item: KnowledgeSuggestion, people: Person[], projects
   }
 }
 
-function editedChange(change: KnowledgeChange, value: string, label: string, personId: string, people: Person[]): KnowledgeChange | undefined {
+function editedChange(change: KnowledgeChangeDisplay, value: string, label: string, personId: string, people: readonly KnowledgePersonDisplay[]): KnowledgeChangeDisplay | undefined {
   switch (change.type) {
     case 'add_fact': return { ...change, statement: value.trim() };
     case 'add_contact': return { ...change, address: value.trim(), label: label.trim() || 'Contact' };
@@ -351,7 +351,7 @@ function editedChange(change: KnowledgeChange, value: string, label: string, per
   }
 }
 
-function currentTargetValues(suggestion: KnowledgeSuggestion, entity: Person | Project | undefined, people: Person[], projects: Project[], sourceLabels: Record<string, string>) {
+function currentTargetValues(suggestion: KnowledgeSuggestionDisplay, entity: KnowledgePersonDisplay | KnowledgeProjectDisplay | undefined, people: readonly KnowledgePersonDisplay[], projects: readonly KnowledgeProjectDisplay[], sourceLabels: Readonly<Record<string, string>>) {
   if (!entity) return ['Current target is unavailable.'];
   if (suggestion.change.type === 'add_fact') return entity.facts.length ? entity.facts.map((item) => `Saved fact · ${item.statement}`) : ['No saved facts yet.'];
   if (suggestion.change.type === 'add_contact' && 'contacts' in entity) return entity.contacts.length ? entity.contacts.map((item) => `Contact claim · ${item.label}: ${item.address}`) : ['No contact claims yet.'];
@@ -364,7 +364,7 @@ function currentTargetValues(suggestion: KnowledgeSuggestion, entity: Person | P
   return ['No matching saved claims.'];
 }
 
-function referenceLabel(reference: KnowledgeReference, people: Person[] = [], projects: Project[] = [], sourceLabels: Record<string, string> = {}) {
+function referenceLabel(reference: KnowledgeReferenceDisplay, people: readonly KnowledgePersonDisplay[] = [], projects: readonly KnowledgeProjectDisplay[] = [], sourceLabels: Readonly<Record<string, string>> = {}) {
   if (reference.kind === 'historical') return `${reference.originalKind} · ${reference.label} (historical)`;
   if (reference.kind === 'person') {
     const person = people.find((item) => item.id === reference.id);
@@ -382,13 +382,8 @@ function referenceLabel(reference: KnowledgeReference, people: Person[] = [], pr
     const sourceId = `mail:${encodeURIComponent(reference.identityKey)}:${encodeURIComponent(reference.id)}`;
     return sourceLabels[sourceId] ?? 'Mail · historical source unavailable';
   }
-  if (reference.kind === 'device_calendar_event') {
-    const sourceId = `device_calendar_event:${encodeURIComponent(reference.installationId)}:${encodeURIComponent(reference.calendarId)}:${encodeURIComponent(reference.eventId)}:${encodeURIComponent(reference.occurrenceStart)}`;
-    return sourceLabels[sourceId] ?? 'On this iPhone · historical event unavailable';
-  }
   return `${reference.kind} · ${reference.id}`;
 }
 
 function entityLabel(kind: 'person' | 'project') { return kind === 'person' ? 'Person' : 'Project'; }
 function labelCase(value: string) { return value.charAt(0).toUpperCase() + value.slice(1); }
-function cloneValue<T>(value: T): T { return JSON.parse(JSON.stringify(value)) as T; }

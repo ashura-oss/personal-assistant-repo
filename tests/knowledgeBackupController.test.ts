@@ -75,6 +75,24 @@ describe('controller portable knowledge backup workflow', () => {
     expect(archive.archivedKnowledge).toHaveLength(1);
   });
 
+  it('cancels one prepared activation idempotently without consuming another plan or mutating entities', async () => {
+    const { backup, sourcePersonId, sourceProjectId } = await createPortableKnowledgeBackup();
+    const { app, archive, cohort } = await importBackup(backup);
+    const personPlan = await app.prepareImportedKnowledgeActivation({ archiveId: archive.id, cohortId: cohort.id, kind: 'person', entityId: sourcePersonId });
+    const projectPlan = await app.prepareImportedKnowledgeActivation({ archiveId: archive.id, cohortId: cohort.id, kind: 'project', entityId: sourceProjectId });
+    const before = structuredClone(app.getSnapshot());
+
+    await app.cancelImportedKnowledgeActivation(personPlan.sessionId);
+    await app.cancelImportedKnowledgeActivation(personPlan.sessionId);
+    await expect(app.activateImportedKnowledgeEntity({ sessionId: personPlan.sessionId, planHash: personPlan.planHash })).rejects.toThrow(/preview is missing/i);
+    expect(app.getSnapshot()).toEqual(before);
+
+    const activated = await app.activateImportedKnowledgeEntity({ sessionId: projectPlan.sessionId, planHash: projectPlan.planHash });
+    expect(activated.entity.name).toBe(cohort.knowledge.state.projects[0]?.name);
+    expect(app.getSnapshot().knowledge.people).toHaveLength(0);
+    expect(app.getSnapshot().knowledge.projects).toHaveLength(1);
+  });
+
   it('activates a person under a fresh ID with narrative and claims, then maps same-cohort project members and entity references', async () => {
     const { backup, sourcePersonId, sourceProjectId, personFact, contact } = await createPortableKnowledgeBackup();
     const { app, archive, cohort } = await importBackup(backup);

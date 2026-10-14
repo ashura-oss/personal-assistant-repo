@@ -1,5 +1,3 @@
-import type { KnowledgeSuggestionReview } from '../knowledge/types';
-
 export async function prepareKnowledgeSuggestionReviewWithPrivacy<T>(input: {
   prepare: () => Promise<T>;
   isPrivacyError: (error: unknown) => boolean;
@@ -16,10 +14,10 @@ export async function prepareKnowledgeSuggestionReviewWithPrivacy<T>(input: {
 export type KnowledgeSuggestionReviewOwner = Readonly<{ suggestionId: string; revision: number; generation: number }>;
 
 /** Synchronous owner and result fence for local Knowledge review preflights. */
-export class KnowledgeSuggestionReviewOwnership {
+export class KnowledgeSuggestionReviewOwnership<T extends { readonly suggestion: { readonly id: string; readonly revision: number } }> {
   private generation = 0;
   private owner: KnowledgeSuggestionReviewOwner | undefined;
-  private review: KnowledgeSuggestionReview | undefined;
+  private review: T | undefined;
 
   publish(suggestionId?: string, revision?: number): KnowledgeSuggestionReviewOwner | undefined {
     this.generation += 1;
@@ -38,8 +36,8 @@ export class KnowledgeSuggestionReviewOwnership {
   async prepare(input: {
     owner: KnowledgeSuggestionReviewOwner;
     isCurrent?: () => boolean;
-    prepare: () => Promise<KnowledgeSuggestionReview>;
-  }): Promise<{ kind: 'stale' } | { kind: 'prepared'; review: KnowledgeSuggestionReview }> {
+    prepare: () => Promise<T>;
+  }): Promise<{ kind: 'stale' } | { kind: 'prepared'; review: T }> {
     if (!this.owns(input.owner) || input.isCurrent?.() === false) return { kind: 'stale' };
     const review = await input.prepare();
     if (!this.owns(input.owner) || input.isCurrent?.() === false ||
@@ -50,7 +48,7 @@ export class KnowledgeSuggestionReviewOwnership {
     return { kind: 'prepared', review };
   }
 
-  current(owner: KnowledgeSuggestionReviewOwner): KnowledgeSuggestionReview | undefined {
+  current(owner: KnowledgeSuggestionReviewOwner): T | undefined {
     return this.owns(owner) && this.review?.suggestion.id === owner.suggestionId &&
       this.review.suggestion.revision === owner.revision ? this.review : undefined;
   }

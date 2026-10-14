@@ -2,7 +2,10 @@
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { KnowledgeSuggestion, KnowledgeSuggestionReview, Person } from '../src/knowledge/types';
+import type { AppState } from '../src/core';
+import { createWorkspaceSnapshotDTO } from '../src/cloud/workspaceDto';
+import { createInitialWorkspaceState } from '../src/services/controller.shared';
+import type { KnowledgeChangeDisplay, KnowledgePersonDisplay, KnowledgeReferenceDisplay, KnowledgeSuggestionDisplay, KnowledgeSuggestionReviewDisplay } from '../src/ui/knowledgeDisplayTypes';
 import { KnowledgeSuggestionSheet } from '../src/ui/KnowledgeSuggestionSheet';
 
 vi.mock('react-native', async () => {
@@ -36,13 +39,46 @@ beforeEach(() => {
 });
 afterEach(() => { act(() => root.unmount()); host.remove(); });
 
-const suggestion = (revision = 1): KnowledgeSuggestion => ({
-  id: 'suggestion-a', revision, change: { type: 'add_fact', entityKind: 'person', entityId: 'person-a', statement: revision === 1 ? 'First fact' : 'Edited fact' },
-  targetRevision: 1, evidence: [{ sourceId: 'note:chat-note', sourceVersion: 'v1', revision: 1, quote: 'A safe quote' }],
-  status: 'pending', createdAt: '2026-10-14T08:00:00.000Z', updatedAt: '2026-10-14T08:00:00.000Z',
+type Suggestion = AppState['knowledge']['suggestions'][number];
+type Person = AppState['knowledge']['people'][number];
+const makeSnapshot = (suggestionItem: Suggestion, personItem: Person) => {
+  const state = createInitialWorkspaceState(() => '33333333-3333-4333-8333-333333333333');
+  state.knowledge.suggestions.push(suggestionItem);
+  state.knowledge.people.push(personItem);
+  return createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId: '7b906fca-65c1-4bd2-b18e-1b56cc6f48a8', privacyEpoch: 1, revision: 1 });
+};
+const displayReference = (reference: ReturnType<typeof createWorkspaceSnapshotDTO>['state']['knowledge']['people'][number]['sourceLinks'][number]['reference']): KnowledgeReferenceDisplay => {
+  if (reference.kind === 'device_calendar_event') return { kind: 'historical', label: `Device calendar event (${reference.occurrenceStart})`, originalKind: 'device_calendar_event' };
+  return reference;
+};
+const displayChange = (change: ReturnType<typeof createWorkspaceSnapshotDTO>['state']['knowledge']['suggestions'][number]['change']): KnowledgeChangeDisplay => {
+  if (change.type === 'add_source_link') return { ...change, reference: displayReference(change.reference) };
+  return change;
+};
+const displaySuggestion = (item: ReturnType<typeof createWorkspaceSnapshotDTO>['state']['knowledge']['suggestions'][number]): KnowledgeSuggestionDisplay => {
+  const { change, originalChange, ...rest } = item;
+  return { ...rest, change: displayChange(change), ...(originalChange ? { originalChange: displayChange(originalChange) } : {}) };
+};
+const displayPerson = (item: ReturnType<typeof createWorkspaceSnapshotDTO>['state']['knowledge']['people'][number]): KnowledgePersonDisplay => ({
+  ...item, sourceLinks: item.sourceLinks.map((link) => ({ ...link, reference: displayReference(link.reference) })),
 });
-const person = (revision = 1): Person => ({ id: 'person-a', revision, name: 'Person A', aliases: [], narrativePath: 'people/person-a.md', createdAt: '2026-10-14T08:00:00.000Z', updatedAt: '2026-10-14T08:00:00.000Z', facts: [], contacts: [], sourceLinks: [] });
-const review = (item: KnowledgeSuggestion, overrides: Partial<KnowledgeSuggestionReview> = {}): KnowledgeSuggestionReview => ({ suggestion: item, canEdit: true, canAccept: true, ...overrides });
+const suggestion = (revision = 1): KnowledgeSuggestionDisplay => {
+  const item: Suggestion = {
+    id: 'suggestion-a', revision, change: { type: 'add_fact', entityKind: 'person', entityId: 'person-a', statement: revision === 1 ? 'First fact' : 'Edited fact' },
+    targetRevision: 1, evidence: [{ sourceId: 'note:chat-note', sourceVersion: 'v1', revision: 1, quote: 'A safe quote' }],
+    status: 'pending', createdAt: '2026-10-14T08:00:00.000Z', updatedAt: '2026-10-14T08:00:00.000Z',
+  };
+  const p: Person = { id: 'person-a', revision: 1, name: 'Person A', aliases: [], narrativePath: 'people/person-a.md', createdAt: '2026-10-14T08:00:00.000Z', updatedAt: '2026-10-14T08:00:00.000Z', facts: [], contacts: [], sourceLinks: [] };
+  return displaySuggestion(makeSnapshot(item, p).state.knowledge.suggestions[0]!);
+};
+const person = (revision = 1): KnowledgePersonDisplay => {
+  const p: Person = { id: 'person-a', revision, name: 'Person A', aliases: [], narrativePath: 'people/person-a.md', createdAt: '2026-10-14T08:00:00.000Z', updatedAt: '2026-10-14T08:00:00.000Z', facts: [], contacts: [], sourceLinks: [] };
+  return displayPerson(makeSnapshot({
+    id: 'suggestion-a', revision: 1, change: { type: 'add_fact', entityKind: 'person', entityId: 'person-a', statement: 'First fact' }, targetRevision: 1,
+    evidence: [{ sourceId: 'note:chat-note', sourceVersion: 'v1', revision: 1, quote: 'A safe quote' }], status: 'pending', createdAt: '2026-10-14T08:00:00.000Z', updatedAt: '2026-10-14T08:00:00.000Z',
+  }, p).state.knowledge.people[0]!);
+};
+const review = (item: KnowledgeSuggestionDisplay, overrides: Partial<KnowledgeSuggestionReviewDisplay> = {}): KnowledgeSuggestionReviewDisplay => ({ suggestion: item, canEdit: true, canAccept: true, ...overrides });
 
 const render = (props: Partial<React.ComponentProps<typeof KnowledgeSuggestionSheet>> = {}) => act(() => root.render(React.createElement(KnowledgeSuggestionSheet, {
   suggestions: [suggestion()], people: [person()], projects: [], sourceLabels: {}, busy: false, blocked: false,
@@ -55,8 +91,8 @@ const flush = async () => { await Promise.resolve(); await Promise.resolve(); };
 
 describe('KnowledgeSuggestionSheet preflight and ownership', () => {
   it('keeps Edit and Accept disabled until the exact source preflight completes, then leaves Dismiss available when it is stale', async () => {
-    let resolve!: (value: KnowledgeSuggestionReview) => void;
-    const onPrepareReview = vi.fn((_id: string, _input: { expectedRevision: number }) => new Promise<KnowledgeSuggestionReview>((accept) => { resolve = accept; }));
+    let resolve!: (value: KnowledgeSuggestionReviewDisplay) => void;
+    const onPrepareReview = vi.fn((_id: string, _input: { expectedRevision: number }) => new Promise<KnowledgeSuggestionReviewDisplay>((accept) => { resolve = accept; }));
     const onReview = vi.fn(async () => true);
     render({ onPrepareReview, onReview });
     await act(async () => { suggestionRow().click(); await flush(); });
@@ -83,8 +119,8 @@ describe('KnowledgeSuggestionSheet preflight and ownership', () => {
   });
 
   it('ignores an old preflight after close and reopen of the same ID and revision', async () => {
-    const resolves: ((value: KnowledgeSuggestionReview) => void)[] = [];
-    const onPrepareReview = vi.fn((_id: string, _input: { expectedRevision: number }) => new Promise<KnowledgeSuggestionReview>((accept) => { resolves.push(accept); }));
+    const resolves: ((value: KnowledgeSuggestionReviewDisplay) => void)[] = [];
+    const onPrepareReview = vi.fn((_id: string, _input: { expectedRevision: number }) => new Promise<KnowledgeSuggestionReviewDisplay>((accept) => { resolves.push(accept); }));
     render({ onPrepareReview });
     await act(async () => { suggestionRow().click(); await flush(); });
     await act(async () => { button('Close suggestion review').click(); });
@@ -98,10 +134,10 @@ describe('KnowledgeSuggestionSheet preflight and ownership', () => {
 
   it('requires a fresh preflight for the exact returned edit revision before another edit or accept', async () => {
     const edited = suggestion(2);
-    let resolveSecond!: (value: KnowledgeSuggestionReview) => void;
+    let resolveSecond!: (value: KnowledgeSuggestionReviewDisplay) => void;
     const onPrepareReview = vi.fn((_id: string, input: { expectedRevision: number }) => input.expectedRevision === 1
       ? Promise.resolve(review(suggestion()))
-      : new Promise<KnowledgeSuggestionReview>((accept) => { resolveSecond = accept; }));
+      : new Promise<KnowledgeSuggestionReviewDisplay>((accept) => { resolveSecond = accept; }));
     const onEdit = vi.fn(async () => edited);
     render({ onPrepareReview, onEdit });
     await act(async () => { suggestionRow().click(); await flush(); });
@@ -123,9 +159,9 @@ describe('KnowledgeSuggestionSheet preflight and ownership', () => {
 
   it('does not let a late edit callback replace the review opened after the old review was closed', async () => {
     const first = suggestion();
-    const other: KnowledgeSuggestion = { ...suggestion(), id: 'suggestion-b', change: { type: 'add_contact', entityKind: 'person', entityId: 'person-a', address: 'other@example.com', label: 'Other contact' } };
-    let resolveEdit!: (value: KnowledgeSuggestion | undefined) => void;
-    const onEdit = vi.fn(() => new Promise<KnowledgeSuggestion | undefined>((resolve) => { resolveEdit = resolve; }));
+    const other: KnowledgeSuggestionDisplay = { ...suggestion(), id: 'suggestion-b', change: { type: 'add_contact', entityKind: 'person', entityId: 'person-a', address: 'other@example.com', label: 'Other contact' } };
+    let resolveEdit!: (value: KnowledgeSuggestionDisplay | undefined) => void;
+    const onEdit = vi.fn(() => new Promise<KnowledgeSuggestionDisplay | undefined>((resolve) => { resolveEdit = resolve; }));
     render({ suggestions: [first, other], onEdit });
     await act(async () => { suggestionRow().click(); await flush(); });
     await act(async () => { button('Edit suggestion').click(); });
@@ -143,8 +179,8 @@ describe('KnowledgeSuggestionSheet preflight and ownership', () => {
   });
 
   it('clears the review owner during a hard block and does not resurrect it when the block clears', async () => {
-    let resolve!: (value: KnowledgeSuggestionReview) => void;
-    const onPrepareReview = vi.fn(() => new Promise<KnowledgeSuggestionReview>((accept) => { resolve = accept; }));
+    let resolve!: (value: KnowledgeSuggestionReviewDisplay) => void;
+    const onPrepareReview = vi.fn(() => new Promise<KnowledgeSuggestionReviewDisplay>((accept) => { resolve = accept; }));
     render({ onPrepareReview });
     await act(async () => { suggestionRow().click(); await flush(); });
     render({ onPrepareReview, blocked: true });

@@ -1024,6 +1024,7 @@ export interface AppController {
   reviewKnowledgeSuggestion(id: string, input: ReviewKnowledgeSuggestionInput): Promise<KnowledgeSuggestion>;
   saveDocument(path: string, content: string, options?: { expectedRevision?: number; expectedEntityRevision?: number }): Promise<ContextDocument>;
   prepareImportedKnowledgeActivation(input: { archiveId: string; cohortId: string; kind: KnowledgeEntityKind; entityId: string }): Promise<ImportedKnowledgeActivationPreview>;
+  cancelImportedKnowledgeActivation(sessionId: string): Promise<void>;
   activateImportedKnowledgeEntity(input: { sessionId: string; planHash: string; expectedDocumentRevision?: number }): Promise<{ entity: import('../knowledge/types').Person | import('../knowledge/types').Project; document: ContextDocument }>;
   saveSettings(patch: SettingsPatch): Promise<AppSettings>;
   saveAccount(config: AccountConfig): Promise<Account>;

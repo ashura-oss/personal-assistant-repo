@@ -12,7 +12,7 @@ const result = (id: string, revision: number, overrides: Partial<KnowledgeSugges
 
 describe('Knowledge review ownership used by the sheet', () => {
   it('does not publish suggestion A when the selected suggestion changes to B during preflight', async () => {
-    const ownership = new KnowledgeSuggestionReviewOwnership();
+    const ownership = new KnowledgeSuggestionReviewOwnership<KnowledgeSuggestionReview>();
     const ownerA = ownership.publish('suggestion-a', 1)!;
     let resolveA!: (value: KnowledgeSuggestionReview) => void;
     const aPreflight = new Promise<KnowledgeSuggestionReview>((resolve) => { resolveA = resolve; });
@@ -26,7 +26,7 @@ describe('Knowledge review ownership used by the sheet', () => {
   });
 
   it('rejects a late preflight after close and reopen of the same ID at the same revision', async () => {
-    const ownership = new KnowledgeSuggestionReviewOwnership();
+    const ownership = new KnowledgeSuggestionReviewOwnership<KnowledgeSuggestionReview>();
     const first = ownership.publish('suggestion-a', 7)!;
     let resolveFirst!: (value: KnowledgeSuggestionReview) => void;
     const firstResult = new Promise<KnowledgeSuggestionReview>((resolve) => { resolveFirst = resolve; });
@@ -41,14 +41,14 @@ describe('Knowledge review ownership used by the sheet', () => {
   });
 
   it('rejects malformed controller replies that do not match the requested ID and revision', async () => {
-    const ownership = new KnowledgeSuggestionReviewOwnership();
+    const ownership = new KnowledgeSuggestionReviewOwnership<KnowledgeSuggestionReview>();
     const owner = ownership.publish('suggestion-a', 3)!;
     await expect(ownership.prepare({ owner, prepare: async () => result('suggestion-a', 4) })).resolves.toEqual({ kind: 'stale' });
     expect(ownership.current(owner)).toBeUndefined();
   });
 
   it('rechecks live workspace hard blocks after the actual preflight await', async () => {
-    const ownership = new KnowledgeSuggestionReviewOwnership();
+    const ownership = new KnowledgeSuggestionReviewOwnership<KnowledgeSuggestionReview>();
     const owner = ownership.publish('suggestion-a', 1)!;
     let blocked = false;
     let resolve!: (value: KnowledgeSuggestionReview) => void;

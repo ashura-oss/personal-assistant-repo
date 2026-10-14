@@ -2,11 +2,11 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExter
 import { ActivityIndicator, Alert, KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView, Switch, Text, TextInput, View } from "react-native";
 import Ionicons from "@expo/vector-icons/Ionicons";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
-import type { Note, Proposal, AppState, AppSettings, AppController, ContextDocument, AccountCapability, LocalTask, MailboxSnapshotMessage, SavedProactiveRule, ProactiveState, SavePersonInput, SaveProjectInput, SaveKnowledgeFactInput, SaveKnowledgeContactInput, SaveKnowledgeSourceLinkInput, SaveKnowledgeMemberInput, KnowledgeItemCommand, ReviewKnowledgeSuggestionInput, EditKnowledgeSuggestionInput, StartupRecoveryStatus, MailReplyBatchReviewPlan, MailReplyBatchSourcesRefreshResult, MailReplyContextSelection, MailReplyConversationContextDiscovery } from "./src/core";
+import type { Note, Proposal, AppState, AppSettings, AppController, ContextDocument, AccountCapability, LocalTask, MailboxSnapshotMessage, SavedProactiveRule, ProactiveState, SaveKnowledgeFactInput, SaveKnowledgeContactInput, SaveKnowledgeSourceLinkInput, SaveKnowledgeMemberInput, KnowledgeItemCommand, ReviewKnowledgeSuggestionInput, StartupRecoveryStatus, MailReplyBatchReviewPlan, MailReplyBatchSourcesRefreshResult, MailReplyContextSelection, MailReplyConversationContextDiscovery, ImportedKnowledgeActivationPreview } from "./src/core";
 import type { ProactiveRecoveryPlan, ProactiveRecoveryStatus } from "./src/proactive/recovery";
 import type { DispatchRecoveryPlan, DispatchRecoveryStatus } from "./src/dispatch/recovery";
 import type { StartupRecoveryPlan } from "./src/storage/startupRecovery";
-import type { KnowledgeEntityKind, KnowledgeReference, KnowledgeSuggestion, KnowledgeSuggestionReview } from "./src/knowledge/types";
+import type { KnowledgeChange, KnowledgeEntityKind, KnowledgeReference, KnowledgeSuggestion, KnowledgeSuggestionReview, Person, Project } from "./src/knowledge/types";
 import { SpeechTranscriptionError } from "./src/transcription/types";
 import { OPENROUTER_SPEECH_DEFAULT_MODEL } from "./src/transcription/openRouterSpeechProfiles";
 import { RecordingAutoStopGate } from "./src/audio/autoStop";
@@ -36,8 +36,13 @@ import { ImportedBackupsSection } from "./src/ui/ImportedBackupsSection";
 import { RecordingAttachmentSheet } from "./src/ui/RecordingAttachmentSheet";
 import { KnowledgeSection } from "./src/ui/KnowledgeSection";
 import { KnowledgeEntitySheet } from "./src/ui/KnowledgeEntitySheet";
+import type { KnowledgeEntityEditCommand, KnowledgeProjectEditCommand } from "./src/ui/KnowledgeEntitySheet";
+import type { ImportedArchiveDisplay, ImportedKnowledgePreviewDisplay, ImportedKnowledgeSelection, KnowledgeChangeDisplay, KnowledgeDisplay, KnowledgeEntityDisplay, KnowledgeReferenceDisplay, KnowledgeSourceChoiceDisplay, KnowledgeSuggestionDisplay, KnowledgeSuggestionEditCommand } from "./src/ui/knowledgeDisplayTypes";
 import { KnowledgeSuggestionSheet } from "./src/ui/KnowledgeSuggestionSheet";
 import { ImportedKnowledgeReview } from "./src/ui/ImportedKnowledgeReview";
+import { ImportedKnowledgeActivationOwnership, attachImportedKnowledgePreviewForRuntime, importedKnowledgeOwnerMatchesRuntime, importedKnowledgeSelectionMatches } from "./src/ui/importedKnowledgeActivationOwnership";
+import { KnowledgeReferenceChoiceOwnership, resolveKnowledgeSourceLinkReference } from "./src/ui/knowledgeReferenceChoiceOwnership";
+import { runWithBusyLock } from "./src/ui/busyActionRunner";
 import { ReminderReview } from "./src/ui/ReminderReview";
 import { RemindersSection } from "./src/ui/RemindersSection";
 import { DeviceCalendarsSection } from "./src/ui/DeviceCalendarsSection";
@@ -247,12 +252,12 @@ function knowledgeReferenceOptions(state: AppState) {
     ...state.knowledge.people.map((entity) => entity.narrativePath),
     ...state.knowledge.projects.map((entity) => entity.narrativePath),
   ]);
-  const references: { reference: KnowledgeReference; label: string }[] = [
-    ...state.notes.filter((note) => note.origin !== 'assistant_chat').map((note) => ({ reference: { kind: 'note' as const, id: note.id }, label: `Note · ${(note.transcript || 'Untitled note').slice(0, 70)}` })),
-    ...state.tasks.map((task) => ({ reference: { kind: 'task' as const, id: task.id }, label: `Task · ${task.title}` })),
-    ...state.documents.filter((document) => !structuredNarrativePaths.has(document.path)).map((document) => ({ reference: { kind: 'document' as const, id: document.path }, label: `Document · ${friendlyDocumentName(document.path)}` })),
-    ...state.knowledge.people.filter((person) => !person.archivedAt).map((person) => ({ reference: { kind: 'person' as const, id: person.id }, label: `Person · ${person.name}${person.importOrigin?.kind === 'backup_knowledge' ? ' · Imported copy' : ''}` })),
-    ...state.knowledge.projects.filter((project) => !project.archivedAt).map((project) => ({ reference: { kind: 'project' as const, id: project.id }, label: `Project · ${project.name}${project.importOrigin?.kind === 'backup_knowledge' ? ' · Imported copy' : ''}` })),
+  const references: { reference: KnowledgeReference; label: string; binding: string }[] = [
+    ...state.notes.filter((note) => note.origin !== 'assistant_chat').map((note) => ({ reference: { kind: 'note' as const, id: note.id }, label: `Note · ${(note.transcript || 'Untitled note').slice(0, 70)}`, binding: JSON.stringify(['note', note]) })),
+    ...state.tasks.map((task) => ({ reference: { kind: 'task' as const, id: task.id }, label: `Task · ${task.title}`, binding: JSON.stringify(['task', task]) })),
+    ...state.documents.filter((document) => !structuredNarrativePaths.has(document.path)).map((document) => ({ reference: { kind: 'document' as const, id: document.path }, label: `Document · ${friendlyDocumentName(document.path)}`, binding: JSON.stringify(['document', document]) })),
+    ...state.knowledge.people.filter((person) => !person.archivedAt).map((person) => ({ reference: { kind: 'person' as const, id: person.id }, label: `Person · ${person.name}${person.importOrigin?.kind === 'backup_knowledge' ? ' · Imported copy' : ''}`, binding: JSON.stringify(['person', person]) })),
+    ...state.knowledge.projects.filter((project) => !project.archivedAt).map((project) => ({ reference: { kind: 'project' as const, id: project.id }, label: `Project · ${project.name}${project.importOrigin?.kind === 'backup_knowledge' ? ' · Imported copy' : ''}`, binding: JSON.stringify(['project', project]) })),
   ];
   for (const message of state.mailbox) {
     const account = state.accounts.find((item) => item.id === message.accountId);
@@ -261,7 +266,7 @@ function knowledgeReferenceOptions(state: AppState) {
         typeof message.connectionGeneration !== 'number' || message.providerDeletedAt ||
         message.verifiedIdentityKey !== identityKey || message.identityKey !== `${identityKey}:${message.providerMessageId}` ||
         message.connectionGeneration !== account.connectionGeneration) continue;
-    references.push({ reference: { kind: 'mail', id: message.providerMessageId, identityKey, connectionGeneration: message.connectionGeneration }, label: `Saved mail · ${message.subject || message.from || 'No subject'}` });
+    references.push({ reference: { kind: 'mail', id: message.providerMessageId, identityKey, connectionGeneration: message.connectionGeneration }, label: `Saved mail · ${message.subject || message.from || 'No subject'}`, binding: JSON.stringify(['mail', account, message]) });
   }
   for (const event of state.calendarEvents) {
     const account = state.accounts.find((item) => item.id === event.accountId);
@@ -271,7 +276,7 @@ function knowledgeReferenceOptions(state: AppState) {
         event.verifiedIdentityKey !== identityKey || event.connectionGeneration !== account.connectionGeneration) continue;
     const calendar = state.calendars.find((item) => item.id === event.calendarId && item.accountId === event.accountId && item.connected);
     if (!calendar) continue;
-    references.push({ reference: { kind: 'calendar', id: event.providerEventId, calendarId: calendar.providerId ?? calendar.id, identityKey, connectionGeneration: event.connectionGeneration }, label: `Saved calendar item · ${event.subject || 'Untitled event'}` });
+    references.push({ reference: { kind: 'calendar', id: event.providerEventId, calendarId: calendar.providerId ?? calendar.id, identityKey, connectionGeneration: event.connectionGeneration }, label: `Saved calendar item · ${event.subject || 'Untitled event'}`, binding: JSON.stringify(['calendar', account, calendar, event]) });
   }
   if (state.deviceCalendars.enabled && state.deviceCalendarAccess.status === 'full_access') {
     const now = Date.now();
@@ -284,10 +289,86 @@ function knowledgeReferenceOptions(state: AppState) {
         reference: { kind: 'device_calendar_event', installationId: state.deviceCalendars.installationId, generation: event.generation,
           calendarId: event.calendarId, eventId: event.nativeEventId, occurrenceStart: event.occurrenceStart },
         label: `On this iPhone · ${calendar.title} · ${event.title || 'Untitled event'}`,
+        binding: JSON.stringify(['device_calendar_event', state.deviceCalendars.installationId, state.deviceCalendars.generation,
+          state.deviceCalendars.enabled, state.deviceCalendars.selectedCalendarIds, state.deviceCalendarAccess.status, calendar, event]),
       });
     }
   }
   return references;
+}
+
+function knowledgeReferenceDisplay(reference: KnowledgeReference): KnowledgeReferenceDisplay {
+  switch (reference.kind) {
+    case 'note': case 'task': case 'document': case 'person': case 'project':
+      return { kind: reference.kind, id: reference.id };
+    case 'mail':
+      return { kind: 'mail', id: reference.id, identityKey: reference.identityKey, connectionGeneration: reference.connectionGeneration };
+    case 'calendar':
+      return { kind: 'calendar', id: reference.id, calendarId: reference.calendarId, identityKey: reference.identityKey, connectionGeneration: reference.connectionGeneration };
+    case 'device_calendar_event':
+      return { kind: 'historical', label: `Device calendar event (${reference.occurrenceStart})`, originalKind: 'device_calendar_event' };
+    case 'historical':
+      return { kind: 'historical', label: reference.label, originalKind: reference.originalKind };
+  }
+}
+
+function knowledgeReferenceChoices(state: AppState, ownership: KnowledgeReferenceChoiceOwnership): KnowledgeSourceChoiceDisplay[] {
+  return ownership.project(knowledgeReferenceOptions(state), knowledgeReferenceDisplay);
+}
+
+function projectKnowledgeChangeDisplay(change: KnowledgeSuggestion['change']): KnowledgeChangeDisplay {
+  switch (change.type) {
+    case 'add_fact': return { type: change.type, entityKind: change.entityKind, entityId: change.entityId, statement: change.statement };
+    case 'add_contact': return { type: change.type, entityKind: change.entityKind, entityId: change.entityId, address: change.address, label: change.label };
+    case 'add_member': return { type: change.type, entityKind: change.entityKind, entityId: change.entityId, personId: change.personId, personRevision: change.personRevision, role: change.role };
+    case 'add_source_link': return { type: change.type, entityKind: change.entityKind, entityId: change.entityId, reference: knowledgeReferenceDisplay(change.reference), ...(change.referenceRevision !== undefined ? { referenceRevision: change.referenceRevision } : {}), label: change.label };
+  }
+}
+
+function projectKnowledgeSuggestionDisplay(item: KnowledgeSuggestion): KnowledgeSuggestionDisplay {
+  const evidence = (items: KnowledgeSuggestion['evidence']) => items.map((entry) => ({ sourceId: entry.sourceId, sourceVersion: entry.sourceVersion, revision: entry.revision, quote: entry.quote }));
+  return { id: item.id, revision: item.revision, change: projectKnowledgeChangeDisplay(item.change), targetRevision: item.targetRevision,
+    evidence: evidence(item.evidence), status: item.status, createdAt: item.createdAt, updatedAt: item.updatedAt,
+    ...(item.originalChange ? { originalChange: projectKnowledgeChangeDisplay(item.originalChange) } : {}), ...(item.originalEvidence ? { originalEvidence: evidence(item.originalEvidence) } : {}),
+    ...(item.staleReason ? { staleReason: item.staleReason } : {}) };
+}
+
+function projectKnowledgeDisplay(value: AppState['knowledge']): KnowledgeDisplay {
+  const sourceLinks = (items: AppState['knowledge']['people'][number]['sourceLinks']) => items.map((item) => ({ id: item.id, provenance: item.provenance,
+    reference: knowledgeReferenceDisplay(item.reference), label: item.label }));
+  const facts = (items: AppState['knowledge']['people'][number]['facts']) => items.map((item) => ({ id: item.id, provenance: item.provenance, statement: item.statement }));
+  const people = value.people.map((person) => ({ id: person.id, revision: person.revision, name: person.name, aliases: [...person.aliases], narrativePath: person.narrativePath,
+    createdAt: person.createdAt, updatedAt: person.updatedAt, ...(person.archivedAt ? { archivedAt: person.archivedAt } : {}), ...(person.importOrigin ? { importOrigin: { kind: 'backup_knowledge' as const } } : {}),
+    facts: facts(person.facts), sourceLinks: sourceLinks(person.sourceLinks), contacts: person.contacts.map((item) => ({ id: item.id, provenance: item.provenance, address: item.address, label: item.label })) }));
+  const projects = value.projects.map((project) => ({ id: project.id, revision: project.revision, name: project.name, aliases: [...project.aliases], narrativePath: project.narrativePath,
+    createdAt: project.createdAt, updatedAt: project.updatedAt, ...(project.archivedAt ? { archivedAt: project.archivedAt } : {}), ...(project.importOrigin ? { importOrigin: { kind: 'backup_knowledge' as const } } : {}),
+    facts: facts(project.facts), sourceLinks: sourceLinks(project.sourceLinks), status: project.status, goal: project.goal, ...(project.startsOn ? { startsOn: project.startsOn } : {}),
+    ...(project.targetOn ? { targetOn: project.targetOn } : {}), ...(project.dateTimeZone ? { dateTimeZone: project.dateTimeZone } : {}), members: project.members.map((member) => ({ ...member })) }));
+  return { people, projects, suggestions: value.suggestions.map(projectKnowledgeSuggestionDisplay) };
+}
+
+function projectKnowledgeEntityDisplay(entity: Person | Project): KnowledgeEntityDisplay {
+  if ('contacts' in entity) return projectKnowledgeDisplay({ schemaVersion: 1, people: [entity], projects: [], suggestions: [] }).people[0]!;
+  return projectKnowledgeDisplay({ schemaVersion: 1, people: [], projects: [entity], suggestions: [] }).projects[0]!;
+}
+
+function projectImportedKnowledgePreview(preview: ImportedKnowledgeActivationPreview): ImportedKnowledgePreviewDisplay {
+  return { archiveId: preview.archiveId, cohortId: preview.cohortId, kind: preview.kind,
+    sourceEntityId: preview.sourceEntityId, sourceName: preview.sourceName, sourceEntity: projectKnowledgeEntityDisplay(preview.sourceEntity),
+    alreadyActivated: preview.alreadyActivated, narrativeContent: preview.narrativeContent,
+    factCount: preview.factCount, contactCount: preview.contactCount, sourceLinkCount: preview.sourceLinkCount, memberCount: preview.memberCount,
+    unavailableProviderReferenceCount: preview.unavailableProviderReferenceCount, unresolvedMemberCount: preview.unresolvedMemberCount };
+}
+
+function projectImportedKnowledgeArchives(archives: AppState['importedBackups']): readonly ImportedArchiveDisplay[] {
+  return archives.map((archive) => ({ id: archive.id, sourceFormat: archive.sourceFormat, importedAt: archive.importedAt, noteLinks: archive.noteLinks.map((link) => ({ sourceId: link.sourceId, noteId: link.noteId })),
+    taskLinks: archive.taskLinks.map((link) => ({ sourceId: link.sourceId, taskId: link.taskId })),
+    documents: archive.documents.map((item) => ({ path: item.path, content: item.content, revision: item.revision, updatedAt: item.updatedAt, id: item.id,
+      ...(item.activatedPath ? { activatedPath: item.activatedPath } : {}), ...(item.activatedAt ? { activatedAt: item.activatedAt } : {}) })),
+    ...(archive.archivedKnowledge ? { archivedKnowledge: archive.archivedKnowledge.map((cohort) => ({ id: cohort.id, sourceId: cohort.sourceId,
+      knowledge: { state: projectKnowledgeDisplay(cohort.knowledge.state), narratives: cohort.knowledge.narratives.map((item) => ({ entityKind: item.entityKind,
+        entityId: item.entityId, content: item.content, revision: item.revision, updatedAt: item.updatedAt })) },
+      activatedEntities: (cohort.activationLinks ?? []).map((link) => ({ entityKind: link.entityKind, sourceEntityId: link.sourceEntityId })) })) } : {}) }));
 }
 
 function knowledgeEvidenceLabels(state: AppState) {
@@ -661,6 +742,7 @@ export function WorkspaceView({ controller, credentials, platform, workspaceGene
   const [moreComputeFocusTurnId, setMoreComputeFocusTurnId] = useState<string | undefined>();
   const [knowledgeReviewRequest, setKnowledgeReviewRequest] = useState<{ suggestionId: string; requestId: number } | undefined>();
   const knowledgeReviewRequestSequence = useRef(0);
+  const [knowledgeReferenceChoiceOwnership] = useState(() => new KnowledgeReferenceChoiceOwnership());
   const [chatTranscriptTransferPlan, setChatTranscriptTransferPlan] = useState<ChatTranscriptTransferPlan | undefined>();
   const [chatTranscriptTransferPreparedAt, setChatTranscriptTransferPreparedAt] = useState<number | undefined>();
   const [chatTranscriptTransferBusy, setChatTranscriptTransferBusy] = useState(false);
@@ -1313,19 +1395,18 @@ export function WorkspaceView({ controller, credentials, platform, workspaceGene
     async <T,>(fn: () => Promise<T>): Promise<T | undefined> => {
       if (privacyOutcomeUnknown) return undefined;
       if (!startupReady) return undefined;
-      if (busyLock.current) return undefined;
-      busyLock.current = true;
-      setBusy(true);
-      setNotice("");
-      try {
-        return await fn();
-      } catch (e) {
-        if (isPrivacyBootstrapError(e)) onPrivacyInvalidated();
-        else setNotice(messageOf(e));
-      } finally {
-        busyLock.current = false;
-        setBusy(false);
-      }
+      return runWithBusyLock(busyLock, async () => {
+        setBusy(true);
+        setNotice("");
+        try {
+          return await fn();
+        } catch (e) {
+          if (isPrivacyBootstrapError(e)) onPrivacyInvalidated();
+          else setNotice(messageOf(e));
+        } finally {
+          setBusy(false);
+        }
+      });
     },
     [onPrivacyInvalidated, privacyOutcomeUnknown, startupReady],
   );
@@ -3821,9 +3902,9 @@ export function WorkspaceView({ controller, credentials, platform, workspaceGene
                   Boolean(state.mailAlertRefreshRequired || state.proactive.integrityError || state.assistantChatRecoveryStatus || state.assistantBatchRecoveryStatus ||
                     state.knowledgeRecoveryStatus || state.reminderRecoveryStatus) ||
                   proactiveRecoveryRequiresRefresh}
-                knowledge={state.knowledge}
+                knowledge={projectKnowledgeDisplay(state.knowledge)}
                 knowledgeRecoveryStatus={state.knowledgeRecoveryStatus}
-                references={knowledgeReferenceOptions(state)}
+                references={knowledgeReferenceChoices(state, knowledgeReferenceChoiceOwnership)}
                 evidenceLabels={knowledgeEvidenceLabels(state)}
                 chatEvidenceLabels={safeChatMemoryEvidenceLabels(chatConversations)}
                 memoryReviewBlocked={knowledgeReviewBlocked}
@@ -3859,19 +3940,45 @@ export function WorkspaceView({ controller, credentials, platform, workspaceGene
                   })
                 }
                 onOpenNote={openNote}
-                onSavePerson={(input) => run(() => controller.savePerson(input))}
-                onSaveProject={(input) => run(() => controller.saveProject(input))}
+                onSavePerson={(input) => run(() => controller.savePerson({ ...input, aliases: [...input.aliases] }))}
+                onSaveProject={(input) => run(() => controller.saveProject({ ...input, aliases: [...input.aliases] }))}
                 onSetKnowledgeArchived={(input) => run(() => controller.setKnowledgeEntityArchived(input))}
                 onSaveKnowledgeFact={(input) => run(() => controller.saveKnowledgeFact(input))}
                 onRemoveKnowledgeFact={(input) => run(async () => { await controller.removeKnowledgeFact(input); return true; })}
                 onSaveKnowledgeContact={(input) => run(() => controller.saveKnowledgeContact(input))}
                 onRemoveKnowledgeContact={(input) => run(async () => { await controller.removeKnowledgeContact(input); return true; })}
-                onSaveKnowledgeSourceLink={(input) => run(() => controller.saveKnowledgeSourceLink(input))}
+                onSaveKnowledgeSourceLink={(input) => {
+                  const entity = input.entityKind === 'person'
+                    ? state.knowledge.people.find((item) => item.id === input.entityId && item.revision === input.expectedEntityRevision)
+                    : state.knowledge.projects.find((item) => item.id === input.entityId && item.revision === input.expectedEntityRevision);
+                  const existing = input.itemId ? entity?.sourceLinks.find((item) => item.id === input.itemId) : undefined;
+                  const selectedReference = resolveKnowledgeSourceLinkReference(knowledgeReferenceChoiceOwnership, input.referenceChoiceId, knowledgeReferenceOptions(state), existing?.reference);
+                  const { referenceChoiceId: _referenceChoiceId, ...command } = input;
+                  if (!entity || (input.itemId && !existing) || !selectedReference) return Promise.resolve(undefined);
+                  return run(() => controller.saveKnowledgeSourceLink({ ...command, reference: selectedReference }));
+                }}
                 onRemoveKnowledgeSourceLink={(input) => run(async () => { await controller.removeKnowledgeSourceLink(input); return true; })}
                 onSaveKnowledgeMember={(input) => run(() => controller.saveKnowledgeMember(input))}
                 onRemoveKnowledgeMember={(input) => run(async () => { await controller.removeKnowledgeMember(input); return true; })}
                 onReviewKnowledgeSuggestion={(id, input) => run(() => controller.reviewKnowledgeSuggestion(id, input))}
-                onEditKnowledgeSuggestion={(id, input) => run(() => controller.editKnowledgeSuggestion(id, input))}
+                onEditKnowledgeSuggestion={async (id, input) => {
+                  const current = state.knowledge.suggestions.find((item) => item.id === id && item.revision === input.expectedRevision);
+                  if (!current || current.status !== 'pending' || current.change.type !== input.change.type) return undefined;
+                  let change: KnowledgeChange;
+                  if (input.change.type === 'add_source_link') {
+                    if (current.change.type !== 'add_source_link') return undefined;
+                    change = { ...input.change, reference: current.change.reference };
+                  } else if (input.change.type === 'add_member') {
+                    const memberChange = input.change;
+                    if (!('personId' in memberChange) || !('personRevision' in memberChange)) return undefined;
+                    const { personId, personRevision } = memberChange;
+                    const person = state.knowledge.people.find((item) => item.id === personId && item.revision === personRevision && !item.archivedAt);
+                    if (!person) return undefined;
+                    change = { ...input.change };
+                  } else change = { ...input.change };
+                  const result = await run(() => controller.editKnowledgeSuggestion(id, { expectedRevision: input.expectedRevision, change, evidence: input.evidence.map((item) => ({ ...item })) }));
+                  return result ? projectKnowledgeSuggestionDisplay(result) : undefined;
+                }}
                 onPrepareKnowledgeSuggestionReview={prepareKnowledgeSuggestionReview}
                 onRun={(action) => run(action)}
                 onOpenDoc={(d) => {
@@ -5005,9 +5112,9 @@ function LibraryScreen({
   chooseBackup: () => Promise<PickedBackupFile | null>;
   importedBackups: AppState["importedBackups"];
   archiveActionsBlocked: boolean;
-  knowledge: AppState["knowledge"];
+  knowledge: KnowledgeDisplay;
   knowledgeRecoveryStatus?: AppState["knowledgeRecoveryStatus"];
-  references: { reference: KnowledgeReference; label: string }[];
+  references: readonly KnowledgeSourceChoiceDisplay[];
   evidenceLabels: Record<string, string>;
   chatEvidenceLabels: Record<string, string>;
   memoryReviewBlocked: boolean;
@@ -5032,23 +5139,109 @@ function LibraryScreen({
   onOpenNote: (n: Note) => void;
   onOpenDoc: (d: { path: string; content: string }) => void;
   onExport: () => void;
-  onSavePerson: (input: SavePersonInput) => Promise<unknown>;
-  onSaveProject: (input: SaveProjectInput) => Promise<unknown>;
+  onSavePerson: (input: KnowledgeEntityEditCommand) => Promise<unknown>;
+  onSaveProject: (input: KnowledgeProjectEditCommand) => Promise<unknown>;
   onSetKnowledgeArchived: (input: { kind: KnowledgeEntityKind; id: string; expectedRevision: number; archived: boolean }) => Promise<unknown>;
   onSaveKnowledgeFact: (input: SaveKnowledgeFactInput) => Promise<unknown>;
   onRemoveKnowledgeFact: (input: KnowledgeItemCommand) => Promise<unknown>;
   onSaveKnowledgeContact: (input: SaveKnowledgeContactInput) => Promise<unknown>;
   onRemoveKnowledgeContact: (input: KnowledgeItemCommand & { entityKind: 'person' }) => Promise<unknown>;
-  onSaveKnowledgeSourceLink: (input: SaveKnowledgeSourceLinkInput) => Promise<unknown>;
+  onSaveKnowledgeSourceLink: (input: Omit<SaveKnowledgeSourceLinkInput, 'reference'> & { referenceChoiceId?: string }) => Promise<unknown>;
   onRemoveKnowledgeSourceLink: (input: KnowledgeItemCommand) => Promise<unknown>;
   onSaveKnowledgeMember: (input: SaveKnowledgeMemberInput) => Promise<unknown>;
   onRemoveKnowledgeMember: (input: KnowledgeItemCommand & { entityKind: 'project' }) => Promise<unknown>;
   onReviewKnowledgeSuggestion: (id: string, input: ReviewKnowledgeSuggestionInput) => Promise<unknown>;
-  onEditKnowledgeSuggestion: (id: string, input: EditKnowledgeSuggestionInput) => Promise<KnowledgeSuggestion | undefined>;
+  onEditKnowledgeSuggestion: (id: string, input: KnowledgeSuggestionEditCommand) => Promise<KnowledgeSuggestionDisplay | undefined>;
   onPrepareKnowledgeSuggestionReview: (id: string, input: { expectedRevision: number }) => Promise<KnowledgeSuggestionReview>;
   onRun: <T>(action: () => Promise<T>) => Promise<T | undefined>;
 }) {
   const [importOpen, setImportOpen] = useState(false);
+  const importedOwnershipRef = useRef(new ImportedKnowledgeActivationOwnership());
+  const importedSelectionRef = useRef<ImportedKnowledgeSelection | null>(null);
+  const importedRuntimeRef = useRef({ controller, blocked: memoryReviewBlocked || archiveActionsBlocked, importedBackups });
+  importedRuntimeRef.current = { controller, blocked: memoryReviewBlocked || archiveActionsBlocked, importedBackups };
+  const [importedReviewState, setImportedReviewState] = useState<{ selection: ImportedKnowledgeSelection | null; preview: ImportedKnowledgePreviewDisplay | null; preparing: boolean; applying: boolean; message: string }>({
+    selection: null, preview: null, preparing: false, applying: false, message: '',
+  });
+  const invalidateImportedReview = useCallback((clearSelection = true) => {
+    importedOwnershipRef.current.invalidate();
+    if (clearSelection) importedSelectionRef.current = null;
+    setImportedReviewState({ selection: clearSelection ? null : importedSelectionRef.current, preview: null, preparing: false, applying: false, message: '' });
+  }, []);
+  const cancelImportedReview = useCallback(() => invalidateImportedReview(), [invalidateImportedReview]);
+  const onImportedSelectionChange = useCallback((selection: ImportedKnowledgeSelection | null) => {
+    importedSelectionRef.current = selection;
+    invalidateImportedReview(false);
+    setImportedReviewState({ selection, preview: null, preparing: false, applying: false, message: '' });
+  }, [invalidateImportedReview]);
+  const prepareImportedKnowledge = useCallback(async (selection: ImportedKnowledgeSelection) => {
+    const runtime = importedRuntimeRef.current;
+    if (busy || runtime.blocked || runtime.controller !== controller || !importedKnowledgeSelectionMatches(importedSelectionRef.current, selection)) return;
+    const archive = runtime.importedBackups.find((item) => item.id === selection.archiveId);
+    const cohort = archive?.archivedKnowledge?.find((item) => item.id === selection.cohortId);
+    const source = selection.kind === 'person'
+      ? cohort?.knowledge.state.people.find((item) => item.id === selection.entityId)
+      : cohort?.knowledge.state.projects.find((item) => item.id === selection.entityId);
+    if (!source) return;
+    const claim = importedOwnershipRef.current.claimPrepare(selection, controller);
+    if (!claim) return;
+    const { owner } = claim;
+    setImportedReviewState({ selection, preview: null, preparing: true, applying: false, message: '' });
+    try {
+      const prepared = await onRun(() => owner.controller.prepareImportedKnowledgeActivation({ archiveId: selection.archiveId, cohortId: selection.cohortId, kind: selection.kind, entityId: selection.entityId }));
+      if (!prepared) return;
+      const currentRuntime = importedRuntimeRef.current;
+      if (!attachImportedKnowledgePreviewForRuntime(importedOwnershipRef.current, owner, selection, prepared, currentRuntime, importedSelectionRef.current)) return;
+      setImportedReviewState({ selection, preview: projectImportedKnowledgePreview(prepared), preparing: false, applying: false, message: '' });
+    } catch (error) {
+      const currentRuntime = importedRuntimeRef.current;
+      if (importedKnowledgeOwnerMatchesRuntime(importedOwnershipRef.current, owner, selection, currentRuntime) && importedKnowledgeSelectionMatches(importedSelectionRef.current, selection)) {
+        setImportedReviewState({ selection, preview: null, preparing: false, applying: false, message: error instanceof Error ? error.message : 'Could not prepare this imported copy. Try again.' });
+      }
+    } finally {
+      importedOwnershipRef.current.release(claim);
+      if (importedOwnershipRef.current.current() === owner) setImportedReviewState((current) => current.selection && importedKnowledgeSelectionMatches(current.selection, selection)
+        ? { ...current, preparing: false } : current);
+    }
+  }, [busy, controller, onRun]);
+  const activateImportedKnowledge = useCallback(async (selection: ImportedKnowledgeSelection, confirmed: true) => {
+    const runtime = importedRuntimeRef.current;
+    if (!confirmed || busy || runtime.blocked || runtime.controller !== controller || !importedKnowledgeSelectionMatches(importedSelectionRef.current, selection)) return;
+    const claim = importedOwnershipRef.current.claimActivation(selection, runtime.controller);
+    if (!claim) return;
+    const { owner, credentials } = claim;
+    setImportedReviewState((current) => ({ ...current, applying: true, message: '' }));
+    try {
+      const result = await onRun(() => owner.controller.activateImportedKnowledgeEntity(credentials));
+      const currentRuntime = importedRuntimeRef.current;
+      if (!importedKnowledgeOwnerMatchesRuntime(importedOwnershipRef.current, owner, selection, currentRuntime) || !importedKnowledgeSelectionMatches(importedSelectionRef.current, selection)) return;
+      if (result) {
+        owner.sessionId = undefined;
+        setImportedReviewState((current) => current.preview ? { ...current, preview: { ...current.preview, alreadyActivated: true }, applying: false,
+          message: `Added ${result.entity.name} as a separate ${selection.kind}.` } : { ...current, applying: false });
+      } else setImportedReviewState((current) => ({ ...current, applying: false }));
+    } catch (error) {
+      const currentRuntime = importedRuntimeRef.current;
+      if (importedKnowledgeOwnerMatchesRuntime(importedOwnershipRef.current, owner, selection, currentRuntime) && importedKnowledgeSelectionMatches(importedSelectionRef.current, selection)) {
+        setImportedReviewState((current) => ({ ...current, applying: false, message: error instanceof Error ? error.message : 'Could not activate this imported copy.' }));
+      }
+    } finally {
+      importedOwnershipRef.current.release(claim);
+      const currentRuntime = importedRuntimeRef.current;
+      if (importedKnowledgeOwnerMatchesRuntime(importedOwnershipRef.current, owner, selection, currentRuntime) && importedKnowledgeSelectionMatches(importedSelectionRef.current, selection)) {
+        setImportedReviewState((current) => ({ ...current, applying: false }));
+      }
+    }
+  }, [busy, controller, onRun]);
+  useEffect(() => {
+    if (memoryReviewBlocked || archiveActionsBlocked) invalidateImportedReview();
+  }, [archiveActionsBlocked, memoryReviewBlocked, invalidateImportedReview]);
+  useEffect(() => {
+    invalidateImportedReview();
+  }, [controller, importedBackups, invalidateImportedReview]);
+  useEffect(() => () => {
+    importedOwnershipRef.current.invalidate();
+  }, []);
   const [section, setSection] = useState<'notes' | 'people' | 'projects' | 'memory' | 'reminders'>(() =>
     memoryReviewRequest ? 'memory' : reminderDemoMode ? 'reminders' : knowledgeDemoMode ? 'memory' : 'notes');
   const [entityKind, setEntityKind] = useState<'person' | 'project'>('person');
@@ -5241,11 +5434,29 @@ function LibraryScreen({
             blocked={memoryReviewBlocked}
             openRequest={memoryReviewRequest}
             onRequestHandled={onMemoryReviewRequestHandled}
-            onPrepareReview={onPrepareKnowledgeSuggestionReview}
+            onPrepareReview={async (id, input) => {
+              const review = await onPrepareKnowledgeSuggestionReview(id, input);
+              return { suggestion: projectKnowledgeSuggestionDisplay(review.suggestion), canEdit: review.canEdit, canAccept: review.canAccept, ...(review.reason ? { reason: review.reason } : {}) };
+            }}
             onReview={onReviewKnowledgeSuggestion}
             onEdit={onEditKnowledgeSuggestion}
           />
-          <ImportedKnowledgeReview archives={importedBackups} busy={busy} controller={controller} onRun={onRun} />
+          <ImportedKnowledgeReview
+            archives={projectImportedKnowledgeArchives(importedBackups)}
+            busy={busy}
+            blocked={archiveActionsBlocked || memoryReviewBlocked}
+            preparing={importedReviewState.preparing}
+            applying={importedReviewState.applying}
+            preview={importedReviewState.preview}
+            message={importedReviewState.message}
+            canActivate={Boolean(importedReviewState.selection && importedOwnershipRef.current.current()?.preview && importedOwnershipRef.current.current()?.sessionId && importedOwnershipRef.current.current()?.planHash &&
+              importedKnowledgeSelectionMatches(importedReviewState.selection, importedOwnershipRef.current.current()?.selection) && importedKnowledgeSelectionMatches(importedSelectionRef.current, importedOwnershipRef.current.current()?.selection) &&
+              importedOwnershipRef.current.current()?.controller === controller && !importedOwnershipRef.current.current()?.preview?.alreadyActivated && !busy && !memoryReviewBlocked && !archiveActionsBlocked)}
+            onSelectionChange={onImportedSelectionChange}
+            onPrepare={(selection) => { void prepareImportedKnowledge(selection); }}
+            onActivate={(selection, confirmed) => { void activateImportedKnowledge(selection, confirmed); }}
+            onCancel={cancelImportedReview}
+          />
         </>
       ) : null}
       <BackupImportSheet
