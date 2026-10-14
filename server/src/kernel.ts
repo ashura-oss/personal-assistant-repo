@@ -95,6 +95,19 @@ export interface ExternalAttemptReceipt {
   readonly result?: JsonValue;
 }
 
+/** Trusted server-module context. Never serialize or expose this object through an HTTP response. */
+export interface OwnedTransactionContext {
+  readonly workspaceId: string;
+  readonly ownerId: string;
+  readonly privacyEpoch: number;
+  readonly revision: number;
+  readonly now: number;
+  /** Raw connection access is restricted to trusted internal modules inside this callback. */
+  readonly db: Database.Database;
+  /** Throws after the synchronous owner transaction callback has returned. */
+  readonly assertActive: () => void;
+}
+
 export class KernelError extends Error {
   constructor(message: string, readonly code: string) {
     super(message);
@@ -439,6 +452,53 @@ export class DurableKernel {
   getOwnedSnapshot(sessionToken: string): WorkspaceSnapshot {
     const { workspace } = this.authenticate(sessionToken);
     return this.loadWorkspaceSnapshot(workspace);
+  }
+
+  /**
+   * TRUSTED INTERNAL ONLY. Runs a synchronous server-module operation under BEGIN IMMEDIATE,
+   * authenticating its owner, session, workspace and privacy epoch on this same connection.
+   * Never pass the context or its database handle to a client or HTTP handler.
+   */
+  withOwnedTransaction<T>(sessionToken: string, expectedPrivacyEpoch: number,
+    callback: (context: OwnedTransactionContext) => T): T {
+    requireInteger(expectedPrivacyEpoch, 'Expected privacy epoch');
+    if (typeof callback !== 'function') fail('invalid_input', 'A trusted synchronous transaction callback is required.');
+    if (callback.constructor?.name === 'AsyncFunction') fail('invalid_mutator', 'Owned transaction callbacks must be synchronous.');
+    const transaction = this.db.transaction((): T => {
+      const { session, workspace, now } = this.authenticate(sessionToken);
+      if (workspace.privacy_epoch !== expectedPrivacyEpoch) fail('stale_epoch', 'The workspace privacy epoch changed.');
+      let active = true;
+      const context: OwnedTransactionContext = Object.freeze({ workspaceId: workspace.id, ownerId: session.owner_id,
+        privacyEpoch: workspace.privacy_epoch, revision: workspace.revision, now, db: this.db,
+        assertActive: () => { if (!active) fail('transaction_context_expired', 'The owned transaction context is no longer active.'); } });
+      try {
+        const result = callback(context);
+        if (result !== null && (typeof result === 'object' || typeof result === 'function') &&
+          typeof (result as { then?: unknown }).then === 'function') {
+          fail('invalid_mutator', 'Owned transaction callbacks must return synchronously.');
+        }
+        return result;
+      } finally {
+        active = false;
+      }
+    });
+    return transaction.immediate();
+  }
+
+  /** TRUSTED INTERNAL ONLY. Used for module-owned schema setup, never for request authority. */
+  withTrustedDatabaseTransaction<T>(callback: (db: Database.Database) => T): T {
+    if (typeof callback !== 'function') fail('invalid_input', 'A trusted synchronous database callback is required.');
+    if (callback.constructor?.name === 'AsyncFunction') fail('invalid_mutator', 'Database callbacks must be synchronous.');
+    this.assertOpen();
+    const transaction = this.db.transaction(() => {
+      const result = callback(this.db);
+      if (result !== null && (typeof result === 'object' || typeof result === 'function') &&
+        typeof (result as { then?: unknown }).then === 'function') {
+        fail('invalid_mutator', 'Database callbacks must return synchronously.');
+      }
+      return result;
+    });
+    return transaction.immediate();
   }
 
   revokeSession(sessionToken: string): void {
