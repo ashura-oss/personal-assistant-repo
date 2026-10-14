@@ -92,6 +92,67 @@ test('registry loads one real shared controller and durable note commands never 
   }
 });
 
+test('concurrent first lookups reserve one entry before invoking the controller factory', async () => {
+  const f = fixture();
+  try {
+    const factoryStarted = deferred();
+    const finishFactory = deferred();
+    let factories = 0;
+    const registry = new WorkspaceRegistry(f.kernel, f.journal, () => f.runtimeSession, async ({ store }) => {
+      factories += 1;
+      factoryStarted.resolve();
+      await finishFactory.promise;
+      return createController({ store });
+    });
+    const first = registry.get(f.admissionA);
+    const second = registry.get(f.admissionB);
+    await factoryStarted.promise;
+    assert.equal(factories, 1);
+    finishFactory.resolve();
+    const [left, right] = await Promise.all([first, second]);
+    assert.equal(left.controller, right.controller);
+    assert.equal(factories, 1);
+  } finally { f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test('a constructed controller is disposed after load failure and cleanup failure stays fenced for explicit retry', async () => {
+  const f = fixture();
+  try {
+    let constructions = 0;
+    let loads = 0;
+    let disposals = 0;
+    const registry = new WorkspaceRegistry(f.kernel, f.journal, () => f.runtimeSession, ({ store }) => {
+      constructions += 1;
+      const construction = constructions;
+      return {
+        async load() {
+          loads += 1;
+          if (construction === 1) throw new Error('synthetic startup load failure');
+          await store.load();
+        },
+        async disposeForPrivacy() {
+          disposals += 1;
+          if (disposals === 1) throw new Error('synthetic exact-controller cleanup failure');
+        },
+      };
+    });
+
+    await assert.rejects(registry.get(f.admissionA), /synthetic startup load failure/);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(constructions, 1);
+    assert.equal(disposals, 1, 'the controller returned by the failed factory is still cleaned up');
+    await assert.rejects(registry.get(f.admissionB), /disposal retry/);
+    assert.equal(constructions, 1, 'a failed cleanup never permits replacement construction');
+
+    await registry.disposeWorkspace(f.admissionA);
+    assert.equal(disposals, 2, 'explicit retry disposes the same failed-load controller');
+    const replacement = await registry.get(f.admissionB);
+    assert.equal(constructions, 2);
+    assert.equal(loads, 2);
+    assert.ok(replacement.controller);
+  } finally { f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
 function deferred() {
   let resolve;
   const promise = new Promise((done) => { resolve = done; });

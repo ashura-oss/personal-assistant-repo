@@ -323,3 +323,144 @@ test('failed controller cleanup remains fenced and can be retried explicitly', a
     assert.equal(f.disposedSpeech(), 2, 'successful disposal remains idempotent');
   } finally { await f.runtime.closeAfterDrain().catch(() => undefined); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
+
+test('runtime port factory is shared within an epoch and replaces only the old epoch ports', async () => {
+  const f = fixture();
+  try {
+    let runtimeSession = f.runtimeSession;
+    const made = [];
+    let unattachedCleanups = 0;
+    const { providers: _providers, integration: _integration, mediaResolver: _mediaResolver, ...base } = f.ports;
+    const runtime = new OwnedWorkspaceRuntime({ ...base, runtimeSessionFor: () => runtimeSession, workspacePortsFor(context) {
+      assert.equal(Object.isFrozen(context.identity), true);
+      assert.equal(context.identity.workspaceId, f.workspace.workspaceId);
+      assert.equal(context.identity.ownerId, f.ownerId);
+      assert.equal(context.identity.privacyEpoch, made.length);
+      assert.equal(context.runtimeSessionToken, runtimeSession);
+      const portSet = { disposed: 0 };
+      const speech = {
+        async transcribe() { throw new Error('speech fixture must not make provider requests'); },
+        async releaseUploadLease() {},
+        disposeMemory() { portSet.disposed += 1; },
+      };
+      made.push(portSet);
+      return { providers: { ...f.ports.providers, speech }, integration: f.ports.integration,
+        mediaResolver: { resolveMediaId() { return undefined; } },
+        disposeUnattached() { unattachedCleanups += 1; } };
+    } });
+    const initial = await runtime.getSnapshot(f.admission);
+    assert.equal((await runtime.getSnapshot(f.admission)), initial);
+    assert.equal(made.length, 1, 'reads in one workspace epoch reuse one provider set');
+
+    const currentSnapshot = f.kernel.getOwnedSnapshot(runtimeSession).snapshot;
+    const loadedIdentity = f.kernel.getOwnedIdentity(runtimeSession);
+    f.kernel.runLocalCommand(runtimeSession, { expectedRevision: loadedIdentity.revision, expectedPrivacyEpoch: loadedIdentity.privacyEpoch,
+      idempotencyKey: randomUUID(), type: 'workspace.privacy.erase', canonicalRequest: '{"erase":true}' }, () => ({
+      snapshot: currentSnapshot, receipt: { kind: 'privacy.erased' }, privacyEpoch: 1,
+    }));
+    const expiry = Date.now() + 60 * 60_000;
+    const nextAdmissionToken = f.kernel.createSession(f.workspace.workspaceId, f.ownerId, expiry);
+    runtimeSession = f.kernel.createSession(f.workspace.workspaceId, f.ownerId, RUNTIME_ACTOR_EXPIRES_AT);
+    const nextAdmission = { sessionToken: nextAdmissionToken, assertCurrent: () => f.kernel.getOwnedIdentity(nextAdmissionToken) };
+    const next = await runtime.refreshSnapshot(nextAdmission);
+    assert.equal(next.privacyEpoch, 1);
+    assert.equal(made.length, 2, 'the new privacy epoch receives a distinct provider set');
+    assert.equal(unattachedCleanups, 0, 'the controller takes ownership after successful construction');
+    assert.equal(made[0].disposed, 1, 'only the old epoch controller disposes its own provider port');
+    assert.equal(made[1].disposed, 0, 'the current provider port remains live');
+    await runtime.closeAfterDrain();
+    assert.equal(unattachedCleanups, 0);
+    assert.equal(made[0].disposed, 1);
+    assert.equal(made[1].disposed, 1, 'shutdown disposes the current epoch provider exactly once');
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test('runtime rejects missing, mixed, and malformed per-epoch port configuration before controller construction', async () => {
+  const f = fixture();
+  try {
+    const { providers, integration, mediaResolver, ...base } = f.ports;
+    assert.throws(() => new OwnedWorkspaceRuntime(base), /owned_workspace_runtime_ports_required/);
+    assert.throws(() => new OwnedWorkspaceRuntime({ ...f.ports, workspacePortsFor: () => ({ providers, integration }) }),
+      /owned_workspace_runtime_ports_required/);
+
+    let cleanupAttempts = 0;
+    const malformed = new OwnedWorkspaceRuntime({ ...base, workspacePortsFor: () => ({ providers: null, integration,
+      disposeUnattached() { cleanupAttempts += 1; } }) });
+    await assert.rejects(malformed.getSnapshot(f.admission), /owned_workspace_runtime_ports_required/);
+    assert.equal(cleanupAttempts, 1, 'returned ports are cleaned if validation fails before construction');
+    await malformed.closeAfterDrain();
+
+    let missingDisposerCalls = 0;
+    const missingDisposer = new OwnedWorkspaceRuntime({ ...base, workspacePortsFor() {
+      missingDisposerCalls += 1;
+      return { providers: null, integration };
+    } });
+    await assert.rejects(missingDisposer.getSnapshot(f.admission), /workspace_runtime_port_cleanup_failed/);
+    await assert.rejects(missingDisposer.refreshSnapshot(f.admission), /explicit disposal retry/);
+    assert.equal(missingDisposerCalls, 1, 'returned resources without cleanup stay fenced instead of being forgotten');
+    await assert.rejects(missingDisposer.retryFailedWorkspaceDisposal(f.admission, 0), /cleanup_unavailable/);
+    await missingDisposer.closeAfterDrain().catch(() => undefined);
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test('failed unattached-port cleanup fences epoch replacement until the caller explicitly retries the exact held epoch', async () => {
+  const f = fixture();
+  try {
+    let runtimeSession = f.runtimeSession;
+    let factoryCalls = 0;
+    let cleanupCalls = 0;
+    const { providers, integration, ...base } = f.ports;
+    const runtime = new OwnedWorkspaceRuntime({ ...base, runtimeSessionFor: () => runtimeSession,
+      workspacePortsFor() {
+        factoryCalls += 1;
+        if (factoryCalls === 1) return { providers: null, integration, disposeUnattached() {
+          cleanupCalls += 1;
+          if (cleanupCalls === 1) throw new Error('synthetic unattached cleanup failure');
+        } };
+        return { providers, integration, disposeUnattached() {} };
+      } });
+
+    await assert.rejects(runtime.getSnapshot(f.admission), /workspace_runtime_port_cleanup_failed/);
+    assert.equal(cleanupCalls, 1);
+    const oldIdentity = f.kernel.getOwnedIdentity(runtimeSession);
+    const currentSnapshot = f.kernel.getOwnedSnapshot(runtimeSession).snapshot;
+    f.kernel.runLocalCommand(runtimeSession, { expectedRevision: oldIdentity.revision, expectedPrivacyEpoch: oldIdentity.privacyEpoch,
+      idempotencyKey: randomUUID(), type: 'workspace.privacy.erase', canonicalRequest: '{"erase":true}' }, () => ({
+      snapshot: currentSnapshot, receipt: { kind: 'privacy.erased' }, privacyEpoch: 1,
+    }));
+    const expiry = Date.now() + 60 * 60_000;
+    const nextAdmissionToken = f.kernel.createSession(f.workspace.workspaceId, f.ownerId, expiry);
+    runtimeSession = f.kernel.createSession(f.workspace.workspaceId, f.ownerId, RUNTIME_ACTOR_EXPIRES_AT);
+    const nextAdmission = { sessionToken: nextAdmissionToken, assertCurrent: () => f.kernel.getOwnedIdentity(nextAdmissionToken) };
+    await assert.rejects(runtime.refreshSnapshot(nextAdmission), /explicit disposal retry/);
+    assert.equal(cleanupCalls, 1, 'an ordinary new-epoch read never retries failed cleanup');
+    assert.equal(factoryCalls, 1, 'no replacement ports are created while old cleanup is unresolved');
+
+    await assert.rejects(runtime.retryFailedWorkspaceDisposal(nextAdmission, 1), /retry_not_available/);
+    assert.equal(cleanupCalls, 1, 'a wrong held epoch cannot retry cleanup');
+    const foreignOwner = randomUUID();
+    const foreignWorkspace = f.kernel.createWorkspace(foreignOwner, createInitialWorkspaceState(randomUUID));
+    const foreignAdmission = f.kernel.createSession(foreignWorkspace.workspaceId, foreignOwner, expiry);
+    await assert.rejects(runtime.retryFailedWorkspaceDisposal({ sessionToken: foreignAdmission,
+      assertCurrent: () => f.kernel.getOwnedIdentity(foreignAdmission) }, 0), /retry_not_available/);
+    assert.equal(cleanupCalls, 1, 'a different owner/workspace cannot retry cleanup');
+    assert.throws(() => runtime.retryFailedWorkspaceDisposal(f.admission, 0), /invalid or expired/);
+
+    let callerAuthorized = true;
+    const guardedAdmission = { sessionToken: nextAdmissionToken, assertCurrent() {
+      if (!callerAuthorized) throw new Error('synthetic caller guard revoked before queued cleanup retry');
+      f.kernel.getOwnedIdentity(nextAdmissionToken);
+    } };
+    queueMicrotask(() => { callerAuthorized = false; });
+    await assert.rejects(runtime.retryFailedWorkspaceDisposal(guardedAdmission, 0), /revoked before queued cleanup retry/);
+    assert.equal(cleanupCalls, 1, 'a caller guard changed before queued work cannot invoke retained cleanup');
+    callerAuthorized = true;
+
+    await runtime.retryFailedWorkspaceDisposal(guardedAdmission, 0);
+    assert.equal(cleanupCalls, 2, 'the exact retry invokes the retained cleanup capability once');
+    const recovered = await runtime.refreshSnapshot(nextAdmission);
+    assert.equal(recovered.privacyEpoch, 1);
+    assert.equal(factoryCalls, 2, 'replacement construction happens only after explicit cleanup and refresh');
+    await runtime.closeAfterDrain();
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});

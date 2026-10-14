@@ -1,12 +1,10 @@
 import type { AppState } from '../core';
-import { AppControllerImpl, type ControllerCryptoPort, type ControllerRuntimePorts, type ControllerSpeechPort } from '../services/controller.shared';
-import type { AssistantModelClient } from '../services/assistantClient';
-import type { OpenRouterSpeechAdapterPort } from '../services/openRouterSpeechAdapter.shared';
+import { AppControllerImpl, type ControllerCryptoPort, type ControllerRuntimePorts } from '../services/controller.shared';
 import { createWorkspaceSnapshotDTO, type WorkspaceMediaResolver, type WorkspaceSnapshotDTO } from './workspaceDto';
 import type { DurableKernel, JsonValue, OwnedWorkspaceIdentity } from '../../server/src/kernel.js';
 import { CommandJournal, type CommandAdmission } from '../../server/src/commandJournal.js';
-import { WorkspaceRegistry } from '../../server/src/workspaceRegistry.js';
-import type { RuntimeSessionResolver } from '../../server/src/workspaceRegistry.js';
+import { WorkspaceControllerFactoryInitializationError, WorkspaceRegistry,
+  type RuntimeSessionResolver, type WorkspaceRuntimeContext } from '../../server/src/workspaceRegistry.js';
 import type { LoadedWorkspaceIdentity } from '../../server/src/workspaceStore.js';
 
 export interface OwnedWorkspaceAdmission {
@@ -16,18 +14,28 @@ export interface OwnedWorkspaceAdmission {
   readonly assertCurrent: () => void;
 }
 
-export interface OwnedWorkspaceRuntimeOptions {
-  readonly kernel: DurableKernel;
-  readonly runtimeSessionFor: RuntimeSessionResolver;
-  readonly crypto: ControllerCryptoPort;
-  readonly providers: {
-    readonly speech: ControllerSpeechPort;
-    readonly speechOpenRouter?: OpenRouterSpeechAdapterPort;
-    readonly openAi: AssistantModelClient;
-  };
+export interface OwnedWorkspaceRuntimePorts {
+  readonly providers: ControllerRuntimePorts['providers'];
   readonly integration: ControllerRuntimePorts['integration'];
   readonly mediaResolver?: WorkspaceMediaResolver;
 }
+
+/** Returned resources remain factory-owned until the real controller is constructed. */
+export interface OwnedWorkspaceFactoryPorts extends OwnedWorkspaceRuntimePorts {
+  readonly disposeUnattached: () => void | Promise<void>;
+}
+
+interface OwnedWorkspaceRuntimeCommonOptions {
+  readonly kernel: DurableKernel;
+  readonly runtimeSessionFor: RuntimeSessionResolver;
+  readonly crypto: ControllerCryptoPort;
+}
+
+export type OwnedWorkspaceRuntimeOptions = OwnedWorkspaceRuntimeCommonOptions & (
+  | (OwnedWorkspaceRuntimePorts & { readonly workspacePortsFor?: never })
+  | { readonly workspacePortsFor: (context: WorkspaceRuntimeContext<AppState>) => OwnedWorkspaceFactoryPorts | Promise<OwnedWorkspaceFactoryPorts>;
+      readonly providers?: never; readonly integration?: never; readonly mediaResolver?: never }
+);
 
 export interface OwnedWorkspaceCommandInput extends OwnedWorkspaceAdmission {
   readonly expectedRevision: number;
@@ -57,6 +65,7 @@ export class OwnedWorkspaceRuntime {
   private readonly journal: CommandJournal;
   private readonly registry: WorkspaceRegistry<AppControllerImpl, AppState>;
   private readonly cache = new Map<string, CachedWorkspaceSnapshot>();
+  private readonly mediaResolvers = new WeakMap<AppControllerImpl, WorkspaceMediaResolver>();
   private readonly refreshRequired = new Set<string>();
   private readonly busy = new Set<string>();
   private readonly inFlight = new Set<Promise<unknown>>();
@@ -64,11 +73,34 @@ export class OwnedWorkspaceRuntime {
   private closePromise?: Promise<void>;
 
   constructor(private readonly options: OwnedWorkspaceRuntimeOptions) {
-    validatePorts(options);
+    validateRuntimeConfiguration(options);
     this.journal = new CommandJournal(options.kernel);
     this.registry = new WorkspaceRegistry<AppControllerImpl, AppState>(options.kernel, this.journal,
-      options.runtimeSessionFor, ({ store }) => new AppControllerImpl({ store, crypto: options.crypto,
-        providers: options.providers, integration: options.integration }));
+      options.runtimeSessionFor, async (context) => {
+        if (typeof options.workspacePortsFor !== 'function') {
+          validateRuntimePorts(options);
+          const controller = new AppControllerImpl({ store: context.store, crypto: options.crypto,
+            providers: options.providers, integration: options.integration });
+          if (options.mediaResolver) this.mediaResolvers.set(controller, options.mediaResolver);
+          return controller;
+        }
+        const returned = await options.workspacePortsFor(context);
+        const cleanup = returned && typeof returned.disposeUnattached === 'function'
+          ? () => returned.disposeUnattached()
+          : () => { throw new Error('workspace_runtime_port_cleanup_unavailable'); };
+        try {
+          if (!returned || typeof returned.disposeUnattached !== 'function') throw new TypeError('owned_workspace_runtime_ports_required');
+          validateRuntimePorts(returned);
+          const controller = new AppControllerImpl({ store: context.store, crypto: options.crypto,
+            providers: returned.providers, integration: returned.integration });
+          if (returned.mediaResolver) this.mediaResolvers.set(controller, returned.mediaResolver);
+          return controller;
+        } catch (error) {
+          try { await cleanup(); }
+          catch { throw new WorkspaceControllerFactoryInitializationError('workspace_runtime_port_cleanup_failed', cleanup); }
+          throw error;
+        }
+      });
   }
 
   getSnapshot(admission: OwnedWorkspaceAdmission): Promise<WorkspaceSnapshotDTO> {
@@ -108,6 +140,24 @@ export class OwnedWorkspaceRuntime {
       admission.assertCurrent();
       try { return this.projectAndCache(admission, identity, runtime.controller, runtime.store.getLoadedIdentity()); }
       catch (error) { this.refreshRequired.add(identity.workspaceId); throw error; }
+    });
+  }
+
+  /** Explicitly retries cleanup of one fenced registry entry; it never publishes a snapshot. */
+  retryFailedWorkspaceDisposal(admission: OwnedWorkspaceAdmission, expectedHeldPrivacyEpoch: number): Promise<void> {
+    this.assertAdmission(admission);
+    if (!Number.isSafeInteger(expectedHeldPrivacyEpoch) || expectedHeldPrivacyEpoch < 0) {
+      return Promise.reject(new TypeError('workspace_disposal_epoch_required'));
+    }
+    const identity = this.options.kernel.getOwnedIdentity(admission.sessionToken);
+    return this.track(identity.workspaceId, () => {
+      this.cache.delete(identity.workspaceId);
+      this.refreshRequired.add(identity.workspaceId);
+    }, async () => {
+      admission.assertCurrent();
+      await this.registry.retryFailedDisposal({ admissionSessionToken: admission.sessionToken,
+        expectedHeldPrivacyEpoch });
+      admission.assertCurrent();
     });
   }
 
@@ -186,7 +236,7 @@ export class OwnedWorkspaceRuntime {
     const current = this.options.kernel.getOwnedIdentity(admission.sessionToken);
     this.assertStillCurrent(admission, initial, loaded, current);
     const snapshot = createWorkspaceSnapshotDTO(controller, { workspaceId: loaded.workspaceId,
-      privacyEpoch: loaded.privacyEpoch, revision: loaded.revision }, this.options.mediaResolver);
+      privacyEpoch: loaded.privacyEpoch, revision: loaded.revision }, this.mediaResolvers.get(controller));
     admission.assertCurrent();
     const afterProjection = this.options.kernel.getOwnedIdentity(admission.sessionToken);
     this.assertStillCurrent(admission, initial, loaded, afterProjection);
@@ -214,17 +264,36 @@ export class OwnedWorkspaceRuntime {
   }
 }
 
-function validatePorts(options: OwnedWorkspaceRuntimeOptions): void {
+function validateRuntimeConfiguration(options: OwnedWorkspaceRuntimeOptions): void {
   if (!options || !options.kernel || typeof options.runtimeSessionFor !== 'function' || !options.crypto ||
       typeof options.crypto.randomUUID !== 'function' || typeof options.crypto.sha256 !== 'function' ||
-      !options.providers || !options.providers.speech || typeof options.providers.speech.transcribe !== 'function' ||
-      typeof options.providers.speech.releaseUploadLease !== 'function' || typeof options.providers.speech.disposeMemory !== 'function' ||
-      !options.providers.openAi || typeof options.providers.openAi.prepare !== 'function' ||
-      typeof options.providers.openAi.analyze !== 'function' || typeof options.providers.openAi.generateReply !== 'function' ||
-      !options.integration || typeof options.integration.writeDocument !== 'function' ||
-      typeof options.integration.removeAudio !== 'function' || typeof options.integration.loadRecordingRecovery !== 'function' ||
-      typeof options.integration.bindRecordingRecovery !== 'function' || !options.integration.reminderBackend ||
-      !options.integration.mailAlertBackend || !options.integration.deviceCalendarBackend) {
+      typeof options !== 'object') {
+    throw new TypeError('owned_workspace_runtime_ports_required');
+  }
+  const hasFactory = Object.prototype.hasOwnProperty.call(options, 'workspacePortsFor');
+  const hasStaticPorts = Object.prototype.hasOwnProperty.call(options, 'providers') ||
+    Object.prototype.hasOwnProperty.call(options, 'integration') || Object.prototype.hasOwnProperty.call(options, 'mediaResolver');
+  if (hasFactory) {
+    if (hasStaticPorts || typeof options.workspacePortsFor !== 'function') throw new TypeError('owned_workspace_runtime_ports_required');
+    return;
+  }
+  if (!Object.prototype.hasOwnProperty.call(options, 'providers') || !Object.prototype.hasOwnProperty.call(options, 'integration')) {
+    throw new TypeError('owned_workspace_runtime_ports_required');
+  }
+  validateRuntimePorts(options as OwnedWorkspaceRuntimePorts);
+}
+
+function validateRuntimePorts(ports: OwnedWorkspaceRuntimePorts): void {
+  if (!ports || typeof ports !== 'object' || !ports.providers || !ports.providers.speech ||
+      typeof ports.providers.speech.transcribe !== 'function' ||
+      typeof ports.providers.speech.releaseUploadLease !== 'function' || typeof ports.providers.speech.disposeMemory !== 'function' ||
+      !ports.providers.openAi || typeof ports.providers.openAi.prepare !== 'function' ||
+      typeof ports.providers.openAi.analyze !== 'function' || typeof ports.providers.openAi.generateReply !== 'function' ||
+      !ports.integration || typeof ports.integration.writeDocument !== 'function' ||
+      typeof ports.integration.removeAudio !== 'function' || typeof ports.integration.loadRecordingRecovery !== 'function' ||
+      typeof ports.integration.bindRecordingRecovery !== 'function' || !ports.integration.reminderBackend ||
+      !ports.integration.mailAlertBackend || !ports.integration.deviceCalendarBackend ||
+      (ports.mediaResolver !== undefined && (!ports.mediaResolver || typeof ports.mediaResolver.resolveMediaId !== 'function'))) {
     throw new TypeError('owned_workspace_runtime_ports_required');
   }
 }
