@@ -277,6 +277,32 @@ test('browser revocation blocks new admission while an already-owned command can
   } finally { release.resolve(); await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
+test('stopAdmission closes only new work while closeAfterDrain still waits for admitted work', async () => {
+  const gate = deferred();
+  const entered = deferred();
+  const f = fixture();
+  try {
+    const initial = await f.runtime.getSnapshot(f.admission);
+    const command = f.runtime.executeCommand({ ...f.admission, expectedRevision: initial.revision,
+      expectedPrivacyEpoch: initial.privacyEpoch, idempotencyKey: randomUUID(), kind: 'test.owned', canonicalBody: '{"run":true}' },
+    async (controller) => {
+      entered.resolve();
+      await gate.promise;
+      return controller.saveNote({ transcript: 'already admitted work drains', capturedAt: '2026-10-14T00:00:00.000Z' });
+    }, (note) => ({ kind: 'note.saved', noteId: note.id }));
+    await entered.promise;
+    f.runtime.stopAdmission();
+    assert.throws(() => f.runtime.getSnapshot(f.admission), /closing/);
+    const closing = f.runtime.closeAfterDrain();
+    assert.equal(f.disposedSpeech(), 0);
+    gate.resolve();
+    const result = await command;
+    await closing;
+    assert.equal(result.snapshot.state.notes[0].transcript, 'already admitted work drains');
+    assert.equal(f.disposedSpeech(), 1);
+  } finally { gate.resolve(); await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
 test('caller authorization is rechecked after async registry lookup and before trusted operation invocation', async () => {
   let callerCurrent = true;
   const f = fixture();

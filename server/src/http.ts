@@ -6,6 +6,7 @@ import { KernelError } from './kernel.js';
 import { VaultError } from './vault.js';
 import type { SafeCredentialMetadataSnapshot, ServerCredentialCommandService } from './credentialCommands.js';
 import type { WorkspaceHttpAdmission, WorkspaceHttpApi } from './workspaceHttp.js';
+import { registerAcceptedHttpServer, trackAcceptedHttpRequest } from './httpRequestDrain.js';
 
 const BODY_LIMIT = 16 * 1024;
 const CREDENTIAL_BODY_LIMIT = 2 * 16 * 1024 * 1024 + 64 * 1024;
@@ -34,6 +35,8 @@ export interface StillHttpOptions {
   readonly allowLocalHttp?: boolean;
   readonly credentialCommands?: ServerCredentialCommandService;
   readonly workspaceApi?: WorkspaceHttpApi;
+  /** Trusted host lifecycle fence checked at request admission and after awaited request bodies. */
+  readonly admissionOpen?: () => boolean;
 }
 
 interface CookieValues { readonly session?: string; readonly preauth?: string }
@@ -503,15 +506,19 @@ export function createStillHttpServer(options: StillHttpOptions): Server {
   const realRoot = realpathSync(staticRoot);
   if (realRoot !== staticRoot) throw new TypeError('static_root_invalid');
   const { paths, index } = collectStaticPaths(realRoot);
-  const server = createServer((request, response) => {
+  let server: Server;
+  server = createServer((request, response) => {
     securityHeaders(response);
-    void handleRequest(request, response, options.auth, origin, realRoot, paths, index, options.credentialCommands, options.workspaceApi).catch((error: unknown) => {
+    const handled = Promise.resolve().then(() => handleRequest(request, response, options.auth, origin, realRoot, paths, index, options.credentialCommands,
+      options.workspaceApi, options.admissionOpen)).catch((error: unknown) => {
       if (response.headersSent) { response.destroy(); return; }
       if (isHttpProblem(error)) { sendError(response, error.status, error.code); return; }
       if (error instanceof AuthError) { sendError(response, authStatus(error), error.code); return; }
       sendError(response, 503, 'service_unavailable');
     });
+    trackAcceptedHttpRequest(server, handled);
   });
+  registerAcceptedHttpServer(server);
   server.requestTimeout = 15_000;
   server.headersTimeout = 10_000;
   server.keepAliveTimeout = 5_000;
@@ -521,7 +528,8 @@ export function createStillHttpServer(options: StillHttpOptions): Server {
 
 async function handleRequest(request: IncomingMessage, response: ServerResponse, auth: AuthService, canonicalOrigin: URL,
   staticRoot: string, staticPaths: Set<string>, index: Buffer, credentialCommands?: ServerCredentialCommandService,
-  workspaceApi?: WorkspaceHttpApi): Promise<void> {
+  workspaceApi?: WorkspaceHttpApi, admissionOpen?: () => boolean): Promise<void> {
+  if (admissionOpen && !admissionOpen()) throw problem(503, 'service_unavailable');
   const host = uniqueHeader(request, 'host', true);
   if (!host || host.toLowerCase() !== canonicalOrigin.host.toLowerCase()) throw problem(403, 'host_rejected');
   const { pathname, hasQuery } = safePath(request.url);
@@ -575,6 +583,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     if (!csrf || !TOKEN_RE.test(csrf)) throw problem(403, 'csrf_rejected');
     const input = exactObject(await readJsonBody(request, response), ['password']);
     if (typeof input.password !== 'string') throw problem(400, 'bad_request');
+    if (admissionOpen && !admissionOpen()) throw problem(503, 'service_unavailable');
     const login = await auth.login({ password: input.password, origin: originHeader, preAuthToken: cookies.preauth, csrfToken: csrf,
       ...(cookies.session === undefined ? {} : { previousSessionToken: cookies.session }) });
     sendJson(response, 200, login.session, false, { 'Set-Cookie': jsonCookies(login.sessionToken, undefined) });
@@ -589,6 +598,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     const csrf = uniqueHeader(request, 'x-still-csrf', true);
     if (!csrf || !TOKEN_RE.test(csrf)) throw problem(403, 'csrf_rejected');
     exactObject(await readJsonBody(request, response), []);
+    if (admissionOpen && !admissionOpen()) throw problem(503, 'service_unavailable');
     auth.logout(cookies.session, originHeader, csrf);
     const challenge = auth.createLoginChallenge(canonicalOrigin.origin);
     sendJson(response, 200, { authenticated: false, setupRequired: false, csrfToken: challenge.csrfToken }, false,
@@ -616,6 +626,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     try {
       exactObject(await readJsonBody(request, response), []);
       admission.assertCurrent();
+      if (admissionOpen && !admissionOpen()) throw problem(503, 'service_unavailable');
       const snapshot = await workspaceApi.refreshSnapshot(admission);
       admission.assertCurrent();
       if (!response.destroyed) sendJson(response, 200, snapshot);
@@ -630,6 +641,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     try {
       const envelope = await readJsonBody(request, response);
       admission.assertCurrent();
+      if (admissionOpen && !admissionOpen()) throw problem(503, 'service_unavailable');
       const result = await workspaceApi.dispatchCommand(admission, envelope);
       admission.assertCurrent();
       if (!response.destroyed) sendJson(response, 200, result);
@@ -672,6 +684,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     // The request body can take seconds to arrive. Recheck the session/CSRF fence
     // after that await, immediately before the synchronous atomic command.
     if (!assertCredentialMutation(response, auth, captured)) return;
+    if (admissionOpen && !admissionOpen()) throw problem(503, 'service_unavailable');
     try {
       const metadata = request.method === 'PUT'
         ? credentialCommands.put(captured.sessionToken, commandId, canonicalBody)

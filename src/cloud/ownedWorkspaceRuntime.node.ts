@@ -203,9 +203,13 @@ export class OwnedWorkspaceRuntime {
   }
 
   /** Stops admission synchronously, drains owned promises, then disposes exact registry entries. */
+  stopAdmission(): void {
+    this.closing = true;
+  }
+
   closeAfterDrain(): Promise<void> {
     if (this.closePromise) return this.closePromise;
-    this.closing = true;
+    this.stopAdmission();
     const closing = (async () => {
       while (this.inFlight.size > 0) await Promise.allSettled([...this.inFlight]);
       await this.registry.disposeAll();

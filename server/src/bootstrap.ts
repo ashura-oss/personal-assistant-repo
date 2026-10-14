@@ -20,6 +20,17 @@ export interface ServerFoundation {
   readonly close: () => void;
 }
 
+/** Trusted in-process composition details. This is intentionally absent from the public server index. */
+export interface PrivateServerFoundationContext {
+  readonly kernel: DurableKernel;
+  readonly vault: SecretVault;
+}
+
+export interface OpenedServerFoundation {
+  readonly foundation: ServerFoundation;
+  readonly privateContext: PrivateServerFoundationContext;
+}
+
 /** The physical kernel boundary: only JSON-compatible plain objects are workspace roots. */
 export function validatePhysicalWorkspaceSnapshot(snapshot: unknown): void {
   if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) throw new TypeError('invalid_snapshot_root');
@@ -39,7 +50,7 @@ function createBundledInitialWorkspaceSnapshot(): unknown {
 }
 
 /** Composes the durable server services without opening a listener or running background work. */
-export function openServerFoundation(config: ServerConfig, options: ServerFoundationOptions = {}): ServerFoundation {
+export function openServerFoundationInternal(config: ServerConfig, options: ServerFoundationOptions = {}): OpenedServerFoundation {
   ensurePrivateDirectory(config.dataDirectory);
   let rootKey: Buffer | undefined;
   let authSecret: Buffer | undefined;
@@ -63,19 +74,26 @@ export function openServerFoundation(config: ServerConfig, options: ServerFounda
       ...(config.allowLocalHttp ? { allowLocalHttp: true } : {}), authSecret });
     vault = new SecretVault(kernel, rootKey);
     credentialCommands = new ServerCredentialCommandService(kernel, vault);
-    let closed = false;
-    return Object.freeze({
-      auth,
-      credentialCommands,
+    const activeKernel = kernel;
+    const activeVault = vault;
+    const activeAuth = auth;
+    const activeCredentialCommands = credentialCommands;
+    let authClosed = false;
+    let vaultClosed = false;
+    let kernelClosed = false;
+    const foundation: ServerFoundation = Object.freeze({
+      auth: activeAuth,
+      credentialCommands: activeCredentialCommands,
       initialWorkspaceSnapshot: options.initialWorkspaceSnapshot ?? createBundledInitialWorkspaceSnapshot,
-      readStatus: () => Object.freeze({ enrolled: kernel!.withTrustedDatabaseTransaction((db) =>
+      readStatus: () => Object.freeze({ enrolled: activeKernel.withTrustedDatabaseTransaction((db) =>
         Boolean(db.prepare('SELECT 1 AS present FROM auth_owner WHERE singleton=1').get())) }),
       close: () => {
-        if (closed) return;
-        closed = true;
-        closeConstructed();
+        if (!authClosed) { activeAuth.close(); authClosed = true; }
+        if (!vaultClosed) { activeVault.close(); vaultClosed = true; }
+        if (!kernelClosed) { activeKernel.close(); kernelClosed = true; }
       },
     });
+    return Object.freeze({ foundation, privateContext: Object.freeze({ kernel: activeKernel, vault: activeVault }) });
   } catch (error) {
     try { closeConstructed(); } catch { /* Preserve the construction error after attempting every cleanup. */ }
     throw error;
@@ -83,6 +101,11 @@ export function openServerFoundation(config: ServerConfig, options: ServerFounda
     rootKey?.fill(0);
     authSecret?.fill(0);
   }
+}
+
+/** Opens the provider-free local foundation without returning internal composition handles. */
+export function openServerFoundation(config: ServerConfig, options: ServerFoundationOptions = {}): ServerFoundation {
+  return openServerFoundationInternal(config, options).foundation;
 }
 
 /** Binds only after explicit start and closes the HTTP listener before its foundation. */
