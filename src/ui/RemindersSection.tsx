@@ -1,58 +1,31 @@
 import React from "react";
 import { Text, View } from "react-native";
-import type { ReminderIntent, ReminderRecord } from "../reminders";
 import { Button } from "./primitives";
 import { C, s } from "./theme";
+import type { ReminderAlertChannel, ReminderAlertDisplay, ReminderDisplayRecord } from "./reminderDisplay";
 
 type Props = {
-  records: ReminderRecord[];
-  intents: ReminderIntent[];
+  records: readonly ReminderDisplayRecord[];
+  alertDisplays: Readonly<Record<string, ReminderAlertDisplay>>;
   query: string;
   busy: boolean;
-  isWeb: boolean;
+  alertChannel: ReminderAlertChannel;
   demoMode: boolean;
   onAdd: () => void;
-  onOpen: (record: ReminderRecord) => void;
-  onRetry: (record: ReminderRecord) => void;
-  onDone: (record: ReminderRecord) => void;
-  onCancel: (record: ReminderRecord) => void;
-  onDelete: (record: ReminderRecord) => void;
+  onOpen: (id: string, expectedRevision: number) => void;
+  onRetry: (id: string, expectedRevision: number) => void;
+  onDone: (id: string, expectedRevision: number) => void;
+  onCancel: (id: string, expectedRevision: number) => void;
+  onDelete: (id: string, expectedRevision: number) => void;
 };
 
-const statusLabel: Record<ReminderRecord["status"], string> = {
+const statusLabel: Record<ReminderDisplayRecord["status"], string> = {
   draft: "Draft",
   approved: "Approved · not saved",
   saved: "Saved reminder",
   cancelled: "Cancelled",
   completed: "Done",
 };
-
-function alertStatus(record: ReminderRecord, intents: ReminderIntent[], isWeb: boolean, demoMode: boolean) {
-  const intent = intents.find((item) => item.id === record.currentIntentId);
-  if (demoMode && record.status === "saved") return intent?.observed === "pending" ? "Sample alert · simulated" : "Sample alert · not scheduled";
-  if (record.status !== "saved") {
-    const cancellations = intents.filter((item) => item.reminderId === record.id && item.desired === "cancelled");
-    if (cancellations.length) {
-      if (cancellations.every((item) => item.observed === "absent")) return "Alert cancellation confirmed.";
-      if (cancellations.some((item) => item.observed === "error" || item.observed === "unavailable")) return "Alert cancellation could not be confirmed.";
-      return "Alert cancellation is still being checked.";
-    }
-    return undefined;
-  }
-  if (isWeb) return "Device alerts are unavailable in the browser.";
-  if (!intent) return "Alert status could not be confirmed.";
-  if (intent.observed === "pending") return "Device alert request is pending.";
-  if (intent.observed === "blocked" || intent.observed === "unavailable") return "Device alerts are unavailable. The reminder is still saved here.";
-  if (intent.observed === "error") return "The alert could not be scheduled.";
-  if (intent.observed === "delivery_unknown") return "Alert outcome needs checking.";
-  return "Alert status could not be confirmed.";
-}
-
-function canRetryAlert(record: ReminderRecord, intents: ReminderIntent[], demoMode: boolean) {
-  if (record.status !== "saved") return false;
-  const intent = intents.find((item) => item.id === record.currentIntentId);
-  return Boolean(intent && (demoMode || ["absent", "blocked", "unavailable", "delivery_unknown", "error"].includes(intent.observed)));
-}
 
 export function RemindersSection(props: Props) {
   const normalizedQuery = props.query.trim().toLocaleLowerCase();
@@ -76,10 +49,10 @@ export function RemindersSection(props: Props) {
         </View>
         <Button label="Add reminder" tone="quiet" icon="add" disabled={props.busy} onPress={props.onAdd} />
       </View>
-      {props.isWeb && !props.demoMode ? <Text style={localStyles.meta}>Browser alerts are unavailable. You can still save and manage reminders here.</Text> : null}
+      {props.alertChannel === "browser_unavailable" && !props.demoMode ? <Text style={localStyles.meta}>Browser alerts are unavailable. You can still save and manage reminders here.</Text> : null}
       {props.demoMode ? <Text style={localStyles.meta}>Sample alerts are simulated in this isolated preview.</Text> : null}
       {records.length ? records.map((record) => {
-        const alert = alertStatus(record, props.intents, props.isWeb, props.demoMode);
+        const alert = props.alertDisplays[record.id];
         const canCancel = record.status === "saved" || record.status === "approved" || record.status === "draft";
         const canDelete = record.status === "completed" || record.status === "cancelled";
         return (
@@ -87,13 +60,13 @@ export function RemindersSection(props: Props) {
             <Text style={localStyles.cardTitle}>{record.title}</Text>
             <Text style={localStyles.meta}>{new Date(record.dueAt).toLocaleString([], { timeZone: record.displayTimeZone })} · {record.displayTimeZone}</Text>
             <Text style={localStyles.meta}>{statusLabel[record.status]}</Text>
-            {alert ? <Text style={localStyles.meta}>{alert}</Text> : null}
+            {alert?.sectionStatus ? <Text style={localStyles.meta}>{alert.sectionStatus}</Text> : null}
             <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
-              <Button label={record.status === "saved" || record.status === "completed" || record.status === "cancelled" ? "View reminder" : "Review reminder"} tone="quiet" disabled={props.busy} onPress={() => props.onOpen(record)} />
-              {record.status === "saved" && canRetryAlert(record, props.intents, props.demoMode) ? <Button label="Retry alert" tone="quiet" disabled={props.busy} onPress={() => props.onRetry(record)} /> : null}
-              {record.status === "saved" ? <Button label="Done" tone="quiet" disabled={props.busy} onPress={() => props.onDone(record)} /> : null}
-              {canCancel ? <Button label="Cancel reminder" tone="quiet" disabled={props.busy} onPress={() => props.onCancel(record)} /> : null}
-              {canDelete ? <Button label="Delete reminder" tone="danger" disabled={props.busy} onPress={() => props.onDelete(record)} /> : null}
+              <Button label={record.status === "saved" || record.status === "completed" || record.status === "cancelled" ? "View reminder" : "Review reminder"} tone="quiet" disabled={props.busy} onPress={() => props.onOpen(record.id, record.revision)} />
+              {record.status === "saved" && alert?.canRetry ? <Button label="Retry alert" tone="quiet" disabled={props.busy} onPress={() => props.onRetry(record.id, record.revision)} /> : null}
+              {record.status === "saved" ? <Button label="Done" tone="quiet" disabled={props.busy} onPress={() => props.onDone(record.id, record.revision)} /> : null}
+              {canCancel ? <Button label="Cancel reminder" tone="quiet" disabled={props.busy} onPress={() => props.onCancel(record.id, record.revision)} /> : null}
+              {canDelete ? <Button label="Delete reminder" tone="danger" disabled={props.busy} onPress={() => props.onDelete(record.id, record.revision)} /> : null}
             </View>
           </View>
         );

@@ -1,27 +1,26 @@
 import React, { useMemo, useState } from "react";
 import { KeyboardAvoidingView, Modal, Platform, ScrollView, Text, View } from "react-native";
-import type { ReminderPayload, ReminderRecord } from "../reminders";
+import type { ReminderPayload } from "../reminders";
 import { resolveReminderLocalDateTime } from "../reminders/time";
 import { Button, Field, IconButton } from "./primitives";
 import { C, s } from "./theme";
+import type { ReminderAlertDisplay, ReminderDisplayRecord } from "./reminderDisplay";
 
 type Props = {
   visible: boolean;
-  record: ReminderRecord;
+  record: ReminderDisplayRecord;
   busy: boolean;
-  isWeb: boolean;
   demoMode: boolean;
   sourceAccountLabel?: string;
-  alertStatus?: string;
-  canRetry?: boolean;
+  alertDisplay: ReminderAlertDisplay;
   onClose: () => void;
-  onUpdate: (id: string, payload: ReminderPayload, expectedRevision: number) => Promise<ReminderRecord | undefined>;
-  onRefreshSource: (record: ReminderRecord) => Promise<ReminderRecord | undefined>;
-  onApprove: (record: ReminderRecord) => Promise<ReminderRecord | undefined>;
-  onSave: (record: ReminderRecord) => Promise<ReminderRecord | undefined>;
-  onRetry?: (record: ReminderRecord) => Promise<ReminderRecord | undefined>;
-  onDone?: (record: ReminderRecord) => Promise<ReminderRecord | undefined>;
-  onCancel?: (record: ReminderRecord) => Promise<ReminderRecord | undefined>;
+  onUpdate: (id: string, payload: ReminderPayload, expectedRevision: number) => Promise<ReminderDisplayRecord | undefined>;
+  onRefreshSource: (id: string, expectedRevision: number) => Promise<ReminderDisplayRecord | undefined>;
+  onApprove: (id: string, expectedRevision: number) => Promise<ReminderDisplayRecord | undefined>;
+  onSave: (id: string, expectedRevision: number) => Promise<ReminderDisplayRecord | undefined>;
+  onRetry?: (id: string, expectedRevision: number) => Promise<ReminderDisplayRecord | undefined>;
+  onDone?: (id: string, expectedRevision: number) => Promise<ReminderDisplayRecord | undefined>;
+  onCancel?: (id: string, expectedRevision: number) => Promise<ReminderDisplayRecord | undefined>;
   error?: string;
 };
 
@@ -45,7 +44,7 @@ function explicitLocalInstant(iso: string, zone: string) {
   }
 }
 
-function originCopy(record: ReminderRecord) {
+function originCopy(record: ReminderDisplayRecord) {
   if (record.origin.kind === "manual") return { heading: "Manual reminder", quote: "You created this reminder directly." };
   if (record.origin.kind === "note") return { heading: "Saved note", quote: record.origin.quote };
   const source = record.origin.source;
@@ -91,9 +90,9 @@ export function ReminderReview(props: Props) {
     }
     else setLocalError("Changes were not saved. Check the message above and try again.");
   };
-  const runAction = async (action: (record: ReminderRecord) => Promise<ReminderRecord | undefined>) => {
+  const runAction = async (action: (id: string, expectedRevision: number) => Promise<ReminderDisplayRecord | undefined>) => {
     setLocalError("");
-    const updated = await action(record);
+    const updated = await action(record.id, record.revision);
     if (updated) setRecord(updated);
     else setLocalError("The reminder changed before this action completed. Reopen it and try again.");
   };
@@ -147,12 +146,11 @@ export function ReminderReview(props: Props) {
           {dirty && editable ? <Button label={canEditSaved ? "Save edits for approval" : "Save changes"} disabled={props.busy || !dueAt || !title.trim()} onPress={() => void saveChanges()} /> : null}
           {record.status === "draft" ? <Button label="Approve reminder" disabled={props.busy || !canApprove || !title.trim()} onPress={() => void runAction(props.onApprove)} /> : null}
           {record.status === "approved" ? <Button label="Save reminder" disabled={props.busy || !canSave} onPress={() => void runAction(props.onSave)} /> : null}
-          {record.status === "saved" && props.onRetry && props.canRetry ? <Button label="Retry device alert" tone="quiet" disabled={props.busy} onPress={() => void runAction(props.onRetry!)} /> : null}
+          {record.status === "saved" && props.onRetry && props.alertDisplay.canRetry ? <Button label="Retry device alert" tone="quiet" disabled={props.busy} onPress={() => void runAction(props.onRetry!)} /> : null}
           {record.status === "saved" && props.onDone ? <Button label="Mark done" tone="quiet" disabled={props.busy} onPress={() => void runAction(props.onDone!)} /> : null}
           {record.status === "saved" && props.onCancel ? <Button label="Cancel reminder" tone="quiet" disabled={props.busy} onPress={() => void runAction(props.onCancel!)} /> : null}
           {record.origin.kind === "proactive" && (record.status === "draft" || record.status === "approved") && props.onRefreshSource ? <Button label="Refresh saved source" tone="quiet" disabled={props.busy} onPress={() => void runAction(props.onRefreshSource)} /> : null}
-          {props.alertStatus ? <Text style={localStyles.meta}>{props.alertStatus}</Text> : null}
-          {props.isWeb && record.status === "saved" ? <Text style={localStyles.meta}>Browser notifications are unavailable; the reminder remains saved in this library.</Text> : null}
+          {props.alertDisplay.status ? <Text style={localStyles.meta}>{props.alertDisplay.status}</Text> : null}
           {localError ? <Text accessibilityRole="alert" style={s.errorText}>{localError}</Text> : null}
           {props.error ? <Text accessibilityRole="alert" style={s.errorText}>{props.error}</Text> : null}
           <Text style={localStyles.meta}>Approval and saving are separate. Saving requests a local device alert where supported; it does not guarantee delivery.</Text>

@@ -64,6 +64,7 @@ import type { OAuthProvider } from "./src/auth/browser";
 import type { PickedBackupFile } from "./src/backupFiles";
 import type { ProviderCleanupRegistry } from "./src/services/providerResponseLifetime";
 import type { ReminderIntent, ReminderRecord } from "./src/reminders";
+import { deriveReminderAlertDisplay, toReminderDisplayRecord, type ReminderAlertChannel } from "./src/ui/reminderDisplay";
 import type { PrivacyService, PrivacyWorkspaceSession } from "./src/privacy/service";
 import type { PrivacyResourceBoundary } from "./src/privacy/resourceBoundary";
 import type { PrivacyAudioBoundary } from "./src/privacy/audioBoundary";
@@ -619,6 +620,8 @@ export function WorkspaceView({ controller, credentials, platform, workspaceGene
   const reminderReviewRecord = reminderReviewId
     ? state.reminders.records.find((item) => item.id === reminderReviewId)
     : undefined;
+  const reminderReviewDisplayRecord = reminderReviewRecord ? toReminderDisplayRecord(reminderReviewRecord) : undefined;
+  const reminderAlertChannel: ReminderAlertChannel = isReminderDemo ? "simulated" : Platform.OS === "web" ? "browser_unavailable" : "device";
   useProactiveClock(
     controller,
     loading || !startupReady || isIsolatedDemo || privacyReviewOpen,
@@ -3773,12 +3776,16 @@ export function WorkspaceView({ controller, credentials, platform, workspaceGene
                 reminderIntents={state.reminders.intents}
                 reminderRecoveryStatus={state.reminderRecoveryStatus}
                 reminderDemoMode={isReminderDemo}
+                reminderAlertChannel={reminderAlertChannel}
                 onCreateReminder={() => void createReminder()}
-                onOpenReminder={openReminder}
-                onRetryReminder={(record) => run(() => controller.retryReminderAlert(record.id, { expectedRevision: record.revision }))}
-                onDoneReminder={(record) => run(() => controller.completeReminder(record.id, { expectedRevision: record.revision }))}
-                onCancelReminder={(record) => run(() => controller.cancelReminder(record.id, { expectedRevision: record.revision }))}
-                onDeleteReminder={(record) => run(() => controller.deleteReminder(record.id, { expectedRevision: record.revision }))}
+                onOpenReminder={(id, expectedRevision) => {
+                  const current = state.reminders.records.find((item) => item.id === id && item.revision === expectedRevision);
+                  if (current) openReminder(current);
+                }}
+                onRetryReminder={(id, expectedRevision) => run(() => controller.retryReminderAlert(id, { expectedRevision }))}
+                onDoneReminder={(id, expectedRevision) => run(() => controller.completeReminder(id, { expectedRevision }))}
+                onCancelReminder={(id, expectedRevision) => run(() => controller.cancelReminder(id, { expectedRevision }))}
+                onDeleteReminder={(id, expectedRevision) => run(() => controller.deleteReminder(id, { expectedRevision }))}
                 onComplete={(id) =>
                   run(async () => {
                     await controller.completeTask(id);
@@ -4191,65 +4198,49 @@ export function WorkspaceView({ controller, credentials, platform, workspaceGene
             onClose={() => setRecordingAttachmentNoteId(null)}
           />
         ) : null}
-        {reminderReviewRecord ? <ReminderReview
+        {reminderReviewRecord && reminderReviewDisplayRecord ? <ReminderReview
           key={`${reminderReviewRecord.id}:${reminderReviewRecord.revision}`}
           visible={Boolean(reminderReviewId)}
-          record={reminderReviewRecord}
+          record={reminderReviewDisplayRecord}
           busy={busy}
-          isWeb={Platform.OS === "web"}
           demoMode={isReminderDemo}
-          canRetry={Boolean(reminderReviewRecord.currentIntentId && (isReminderDemo || ["absent", "blocked", "unavailable", "delivery_unknown", "error"].includes(state.reminders.intents.find((item) => item.id === reminderReviewRecord.currentIntentId)?.observed ?? "unconfirmed")))}
-          alertStatus={(() => {
-            const intent = state.reminders.intents.find((item) => item.id === reminderReviewRecord.currentIntentId);
-            if (isReminderDemo && reminderReviewRecord.status === "saved") return intent?.observed === "pending" ? "A sample alert is simulated." : "The sample alert is not scheduled.";
-            if (Platform.OS === "web" && reminderReviewRecord.status === "saved") return "Browser notifications are unavailable.";
-            if (intent?.observed === "pending") return "Device alert request is pending.";
-            if (intent?.observed === "blocked" || intent?.observed === "unavailable") return "Device alerts are unavailable; the reminder remains saved.";
-            if (intent?.observed === "error") return "The device alert could not be scheduled.";
-            if (intent?.observed === "delivery_unknown") return "Alert outcome needs checking.";
-            if (reminderReviewRecord.status === "saved") return "Alert status could not be confirmed.";
-            const cancellations = state.reminders.intents.filter((item) => item.reminderId === reminderReviewRecord.id && item.desired === "cancelled");
-            if (cancellations.length && cancellations.every((item) => item.observed === "absent")) return "Alert cancellation confirmed.";
-            if (cancellations.some((item) => item.observed === "error" || item.observed === "unavailable")) return "Alert cancellation could not be confirmed.";
-            if (cancellations.length) return "Alert cancellation is still being checked.";
-            return undefined;
-          })()}
+          alertDisplay={deriveReminderAlertDisplay(reminderReviewRecord, state.reminders.intents, reminderAlertChannel, isReminderDemo)}
           sourceAccountLabel={reminderSourceAccountLabel}
           onClose={() => { setReminderReviewId(null); setReminderSourceAccountLabel(undefined); }}
           onUpdate={(id, payload, expectedRevision) => run(async () => {
             const updated = await controller.updateReminderDraft(id, { ...payload, expectedRevision });
             setNotice("Changes saved. Approve this version before saving the reminder.");
-            return updated;
+            return updated ? toReminderDisplayRecord(updated) : undefined;
           })}
-          onRefreshSource={(record) => run(async () => {
-            const updated = await controller.refreshReminderSource(record.id, { expectedRevision: record.revision });
+          onRefreshSource={(id, expectedRevision) => run(async () => {
+            const updated = await controller.refreshReminderSource(id, { expectedRevision });
             setNotice("Source refreshed. Review and approve this reminder again.");
-            return updated;
+            return updated ? toReminderDisplayRecord(updated) : undefined;
           })}
-          onApprove={(record) => run(async () => {
-            const updated = await controller.approveReminder(record.id, { expectedRevision: record.revision });
+          onApprove={(id, expectedRevision) => run(async () => {
+            const updated = await controller.approveReminder(id, { expectedRevision });
             setNotice("Reminder approved. Saving it is a separate step.");
-            return updated;
+            return updated ? toReminderDisplayRecord(updated) : undefined;
           })}
-          onSave={(record) => run(async () => {
-            const updated = await controller.saveApprovedReminder(record.id, { expectedRevision: record.revision });
+          onSave={(id, expectedRevision) => run(async () => {
+            const updated = await controller.saveApprovedReminder(id, { expectedRevision });
             setNotice(isReminderDemo ? "Sample reminder saved. The alert is simulated." : "Reminder saved on this device.");
-            return updated;
+            return updated ? toReminderDisplayRecord(updated) : undefined;
           })}
-          onRetry={(record) => run(async () => {
-            const updated = await controller.retryReminderAlert(record.id, { expectedRevision: record.revision });
+          onRetry={(id, expectedRevision) => run(async () => {
+            const updated = await controller.retryReminderAlert(id, { expectedRevision });
             setNotice(isReminderDemo ? "Sample alert check completed." : "Alert retry completed; review its status below.");
-            return updated;
+            return updated ? toReminderDisplayRecord(updated) : undefined;
           })}
-          onDone={(record) => run(async () => {
-            const updated = await controller.completeReminder(record.id, { expectedRevision: record.revision });
+          onDone={(id, expectedRevision) => run(async () => {
+            const updated = await controller.completeReminder(id, { expectedRevision });
             setNotice("Reminder marked done.");
-            return updated;
+            return updated ? toReminderDisplayRecord(updated) : undefined;
           })}
-          onCancel={(record) => run(async () => {
-            const updated = await controller.cancelReminder(record.id, { expectedRevision: record.revision });
+          onCancel={(id, expectedRevision) => run(async () => {
+            const updated = await controller.cancelReminder(id, { expectedRevision });
             setNotice("Reminder cancelled. Alert removal is checked separately.");
-            return updated;
+            return updated ? toReminderDisplayRecord(updated) : undefined;
           })}
         /> : null}
         <Modal
@@ -4875,6 +4866,7 @@ function LibraryScreen({
   reminderIntents,
   reminderRecoveryStatus,
   reminderDemoMode,
+  reminderAlertChannel,
   onCreateReminder,
   onOpenReminder,
   onRetryReminder,
@@ -4927,12 +4919,13 @@ function LibraryScreen({
   reminderIntents: ReminderIntent[];
   reminderRecoveryStatus?: AppState["reminderRecoveryStatus"];
   reminderDemoMode: boolean;
+  reminderAlertChannel: ReminderAlertChannel;
   onCreateReminder: () => void;
-  onOpenReminder: (record: ReminderRecord) => void;
-  onRetryReminder: (record: ReminderRecord) => Promise<unknown>;
-  onDoneReminder: (record: ReminderRecord) => Promise<unknown>;
-  onCancelReminder: (record: ReminderRecord) => Promise<unknown>;
-  onDeleteReminder: (record: ReminderRecord) => Promise<unknown>;
+  onOpenReminder: (id: string, expectedRevision: number) => void;
+  onRetryReminder: (id: string, expectedRevision: number) => Promise<unknown>;
+  onDoneReminder: (id: string, expectedRevision: number) => Promise<unknown>;
+  onCancelReminder: (id: string, expectedRevision: number) => Promise<unknown>;
+  onDeleteReminder: (id: string, expectedRevision: number) => Promise<unknown>;
   onComplete: (id: string) => void;
   onReopen: (id: string) => void;
   onOpenNote: (n: Note) => void;
@@ -5004,18 +4997,18 @@ function LibraryScreen({
       </View>
       {reminderRecoveryStatus ? <View style={s.analysisStale}><Text style={s.analysisText}>{reminderRecoveryStatus.message}</Text></View> : null}
       {section === 'reminders' ? <RemindersSection
-        records={reminderRecords}
-        intents={reminderIntents}
+        records={reminderRecords.map(toReminderDisplayRecord)}
+        alertDisplays={Object.fromEntries(reminderRecords.map((record) => [record.id, deriveReminderAlertDisplay(record, reminderIntents, reminderAlertChannel, reminderDemoMode)]))}
         query={query}
         busy={busy}
-        isWeb={Platform.OS === 'web'}
+        alertChannel={reminderAlertChannel}
         demoMode={reminderDemoMode}
         onAdd={onCreateReminder}
         onOpen={onOpenReminder}
-        onRetry={(record) => { void onRetryReminder(record); }}
-        onDone={(record) => { void onDoneReminder(record); }}
-        onCancel={(record) => { void onCancelReminder(record); }}
-        onDelete={(record) => { void onDeleteReminder(record); }}
+        onRetry={(id, expectedRevision) => { void onRetryReminder(id, expectedRevision); }}
+        onDone={(id, expectedRevision) => { void onDoneReminder(id, expectedRevision); }}
+        onCancel={(id, expectedRevision) => { void onCancelReminder(id, expectedRevision); }}
+        onDelete={(id, expectedRevision) => { void onDeleteReminder(id, expectedRevision); }}
       /> : null}
       {section === 'notes' ? <>
       <TasksSection
