@@ -107,7 +107,7 @@ export class SharedAzureSpeechClient {
     let credentialReadStarted = false;
     let releasePromise: Promise<void> | undefined;
     let dispatchCleanup: Promise<void> | undefined;
-    const release = () => releasePromise ??= prepared ? Promise.resolve().then(() => this.releaseUploadLease(prepared!.leaseId)) : Promise.resolve();
+    const release = () => releasePromise ??= Promise.resolve().then(() => this.releaseUploadLease(prepared?.leaseId ?? leaseId));
     try {
       prepared = await this.audio.prepare(note, { leaseId, maxDurationSeconds: Math.min(settings.maxAudioSeconds, SPEECH_MAX_AUDIO_SECONDS), signal });
       const snapshot = validateSpeechAudioSnapshot(prepared);
@@ -130,7 +130,7 @@ export class SharedAzureSpeechClient {
       await this.audio.verify(prepared, signal);
       if (signal?.aborted) fail('Speech transcription was cancelled before upload.', 'cancelled');
       const form = new FormData();
-      if (prepared.platform === 'web') form.append('audio', prepared.upload.blob, prepared.upload.fileName);
+      if (prepared.platform === 'web' || prepared.platform === 'server') form.append('audio', prepared.upload.blob, prepared.upload.fileName);
       else form.append('audio', prepared.upload.part as unknown as Blob);
       form.append('definition', JSON.stringify({ locales: ['en-US'] }));
       if (this.rawPostInFlight) fail('Another speech upload started before this request could be dispatched.', 'pre_dispatch');

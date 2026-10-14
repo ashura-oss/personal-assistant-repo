@@ -19,7 +19,7 @@ export type { OpenRouterSpeechModel, OpenRouterSpeechProfileVersion } from './op
 
 export type SpeechAudioSnapshot = Readonly<{
   leaseId: string;
-  platform: 'native' | 'web';
+  platform: 'native' | 'web' | 'server';
   format: RecoveryFormat;
   mimeType: string;
   byteLength: number;
@@ -166,7 +166,7 @@ export function validateSpeechAudioSnapshot(value: unknown): SpeechAudioSnapshot
   if (Object.keys(row).some((key) => !allowed.has(key))) throw new Error('Prepared audio metadata contains unsupported fields.');
   const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
   if (typeof row.leaseId !== 'string' || !uuid.test(row.leaseId)) throw new Error('Prepared audio lease is invalid.');
-  if (row.platform !== 'native' && row.platform !== 'web') throw new Error('Prepared audio platform is invalid.');
+  if (row.platform !== 'native' && row.platform !== 'web' && row.platform !== 'server') throw new Error('Prepared audio platform is invalid.');
   if (!['m4a', 'mp3', 'wav', 'webm', 'ogg'].includes(String(row.format))) throw new Error('Prepared audio format is invalid.');
   const format = row.format as RecoveryFormat;
   if (row.format === 'caf') throw new Error('CAF audio cannot be uploaded to cloud transcription.');

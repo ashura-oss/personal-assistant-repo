@@ -91,7 +91,7 @@ export class SharedOpenRouterSpeechAdapter implements OpenRouterSpeechAdapterPor
         this.activeUploadLeases.delete(prepared.leaseId);
         uploadLeaseActive = false;
       }
-      return releasePromise ??= prepared ? this.releaseUploadLease(prepared.leaseId) : Promise.resolve();
+      return releasePromise ??= this.releaseUploadLease(prepared?.leaseId ?? leaseId);
     };
     try {
       prepared = await this.options.audio.prepare(note, {

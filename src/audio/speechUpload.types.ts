@@ -4,7 +4,8 @@ import type { SpeechAudioSnapshot } from '../transcription/types';
 
 export type PreparedSpeechAudio =
   | (SpeechAudioSnapshot & Readonly<{ platform: 'native'; upload: Readonly<{ uri: string; part: NativeSpeechUploadPart }> }>)
-  | (SpeechAudioSnapshot & Readonly<{ platform: 'web'; upload: Readonly<{ blob: Blob; fileName: string }> }>);
+  | (SpeechAudioSnapshot & Readonly<{ platform: 'web'; upload: Readonly<{ blob: Blob; fileName: string }> }>)
+  | (SpeechAudioSnapshot & Readonly<{ platform: 'server'; upload: Readonly<{ blob: Blob; fileName: string }> }>);
 
 export type NativeSpeechUploadPart = Readonly<{ name: string; type: string; bytes(): Promise<Uint8Array> }>;
 
