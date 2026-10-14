@@ -8,6 +8,7 @@ import { CommandJournal } from '../server/src/commandJournal';
 import type { DurableKernel, OwnedWorkspaceIdentity } from '../server/src/kernel';
 import { WorkspaceRegistry } from '../server/src/workspaceRegistry';
 import { ServerWorkspaceStore } from '../server/src/workspaceStore';
+import { OwnedWorkspaceRuntime, type OwnedWorkspaceRuntimeOptions } from '../src/cloud/ownedWorkspaceRuntime.node';
 
 /** Compile-only proof that the real server state adapter and Node ports compose with the shared controller. */
 export function createTypedServerRuntime(
@@ -31,6 +32,11 @@ export function createTypedServerRuntime(
     const sharedStore: StateStore = store;
     return new AppControllerImpl({ store: sharedStore, crypto, providers, integration });
   });
+}
+
+/** Compile-only proof for the private Node gateway's fully injected real-controller composition. */
+export function createTypedOwnedWorkspaceRuntime(options: OwnedWorkspaceRuntimeOptions): OwnedWorkspaceRuntime {
+  return new OwnedWorkspaceRuntime(options);
 }
 
 /** The generated server bundle's declaration stays compatible with the actual complete AppState factory. */

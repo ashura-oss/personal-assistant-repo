@@ -22,3 +22,28 @@ await build({
     },
   }],
 });
+
+await build({
+  entryPoints: [resolve(repositoryRoot, 'src/cloud/ownedWorkspaceRuntime.node.ts')],
+  outfile: resolve(import.meta.dirname, '../dist/ownedWorkspaceRuntime.node.mjs'),
+  bundle: true,
+  platform: 'node',
+  format: 'esm',
+  target: 'node22',
+  sourcemap: false,
+  plugins: [{
+    name: 'preserve-server-module-identity',
+    setup(buildApi) {
+      buildApi.onResolve({ filter: /^\.\.\/\.\.\/server\/src\/.+\.js$/ }, (args) => ({
+        path: `./${args.path.slice('../../server/src/'.length)}`,
+        external: true,
+      }));
+      buildApi.onResolve({ filter: /.*/ }, (args) => {
+        if (/^(?:expo(?:$|[-/])|react-native(?:$|\/))/.test(args.path)) {
+          return { errors: [{ text: `Node runtime import boundary rejected ${args.path} (imported by ${args.importer})` }] };
+        }
+        return undefined;
+      });
+    },
+  }],
+});

@@ -21,6 +21,13 @@ interface LoadedWorkspace {
   schemaVersion: number;
 }
 
+export interface LoadedWorkspaceIdentity {
+  readonly workspaceId: string;
+  readonly ownerId: string;
+  readonly revision: number;
+  readonly privacyEpoch: number;
+}
+
 /** The shared controller's StateStore backed by a kernel-owned SQLite workspace snapshot. */
 export class ServerWorkspaceStore<TState extends object = Record<string, unknown>> {
   private loaded?: LoadedWorkspace;
@@ -88,6 +95,14 @@ export class ServerWorkspaceStore<TState extends object = Record<string, unknown
 
   getOwnedIdentity(): { readonly workspaceId: string; readonly ownerId: string; readonly revision: number; readonly privacyEpoch: number } {
     return this.options.kernel.getOwnedIdentity(this.options.sessionToken);
+  }
+
+  /** The identity loaded by this controller, not a claim about the current database head. */
+  getLoadedIdentity(): LoadedWorkspaceIdentity {
+    const loaded = this.requireLoaded();
+    this.assertNotAckBlocked();
+    return Object.freeze({ workspaceId: loaded.workspaceId, ownerId: loaded.ownerId,
+      revision: loaded.revision, privacyEpoch: loaded.privacyEpoch });
   }
 
   private commitSnapshot(loaded: LoadedWorkspace, serialized: string, accountGenerations: Readonly<Record<string, number>>): number {

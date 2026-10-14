@@ -22,7 +22,7 @@ interface WorkspaceEntry<C extends WorkspaceController, TState extends object> {
   readonly runtimeSessionToken: string;
   activeWork: number;
   closing: boolean;
-  closingPromise?: Promise<void>;
+  closingPromise: Promise<void> | undefined;
 }
 
 export type RuntimeSessionResolver = (identity: OwnedWorkspaceIdentity) => string;
@@ -30,6 +30,8 @@ export type RuntimeSessionResolver = (identity: OwnedWorkspaceIdentity) => strin
 /** One loaded shared controller per authenticated workspace for this server process. */
 export class WorkspaceRegistry<C extends WorkspaceController, TState extends object = Record<string, unknown>> {
   private readonly entries = new Map<string, WorkspaceEntry<C, TState>>();
+  private accepting = true;
+  private disposeAllPromise: Promise<void> | undefined;
 
   constructor(
     private readonly kernel: DurableKernel,
@@ -41,6 +43,7 @@ export class WorkspaceRegistry<C extends WorkspaceController, TState extends obj
 
   async get(admissionSessionToken: string): Promise<{ controller: C; store: ServerWorkspaceStore<TState> }> {
     for (;;) {
+      if (!this.accepting) throw new Error('The workspace registry is closing.');
       const identity = this.kernel.getOwnedIdentity(admissionSessionToken);
       const runtimeSessionToken = this.runtimeSessionFor(identity);
       if (typeof runtimeSessionToken !== 'string' || !runtimeSessionToken) throw new Error('The trusted workspace runtime session is unavailable.');
@@ -54,6 +57,7 @@ export class WorkspaceRegistry<C extends WorkspaceController, TState extends obj
         continue;
       }
       if (entry?.closing) {
+        if (!entry.closingPromise) throw new Error('The previous workspace runtime is fenced pending an explicit disposal retry.');
         await entry.closingPromise;
         continue;
       }
@@ -90,12 +94,17 @@ export class WorkspaceRegistry<C extends WorkspaceController, TState extends obj
     if (entry.closingPromise) return entry.closingPromise;
     if (entry.activeWork > 0) throw new Error('Workspace runtime has active work and cannot be disposed.');
     entry.closing = true;
-    entry.closingPromise = (async () => {
+    const attempt = Promise.resolve().then(async () => {
       const controller = await entry.controllerPromise;
       await controller.disposeForPrivacy?.();
       if (this.entries.get(entry.identity.workspaceId) === entry) this.entries.delete(entry.identity.workspaceId);
-    })();
-    return entry.closingPromise;
+    });
+    entry.closingPromise = attempt;
+    void attempt.catch(() => {
+      // Keep the entry fenced, but allow its owner to retry disposal of this exact entry.
+      if (entry.closingPromise === attempt) entry.closingPromise = undefined;
+    });
+    return attempt;
   }
 
   async execute<T>(input: {
@@ -138,6 +147,27 @@ export class WorkspaceRegistry<C extends WorkspaceController, TState extends obj
   }
 
   getRuntimeCount(): number { return this.entries.size; }
+
+  /** TRUSTED INTERNAL ONLY. Call after the owner has drained all lookups and commands. */
+  disposeAll(): Promise<void> {
+    if (this.disposeAllPromise) return this.disposeAllPromise;
+    if ([...this.entries.values()].some((entry) => entry.activeWork > 0)) {
+      throw new Error('Workspace registry has active work and cannot be disposed.');
+    }
+    this.accepting = false;
+    const entries = [...this.entries.values()];
+    const attempts = entries.map((entry) => this.closeEntry(entry));
+    const disposal = Promise.allSettled(attempts).then((results) => {
+      const failures = results.flatMap((result) => result.status === 'rejected' ? [result.reason] : []);
+      if (failures.length === 1) throw failures[0];
+      if (failures.length > 1) throw new AggregateError(failures, 'One or more workspace runtimes could not be disposed.');
+    });
+    this.disposeAllPromise = disposal;
+    void disposal.catch(() => {
+      if (this.disposeAllPromise === disposal) this.disposeAllPromise = undefined;
+    });
+    return disposal;
+  }
 
   async disposeWorkspace(admissionSessionToken: string): Promise<void> {
     const identity = this.kernel.getOwnedIdentity(admissionSessionToken);

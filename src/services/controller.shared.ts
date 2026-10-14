@@ -1482,10 +1482,13 @@ class MailReplyContextRefreshRequiredError extends Error {
 
 export interface ControllerRuntimePorts {
   store: StateStore; crypto: ControllerCryptoPort;
-  providers: { speech: AzureSpeechClient; speechOpenRouter?: OpenRouterSpeechAdapter; openAi: AssistantModelClient };
+  providers: { speech: ControllerSpeechPort; speechOpenRouter?: OpenRouterSpeechAdapter; openAi: AssistantModelClient };
   integration: ControllerIntegrationDependencies & { reminderBackend: NotificationBackend; mailAlertBackend: MailAlertNotificationBackend; deviceCalendarBackend: DeviceCalendarBackend; writeDocument(path: string, content: string): Promise<void>; removeAudio(uri: string): Promise<void>; loadRecordingRecovery(): Promise<RecordingRecoveryService>; bindRecordingRecovery(service: RecordingRecoveryService): RecordingRecoveryService };
   pendingCapture?: PendingCaptureControllerPort;
 }
+
+/** The shared controller's narrow speech surface; Node runtimes need no Azure client internals. */
+export type ControllerSpeechPort = Pick<AzureSpeechClient, 'transcribe' | 'releaseUploadLease' | 'disposeMemory'>;
 
 type ProposalStatusOutcome = { status: 'executed' | 'simulated' | 'failed' | 'accepted' | 'unknown'; message: string; notificationId?: string; operation?: ApprovedDispatch['operation']; remoteId?: string; replyDraftCheck?: 'matches_approved' | 'differs' | 'unverified'; dispatchOutcome?: Exclude<DispatchOutcome, 'pending'>; rejectionCode?: 'provider_rejected' | 'precondition_failed' };
 
@@ -1515,7 +1518,7 @@ export class AppControllerImpl implements AppController {
   private readonly store: StateStore;
   private readonly integration: ControllerRuntimePorts['integration'];
   private readonly pendingCapture?: PendingCaptureControllerPort;
-  private readonly speechClient: AzureSpeechClient;
+  private readonly speechClient: ControllerSpeechPort;
   private readonly openRouterSpeechAdapter?: OpenRouterSpeechAdapter;
   private readonly openAiClient: AssistantModelClient;
   private readonly openRouterBatchClient?: OpenRouterBatchClient;

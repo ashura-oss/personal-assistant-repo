@@ -177,3 +177,49 @@ test('command admission waits for an owned disposal to finish before creating a 
     assert.equal(lifecycle.loads(), 2);
   } finally { f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
+
+test('disposeAll waits for every entry, keeps failed entries fenced, and retries only failed cleanup explicitly', async () => {
+  const f = fixture();
+  const secondWorkspace = f.kernel.createWorkspace(f.ownerId, { notes: [], proposals: [], tasks: [], accounts: [], calendars: [], documents: [], activity: [] });
+  const secondAdmission = f.kernel.createSession(secondWorkspace.workspaceId, f.ownerId, Date.now() + 60 * 60_000);
+  const secondRuntimeSession = f.kernel.createSession(secondWorkspace.workspaceId, f.ownerId, Date.now() + 60 * 60_000);
+  const delayed = deferred();
+  const secondDisposeStarted = deferred();
+  let firstDisposeAttempts = 0;
+  let secondDisposeAttempts = 0;
+  try {
+    const runtimeByWorkspace = new Map([[f.workspace.workspaceId, f.runtimeSession], [secondWorkspace.workspaceId, secondRuntimeSession]]);
+    const registry = new WorkspaceRegistry(f.kernel, f.journal, (identity) => runtimeByWorkspace.get(identity.workspaceId), ({ identity }) => ({
+      async load() {},
+      async disposeForPrivacy() {
+        if (identity.workspaceId === f.workspace.workspaceId) {
+          firstDisposeAttempts += 1;
+          if (firstDisposeAttempts === 1) throw new Error('first workspace cleanup failed once');
+          return;
+        }
+        secondDisposeAttempts += 1;
+        secondDisposeStarted.resolve();
+        await delayed.promise;
+      },
+    }));
+    await registry.get(f.admissionA);
+    await registry.get(secondAdmission);
+
+    let settled = false;
+    const firstAttempt = registry.disposeAll().then(() => { settled = true; }, () => { settled = true; });
+    await secondDisposeStarted.promise;
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(settled, false, 'one cleanup failure does not make disposeAll return while another cleanup is active');
+    delayed.resolve();
+    await firstAttempt;
+    await assert.rejects(registry.get(f.admissionA), /registry is closing/);
+    assert.equal(firstDisposeAttempts, 1);
+    assert.equal(secondDisposeAttempts, 1);
+
+    await registry.disposeAll();
+    assert.equal(firstDisposeAttempts, 2, 'explicit retry runs cleanup again only for the failed exact entry');
+    assert.equal(secondDisposeAttempts, 1, 'successfully disposed entries are not disposed twice');
+    await registry.disposeAll();
+    assert.equal(firstDisposeAttempts, 2, 'successful explicit retry is idempotent');
+  } finally { delayed.resolve(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
