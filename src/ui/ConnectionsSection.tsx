@@ -1,13 +1,17 @@
 import React, { useState } from "react";
-import { Platform, Pressable, Text, View } from "react-native";
+import { Pressable, Text, View } from "react-native";
 import type { Account, AccountCapability, AccountSyncState } from "../core";
 import { MailSyncControls } from "./MailSyncControls";
-import {
-  configuredProviderAuth,
-  scopesFor,
-  type AuthCapability,
-  type OAuthProvider,
-} from "../auth/browser";
+
+type OAuthProvider = "google" | "microsoft";
+type AuthCapability = Extract<AccountCapability, "mail.read" | "mail.draft" | "mail.send" | "calendar.read" | "calendar.write">;
+type ProviderSetup = Readonly<{
+  clientId: string;
+  nativeRedirectUri: string;
+  webRedirectUri: string;
+  authority?: string;
+  scopes: readonly string[];
+}>;
 
 const colors = {
   card: "#191B1E",
@@ -49,6 +53,8 @@ type ConnectionsProps = {
   syncStates: Record<string, AccountSyncState>;
   busy: boolean;
   demoMode: boolean;
+  isWeb: boolean;
+  getProviderSetup: (provider: OAuthProvider, capabilities: readonly AccountCapability[]) => ProviderSetup;
   onConnect: (
     provider: OAuthProvider,
     capabilities: AccountCapability[],
@@ -65,6 +71,8 @@ export function ConnectionsSection({
   syncStates,
   busy,
   demoMode,
+  isWeb,
+  getProviderSetup,
   onConnect,
   onDisconnect,
   onSync,
@@ -90,15 +98,15 @@ export function ConnectionsSection({
         app.
       </Text>
       {(["google", "microsoft"] as const).map((provider) => {
-        const config = configuredProviderAuth(provider);
+        const config = getProviderSetup(provider, selected[provider]);
         const configuredAccounts = accounts.filter(
           (account) => account.provider === provider,
         );
         const callback =
-          Platform.OS === "web"
+          isWeb
             ? config.webRedirectUri
             : config.nativeRedirectUri;
-        const googleWeb = provider === "google" && Platform.OS === "web";
+        const googleWeb = provider === "google" && isWeb;
         const ready = !googleWeb && Boolean(config.clientId && callback);
         return (
           <View key={provider} style={styles.card}>
@@ -112,7 +120,7 @@ export function ConnectionsSection({
                   ? "Connect Google from the iOS app."
                   : ready
                     ? "App registration configured for this platform."
-                    : `Not configured · add a public ${Platform.OS === "web" ? "web" : "native"} OAuth client ID and exact redirect URI to the build environment.`}
+                    : `Not configured · add a public ${isWeb ? "web" : "native"} OAuth client ID and exact redirect URI to the build environment.`}
             </Text>
             <Text style={styles.scopeHeading}>Requested access</Text>
             {options.map((option) => {
@@ -210,7 +218,7 @@ export function ConnectionsSection({
                 ) : null}
                 <Text style={styles.detail}>
                   Requested scopes:{" "}
-                  {scopesFor(provider, selected[provider]).join(" · ")}
+                  {config.scopes.join(" · ")}
                 </Text>
               </View>
             ) : null}
