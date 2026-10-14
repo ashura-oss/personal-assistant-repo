@@ -30,6 +30,7 @@ import { ReviewSheet } from "./src/ui/ReviewSheet";
 import type { MoreComputeReviewActions } from "./src/ui/MoreComputeReview";
 import { moreComputeConfigurationFingerprint, moreComputeWorkspaceIsBlocked } from "./src/ui/moreComputeOwnership";
 import { NoteDetail as NoteDetailView } from "./src/ui/NoteDetail";
+import { findCurrentNativeDetailNote } from "./src/ui/nativeDetailSelection";
 import { BackupImportSheet } from "./src/ui/BackupImportSheet";
 import { ImportedBackupsSection } from "./src/ui/ImportedBackupsSection";
 import { RecordingAttachmentSheet } from "./src/ui/RecordingAttachmentSheet";
@@ -928,9 +929,7 @@ export function WorkspaceView({ controller, credentials, platform, workspaceGene
     !chatAppBlocked && !busy &&
     !chatDeleteReviewOpen && !state.assistantChatRecoveryStatus && !state.assistantBatchRecoveryStatus && !state.mailAlertRefreshRequired &&
     state.settings.mode === "provider" && state.settings.llmProvider === "openrouter");
-  const activeDetailNote = detail
-    ? state.notes.find((note) => note.id === detail.id)
-    : undefined;
+  const activeDetailNote = findCurrentNativeDetailNote(state.notes, detail);
   const voiceTransferHardBlocked = !startupReady || loading || isIsolatedDemo || isolatedPreviewFailed ||
     privacyReviewOpen || privacyOutcomeUnknown || (busy && !chatTranscriptTransferBusy) ||
     audio.status !== "idle" || pendingCaptureLoading || Boolean(captureJournal && pendingCaptureStatus?.kind !== "empty") ||
@@ -3383,8 +3382,9 @@ export function WorkspaceView({ controller, credentials, platform, workspaceGene
             ) : detail ? (
               <NoteDetailView
                 key={`${detail.id}:${detail.revision}`}
-                note={state.notes.find((n) => n.id === detail.id) ?? detail}
-                importedAudioMissing={Boolean(detail.importOrigin?.audioMissing)}
+                note={activeDetailNote ?? detail}
+                recordingAvailable={Boolean((activeDetailNote ?? detail).audioUri)}
+                importedAudioMissing={Boolean((activeDetailNote ?? detail).importOrigin?.audioMissing)}
                 analysis={state.notes.find((n) => n.id === detail.id)?.analysis}
                 proposals={state.proposals.filter(
                   (p) => p.noteId === detail.id,

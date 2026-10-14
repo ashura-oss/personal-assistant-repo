@@ -7,13 +7,13 @@ import {
   Text,
   View,
 } from "react-native";
-import type { AssistIntent, Note, NoteAssistResult, Proposal } from "../core";
-import type { TranscriptionAttempt } from "../transcription";
+import type { AssistIntent } from "../core";
 import type { AssistantBatchJobDTO } from "../services/openRouterBatchJobs";
 import type { ChatConversationDTO, ChatTranscriptTransferPlan } from "../chat/types";
-import type { KnowledgeChange, KnowledgeEntityKind, Person, Project } from "../knowledge/types";
+import type { KnowledgeChange, KnowledgeEntityKind } from "../knowledge/types";
+import type { WorkspaceSnapshotDTO } from "../cloud/workspaceDto";
 import { Button, Field, IconButton } from "./primitives";
-import { TranscriptionPanel } from "./TranscriptionPanel";
+import { TranscriptionPanel, type TranscriptionPanelAttempt } from "./TranscriptionPanel";
 import { AssistantBatchJobCard } from "./AssistantBatchJobCard";
 import { VoiceChatTransferReview } from "./VoiceChatTransferReview";
 import { C, s } from "./theme";
@@ -28,16 +28,28 @@ function validTimeZone(value: string) {
   }
 }
 
-export function canUseSavedTranscriptInChat(note: Note, draft: string, busy: boolean, blocked: boolean): boolean {
+type WorkspaceNote = WorkspaceSnapshotDTO["state"]["notes"][number];
+type WorkspaceProposal = WorkspaceSnapshotDTO["state"]["proposals"][number];
+type WorkspacePerson = WorkspaceSnapshotDTO["state"]["knowledge"]["people"][number];
+type WorkspaceProject = WorkspaceSnapshotDTO["state"]["knowledge"]["projects"][number];
+
+type NoteImportDisplay = Pick<NonNullable<WorkspaceNote["importOrigin"]>, "kind" | "audioMissing" | "originalTimeZoneUnknown">;
+export type NoteDetailDisplayNote = Pick<WorkspaceNote,
+  "id" | "transcript" | "revision" | "createdAt" | "capturedAt" | "captureTimeZone" |
+  "audioAttachment" | "durationSeconds"
+> & { readonly importOrigin?: NoteImportDisplay };
+
+export function canUseSavedTranscriptInChat(note: Pick<NoteDetailDisplayNote, "transcript" | "importOrigin" | "captureTimeZone">, draft: string, busy: boolean, blocked: boolean): boolean {
   return !busy && !blocked && draft === note.transcript && Boolean(draft.trim()) &&
     note.importOrigin?.originalTimeZoneUnknown !== true && validTimeZone(note.captureTimeZone ?? "");
 }
 
 type Props = {
-  note: Note;
+  note: NoteDetailDisplayNote;
+  recordingAvailable: boolean;
   importedAudioMissing?: boolean;
-  analysis?: NoteAssistResult;
-  proposals: Proposal[];
+  analysis?: WorkspaceNote["analysis"];
+  proposals: readonly Pick<WorkspaceProposal, "status">[];
   busy: boolean;
   preview: boolean;
   demoMode: boolean;
@@ -45,7 +57,7 @@ type Props = {
   speechProvider?: "azure" | "openrouter";
   providerReady: boolean;
   speechEnabled: boolean;
-  transcriptionAttempts: readonly TranscriptionAttempt[];
+  transcriptionAttempts: readonly TranscriptionPanelAttempt[];
   assistantBatchJobs?: readonly AssistantBatchJobDTO[];
   assistantBatchActionsBlocked?: boolean;
   cancelingTranscriptionId?: string;
@@ -54,8 +66,8 @@ type Props = {
   retryingTranscriptionCleanupId?: string;
   analysisStatusError?: string;
   analysisStatusChecking?: boolean;
-  people?: Person[];
-  projects?: Project[];
+  people?: readonly Pick<WorkspacePerson, "id" | "name" | "revision" | "archivedAt" | "importOrigin">[];
+  projects?: readonly Pick<WorkspaceProject, "id" | "name" | "revision" | "archivedAt" | "importOrigin">[];
   onRetryStatus: () => void;
   onClose: () => void;
   onUpdate: (text: string) => void;
@@ -103,6 +115,7 @@ const intents: { key: AssistIntent; label: string }[] = [
 
 export function NoteDetail({
   note,
+  recordingAvailable,
   importedAudioMissing = false,
   analysis,
   proposals,
@@ -155,7 +168,7 @@ export function NoteDetail({
   const [advanced, setAdvanced] = useState(false);
   const [showCitations, setShowCitations] = useState(false);
   const [showContext, setShowContext] = useState(false);
-  const [knowledgeSelection, setKnowledgeSelection] = useState<{ kind: KnowledgeEntityKind; id: string }[]>(analysis?.knowledgeSelection ?? []);
+  const [knowledgeSelection, setKnowledgeSelection] = useState<{ kind: KnowledgeEntityKind; id: string }[]>(() => [...(analysis?.knowledgeSelection ?? [])]);
   const [suggestionOpen, setSuggestionOpen] = useState(false);
   const [suggestionTargetKind, setSuggestionTargetKind] = useState<KnowledgeEntityKind>('person');
   const [suggestionTargetId, setSuggestionTargetId] = useState('');
@@ -218,7 +231,7 @@ export function NoteDetail({
             onPress={onClose}
           />
           <Text style={s.modalTitle}>
-            {note.audioUri ? "Voice note" : "Note"}
+            {recordingAvailable ? "Voice note" : "Note"}
           </Text>
           <IconButton
             name="trash-outline"
@@ -239,7 +252,7 @@ export function NoteDetail({
               )}${note.captureTimeZone ? ` · ${note.captureTimeZone}` : ""}`}
         </Text>
         <Text style={s.h1Small}>A thought, kept.</Text>
-        {importedAudioMissing && !note.audioUri ? (
+        {importedAudioMissing && !recordingAvailable ? (
           <Text style={s.disclaimer}>
             Imported note · its original recording was not included in the backup.
           </Text>
@@ -262,7 +275,7 @@ export function NoteDetail({
             />
           </View>
         ) : null}
-        {importedAudioMissing && !note.audioUri ? (
+        {importedAudioMissing && !recordingAvailable ? (
           <View style={s.setupCard}>
             <Text style={s.setupTitle}>Add a replacement recording</Text>
             <Text style={s.setupBody}>
@@ -291,7 +304,7 @@ export function NoteDetail({
             ) : null}
           </View>
         ) : null}
-        {note.audioUri ? (
+        {recordingAvailable ? (
           <>
             <Button
               label={demoMode ? "Playback unavailable in sample preview" : "Play recording"}
@@ -355,9 +368,10 @@ export function NoteDetail({
           </>
         ) : null}
         {(!demoMode || transcriptionDemoMode) &&
-        (note.audioUri || transcriptionAttempts.length > 0) ? (
+        (recordingAvailable || transcriptionAttempts.length > 0) ? (
           <TranscriptionPanel
             note={note}
+            recordingAvailable={recordingAvailable}
             attempts={transcriptionAttempts}
             speechProvider={speechProvider}
             enabled={speechEnabled}

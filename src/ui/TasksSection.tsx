@@ -1,11 +1,17 @@
 import React, { useState } from "react";
 import { Pressable, Text, View } from "react-native";
 import Ionicons from "@expo/vector-icons/Ionicons";
-import type { LocalTask } from "../core";
+import type { WorkspaceSnapshotDTO } from "../cloud/workspaceDto";
 import { C, s } from "./theme";
 
+type WorkspaceTask = WorkspaceSnapshotDTO["state"]["tasks"][number];
+type TaskImportDisplay = Pick<NonNullable<WorkspaceTask["importOrigin"]>, "kind">;
+export type TaskDisplay = Pick<WorkspaceTask, "id" | "status" | "title" | "body" | "createdAt" | "dueAt"> & {
+  readonly importOrigin?: TaskImportDisplay;
+};
+
 type Props = {
-  tasks: LocalTask[];
+  tasks: readonly TaskDisplay[];
   busy: boolean;
   onComplete: (id: string) => void;
   onReopen: (id: string) => void;

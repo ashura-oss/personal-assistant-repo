@@ -1,14 +1,26 @@
 import React, { useRef, useState } from "react";
 import { Text, View } from "react-native";
-import type { Note } from "../core";
-import type { TranscriptionAttempt } from "../transcription";
+import type { WorkspaceSnapshotDTO } from "../cloud/workspaceDto";
 import { Button } from "./primitives";
 import { formatProviderReportedCostUsd } from "./formatProviderReportedCostUsd";
 import { C, s } from "./theme";
 
+type WorkspaceNote = WorkspaceSnapshotDTO["state"]["notes"][number];
+type WorkspaceAttempt = WorkspaceSnapshotDTO["state"]["transcription"]["attempts"][number];
+export type TranscriptionPanelAttempt = Pick<WorkspaceAttempt,
+  "id" | "provider" | "outcome" | "code" | "actualUsage" | "durationMilliseconds" |
+  "createdAt" | "unknownCharge" | "dispatchStarted"
+> & Readonly<{
+  source: Pick<WorkspaceAttempt["source"], "durationSeconds">;
+  /** Native-only duration display fallback; never includes the private upload lease. */
+  prepared?: Readonly<{ durationSeconds: number }>;
+}>;
+type TranscriptionPanelNote = Pick<WorkspaceNote, "revision" | "transcript" | "durationSeconds" | "audioAttachment">;
+
 type Props = {
-  note: Note;
-  attempts: readonly TranscriptionAttempt[];
+  note: TranscriptionPanelNote;
+  recordingAvailable: boolean;
+  attempts: readonly TranscriptionPanelAttempt[];
   speechProvider?: "azure" | "openrouter";
   enabled: boolean;
   configured: boolean;
@@ -24,7 +36,7 @@ type Props = {
   onOpenSettings: () => void;
 };
 
-function outcomeLabel(attempt: TranscriptionAttempt) {
+function outcomeLabel(attempt: TranscriptionPanelAttempt) {
   const provider = attempt.provider === "openrouter" ? "OpenRouter Speech" : "Azure Speech";
   switch (attempt.outcome) {
     case "preparing":
@@ -52,11 +64,11 @@ function outcomeLabel(attempt: TranscriptionAttempt) {
   }
 }
 
-function attemptProviderLabel(attempt: TranscriptionAttempt) {
+function attemptProviderLabel(attempt: TranscriptionPanelAttempt) {
   return attempt.provider === "openrouter" ? "OpenRouter Speech" : "Azure Speech";
 }
 
-function openRouterUsageLines(attempt: TranscriptionAttempt) {
+function openRouterUsageLines(attempt: TranscriptionPanelAttempt) {
   if (attempt.provider !== "openrouter") return null;
   const usage = attempt.actualUsage;
   if (!usage) return attempt.outcome === "preparing" || attempt.outcome === "pending"
@@ -88,7 +100,7 @@ function durationLabel(seconds: number) {
   return `${formatted} seconds`;
 }
 
-function originalDurationLabel(attempt: TranscriptionAttempt, note: Note) {
+function originalDurationLabel(attempt: TranscriptionPanelAttempt, note: TranscriptionPanelNote) {
   const seconds = attempt.source.durationSeconds || note.durationSeconds || attempt.prepared?.durationSeconds;
   return typeof seconds === "number" && Number.isFinite(seconds) && seconds > 0
     ? durationLabel(seconds)
@@ -104,6 +116,7 @@ function dateLabel(value: string) {
 
 export function TranscriptionPanel({
   note,
+  recordingAvailable,
   attempts,
   speechProvider = "azure",
   enabled,
@@ -123,7 +136,7 @@ export function TranscriptionPanel({
   const [cleanupError, setCleanupError] = useState(false);
   const cleanupActionLock = useRef(false);
   const selectedProviderLabel = speechProvider === "openrouter" ? "OpenRouter Speech" : "Azure Speech";
-  const recordingAttached = Boolean(note.audioUri);
+  const recordingAttached = recordingAvailable;
   const ordered = [...attempts].reverse().sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   const latest = ordered[0];
   const active = ordered.find((attempt) => attempt.outcome === "preparing" || attempt.outcome === "pending");

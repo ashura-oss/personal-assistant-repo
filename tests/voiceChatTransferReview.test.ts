@@ -63,7 +63,8 @@ describe('VoiceChatTransferReview', () => {
     expect(canUseSavedTranscriptInChat(note, note.transcript, true, false)).toBe(false);
     expect(canUseSavedTranscriptInChat(note, note.transcript, false, true)).toBe(false);
     expect(canUseSavedTranscriptInChat({ ...note, captureTimeZone: undefined }, note.transcript, false, false)).toBe(false);
-    expect(canUseSavedTranscriptInChat({ ...note, importOrigin: { kind: 'backup_import', archiveId: 'a', sourceNoteId: 'b', audioMissing: true, originalTimeZoneUnknown: true } }, note.transcript, false, false)).toBe(false);
+    const importedNote = { ...note, importOrigin: { kind: 'backup_import' as const, archiveId: 'a', sourceNoteId: 'b', audioMissing: true, originalTimeZoneUnknown: true as const } };
+    expect(canUseSavedTranscriptInChat(importedNote, note.transcript, false, false)).toBe(false);
   });
 
   it('shows the immutable saved transcript and capture zone, with send unavailable until provider readiness', () => {
