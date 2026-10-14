@@ -1,7 +1,7 @@
 import type { AppState } from '../core';
 import { AppControllerImpl, type ControllerCryptoPort, type ControllerRuntimePorts, type ControllerSpeechPort } from '../services/controller.shared';
 import type { AssistantModelClient } from '../services/assistantClient';
-import type { OpenRouterSpeechAdapter } from '../services/openRouterSpeechAdapter';
+import type { OpenRouterSpeechAdapterPort } from '../services/openRouterSpeechAdapter.shared';
 import { createWorkspaceSnapshotDTO, type WorkspaceMediaResolver, type WorkspaceSnapshotDTO } from './workspaceDto';
 import type { DurableKernel, JsonValue, OwnedWorkspaceIdentity } from '../../server/src/kernel.js';
 import { CommandJournal, type CommandAdmission } from '../../server/src/commandJournal.js';
@@ -22,7 +22,7 @@ export interface OwnedWorkspaceRuntimeOptions {
   readonly crypto: ControllerCryptoPort;
   readonly providers: {
     readonly speech: ControllerSpeechPort;
-    readonly speechOpenRouter?: OpenRouterSpeechAdapter;
+    readonly speechOpenRouter?: OpenRouterSpeechAdapterPort;
     readonly openAi: AssistantModelClient;
   };
   readonly integration: ControllerRuntimePorts['integration'];

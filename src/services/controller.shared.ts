@@ -92,7 +92,7 @@ import {
   OPENROUTER_BATCH_MODEL, OPENROUTER_BATCH_BODY_MODEL, OPENROUTER_BATCH_RESPONSE_MAX_BYTES, OPENROUTER_BATCH_REQUEST_PROFILE_VERSION, OpenRouterBatchClient, OpenRouterBatchDispatchError,
   OpenRouterBatchRequestBuilder, isOpenRouterBatchRequestProfile, buildMoreComputeRequestBody, higherOpenRouterRecoveryEfforts, type OpenRouterBatchBaseOperation, type OpenRouterBatchInspection, type PreparedOpenRouterAnalysis,
 } from './openRouter';
-import type { OpenRouterSpeechAdapter } from './openRouterSpeechAdapter';
+import type { OpenRouterSpeechAdapterPort } from './openRouterSpeechAdapter.shared';
 import { emptyChatLedger, selectCompletedChatContext, validateChatLedger } from '../chat/ledger';
 import type { ChatConversation, ChatConversationDTO, ChatReplySnapshot, ChatTranscriptTransferPlan, ReadonlyChatLedger } from '../chat/types';
 import type { KnowledgeSuggestionReview } from '../knowledge/types';
@@ -1372,7 +1372,7 @@ export interface ControllerIntegrationDependencies {
   mailAlertTapBackend?: MailAlertTapBackend;
   withMailAlertNotificationWriter?: <T>(actual: (scope: PrivacyWriterScope, store: ExistingWorkspaceWriterStore) => Promise<T>) => Promise<T>;
   openRouterBatchClient?: OpenRouterBatchClient;
-  openRouterSpeechAdapter?: OpenRouterSpeechAdapter;
+  openRouterSpeechAdapter?: OpenRouterSpeechAdapterPort;
 }
 
 interface BackupImportSession {
@@ -1482,7 +1482,7 @@ class MailReplyContextRefreshRequiredError extends Error {
 
 export interface ControllerRuntimePorts {
   store: StateStore; crypto: ControllerCryptoPort;
-  providers: { speech: ControllerSpeechPort; speechOpenRouter?: OpenRouterSpeechAdapter; openAi: AssistantModelClient };
+  providers: { speech: ControllerSpeechPort; speechOpenRouter?: OpenRouterSpeechAdapterPort; openAi: AssistantModelClient };
   integration: ControllerIntegrationDependencies & { reminderBackend: NotificationBackend; mailAlertBackend: MailAlertNotificationBackend; deviceCalendarBackend: DeviceCalendarBackend; writeDocument(path: string, content: string): Promise<void>; removeAudio(uri: string): Promise<void>; loadRecordingRecovery(): Promise<RecordingRecoveryService>; bindRecordingRecovery(service: RecordingRecoveryService): RecordingRecoveryService };
   pendingCapture?: PendingCaptureControllerPort;
 }
@@ -1519,7 +1519,7 @@ export class AppControllerImpl implements AppController {
   private readonly integration: ControllerRuntimePorts['integration'];
   private readonly pendingCapture?: PendingCaptureControllerPort;
   private readonly speechClient: ControllerSpeechPort;
-  private readonly openRouterSpeechAdapter?: OpenRouterSpeechAdapter;
+  private readonly openRouterSpeechAdapter?: OpenRouterSpeechAdapterPort;
   private readonly openAiClient: AssistantModelClient;
   private readonly openRouterBatchClient?: OpenRouterBatchClient;
   private readonly connector?: ConnectorClient;
