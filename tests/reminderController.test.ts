@@ -477,13 +477,15 @@ describe('reminder controller integrity', () => {
   });
 
   it('routes note reminders through the saved ledger and cancels them atomically with note deletion', async () => {
-    const transcript = 'Remind me to call Sam at 2026-10-14T09:00:00Z.';
+    const dueAt = new Date(Math.ceil((Date.now() + 60 * 60_000) / 60_000) * 60_000).toISOString();
+    const transcriptDueAt = dueAt.replace('.000Z', 'Z');
+    const transcript = `Remind me to call Sam at ${transcriptDueAt}.`;
     const sourceVersion = `1:${await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, transcript.normalize('NFC'))}`;
     const fetcher = async () => new Response(JSON.stringify({
       output: [{ content: [{ type: 'output_text', text: JSON.stringify({
         summary: 'Call Sam.', answer: '', decisions: [],
         citations: [{ sourceId: 'transcript', revision: 1, sourceVersion, quote: transcript }], clarifications: [],
-        proposals: [{ kind: 'reminder', title: 'Call Sam', body: 'Call Sam about the appointment.', recipients: [], dueAt: '2026-10-14T09:00:00.000Z', evidence: [transcript] }],
+        proposals: [{ kind: 'reminder', title: 'Call Sam', body: 'Call Sam about the appointment.', recipients: [], dueAt, evidence: [transcript] }],
         memorySuggestions: [],
       }) }] }], usage: { input_tokens: 10, output_tokens: 5 },
     }), { status: 200, headers: { 'content-type': 'application/json' } });

@@ -94,12 +94,13 @@ export function validateIosConfiguration({ config, autolink, podspecContent, pro
     !/userInfo\s*\?\[\s*["']url["']\s*\]/.test(expiryHandler),
   'The pinned Expo background-task expiry bridge does not match the approved notification contract.');
 
-  const boundedExpoFetchSource = typeof expoFetchSource === 'string' && Buffer.byteLength(expoFetchSource, 'utf8') <= FETCH_SOURCE_LIMIT_BYTES
-    ? expoFetchSource
+  const boundedSource = (source, limit) => typeof source === 'string' && Buffer.byteLength(source, 'utf8') <= limit
+    ? source.replace(/\r\n?/g, '\n')
     : '';
-  const boundedSwift = (source) => typeof source === 'string' && Buffer.byteLength(source, 'utf8') <= FETCH_SWIFT_SOURCE_LIMIT_BYTES ? source : '';
+  const boundedExpoFetchSource = boundedSource(expoFetchSource, FETCH_SOURCE_LIMIT_BYTES);
+  const boundedSwift = (source) => boundedSource(source, FETCH_SWIFT_SOURCE_LIMIT_BYTES);
   const lifetimeHelper = boundedExpoFetchSource.match(/export async function withFetchLifetime[\s\S]*?\n}\n/)?.[0] ?? '';
-  const boundedRequestType = boundedExpoFetchSource ? expoRequestTypeSource : '';
+  const boundedRequestType = boundedSource(expoRequestTypeSource, FETCH_SOURCE_LIMIT_BYTES);
   const boundedFetchModule = boundedSwift(expoFetchModuleSwiftSource);
   const boundedNativeRequest = boundedSwift(expoNativeRequestSwiftSource);
   const boundedURLSessionTask = boundedSwift(expoURLSessionTaskSwiftSource);

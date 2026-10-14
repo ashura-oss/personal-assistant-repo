@@ -93,6 +93,36 @@ describe('read-only iOS config validation', () => {
     expect(result.failures).toEqual([]);
   });
 
+  it('accepts bounded Expo TypeScript and Swift sources with CRLF line endings', () => {
+    const crlfFixture = validFixture();
+    for (const key of [
+      'expoFetchSource',
+      'expoRequestTypeSource',
+      'expoFetchModuleSwiftSource',
+      'expoNativeRequestSwiftSource',
+      'expoURLSessionTaskSwiftSource',
+      'expoNativeResponseSwiftSource',
+      'expoFetchTaskLifetimeSwiftSource',
+      'expoFetchExceptionsSwiftSource',
+    ] as const) {
+      crlfFixture[key] = crlfFixture[key].replace(/\r?\n/g, '\r\n');
+    }
+    expect(validateIosConfiguration(crlfFixture)).toMatchObject({ ok: true, failures: [] });
+  });
+
+  it('enforces physical source bounds before normalizing CRLF', () => {
+    const oversizedCRLF = validFixture();
+    const source = oversizedCRLF.expoNativeRequestSwiftSource.replace(/\r\n?/g, '\n');
+    const lineCount = 2048;
+    const normalizedPaddingLength = 64 * 1024 - Buffer.byteLength(source, 'utf8') - 512 - lineCount;
+    expect(normalizedPaddingLength).toBeGreaterThan(0);
+    const paddedLF = `${source}\n/*${'x'.repeat(normalizedPaddingLength)}${'\n'.repeat(lineCount)}*/`;
+    oversizedCRLF.expoNativeRequestSwiftSource = paddedLF.replace(/\n/g, '\r\n');
+    expect(Buffer.byteLength(paddedLF, 'utf8')).toBeLessThanOrEqual(64 * 1024);
+    expect(Buffer.byteLength(oversizedCRLF.expoNativeRequestSwiftSource, 'utf8')).toBeGreaterThan(64 * 1024);
+    expect(validateIosConfiguration(oversizedCRLF).failures).toContain('The pinned Expo fetch lifetime/cancellation helper is missing or changed.');
+  });
+
   it('rejects a missing or duplicate native module registration', () => {
     const missing = validFixture();
     missing.autolink.modules = [];
