@@ -18,6 +18,7 @@ import type { ChatConversationDTO, ChatTurnDTO } from '../chat/types';
 import type { TranscriptionAttempt, TranscriptionState } from '../transcription/types';
 import type { RecoveryFormat } from '../audio/recovery.types';
 import type { DeviceCalendarState, DeviceEventDispatchRecord, DeviceEventSnapshot } from '../deviceCalendars/types';
+import { encodeWorkspaceSnapshotDTO } from './workspaceSnapshotCodec';
 
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -200,15 +201,15 @@ export interface WorkspaceDTOState {
 
 export interface WorkspaceSettingsDTO {
   readonly mode: AppSettings['mode'];
-  readonly llmProvider: AppSettings['llmProvider'];
-  readonly openRouterModel: AppSettings['openRouterModel'];
-  readonly openRouterReasoningEffort: AppSettings['openRouterReasoningEffort'];
-  readonly llmRequestContractVersion: AppSettings['llmRequestContractVersion'];
+  readonly llmProvider?: AppSettings['llmProvider'];
+  readonly openRouterModel?: AppSettings['openRouterModel'];
+  readonly openRouterReasoningEffort?: AppSettings['openRouterReasoningEffort'];
+  readonly llmRequestContractVersion?: AppSettings['llmRequestContractVersion'];
   readonly timezone: AppSettings['timezone'];
-  readonly backgroundMailRefreshEnabled: AppSettings['backgroundMailRefreshEnabled'];
-  readonly backgroundRefreshGeneration: AppSettings['backgroundRefreshGeneration'];
-  readonly speechEnabled: AppSettings['speechEnabled'];
-  readonly speechProvider: AppSettings['speechProvider'];
+  readonly backgroundMailRefreshEnabled?: AppSettings['backgroundMailRefreshEnabled'];
+  readonly backgroundRefreshGeneration?: AppSettings['backgroundRefreshGeneration'];
+  readonly speechEnabled?: AppSettings['speechEnabled'];
+  readonly speechProvider?: AppSettings['speechProvider'];
   readonly speechEndpoint?: AppSettings['speechEndpoint'];
   readonly speechRegion?: AppSettings['speechRegion'];
   readonly maxAudioSeconds: AppSettings['maxAudioSeconds'];
@@ -251,17 +252,6 @@ function pick<T extends object, K extends keyof T>(source: T, keys: readonly K[]
   const result: Partial<Pick<T, K>> = {};
   for (const key of keys) if (Object.prototype.hasOwnProperty.call(source, key)) result[key] = source[key];
   return result as Pick<T, K>;
-}
-
-function cloneAndFreeze<T>(value: T): T {
-  const cloned = structuredClone(value);
-  const freeze = (current: unknown): void => {
-    if (!current || typeof current !== 'object' || Object.isFrozen(current)) return;
-    for (const child of Object.values(current)) freeze(child);
-    Object.freeze(current);
-  };
-  freeze(cloned);
-  return cloned;
 }
 
 function assertList<T>(value: readonly T[] | undefined, label: string): readonly T[] {
@@ -668,6 +658,6 @@ export function createWorkspaceSnapshotDTO(controller: Pick<AppController, 'getS
     !Number.isSafeInteger(metadata.revision) || metadata.revision < 0) throw new TypeError('workspace_snapshot_identity_invalid');
   const state = controller.getSnapshot();
   if (!state || typeof state !== 'object' || Array.isArray(state)) throw new TypeError('workspace_snapshot_invalid');
-  return cloneAndFreeze({ schemaVersion: 1 as const, workspaceId: metadata.workspaceId, privacyEpoch: metadata.privacyEpoch, revision: metadata.revision,
-    state: projectState(state, mediaResolver) }) as WorkspaceSnapshotDTO;
+  return encodeWorkspaceSnapshotDTO({ schemaVersion: 1 as const, workspaceId: metadata.workspaceId, privacyEpoch: metadata.privacyEpoch, revision: metadata.revision,
+    state: projectState(state, mediaResolver) });
 }

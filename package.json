@@ -16,6 +16,8 @@
     "test:watch": "vitest",
     "postinstall": "patch-package --error-on-fail",
     "check:ios-config": "node scripts/check-ios-config.mjs",
+    "generate:workspace-schema": "node scripts/generate-workspace-snapshot-schema.mjs",
+    "check:workspace-schema": "node scripts/generate-workspace-snapshot-schema.mjs --check",
     "check:server": "npm --prefix server run check && node --test tests/nodeControllerRuntime.test.mjs"
   },
   "dependencies": {

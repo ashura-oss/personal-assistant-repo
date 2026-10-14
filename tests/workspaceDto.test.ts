@@ -161,8 +161,8 @@ function richState(): AppState {
   });
 
   state.assistantBatchJobs = [{
-    id: 'batch-job-display-id', kind: 'note_assistance', status: 'completed', createdAt: '2026-10-14T08:00:00.000Z', updatedAt: '2026-10-14T08:02:00.000Z',
-    model: 'openai/gpt-6-luna:batch', effort: 'low', requestBytes: 500, costStatus: 'reported', providerReportedCostUsd: 0.015,
+    id: 'batch-job-display-id', kind: 'note_assistance', status: 'completed', canCheck: false, unknownCharge: false, createdAt: '2026-10-14T08:00:00.000Z', updatedAt: '2026-10-14T08:02:00.000Z',
+    model: 'openai/gpt-6-luna:batch', effort: 'low', requestBytes: 500, costStatus: 'reported', billingScope: 'openrouter_reported', providerReportedCostUsd: 0.015,
     promptTokens: 100, completionTokens: 40, totalTokens: 140,
   } as NonNullable<AppState['assistantBatchJobs']>[number] & { requestBody: string; privateBinding: string }];
   Object.assign(state.assistantBatchJobs[0]!, { requestBody: 'private raw request body', privateBinding: 'private batch authority' });
