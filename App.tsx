@@ -67,6 +67,8 @@ import * as FileSystem from "expo-file-system/legacy";
 import * as Sharing from "expo-sharing";
 import { loadAudioForUpload } from "./src/audio/readAudio";
 import { ConnectionsSection } from "./src/ui/ConnectionsSection";
+import { ProviderCleanupNotice } from "./src/ui/ProviderCleanupNotice";
+import { OAuthConnectionIntentOwnership, oauthInstallFailureWithCleanupContext, runOwnedOAuthConnection, type OAuthConnectionIntentSnapshot } from "./src/ui/oauthConnectionIntent";
 import { MailboxSection } from "./src/ui/MailboxSection";
 import { MailReplyComposer } from "./src/ui/MailReplyComposer";
 import { MailReplyBatchOwnership, mailReplyBatchIsBlocked, mailReplyBatchReviewSourceIsBlocked, mailReplyBatchKeyIsReady, rethrowMailReplyBatchError, type MailReplyBatchBlockState, type MailReplyBatchKeyStatus, type MailReplyBatchOwner } from "./src/ui/mailReplyBatchOwnership";
@@ -116,9 +118,12 @@ import { C, s } from "./src/ui/theme";
 import {
   authorizeWithBrowser,
   configuredProviderAuth,
+  exactRedirectUri,
+  scopesFor,
   type OAuthProvider,
 } from "./src/auth/browser";
 import { exchangeAuthorizationCode } from "./src/connectors/oauth";
+import { providerCleanupRegistry } from "./src/services/providerResponseLifetime";
 import type { ReminderIntent, ReminderRecord } from "./src/reminders";
 import type { PrivacyService, PrivacyWorkspaceSession } from "./src/privacy/service";
 import type { PrivacyResourceBoundary } from "./src/privacy/resourceBoundary";
@@ -567,6 +572,38 @@ function matchesSavedTranscriptNote(note: Note | undefined, expected: Note): boo
     (note.capturedAt ?? note.createdAt) === (expected.capturedAt ?? expected.createdAt));
 }
 
+function oauthAccountLifecycleFingerprint(accounts: readonly AppState["accounts"][number][], provider: OAuthProvider): string {
+  return JSON.stringify(accounts.filter((account) => account.provider === provider).map((account) => ({
+    id: account.id,
+    provider: account.provider,
+    connected: account.connected,
+    authStatus: account.authStatus,
+    connectionGeneration: account.connectionGeneration ?? 0,
+    tokenRef: account.tokenRef ?? null,
+    capabilities: [...(account.capabilities ?? [])].sort(),
+    capabilityLimits: [...(account.capabilityLimits ?? [])].sort(),
+    identity: account.identity ? {
+      providerNamespace: account.identity.providerNamespace ?? null,
+      clientId: account.identity.clientId ?? null,
+      subject: account.identity.subject,
+      issuer: account.identity.issuer ?? null,
+      tenantId: account.identity.tenantId ?? null,
+      resourceUserId: account.identity.resourceUserId ?? null,
+    } : null,
+  })).sort((a, b) => a.id.localeCompare(b.id)));
+}
+
+function ProviderCleanupFallback({ children }: { children: React.ReactNode }) {
+  return (
+    <View style={{ flex: 1 }}>
+      {children}
+      <View pointerEvents="box-none" style={{ position: "absolute", left: 0, right: 0, bottom: 10, zIndex: 20 }}>
+        <ProviderCleanupNotice registry={providerCleanupRegistry} scope="all" />
+      </View>
+    </View>
+  );
+}
+
 function unavailableReason(): "dedicated_ios_build_required" | "secure_context_and_web_locks_required" {
   return Platform.OS === "web" ? "secure_context_and_web_locks_required" : "dedicated_ios_build_required";
 }
@@ -879,7 +916,7 @@ export default function App() {
   };
 
   if (bootstrap.kind === "opening") return (
-    <SafeAreaProvider><SafeAreaView style={s.safe}><View style={[s.viewport, { alignItems: "center", justifyContent: "center", gap: 12 }]}><ActivityIndicator color={C.sage} /><Text style={s.accountSub}>Checking local privacy controls…</Text></View></SafeAreaView></SafeAreaProvider>
+    <SafeAreaProvider><SafeAreaView style={s.safe}><ProviderCleanupFallback><View style={[s.viewport, { alignItems: "center", justifyContent: "center", gap: 12 }]}><ActivityIndicator color={C.sage} /><Text style={s.accountSub}>Checking local privacy controls…</Text></View></ProviderCleanupFallback></SafeAreaView></SafeAreaProvider>
   );
   if (bootstrap.kind === "pending_capture_preview") return <PendingCapturePreview />;
   if (bootstrap.kind === "background_refresh_preview") return <BackgroundRefreshPreview />;
@@ -890,10 +927,10 @@ export default function App() {
     <SafeAreaProvider><SafeAreaView style={s.safe}><View style={s.viewport}><Text style={s.kicker}>ISOLATED PREVIEW</Text><Text style={s.h1}>Sample preview could not load.</Text><Text accessibilityRole="alert" style={s.analysisText}>The sample remained isolated. Reload to try again.</Text><Button label="Reload preview" onPress={() => { if (Platform.OS === "web" && typeof window !== "undefined") window.location.reload(); }} /></View></SafeAreaView></SafeAreaProvider>
   );
   if (bootstrap.kind === "unavailable") return (
-    <PrivacyCleanupScreen phase="unavailable" unavailableReason={bootstrap.reason} onRetry={() => setAttempt((value) => value + 1)} onOpenFreshWorkspace={() => setAttempt((value) => value + 1)} />
+    <ProviderCleanupFallback><PrivacyCleanupScreen phase="unavailable" unavailableReason={bootstrap.reason} onRetry={() => setAttempt((value) => value + 1)} onOpenFreshWorkspace={() => setAttempt((value) => value + 1)} /></ProviderCleanupFallback>
   );
   if (bootstrap.kind === "cleanup") return (
-    <PrivacyCleanupScreen
+    <ProviderCleanupFallback><PrivacyCleanupScreen
       phase={toCleanupPhase(bootstrap.status)}
       steps={bootstrap.status.categoryStates}
       failureKind={bootstrap.failure}
@@ -903,12 +940,13 @@ export default function App() {
       samplePreview={bootstrap.samplePreview}
       onRetry={() => void runCleanup(bootstrap.privacy, true)}
       onOpenFreshWorkspace={requestFreshWorkspace}
-    />
+    /></ProviderCleanupFallback>
   );
 
   return <>
     <Workspace
       key={attempt}
+      workspaceGeneration={attempt}
       {...bootstrap.bindings}
       privacyReviewOpen={eraseReviewOpen || eraseOutcomeUnknown}
       privacyOutcomeUnknown={eraseOutcomeUnknown}
@@ -941,13 +979,14 @@ export default function App() {
 }
 
 type WorkspaceProps = WorkspaceBindings & {
+  workspaceGeneration: number;
   privacyReviewOpen: boolean;
   privacyOutcomeUnknown?: boolean;
   onPrivacyReview: () => void;
   onPrivacyInvalidated: () => void;
 };
 
-function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps, credentials, audioBoundary, privacy, session, batchPreviewMetrics, chatPreviewMetrics, isolated: isIsolatedDemo, privacyReviewOpen, privacyOutcomeUnknown = false, onPrivacyReview, onPrivacyInvalidated }: WorkspaceProps) {
+function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps, credentials, audioBoundary, privacy, session, resources, workspaceGeneration, batchPreviewMetrics, chatPreviewMetrics, isolated: isIsolatedDemo, privacyReviewOpen, privacyOutcomeUnknown = false, onPrivacyReview, onPrivacyInvalidated }: WorkspaceProps) {
   const state = useAppState(controller);
   const [tab, setTab] = useState<Tab>(isOpenRouterChatDemo ? "chat" : isBackupImportDemo || isKnowledgeDemo || isReminderDemo || isTranscriptionDemo ? "library" : isIsolatedDemo ? "inbox" : "record");
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -976,8 +1015,22 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
   const [notice, setNotice] = useState("");
   const [isolatedPreviewFailed, setIsolatedPreviewFailed] = useState(false);
   const [busy, setBusy] = useState(false);
+  const oauthIntentOwnershipRef = useRef<OAuthConnectionIntentOwnership | null>(null);
+  if (oauthIntentOwnershipRef.current == null) oauthIntentOwnershipRef.current = new OAuthConnectionIntentOwnership();
+  const workspaceMountedRef = useRef(false);
   const [loading, setLoading] = useState(true);
   const [startupReady, setStartupReady] = useState(false);
+  const oauthGateRef = useRef({ workspaceGeneration, privacyReviewOpen, privacyOutcomeUnknown, startupReady, loading, isolated: isIsolatedDemo });
+  useLayoutEffect(() => {
+    oauthGateRef.current = { workspaceGeneration, privacyReviewOpen, privacyOutcomeUnknown, startupReady, loading, isolated: isIsolatedDemo };
+  }, [workspaceGeneration, privacyReviewOpen, privacyOutcomeUnknown, startupReady, loading, isIsolatedDemo]);
+  useLayoutEffect(() => {
+    workspaceMountedRef.current = true;
+    return () => {
+      workspaceMountedRef.current = false;
+      oauthIntentOwnershipRef.current?.invalidate();
+    };
+  }, [controller, resources, privacy, session, workspaceGeneration]);
   const [startupRecoveryStatus, setStartupRecoveryStatus] = useState<StartupRecoveryStatus | undefined>();
   const [startupRecoveryPlan, setStartupRecoveryPlan] = useState<StartupRecoveryPlan | undefined>();
   const [startupRecoveryBusy, setStartupRecoveryBusy] = useState(false);
@@ -3160,48 +3213,119 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
         return;
       }
       await run(async () => {
-        const config = configuredProviderAuth(provider);
-        const handoff = await authorizeWithBrowser(config, capabilities);
-        const exchanged = await exchangeAuthorizationCode(
-          {
-            provider,
-            clientId: config.clientId,
-            redirectUri: handoff.redirectUri,
-            authority: config.authority,
-            requestedCapabilities: capabilities,
-          },
-          handoff,
-        );
-        if (!exchanged.result.email)
-          throw new Error(
-            "The provider did not return a verified email address. Review account permissions and try again.",
-          );
-        try {
-          await controller.installVerifiedAccount(
-            {
-              ...(accountId ? { id: accountId } : {}),
-              provider,
-              displayName: exchanged.result.displayName,
-              email: exchanged.result.email,
-            },
-            exchanged.result,
-          );
-        } catch (error) {
-          const pendingCleanup =
-            controller.getSnapshot().pendingCredentialCleanup.length;
-          if (pendingCleanup) {
-            throw new Error(
-              `The account was not connected. Credential cleanup is pending for ${pendingCleanup} item${pendingCleanup === 1 ? "" : "s"}; retry below.`,
-            );
+        if (!resources || !privacy || !session) throw new Error("Account connection is unavailable until the secure workspace is ready.");
+        const capturedConfig = Object.freeze({ ...configuredProviderAuth(provider) });
+        const capturedCapabilities = [...new Set(capabilities)].sort() as AccountCapability[];
+        const capturedScopes = scopesFor(provider, capturedCapabilities);
+        const capturedRedirectUri = exactRedirectUri(capturedConfig);
+        const owner = oauthIntentOwnershipRef.current!.begin({
+          workspaceGeneration,
+          controller,
+          resources,
+          privacy,
+          sessionEpoch: session.epoch,
+          sessionRuntimeId: session.runtimeId,
+          provider,
+          ...(accountId ? { accountId } : {}),
+          accountLifecycle: oauthAccountLifecycleFingerprint(controller.getSnapshot().accounts, provider),
+          platform: Platform.OS,
+          clientId: capturedConfig.clientId,
+          nativeRedirectUri: capturedConfig.nativeRedirectUri,
+          webRedirectUri: capturedConfig.webRedirectUri,
+          authority: capturedConfig.authority,
+          redirectUri: capturedRedirectUri,
+          capabilities: capturedCapabilities,
+          scopes: capturedScopes,
+        });
+        const makeCurrentSnapshot = (): OAuthConnectionIntentSnapshot => {
+          const gate = oauthGateRef.current;
+          if (!workspaceMountedRef.current || gate.workspaceGeneration !== workspaceGeneration ||
+              !gate.startupReady || gate.loading || gate.isolated || gate.privacyReviewOpen || gate.privacyOutcomeUnknown) {
+            throw new Error("Sign-in was cancelled because the workspace is not available. Start again from Settings.");
           }
-          throw error;
+          const currentConfig = configuredProviderAuth(provider);
+          return {
+            workspaceGeneration,
+            controller,
+            resources,
+            privacy,
+            sessionEpoch: session.epoch,
+            sessionRuntimeId: session.runtimeId,
+            provider,
+            ...(accountId ? { accountId } : {}),
+            accountLifecycle: oauthAccountLifecycleFingerprint(controller.getSnapshot().accounts, provider),
+            platform: Platform.OS,
+            clientId: currentConfig.clientId,
+            nativeRedirectUri: currentConfig.nativeRedirectUri,
+            webRedirectUri: currentConfig.webRedirectUri,
+            authority: currentConfig.authority,
+            redirectUri: exactRedirectUri(currentConfig),
+            capabilities: capturedCapabilities,
+            scopes: scopesFor(provider, capturedCapabilities),
+          };
+        };
+        const assertCurrent = () => oauthIntentOwnershipRef.current!.assertCurrent(owner, makeCurrentSnapshot());
+        const assertWorkspaceCurrent = () => {
+          if (!workspaceMountedRef.current || oauthGateRef.current.workspaceGeneration !== workspaceGeneration) {
+            throw new Error("The workspace changed before account connection could finish.");
+          }
+          oauthIntentOwnershipRef.current!.assertOwnerCurrent(owner);
+        };
+        try {
+          const completion = await runOwnedOAuthConnection({
+            assertCurrent,
+            assertWorkspaceCurrent,
+            // The system-browser wait owns no provider request lifetime or privacy writer.
+            authorize: () => authorizeWithBrowser(capturedConfig, capturedCapabilities),
+            validateHandoff: (handoff) => {
+              if (handoff.provider !== provider || handoff.redirectUri !== capturedRedirectUri ||
+                  JSON.stringify(handoff.requestedCapabilities) !== JSON.stringify(capturedCapabilities) ||
+                  JSON.stringify(handoff.requestedScopes) !== JSON.stringify(capturedScopes)) {
+                throw new Error("The sign-in response no longer matches the selected provider access. Start again from Settings.");
+              }
+            },
+            exchange: (handoff, beforeStart) => exchangeAuthorizationCode(
+              {
+                provider,
+                clientId: capturedConfig.clientId,
+                redirectUri: capturedRedirectUri,
+                authority: capturedConfig.authority,
+                requestedCapabilities: capturedCapabilities,
+              },
+              handoff,
+              {
+                withProviderOwnership: resources.withProviderOwnership,
+                withResponseLifetime: resources.withResponseLifetimeFor("oauth"),
+                beforeStart,
+              },
+            ),
+            install: async (exchanged, assertInstallCurrent) => {
+              if (!exchanged.result.email)
+                throw new Error("The provider did not return a verified email address. Review account permissions and try again.");
+              try {
+                await controller.installVerifiedAccount(
+                  {
+                    ...(accountId ? { id: accountId } : {}),
+                    provider,
+                    displayName: exchanged.result.displayName,
+                    email: exchanged.result.email,
+                  },
+                  exchanged.result,
+                  { assertCurrent: assertInstallCurrent },
+                );
+              } catch (error) {
+                const pendingCleanup = controller.getSnapshot().pendingCredentialCleanup.length;
+                throw oauthInstallFailureWithCleanupContext(error, pendingCleanup, isPrivacyBootstrapError);
+              }
+            },
+          });
+          if (completion.canPublish) setNotice(`${provider === "google" ? "Google" : "Microsoft"} account verified and connected.`);
+        } finally {
+          oauthIntentOwnershipRef.current?.invalidate(owner);
         }
-        setNotice(
-          `${provider === "google" ? "Google" : "Microsoft"} account verified and connected.`,
-        );
       });
     },
-    [run, controller, isIsolatedDemo],
+    [run, controller, resources, privacy, session, workspaceGeneration, isIsolatedDemo],
   );
 
   const disconnectAccount = useCallback(
@@ -3442,19 +3566,24 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
 
   if (!startupReady) {
     return (
-      <StartupRecoveryScreen
-        phase={startupRecoveryStatus?.phase === "ready" ? "failed" : startupRecoveryStatus?.phase ?? "failed"}
-        inspection={startupRecoveryStatus?.inspection}
-        receipt={startupRecoveryStatus?.inspection?.pendingReceipt}
-        message={startupRecoveryError}
-        plan={startupRecoveryPlan}
-        busy={startupRecoveryBusy}
-        samplePreview={isStartupRecoveryDemo}
-        onRetry={() => void retryStartup()}
-        onPrepare={() => void prepareStartupRecovery()}
-        onCommit={() => void commitStartupRecovery()}
-        onCancel={cancelStartupRecovery}
-      />
+      <>
+        <StartupRecoveryScreen
+          phase={startupRecoveryStatus?.phase === "ready" ? "failed" : startupRecoveryStatus?.phase ?? "failed"}
+          inspection={startupRecoveryStatus?.inspection}
+          receipt={startupRecoveryStatus?.inspection?.pendingReceipt}
+          message={startupRecoveryError}
+          plan={startupRecoveryPlan}
+          busy={startupRecoveryBusy}
+          samplePreview={isStartupRecoveryDemo}
+          onRetry={() => void retryStartup()}
+          onPrepare={() => void prepareStartupRecovery()}
+          onCommit={() => void commitStartupRecovery()}
+          onCancel={cancelStartupRecovery}
+        />
+        <View pointerEvents="box-none" style={{ position: "absolute", left: 0, right: 0, bottom: 10, zIndex: 20 }}>
+          <ProviderCleanupNotice registry={resources?.providerCleanup ?? providerCleanupRegistry} scope="all" />
+        </View>
+      </>
     );
   }
 
@@ -3473,6 +3602,7 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
             onPress={openSettings}
             />
           </View>
+          {!isIsolatedDemo && resources ? <ProviderCleanupNotice registry={resources.providerCleanup} scope="all" /> : null}
           {isIsolatedDemo ? (
             <View style={s.notice}>
               <Text style={s.noticeText}>
