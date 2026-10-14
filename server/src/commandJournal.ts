@@ -250,6 +250,25 @@ export class CommandJournal {
     });
   }
 
+  /**
+   * TRUSTED INTERNAL ONLY. A single-lease speech cleanup child may be recorded
+   * only inside the exact live command execution that owns the lease. This is
+   * deliberately registration-specific: it does not expose a general ticket
+   * transaction or allow finished tickets to mutate workspace state.
+   */
+  withActiveSpeechCleanupRegistration<T>(ticket: CommandTicketContext,
+    register: (context: OwnedTransactionContext) => T): T {
+    if (!ticket || currentTicket.getStore() !== ticket) throw new Error('Speech cleanup registration requires the current command ticket.');
+    return this.kernel.withOwnedTransaction(ticket.runtimeSessionToken, ticket.privacyEpoch, (context) => {
+      if (currentTicket.getStore() !== ticket) throw new Error('Speech cleanup registration lost its active command context.');
+      const row = this.getTicketRow(context, ticket);
+      if (row.status !== 'claimed' && row.status !== 'checkpointed') {
+        throw new Error('Speech cleanup registration requires an active command parent.');
+      }
+      return register(context);
+    });
+  }
+
   /** Mark claims left by a previous process as ambiguous; never replay their operation. */
   recoverInterrupted(verifyExclusiveProcessOwnership: () => boolean, workspaceId?: string): number {
     if (typeof verifyExclusiveProcessOwnership !== 'function' || verifyExclusiveProcessOwnership() !== true) {
