@@ -56,6 +56,104 @@ function terminalMailReceipt(sourceActionKey: string, outcome: 'accepted' | 'unk
 }
 
 describe('selective dispatch recovery', () => {
+  it.each([
+    ['object sidecar', { orphanSidecarSentinel: 'private-sidecar-object' }],
+    ['null sidecar', null],
+    ['malformed sidecar', 'private-malformed-sidecar'],
+  ])('holds an orphan %s until explicit recovery, preserving the opaque value', async (_label, sidecar) => {
+    const store = new RecoveryStore();
+    const seed = new AppControllerImpl(store);
+    await seed.load();
+    const draft = remoteDraft();
+    const approved = { ...remoteDraft(), id: 'approved-mail-proposal', status: 'approved' as const,
+      approvedRevision: 1, approvedPayloadDigest: 'c'.repeat(64) };
+    const raw = structuredClone(seed.getSnapshot()) as RawState;
+    raw.proposals = [draft, approved];
+    raw.dispatchRecoveryRawEvidence = sidecar;
+    store.value = raw;
+    let providerWrites = 0;
+    const connector = { async createDraft() { providerWrites += 1; return { status: 'accepted' as const, id: 'unexpected' }; },
+      async sendEmail() { providerWrites += 1; return { status: 'accepted' as const, id: 'unexpected' }; } };
+    let app = new AppControllerImpl(store, {}, { privacySession, connectorFactory: () => connector as never });
+    await app.load();
+    expect(app.getDispatchRecoveryStatus().status).toBe('available');
+    expect(app.getSnapshot().dispatchRecoveryStatus?.quarantinedCount).toBeGreaterThan(0);
+    expect(JSON.stringify(app.getSnapshot())).not.toContain('private-sidecar');
+    const note = await app.saveNote({ transcript: 'Content cleanup is held while an orphan recovery sidecar is reviewed.' });
+    expect(store.value?.dispatchRecoveryRawEvidence).toEqual(sidecar);
+    const evidenceAfterFirstSave = JSON.stringify(store.value?.dispatchRecoveryRawEvidence);
+    const reloaded = new AppControllerImpl(store, {}, { privacySession, connectorFactory: () => connector as never });
+    await reloaded.load();
+    await reloaded.saveNote({ transcript: 'An orphan sidecar stays byte-stable through JSON restart.' });
+    expect(JSON.stringify(store.value?.dispatchRecoveryRawEvidence)).toBe(evidenceAfterFirstSave);
+    app = reloaded;
+    await expect(app.approveProposal(draft.id)).rejects.toThrow(/integrity validation/i);
+    await expect(app.executeProposal(approved.id)).rejects.toThrow(/integrity validation/i);
+    await expect(app.deleteNote(note.id)).rejects.toThrow(/unresolved receipt evidence/i);
+    expect(providerWrites).toBe(0);
+
+    const plan = await app.prepareDispatchRecovery();
+    expect(plan.effects.quarantinedReceiptCount).toBeGreaterThan(0);
+    expect(JSON.stringify(plan)).not.toContain('private-sidecar');
+    expect(await app.confirmDispatchRecovery({ operationId: plan.operationId, confirmation: 'RETIRE ACTIONS' })).toMatchObject({ status: 'applied' });
+    const archive = store.value?.dispatchRecoveryArchives as { entries: { sourceJson: string }[] };
+    expect(JSON.parse(archive.entries[0]!.sourceJson).quarantine).toEqual(sidecar);
+    expect(store.value?.dispatchRecoveryRawEvidence).toBeUndefined();
+    expect(store.value?.dispatchRecordQuarantine).toBeUndefined();
+    expect(app.getDispatchRecoveryStatus().status).toBe('not_needed');
+    await app.saveNote({ transcript: 'A new local action is available after explicit recovery.' });
+    expect(providerWrites).toBe(0);
+  });
+
+  it('preserves marker-shaped quarantine envelopes with extra opaque evidence across JSON restarts and archival', async () => {
+    const store = new RecoveryStore();
+    const seed = new AppControllerImpl(store);
+    await seed.load();
+    const raw = structuredClone(seed.getSnapshot()) as RawState;
+    const originalSidecar = {
+      priorEvidence: { rawQuarantine: [{ originalPrivateEvidence: 'keep-this-sidecar' }], invalidDispatchRecords: [] },
+      rawQuarantine: [],
+      invalidDispatchRecords: [],
+    };
+    raw.dispatchRecoveryRawEvidence = originalSidecar;
+    store.value = raw;
+
+    const first = new AppControllerImpl(store, {}, { privacySession });
+    await first.load();
+    await first.saveNote({ transcript: 'Persist the generated orphan marker before observing another envelope.' });
+    expect(store.value?.dispatchRecordQuarantine).toHaveLength(1);
+
+    const markerCollision = {
+      reason: 'invalid_persisted_receipt',
+      quarantinedAt: '2026-10-14T01:00:00.000Z',
+      raw: { kind: 'orphan_dispatch_recovery_raw_evidence' },
+      extraPrivateEvidence: 'preserve-the-entire-envelope',
+    };
+    store.value!.dispatchRecordQuarantine = [markerCollision] as never;
+    store.value!.dispatchRecords = [{ id: 'later-invalid-receipt', laterEvidence: 'append-this-once' }] as never;
+
+    const observed = new AppControllerImpl(store, {}, { privacySession });
+    await observed.load();
+    await observed.saveNote({ transcript: 'Persist the collision and the later distinct evidence.' });
+    const evidence = JSON.stringify(store.value?.dispatchRecoveryRawEvidence);
+    expect(evidence).toContain('keep-this-sidecar');
+    expect(evidence).toContain('preserve-the-entire-envelope');
+    expect(evidence).toContain('append-this-once');
+
+    const restarted = new AppControllerImpl(store, {}, { privacySession });
+    await restarted.load();
+    await restarted.saveNote({ transcript: 'Repeated JSON reloads do not duplicate evidence.' });
+    expect(JSON.stringify(store.value?.dispatchRecoveryRawEvidence)).toBe(evidence);
+
+    const plan = await restarted.prepareDispatchRecovery();
+    expect((await restarted.confirmDispatchRecovery({ operationId: plan.operationId, confirmation: 'RETIRE ACTIONS' })).status).toBe('applied');
+    const archives = store.value?.dispatchRecoveryArchives as { entries: { sourceJson: string }[] };
+    const archived = archives.entries.map((entry) => entry.sourceJson).join('\n');
+    expect(archived).toContain('preserve-the-entire-envelope');
+    expect(archived).toContain('append-this-once');
+    expect(archived).toContain('keep-this-sidecar');
+  });
+
   it('archives malformed receipt evidence, preserves valid workspace state, and permanently retires its remote proposal', async () => {
     const store = new RecoveryStore();
     const seed = new AppControllerImpl(store);

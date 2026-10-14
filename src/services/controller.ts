@@ -897,6 +897,22 @@ function createProposalProvenance(input: {
 }
 
 type DispatchRecordQuarantineEntry = { reason: 'invalid_persisted_receipt'; quarantinedAt: string; raw: unknown };
+const ORPHAN_DISPATCH_RAW_EVIDENCE_MARKER = Object.freeze({ kind: 'orphan_dispatch_recovery_raw_evidence' as const });
+function isCanonicalDispatchQuarantineWrapper(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const row = value as Record<string, unknown>;
+  const keys = Object.keys(row).sort();
+  if (keys.length !== 3 || keys[0] !== 'quarantinedAt' || keys[1] !== 'raw' || keys[2] !== 'reason' || row.reason !== 'invalid_persisted_receipt') return false;
+  try {
+    validateRecoveryIso(row.quarantinedAt, 'Dispatch quarantine time');
+    return true;
+  } catch {
+    return false;
+  }
+}
+function isOrphanDispatchRawEvidenceMarkerQuarantine(value: unknown): boolean {
+  return isCanonicalDispatchQuarantineWrapper(value) && stableJson(value.raw) === stableJson(ORPHAN_DISPATCH_RAW_EVIDENCE_MARKER);
+}
 type NormalizedLoadedState = AppState & {
   dispatchRecordQuarantine?: DispatchRecordQuarantineEntry[];
   dispatchRecoveryRawEvidence?: unknown;
@@ -1116,6 +1132,10 @@ function normalizeLoadedState(value: unknown): NormalizedLoadedState {
     invalidDispatchRecords.push(clone(raw.dispatchRecords));
     dispatchRecordQuarantine.push({ reason: 'invalid_persisted_receipt', quarantinedAt: now(), raw: raw.dispatchRecords });
   }
+  const hasDispatchRecoveryRawEvidence = Object.prototype.hasOwnProperty.call(raw, 'dispatchRecoveryRawEvidence');
+  if (hasDispatchRecoveryRawEvidence && dispatchRecordQuarantine.length === 0 && invalidDispatchRecords.length === 0) {
+    dispatchRecordQuarantine.push({ reason: 'invalid_persisted_receipt', quarantinedAt: now(), raw: clone(ORPHAN_DISPATCH_RAW_EVIDENCE_MARKER) });
+  }
   const recordIds = new Set(dispatchRecords.map((record) => record.id));
   for (const proposal of proposals) {
     if (proposal.dispatchRecordId && !recordIds.has(proposal.dispatchRecordId)) proposal.dispatchRecordId = undefined;
@@ -1169,12 +1189,21 @@ function normalizeLoadedState(value: unknown): NormalizedLoadedState {
           invalidDispatchRecords,
         };
         const previousEvidence = raw.dispatchRecoveryRawEvidence;
-        if (previousEvidence === undefined || !Object.prototype.hasOwnProperty.call(raw, 'dispatchRecordQuarantine') && !invalidDispatchRecords.length) {
-          return { dispatchRecoveryRawEvidence: clone(previousEvidence ?? currentEvidence) };
+        const rawQuarantine = raw.dispatchRecordQuarantine;
+        const filteredRawQuarantine = Array.isArray(rawQuarantine) && hasDispatchRecoveryRawEvidence
+          ? rawQuarantine.filter((item) => !isOrphanDispatchRawEvidenceMarkerQuarantine(item))
+          : rawQuarantine;
+        const evidenceForCurrentObservation = {
+          ...(Object.prototype.hasOwnProperty.call(raw, 'dispatchRecordQuarantine') ? { rawQuarantine: clone(filteredRawQuarantine) } : {}),
+          invalidDispatchRecords,
+        };
+        if (hasDispatchRecoveryRawEvidence && Array.isArray(rawQuarantine) && Array.isArray(filteredRawQuarantine) && filteredRawQuarantine.length === 0 && !invalidDispatchRecords.length) {
+          return { dispatchRecoveryRawEvidence: clone(previousEvidence !== undefined ? previousEvidence : currentEvidence) };
         }
-        const rawItems = (value: unknown, observationList = false): unknown[] => observationList && Array.isArray(value) ? clone(value) : Array.isArray(value) && value.length > 0 && value.every((item) =>
-          item && typeof item === 'object' && !Array.isArray(item) && Object.prototype.hasOwnProperty.call(item, 'raw') &&
-          typeof (item as Record<string, unknown>).reason === 'string' && typeof (item as Record<string, unknown>).quarantinedAt === 'string')
+        if (previousEvidence === undefined || !Object.prototype.hasOwnProperty.call(raw, 'dispatchRecordQuarantine') && !invalidDispatchRecords.length) {
+          return { dispatchRecoveryRawEvidence: clone(previousEvidence !== undefined ? previousEvidence : currentEvidence) };
+        }
+        const rawItems = (value: unknown, observationList = false): unknown[] => observationList && Array.isArray(value) ? clone(value) : Array.isArray(value) && value.length > 0 && value.every(isCanonicalDispatchQuarantineWrapper)
           ? value.map((item) => clone((item as Record<string, unknown>).raw)) : value === undefined ? [] : [clone(value)];
         const observationSources = (evidence: unknown): unknown[] | undefined => {
           const sources: unknown[] = [];
@@ -1191,7 +1220,7 @@ function normalizeLoadedState(value: unknown): NormalizedLoadedState {
           }
           return found ? sources : undefined;
         };
-        const currentSources = [...rawItems(currentEvidence.rawQuarantine), ...clone(currentEvidence.invalidDispatchRecords)];
+        const currentSources = [...rawItems(evidenceForCurrentObservation.rawQuarantine), ...clone(evidenceForCurrentObservation.invalidDispatchRecords)];
         const previousSources = observationSources(previousEvidence);
         if (previousSources) {
           const remaining = new Map<string, number>();
@@ -1210,7 +1239,7 @@ function normalizeLoadedState(value: unknown): NormalizedLoadedState {
           const nextEvidence = { priorEvidence: clone(previousEvidence), rawQuarantine: newSources, invalidDispatchRecords: [] };
           return { dispatchRecoveryRawEvidence: nextEvidence };
         }
-        return { dispatchRecoveryRawEvidence: { priorEvidence: clone(previousEvidence), ...currentEvidence } };
+        return { dispatchRecoveryRawEvidence: { priorEvidence: clone(previousEvidence), ...evidenceForCurrentObservation } };
       })() : {}),
     ...(Object.prototype.hasOwnProperty.call(raw, 'dispatchRecoveryArchives') ? { dispatchRecoveryArchives: clone((raw as Record<string, unknown>).dispatchRecoveryArchives) } : {}),
     ...(dispatchRecordQuarantine.length ? { dispatchRecoveryStatus: {
@@ -3828,6 +3857,7 @@ export class AppControllerImpl implements AppController {
   private assertDispatchRecoveryProposalAllowed(proposal: Proposal): void {
     if (!isPotentialRemoteProposal(proposal)) return;
     if (proposal.dispatchRecoveryRetired) throw new Error('This external action was retired during dispatch recovery and is permanently read-only.');
+    if (this.dispatchRecordQuarantine.length) throw new Error('Dispatch history failed integrity validation. External writes are disabled until recovery.');
     if (this.dispatchRecoveryFencesAction(proposal.sourceActionKey)) throw new Error('This source action is retired in dispatch recovery history and cannot be approved or executed again.');
   }
 
@@ -3945,8 +3975,7 @@ export class AppControllerImpl implements AppController {
         const previous = this.currentDispatchRecoveryArchives();
         await this.compileDispatchRecoveryAuthority(previous, capturedState, generation);
         if (previous.entries.length >= DISPATCH_RECOVERY_MAX_ARCHIVES) throw new Error('archive_full');
-        const quarantined = this.dispatchRecoveryRawEvidence && typeof this.dispatchRecoveryRawEvidence === 'object'
-          ? clone(this.dispatchRecoveryRawEvidence) as Record<string, unknown> : {};
+        const quarantined = this.dispatchRecoveryRawEvidence === undefined ? {} : clone(this.dispatchRecoveryRawEvidence);
         const proposals = capturedState.proposals.filter(isRecoveryRemoteProposal);
         const trustedRemoteProposals = proposals.map((proposal) => ({
           proposalId: proposal.id, kind: proposal.kind, status: proposal.status,
