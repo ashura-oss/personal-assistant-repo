@@ -1,9 +1,32 @@
+import type { ChatKnowledgeSelectionBinding } from './workspaceChatDisplayTypes';
+
 export type AcceptedChatSubmission = Readonly<{
   kind: 'accepted';
   conversationId: string;
   turnId: string;
   jobId: string;
 }>;
+
+export type ChatSendAttempt = Readonly<{
+  attemptId: number;
+  conversationId: string;
+  ownerGeneration: number;
+  text: string;
+  knowledgeSelection: readonly ChatKnowledgeSelectionBinding[];
+}>;
+
+export type ChatSendInspectionResult =
+  | Readonly<{ kind: 'accepted'; submission: AcceptedChatSubmission }>
+  | Readonly<{ kind: 'not_started' }>
+  | Readonly<{ kind: 'unresolved' }>;
+
+/** Parent proof that the controller entry point was never invoked; safe for an explicit user retry. */
+export class ChatSubmissionNotStartedError extends Error {
+  constructor(message = 'Chat submission did not start. Review the message and try again.') {
+    super(message);
+    this.name = 'ChatSubmissionNotStartedError';
+  }
+}
 
 export function isAcceptedChatSubmission(value: unknown): value is AcceptedChatSubmission {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;

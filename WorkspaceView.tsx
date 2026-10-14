@@ -53,8 +53,10 @@ import { AssistantBatchHistorySection } from "./src/ui/AssistantBatchHistorySect
 import { ChatSection } from "./src/ui/ChatSection";
 import { safeChatMemoryEvidenceLabels } from "./src/ui/chatMemoryReview";
 import { prepareKnowledgeSuggestionReviewWithPrivacy } from "./src/ui/knowledgeSuggestionReviewOwnership";
-import { isAcceptedChatSubmission, runAcceptedChatSubmission } from "./src/ui/chatSubmission";
+import { ChatSubmissionNotStartedError, isAcceptedChatSubmission, runAcceptedChatSubmission } from "./src/ui/chatSubmission";
 import type { ChatConversationDTO, ChatTranscriptTransferPlan, ChatTurnDTO } from "./src/chat/types";
+import { buildCurrentChatTurnCommand, captureChatSubmissionOwner, chatSubmissionOwnerIsCurrent, resolveChatKnowledgeSelection, type ChatSubmissionRuntime } from "./src/ui/chatKnowledgeContext";
+import { projectChatKnowledgeChoices, type ChatKnowledgeSelectionBinding } from "./src/ui/workspaceChatDisplayTypes";
 import { VoiceChatTransferOwnership } from "./src/ui/voiceChatTransferOwnership";
 import { createSpeechTranscriptionAdmission, runExplicitSpeechTranscriptionAction } from "./src/ui/speechTranscriptionAction";
 import type { AssistantBatchJobDTO } from "./src/services/openRouterBatchJobs";
@@ -1914,31 +1916,78 @@ export function WorkspaceView({ controller, credentials, platform, workspaceGene
     if (!chatTranscriptTransferOwnershipRef.current?.getPlan(expectedPlanId)) return;
     cancelVoiceTransferPlan(expectedPlanId);
   }, [cancelVoiceTransferPlan]);
-  const chatSend = useCallback(async (text: string) => {
-    return runAcceptedChatSubmission(run, async () => {
+  const chatSubmissionRuntimeRef = useRef<ChatSubmissionRuntime>({
+    controller, selectedConversationId: selectedChatConversationId, workspaceGeneration, privacyOwner: session ?? null,
+    ready: startupReady && !loading, blocked: chatAppBlocked || privacyReviewOpen || privacyOutcomeUnknown, mounted: false,
+  });
+  useLayoutEffect(() => {
+    chatSubmissionRuntimeRef.current = {
+      controller, selectedConversationId: selectedChatConversationId, workspaceGeneration, privacyOwner: session ?? null,
+      ready: startupReady && !loading, blocked: chatAppBlocked || privacyReviewOpen || privacyOutcomeUnknown, mounted: workspaceMountedRef.current,
+    };
+  }, [chatAppBlocked, controller, loading, privacyOutcomeUnknown, privacyReviewOpen, selectedChatConversationId, session, startupReady, workspaceGeneration]);
+  const chatSend = useCallback(async (text: string, contextBindings: readonly ChatKnowledgeSelectionBinding[] = []) => {
+    let controllerSubmitInvoked = false;
+    let predispatchError: unknown;
+    try {
+      const action = async () => {
+        try {
+      if (!workspaceMountedRef.current) throw new Error("The workspace closed before the message could be submitted.");
       if (!isOpenRouterChatDemo && !productionChatSubmissionEnabled) {
         throw new Error("Chat submission is temporarily disabled.");
       }
-      if (!isOpenRouterChatDemo && (state.settings.mode !== "provider" || state.settings.llmProvider !== "openrouter")) {
+      const initialRuntime = chatSubmissionRuntimeRef.current;
+      const owner = captureChatSubmissionOwner(initialRuntime);
+      if (!owner || initialRuntime.controller !== controller) throw new Error("Chat changed before the message could be submitted. Review the conversation and try again.");
+      const initialState = controller.getSnapshot();
+      if (!(initialState.assistantChatConversations ?? []).some((item) => item.id === owner.conversationId)) throw new Error("The selected conversation is no longer available.");
+      const initialKnowledgeSelection = resolveChatKnowledgeSelection(initialState.knowledge, contextBindings);
+      if (!isOpenRouterChatDemo && (initialState.settings.mode !== "provider" || initialState.settings.llmProvider !== "openrouter")) {
         openSettings();
         throw new Error("Choose OpenRouter in Provider mode before sending a chat message.");
       }
       if (!isOpenRouterChatDemo) {
+        if (!workspaceMountedRef.current) throw new Error("The workspace closed before Chat access could be checked.");
         const credentialStatus = await credentials.getCredentials();
+        if (!workspaceMountedRef.current) throw new Error("The workspace closed while Chat access was being checked.");
         if (credentialStatus.openRouterConfigured !== true) {
           openSettings();
           throw new Error("Save an OpenRouter API key in Settings before sending a chat message.");
         }
       }
-      if (!selectedChatConversation) throw new Error("Create or select a conversation before sending a message.");
-      const accepted = await controller.submitChatTurn({ conversationId: selectedChatConversation.id, text });
+      const currentRuntime = chatSubmissionRuntimeRef.current;
+      const currentState = controller.getSnapshot();
+      const command = buildCurrentChatTurnCommand(owner, currentRuntime, currentState, text, contextBindings);
+      const knowledgeSelection = command.knowledgeSelection ?? [];
+      if (JSON.stringify(knowledgeSelection) !== JSON.stringify(initialKnowledgeSelection)) throw new Error("The selected context changed while checking Chat access. Review it and try again.");
+      if (!isOpenRouterChatDemo && (currentState.settings.mode !== "provider" || currentState.settings.llmProvider !== "openrouter")) {
+        openSettings();
+        throw new Error("Choose OpenRouter in Provider mode before sending a chat message.");
+      }
+      if (!workspaceMountedRef.current || !chatSubmissionOwnerIsCurrent(owner, chatSubmissionRuntimeRef.current)) {
+        throw new Error("The workspace or conversation changed before Chat could be submitted.");
+      }
+      controllerSubmitInvoked = true;
+      const accepted = await controller.submitChatTurn({ conversationId: command.conversationId, text: command.text, ...(knowledgeSelection.length ? { knowledgeSelection: knowledgeSelection.map((item) => ({ ...item })) } : {}) });
       if (!accepted || accepted.kind !== "accepted") throw new Error("The chat request was not explicitly accepted.");
-      setNotice(isOpenRouterChatDemo
+      if (chatSubmissionOwnerIsCurrent(owner, chatSubmissionRuntimeRef.current)) setNotice(isOpenRouterChatDemo
         ? "SAMPLE · Simulated message saved. Its request status is shown below. No provider or external service was contacted."
         : "Message saved. Its request status is shown below.");
       return accepted;
-    });
-  }, [controller, credentials, openSettings, run, selectedChatConversation, state.settings.llmProvider, state.settings.mode]);
+        } catch (error) {
+          if (!controllerSubmitInvoked) predispatchError = error;
+          throw error;
+        }
+      };
+      return await runAcceptedChatSubmission(run, action);
+    } catch (error) {
+      if (!controllerSubmitInvoked) {
+        const cause = predispatchError ?? error;
+        throw new ChatSubmissionNotStartedError(cause instanceof Error ? cause.message : "Chat submission did not start. Review the message and try again.");
+      }
+      throw error;
+    }
+  }, [controller, credentials, openSettings, run]);
   const chatRefineTurn = useCallback(async (request: {
     conversationId: string;
     parentTurnId: string;
@@ -3789,6 +3838,7 @@ export function WorkspaceView({ controller, credentials, platform, workspaceGene
                 disabledReason={chatDisabledReason}
                 recoveryMessage={chatRecoveryMessage}
                 samplePreview={isOpenRouterChatDemo}
+                knowledgeChoices={projectChatKnowledgeChoices(state.knowledge)}
                 onDeleteReviewChange={(open) => {
                   setChatDeleteReviewOpen(open);
                   setChatInteraction(open);

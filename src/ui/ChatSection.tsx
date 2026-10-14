@@ -3,11 +3,11 @@ import { KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView, Text, Tex
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { AssistantBatchJobCard } from './AssistantBatchJobCard';
 import { Button } from './primitives';
-import { isAcceptedChatSubmission } from './chatSubmission';
+import { ChatSubmissionNotStartedError, isAcceptedChatSubmission, type ChatSendAttempt, type ChatSendInspectionResult } from './chatSubmission';
 import { chatMemoryReviewSuggestionIds } from './chatMemoryReview';
 import { C, s } from './theme';
 import type { MoreComputeReviewActions } from './MoreComputeReview';
-import type { WorkspaceChatConversationDisplay, WorkspaceChatTurnDisplay } from './workspaceChatDisplayTypes';
+import type { ChatKnowledgeChoiceDisplay, ChatKnowledgeSelectionBinding, WorkspaceChatConversationDisplay, WorkspaceChatTurnDisplay } from './workspaceChatDisplayTypes';
 
 export type ChatConversation = WorkspaceChatConversationDisplay;
 export type ChatTurn = WorkspaceChatTurnDisplay;
@@ -31,12 +31,14 @@ export type ChatSectionProps = {
   recoveryMessage?: string;
   disabledReason?: string;
   samplePreview?: boolean;
+  knowledgeChoices?: readonly ChatKnowledgeChoiceDisplay[];
   onDeleteReviewChange?: (open: boolean) => void;
   onInteractionLockChange?: (active: boolean) => void;
   onSelectConversation: (conversationId: string) => void;
   onDeleteConversation?: (conversationId: string) => Promise<unknown> | unknown;
   onCreateConversation: () => void;
-  onSend: (text: string) => Promise<unknown>;
+  onSend: (text: string, knowledgeSelection?: readonly ChatKnowledgeSelectionBinding[]) => Promise<unknown>;
+  onInspectUnconfirmedSend?: (attempt: ChatSendAttempt) => Promise<ChatSendInspectionResult>;
   onOpenActions: (noteId: string) => void;
   onCheckJob: (jobId: string) => Promise<unknown> | unknown;
   onRetryJobCleanup: (jobId: string) => Promise<unknown> | unknown;
@@ -68,6 +70,7 @@ function ConversationButton({
   selected,
   disabled,
   sendLock,
+  unconfirmedSendRef,
   deleteLock,
   refinementLock,
   onSelect,
@@ -76,6 +79,7 @@ function ConversationButton({
   selected: boolean;
   disabled: boolean;
   sendLock: React.RefObject<boolean>;
+  unconfirmedSendRef: React.RefObject<ChatSendAttempt | undefined>;
   deleteLock: React.RefObject<boolean>;
   refinementLock: React.RefObject<boolean>;
   onSelect: (conversationId: string) => void;
@@ -86,7 +90,7 @@ function ConversationButton({
       accessibilityState={{ selected }}
       accessibilityLabel={`Open conversation ${conversation.title}`}
       disabled={disabled}
-      onPress={() => { if (!disabled && !sendLock.current && !deleteLock.current && !refinementLock.current) onSelect(conversation.id); }}
+      onPress={() => { if (!disabled && !unconfirmedSendRef.current && !sendLock.current && !deleteLock.current && !refinementLock.current) onSelect(conversation.id); }}
       style={[styles.conversation, selected && styles.conversationSelected]}
     >
       <Text numberOfLines={2} style={styles.conversationTitle}>{conversation.title}</Text>
@@ -131,12 +135,14 @@ export function ChatSection({
   recoveryMessage,
   disabledReason,
   samplePreview = false,
+  knowledgeChoices = [],
   onDeleteReviewChange,
   onInteractionLockChange,
   onSelectConversation,
   onDeleteConversation,
   onCreateConversation,
   onSend,
+  onInspectUnconfirmedSend,
   onOpenActions,
   onCheckJob,
   onRetryJobCleanup,
@@ -145,7 +151,12 @@ export function ChatSection({
   moreComputeActions,
 }: ChatSectionProps) {
   const [draft, setDraft] = useState('');
+  const [selectedKnowledge, setSelectedKnowledge] = useState<readonly ChatKnowledgeSelectionBinding[]>([]);
+  const selectedKnowledgeRef = useRef<readonly ChatKnowledgeSelectionBinding[]>([]);
+  const [knowledgeNotice, setKnowledgeNotice] = useState<string>();
   const [sending, setSending] = useState(false);
+  const [unconfirmedSend, setUnconfirmedSend] = useState<ChatSendAttempt | undefined>(undefined);
+  const [inspectingSend, setInspectingSend] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [sendError, setSendError] = useState<string>();
   const [deleteReviewOpen, setDeleteReviewOpen] = useState(false);
@@ -156,6 +167,10 @@ export function ChatSection({
   const [refinementError, setRefinementError] = useState<string>();
   const [refinementNotice, setRefinementNotice] = useState<string>();
   const sendLock = useRef(false);
+  const unconfirmedSendRef = useRef<ChatSendAttempt | undefined>(undefined);
+  const inspectLock = useRef(false);
+  const sendAttemptSequence = useRef(0);
+  const sendOwnerRef = useRef({ conversationId: selectedConversationId, generation: 0 });
   const deleteLock = useRef(false);
   const deleteOperationLock = useRef(false);
   const refinementLock = useRef(false);
@@ -168,8 +183,27 @@ export function ChatSection({
   const interactionLock = useRef(false);
   const callbacks = useRef({ onDeleteReviewChange, onInteractionLockChange });
   const trimmedDraft = draft.trim();
-  const navigationBlocked = busy || sending || deleting || refining || deleteReviewOpen || Boolean(refinementReview) || reviewBlocked || Boolean(recoveryMessage);
+  const navigationBlocked = busy || sending || Boolean(unconfirmedSend) || deleting || refining || deleteReviewOpen || Boolean(refinementReview) || reviewBlocked || Boolean(recoveryMessage);
   const selectedConversation = conversations.find((conversation) => conversation.id === selectedConversationId);
+  useLayoutEffect(() => {
+    const owner = sendOwnerRef.current;
+    const conversationChanged = owner.conversationId !== selectedConversationId;
+    const choiceInvalidated = selectedKnowledgeRef.current.some((binding) => {
+      const choice = knowledgeChoices.find((item) => item.kind === binding.kind && item.id === binding.id);
+      return !choice || Boolean(choice.archivedAt) || choice.revision !== binding.revision;
+    });
+    let generation = owner.generation;
+    if (conversationChanged) generation += 1;
+    if (conversationChanged || choiceInvalidated) {
+      if (!unconfirmedSendRef.current) {
+        selectedKnowledgeRef.current = [];
+        setSelectedKnowledge([]);
+        setKnowledgeNotice(undefined);
+      }
+      setSendError(undefined);
+    }
+    sendOwnerRef.current = { conversationId: selectedConversationId, generation };
+  }, [knowledgeChoices, selectedConversationId]);
   useEffect(() => {
     if (focusTurnId && turns.some((turn) => turn.id === focusTurnId)) messagesScrollRef.current?.scrollToEnd({ animated: true });
   }, [focusTurnId, turns]);
@@ -261,7 +295,7 @@ export function ChatSection({
 
   const openRefinementReview = (parentTurn: ChatTurn) => {
     if (!enabled || !onRefineTurn || !selectedConversation || !parentTurn.reply || !parentTurn.job?.id || parentTurn.job.status !== 'completed' ||
-        busy || reviewBlocked || recoveryMessage ||
+        busy || reviewBlocked || recoveryMessage || unconfirmedSendRef.current ||
         deleteReviewOpen || sendLock.current || deleteLock.current || refinementLock.current || refinementReviewLock.current) return;
     const generation = refinementGeneration.current + 1;
     refinementGeneration.current = generation;
@@ -283,7 +317,7 @@ export function ChatSection({
       ?.turns.find((turn) => turn.id === review?.parentTurnId);
     if (!review || refinementReviewRef.current !== review || !parent || selectedConversationId !== review.conversationId || parent.job?.id !== review.parentJobId || parent.job.status !== 'completed' ||
         !parent.reply || !enabled || !onRefineTurn || busy || reviewBlocked ||
-        recoveryMessage || refining || refinementLock.current || deleteReviewOpen || sendLock.current || deleteLock.current) return;
+        recoveryMessage || refining || refinementLock.current || deleteReviewOpen || unconfirmedSendRef.current || sendLock.current || deleteLock.current) return;
     refinementLock.current = true;
     setRefining(true);
     setRefinementError(undefined);
@@ -312,28 +346,101 @@ export function ChatSection({
   };
 
   const send = async () => {
-    if (!enabled || !selectedConversation || busy || reviewBlocked || Boolean(recoveryMessage) || sendLock.current || deleteLock.current || refinementReviewLock.current || refinementLock.current || !trimmedDraft) return;
+    if (!enabled || !selectedConversation || busy || reviewBlocked || Boolean(recoveryMessage) || unconfirmedSendRef.current || sendLock.current || deleteLock.current || refinementReviewLock.current || refinementLock.current || !trimmedDraft) return;
+    const sendOwner = sendOwnerRef.current;
+    if (sendOwner.conversationId !== selectedConversation.id) return;
+    const capturedKnowledge = Object.freeze(selectedKnowledgeRef.current.map((binding) => Object.freeze({ kind: binding.kind, id: binding.id, revision: binding.revision })));
+    const available = new Map(knowledgeChoices.filter((choice) => !choice.archivedAt).map((choice) => [`${choice.kind}:${choice.id}`, choice.revision] as const));
+    if (capturedKnowledge.some((binding) => available.get(`${binding.kind}:${binding.id}`) !== binding.revision)) {
+      selectedKnowledgeRef.current = [];
+      setSelectedKnowledge([]);
+      setKnowledgeNotice(undefined);
+      setSendError('A selected person or project changed. Review the current context before sending again.');
+      sendOwnerRef.current = { ...sendOwner, generation: sendOwner.generation + 1 };
+      return;
+    }
+    const attempt: ChatSendAttempt = Object.freeze({
+      attemptId: ++sendAttemptSequence.current,
+      conversationId: selectedConversation.id,
+      ownerGeneration: sendOwner.generation,
+      text: trimmedDraft,
+      knowledgeSelection: capturedKnowledge,
+    });
     sendLock.current = true;
     setSending(true);
     notifyInteractionLock(true);
     setSendError(undefined);
     try {
-      const result = await onSend(trimmedDraft);
+      const result = capturedKnowledge.length ? await onSend(trimmedDraft, capturedKnowledge) : await onSend(trimmedDraft);
       if (!isAcceptedChatSubmission(result) || result.conversationId !== selectedConversation.id) {
         throw new Error('Submission was not explicitly accepted.');
       }
+      const currentOwner = sendOwnerRef.current;
+      if (currentOwner.generation !== sendOwner.generation || currentOwner.conversationId !== selectedConversation.id) {
+        throw new Error('The conversation or selected context changed while sending.');
+      }
       setDraft('');
-    } catch {
-      setSendError('Could not confirm submission. Check saved messages and request status before sending again. Your draft is still here.');
+      if (capturedKnowledge.length) {
+        selectedKnowledgeRef.current = [];
+        setSelectedKnowledge([]);
+        setKnowledgeNotice(attempt.knowledgeSelection.length ? 'Selected people and projects context was sent with this message.' : undefined);
+        sendOwnerRef.current = { ...currentOwner, generation: currentOwner.generation + 1 };
+      }
+    } catch (error) {
+      if (error instanceof ChatSubmissionNotStartedError) {
+        setSendError(`${error.message} Your draft and selected context are still here.`);
+      } else {
+        unconfirmedSendRef.current = attempt;
+        setUnconfirmedSend(attempt);
+        selectedKnowledgeRef.current = attempt.knowledgeSelection;
+        setSelectedKnowledge(attempt.knowledgeSelection);
+        setSendError('The submission outcome is unknown. Your original draft and context are held here. Inspect this exact request or check saved history before sending again.');
+      }
     } finally {
       setSending(false);
       sendLock.current = false;
-      notifyInteractionLock(false);
+      if (!unconfirmedSendRef.current) notifyInteractionLock(false);
+    }
+  };
+
+  const inspectUnconfirmedSend = async () => {
+    const attempt = unconfirmedSendRef.current;
+    if (!attempt || !onInspectUnconfirmedSend || inspectLock.current) return;
+    inspectLock.current = true;
+    setInspectingSend(true);
+    try {
+      const result = await onInspectUnconfirmedSend(attempt);
+      if (unconfirmedSendRef.current !== attempt || !mounted.current) return;
+      const currentOwner = sendOwnerRef.current;
+      const sameOwner = selectedConversationId === attempt.conversationId && currentOwner.conversationId === attempt.conversationId && currentOwner.generation === attempt.ownerGeneration;
+      if (result?.kind === 'not_started' && sameOwner) {
+        unconfirmedSendRef.current = undefined;
+        setUnconfirmedSend(undefined);
+        setSendError('The original request did not start. Your draft and context are ready for an explicit retry.');
+        notifyInteractionLock(false);
+      } else if (result?.kind === 'accepted' && isAcceptedChatSubmission(result.submission) && result.submission.conversationId === attempt.conversationId && sameOwner) {
+        unconfirmedSendRef.current = undefined;
+        setUnconfirmedSend(undefined);
+        setDraft((current) => current.trim() === attempt.text ? '' : current);
+        selectedKnowledgeRef.current = [];
+        setSelectedKnowledge([]);
+        setKnowledgeNotice('Selected people and projects context was sent with this message.');
+        sendOwnerRef.current = { ...currentOwner, generation: currentOwner.generation + 1 };
+        setSendError(undefined);
+        notifyInteractionLock(false);
+      } else {
+        setSendError('The exact submission is still unresolved. Your draft and context remain held; check saved history or refresh the workspace before sending again.');
+      }
+    } catch {
+      if (unconfirmedSendRef.current === attempt && mounted.current) setSendError('Could not verify the exact submission. Your draft and context remain held; check saved history or refresh the workspace before sending again.');
+    } finally {
+      inspectLock.current = false;
+      if (mounted.current) setInspectingSend(false);
     }
   };
 
   const openDeleteReview = () => {
-    if (!selectedConversation || !onDeleteConversation || busy || reviewBlocked || Boolean(recoveryMessage) || sendLock.current || deleteLock.current || refinementReviewLock.current || refinementLock.current) return;
+    if (!selectedConversation || !onDeleteConversation || busy || reviewBlocked || Boolean(recoveryMessage) || unconfirmedSendRef.current || sendLock.current || deleteLock.current || refinementReviewLock.current || refinementLock.current) return;
     deleteLock.current = true;
     deleteReviewOpenRef.current = true;
     setDeleteReviewConversationId(selectedConversation.id);
@@ -354,7 +461,7 @@ export function ChatSection({
 
   const confirmDeleteSelectedConversation = async () => {
     const reviewConversation = conversations.find((conversation) => conversation.id === deleteReviewConversationId);
-    if (!reviewConversation || selectedConversationId !== deleteReviewConversationId || !onDeleteConversation || busy || reviewBlocked || Boolean(recoveryMessage) || sendLock.current || refinementReviewLock.current || refinementLock.current || deleting || deleteOperationLock.current || !deleteLock.current || !deleteReviewOpenRef.current) return;
+    if (!reviewConversation || selectedConversationId !== deleteReviewConversationId || !onDeleteConversation || busy || reviewBlocked || Boolean(recoveryMessage) || unconfirmedSendRef.current || sendLock.current || refinementReviewLock.current || refinementLock.current || deleting || deleteOperationLock.current || !deleteLock.current || !deleteReviewOpenRef.current) return;
     deleteLock.current = true;
     deleteOperationLock.current = true;
     setDeleting(true);
@@ -392,12 +499,17 @@ export function ChatSection({
             <Text style={s.h1Small}>Queued chat</Text>
             <Text style={styles.copy}>Messages are submitted as Batch requests. Replies may be delayed; nothing checks or resubmits in the background.</Text>
           </View>
-          <Button label="New conversation" tone="quiet" disabled={navigationBlocked} onPress={() => { if (!busy && !sending && !deleting && !recoveryMessage && !sendLock.current && !deleteLock.current && !refinementReviewLock.current && !refinementLock.current) onCreateConversation(); }} />
+          <Button label="New conversation" tone="quiet" disabled={navigationBlocked} onPress={() => { if (!busy && !sending && !unconfirmedSendRef.current && !deleting && !recoveryMessage && !sendLock.current && !deleteLock.current && !refinementReviewLock.current && !refinementLock.current) onCreateConversation(); }} />
         </View>
 
         {samplePreview ? <Text style={styles.sampleBadge}>SAMPLE · Simulated Batch requests and replies. No provider or external service is contacted.</Text> : null}
         {!enabled && disabledReason ? <Text style={styles.notice}>{disabledReason}</Text> : null}
         {recoveryMessage ? <Text accessibilityRole="alert" style={styles.warning}>{recoveryMessage}</Text> : null}
+        {unconfirmedSend ? <View style={styles.warning}>
+          <Text style={styles.warning}>This exact message may already have been accepted. Sending, editing, and switching conversations are paused until its outcome is known.</Text>
+          {onInspectUnconfirmedSend ? <Button label={inspectingSend ? 'Checking exact submission…' : 'Check submission status'} tone="quiet" disabled={inspectingSend} onPress={() => { void inspectUnconfirmedSend(); }} />
+            : <Text style={styles.meta}>Check saved history or refresh the workspace to verify this request. The original draft and selected context are held here.</Text>}
+        </View> : null}
         {refinementNotice ? <Text accessibilityLiveRegion="polite" style={styles.notice}>{refinementNotice}</Text> : null}
 
         {conversations.length ? (
@@ -409,6 +521,7 @@ export function ChatSection({
                 selected={conversation.id === selectedConversationId}
                 disabled={navigationBlocked}
                 sendLock={sendLock}
+                unconfirmedSendRef={unconfirmedSendRef}
                 deleteLock={deleteLock}
                 refinementLock={refinementReviewLock}
                 onSelect={onSelectConversation}
@@ -423,9 +536,35 @@ export function ChatSection({
           <Button
             label={deleting ? 'Deleting conversation…' : 'Delete conversation'}
             tone="quiet"
-            disabled={busy || sending || deleting || deleteReviewOpen || Boolean(recoveryMessage)}
+            disabled={navigationBlocked || deleting}
             onPress={openDeleteReview}
           />
+        ) : null}
+
+        {knowledgeChoices.some((choice) => !choice.archivedAt) ? (
+          <View style={styles.knowledgeContext}>
+            <Text style={styles.composerLabel}>Optional context · People and projects</Text>
+            <Text style={styles.meta}>Choose saved context to send with this message only. It does not change the conversation history.</Text>
+            {knowledgeChoices.filter((choice) => !choice.archivedAt).map((choice) => {
+              const selected = selectedKnowledge.some((item) => item.kind === choice.kind && item.id === choice.id && item.revision === choice.revision);
+              return <Pressable key={`${choice.kind}:${choice.id}`} accessibilityRole="checkbox" accessibilityState={{ checked: selected }} accessibilityLabel={`Include ${choice.kind} ${choice.name} in this message`} disabled={navigationBlocked}
+                onPress={() => {
+                  if (navigationBlocked || unconfirmedSendRef.current) return;
+                  const current = selectedKnowledgeRef.current;
+                  const exists = current.some((item) => item.kind === choice.kind && item.id === choice.id);
+                  const next = exists ? current.filter((item) => item.kind !== choice.kind || item.id !== choice.id)
+                    : [...current, { kind: choice.kind, id: choice.id, revision: choice.revision }];
+                  selectedKnowledgeRef.current = next;
+                  setSelectedKnowledge(next);
+                  setKnowledgeNotice(undefined);
+                  setSendError(undefined);
+                }} style={[styles.knowledgeChoice, selected && styles.knowledgeChoiceSelected]}>
+                <Text style={styles.meta}>{choice.kind === 'person' ? 'Person' : 'Project'} · {choice.name}{selected ? ' · Selected' : ''}</Text>
+              </Pressable>;
+            })}
+            {selectedKnowledge.length ? <Text style={styles.meta}>{selectedKnowledge.length} selected context item{selectedKnowledge.length === 1 ? '' : 's'} will be sent with this message only.</Text> : null}
+            {knowledgeNotice ? <Text accessibilityLiveRegion="polite" style={styles.notice}>{knowledgeNotice}</Text> : null}
+          </View>
         ) : null}
 
         <View style={styles.turnList} accessibilityLabel="Conversation messages">
@@ -509,18 +648,18 @@ export function ChatSection({
             accessibilityLabel="Chat message"
             accessibilityHint="Write a message, then choose Send."
             value={draft}
-            onChangeText={(value) => { setDraft(value); setSendError(undefined); }}
+                    onChangeText={(value) => { if (unconfirmedSendRef.current) return; setDraft(value); setSendError(undefined); }}
             placeholder="Ask a question or describe what you need…"
             placeholderTextColor={C.muted}
             multiline
-            editable={!busy && !sending && !deleting && !deleteReviewOpen && !reviewBlocked && !recoveryMessage}
+            editable={!busy && !sending && !unconfirmedSend && !deleting && !deleteReviewOpen && !reviewBlocked && !recoveryMessage}
             textAlignVertical="top"
             style={styles.input}
           />
           {sendError ? <Text accessibilityRole="alert" style={styles.warning}>{sendError}</Text> : null}
           <Button
             label={sending ? 'Submitting…' : 'Send'}
-            disabled={!enabled || !selectedConversation || busy || sending || deleting || deleteReviewOpen || reviewBlocked || Boolean(recoveryMessage) || !trimmedDraft}
+            disabled={!enabled || !selectedConversation || busy || sending || Boolean(unconfirmedSend) || deleting || deleteReviewOpen || reviewBlocked || Boolean(recoveryMessage) || !trimmedDraft}
             onPress={() => { void send(); }}
           />
         </View>
@@ -580,6 +719,9 @@ const styles = {
   clarification: { gap: 4, borderTopWidth: 1, borderTopColor: C.border, paddingTop: 8 },
   meta: { color: C.muted, fontSize: 11, lineHeight: 16 },
   composer: { padding: 13, gap: 9, borderWidth: 1, borderColor: C.border, borderRadius: 17, backgroundColor: C.card },
+  knowledgeContext: { padding: 13, gap: 8, borderWidth: 1, borderColor: C.border, borderRadius: 15, backgroundColor: C.card },
+  knowledgeChoice: { padding: 10, borderWidth: 1, borderColor: C.border, borderRadius: 11 },
+  knowledgeChoiceSelected: { borderColor: C.sage },
   composerLabel: { color: C.text, fontSize: 13, fontWeight: '600' as const },
   input: { minHeight: 96, maxHeight: 220, padding: 12, borderWidth: 1, borderColor: C.border, borderRadius: 12, color: C.text, backgroundColor: C.input, fontSize: 15, lineHeight: 22 },
   sampleBadge: { color: C.sage, backgroundColor: C.card, borderColor: C.sage, borderWidth: 1, borderRadius: 12, padding: 12, fontSize: 12, lineHeight: 18, fontWeight: '700' as const },

@@ -238,7 +238,7 @@ describe('ChatSection review and submission behavior', () => {
     const input = enterDraft('keep my draft');
     await act(async () => { button('Send')?.click(); await Promise.resolve(); });
     expect(input.value).toBe('keep my draft');
-    expect(host.textContent).toContain('Could not confirm submission');
+    expect(host.textContent).toContain('submission outcome is unknown');
     expect(props.onSend).toHaveBeenCalledWith('keep my draft');
   });
 
