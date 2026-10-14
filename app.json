@@ -3,6 +3,7 @@
     "name": "Still",
     "slug": "still-voice-assistant",
     "version": "0.1.0",
+    "icon": "./assets/still-icon.png",
     "orientation": "portrait",
     "scheme": "still",
     "userInterfaceStyle": "dark",
