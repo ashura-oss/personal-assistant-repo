@@ -56,12 +56,58 @@ type ReviewSheetProps = {
 };
 export function ReviewSheet(props: ReviewSheetProps) {
   if (!props.proposal) return null;
+  if (props.proposal.dispatchRecoveryRetired === true) {
+    return (
+      <RetiredProposalReview
+        proposal={props.proposal}
+        dispatchRecords={props.dispatchRecords}
+        onClose={props.onClose}
+      />
+    );
+  }
   return (
     <ReviewSheetContent
       key={`${props.proposal.id}:${props.proposal.revision}`}
       {...props}
       proposal={props.proposal}
     />
+  );
+}
+
+function RetiredProposalReview({ proposal, dispatchRecords, onClose }: {
+  proposal: Proposal;
+  dispatchRecords: DispatchRecord[];
+  onClose: () => void;
+}) {
+  const records = dispatchRecords.filter((record) => record.proposalId === proposal.id);
+  return (
+    <ScrollView style={s.sheetBody} contentContainerStyle={s.sheetContent} showsVerticalScrollIndicator={false}>
+      <View style={s.sheetTop}>
+        <Text style={s.kicker}>RETIRED ACTION · READ ONLY</Text>
+        <IconButton name="close" label="Close review" onPress={onClose} />
+      </View>
+      <Text style={s.h1Small}>{proposal.title}</Text>
+      <Text style={s.label}>{proposal.kind.toUpperCase()} · ORIGINAL STATUS {proposal.status.toUpperCase()}</Text>
+      <Text style={s.disclaimer}>This existing remote proposal was retired with damaged action history and is permanently read-only. Its original status and receipts are preserved.</Text>
+      {proposal.email ? (
+        <View style={s.analysisBlock}>
+          <Text style={s.analysisSource}>To · {proposal.email.to.join(", ") || "None"}</Text>
+          {proposal.email.cc.length ? <Text style={s.analysisSource}>Cc · {proposal.email.cc.join(", ")}</Text> : null}
+          {proposal.email.bcc.length ? <Text style={s.analysisSource}>Bcc · {proposal.email.bcc.join(", ")}</Text> : null}
+          <Text style={s.analysisSource}>Subject · {proposal.email.subject}</Text>
+          <Text selectable style={s.analysisText}>Message · {proposal.email.text}</Text>
+        </View>
+      ) : null}
+      {proposal.event ? (
+        <View style={s.analysisBlock}>
+          <Text style={s.analysisSource}>Event · {proposal.event.title}</Text>
+          <Text style={s.analysisSource}>{proposal.event.start} – {proposal.event.end} · {proposal.event.timeZone}</Text>
+          <Text style={s.analysisSource}>Invitation policy · {proposal.event.invitePolicy === "send" ? "send with event" : "no invitations"}</Text>
+        </View>
+      ) : null}
+      {records.length ? <DispatchHistory records={records} incomplete={proposal.dispatchHistoryIncomplete} title="Preserved receipts" /> : null}
+      <Button label="Close review" tone="quiet" onPress={onClose} />
+    </ScrollView>
   );
 }
 

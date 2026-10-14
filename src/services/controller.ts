@@ -51,6 +51,11 @@ import { buildLocalSourceSet, buildOfflinePreview, createSourceCatalog, validate
 import { isMailTextFresh, normalizeMailText, utf8Bytes, validSelectedMailTextSnapshot, MAX_SELECTED_MAIL_TEXT_BYTES, MAIL_TEXT_FRESHNESS_MS } from '../mailText';
 import { appendDispatchReconciliation, createDispatchRecord, recordDispatchOutcome, validateDispatchRecord } from '../dispatch';
 import type { DispatchOutcome, DispatchRecord, DispatchReconciliation } from '../dispatch';
+import {
+  DISPATCH_RECOVERY_MAX_ARCHIVES, DISPATCH_RECOVERY_MAX_SOURCE_BYTES, DISPATCH_RECOVERY_MAX_ARCHIVE_BYTES, DISPATCH_RECOVERY_TTL_MS,
+  dispatchRecoveryArchiveBytes, dispatchRecoveryEvidenceJson, emptyDispatchRecoveryArchiveState, validateDispatchRecoveryArchiveState,
+} from '../dispatch/recovery';
+import type { DispatchRecoveryArchiveEntry, DispatchRecoveryArchiveState, DispatchRecoveryPlan, DispatchRecoveryReceiptInspection, DispatchRecoveryResult, DispatchRecoveryStatus } from '../dispatch/recovery';
 import { evaluateProactive, type ProactiveMailSource, type ProactiveTrigger, type QuietHours } from '../proactive';
 import { computeProactiveNextCheckAt } from '../proactive/boundaries';
 import { buildProactiveMailSources, buildProactiveSources, proactiveStableValue, type ProactiveSourceHashMemo } from '../proactive/adapters';
@@ -484,6 +489,22 @@ function assertNoDuplicateDispatch(state: AppState, candidate: DispatchRecord): 
   if (legacyDuplicate) throw new Error('A legacy provider action for this source already exists. Its historical payload was not captured, so this action is blocked from duplicate dispatch.');
 }
 
+function isPotentialRemoteProposal(proposal: Proposal): boolean {
+  return proposal.kind === 'email' || (proposal.kind === 'event' && proposal.eventDestination?.kind !== 'device_calendar');
+}
+
+function isRecoveryRemoteProposal(proposal: Proposal): boolean {
+  return isPotentialRemoteProposal(proposal) && !(proposal.simulated && proposal.status === 'simulated');
+}
+
+function canonicalValidDispatchRecords(value: unknown): DispatchRecord[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((candidate) => {
+    try { validateDispatchRecord(candidate); return [clone(candidate) as DispatchRecord]; }
+    catch { return []; }
+  });
+}
+
 function identityKey(account: Account): string {
   const identity = account.identity;
   if (!identity?.providerNamespace || !identity.clientId || !identity.subject ||
@@ -878,6 +899,8 @@ function createProposalProvenance(input: {
 type DispatchRecordQuarantineEntry = { reason: 'invalid_persisted_receipt'; quarantinedAt: string; raw: unknown };
 type NormalizedLoadedState = AppState & {
   dispatchRecordQuarantine?: DispatchRecordQuarantineEntry[];
+  dispatchRecoveryRawEvidence?: unknown;
+  dispatchRecoveryArchives?: unknown;
   backupImportQuarantine?: unknown[];
   knowledgeQuarantine?: unknown[];
   reminderQuarantine?: unknown[];
@@ -889,7 +912,7 @@ type NormalizedLoadedState = AppState & {
 function normalizeLoadedState(value: unknown): NormalizedLoadedState {
   const defaults = initialState();
   if (!value || typeof value !== 'object') throw new Error('Saved app data is not a valid state snapshot. It was preserved for recovery.');
-  const raw = value as Partial<AppState> & { dispatchRecordQuarantine?: unknown; proactiveMailAlertQuarantine?: unknown };
+  const raw = value as Partial<AppState> & { dispatchRecordQuarantine?: unknown; dispatchRecoveryRawEvidence?: unknown; proactiveMailAlertQuarantine?: unknown };
   if (!Array.isArray(raw.notes) || !Array.isArray(raw.proposals) || !Array.isArray(raw.accounts) ||
       !Array.isArray(raw.calendars) || !Array.isArray(raw.documents) || !Array.isArray(raw.activity)) {
     throw new Error('Saved app data is incomplete. It was preserved for recovery.');
@@ -1077,6 +1100,7 @@ function normalizeLoadedState(value: unknown): NormalizedLoadedState {
     catch { deviceCalendars = defaults.deviceCalendars; deviceCalendarQuarantine.push(raw.deviceCalendars); }
   }
   const dispatchRecords: DispatchRecord[] = [];
+  const invalidDispatchRecords: unknown[] = [];
   const persistedDispatchQuarantine = raw.dispatchRecordQuarantine;
   const dispatchRecordQuarantine: DispatchRecordQuarantineEntry[] = Array.isArray(persistedDispatchQuarantine)
     ? persistedDispatchQuarantine.map((item) => item && typeof item === 'object' && 'raw' in item && 'quarantinedAt' in item
@@ -1086,8 +1110,11 @@ function normalizeLoadedState(value: unknown): NormalizedLoadedState {
   if (Array.isArray(raw.dispatchRecords)) {
     for (const value of raw.dispatchRecords) {
       try { dispatchRecords.push(validateDispatchRecord(value)); }
-      catch { dispatchRecordQuarantine.push({ reason: 'invalid_persisted_receipt', quarantinedAt: now(), raw: value }); }
+      catch { invalidDispatchRecords.push(clone(value)); dispatchRecordQuarantine.push({ reason: 'invalid_persisted_receipt', quarantinedAt: now(), raw: value }); }
     }
+  } else if (raw.dispatchRecords !== undefined) {
+    invalidDispatchRecords.push(clone(raw.dispatchRecords));
+    dispatchRecordQuarantine.push({ reason: 'invalid_persisted_receipt', quarantinedAt: now(), raw: raw.dispatchRecords });
   }
   const recordIds = new Set(dispatchRecords.map((record) => record.id));
   for (const proposal of proposals) {
@@ -1135,6 +1162,57 @@ function normalizeLoadedState(value: unknown): NormalizedLoadedState {
     proactive: emptyProactiveState(),
     dispatchRecords,
     dispatchRecordQuarantine,
+    ...(Object.prototype.hasOwnProperty.call(raw, 'dispatchRecoveryRawEvidence') || Object.prototype.hasOwnProperty.call(raw, 'dispatchRecordQuarantine') || invalidDispatchRecords.length
+      ? (() => {
+        const currentEvidence = {
+          ...(Object.prototype.hasOwnProperty.call(raw, 'dispatchRecordQuarantine') ? { rawQuarantine: clone(raw.dispatchRecordQuarantine) } : {}),
+          invalidDispatchRecords,
+        };
+        const previousEvidence = raw.dispatchRecoveryRawEvidence;
+        if (previousEvidence === undefined || !Object.prototype.hasOwnProperty.call(raw, 'dispatchRecordQuarantine') && !invalidDispatchRecords.length) {
+          return { dispatchRecoveryRawEvidence: clone(previousEvidence ?? currentEvidence) };
+        }
+        const rawItems = (value: unknown, observationList = false): unknown[] => observationList && Array.isArray(value) ? clone(value) : Array.isArray(value) && value.length > 0 && value.every((item) =>
+          item && typeof item === 'object' && !Array.isArray(item) && Object.prototype.hasOwnProperty.call(item, 'raw') &&
+          typeof (item as Record<string, unknown>).reason === 'string' && typeof (item as Record<string, unknown>).quarantinedAt === 'string')
+          ? value.map((item) => clone((item as Record<string, unknown>).raw)) : value === undefined ? [] : [clone(value)];
+        const observationSources = (evidence: unknown): unknown[] | undefined => {
+          const sources: unknown[] = [];
+          let found = false;
+          let current = evidence;
+          while (current && typeof current === 'object' && !Array.isArray(current)) {
+            const item = current as Record<string, unknown>;
+            if (Object.prototype.hasOwnProperty.call(item, 'rawQuarantine') && Array.isArray(item.invalidDispatchRecords)) {
+              found = true;
+              sources.push(...rawItems(item.rawQuarantine, Object.prototype.hasOwnProperty.call(item, 'priorEvidence')),
+                ...clone(item.invalidDispatchRecords));
+            }
+            current = item.priorEvidence;
+          }
+          return found ? sources : undefined;
+        };
+        const currentSources = [...rawItems(currentEvidence.rawQuarantine), ...clone(currentEvidence.invalidDispatchRecords)];
+        const previousSources = observationSources(previousEvidence);
+        if (previousSources) {
+          const remaining = new Map<string, number>();
+          for (const source of previousSources) {
+            const key = stableJson(source);
+            remaining.set(key, (remaining.get(key) ?? 0) + 1);
+          }
+          const newSources: unknown[] = [];
+          for (const source of currentSources) {
+            const key = stableJson(source);
+            const count = remaining.get(key) ?? 0;
+            if (count > 0) remaining.set(key, count - 1);
+            else newSources.push(source);
+          }
+          if (!newSources.length) return { dispatchRecoveryRawEvidence: clone(previousEvidence) };
+          const nextEvidence = { priorEvidence: clone(previousEvidence), rawQuarantine: newSources, invalidDispatchRecords: [] };
+          return { dispatchRecoveryRawEvidence: nextEvidence };
+        }
+        return { dispatchRecoveryRawEvidence: { priorEvidence: clone(previousEvidence), ...currentEvidence } };
+      })() : {}),
+    ...(Object.prototype.hasOwnProperty.call(raw, 'dispatchRecoveryArchives') ? { dispatchRecoveryArchives: clone((raw as Record<string, unknown>).dispatchRecoveryArchives) } : {}),
     ...(dispatchRecordQuarantine.length ? { dispatchRecoveryStatus: {
       quarantinedCount: dispatchRecordQuarantine.length,
       message: 'Some saved dispatch receipts could not be validated and are held privately. New external writes are disabled until recovery.' as const,
@@ -1362,6 +1440,34 @@ export class AppControllerImpl implements AppController {
   private proactiveRecoveryInspectionOperationId?: string;
   private proactiveRecoveryExpectedReceipt?: ProactiveRecoveryArchiveEntry;
   private proactiveRecoveryReceiptReadAfterRefresh = false;
+  private dispatchRecoveryRawEvidence?: unknown;
+  private dispatchRecoveryArchivesRaw?: unknown;
+  private dispatchRecoveryArchivesValidated?: DispatchRecoveryArchiveState;
+  private dispatchRecoveryArchivesMalformed = false;
+  private dispatchRecoverySourceActionKeys = new Set<string>();
+  private dispatchRecoveryUnresolvedReceiptCount = 0;
+  private dispatchRecoveryPlan?: {
+    readonly publicPlan: DispatchRecoveryPlan;
+    readonly preparedAtMs: number;
+    readonly capturedBootstrapGeneration: number;
+    readonly capturedPrivacyEpoch?: string;
+    readonly capturedState: AppState;
+    readonly raw: string;
+    readonly schemaVersion: number;
+    readonly rawSha256: string;
+    readonly evidenceJson: string;
+    readonly evidenceSha256: string;
+    readonly archiveState: DispatchRecoveryArchiveState;
+    readonly archivedAt: string;
+  };
+  private dispatchRecoveryBusy = false;
+  // Tracks this process's actual provider writes across workspace reloads.
+  // A persisted receipt may be normalized from pending to unknown on refresh,
+  // but that must not make a still-running request eligible for recovery.
+  private readonly activeRemoteDispatchOperations = new Set<string>();
+  private dispatchRecoveryInspectionOperationId?: string;
+  private dispatchRecoveryExpectedReceipt?: DispatchRecoveryArchiveEntry;
+  private dispatchRecoveryReceiptReadAfterRefresh = false;
   private proactiveMailAlertQuarantine: unknown[] = [];
   private backupImportQuarantine: unknown[] = [];
   private knowledgeQuarantine: unknown[] = [];
@@ -1484,6 +1590,17 @@ export class AppControllerImpl implements AppController {
     this.proactiveRecoveryInspectionOperationId = undefined;
     this.proactiveRecoveryExpectedReceipt = undefined;
     this.proactiveRecoveryReceiptReadAfterRefresh = false;
+    this.dispatchRecoveryRawEvidence = undefined;
+    this.dispatchRecoveryArchivesRaw = undefined;
+    this.dispatchRecoveryArchivesValidated = undefined;
+    this.dispatchRecoveryArchivesMalformed = false;
+    this.dispatchRecoverySourceActionKeys.clear();
+    this.dispatchRecoveryUnresolvedReceiptCount = 0;
+    this.dispatchRecoveryPlan = undefined;
+    this.dispatchRecoveryBusy = false;
+    this.dispatchRecoveryInspectionOperationId = undefined;
+    this.dispatchRecoveryExpectedReceipt = undefined;
+    this.dispatchRecoveryReceiptReadAfterRefresh = false;
     this.proactiveMailAlertQuarantine = [];
     this.backupImportQuarantine = [];
     this.knowledgeQuarantine = [];
@@ -2045,7 +2162,7 @@ export class AppControllerImpl implements AppController {
   }
 
   private persistedStateWithBatchLedger(state: AppState, batchLedger?: OpenRouterBatchLedger, chatLedger?: ReadonlyChatLedger): AppState {
-    const result = { ...state } as AppState & { dispatchRecordQuarantine?: DispatchRecordQuarantineEntry[]; proactiveQuarantine?: unknown; proactiveRecoveryArchives?: unknown; proactiveMailAlertQuarantine?: unknown[]; backupImportQuarantine?: unknown[]; knowledgeQuarantine?: unknown[]; reminderQuarantine?: unknown[]; deviceCalendarQuarantine?: unknown[]; transcriptionQuarantine?: unknown[]; openRouterBatchLedger?: unknown; assistantChatLedger?: unknown; assistantBatchJobs?: unknown; assistantBatchRecoveryStatus?: unknown; assistantChatConversations?: unknown; assistantChatRecoveryStatus?: unknown };
+    const result = { ...state } as AppState & { dispatchRecordQuarantine?: DispatchRecordQuarantineEntry[]; dispatchRecoveryArchives?: unknown; dispatchRecoveryRawEvidence?: unknown; proactiveQuarantine?: unknown; proactiveRecoveryArchives?: unknown; proactiveMailAlertQuarantine?: unknown[]; backupImportQuarantine?: unknown[]; knowledgeQuarantine?: unknown[]; reminderQuarantine?: unknown[]; deviceCalendarQuarantine?: unknown[]; transcriptionQuarantine?: unknown[]; openRouterBatchLedger?: unknown; assistantChatLedger?: unknown; assistantBatchJobs?: unknown; assistantBatchRecoveryStatus?: unknown; assistantChatConversations?: unknown; assistantChatRecoveryStatus?: unknown };
     delete result.assistantBatchJobs;
     delete result.assistantBatchRecoveryStatus;
     delete result.assistantChatConversations;
@@ -2064,6 +2181,10 @@ export class AppControllerImpl implements AppController {
       message: 'Some saved dispatch receipts could not be validated and are held privately. New external writes are disabled until recovery.',
     };
     else delete result.dispatchRecoveryStatus;
+    if (this.dispatchRecoveryArchivesRaw !== undefined) result.dispatchRecoveryArchives = clone(this.dispatchRecoveryArchivesRaw);
+    else delete result.dispatchRecoveryArchives;
+    if (this.dispatchRecoveryRawEvidence !== undefined) result.dispatchRecoveryRawEvidence = clone(this.dispatchRecoveryRawEvidence);
+    else delete result.dispatchRecoveryRawEvidence;
     if (this.proactiveQuarantine) result.proactiveQuarantine = clone(this.proactiveQuarantine);
     if (this.proactiveRecoveryArchivesRaw !== undefined) result.proactiveRecoveryArchives = clone(this.proactiveRecoveryArchivesRaw);
     else delete result.proactiveRecoveryArchives;
@@ -2084,7 +2205,7 @@ export class AppControllerImpl implements AppController {
   }
 
   private publicState(state: AppState): AppState {
-    const result = clone(state) as AppState & { dispatchRecordQuarantine?: unknown; proactiveQuarantine?: unknown; proactiveRecoveryArchives?: unknown; proactiveMailAlertQuarantine?: unknown; backupImportQuarantine?: unknown; knowledgeQuarantine?: unknown; reminderQuarantine?: unknown; deviceCalendarQuarantine?: unknown; transcriptionQuarantine?: unknown; openRouterBatchLedger?: unknown; assistantChatLedger?: unknown; assistantBatchJobs?: unknown; assistantChatConversations?: unknown; assistantChatRecoveryStatus?: unknown };
+    const result = clone(state) as AppState & { dispatchRecordQuarantine?: unknown; dispatchRecoveryArchives?: unknown; proactiveQuarantine?: unknown; proactiveRecoveryArchives?: unknown; proactiveMailAlertQuarantine?: unknown; backupImportQuarantine?: unknown; knowledgeQuarantine?: unknown; reminderQuarantine?: unknown; deviceCalendarQuarantine?: unknown; transcriptionQuarantine?: unknown; openRouterBatchLedger?: unknown; assistantChatLedger?: unknown; assistantBatchJobs?: unknown; assistantChatConversations?: unknown; assistantChatRecoveryStatus?: unknown };
     delete result.openRouterBatchLedger;
     delete result.assistantChatLedger;
     delete result.assistantChatConversations;
@@ -2106,6 +2227,8 @@ export class AppControllerImpl implements AppController {
       result.assistantChatConversations = this.chatConversationDTOs();
     }
     delete result.dispatchRecordQuarantine;
+    delete result.dispatchRecoveryArchives;
+    delete (result as AppState & { dispatchRecoveryRawEvidence?: unknown }).dispatchRecoveryRawEvidence;
     if (this.dispatchRecordQuarantine.length) result.dispatchRecoveryStatus = {
       quarantinedCount: this.dispatchRecordQuarantine.length,
       message: 'Some saved dispatch receipts could not be validated and are held privately. New external writes are disabled until recovery.',
@@ -3180,6 +3303,7 @@ export class AppControllerImpl implements AppController {
     let issue: string | undefined;
     return this.mutateIfChanged<{ current: boolean; reason?: string }>(async (state) => {
       const proposal = this.proposal(state, id);
+      if (proposal.dispatchRecoveryRetired) return { changed: false, result: { current: false, reason: 'This external action was retired during dispatch recovery and is permanently read-only.' } };
       if (['executed', 'accepted', 'simulated', 'dismissed', 'dispatching', 'unknown'].includes(proposal.status)) {
         return { changed: false, result: { current: true } };
       }
@@ -3260,11 +3384,16 @@ export class AppControllerImpl implements AppController {
         throw new Error('Workspace storage is still in use. Try refreshing after current actions finish.');
       }
       this.bootstrapGeneration += 1;
+      const priorDispatchRecoveryOperationId = this.dispatchRecoveryInspectionOperationId;
       this.loaded = false;
       this.loadPromise = undefined;
       await this.openStartupData(true);
+      if (priorDispatchRecoveryOperationId && !this.dispatchRecoveryArchivesValidated?.entries.some((entry) => entry.operationId === priorDispatchRecoveryOperationId)) {
+        this.dispatchRecoveryInspectionOperationId = priorDispatchRecoveryOperationId;
+      }
       this.clearMailAlertRefreshRequired();
       this.proactiveRecoveryReceiptReadAfterRefresh = true;
+      this.dispatchRecoveryReceiptReadAfterRefresh = true;
     });
     this.transactionQueue = refresh.then(() => undefined, () => undefined);
     await refresh;
@@ -3677,6 +3806,322 @@ export class AppControllerImpl implements AppController {
     } catch { return { status: 'unavailable', operationId }; }
   }
 
+  private dispatchRecoveryHasActiveDispatch(): boolean {
+    return this.activeRemoteDispatchOperations.size > 0 || this.state.proposals.some((proposal) => proposal.status === 'dispatching' && isPotentialRemoteProposal(proposal)) ||
+      this.state.dispatchRecords.some((record) => record.outcome === 'pending');
+  }
+
+  private currentDispatchRecoveryArchives(): DispatchRecoveryArchiveState {
+    if (this.dispatchRecoveryArchivesMalformed) throw new Error('archive_invalid');
+    if (this.dispatchRecoveryArchivesValidated) return this.dispatchRecoveryArchivesValidated;
+    try {
+      this.dispatchRecoveryArchivesValidated = validateDispatchRecoveryArchiveState(this.dispatchRecoveryArchivesRaw ?? emptyDispatchRecoveryArchiveState());
+      return this.dispatchRecoveryArchivesValidated;
+    } catch { this.dispatchRecoveryArchivesMalformed = true; throw new Error('archive_invalid'); }
+  }
+
+  private dispatchRecoveryFencesAction(sourceKey: string | undefined): boolean {
+    if (this.dispatchRecoveryArchivesMalformed) throw new Error('Dispatch recovery evidence failed integrity validation. External writes are disabled.');
+    return Boolean(sourceKey && this.dispatchRecoverySourceActionKeys.has(sourceKey));
+  }
+
+  private assertDispatchRecoveryProposalAllowed(proposal: Proposal): void {
+    if (!isPotentialRemoteProposal(proposal)) return;
+    if (proposal.dispatchRecoveryRetired) throw new Error('This external action was retired during dispatch recovery and is permanently read-only.');
+    if (this.dispatchRecoveryFencesAction(proposal.sourceActionKey)) throw new Error('This source action is retired in dispatch recovery history and cannot be approved or executed again.');
+  }
+
+  private async compileDispatchRecoveryAuthority(archives: DispatchRecoveryArchiveState, capturedState?: AppState, generation?: number,
+    allowMailAlertRefresh = false): Promise<void> {
+    const contextIsCurrent = () => (capturedState === undefined || capturedState === this.state) &&
+      (generation === undefined || generation === this.bootstrapGeneration);
+    await this.assertPrivacySessionCurrent(allowMailAlertRefresh);
+    if (!contextIsCurrent()) throw new Error('refresh_required');
+    const keys = new Set<string>();
+    let unresolved = 0;
+    for (const entry of archives.entries) {
+      const digest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, entry.sourceJson, { encoding: Crypto.CryptoEncoding.HEX });
+      await this.assertPrivacySessionCurrent(allowMailAlertRefresh);
+      // A stale read must never poison caches belonging to a newer workspace.
+      // Only integrity failure in the still-owned context marks evidence bad.
+      if (!contextIsCurrent()) throw new Error('refresh_required');
+      if (digest.toLowerCase() !== entry.sourceSha256) {
+        this.dispatchRecoveryArchivesMalformed = true;
+        this.dispatchRecoveryArchivesValidated = undefined;
+        this.dispatchRecoverySourceActionKeys.clear();
+        throw new Error('archive_invalid');
+      }
+      const payload = JSON.parse(entry.sourceJson) as { sourceActionFences: { sourceActionKey: string }[]; unresolvedReceiptCount: number };
+      for (const fence of payload.sourceActionFences) keys.add(fence.sourceActionKey);
+      unresolved += payload.unresolvedReceiptCount;
+    }
+    await this.assertPrivacySessionCurrent(allowMailAlertRefresh);
+    if (!contextIsCurrent()) throw new Error('refresh_required');
+    this.dispatchRecoverySourceActionKeys = keys;
+    this.dispatchRecoveryUnresolvedReceiptCount = unresolved;
+  }
+
+  private async assertDispatchRecoveryPrivacyIdle(): Promise<void> {
+    const privacy = this.integration.privacySession;
+    if (!privacy?.getStatus) throw new Error('privacy_unavailable');
+    await privacy.assertCurrent();
+    const status = await privacy.getStatus();
+    await privacy.assertCurrent();
+    if (status.epoch !== privacy.epoch) throw new Error('privacy_unavailable');
+    if (status.phase !== 'ready' || status.activeWriterCount !== 0 || status.pendingCleanupCount !== 0 || status.failedCleanupCount !== 0) throw new Error('busy');
+  }
+
+  private async withDispatchRecoverySlot<T>(work: (generation: number, state: AppState) => Promise<T>): Promise<T> {
+    const generation = this.bootstrapGeneration;
+    const run = this.transactionQueue.then(async () => {
+      await this.assertPrivacySessionCurrent();
+      if (!this.loaded || this.startupRecoveryPhase !== 'ready' || generation !== this.bootstrapGeneration) throw new Error('startup_unavailable');
+      if (this.mailAlertRefreshRequired) throw new Error('refresh_required');
+      if (this.dispatchRecoveryHasActiveDispatch()) throw new Error('busy');
+      const state = this.state;
+      await this.assertDispatchRecoveryPrivacyIdle();
+      if (!this.loaded || this.startupRecoveryPhase !== 'ready' || generation !== this.bootstrapGeneration || state !== this.state) throw new Error('refresh_required');
+      return work(generation, state);
+    });
+    this.transactionQueue = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  private dispatchRecoveryPersistenceProjection(value: unknown): string {
+    const serialized = typeof value === 'string' ? value : JSON.stringify(value);
+    if (typeof serialized !== 'string') throw new Error('Workspace snapshot cannot be serialized.');
+    const parsed = JSON.parse(serialized) as Record<string, unknown>;
+    // These fields are intentionally replaced by recovery. Their exact raw
+    // values are separately archived as opaque evidence.
+    delete parsed.dispatchRecords;
+    delete parsed.dispatchRecordQuarantine;
+    delete parsed.dispatchRecoveryStatus;
+    delete parsed.dispatchRecoveryRawEvidence;
+    delete parsed.dispatchRecoveryArchives;
+    return stableJson(parsed);
+  }
+
+  getDispatchRecoveryStatus(): DispatchRecoveryStatus {
+    let archives: DispatchRecoveryArchiveState;
+    try { archives = this.currentDispatchRecoveryArchives(); }
+    catch { return { status: 'unavailable', reason: 'archive_invalid', archiveCount: null, archiveBytes: null }; }
+    const archiveCount = archives.entries.length;
+    const archiveBytes = dispatchRecoveryArchiveBytes(archives);
+    const lastOperationId = this.dispatchRecoveryInspectionOperationId ?? archives.entries.at(-1)?.operationId;
+    const unresolvedReceiptCount = this.dispatchRecordQuarantine.length + this.dispatchRecoveryUnresolvedReceiptCount;
+    if (!this.loaded || this.startupRecoveryPhase !== 'ready') return { status: 'unavailable', reason: 'startup_unavailable', archiveCount, archiveBytes, ...(lastOperationId ? { lastOperationId } : {}) };
+    if (this.mailAlertRefreshRequired) return { status: 'refresh_required', archiveCount, archiveBytes, ...(lastOperationId ? { lastOperationId } : {}) };
+    if (!this.store.readCurrentSnapshot || !this.store.assertCurrent) return { status: 'unavailable', reason: 'unsupported_storage', archiveCount, archiveBytes, ...(lastOperationId ? { lastOperationId } : {}) };
+    if (!this.integration.privacySession?.getStatus) return { status: 'unavailable', reason: 'privacy_unavailable', archiveCount, archiveBytes, ...(lastOperationId ? { lastOperationId } : {}) };
+    if (this.dispatchRecoveryBusy || this.dispatchRecoveryHasActiveDispatch()) return { status: 'busy', archiveCount, archiveBytes, ...(lastOperationId ? { lastOperationId } : {}) };
+    if (!this.dispatchRecordQuarantine.length) return { status: 'not_needed', archiveCount, archiveBytes, ...(lastOperationId ? { lastOperationId } : {}), unresolvedReceiptCount };
+    const plan = this.dispatchRecoveryPlan;
+    if (plan) {
+      const now = Date.now();
+      if (now < plan.preparedAtMs || now >= Date.parse(plan.publicPlan.expiresAt) || plan.capturedState !== this.state || plan.capturedBootstrapGeneration !== this.bootstrapGeneration) this.dispatchRecoveryPlan = undefined;
+      else return { status: 'prepared', archiveCount, archiveBytes, plan: plan.publicPlan, ...(lastOperationId ? { lastOperationId } : {}), unresolvedReceiptCount };
+    }
+    if (archiveCount >= DISPATCH_RECOVERY_MAX_ARCHIVES || archiveBytes >= DISPATCH_RECOVERY_MAX_ARCHIVE_BYTES) return { status: 'unavailable', reason: 'archive_full', archiveCount, archiveBytes, ...(lastOperationId ? { lastOperationId } : {}) };
+    return { status: 'available', archiveCount, archiveBytes, ...(lastOperationId ? { lastOperationId } : {}), unresolvedReceiptCount };
+  }
+
+  async prepareDispatchRecovery(): Promise<DispatchRecoveryPlan> {
+    if (this.dispatchRecoveryBusy) throw new Error('A dispatch recovery operation is already in progress.');
+    this.dispatchRecoveryBusy = true;
+    this.dispatchRecoveryPlan = undefined;
+    try {
+      return await this.withDispatchRecoverySlot(async (generation, capturedState) => {
+        if (!this.dispatchRecordQuarantine.length) throw new Error('not_needed');
+        if (!this.store.readCurrentSnapshot || !this.store.assertCurrent) throw new Error('unsupported_storage');
+        const snapshot = await this.store.readCurrentSnapshot();
+        await this.assertPrivacySessionCurrent();
+        if (!snapshot || snapshot.schemaVersion !== 1 || generation !== this.bootstrapGeneration || capturedState !== this.state) throw new Error('refresh_required');
+        await this.store.assertCurrent();
+        await this.assertDispatchRecoveryPrivacyIdle();
+        const raw = JSON.parse(snapshot.raw) as Record<string, unknown>;
+        const preservedValidReceipts = canonicalValidDispatchRecords(raw.dispatchRecords);
+        const normalizedSnapshot = this.persistedState(capturedState);
+        if (this.dispatchRecoveryPersistenceProjection(raw) !== this.dispatchRecoveryPersistenceProjection(normalizedSnapshot)) throw new Error('refresh_required');
+        const previous = this.currentDispatchRecoveryArchives();
+        await this.compileDispatchRecoveryAuthority(previous, capturedState, generation);
+        if (previous.entries.length >= DISPATCH_RECOVERY_MAX_ARCHIVES) throw new Error('archive_full');
+        const quarantined = this.dispatchRecoveryRawEvidence && typeof this.dispatchRecoveryRawEvidence === 'object'
+          ? clone(this.dispatchRecoveryRawEvidence) as Record<string, unknown> : {};
+        const proposals = capturedState.proposals.filter(isRecoveryRemoteProposal);
+        const trustedRemoteProposals = proposals.map((proposal) => ({
+          proposalId: proposal.id, kind: proposal.kind, status: proposal.status,
+          ...(proposal.remoteOperation ?? (proposal.kind === 'email' ? proposal.email?.operation : proposal.kind === 'event' ? 'event' : undefined)
+            ? { operation: proposal.remoteOperation ?? (proposal.kind === 'email' ? proposal.email?.operation : 'event') } : {}),
+          ...(proposal.sourceActionKey ? { sourceActionKey: proposal.sourceActionKey } : {}),
+          ...(proposal.accountId ? { accountId: proposal.accountId } : {}),
+        }));
+        const sourceActionFences = new Map<string, Record<string, unknown>>();
+        const addFence = (sourceKey: string, operation: 'mail_any' | 'event', accountId?: string, identity?: Record<string, string>) => {
+          const row = { sourceActionKey: sourceKey, operation, ...(accountId ? { accountId } : {}), ...(identity ? { identity } : {}) };
+          const key = stableJson([row.sourceActionKey, row.accountId ?? '', row.identity ?? null, row.operation]);
+          if (!sourceActionFences.has(key)) sourceActionFences.set(key, row);
+        };
+        for (const proposal of proposals) if (proposal.sourceActionKey) {
+          const operation = proposal.kind === 'event' ? 'event' : 'mail_any';
+          addFence(proposal.sourceActionKey, operation, proposal.accountId);
+        }
+        for (const record of capturedState.dispatchRecords) {
+          const operation = record.operation === 'event' ? 'event' : 'mail_any';
+          const identity = record.account.identity;
+          const identityRow = {
+            providerNamespace: identity.providerNamespace, clientId: identity.clientId, subject: identity.subject,
+            ...(identity.resourceUserId ? { resourceUserId: identity.resourceUserId } : {}),
+          };
+          addFence(record.sourceActionKey, operation, record.accountId);
+          addFence(record.sourceActionKey, operation, undefined, identityRow);
+        }
+        const sourcePayload = {
+          quarantine: quarantined,
+          trustedRemoteProposals,
+          sourceActionFences: [...sourceActionFences.values()],
+          unresolvedReceiptCount: this.dispatchRecordQuarantine.length,
+        };
+        const evidenceJson = dispatchRecoveryEvidenceJson(sourcePayload);
+        if (!evidenceJson) throw new Error('evidence_too_large');
+        const evidenceBytes = recoveryUtf8Bytes(evidenceJson);
+        if (evidenceBytes > DISPATCH_RECOVERY_MAX_SOURCE_BYTES || dispatchRecoveryArchiveBytes(previous) + evidenceBytes > DISPATCH_RECOVERY_MAX_ARCHIVE_BYTES) throw new Error('evidence_too_large');
+        const [rawSha256, evidenceSha256] = await Promise.all([
+          Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, snapshot.raw, { encoding: Crypto.CryptoEncoding.HEX }),
+          Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, evidenceJson, { encoding: Crypto.CryptoEncoding.HEX }),
+        ]);
+        await this.assertPrivacySessionCurrent();
+        await this.store.assertCurrent();
+        if (generation !== this.bootstrapGeneration || capturedState !== this.state || this.dispatchRecoveryHasActiveDispatch()) throw new Error('refresh_required');
+        const operationId = newId();
+        const archivedAt = new Date().toISOString();
+        const expiresAt = new Date(Date.now() + DISPATCH_RECOVERY_TTL_MS).toISOString();
+        const archiveCount = previous.entries.length;
+        const plan: DispatchRecoveryPlan = Object.freeze({ operationId, expiresAt, evidenceBytes, archiveCount,
+          effects: Object.freeze({ quarantinedReceiptCount: this.dispatchRecordQuarantine.length,
+            preservedValidReceiptCount: preservedValidReceipts.length, remoteProposalsRetired: trustedRemoteProposals.length,
+            sourceActionFencesAdded: sourceActionFences.size, unresolvedReceiptCount: this.dispatchRecordQuarantine.length }) });
+        this.dispatchRecoveryPlan = { publicPlan: plan, preparedAtMs: Date.now(), capturedBootstrapGeneration: generation,
+          capturedPrivacyEpoch: this.integration.privacySession?.epoch, capturedState,
+          raw: snapshot.raw, schemaVersion: snapshot.schemaVersion, rawSha256: rawSha256.toLowerCase(), evidenceJson,
+          evidenceSha256: evidenceSha256.toLowerCase(), archiveState: previous, archivedAt };
+        return plan;
+      });
+    } finally { this.dispatchRecoveryBusy = false; }
+  }
+
+  async cancelDispatchRecovery(operationId: string): Promise<void> {
+    if (this.dispatchRecoveryBusy) throw new Error('Dispatch recovery is busy.');
+    if (this.dispatchRecoveryPlan?.publicPlan.operationId === operationId) this.dispatchRecoveryPlan = undefined;
+  }
+
+  async confirmDispatchRecovery(input: { operationId: string; confirmation: 'RETIRE ACTIONS' }): Promise<DispatchRecoveryResult> {
+    if (input?.confirmation !== 'RETIRE ACTIONS') throw new Error('Type RETIRE ACTIONS exactly to confirm this recovery.');
+    const plan = this.dispatchRecoveryPlan;
+    if (!plan || input.operationId !== plan.publicPlan.operationId) throw new Error('The dispatch recovery plan is no longer current. Prepare it again.');
+    const now = Date.now();
+    if (now < plan.preparedAtMs || now >= Date.parse(plan.publicPlan.expiresAt)) { this.dispatchRecoveryPlan = undefined; throw new Error('The dispatch recovery plan expired. Prepare it again.'); }
+    if (this.dispatchRecoveryBusy) throw new Error('Dispatch recovery is busy.');
+    this.dispatchRecoveryBusy = true;
+    // Consume synchronously before any queue/storage await. A lost save ACK
+    // must require a fresh read/plan rather than allowing plan replay.
+    this.dispatchRecoveryPlan = undefined;
+    try {
+      return await this.withDispatchRecoverySlot(async (generation, capturedState) => {
+        if (generation !== plan.capturedBootstrapGeneration || capturedState !== plan.capturedState || generation !== this.bootstrapGeneration || capturedState !== this.state || this.integration.privacySession?.epoch !== plan.capturedPrivacyEpoch) throw new Error('refresh_required');
+        if (!this.store.readCurrentSnapshot || !this.store.assertCurrent) throw new Error('unsupported_storage');
+        const snapshot = await this.store.readCurrentSnapshot();
+        await this.assertPrivacySessionCurrent();
+        if (!snapshot || snapshot.schemaVersion !== plan.schemaVersion || snapshot.raw !== plan.raw) throw new Error('refresh_required');
+        const [rawHash, evidenceHash] = await Promise.all([
+          Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, snapshot.raw, { encoding: Crypto.CryptoEncoding.HEX }),
+          Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, plan.evidenceJson, { encoding: Crypto.CryptoEncoding.HEX }),
+        ]);
+        await this.store.assertCurrent();
+        await this.assertDispatchRecoveryPrivacyIdle();
+        if (rawHash.toLowerCase() !== plan.rawSha256 || evidenceHash.toLowerCase() !== plan.evidenceSha256 || generation !== this.bootstrapGeneration || capturedState !== this.state || Date.now() < plan.preparedAtMs || Date.now() >= Date.parse(plan.publicPlan.expiresAt)) throw new Error('refresh_required');
+        const raw = JSON.parse(snapshot.raw) as Record<string, unknown>;
+        const preservedValidReceipts = canonicalValidDispatchRecords(raw.dispatchRecords);
+        const sourcePayload = JSON.parse(plan.evidenceJson) as { trustedRemoteProposals: { proposalId: string }[]; sourceActionFences: unknown[] };
+        const archives = validateDispatchRecoveryArchiveState(Object.hasOwn(raw, 'dispatchRecoveryArchives') ? raw.dispatchRecoveryArchives : emptyDispatchRecoveryArchiveState());
+        if (stableJson(archives) !== stableJson(plan.archiveState)) throw new Error('archive_invalid');
+        await this.compileDispatchRecoveryAuthority(archives, capturedState, generation);
+        const entry: DispatchRecoveryArchiveEntry = Object.freeze({ operationId: plan.publicPlan.operationId, archivedAt: plan.archivedAt,
+          sourceJson: plan.evidenceJson, sourceSha256: plan.evidenceSha256, sourceBytes: plan.publicPlan.evidenceBytes });
+        const nextArchives = validateDispatchRecoveryArchiveState({ version: 1, entries: [...archives.entries, entry] });
+        const retiredIds = new Set(sourcePayload.trustedRemoteProposals.map((proposal) => proposal.proposalId));
+        const replacement = { ...raw, proposals: (Array.isArray(raw.proposals) ? raw.proposals : []).map((proposal: Record<string, unknown>) => retiredIds.has(String(proposal.id)) ? { ...proposal, dispatchRecoveryRetired: true } : proposal), dispatchRecords: clone(preservedValidReceipts), dispatchRecoveryArchives: nextArchives } as Record<string, unknown>;
+        delete replacement.dispatchRecordQuarantine;
+        delete replacement.dispatchRecoveryStatus;
+        delete replacement.dispatchRecoveryRawEvidence;
+        const serialized = JSON.stringify(replacement);
+        if (!serialized || recoveryUtf8Bytes(serialized, STATE_SNAPSHOT_READ_MAX_BYTES) > STATE_SNAPSHOT_READ_MAX_BYTES) throw new Error('evidence_too_large');
+        const nextCached = clone(capturedState);
+        nextCached.proposals = nextCached.proposals.map((proposal) => retiredIds.has(proposal.id) ? { ...proposal, dispatchRecoveryRetired: true } : proposal);
+        delete (nextCached as AppState & { dispatchRecoveryStatus?: unknown }).dispatchRecoveryStatus;
+        await this.store.assertCurrent();
+        await this.assertPrivacySessionCurrent();
+        if (generation !== this.bootstrapGeneration || capturedState !== this.state || this.dispatchRecoveryHasActiveDispatch() || Date.now() < plan.preparedAtMs || Date.now() >= Date.parse(plan.publicPlan.expiresAt)) throw new Error('refresh_required');
+        this.dispatchRecoveryInspectionOperationId = plan.publicPlan.operationId;
+        this.dispatchRecoveryExpectedReceipt = entry;
+        this.dispatchRecoveryReceiptReadAfterRefresh = false;
+        try {
+          await this.store.save(replacement as unknown as AppState);
+          await this.store.assertCurrent();
+          await this.assertPrivacySessionCurrent();
+          if (generation !== this.bootstrapGeneration || capturedState !== this.state || this.mailAlertRefreshRequired || this.integration.privacySession?.epoch !== plan.capturedPrivacyEpoch) throw new Error('refresh_required');
+          this.state = nextCached;
+          this.dispatchRecordQuarantine = [];
+          this.dispatchRecoveryRawEvidence = undefined;
+          this.dispatchRecoveryArchivesRaw = nextArchives;
+          this.dispatchRecoveryArchivesValidated = nextArchives;
+          this.dispatchRecoveryArchivesMalformed = false;
+          const nextKeys = new Set(this.dispatchRecoverySourceActionKeys);
+          for (const fence of sourcePayload.sourceActionFences as { sourceActionKey: string }[]) nextKeys.add(fence.sourceActionKey);
+          this.dispatchRecoverySourceActionKeys = nextKeys;
+          this.dispatchRecoveryUnresolvedReceiptCount += plan.publicPlan.effects.unresolvedReceiptCount;
+          this.dispatchRecoveryExpectedReceipt = entry;
+          this.snapshot = deepFreeze(this.publicState(nextCached));
+          this.emit();
+        } catch {
+          if (generation === this.bootstrapGeneration && capturedState === this.state && this.integration.privacySession?.epoch === plan.capturedPrivacyEpoch) this.setMailAlertRefreshRequired();
+          return { status: 'unknown', operationId: plan.publicPlan.operationId };
+        }
+        return { status: 'applied', operationId: plan.publicPlan.operationId, archivedAt: entry.archivedAt, evidenceBytes: entry.sourceBytes, archiveCount: nextArchives.entries.length };
+      });
+    } finally { this.dispatchRecoveryBusy = false; }
+  }
+
+  async inspectDispatchRecoveryReceipt(operationId: string): Promise<DispatchRecoveryReceiptInspection> {
+    if (!this.dispatchRecoveryReceiptReadAfterRefresh || operationId !== this.dispatchRecoveryInspectionOperationId || !this.loaded || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired || this.dispatchRecoveryArchivesMalformed) return { status: 'not_verified', operationId };
+    if (!this.store.readCurrentSnapshot || !this.store.assertCurrent) return { status: 'unavailable', operationId };
+    try {
+      return await this.withDispatchRecoverySlot(async (generation, capturedState) => {
+        if (!this.dispatchRecoveryReceiptReadAfterRefresh || operationId !== this.dispatchRecoveryInspectionOperationId) return { status: 'not_verified', operationId };
+        const snapshot = await this.store.readCurrentSnapshot!();
+        await this.assertPrivacySessionCurrent();
+        if (!snapshot || snapshot.schemaVersion !== 1) return { status: 'unavailable', operationId };
+        const raw = JSON.parse(snapshot.raw) as Record<string, unknown>;
+        const archives = validateDispatchRecoveryArchiveState(raw.dispatchRecoveryArchives);
+        const entry = archives.entries.find((candidate) => candidate.operationId === operationId);
+        if (!entry) return { status: 'not_verified', operationId };
+        if (this.dispatchRecoveryExpectedReceipt && (entry.archivedAt !== this.dispatchRecoveryExpectedReceipt.archivedAt || entry.sourceJson !== this.dispatchRecoveryExpectedReceipt.sourceJson ||
+            entry.sourceSha256 !== this.dispatchRecoveryExpectedReceipt.sourceSha256 || entry.sourceBytes !== this.dispatchRecoveryExpectedReceipt.sourceBytes)) return { status: 'not_verified', operationId };
+        if (Object.hasOwn(raw, 'dispatchRecordQuarantine') || Object.hasOwn(raw, 'dispatchRecoveryRawEvidence') || !Array.isArray(raw.dispatchRecords)) return { status: 'not_verified', operationId };
+        const checkedRecords = raw.dispatchRecords.map((record: unknown) => validateDispatchRecord(record));
+        if (stableJson(checkedRecords) !== stableJson(raw.dispatchRecords)) return { status: 'not_verified', operationId };
+        const payload = JSON.parse(entry.sourceJson) as { trustedRemoteProposals: { proposalId: string }[] };
+        const rawProposals = Array.isArray(raw.proposals) ? raw.proposals as Record<string, unknown>[] : [];
+        const retiredProposalIds = new Set(rawProposals.flatMap((saved) => saved.dispatchRecoveryRetired === true && typeof saved.id === 'string' ? [saved.id] : []));
+        if (payload.trustedRemoteProposals.some((proposal) => !retiredProposalIds.has(proposal.proposalId))) return { status: 'not_verified', operationId };
+        const digest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, entry.sourceJson, { encoding: Crypto.CryptoEncoding.HEX });
+        await this.store.assertCurrent!();
+        await this.assertDispatchRecoveryPrivacyIdle();
+        if (generation !== this.bootstrapGeneration || capturedState !== this.state || digest.toLowerCase() !== entry.sourceSha256) return { status: 'unavailable', operationId };
+        return { status: 'applied', operationId, archivedAt: entry.archivedAt, evidenceBytes: entry.sourceBytes, archiveCount: archives.entries.length };
+      });
+    } catch { return { status: 'unavailable', operationId }; }
+  }
+
   private async openStartupData(allowMailAlertRefresh = false): Promise<void> {
     if (this.loaded) return;
     if (this.loadPromise) return this.loadPromise;
@@ -3686,6 +4131,7 @@ export class AppControllerImpl implements AppController {
       await this.discoverPendingStartupReceipt();
       if (this.startupRecoveryReceipt) await this.acknowledgeStartupRecoveryReceipt();
       else this.startupRecoveryPhase = 'ready';
+      if (this.dispatchRecoveryArchivesValidated?.entries.length) this.dispatchRecoveryReceiptReadAfterRefresh = true;
     } catch (error) {
       await this.discoverPendingStartupReceipt();
       this.startupRecoveryPhase = this.startupRecoveryReceipt ? 'committed_opening' : 'failed';
@@ -3883,6 +4329,14 @@ export class AppControllerImpl implements AppController {
     this.deviceEventQuarantine = [];
     this.transcriptionQuarantine = [];
     this.dispatchRecordQuarantine = [];
+    this.dispatchRecoveryRawEvidence = undefined;
+    this.dispatchRecoveryArchivesRaw = undefined;
+    this.dispatchRecoveryArchivesValidated = undefined;
+    this.dispatchRecoveryArchivesMalformed = false;
+    this.dispatchRecoveryPlan = undefined;
+    this.dispatchRecoveryInspectionOperationId = undefined;
+    this.dispatchRecoveryExpectedReceipt = undefined;
+    this.dispatchRecoveryReceiptReadAfterRefresh = false;
     this.proactiveSourceHashMemo = new Map();
     this.analysisCache.clear();
     this.verifiedReminderForeground.clear();
@@ -3895,6 +4349,10 @@ export class AppControllerImpl implements AppController {
     const capturedBootstrapGeneration = this.bootstrapGeneration;
     this.proactiveRecoveryPlan = undefined;
     this.proactiveRecoveryReceiptReadAfterRefresh = false;
+    this.dispatchRecoveryPlan = undefined;
+    this.dispatchRecoveryReceiptReadAfterRefresh = false;
+    this.dispatchRecoverySourceActionKeys.clear();
+    this.dispatchRecoveryUnresolvedReceiptCount = 0;
     await this.assertPrivacySessionCurrent(allowMailAlertRefresh);
     this.verifiedReminderForeground.clear();
     this.verifiedDeviceCalendarGeneration = undefined;
@@ -3975,6 +4433,28 @@ export class AppControllerImpl implements AppController {
     delete (normalized as AppState & { openRouterBatchLedger?: unknown }).openRouterBatchLedger;
     delete (normalized as AppState & { assistantChatLedger?: unknown }).assistantChatLedger;
     delete (normalized as AppState & { proactiveRecoveryArchives?: unknown }).proactiveRecoveryArchives;
+    this.dispatchRecoveryRawEvidence = clone(normalized.dispatchRecoveryRawEvidence);
+    delete normalized.dispatchRecoveryRawEvidence;
+    if (loaded && Object.prototype.hasOwnProperty.call(loaded, 'dispatchRecoveryArchives')) {
+      this.dispatchRecoveryArchivesRaw = clone((loaded as AppState & { dispatchRecoveryArchives?: unknown }).dispatchRecoveryArchives);
+      try {
+        this.dispatchRecoveryArchivesValidated = validateDispatchRecoveryArchiveState(this.dispatchRecoveryArchivesRaw);
+        this.dispatchRecoveryArchivesMalformed = false;
+      } catch {
+        this.dispatchRecoveryArchivesValidated = undefined;
+        this.dispatchRecoveryArchivesMalformed = true;
+      }
+    } else {
+      this.dispatchRecoveryArchivesRaw = undefined;
+      this.dispatchRecoveryArchivesValidated = emptyDispatchRecoveryArchiveState();
+      this.dispatchRecoveryArchivesMalformed = false;
+    }
+    if (!this.dispatchRecoveryArchivesMalformed) {
+      const lastEntry = this.dispatchRecoveryArchivesValidated?.entries.at(-1);
+      this.dispatchRecoveryInspectionOperationId = lastEntry?.operationId;
+      this.dispatchRecoveryExpectedReceipt = lastEntry;
+    }
+    delete (normalized as AppState & { dispatchRecoveryArchives?: unknown }).dispatchRecoveryArchives;
     this.dispatchRecordQuarantine = clone(normalized.dispatchRecordQuarantine ?? []);
     delete normalized.dispatchRecordQuarantine;
     this.backupImportQuarantine = clone((normalized as AppState & { backupImportQuarantine?: unknown[] }).backupImportQuarantine ?? []);
@@ -3989,6 +4469,13 @@ export class AppControllerImpl implements AppController {
     delete (normalized as AppState & { deviceCalendarQuarantine?: unknown[] }).deviceCalendarQuarantine;
     this.state = normalized;
     this.state.transcription = clone(normalized.transcription);
+    if (!this.dispatchRecoveryArchivesMalformed && this.dispatchRecoveryArchivesValidated) {
+      try { await this.compileDispatchRecoveryAuthority(this.dispatchRecoveryArchivesValidated, this.state, capturedBootstrapGeneration, allowMailAlertRefresh); }
+      catch (error) {
+        if (error instanceof Error && error.message === 'archive_invalid') this.dispatchRecoveryArchivesMalformed = true;
+        else throw error;
+      }
+    }
     if (!this.assistantChatLedgerMalformed && !this.chatLedgerLinksAreValid(this.assistantChatLedger, this.state)) {
       this.assistantChatLedgerMalformed = true;
       this.assistantChatLedger = emptyChatLedger();
@@ -5978,8 +6465,12 @@ export class AppControllerImpl implements AppController {
     if (this.assistantBatchLedgerMalformed) throw new Error('Saved Batch history is invalid. Refresh local data before changing or deleting content.');
   }
 
+  private hasUnresolvedDispatchRecoveryEvidence(): boolean {
+    return this.dispatchRecoveryArchivesMalformed || this.dispatchRecordQuarantine.length > 0 || this.dispatchRecoveryUnresolvedReceiptCount > 0;
+  }
+
   private assertMailBatchCleanupIsCertain(state: AppState, jobs: readonly OpenRouterMailReplyContentJob[]): void {
-    if (jobs.length && this.dispatchRecordQuarantine.length) {
+    if (jobs.length && this.hasUnresolvedDispatchRecoveryEvidence()) {
       throw new Error('Dispatch history failed integrity validation. Refresh local data before removing mail Batch content.');
     }
     if (this.mailBatchJobsWithUncertainCleanup(state, jobs).size) {
@@ -6013,14 +6504,14 @@ export class AppControllerImpl implements AppController {
         const directlyAffected = this.assistantBatchLedger.jobs.filter((job) =>
           (isOpenRouterBatchContentJob(job) || isOpenRouterMailReplyContentJob(job)) && predicate(job));
         if (!directlyAffected.length) return undefined;
-        if (directlyAffected.some(isOpenRouterMailReplyContentJob) && this.dispatchRecordQuarantine.length && !options.retainUncertainMailObservation) {
+        if (directlyAffected.some(isOpenRouterMailReplyContentJob) && this.hasUnresolvedDispatchRecoveryEvidence() && !options.retainUncertainMailObservation) {
           throw new Error('Dispatch history failed integrity validation. Refresh local data before removing mail Batch content.');
         }
 
         const affectedMailJobs = directlyAffected.filter(isOpenRouterMailReplyContentJob);
         const retainedMailJobIds = new Set<string>();
         if (options.retainUncertainMailObservation && affectedMailJobs.length) {
-          if (this.dispatchRecordQuarantine.length) for (const job of affectedMailJobs) retainedMailJobIds.add(job.id);
+          if (this.hasUnresolvedDispatchRecoveryEvidence()) for (const job of affectedMailJobs) retainedMailJobIds.add(job.id);
           else for (const id of this.mailBatchJobsWithUncertainCleanup(draft, affectedMailJobs)) retainedMailJobIds.add(id);
         } else this.assertMailBatchCleanupIsCertain(draft, affectedMailJobs);
         const retireDirectlyAffected = directlyAffected.filter((job) => !retainedMailJobIds.has(job.id));
@@ -6319,7 +6810,11 @@ export class AppControllerImpl implements AppController {
       const terminalStatuses = ['executed', 'accepted', 'simulated', 'dismissed', 'dispatching', 'unknown'];
       for (const proposal of created) {
         const existing = existingByAction.get(proposal.sourceActionKey!);
-        if (!existing || terminalStatuses.includes(existing.status)) {
+        if (isPotentialRemoteProposal(proposal) && this.dispatchRecoveryFencesAction(proposal.sourceActionKey)) {
+          if (existing?.dispatchRecoveryRetired) selected.push(existing);
+          continue;
+        }
+        if (!existing || existing.dispatchRecoveryRetired || terminalStatuses.includes(existing.status)) {
           selected.push(existing ?? proposal);
         } else if (!existing.requiresRebuild && existing.provenance?.version === 1 && existing.provenance.analysisFingerprint === processingFingerprint) {
           selected.push(existing);
@@ -6331,7 +6826,7 @@ export class AppControllerImpl implements AppController {
       const selectedIds = new Set(selected.map((proposal) => proposal.id));
       draft.proposals = [
         ...selected,
-        ...draft.proposals.filter((proposal) => proposal.noteId !== id || (!selectedIds.has(proposal.id) && proposal.status !== 'draft')),
+        ...draft.proposals.filter((proposal) => proposal.noteId !== id || (!selectedIds.has(proposal.id) && (proposal.status !== 'draft' || proposal.dispatchRecoveryRetired))),
       ];
       current.status = 'processed';
       current.processingFingerprint = processingFingerprint;
@@ -6996,6 +7491,8 @@ export class AppControllerImpl implements AppController {
   async editProposal(id: string, patch: ProposalPatch, options?: { expectedRevision: number }): Promise<Proposal> {
     const result = await this.mutate(async (state) => {
       const proposal = this.proposal(state, id);
+      if (proposal.dispatchRecoveryRetired) throw new Error('This external action was retired during dispatch recovery and is permanently read-only.');
+      this.assertDispatchRecoveryProposalAllowed(proposal);
       if (options && proposal.revision !== options.expectedRevision) throw new Error('This proposal changed. Reopen the current version before editing.');
       if (['executed', 'accepted', 'simulated', 'dispatching', 'unknown', 'dismissed'].includes(proposal.status)) throw new Error('This proposal can no longer be edited.');
       if (proposal.kind === 'reminder') {
@@ -7062,6 +7559,8 @@ export class AppControllerImpl implements AppController {
     }
     const result = await this.mutate(async (state) => {
       const proposal = this.proposal(state, id);
+      if (proposal.dispatchRecoveryRetired) throw new Error('This external action was retired during dispatch recovery and is permanently read-only.');
+      this.assertDispatchRecoveryProposalAllowed(proposal);
       if (options && proposal.revision !== options.expectedRevision) throw new Error('This proposal changed while approval was checked. Reopen the current version before approving.');
       if (proposal.status !== 'draft' && proposal.status !== 'failed') throw new Error('Only a draft or safely failed proposal can be approved.');
       if (proposal.provenance?.version === 1) {
@@ -7165,6 +7664,8 @@ export class AppControllerImpl implements AppController {
     }
     const claim = await this.mutate(async (state) => {
       const proposal = this.proposal(state, id);
+      if (proposal.dispatchRecoveryRetired) throw new Error('This external action was retired during dispatch recovery and is permanently read-only.');
+      this.assertDispatchRecoveryProposalAllowed(proposal);
       if (options && proposal.revision !== options.expectedRevision) throw new Error('This proposal changed while execution was checked. Reopen the current version before continuing.');
       if (proposal.status !== 'approved' || proposal.approvedRevision !== proposal.revision || !proposal.approvedPayloadDigest) throw new Error('Approve this exact version before continuing.');
       let dependencyProjection: string;
@@ -7352,6 +7853,7 @@ export class AppControllerImpl implements AppController {
       } else {
         const account = claim.capturedAccount;
         const record = frozenRecord;
+        this.activeRemoteDispatchOperations.add(record.id);
         const operation = record.operation;
         const envelope: ApprovedDispatch = {
           proposalId: record.proposalId, revision: record.approvedRevision, sourceRevision: record.sourceRevision, operation,
@@ -7499,8 +8001,12 @@ export class AppControllerImpl implements AppController {
         addActivity(state, result.status === 'simulated' ? 'simulation' : result.status === 'failed' || result.status === 'unknown' ? 'error' : 'local_action', result.message, { proposalId: id, noteId: proposal.noteId });
         return proposal;
       });
-    } catch (error) { throw error; }
+    } catch (error) {
+      if (frozenRecord) this.activeRemoteDispatchOperations.delete(frozenRecord.id);
+      throw error;
+    }
     if (!committed && frozenRecord) {
+      this.activeRemoteDispatchOperations.delete(frozenRecord.id);
       // Preserve a truthful result for the caller even if the local proposal was removed;
       // the durable dispatch history remains the canonical receipt.
       return {
@@ -7511,6 +8017,7 @@ export class AppControllerImpl implements AppController {
       };
     }
     if (!committed) throw new Error('The action was removed before completion.');
+    if (frozenRecord) this.activeRemoteDispatchOperations.delete(frozenRecord.id);
     return committed;
   }
 
@@ -7555,6 +8062,7 @@ export class AppControllerImpl implements AppController {
   async dismissProposal(id: string): Promise<Proposal> {
     return this.mutate((state) => {
       const proposal = this.proposal(state, id);
+      if (proposal.dispatchRecoveryRetired) throw new Error('This external action was retired during dispatch recovery and is permanently read-only.');
       if (['dispatching', 'unknown', 'executed', 'accepted', 'simulated'].includes(proposal.status)) throw new Error('This proposal cannot be dismissed while or after execution.');
       proposal.status = 'dismissed';
       proposal.approvedRevision = undefined;
@@ -9314,6 +9822,7 @@ export class AppControllerImpl implements AppController {
     const email = { operation: 'draft' as const, to, cc, bcc: [], subject: source.subject, text: input.text, attachments: [], reply };
     validateReplyBinding(email, provenance);
     const sourceActionKey = JSON.stringify(['mail-reply-v1', identityKey(account), source.providerMessageId, input.mode]);
+    if (this.dispatchRecoveryFencesAction(sourceActionKey)) throw new Error('This mail source action was retired during dispatch recovery. Create a new independent reply from a different message.');
     const duplicate = state.proposals.some((proposal) => proposal.sourceActionKey === sourceActionKey && ['accepted', 'unknown', 'dispatching'].includes(proposal.status) && !proposal.simulated) ||
       state.dispatchRecords.some((record) => record.sourceActionKey === sourceActionKey && ['pending', 'accepted', 'unknown'].includes(record.outcome));
     if (duplicate) throw new Error('A reply draft attempt for this message and mode already exists. Review its history before creating another.');
@@ -10666,6 +11175,9 @@ export class AppControllerImpl implements AppController {
 
   async deleteNote(id: string): Promise<void> {
     this.assertBatchLedgerCanDropContent();
+    if (this.hasUnresolvedDispatchRecoveryEvidence()) {
+      throw new Error('External action history contains unresolved receipt evidence. Content deletion is paused until that history is reviewed.');
+    }
     if (this.assistantChatLedgerMalformed && this.state.notes.some((note) => note.id === id && note.origin === 'assistant_chat')) throw new Error('Saved chat history could not be validated. Refresh local data before continuing.');
     if (this.state.notes.find((note) => note.id === id)?.origin === 'assistant_chat') throw new Error('Delete this message from its Chat conversation.');
     if (this.activeBatchNoteOperations.has(id)) throw new Error('A Batch request is still using this note. Try again after it finishes.');

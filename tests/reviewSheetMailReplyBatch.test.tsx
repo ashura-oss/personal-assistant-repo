@@ -46,7 +46,7 @@ const proposal: Proposal = {
   id: 'proposal-1', kind: 'email', title: 'Reply subject', body: 'Generated batch text.', status: 'draft', revision: 1,
   recipients: ['person@example.com'], evidence: [], accountId: 'account-1', provenance: batchReplyProvenance,
   email: {
-    operation: 'draft', to: ['person@example.com'], cc: ['copy@example.com'], bcc: [], subject: 'Reply subject',
+    operation: 'draft', to: ['person@example.com'], cc: ['copy@example.com'], bcc: ['hidden@example.com'], subject: 'Reply subject',
     text: 'Generated batch text.', attachments: [],
     reply: { mode: 'reply', sourceDigest: 'a'.repeat(64), localMessageId: 'message-1', providerMessageId: 'provider-1', idFormat: 'gmail', internetMessageId: '<message-1@example.com>', sourceSubject: 'Original subject' },
   },
@@ -71,5 +71,42 @@ describe('ReviewSheet Batch reply immutability', () => {
     expect(host.textContent).toContain('Generated batch text.');
     expect(host.querySelectorAll('input,textarea')).toHaveLength(0);
     expect([...host.querySelectorAll('button')].some((button) => button.textContent === 'Save edits')).toBe(false);
+  });
+
+  it('keeps dispatch-recovery-retired proposals readable with their original status and no mutation actions', () => {
+    const approve = vi.fn(); const execute = vi.fn(); const dismiss = vi.fn(); const edit = vi.fn();
+    const retired: Proposal = { ...proposal, dispatchRecoveryRetired: true, provenance: undefined, status: 'draft' };
+    act(() => root.render(React.createElement(ReviewSheet, {
+      state, proposal: retired, dispatchRecords: [], busy: false,
+      onClose: vi.fn(), onEdit: edit, onApprove: approve, onExecute: execute, onDismiss: dismiss,
+    })));
+    expect(host.textContent).toContain('RETIRED ACTION · READ ONLY');
+    expect(host.textContent).toContain('ORIGINAL STATUS DRAFT');
+    expect(host.textContent).toContain('permanently read-only');
+    expect(host.textContent).toContain('Generated batch text.');
+    expect(host.textContent).toContain('hidden@example.com');
+    expect(host.textContent).toContain('Bcc · hidden@example.com');
+    expect(host.querySelectorAll('input,textarea')).toHaveLength(0);
+    expect([...host.querySelectorAll('button')].map((button) => button.textContent)).toEqual(['Close review', 'Close review']);
+    expect(edit).not.toHaveBeenCalled(); expect(approve).not.toHaveBeenCalled(); expect(execute).not.toHaveBeenCalled(); expect(dismiss).not.toHaveBeenCalled();
+
+    const retiredEvent: Proposal = {
+      ...retired, id: 'event-retired', kind: 'event', title: 'Retired event', body: 'Event details', status: 'unknown',
+      email: undefined, accountId: 'calendar-account', calendarId: 'calendar-1',
+      eventDestination: { kind: 'remote_calendar', accountId: 'calendar-account', calendarId: 'calendar-1' },
+      event: {
+        title: 'Retired event', description: 'Event details', start: '2026-10-15T10:00:00.000Z',
+        end: '2026-10-15T11:00:00.000Z', timeZone: 'UTC', attendees: ['guest@example.com'], invitePolicy: 'send',
+      },
+    };
+    act(() => root.render(React.createElement(ReviewSheet, {
+      state, proposal: retiredEvent, dispatchRecords: [], busy: false,
+      onClose: vi.fn(), onEdit: edit, onApprove: approve, onExecute: execute, onDismiss: dismiss,
+    })));
+    expect(host.textContent).toContain('Invitation policy · send with event');
+    expect(host.textContent).not.toContain('Invitations · sent');
+    expect(host.textContent).toContain('ORIGINAL STATUS UNKNOWN');
+    expect([...host.querySelectorAll('button')].map((button) => button.textContent)).toEqual(['Close review', 'Close review']);
+    expect(edit).not.toHaveBeenCalled(); expect(approve).not.toHaveBeenCalled(); expect(execute).not.toHaveBeenCalled(); expect(dismiss).not.toHaveBeenCalled();
   });
 });

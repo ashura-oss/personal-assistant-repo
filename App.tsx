@@ -50,6 +50,7 @@ import type {
   ProactiveRecoveryPlan,
   ProactiveRecoveryStatus,
 } from "./src/proactive/recovery";
+import type { DispatchRecoveryPlan, DispatchRecoveryStatus } from "./src/dispatch/recovery";
 import type { StartupRecoveryPlan } from "./src/storage/startupRecovery";
 import type { KnowledgeEntityKind, KnowledgeReference, KnowledgeSuggestion, KnowledgeSuggestionReview } from "./src/knowledge/types";
 import { SpeechTranscriptionError } from "./src/transcription/types";
@@ -70,6 +71,8 @@ import { ProactiveCandidatesSection } from "./src/ui/ProactiveCandidatesSection"
 import { ProactiveRulesSection } from "./src/ui/ProactiveRulesSection";
 import { ProactiveMailAlertsSection, type EnableProactiveMailAlertsInput } from "./src/ui/ProactiveMailAlertsSection";
 import { ProactiveRecoverySheet, shouldShowProactiveRecoverySection } from "./src/ui/ProactiveRecoverySheet";
+import { DispatchRecoverySection } from "./src/ui/DispatchRecoverySection";
+import { closeOwnedDispatchRecovery, DispatchRecoveryOwnership, openCurrentDispatchRecoveryAfterNotVerified, runOwnedDispatchRecoveryAction } from "./src/ui/dispatchRecoveryOwnership";
 import { useProactiveClock } from "./src/ui/useProactiveClock";
 import { ReviewSheet } from "./src/ui/ReviewSheet";
 import { NoteDetail as NoteDetailView } from "./src/ui/NoteDetail";
@@ -984,6 +987,16 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
   const [proactiveRecoveryUnknownId, setProactiveRecoveryUnknownId] = useState<string | undefined>();
   const [proactiveRecoveryRefreshedId, setProactiveRecoveryRefreshedId] = useState<string | undefined>();
   const [proactiveRecoverySheetOpen, setProactiveRecoverySheetOpen] = useState(false);
+  const [dispatchRecoveryPlan, setDispatchRecoveryPlan] = useState<DispatchRecoveryPlan | undefined>();
+  const [dispatchRecoveryBusy, setDispatchRecoveryBusy] = useState(false);
+  const [dispatchRecoveryError, setDispatchRecoveryError] = useState("");
+  const [dispatchRecoverySheetOpen, setDispatchRecoverySheetOpen] = useState(false);
+  const [dispatchRecoveryOwner, setDispatchRecoveryOwner] = useState(0);
+  const [dispatchRecoveryUnknownId, setDispatchRecoveryUnknownId] = useState<string | undefined>();
+  const [dispatchRecoveryRefreshedId, setDispatchRecoveryRefreshedId] = useState<string | undefined>();
+  const privacyInvalidatedCallbackRef = useRef(onPrivacyInvalidated);
+  const dispatchRecoveryReadBlockedRef = useRef(true);
+  const dispatchRecoveryMutationBlockedRef = useRef(true);
   const [selectedChatConversationId, setSelectedChatConversationId] = useState<string | undefined>();
   const [knowledgeReviewRequest, setKnowledgeReviewRequest] = useState<{ suggestionId: string; requestId: number } | undefined>();
   const knowledgeReviewRequestSequence = useRef(0);
@@ -1086,6 +1099,7 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
   const [reviewFreshnessRetry, setReviewFreshnessRetry] = useState(0);
   const [answerWindowTick, setAnswerWindowTick] = useState(0);
   const busyLock = useRef(false);
+  const [dispatchRecoveryOwnership] = useState(() => new DispatchRecoveryOwnership());
   const speechTranscriptionAdmission = useRef<ReturnType<typeof createSpeechTranscriptionAdmission> | null>(null);
   if (speechTranscriptionAdmission.current == null) speechTranscriptionAdmission.current = createSpeechTranscriptionAdmission();
   const checkedAnalysisKey = useRef("");
@@ -1652,6 +1666,221 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
     audio.status !== "idle" || pendingCaptureLoading || foregroundResumeRefreshing || !foregroundCatchupComplete ||
     Boolean(captureJournal && pendingCaptureStatus?.kind !== "empty") ||
     Boolean(review || replyMessageId || reminderReviewId || detail || doc || recordingAttachmentNoteId || manualOpen);
+  const dispatchRecoveryReadBlocked = !startupReady || loading || privacyReviewOpen || privacyOutcomeUnknown ||
+    isolatedPreviewFailed || isIsolatedDemo || (busy && !dispatchRecoveryBusy) ||
+    Boolean(state.assistantChatRecoveryStatus || state.assistantBatchRecoveryStatus ||
+      state.proactiveMailAlertRecoveryStatus || state.backupRecoveryStatus || state.knowledgeRecoveryStatus || state.reminderRecoveryStatus) ||
+    audio.status !== "idle" || pendingCaptureLoading || foregroundResumeRefreshing || !foregroundCatchupComplete ||
+    Boolean(captureJournal && pendingCaptureStatus?.kind !== "empty") || proactiveRecoverySheetOpen ||
+    Boolean(review || replyMessageId || reminderReviewId || detail || doc || recordingAttachmentNoteId || manualOpen ||
+      mailAlertTapResolution || mailAlertTapPending || chatDeleteReviewOpen || chatInteractionLocked);
+  const dispatchRecoveryMutationBlocked = dispatchRecoveryReadBlocked || Boolean(state.mailAlertRefreshRequired || proactiveRecoveryRequiresRefresh);
+  const dispatchRecoveryStatus: DispatchRecoveryStatus | undefined = startupReady
+    ? controller.getDispatchRecoveryStatus()
+    : undefined;
+  useLayoutEffect(() => { privacyInvalidatedCallbackRef.current = onPrivacyInvalidated; }, [onPrivacyInvalidated]);
+  const dispatchRecoveryReadAllowed = useCallback(() => {
+    const ownership = dispatchRecoveryOwnership;
+    return !dispatchRecoveryReadBlockedRef.current && (!busyLock.current || ownership?.isBusy === true);
+  }, [dispatchRecoveryOwnership]);
+  const dispatchRecoveryMutationAllowed = useCallback(() => {
+    const ownership = dispatchRecoveryOwnership;
+    return !dispatchRecoveryMutationBlockedRef.current && (!busyLock.current || ownership?.isBusy === true);
+  }, [dispatchRecoveryOwnership]);
+  const reflectDispatchRecoveryBusy = useCallback((actionBusy = dispatchRecoveryOwnership.isBusy) => {
+    busyLock.current = actionBusy;
+    setBusy(actionBusy);
+    setDispatchRecoveryBusy(actionBusy);
+  }, [dispatchRecoveryOwnership]);
+  useLayoutEffect(() => {
+    dispatchRecoveryOwnership.setBackgroundErrorHandler((error) => {
+      if (isPrivacyBootstrapError(error)) onPrivacyInvalidated();
+    });
+    dispatchRecoveryReadBlockedRef.current = dispatchRecoveryReadBlocked;
+    dispatchRecoveryMutationBlockedRef.current = dispatchRecoveryMutationBlocked;
+    const ownership = dispatchRecoveryOwnership;
+    if (dispatchRecoveryReadBlocked && ownership.isOpen) {
+      const operationId = ownership.invalidate();
+      const invalidatedOwner = ownership.owner;
+      queueMicrotask(() => {
+        if (ownership.owner !== invalidatedOwner || ownership.isOpen) return;
+        setDispatchRecoveryOwner(invalidatedOwner);
+        setDispatchRecoveryPlan(undefined);
+        setDispatchRecoverySheetOpen(false);
+      });
+      if (operationId) void controller.cancelDispatchRecovery(operationId).catch((error) => {
+        if (isPrivacyBootstrapError(error)) onPrivacyInvalidated();
+      });
+    } else if (dispatchRecoveryMutationBlocked && ownership.isOpen && ownership.plan) {
+      const operationId = ownership.discardPlan(ownership.owner);
+      const currentOwner = ownership.owner;
+      queueMicrotask(() => {
+        if (ownership.owner !== currentOwner || !ownership.isOpen || ownership.plan) return;
+        setDispatchRecoveryPlan(undefined);
+        setDispatchRecoverySheetOpen(false);
+      });
+      if (operationId) void controller.cancelDispatchRecovery(operationId).catch((error) => {
+        if (isPrivacyBootstrapError(error)) onPrivacyInvalidated();
+      });
+    }
+  }, [controller, dispatchRecoveryMutationBlocked, dispatchRecoveryOwnership, dispatchRecoveryReadBlocked, onPrivacyInvalidated]);
+  useEffect(() => () => {
+    const operationId = dispatchRecoveryOwnership.invalidate();
+    if (operationId) void controller.cancelDispatchRecovery(operationId).catch((error) => {
+      if (isPrivacyBootstrapError(error)) privacyInvalidatedCallbackRef.current();
+    });
+  }, [controller, dispatchRecoveryOwnership]);
+  const openDispatchRecovery = useCallback(() => {
+    const status = controller.getDispatchRecoveryStatus();
+    const owner = dispatchRecoveryOwnership.open(dispatchRecoveryMutationAllowed, status.plan);
+    if (owner === undefined) return;
+    setDispatchRecoveryOwner(owner);
+    setDispatchRecoveryPlan(status.plan);
+    setDispatchRecoveryError("");
+    setDispatchRecoverySheetOpen(true);
+  }, [controller, dispatchRecoveryMutationAllowed, dispatchRecoveryOwnership]);
+  const closeDispatchRecovery = useCallback((owner: number, expectedOperationId?: string) => {
+    const closed = closeOwnedDispatchRecovery(dispatchRecoveryOwnership, owner, expectedOperationId);
+    if (!closed) return;
+    const operationId = closed.operationId;
+    setDispatchRecoveryOwner(dispatchRecoveryOwnership.owner);
+    setDispatchRecoveryPlan(undefined);
+    setDispatchRecoverySheetOpen(false);
+    setDispatchRecoveryError("");
+    if (operationId) void controller.cancelDispatchRecovery(operationId).catch((error) => {
+      if (isPrivacyBootstrapError(error)) onPrivacyInvalidated();
+    });
+  }, [controller, dispatchRecoveryOwnership, onPrivacyInvalidated]);
+  const onPrepareDispatchRecovery = useCallback(async (owner: number) => {
+    if (!dispatchRecoveryOwnership.isCurrent(owner) || !dispatchRecoveryMutationAllowed()) return;
+    setDispatchRecoveryError("");
+    try {
+      const plan = await runOwnedDispatchRecoveryAction(
+        (onAdmitted) => dispatchRecoveryOwnership.prepare(owner, controller, dispatchRecoveryMutationAllowed, onAdmitted),
+        reflectDispatchRecoveryBusy,
+      );
+      if (plan) setDispatchRecoveryPlan(plan);
+    } catch (error) {
+      if (isPrivacyBootstrapError(error)) onPrivacyInvalidated();
+      else if (dispatchRecoveryOwnership.isCurrent(owner)) setDispatchRecoveryError("The retirement review could not be prepared. No changes were made.");
+    }
+  }, [controller, dispatchRecoveryMutationAllowed, dispatchRecoveryOwnership, onPrivacyInvalidated, reflectDispatchRecoveryBusy]);
+  const onCancelDispatchRecovery = useCallback(async (owner: number, operationId: string) => {
+    const ownership = dispatchRecoveryOwnership;
+    if (ownership.plan?.operationId !== operationId) return;
+    try {
+      const canceled = await runOwnedDispatchRecoveryAction(
+        (onAdmitted) => ownership.cancel(owner, operationId, controller, dispatchRecoveryReadAllowed, onAdmitted),
+        reflectDispatchRecoveryBusy,
+      );
+      if (canceled && ownership.isCurrent(owner)) {
+        const id = ownership.invalidate(owner);
+        if (id) void controller.cancelDispatchRecovery(id).catch(() => undefined);
+        setDispatchRecoveryOwner(ownership.owner);
+        setDispatchRecoveryPlan(undefined);
+        setDispatchRecoverySheetOpen(false);
+      }
+    } catch (error) {
+      if (isPrivacyBootstrapError(error)) onPrivacyInvalidated();
+      else if (ownership.isCurrent(owner)) setDispatchRecoveryError("The review could not be cancelled locally. Close and reopen Settings before continuing.");
+    }
+  }, [controller, dispatchRecoveryReadAllowed, dispatchRecoveryOwnership, onPrivacyInvalidated, reflectDispatchRecoveryBusy]);
+  const onConfirmDispatchRecovery = useCallback(async (owner: number, operationId: string) => {
+    const ownership = dispatchRecoveryOwnership;
+    if (ownership.plan?.operationId !== operationId) return;
+    try {
+      const result = await runOwnedDispatchRecoveryAction((onAdmitted) => {
+        const pending = ownership.confirm(owner, operationId, controller, dispatchRecoveryMutationAllowed, dispatchRecoveryReadAllowed, onAdmitted);
+        // The coordinator consumes the exact plan synchronously before its first await.
+        if (ownership.plan !== undefined) return Promise.resolve(undefined);
+        setDispatchRecoveryPlan(undefined);
+        setDispatchRecoveryUnknownId(undefined);
+        setDispatchRecoveryRefreshedId(undefined);
+        return pending;
+      }, reflectDispatchRecoveryBusy);
+      if (!result) return;
+      if (!ownership.isCurrent(owner)) return;
+      setDispatchRecoverySheetOpen(false);
+      if (result.status === "applied") {
+        ownership.invalidate(owner);
+        setDispatchRecoveryOwner(ownership.owner);
+        setDispatchRecoveryUnknownId(undefined);
+        setDispatchRecoveryRefreshedId(undefined);
+        setNotice("Damaged action history was archived locally. Existing remote proposals are permanently read-only.");
+      } else {
+        setDispatchRecoveryUnknownId(result.operationId);
+        setDispatchRecoveryRefreshedId(undefined);
+        setDispatchRecoveryError("The retirement outcome is unresolved. Refresh saved data, then inspect the receipt. No action was resent.");
+      }
+    } catch (error) {
+      if (isPrivacyBootstrapError(error)) onPrivacyInvalidated();
+      else if (dispatchRecoveryOwnership.isCurrent(owner)) {
+        setDispatchRecoveryError("The retirement outcome could not be confirmed. Refresh saved data and inspect the receipt; do not repeat this review.");
+        setDispatchRecoveryUnknownId(operationId);
+        setDispatchRecoveryRefreshedId(undefined);
+        setDispatchRecoverySheetOpen(false);
+      }
+    }
+  }, [controller, dispatchRecoveryMutationAllowed, dispatchRecoveryOwnership, dispatchRecoveryReadAllowed, onPrivacyInvalidated, reflectDispatchRecoveryBusy]);
+  const onRefreshDispatchRecovery = useCallback(async (owner: number, operationId: string) => {
+    const isExpected = () => dispatchRecoveryUnknownId === operationId || dispatchRecoveryStatus?.lastOperationId === operationId;
+    if (!dispatchRecoveryOwnership.isCurrent(owner) || !dispatchRecoveryReadAllowed() || !isExpected()) return;
+    setDispatchRecoveryRefreshedId(undefined);
+    try {
+      const refreshed = await runOwnedDispatchRecoveryAction(
+        (onAdmitted) => dispatchRecoveryOwnership.refresh(owner, operationId, controller, dispatchRecoveryReadAllowed, isExpected, onAdmitted),
+        reflectDispatchRecoveryBusy,
+      );
+      if (refreshed && dispatchRecoveryOwnership.isCurrent(owner) && isExpected()) setDispatchRecoveryRefreshedId(operationId);
+    } catch (error) {
+      if (isPrivacyBootstrapError(error)) onPrivacyInvalidated();
+      else if (dispatchRecoveryOwnership.isCurrent(owner)) setDispatchRecoveryError("Saved data could not be refreshed. The receipt was not inspected.");
+    }
+  }, [controller, dispatchRecoveryReadAllowed, dispatchRecoveryOwnership, dispatchRecoveryStatus?.lastOperationId, dispatchRecoveryUnknownId, onPrivacyInvalidated, reflectDispatchRecoveryBusy]);
+  const onInspectDispatchRecovery = useCallback(async (owner: number, operationId: string) => {
+    const isExpected = () => dispatchRecoveryUnknownId === operationId || dispatchRecoveryStatus?.lastOperationId === operationId;
+    try {
+      const receipt = await runOwnedDispatchRecoveryAction(
+        (onAdmitted) => dispatchRecoveryOwnership.inspect(owner, operationId, dispatchRecoveryRefreshedId, controller, dispatchRecoveryReadAllowed, isExpected, onAdmitted),
+        reflectDispatchRecoveryBusy,
+      );
+      if (!receipt) return;
+      if (!dispatchRecoveryOwnership.isCurrent(owner) || !isExpected()) return;
+      if (receipt.status === "applied") {
+        setDispatchRecoveryUnknownId(undefined);
+        setDispatchRecoveryRefreshedId(undefined);
+        setDispatchRecoveryError("");
+        setNotice("The saved receipt confirms the action history was retired. No remote action was resent.");
+      } else if (receipt.status === "not_verified") {
+        setDispatchRecoveryRefreshedId(undefined);
+        setDispatchRecoveryError("The previous local retirement could not be verified. This starts a separate review of the current damaged history.");
+      } else {
+        setDispatchRecoveryRefreshedId(undefined);
+        setDispatchRecoveryError("The saved receipt is unavailable and does not establish an outcome. Refresh local data before inspecting again.");
+      }
+    } catch (error) {
+      if (isPrivacyBootstrapError(error)) onPrivacyInvalidated();
+      else if (dispatchRecoveryOwnership.isCurrent(owner)) setDispatchRecoveryError("The saved receipt could not be inspected. Refresh local data before trying again.");
+    }
+  }, [controller, dispatchRecoveryOwnership, dispatchRecoveryReadAllowed, dispatchRecoveryRefreshedId, dispatchRecoveryStatus?.lastOperationId, dispatchRecoveryUnknownId, onPrivacyInvalidated, reflectDispatchRecoveryBusy]);
+  const onReviewCurrentDispatchRecovery = useCallback((owner: number, previousOperationId: string) => {
+    if (dispatchRecoveryUnknownId !== previousOperationId) return;
+    const currentStatus = controller.getDispatchRecoveryStatus();
+    const newOwner = openCurrentDispatchRecoveryAfterNotVerified(
+      dispatchRecoveryOwnership,
+      owner,
+      previousOperationId,
+      () => currentStatus,
+      dispatchRecoveryMutationAllowed,
+    );
+    if (newOwner === undefined) return;
+    setDispatchRecoveryOwner(newOwner);
+    setDispatchRecoveryPlan(undefined);
+    setDispatchRecoveryUnknownId(undefined);
+    setDispatchRecoveryRefreshedId(undefined);
+    setDispatchRecoveryError("The previous local retirement could not be verified. This starts a separate review of the current damaged history.");
+    setDispatchRecoverySheetOpen(true);
+  }, [controller, dispatchRecoveryMutationAllowed, dispatchRecoveryOwnership, dispatchRecoveryUnknownId]);
   const runProactiveRecovery = useCallback(async <T,>(fallback: string, action: () => Promise<T>): Promise<T | undefined> => {
     if (proactiveRecoveryBlocked || busyLock.current) return undefined;
     busyLock.current = true;
@@ -1689,13 +1918,23 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
     return true;
   }, [controller]);
   const closeSettings = useCallback(async () => {
+    const dispatchRecoveryWasOpen = dispatchRecoveryOwnership.isOpen;
+    const dispatchOperationId = dispatchRecoveryOwnership.invalidate();
+    if (dispatchRecoveryWasOpen) {
+      setDispatchRecoveryOwner(dispatchRecoveryOwnership.owner);
+      setDispatchRecoveryPlan(undefined);
+      setDispatchRecoverySheetOpen(false);
+      if (dispatchOperationId) void controller.cancelDispatchRecovery(dispatchOperationId).catch((error) => {
+        if (isPrivacyBootstrapError(error)) onPrivacyInvalidated();
+      });
+    }
     if (proactiveRecoverySheetOpen) {
       const operationId = proactiveRecoveryPlan?.operationId ?? controller.getProactiveRecoveryStatus().plan?.operationId;
       const cancelled = await onCancelProactiveRecovery(operationId);
       if (!cancelled) return;
     }
     setSettingsOpen(false);
-  }, [controller, onCancelProactiveRecovery, proactiveRecoveryPlan?.operationId, proactiveRecoverySheetOpen]);
+  }, [controller, dispatchRecoveryOwnership, onCancelProactiveRecovery, onPrivacyInvalidated, proactiveRecoveryPlan?.operationId, proactiveRecoverySheetOpen]);
   const onConfirmProactiveRecovery = useCallback(async (operationId: string) => {
     if (proactiveRecoveryBlocked || busyLock.current) return;
     busyLock.current = true; setBusy(true); setProactiveRecoveryBusy(true); setProactiveRecoveryError("");
@@ -1729,7 +1968,14 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
     }
     setBackgroundStatusRefreshKey((value) => value + 1);
     setSettingsOpen(true);
-  }, [audio.status]);
+    if ((dispatchRecoveryStatus?.status === "refresh_required" && dispatchRecoveryStatus.lastOperationId) || dispatchRecoveryUnknownId) {
+      const current = dispatchRecoveryOwnership;
+      if (!current.isOpen) {
+        const owner = current.open(dispatchRecoveryReadAllowed);
+        if (owner !== undefined) setDispatchRecoveryOwner(owner);
+      }
+    }
+  }, [audio.status, dispatchRecoveryOwnership, dispatchRecoveryReadAllowed, dispatchRecoveryStatus, dispatchRecoveryUnknownId]);
   const chatCreateConversation = useCallback(async () => {
     if (chatAppBlocked || busy || chatDeleteReviewOpen || Boolean(mailAlertTapResolution)) {
       setNotice("Chat is unavailable until startup and recovery are ready.");
@@ -3705,6 +3951,25 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
               onInspectProactiveRecovery={onInspectProactiveRecovery}
               proactiveRecoverySheetOpen={proactiveRecoverySheetOpen}
               proactiveRecoveryActionBlocked={proactiveRecoveryBlocked}
+              dispatchRecoveryStatus={dispatchRecoveryStatus}
+              dispatchRecoveryPlan={dispatchRecoveryPlan}
+              dispatchRecoveryBusy={dispatchRecoveryBusy}
+              dispatchRecoveryError={dispatchRecoveryError}
+              dispatchRecoverySheetOpen={dispatchRecoverySheetOpen}
+              dispatchRecoveryOwner={dispatchRecoveryOwner}
+              dispatchRecoveryBlocked={dispatchRecoveryReadBlocked}
+              dispatchRecoveryMutationBlocked={dispatchRecoveryMutationBlocked}
+              dispatchRecoveryUnknownId={dispatchRecoveryUnknownId ?? (dispatchRecoveryStatus?.status === "refresh_required" ? dispatchRecoveryStatus.lastOperationId : undefined)}
+              dispatchRecoveryRefreshedId={dispatchRecoveryRefreshedId}
+              dispatchRecoveryCurrentReviewOperationId={dispatchRecoveryStatus?.status === "available" ? dispatchRecoveryOwnership.currentNotVerifiedOperationId(dispatchRecoveryOwner) : undefined}
+              onOpenDispatchRecovery={openDispatchRecovery}
+              onPrepareDispatchRecovery={(owner) => { void onPrepareDispatchRecovery(owner); }}
+              onConfirmDispatchRecovery={(owner, operationId) => { void onConfirmDispatchRecovery(owner, operationId); }}
+              onCancelDispatchRecovery={(owner, operationId) => { void onCancelDispatchRecovery(owner, operationId); }}
+              onCloseDispatchRecovery={(owner) => closeDispatchRecovery(owner)}
+              onRefreshDispatchRecovery={(owner, operationId) => { void onRefreshDispatchRecovery(owner, operationId); }}
+              onInspectDispatchRecovery={(owner, operationId) => { void onInspectDispatchRecovery(owner, operationId); }}
+              onReviewCurrentDispatchRecovery={(owner, operationId) => onReviewCurrentDispatchRecovery(owner, operationId)}
               onClose={() => { void closeSettings(); }}
               onSave={(patch) => run(() => controller.saveSettings(patch))}
               onSaveAccount={(c) => run(() => controller.saveAccount(c))}
@@ -4990,6 +5255,25 @@ function SettingsScreen({
   onInspectProactiveRecovery,
   proactiveRecoverySheetOpen,
   proactiveRecoveryActionBlocked,
+  dispatchRecoveryStatus,
+  dispatchRecoveryPlan,
+  dispatchRecoveryBusy,
+  dispatchRecoveryError,
+  dispatchRecoverySheetOpen,
+  dispatchRecoveryOwner,
+  dispatchRecoveryBlocked,
+  dispatchRecoveryMutationBlocked,
+  dispatchRecoveryUnknownId,
+  dispatchRecoveryRefreshedId,
+  dispatchRecoveryCurrentReviewOperationId,
+  onOpenDispatchRecovery,
+  onPrepareDispatchRecovery,
+  onConfirmDispatchRecovery,
+  onCancelDispatchRecovery,
+  onCloseDispatchRecovery,
+  onRefreshDispatchRecovery,
+  onInspectDispatchRecovery,
+  onReviewCurrentDispatchRecovery,
   demoMode,
   onClose,
   onSave,
@@ -5048,6 +5332,25 @@ function SettingsScreen({
   onInspectProactiveRecovery: () => Promise<void>;
   proactiveRecoverySheetOpen: boolean;
   proactiveRecoveryActionBlocked: boolean;
+  dispatchRecoveryStatus?: DispatchRecoveryStatus;
+  dispatchRecoveryPlan?: DispatchRecoveryPlan;
+  dispatchRecoveryBusy: boolean;
+  dispatchRecoveryError: string;
+  dispatchRecoverySheetOpen: boolean;
+  dispatchRecoveryOwner: number;
+  dispatchRecoveryBlocked: boolean;
+  dispatchRecoveryMutationBlocked: boolean;
+  dispatchRecoveryUnknownId?: string;
+  dispatchRecoveryRefreshedId?: string;
+  dispatchRecoveryCurrentReviewOperationId?: string;
+  onOpenDispatchRecovery: () => void;
+  onPrepareDispatchRecovery: (owner: number) => void;
+  onConfirmDispatchRecovery: (owner: number, operationId: string) => void;
+  onCancelDispatchRecovery: (owner: number, operationId: string) => void;
+  onCloseDispatchRecovery: (owner: number) => void;
+  onRefreshDispatchRecovery: (owner: number, operationId: string) => void;
+  onInspectDispatchRecovery: (owner: number, operationId: string) => void;
+  onReviewCurrentDispatchRecovery: (owner: number, previousOperationId: string) => void;
   onClose: () => void;
   busy: boolean;
   demoMode: boolean;
@@ -5308,6 +5611,27 @@ function SettingsScreen({
             </Text>
           </View>
         ) : null}
+        <DispatchRecoverySection
+          status={dispatchRecoveryStatus}
+          integrityMessage={state.dispatchRecoveryStatus?.message}
+          plan={dispatchRecoveryPlan}
+          open={dispatchRecoverySheetOpen}
+          busy={dispatchRecoveryBusy}
+          blocked={dispatchRecoveryBlocked || Boolean(backgroundActionBlockedReason)}
+          mutationBlocked={dispatchRecoveryMutationBlocked || Boolean(backgroundActionBlockedReason)}
+          error={dispatchRecoveryError}
+          unknownOperationId={dispatchRecoveryUnknownId}
+          refreshedOperationId={dispatchRecoveryRefreshedId}
+          reviewCurrentOperationId={dispatchRecoveryCurrentReviewOperationId}
+          onOpen={onOpenDispatchRecovery}
+          onPrepare={() => onPrepareDispatchRecovery(dispatchRecoveryOwner)}
+          onConfirm={(operationId) => onConfirmDispatchRecovery(dispatchRecoveryOwner, operationId)}
+          onCancel={(operationId) => onCancelDispatchRecovery(dispatchRecoveryOwner, operationId)}
+          onClose={() => onCloseDispatchRecovery(dispatchRecoveryOwner)}
+          onRefresh={(operationId) => onRefreshDispatchRecovery(dispatchRecoveryOwner, operationId)}
+          onInspect={(operationId) => onInspectDispatchRecovery(dispatchRecoveryOwner, operationId)}
+          onReviewCurrent={(operationId) => onReviewCurrentDispatchRecovery(dispatchRecoveryOwner, operationId)}
+        />
         {mailAlertTapStatus ? (
           <MailAlertTapStatusCard status={mailAlertTapStatus} />
         ) : null}

@@ -21,6 +21,8 @@ class MemoryStore implements StateStore {
     if (this.failAfterCommit) { this.failAfterCommit = false; throw new Error('fixture lost the save acknowledgement'); }
   }
   async clear() { this.value = undefined; }
+  async readCurrentSnapshot() { return this.value ? { raw: JSON.stringify(this.value), schemaVersion: 1 } : undefined; }
+  async assertCurrent() {}
 }
 
 function client() {
@@ -114,6 +116,151 @@ function completedInspection(customId: string, content = JSON.stringify({
 }
 
 describe('OpenRouter Batch controller lifecycle', () => {
+  it('keeps a retired reply source fenced after proposal deletion and same-identity reconnect', async () => {
+    const fixture = await mailFixture(client());
+    const { app, store, integration, message, source, identityKey } = fixture;
+    const recoveryIntegration = { ...integration, privacySession: { epoch: 'mail-recovery-test', async assertCurrent() {}, async getStatus() {
+      return { phase: 'ready' as const, epoch: 'mail-recovery-test', activeWriterCount: 0, pendingCleanupCount: 0, failedCleanupCount: 0,
+        limits: { namespaces: 10, oauthTokenRefs: 1024, legacyMarkdownPaths: 4096, writerLeases: 512, cleanupTargets: 5130, cleanupBatch: 16 },
+        coverage: 'tracked_with_legacy_limits' as const };
+    } } };
+    const draft = await app.createMailReplyProposal({ messageId: message.id, mode: 'reply', sourceDigest: source.source!.sourceDigest, text: 'Draft reply.' });
+    const send = await app.createMailReplyProposal({ messageId: message.id, mode: 'reply_all', sourceDigest: source.source!.sourceDigest, text: 'Send reply.' });
+
+    const raw = store.value as AppState & { dispatchRecordQuarantine?: unknown; dispatchRecords: unknown[] };
+    raw.proposals.find((item) => item.id === send.id)!.email!.operation = 'send';
+    raw.dispatchRecords = [{ id: 'bad-mail-receipt', raw: 'private' }] as never;
+    raw.dispatchRecordQuarantine = { opaque: 'uncertain provider receipt' };
+    await store.save(raw);
+    const recovery = new AppControllerImpl(store, {}, recoveryIntegration);
+    await recovery.load();
+    const plan = await recovery.prepareDispatchRecovery();
+    await recovery.confirmDispatchRecovery({ operationId: plan.operationId, confirmation: 'RETIRE ACTIONS' });
+
+    // The action tombstone outlives both generated proposal rows and the local
+    // connection generation, while the provider identity remains the same.
+    const reconnected = store.value as AppState;
+    reconnected.proposals = reconnected.proposals.filter((item) => item.id !== draft.id && item.id !== send.id);
+    const savedAccount = reconnected.accounts.find((item) => item.id === message.accountId)!;
+    savedAccount.connectionGeneration = (savedAccount.connectionGeneration ?? 0) + 1;
+    reconnected.mailbox.find((item) => item.id === message.id)!.connectionGeneration = savedAccount.connectionGeneration;
+    await store.save(reconnected);
+    const reopened = new AppControllerImpl(store, {}, recoveryIntegration);
+    await reopened.load();
+    const currentSource = await reopened.getMailReplySource(message.id);
+    expect(currentSource.status).toBe('current');
+    expect(identityKey).toBe('google:mail-fixture-client:mail-fixture-subject:');
+    await expect(reopened.createMailReplyProposal({ messageId: message.id, mode: 'reply', sourceDigest: currentSource.source!.sourceDigest, text: 'Another draft.' }))
+      .rejects.toThrow(/retired during dispatch recovery/);
+    await expect(reopened.createMailReplyProposal({ messageId: message.id, mode: 'reply_all', sourceDigest: currentSource.source!.sourceDigest, text: 'Another send.' }))
+      .rejects.toThrow(/retired during dispatch recovery/);
+
+    const freshMessage = { ...message, id: 'fresh-after-recovery', providerMessageId: 'fresh-after-recovery-provider',
+      identityKey: `${identityKey}:fresh-after-recovery-provider`, subject: 'Independent message',
+      internetMessageId: '<fresh-after-recovery@example.test>', connectionGeneration: savedAccount.connectionGeneration };
+    reconnected.mailbox.push(freshMessage);
+    await store.save(reconnected);
+    const freshApp = new AppControllerImpl(store, {}, recoveryIntegration);
+    await freshApp.load();
+    const freshSource = await freshApp.getMailReplySource(freshMessage.id);
+    expect(freshSource.status).toBe('current');
+    await expect(freshApp.createMailReplyProposal({ messageId: freshMessage.id, mode: 'reply', sourceDigest: freshSource.source!.sourceDigest,
+      text: 'A new message has an independent action.' })).resolves.toMatchObject({ status: 'draft' });
+  });
+
+  it('commits a fresh mailbox observation while archived uncertainty retains the linked Batch context', async () => {
+    let connectorAccount: Parameters<typeof describeMessageWindowQuery>[0] | undefined;
+    const connector = { async syncMessageWindow(account: Parameters<typeof describeMessageWindowQuery>[0], options: {
+      timeMin: string; timeMax: string; pageSize?: number;
+      onPage?: (items: unknown[], cursor: undefined, pages: number, metadata: { unavailableIds: string[]; window: { from: string; to: string }; queryFingerprint: string }) => unknown;
+    }) {
+      connectorAccount = account;
+      const descriptor = describeMessageWindowQuery(account, { timeMin: options.timeMin, timeMax: options.timeMax, pageSize: options.pageSize });
+      const summary = { id: 'mail-fixture-provider', idFormat: 'gmail' as const, subject: 'Freshly observed subject',
+        receivedAt: '2026-10-14T02:00:00.000Z', senderEmail: 'sam@example.test', isRead: false,
+        replyMetadataComplete: true, internetMessageId: '<mail-fixture@example.test>', to: ['me@example.test'] };
+      await options.onPage?.([summary], undefined, 1, { unavailableIds: [], window: descriptor.window, queryFingerprint: descriptor.queryFingerprint });
+      return { items: [summary], nextCursor: undefined, pagesRead: 1, partial: false, window: descriptor.window,
+        queryFingerprint: descriptor.queryFingerprint, unavailableIds: [] };
+    } };
+    const fixture = await mailFixture(client(), connector);
+    const { app, store, integration, message, source, textDigest, account } = fixture;
+    const job = await app.submitMailReplyBatch({ messageId: message.id, sourceDigest: source.source!.sourceDigest, textDigest,
+      mode: 'reply', to: ['sam@example.test'], cc: [], brief: 'Preserve this pending request during source observation.', composerRevision: 1 });
+    const raw = store.value as AppState & { dispatchRecordQuarantine?: unknown; dispatchRecords: unknown[] };
+    raw.dispatchRecords = [{ id: 'bad-observation-receipt', raw: 'opaque' }] as never;
+    raw.dispatchRecordQuarantine = { sentinel: 'unresolved-observation-receipt' };
+    await store.save(raw);
+    const privacySession = { epoch: 'mail-observation-recovery', async assertCurrent() {}, async getStatus() {
+      return { phase: 'ready' as const, epoch: 'mail-observation-recovery', activeWriterCount: 0, pendingCleanupCount: 0, failedCleanupCount: 0,
+        limits: { namespaces: 10, oauthTokenRefs: 1024, legacyMarkdownPaths: 4096, writerLeases: 512, cleanupTargets: 5130, cleanupBatch: 16 },
+        coverage: 'tracked_with_legacy_limits' as const };
+    } };
+    const recoveryIntegration = { ...integration, privacySession };
+    const recovering = new AppControllerImpl(store, {}, recoveryIntegration);
+    await recovering.load();
+    const plan = await recovering.prepareDispatchRecovery();
+    await recovering.confirmDispatchRecovery({ operationId: plan.operationId, confirmation: 'RETIRE ACTIONS' });
+
+    const before = store.value as AppState & { openRouterBatchLedger: { jobs: Record<string, unknown>[] } };
+    const retainedBefore = before.openRouterBatchLedger.jobs.find((item) => item.id === job.id)!;
+    expect(retainedBefore).toHaveProperty('requestBody');
+    const observed = await recovering.refreshMailHead(account.id);
+    expect(observed).toMatchObject({ status: 'complete', lane: 'head' });
+    expect(connectorAccount?.id).toBe(account.id);
+    expect(recovering.getSnapshot().mailbox.find((item) => item.id === message.id)?.subject).toBe('Freshly observed subject');
+    const after = store.value as AppState & { openRouterBatchLedger: { jobs: Record<string, unknown>[] } };
+    expect(after.openRouterBatchLedger.jobs.find((item) => item.id === job.id)).toEqual(retainedBefore);
+    expect(recovering.getDispatchRecoveryStatus().unresolvedReceiptCount).toBeGreaterThan(0);
+  });
+
+  it('fails closed for simulated-flag mail proposals that could still be approved or remotely executed', async () => {
+    let providerWrites = 0;
+    const connector = { async createDraft() { providerWrites += 1; return { status: 'accepted' as const, id: 'draft-accepted' }; },
+      async sendEmail() { providerWrites += 1; return { status: 'accepted' as const, id: 'message-accepted' }; } };
+    const fixture = await mailFixture(client(), connector);
+    const { app, store, integration, message, source, identity } = fixture;
+    const draft = await app.createMailReplyProposal({ messageId: message.id, mode: 'reply', sourceDigest: source.source!.sourceDigest, text: 'Review this draft.' });
+    const approved = await app.createMailReplyProposal({ messageId: message.id, mode: 'reply_all', sourceDigest: source.source!.sourceDigest, text: 'Review this send.' });
+    await (app as unknown as { mutate(operation: (state: AppState) => void): Promise<void> }).mutate((state) => {
+      const account = state.accounts.find((item) => item.id === message.accountId)!;
+      account.capabilities = ['mail.read', 'mail.draft', 'mail.send'];
+      account.grantedScopes = ['openid', 'https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/gmail.compose', 'https://www.googleapis.com/auth/gmail.modify'];
+    });
+    await app.approveProposal(approved.id);
+    const raw = store.value as AppState & { dispatchRecoveryArchives?: unknown };
+    raw.proposals.find((item) => item.id === draft.id)!.simulated = true;
+    raw.proposals.find((item) => item.id === approved.id)!.simulated = true;
+    raw.dispatchRecoveryArchives = { version: 1, entries: [{ operationId: 'malformed-archive' }] };
+    await store.save(raw);
+    const privacySession = { epoch: 'simulated-guard-test', async assertCurrent() {}, async getStatus() {
+      return { phase: 'ready' as const, epoch: 'simulated-guard-test', activeWriterCount: 0, pendingCleanupCount: 0, failedCleanupCount: 0,
+        limits: { namespaces: 10, oauthTokenRefs: 1024, legacyMarkdownPaths: 4096, writerLeases: 512, cleanupTargets: 5130, cleanupBatch: 16 },
+        coverage: 'tracked_with_legacy_limits' as const };
+    } };
+    const guarded = new AppControllerImpl(store, {}, { ...integration, privacySession });
+    await guarded.load();
+    await expect(guarded.approveProposal(draft.id)).rejects.toThrow(/integrity validation|archive_invalid/i);
+    await expect(guarded.executeProposal(approved.id)).rejects.toThrow(/integrity validation|archive_invalid/i);
+    expect(providerWrites).toBe(0);
+    expect(identity.providerNamespace).toBe('google');
+
+    const previewFixture = await mailFixture(client());
+    const previewDraft = await previewFixture.app.createMailReplyProposal({ messageId: previewFixture.message.id, mode: 'reply',
+      sourceDigest: previewFixture.source.source!.sourceDigest, text: 'Preview-only source action.' });
+    await (previewFixture.app as unknown as { mutate(operation: (state: AppState) => void): Promise<void> }).mutate((state) => {
+      const account = state.accounts.find((item) => item.id === previewFixture.message.accountId)!;
+      account.capabilities = ['mail.read', 'mail.draft'];
+      account.grantedScopes = ['openid', 'https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/gmail.compose'];
+    });
+    const previewState = previewFixture.store.value as AppState;
+    previewState.proposals.find((item) => item.id === previewDraft.id)!.simulated = true;
+    await previewFixture.store.save(previewState);
+    const previewApp = new AppControllerImpl(previewFixture.store, {}, previewFixture.integration);
+    await previewApp.load();
+    await expect(previewApp.approveProposal(previewDraft.id)).resolves.toMatchObject({ status: 'approved' });
+  });
+
   it('preserves mail Batch history across account revocation and safely attaches a late owned POST acknowledgement', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-10-14T03:00:00.000Z'));

@@ -8,6 +8,7 @@ import type { PendingCaptureReceipt, PendingCaptureSafeStatus } from '../audio/p
 import type { ProactiveMailAlertState } from '../proactiveMailAlerts/types';
 import type { MailAlertTapKey, MailAlertTapResolution } from '../proactiveMailAlerts/taps';
 import type { ProactiveRecoveryPlan, ProactiveRecoveryReceiptInspection, ProactiveRecoveryResult, ProactiveRecoveryStatus } from '../proactive/recovery';
+import type { DispatchRecoveryPlan, DispatchRecoveryReceiptInspection, DispatchRecoveryResult, DispatchRecoveryStatus } from '../dispatch/recovery';
 import type { ChatTranscriptTransferPlan } from '../chat/types';
 
 export type NoteStatus = 'recorded' | 'processed' | 'error';
@@ -193,6 +194,8 @@ export interface Proposal {
   dispatchRecordId?: string;
   /** Legacy terminal external action lacks an exact credential-free frozen receipt. */
   dispatchHistoryIncomplete?: boolean;
+  /** This proposal predates dispatch recovery and is permanently read-only, even if its source is later edited. */
+  dispatchRecoveryRetired?: true;
   accountId?: string;
   recipients: string[];
   calendarId?: string;
@@ -941,6 +944,11 @@ export interface AppController {
   cancelProactiveRecovery(operationId: string): Promise<void>;
   confirmProactiveRecovery(input: { operationId: string; confirmation: 'RESET RULES' }): Promise<ProactiveRecoveryResult>;
   inspectProactiveRecoveryReceipt(operationId: string): Promise<ProactiveRecoveryReceiptInspection>;
+  getDispatchRecoveryStatus(): DispatchRecoveryStatus;
+  prepareDispatchRecovery(): Promise<DispatchRecoveryPlan>;
+  cancelDispatchRecovery(operationId: string): Promise<void>;
+  confirmDispatchRecovery(input: { operationId: string; confirmation: 'RETIRE ACTIONS' }): Promise<DispatchRecoveryResult>;
+  inspectDispatchRecoveryReceipt(operationId: string): Promise<DispatchRecoveryReceiptInspection>;
   saveProactiveRule(input: {
     id?: string; expectedVersion?: number; name: string; enabled: boolean; accountIds: string[];
     trigger: import('../proactive').ProactiveTrigger; quietHours?: import('../proactive').QuietHours;
