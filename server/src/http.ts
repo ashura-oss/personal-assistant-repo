@@ -5,6 +5,7 @@ import { AuthError, type AuthService } from './auth.js';
 import { KernelError } from './kernel.js';
 import { VaultError } from './vault.js';
 import type { SafeCredentialMetadataSnapshot, ServerCredentialCommandService } from './credentialCommands.js';
+import type { WorkspaceHttpAdmission, WorkspaceHttpApi } from './workspaceHttp.js';
 
 const BODY_LIMIT = 16 * 1024;
 const CREDENTIAL_BODY_LIMIT = 2 * 16 * 1024 * 1024 + 64 * 1024;
@@ -32,6 +33,7 @@ export interface StillHttpOptions {
   readonly staticRoot: string;
   readonly allowLocalHttp?: boolean;
   readonly credentialCommands?: ServerCredentialCommandService;
+  readonly workspaceApi?: WorkspaceHttpApi;
 }
 
 interface CookieValues { readonly session?: string; readonly preauth?: string }
@@ -182,6 +184,62 @@ async function readJsonBody(request: IncomingMessage, response: ServerResponse, 
   const text = Buffer.concat(chunks, size).toString('utf8');
   if (Buffer.from(text, 'utf8').length !== size) throw problem(400, 'bad_request');
   try { return JSON.parse(text) as unknown; } catch { throw problem(400, 'bad_request'); }
+}
+
+function workspaceReadAdmission(request: IncomingMessage, auth: AuthService, canonicalOrigin: URL): WorkspaceHttpAdmission {
+  const cookies = readCookies(request);
+  if (!cookies.session) throw problem(401, 'unauthenticated');
+  const session = auth.getSession(cookies.session);
+  if (!session.authenticated) throw problem(401, 'unauthenticated');
+  const captured = Object.freeze({ sessionToken: cookies.session, origin: canonicalOrigin.origin, csrf: session.csrfToken });
+  const assertCurrent = () => { auth.assertMutation(captured.sessionToken, captured.origin, captured.csrf); };
+  assertCurrent();
+  return Object.freeze({ sessionToken: captured.sessionToken, assertCurrent });
+}
+
+function workspaceMutationAdmission(request: IncomingMessage, auth: AuthService, canonicalOrigin: URL): WorkspaceHttpAdmission {
+  const captured = authenticatedMutation(request, auth, canonicalOrigin);
+  const assertCurrent = () => { auth.assertMutation(captured.sessionToken, captured.origin, captured.csrf); };
+  assertCurrent();
+  return Object.freeze({ sessionToken: captured.sessionToken, assertCurrent });
+}
+
+function workspaceFailure(error: unknown): { readonly status: number; readonly code: string } {
+  if (isHttpProblem(error)) {
+    const expected = new Set(['bad_request', 'unsupported_media_type', 'request_too_large', 'request_timeout',
+      'unauthenticated', 'origin_rejected', 'csrf_rejected']);
+    if (Number.isInteger(error.status) && error.status >= 400 && error.status <= 499 && expected.has(error.code)) {
+      return { status: error.status, code: error.code };
+    }
+    return { status: 503, code: 'service_unavailable' };
+  }
+  if (error instanceof AuthError) return { status: authStatus(error), code: error.code };
+  if (error instanceof KernelError) {
+    if (error.code === 'unauthenticated') return { status: 401, code: 'unauthenticated' };
+    if (error.code === 'forbidden') return { status: 403, code: 'forbidden' };
+    if (['invalid_id', 'invalid_input', 'invalid_json', 'size_limit'].includes(error.code)) {
+      return { status: 400, code: 'invalid_workspace_command' };
+    }
+    if (['stale_epoch', 'stale_account', 'idempotency_conflict'].includes(error.code)) return { status: 409, code: 'workspace_conflict' };
+    return { status: 503, code: 'service_unavailable' };
+  }
+  if (error instanceof Error) {
+    if (['workspace_command_invalid', 'workspace_command_id_invalid', 'workspace_command_receipt_invalid'].includes(error.message)) {
+      return { status: 400, code: 'invalid_workspace_command' };
+    }
+    if (error.message === 'workspace_refresh_required') return { status: 409, code: 'workspace_refresh_required' };
+    if (['This command idempotency key is already bound to different ownership or request content.',
+      'The workspace revision changed before command admission.', 'The workspace runtime is busy.',
+      'workspace_ownership_changed', 'workspace_loaded_revision_mismatch'].includes(error.message)) {
+      return { status: 409, code: 'workspace_conflict' };
+    }
+  }
+  return { status: 503, code: 'service_unavailable' };
+}
+
+function sendWorkspaceFailure(response: ServerResponse, error: unknown): void {
+  const mapped = workspaceFailure(error);
+  sendError(response, mapped.status, mapped.code);
 }
 
 function exactObject(value: unknown, keys: string[]): Record<string, unknown> {
@@ -447,7 +505,7 @@ export function createStillHttpServer(options: StillHttpOptions): Server {
   const { paths, index } = collectStaticPaths(realRoot);
   const server = createServer((request, response) => {
     securityHeaders(response);
-    void handleRequest(request, response, options.auth, origin, realRoot, paths, index, options.credentialCommands).catch((error: unknown) => {
+    void handleRequest(request, response, options.auth, origin, realRoot, paths, index, options.credentialCommands, options.workspaceApi).catch((error: unknown) => {
       if (response.headersSent) { response.destroy(); return; }
       if (isHttpProblem(error)) { sendError(response, error.status, error.code); return; }
       if (error instanceof AuthError) { sendError(response, authStatus(error), error.code); return; }
@@ -462,7 +520,8 @@ export function createStillHttpServer(options: StillHttpOptions): Server {
 }
 
 async function handleRequest(request: IncomingMessage, response: ServerResponse, auth: AuthService, canonicalOrigin: URL,
-  staticRoot: string, staticPaths: Set<string>, index: Buffer, credentialCommands?: ServerCredentialCommandService): Promise<void> {
+  staticRoot: string, staticPaths: Set<string>, index: Buffer, credentialCommands?: ServerCredentialCommandService,
+  workspaceApi?: WorkspaceHttpApi): Promise<void> {
   const host = uniqueHeader(request, 'host', true);
   if (!host || host.toLowerCase() !== canonicalOrigin.host.toLowerCase()) throw problem(403, 'host_rejected');
   const { pathname, hasQuery } = safePath(request.url);
@@ -534,6 +593,63 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     const challenge = auth.createLoginChallenge(canonicalOrigin.origin);
     sendJson(response, 200, { authenticated: false, setupRequired: false, csrfToken: challenge.csrfToken }, false,
       { 'Set-Cookie': jsonCookies(undefined, challenge.preAuthToken) });
+    return;
+  }
+  if (pathname === '/api/workspace/snapshot') {
+    if (request.method !== 'GET') { response.setHeader('Allow', 'GET'); throw problem(405, 'method_not_allowed'); }
+    if (hasQuery) throw problem(400, 'bad_request');
+    if (!workspaceApi) throw problem(503, 'service_unavailable');
+    const admission = workspaceReadAdmission(request, auth, canonicalOrigin);
+    try {
+      admission.assertCurrent();
+      const snapshot = await workspaceApi.getSnapshot(admission);
+      admission.assertCurrent();
+      if (!response.destroyed) sendJson(response, 200, snapshot);
+    } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
+    return;
+  }
+  if (pathname === '/api/workspace/refresh') {
+    if (request.method !== 'POST') { response.setHeader('Allow', 'POST'); throw problem(405, 'method_not_allowed'); }
+    if (hasQuery) throw problem(400, 'bad_request');
+    if (!workspaceApi) throw problem(503, 'service_unavailable');
+    const admission = workspaceMutationAdmission(request, auth, canonicalOrigin);
+    try {
+      exactObject(await readJsonBody(request, response), []);
+      admission.assertCurrent();
+      const snapshot = await workspaceApi.refreshSnapshot(admission);
+      admission.assertCurrent();
+      if (!response.destroyed) sendJson(response, 200, snapshot);
+    } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
+    return;
+  }
+  if (pathname === '/api/workspace/commands') {
+    if (request.method !== 'POST') { response.setHeader('Allow', 'POST'); throw problem(405, 'method_not_allowed'); }
+    if (hasQuery) throw problem(400, 'bad_request');
+    if (!workspaceApi) throw problem(503, 'service_unavailable');
+    const admission = workspaceMutationAdmission(request, auth, canonicalOrigin);
+    try {
+      const envelope = await readJsonBody(request, response);
+      admission.assertCurrent();
+      const result = await workspaceApi.dispatchCommand(admission, envelope);
+      admission.assertCurrent();
+      if (!response.destroyed) sendJson(response, 200, result);
+    } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
+    return;
+  }
+  const workspaceCommandPrefix = '/api/workspace/commands/';
+  if (pathname.startsWith(workspaceCommandPrefix)) {
+    if (request.method !== 'GET') { response.setHeader('Allow', 'GET'); throw problem(405, 'method_not_allowed'); }
+    if (hasQuery) throw problem(400, 'bad_request');
+    if (!workspaceApi) throw problem(503, 'service_unavailable');
+    const commandId = pathname.slice(workspaceCommandPrefix.length);
+    if (!COMMAND_ID_RE.test(commandId)) throw problem(400, 'bad_request');
+    const admission = workspaceReadAdmission(request, auth, canonicalOrigin);
+    try {
+      admission.assertCurrent();
+      const result = workspaceApi.inspectCommand(admission, commandId);
+      admission.assertCurrent();
+      if (!response.destroyed) sendJson(response, 200, result);
+    } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
     return;
   }
   if (pathname === '/api/credentials') {
