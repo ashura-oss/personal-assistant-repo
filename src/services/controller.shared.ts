@@ -1498,12 +1498,35 @@ class MailReplyContextRefreshRequiredError extends Error {
 export interface ControllerRuntimePorts {
   store: StateStore; crypto: ControllerCryptoPort;
   providers: { speech: ControllerSpeechPort; speechOpenRouter?: OpenRouterSpeechAdapterPort; openAi: AssistantModelClient };
+  speechCleanup?: ControllerSpeechCleanupPort;
   integration: ControllerIntegrationDependencies & { reminderBackend: NotificationBackend; mailAlertBackend: MailAlertNotificationBackend; deviceCalendarBackend: DeviceCalendarBackend; writeDocument(path: string, content: string): Promise<void>; removeAudio(uri: string): Promise<void>; loadRecordingRecovery(): Promise<RecordingRecoveryService>; bindRecordingRecovery(service: RecordingRecoveryService): RecordingRecoveryService };
   pendingCapture?: PendingCaptureControllerPort;
 }
 
 /** The shared controller's narrow speech surface; Node runtimes need no Azure client internals. */
 export type ControllerSpeechPort = Pick<AzureSpeechClient, 'transcribe' | 'releaseUploadLease' | 'disposeMemory'>;
+
+export interface ControllerSpeechCleanupObserver {
+  /** Record that the controller's durable lease reached its cleanup-pending phase. */
+  markPending(): void;
+  /** Observe actual audio cleanup; retry is bound to this exact attempt lease. */
+  observeCleanup(actualCleanup: Promise<void>, retryCleanup: () => Promise<void>): void;
+}
+
+export interface ControllerSpeechCleanupPort {
+  /** Registers only a newly persisted lease while its transcription command is active. */
+  register(input: { readonly noteId: string; readonly attemptId: string; readonly leaseId: string; readonly provider: 'azure' | 'openrouter' }): ControllerSpeechCleanupObserver;
+}
+
+interface ControllerTranscriptionJob {
+  attemptId: string;
+  sourceRevision: number;
+  leaseId: string;
+  controller: AbortController;
+  promise: Promise<Note>;
+  speechCleanupRegistrationAttempted?: boolean;
+  speechCleanupObserver?: ControllerSpeechCleanupObserver;
+}
 
 type ProposalStatusOutcome = { status: 'executed' | 'simulated' | 'failed' | 'accepted' | 'unknown'; message: string; notificationId?: string; operation?: ApprovedDispatch['operation']; remoteId?: string; replyDraftCheck?: 'matches_approved' | 'differs' | 'unverified'; dispatchOutcome?: Exclude<DispatchOutcome, 'pending'>; rejectionCode?: 'provider_rejected' | 'precondition_failed' };
 
@@ -1533,6 +1556,7 @@ export class AppControllerImpl implements AppController {
   private readonly store: StateStore;
   private readonly integration: ControllerRuntimePorts['integration'];
   private readonly pendingCapture?: PendingCaptureControllerPort;
+  private readonly speechCleanup?: ControllerSpeechCleanupPort;
   private readonly speechClient: ControllerSpeechPort;
   private readonly openRouterSpeechAdapter?: OpenRouterSpeechAdapterPort;
   private readonly openAiClient: AssistantModelClient;
@@ -1652,7 +1676,7 @@ export class AppControllerImpl implements AppController {
   private recordingRecoveryPromise?: Promise<RecordingRecoveryService>;
   private transcriptionCleanupPromises = new Set<string>();
   private transcriptionQuarantine: unknown[] = [];
-  private transcriptionJobs = new Map<string, { attemptId: string; sourceRevision: number; leaseId: string; controller: AbortController; promise: Promise<Note> }>();
+  private transcriptionJobs = new Map<string, ControllerTranscriptionJob>();
   private transcriptionCleanupJob?: Promise<void>;
   private readonly speechRequestCleanupRetries = new Map<string, import('./providerResponseLifetime').ProviderCancellationRetry>();
   private readonly speechRequestCleanupAttemptIds = new Map<string, string>();
@@ -1675,7 +1699,7 @@ export class AppControllerImpl implements AppController {
   private readonly deviceCalendarBackend: DeviceCalendarBackend;
 
   constructor(ports: ControllerRuntimePorts) {
-    this.store = ports.store; this.crypto = ports.crypto; this.integration = ports.integration; this.pendingCapture = ports.pendingCapture;
+    this.store = ports.store; this.crypto = ports.crypto; this.integration = ports.integration; this.pendingCapture = ports.pendingCapture; this.speechCleanup = ports.speechCleanup;
     this.state = initialState(this.newId); this.snapshot = deepFreeze(clone(this.state));
     this.speechClient = ports.providers.speech; this.openRouterSpeechAdapter = ports.providers.speechOpenRouter ?? ports.integration.openRouterSpeechAdapter;
     this.openAiClient = new AssistantClientRouter(ports.providers.openAi);
@@ -1772,6 +1796,11 @@ export class AppControllerImpl implements AppController {
     this.verifiedReminderForeground.clear();
     this.verifiedDeviceCalendarGeneration = undefined;
     this.integration.disposePrivacyResources?.();
+  }
+
+  /** Trusted runtime shutdown hook: abort speech work without disposing its owned audio resources. */
+  stopActiveTranscriptions(): void {
+    for (const job of this.transcriptionJobs.values()) job.controller.abort(new Error('The workspace runtime is stopping.'));
   }
 
   private async assertPrivacySessionCurrent(allowMailAlertRefresh = false): Promise<void> {
@@ -2212,6 +2241,7 @@ export class AppControllerImpl implements AppController {
   }
 
   private async retryTranscriptionCleanup(): Promise<void> {
+    if (this.speechCleanup) return;
     if (this.transcriptionCleanupJob) return this.transcriptionCleanupJob;
     const job = (async () => {
       const activeLeaseIds = new Set([...this.transcriptionJobs.values()].map((item) => item.leaseId));
@@ -4841,7 +4871,7 @@ export class AppControllerImpl implements AppController {
     this.snapshot = deepFreeze(this.publicState(this.state));
     this.loaded = true;
     this.emit();
-    if (this.state.transcription.cleanupLeases.some((lease) => lease.outcome === 'pending_cleanup')) void this.retryTranscriptionCleanup().catch(() => undefined);
+    if (!this.speechCleanup && this.state.transcription.cleanupLeases.some((lease) => lease.outcome === 'pending_cleanup')) void this.retryTranscriptionCleanup().catch(() => undefined);
     for (const document of this.state.documents) this.mirrorDirty.add(document.path);
     await this.retryDocumentMirrors();
   }
@@ -8082,13 +8112,13 @@ export class AppControllerImpl implements AppController {
     }
     const controller = new AbortController();
     const attemptId = this.newId();
-    const job: { attemptId: string; sourceRevision: number; leaseId: string; controller: AbortController; promise: Promise<Note> } = {
+    const job: ControllerTranscriptionJob = {
       attemptId, sourceRevision: requestedRevision, leaseId: this.newId(), controller, promise: Promise.resolve(undefined as unknown as Note),
     };
     const promise = this.transcribeNoteInternal(id, requestedRevision, attemptId, controller, job)
       .finally(() => {
         if (this.transcriptionJobs.get(id) === job) this.transcriptionJobs.delete(id);
-        this.markTranscriptionCleanupPending(job.leaseId);
+        if (!job.speechCleanupRegistrationAttempted) this.markTranscriptionCleanupPending(job.leaseId);
       });
     job.promise = promise;
     this.transcriptionJobs.set(id, job);
@@ -8096,11 +8126,11 @@ export class AppControllerImpl implements AppController {
   }
 
   private async transcribeNoteInternal(id: string, requestedRevision: number, attemptId: string, controller: AbortController,
-    job: { attemptId: string; sourceRevision: number; leaseId: string; controller: AbortController; promise: Promise<Note> }): Promise<Note> {
+    job: ControllerTranscriptionJob): Promise<Note> {
     await this.load();
     if (this.transcriptionQuarantine.length) throw new Error('Speech-transcription history failed integrity validation. New cloud transcription is disabled until recovery.');
     if (await this.recoverOrphanedTranscriptions(id, attemptId)) {
-      void this.retryTranscriptionCleanup().catch(() => undefined);
+      if (!this.speechCleanup) void this.retryTranscriptionCleanup().catch(() => undefined);
       throw new Error('An earlier transcription was recovered as interrupted or uncertain. Review its status before starting a new transcription.');
     }
     const initial = this.snapshot;
@@ -8141,6 +8171,25 @@ export class AppControllerImpl implements AppController {
       if (state.transcription.cleanupLeases.length >= 500) throw new Error('Speech cleanup history is full. Retry cleanup before transcribing.');
       state.transcription.cleanupLeases.push({ leaseId: job.leaseId, attemptId, createdAt: now(), outcome: 'owned' });
     });
+
+    if (this.speechCleanup) {
+      job.speechCleanupRegistrationAttempted = true;
+      try {
+        job.speechCleanupObserver = this.speechCleanup.register({ noteId: id, attemptId, leaseId: job.leaseId, provider: speechProvider });
+      } catch (error) {
+        await this.mutate((state) => {
+          const savedAttempt = state.transcription.attempts.find((item) => item.id === attemptId);
+          if (savedAttempt && savedAttempt.outcome === 'preparing') {
+            savedAttempt.outcome = 'failed';
+            savedAttempt.code = 'preparation_interrupted';
+            savedAttempt.terminalAt = now();
+          }
+          const lease = state.transcription.cleanupLeases.find((item) => item.leaseId === job.leaseId && item.attemptId === attemptId);
+          if (lease && lease.outcome !== 'released') lease.outcome = 'pending_cleanup';
+        });
+        throw error;
+      }
+    }
 
     const leaseId = job.leaseId;
     let preparedSnapshot: SpeechAudioSnapshot | undefined;
@@ -8189,12 +8238,27 @@ export class AppControllerImpl implements AppController {
 
     let providerCleanup: Promise<void> | undefined;
     let providerResult: AnySpeechTranscriptionResult | undefined;
+    let cleanupObserved = false;
+    const retryCleanup = () => speechProvider === 'openrouter'
+      ? this.openRouterSpeechAdapter!.releaseUploadLease(leaseId)
+      : this.speechClient.releaseUploadLease(leaseId);
+    const observeCleanup = (cleanup: Promise<void>) => {
+      if (cleanupObserved) return;
+      cleanupObserved = true;
+      if (job.speechCleanupObserver) {
+        this.transcriptionCleanupPromises.add(leaseId);
+        void cleanup.then(() => { this.transcriptionCleanupPromises.delete(leaseId); }, () => { this.transcriptionCleanupPromises.delete(leaseId); });
+        job.speechCleanupObserver.observeCleanup(cleanup, retryCleanup);
+      } else this.trackTranscriptionCleanup(leaseId, cleanup);
+    };
     try {
       const result = speechProvider === 'openrouter'
         ? await this.openRouterSpeechAdapter!.transcribe(note, settings, controller.signal, onAttempt, beforeDispatch, onPrepared, leaseId)
         : await this.speechClient.transcribe(note, settings, controller.signal, onAttempt, beforeDispatch, onPrepared, leaseId);
       providerResult = result;
       providerCleanup = result.cleanupPromise;
+      if (providerCleanup) observeCleanup(providerCleanup);
+      else if (job.speechCleanupObserver) observeCleanup(Promise.resolve().then(retryCleanup));
       if (isOpenRouterSpeechResult(result) && result.outcome !== 'completed') {
         await this.mutate((state) => {
           const savedAttempt = state.transcription.attempts.find((item) => item.id === attemptId);
@@ -8291,8 +8355,9 @@ export class AppControllerImpl implements AppController {
           if (detach.detached && detach.note) { try { await (this.integration.removeAudio(retentionUri)); } catch { /* The note no longer references this private clip. */ } updated = clone(detach.note); }
         } catch { /* Durable transcript stays committed if clip cleanup fails. */ }
       }
-      this.markTranscriptionCleanupPending(leaseId);
-      if (providerCleanup) this.trackTranscriptionCleanup(leaseId, providerCleanup);
+      if (job.speechCleanupObserver) job.speechCleanupObserver.markPending();
+      else this.markTranscriptionCleanupPending(leaseId);
+      if (providerCleanup && !job.speechCleanupObserver) observeCleanup(providerCleanup);
       return updated;
     } catch (error) {
       const typed = error instanceof SpeechTranscriptionError ? error : undefined;
@@ -8300,7 +8365,13 @@ export class AppControllerImpl implements AppController {
       // Register actual cleanup before any terminal journal write. If the
       // journal is hard-gated or its save fails, the provider promise still
       // remains tracked until its real I/O has settled.
-      if (cleanup) this.trackTranscriptionCleanup(leaseId, cleanup);
+      if (cleanup) observeCleanup(cleanup);
+      else if (job.speechCleanupObserver && !cleanupObserved) {
+        // Preparation may fail after the durable lease exists but before the
+        // provider returns its cleanup promise. Start the normal exact-lease
+        // release once and let the private owner observe its real result.
+        observeCleanup(Promise.resolve().then(retryCleanup));
+      }
       try {
         await this.mutate((state) => {
           const savedAttempt = state.transcription.attempts.find((item) => item.id === attemptId);
@@ -8344,6 +8415,11 @@ export class AppControllerImpl implements AppController {
           throw new Error('Transcription status could not be saved. Refresh local data and review the attempt before uploading again.');
         }
         throw terminalError;
+      } finally {
+        // The cleanup child belongs to this exact active command. Schedule its
+        // named settlement even when the terminal transcription checkpoint
+        // itself fails, after observing the real provider cleanup above.
+        if (job.speechCleanupObserver) job.speechCleanupObserver.markPending();
       }
       throw error;
     }

@@ -28,9 +28,16 @@ export interface LoadedWorkspaceIdentity {
   readonly privacyEpoch: number;
 }
 
+/** Proof of bytes actually adopted by this controller after a successful load/save acknowledgement. */
+export interface LoadedWorkspaceStateProof extends LoadedWorkspaceIdentity {
+  readonly schemaVersion: number;
+  readonly sha256: string;
+}
+
 /** The shared controller's StateStore backed by a kernel-owned SQLite workspace snapshot. */
 export class ServerWorkspaceStore<TState extends object = Record<string, unknown>> {
   private loaded?: LoadedWorkspace;
+  private loadedStateProof?: LoadedWorkspaceStateProof;
   private blockedUntilLoad = false;
 
   constructor(private readonly options: ServerWorkspaceStoreOptions) {}
@@ -42,6 +49,9 @@ export class ServerWorkspaceStore<TState extends object = Record<string, unknown
     const value = parseState<TState>(raw.raw);
     this.loaded = Object.freeze({ workspaceId: snapshot.workspaceId, ownerId: raw.ownerId,
       revision: snapshot.revision, privacyEpoch: snapshot.privacyEpoch, schemaVersion: raw.schemaVersion });
+    this.loadedStateProof = Object.freeze({ workspaceId: snapshot.workspaceId, ownerId: raw.ownerId,
+      revision: snapshot.revision, privacyEpoch: snapshot.privacyEpoch, schemaVersion: raw.schemaVersion,
+      sha256: sha256(raw.raw) });
     this.blockedUntilLoad = false;
     return value;
   }
@@ -71,6 +81,9 @@ export class ServerWorkspaceStore<TState extends object = Record<string, unknown
       }
       await this.options.afterCommitForTesting?.();
       this.loaded = Object.freeze({ ...loaded, revision: committedRevision });
+      this.loadedStateProof = Object.freeze({ workspaceId: loaded.workspaceId, ownerId: loaded.ownerId,
+        revision: committedRevision, privacyEpoch: loaded.privacyEpoch, schemaVersion: loaded.schemaVersion,
+        sha256: sha256(serialized) });
     } catch (error) {
       // A command may have committed before its acknowledgement was lost. Never
       // allow this in-memory controller to overwrite that newer workspace.
@@ -103,6 +116,18 @@ export class ServerWorkspaceStore<TState extends object = Record<string, unknown
     this.assertNotAckBlocked();
     return Object.freeze({ workspaceId: loaded.workspaceId, ownerId: loaded.ownerId,
       revision: loaded.revision, privacyEpoch: loaded.privacyEpoch });
+  }
+
+  /** Private acknowledgement proof; it never rereads the DB to manufacture adoption evidence. */
+  getLoadedStateProof(): LoadedWorkspaceStateProof {
+    const loaded = this.requireLoaded();
+    this.assertNotAckBlocked();
+    const proof = this.loadedStateProof;
+    if (!proof || proof.workspaceId !== loaded.workspaceId || proof.ownerId !== loaded.ownerId ||
+        proof.revision !== loaded.revision || proof.privacyEpoch !== loaded.privacyEpoch || proof.schemaVersion !== loaded.schemaVersion) {
+      throw new Error('The loaded workspace state proof is unavailable.');
+    }
+    return Object.freeze({ ...proof });
   }
 
   private commitSnapshot(loaded: LoadedWorkspace, serialized: string, accountGenerations: Readonly<Record<string, number>>): number {

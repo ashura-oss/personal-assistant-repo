@@ -12,6 +12,7 @@ import { openServerFoundation } from '../dist/bootstrap.js';
 import { ApplicationHostStartError, ApplicationHostStartupCleanupError, startApplicationHost } from '../dist/applicationHost.js';
 import { createInitialWorkspaceState } from '../dist/sharedControllerNode.mjs';
 import { createCloudApplicationRuntimeFactory } from '../dist/applicationHost.node.mjs';
+import { createNodeProviderResponseLifetimeOwner } from '../dist/providerResponseLifetime.node.mjs';
 
 const PASSWORD = 'closed application host fixture password';
 
@@ -51,6 +52,9 @@ function closedPorts() {
   const unavailable = async () => 'unavailable';
   return {
     disposeUnattached() {},
+    responseLifetimeOwner: createNodeProviderResponseLifetimeOwner({
+      fetcher: async () => { throw new Error('provider access is closed in this fixture'); }, createId: randomUUID,
+    }),
     providers: {
       speech: { async transcribe() { throw new Error('provider access is closed in this fixture'); }, async releaseUploadLease() {}, disposeMemory() {} },
       openAi: { async prepare() { throw new Error('provider access is closed in this fixture'); },

@@ -297,6 +297,51 @@ test('lost settlement acknowledgement requires inspection and cannot replay from
   } finally { cleanup(f); }
 });
 
+test('lost settlement ACK clears only after explicit controller load proves exact child receipt and adopted bytes', async () => {
+  const f = setup({ afterCommitForTesting: () => { throw new Error('simulated lost acknowledgement'); } });
+  try {
+    const { registration } = await registerUnderParent(f);
+    const store = new ServerWorkspaceStore({ kernel: f.kernel, sessionToken: f.runtimeSession, journal: f.journal });
+    await store.load();
+    const staleProof = store.getLoadedStateProof();
+    assert.throws(() => f.service.settle(registration.handle, 'pending_cleanup'), /lost acknowledgement/i);
+    const inspection = f.service.inspect(registration.childId);
+    const expected = { childId: registration.childId, outcome: 'pending_cleanup',
+      idempotencyKey: inspection.lastSettlement.idempotencyKey, revision: inspection.lastSettlement.revision };
+    assert.throws(() => f.service.acknowledgeAfterRefresh(registration.handle, staleProof, expected), /proof|current|refresh/i);
+    assert.equal(f.service.inspect(registration.childId).refreshRequired, true);
+
+    await store.load(); // Explicit controller refresh adopts the committed settlement snapshot.
+    const adoptedProof = store.getLoadedStateProof();
+    assert.equal(adoptedProof.revision, expected.revision);
+    f.service.acknowledgeAfterRefresh(registration.handle, adoptedProof, expected);
+    assert.equal(f.service.inspect(registration.childId).refreshRequired, undefined);
+    assert.throws(() => f.service.acknowledgeAfterRefresh(registration.handle, adoptedProof, expected), /does not require refresh/i);
+  } finally { cleanup(f); }
+});
+
+test('lost settlement ACK accepts a newer adopted head only when it still contains the exact receipt outcome', async () => {
+  const f = setup({ afterCommitForTesting: () => { throw new Error('simulated lost acknowledgement'); } });
+  try {
+    const { registration } = await registerUnderParent(f);
+    assert.throws(() => f.service.settle(registration.handle, 'pending_cleanup'), /lost acknowledgement/i);
+    const inspection = f.service.inspect(registration.childId);
+    const expected = { childId: registration.childId, outcome: 'pending_cleanup',
+      idempotencyKey: inspection.lastSettlement.idempotencyKey, revision: inspection.lastSettlement.revision };
+    const store = new ServerWorkspaceStore({ kernel: f.kernel, sessionToken: f.runtimeSession, journal: f.journal });
+    await store.load();
+    const later = structuredClone(f.kernel.getOwnedSnapshot(f.runtimeSession).snapshot);
+    later.task.title = 'an unrelated later command';
+    await store.save(later);
+    await store.load();
+    const adoptedProof = store.getLoadedStateProof();
+    assert.ok(adoptedProof.revision > expected.revision);
+    f.service.acknowledgeAfterRefresh(registration.handle, adoptedProof, expected);
+    assert.equal(f.service.inspect(registration.childId).refreshRequired, undefined);
+    assert.equal(f.kernel.getOwnedSnapshot(f.runtimeSession).snapshot.transcription.cleanupLeases[0].outcome, 'pending_cleanup');
+  } finally { cleanup(f); }
+});
+
 test('a lost settlement acknowledgement is inspection-only after a process restart', async () => {
   const f = setup({ afterCommitForTesting: () => { throw new Error('simulated lost acknowledgement'); } });
   let restartedKernel;

@@ -7,6 +7,14 @@ export interface WorkspaceController {
   disposeForPrivacy?(): Promise<void>;
 }
 
+export type WorkspaceControllerTeardown<C extends WorkspaceController> = (controller: C, input: {
+  readonly identity: WorkspaceEntryIdentity;
+  /** Present only when a new authoritative admission is retiring an older privacy epoch. */
+  readonly replacement?: { readonly identity: OwnedWorkspaceIdentity; readonly admissionSessionToken: string };
+}) => Promise<void>;
+
+export type WorkspaceEntryIdentity = Pick<OwnedWorkspaceIdentity, 'workspaceId' | 'ownerId' | 'privacyEpoch'>;
+
 export interface WorkspaceRuntimeContext<TState extends object = Record<string, unknown>> {
   readonly identity: OwnedWorkspaceIdentity;
   /** Kernel-verified private actor used for this exact workspace epoch. */
@@ -57,6 +65,7 @@ export class WorkspaceRegistry<C extends WorkspaceController, TState extends obj
     private readonly journal: CommandJournal,
     private readonly runtimeSessionFor: RuntimeSessionResolver,
     private readonly createController: WorkspaceControllerFactory<C, TState>,
+    private readonly teardownController?: WorkspaceControllerTeardown<C>,
   ) {
   }
 
@@ -77,7 +86,7 @@ export class WorkspaceRegistry<C extends WorkspaceController, TState extends obj
       }
       if (entry && (entry.identity.ownerId !== identity.ownerId || entry.identity.privacyEpoch !== identity.privacyEpoch)) {
         if (entry.activeWork > 0) throw new Error('The previous workspace runtime still has active work.');
-        await this.closeEntry(entry);
+        await this.closeEntry(entry, { identity, admissionSessionToken });
         continue;
       }
       if (entry?.closing) {
@@ -135,7 +144,7 @@ export class WorkspaceRegistry<C extends WorkspaceController, TState extends obj
     }
   }
 
-  private closeEntry(entry: WorkspaceEntry<C, TState>): Promise<void> {
+  private closeEntry(entry: WorkspaceEntry<C, TState>, replacement?: { readonly identity: OwnedWorkspaceIdentity; readonly admissionSessionToken: string }): Promise<void> {
     if (entry.closingPromise) return entry.closingPromise;
     if (entry.activeWork > 0) throw new Error('Workspace runtime has active work and cannot be disposed.');
     entry.closing = true;
@@ -152,7 +161,8 @@ export class WorkspaceRegistry<C extends WorkspaceController, TState extends obj
       // Disposal must wait for startup load to settle, including the failed-load
       // path that calls closeEntry from its rejection handler.
       try { await entry.loadPromise; } catch { /* dispose the constructed controller below */ }
-      await controller.disposeForPrivacy?.();
+      if (this.teardownController) await this.teardownController(controller, { identity: entry.identity, ...(replacement ? { replacement } : {}) });
+      else await controller.disposeForPrivacy?.();
       if (this.entries.get(entry.identity.workspaceId) === entry) this.entries.delete(entry.identity.workspaceId);
     });
     entry.closingPromise = attempt;
@@ -244,12 +254,53 @@ export class WorkspaceRegistry<C extends WorkspaceController, TState extends obj
         entry.identity.privacyEpoch !== input.expectedHeldPrivacyEpoch || !entry.closing) {
       throw new Error('workspace_disposal_retry_not_available');
     }
+    if (identity.privacyEpoch < entry.identity.privacyEpoch) throw new Error('workspace_disposal_retry_not_available');
     if (entry.activeWork > 0) throw new Error('Workspace runtime has active work and cannot be disposed.');
-    await this.closeEntry(entry);
+    await this.closeEntry(entry, identity.privacyEpoch > entry.identity.privacyEpoch
+      ? { identity, admissionSessionToken: input.admissionSessionToken } : undefined);
+  }
+
+  /** TRUSTED INTERNAL ONLY: returns an existing exact controller for post-close refresh acknowledgement. */
+  async getHeldControllerForRefresh(input: { admissionSessionToken: string; expectedHeldPrivacyEpoch: number }): Promise<{
+    readonly controller: C; readonly store: ServerWorkspaceStore<TState>; readonly identity: WorkspaceEntryIdentity;
+  }> {
+    const identity = this.kernel.getOwnedIdentity(input.admissionSessionToken);
+    if (!Number.isSafeInteger(input.expectedHeldPrivacyEpoch) || input.expectedHeldPrivacyEpoch < 0 ||
+        identity.privacyEpoch !== input.expectedHeldPrivacyEpoch) throw new Error('workspace_cleanup_refresh_unavailable');
+    const entry = this.entries.get(identity.workspaceId);
+    if (!entry || entry.identity.ownerId !== identity.ownerId || entry.identity.privacyEpoch !== identity.privacyEpoch ||
+        entry.activeWork > 0) throw new Error('workspace_cleanup_refresh_unavailable');
+    await entry.loadPromise;
+    const current = this.kernel.getOwnedIdentity(input.admissionSessionToken);
+    if (this.entries.get(identity.workspaceId) !== entry || current.ownerId !== entry.identity.ownerId ||
+        current.workspaceId !== entry.identity.workspaceId || current.privacyEpoch !== entry.identity.privacyEpoch || !entry.controller) {
+      throw new Error('workspace_cleanup_refresh_unavailable');
+    }
+    return Object.freeze({ controller: entry.controller, store: entry.store, identity: entry.identity });
+  }
+
+  /** TRUSTED INTERNAL ONLY: exact old entry for physical cleanup after a newer epoch is authoritative. */
+  async getFencedOlderControllerForRetirement(input: { admissionSessionToken: string; expectedHeldPrivacyEpoch: number }): Promise<{
+    readonly controller: C; readonly identity: WorkspaceEntryIdentity;
+  }> {
+    const identity = this.kernel.getOwnedIdentity(input.admissionSessionToken);
+    const entry = this.entries.get(identity.workspaceId);
+    if (!Number.isSafeInteger(input.expectedHeldPrivacyEpoch) || input.expectedHeldPrivacyEpoch < 0 ||
+        identity.privacyEpoch <= input.expectedHeldPrivacyEpoch || !entry || !entry.controller || !entry.closing ||
+        entry.activeWork > 0 || entry.identity.ownerId !== identity.ownerId ||
+        entry.identity.privacyEpoch !== input.expectedHeldPrivacyEpoch) throw new Error('workspace_retirement_cleanup_unavailable');
+    await entry.loadPromise;
+    const current = this.kernel.getOwnedIdentity(input.admissionSessionToken);
+    if (this.entries.get(identity.workspaceId) !== entry || current.workspaceId !== entry.identity.workspaceId ||
+        current.ownerId !== entry.identity.ownerId || current.privacyEpoch <= entry.identity.privacyEpoch) {
+      throw new Error('workspace_retirement_cleanup_unavailable');
+    }
+    return Object.freeze({ controller: entry.controller, identity: entry.identity });
   }
 }
 
 export function createWorkspaceRegistry<C extends WorkspaceController, TState extends object = Record<string, unknown>>(kernel: DurableKernel,
-  journal: CommandJournal, runtimeSessionFor: RuntimeSessionResolver, factory: WorkspaceControllerFactory<C, TState>): WorkspaceRegistry<C, TState> {
-  return new WorkspaceRegistry<C, TState>(kernel, journal, runtimeSessionFor, factory);
+  journal: CommandJournal, runtimeSessionFor: RuntimeSessionResolver, factory: WorkspaceControllerFactory<C, TState>,
+  teardownController?: WorkspaceControllerTeardown<C>): WorkspaceRegistry<C, TState> {
+  return new WorkspaceRegistry<C, TState>(kernel, journal, runtimeSessionFor, factory, teardownController);
 }

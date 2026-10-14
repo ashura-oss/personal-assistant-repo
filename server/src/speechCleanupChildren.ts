@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import type { CommandReceipt, DurableKernel, JsonValue, OwnedTransactionContext } from './kernel.js';
 import { currentCommandTicket, type CommandJournal } from './commandJournal.js';
+import type { LoadedWorkspaceStateProof } from './workspaceStore.js';
 
 const SCHEMA_VERSION = 1;
 const SNAPSHOT_LIMIT = 16 * 1024 * 1024;
@@ -47,6 +48,13 @@ export interface SpeechCleanupSettlement {
   /** This is the committed revision, not a promise that an in-memory controller adopted it. */
   readonly revision: number;
   readonly replayed: boolean;
+}
+
+export interface SpeechCleanupSettlementProof {
+  readonly childId: string;
+  readonly outcome: SpeechCleanupOutcome;
+  readonly idempotencyKey: string;
+  readonly revision: number;
 }
 
 export interface SpeechCleanupChildrenOptions {
@@ -232,7 +240,7 @@ export class SpeechCleanupChildren {
 
       if (!['owned', 'pending_cleanup'].includes(row.status)) throw new Error('Speech cleanup child cannot settle from its current state.');
       const current = readWorkspace(outer);
-      assertLeaseRelationship(current.state, {
+      const currentLeaseOutcome = assertLeaseRelationship(current.state, {
         attemptId: row.attempt_id, leaseId: row.lease_id, noteId: row.note_id, provider: row.provider,
       });
       const command: CommandReceipt = this.options.kernel.runLocalCommand(this.options.runtimeSessionToken, {
@@ -253,10 +261,10 @@ export class SpeechCleanupChildren {
         const index = leases.findIndex((lease) => isRecord(lease) && lease.leaseId === row.lease_id && lease.attemptId === row.attempt_id);
         if (index < 0) throw new Error('The exact speech cleanup lease is missing from the workspace.');
         const lease = requireRecord(leases[index], 'Speech cleanup lease');
-        const expectedCurrent = row.status === 'pending_cleanup' ? 'pending_cleanup' : 'owned';
-        if (lease.outcome !== expectedCurrent) throw new Error('Speech cleanup child does not match the persisted lease state.');
+        const expectedCurrent = row.status === 'pending_cleanup' ? ['pending_cleanup'] : ['owned', 'pending_cleanup'];
+        if (!expectedCurrent.includes(String(lease.outcome)) || lease.outcome !== currentLeaseOutcome) throw new Error('Speech cleanup child does not match the persisted lease state.');
         const allowed = outcome === 'pending_cleanup'
-          ? lease.outcome === 'owned'
+          ? lease.outcome === 'owned' || lease.outcome === 'pending_cleanup'
           : lease.outcome === 'owned' || lease.outcome === 'pending_cleanup';
         if (!allowed) throw new Error('Speech cleanup lease transition is no longer valid.');
         leases[index] = { ...lease, outcome };
@@ -281,6 +289,65 @@ export class SpeechCleanupChildren {
     }
     const saved = parseSettlementReceipt(receipt.saved, binding.child_id, outcome);
     return Object.freeze({ childId: binding.child_id, outcome: saved.outcome, revision: receipt.revision, replayed: receipt.replayed });
+  }
+
+  /** Clears a lost-ACK hold only after the controller proves it adopted the exact committed bytes. */
+  acknowledgeAfterRefresh(handle: SpeechCleanupChildHandle, proof: LoadedWorkspaceStateProof,
+    expected: SpeechCleanupSettlementProof): void {
+    const capability = handle && typeof handle === 'object' ? this.handles.get(handle as object) : undefined;
+    if (!capability || this.handleByChildId.get(capability.row.child_id)?.deref() !== handle) {
+      throw new Error('Speech cleanup child handle is not active in this service instance.');
+    }
+    const binding = capability.row;
+    if (!this.refreshRequiredChildren.has(binding.child_id)) throw new Error('Speech cleanup child does not require refresh acknowledgement.');
+    requireUuid(expected.childId, 'Speech cleanup settlement child');
+    requireUuid(proof.workspaceId, 'Loaded workspace');
+    requireUuid(proof.ownerId, 'Loaded workspace owner');
+    if (expected.childId !== binding.child_id || (expected.outcome !== 'pending_cleanup' && expected.outcome !== 'released') ||
+        expected.idempotencyKey !== settlementKey(binding.child_id, expected.outcome) ||
+        !Number.isSafeInteger(expected.revision) || expected.revision < 0 ||
+        proof.workspaceId !== binding.workspace_id || proof.ownerId !== binding.owner_id || proof.privacyEpoch !== binding.privacy_epoch ||
+        !Number.isSafeInteger(proof.revision) || proof.revision < expected.revision ||
+        !Number.isSafeInteger(proof.schemaVersion) || proof.schemaVersion < 1 || !/^[a-f0-9]{64}$/.test(proof.sha256)) {
+      throw new Error('Speech cleanup refresh proof does not match its exact settlement.');
+    }
+
+    this.options.kernel.withOwnedTransaction(this.options.runtimeSessionToken, binding.privacy_epoch, (context) => {
+      if (context.workspaceId !== proof.workspaceId || context.ownerId !== proof.ownerId ||
+          context.privacyEpoch !== proof.privacyEpoch || context.revision !== proof.revision) {
+        throw new Error('Speech cleanup refresh proof is no longer current.');
+      }
+      const workspace = context.db.prepare('SELECT snapshot_json,schema_version,revision,privacy_epoch FROM workspaces WHERE id=?')
+        .get(binding.workspace_id) as { snapshot_json: string; schema_version: number; revision: number; privacy_epoch: number } | undefined;
+      if (!workspace || workspace.revision !== proof.revision || workspace.privacy_epoch !== proof.privacyEpoch ||
+          workspace.schema_version !== proof.schemaVersion || sha256(workspace.snapshot_json) !== proof.sha256) {
+        throw new Error('Speech cleanup refresh proof does not match the current durable snapshot.');
+      }
+      const state = requireRecord(JSON.parse(workspace.snapshot_json), 'Workspace snapshot');
+      const child = context.db.prepare('SELECT * FROM speech_cleanup_children WHERE workspace_id=? AND child_id=?')
+        .get(binding.workspace_id, binding.child_id) as ChildRow | undefined;
+      if (!child) throw new Error('Speech cleanup child no longer exists.');
+      validateChildRow(child);
+      if (child.owner_id !== binding.owner_id || child.privacy_epoch !== binding.privacy_epoch ||
+          child.binding_digest !== binding.binding_digest || child.process_instance_id !== binding.process_instance_id ||
+          child.process_instance_id !== this.options.processInstanceId || child.status !== expected.outcome ||
+          child.last_settlement_key !== expected.idempotencyKey) {
+        throw new Error('Speech cleanup settlement receipt is not the exact current child outcome.');
+      }
+      const receiptRow = context.db.prepare(`SELECT request_digest,command_type,privacy_epoch,status,result_json,committed_revision
+        FROM commands WHERE workspace_id=? AND idempotency_key=?`).get(binding.workspace_id, expected.idempotencyKey) as CommandRow | undefined;
+      if (!receiptRow || receiptRow.command_type !== CLEANUP_TYPE || receiptRow.privacy_epoch !== binding.privacy_epoch ||
+          receiptRow.status !== 'committed' || receiptRow.committed_revision !== expected.revision) {
+        throw new Error('Speech cleanup settlement receipt is unavailable.');
+      }
+      parseSettlementReceipt(receiptRow.result_json, binding.child_id, expected.outcome);
+      const request = canonical({ childId: binding.child_id, outcome: expected.outcome, bindingDigest: binding.binding_digest });
+      if (receiptRow.request_digest !== sha256(`${CLEANUP_TYPE}\0${request}`)) throw new Error('Speech cleanup settlement receipt binding is invalid.');
+      const leaseOutcome = assertLeaseRelationship(state, { attemptId: child.attempt_id, leaseId: child.lease_id,
+        noteId: child.note_id, provider: child.provider });
+      if (leaseOutcome !== expected.outcome) throw new Error('The refreshed workspace did not adopt the exact speech cleanup lease outcome.');
+    });
+    this.refreshRequiredChildren.delete(binding.child_id);
   }
 
   private initialize(db: Database.Database): void {
