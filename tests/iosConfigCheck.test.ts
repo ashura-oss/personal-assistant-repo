@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { validateIosConfiguration } from '../scripts/check-ios-config.mjs';
@@ -79,6 +80,15 @@ function validFixture() {
 }
 
 describe('read-only iOS config validation', () => {
+  it('keeps the macOS build handoff script as UTF-8 without BOM and LF-only text', () => {
+    const scriptBytes = readFileSync(path.join(projectRoot, 'scripts/build-unsigned-ios.sh'));
+    expect(scriptBytes[0]).not.toBe(0xef);
+    expect(scriptBytes.includes(0x0d)).toBe(false);
+    const attributes = readFileSync(path.join(projectRoot, '.gitattributes'), 'utf8');
+    expect(attributes.split(/\r?\n/)).toContain('*.sh text eol=lf');
+    expect(scriptBytes.subarray(0, 19).toString('utf8')).toBe('#!/usr/bin/env bash');
+  });
+
   it('accepts the expected app config and resolved StillPrivacy callback/pod', () => {
     const result = validateIosConfiguration(validFixture());
     expect(result.ok).toBe(true);
