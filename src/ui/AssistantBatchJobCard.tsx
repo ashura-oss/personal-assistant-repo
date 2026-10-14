@@ -16,6 +16,7 @@ import {
 
 type Props = {
   job: AssistantBatchJobDTO;
+  chatContext?: 'chat' | 'refinement';
   busy?: boolean;
   blocked?: boolean;
   onCheck?: (jobId: string) => Promise<unknown> | unknown;
@@ -30,7 +31,7 @@ function dateLabel(value: string): string {
     : 'Time unavailable';
 }
 
-export function AssistantBatchJobCard({ job, busy = false, blocked = false, onCheck, onRetryCleanup, moreCompute }: Props) {
+export function AssistantBatchJobCard({ job, chatContext, busy = false, blocked = false, onCheck, onRetryCleanup, moreCompute }: Props) {
   const [checking, setChecking] = useState(false);
   const [retryingCleanup, setRetryingCleanup] = useState(false);
   const [actionError, setActionError] = useState<string | undefined>();
@@ -40,6 +41,9 @@ export function AssistantBatchJobCard({ job, busy = false, blocked = false, onCh
   const reportedCost = job.costStatus === 'reported'
     ? formatReportedBatchCost(job.providerReportedCostUsd)
     : undefined;
+  const title = job.kind === 'mail_reply' ? 'Mail reply'
+    : chatContext === 'refinement' ? 'Answer refinement'
+      : chatContext === 'chat' ? 'Chat message' : 'Note assistance';
 
   const runAction = async (kind: 'check' | 'cleanup') => {
     const callback = kind === 'check' ? onCheck : onRetryCleanup;
@@ -64,7 +68,7 @@ export function AssistantBatchJobCard({ job, busy = false, blocked = false, onCh
 
   return (
     <View style={styles.card}>
-      <Text style={s.sectionTitle}>OpenRouter Batch · {job.kind === 'mail_reply' ? 'Mail reply' : 'Note assistance'}</Text>
+      <Text style={s.sectionTitle}>OpenRouter Batch · {title}</Text>
       <Text style={styles.status}>{assistantBatchStatusLabel(job.status, job.kind)}</Text>
       <Text style={styles.meta}>Added {dateLabel(job.createdAt)} · {job.model} · {job.effort} reasoning</Text>
       {job.status === 'queued' || job.status === 'processing' ? (

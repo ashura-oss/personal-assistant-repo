@@ -3807,9 +3807,7 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
             <View style={s.notice}>
               <Text style={[s.noticeText, { flex: 1 }]}>A mail alert needs review in Settings.</Text>
               <Button label="Open Settings" tone="quiet" onPress={openSettings} />
-              <Pressable accessibilityRole="button" accessibilityLabel="Dismiss mail alert status notice" onPress={dismissMailAlertTapStatus} hitSlop={8}>
-                <Ionicons accessible={false} name="close" size={17} color={C.muted} />
-              </Pressable>
+              <IconButton name="close" label="Dismiss mail alert status notice" onPress={dismissMailAlertTapStatus} color={C.muted} />
             </View>
           ) : null}
           {notice || audio.error || state.pendingCredentialCleanup.length ? (
@@ -3850,19 +3848,7 @@ function Workspace({ controller, captureJournal, backgroundTasks, mailAlertTaps,
                   }
                 />
               ) : (
-                <Pressable
-                  accessibilityRole="button"
-                  accessibilityLabel="Dismiss message"
-                  onPress={() => setNotice("")}
-                  hitSlop={8}
-                >
-                  <Ionicons
-                    accessible={false}
-                    name="close"
-                    size={17}
-                    color={C.muted}
-                  />
-                </Pressable>
+                <IconButton name="close" label="Dismiss message" onPress={() => setNotice("")} color={C.muted} />
               )}
             </View>
           ) : null}

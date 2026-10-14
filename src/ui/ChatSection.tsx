@@ -464,6 +464,7 @@ export function ChatSection({
               {turn.job ? (
                 <AssistantBatchJobCard
                   job={turn.job}
+                  chatContext={turn.operation === 'chat_refinement' ? 'refinement' : 'chat'}
                   busy={busy}
                   blocked={Boolean(recoveryMessage)}
                   onCheck={onCheckJob}

@@ -87,6 +87,21 @@ describe('ChatSection review and submission behavior', () => {
       costStatus: 'reported', billingScope: 'openrouter_reported', providerReportedCostUsd: 0 },
   } satisfies React.ComponentProps<typeof ChatSection>['turns'][number];
 
+  it('labels ordinary and refinement Batch jobs from the visible Chat turns', () => {
+    const refinementTurn = {
+      ...completedParentTurn,
+      id: 'refinement-turn',
+      operation: 'chat_refinement' as const,
+      reasoningEffort: 'high' as const,
+      parentTurnId: completedParentTurn.id,
+      job: { ...completedParentTurn.job, id: 'refinement-job' },
+    };
+    const turns = [completedParentTurn, refinementTurn];
+    renderChat({ conversations: [{ ...conversation, turns }], turns });
+    expect(host.textContent).toContain('OpenRouter Batch · Chat message');
+    expect(host.textContent).toContain('OpenRouter Batch · Answer refinement');
+  });
+
   it('reviews a separate paid refinement with Medium selected, then submits only the chosen effort', async () => {
     const onRefineTurn = vi.fn(async () => ({ kind: 'accepted', conversationId: conversation.id, turnId: 'child-turn', jobId: 'child-job' }));
     renderChat({ conversations: [{ ...conversation, turns: [completedParentTurn] }], turns: [completedParentTurn], onRefineTurn });
