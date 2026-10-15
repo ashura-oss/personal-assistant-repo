@@ -7,6 +7,7 @@ import type { AudioHttpApi } from './audioHttp.js';
 import type { DurableKernel, OwnedWorkspaceIdentity } from './kernel.js';
 import { ProcessWorkspaceActors } from './runtimeActors.js';
 import type { SecretVault } from './vault.js';
+import type { AuthService } from './auth.js';
 import type { RuntimeSessionResolver } from './workspaceRegistry.js';
 import type { WorkspaceHttpApi } from './workspaceHttp.js';
 
@@ -22,6 +23,7 @@ export interface ApplicationRuntime {
 export interface ApplicationRuntimeFactoryContext {
   readonly kernel: DurableKernel;
   readonly vault: SecretVault;
+  readonly auth: AuthService;
   readonly runtimeSessionFor: RuntimeSessionResolver;
 }
 
@@ -198,6 +200,7 @@ export async function startApplicationHost(options: ApplicationHostOptions): Pro
     const runtime = await options.createRuntime(Object.freeze({
       kernel: opened.privateContext.kernel,
       vault: opened.privateContext.vault,
+      auth: opened.foundation.auth,
       runtimeSessionFor: (identity: OwnedWorkspaceIdentity) => actors.sessionForRegistry(identity),
     }));
     if (runtime && typeof runtime === 'object' && typeof runtime.stopAdmission === 'function' &&

@@ -57,9 +57,9 @@ function deferred<T>() {
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers(); });
 
 describe('same-origin web workspace command client', () => {
-  it('keeps the server projection map and browser history decoder on the same twelve public command kinds', () => {
+  it('keeps the server projection map and browser history decoder on the same thirteen public command kinds', () => {
     expect(SERVER_HISTORY_KINDS).toEqual(['tasks.complete', 'tasks.reopen', 'chat.create', 'settings.update', 'notes.save', 'notes.capture.adopt',
-      'notes.updateTranscript', 'assistant.batch.submitNote', 'assistant.batch.check', 'chat.submit', 'chat.refine', 'notes.transcribe']);
+      'notes.updateTranscript', 'assistant.batch.submitNote', 'assistant.batch.check', 'chat.submit', 'chat.refine', 'notes.transcribe', 'accounts.installOAuth']);
     expect(CLIENT_HISTORY_KINDS).toEqual(SERVER_HISTORY_KINDS);
     for (const kind of SERVER_HISTORY_KINDS) {
       expect(serverJournalKind(kind.toLowerCase())).toBe(kind);
@@ -247,6 +247,38 @@ describe('same-origin web workspace command client', () => {
     await expect(predispatch.execute({ kind: 'chat.create' }, () => { throw new Error('owner binding rejected'); })).rejects.toBeInstanceOf(WorkspaceCommandNotStartedError);
     expect(predispatch.getPendingCommand()).toBeUndefined();
     predispatch.dispose();
+  });
+
+  it('binds OAuth install receipt inspection to the exact stage without exposing credential material', async () => {
+    const dto = snapshot(1);
+    const stageId = conversationId;
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(body(dto))
+      .mockResolvedValueOnce(body({ schemaVersion: 1, commandId, status: 'finished', receipt: {
+        schemaVersion: 1, commandId, kind: 'accounts.installOAuth', objectId: 'acct:opaque:日本語', stageId, accountGeneration: 4,
+      } }));
+    const client = makeClient(fetcher, () => true, [commandId]);
+    await client.getSnapshot();
+    await expect(client.execute({ kind: 'accounts.installOAuth', stageId })).resolves.toMatchObject({
+      status: 'finished', receipt: { kind: 'accounts.installOAuth', stageId, accountGeneration: 4 },
+    });
+    expect(JSON.parse(String(fetcher.mock.calls[1]?.[1].body))).toMatchObject({ command: { kind: 'accounts.installOAuth', stageId } });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    client.dispose();
+
+    const mismatch = makeClient(vi.fn()
+      .mockResolvedValueOnce(body(snapshot(1)))
+      .mockResolvedValueOnce(body({ schemaVersion: 1, commandId, status: 'finished', receipt: {
+        schemaVersion: 1, commandId, kind: 'accounts.installOAuth', objectId: 'acct:opaque:日本語', stageId: anotherConversationId, accountGeneration: 4,
+      } }))
+      .mockResolvedValueOnce(body({ schemaVersion: 1, commandId, status: 'finished', receipt: {
+        schemaVersion: 1, commandId, kind: 'accounts.installOAuth', objectId: 'acct:opaque:日本語', stageId: anotherConversationId, accountGeneration: 4,
+      } })), () => true, [commandId]);
+    await mismatch.getSnapshot();
+    await expect(mismatch.execute({ kind: 'accounts.installOAuth', stageId })).rejects.toBeInstanceOf(WorkspaceCommandUnknownError);
+    await expect(mismatch.inspectCommand()).rejects.toMatchObject({ kind: 'malformed' });
+    expect(mismatch.getPendingCommand()?.command).toEqual({ kind: 'accounts.installOAuth', stageId });
+    mismatch.dispose();
   });
 
   it('uses relative endpoints, strict command envelopes, CSRF, and the injected full DTO decoder', async () => {

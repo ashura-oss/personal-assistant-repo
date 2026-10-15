@@ -2,15 +2,21 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type Database from 'better-sqlite3';
 import type { DurableKernel, JsonValue, OwnedTransactionContext } from './kernel.js';
+import type { AuthService } from './auth.js';
+import type { SecretVault } from './vault.js';
+import { isValidAccountId } from './accountIds.js';
+import { OAuthInstallStages, type OAuthVerifiedPayload, type OAuthReconnectLifecycle } from './oauthInstallStages.js';
+import { ServerOAuthTokenBindings, isValidOAuthTokenRef } from './oauthTokenBindings.js';
 import { WORKSPACE_COMMAND_HISTORY_KINDS, WORKSPACE_COMMAND_HISTORY_PAGE_SIZE, isWorkspaceCommandId,
   workspaceCommandKindFromJournal, workspaceCommandKindToJournal, type WorkspaceCommandHistoryEntry,
   type WorkspaceCommandHistoryPage } from './workspaceCommandHistory.js';
 
-const JOURNAL_SCHEMA_VERSION = 2;
+const JOURNAL_SCHEMA_VERSION = 3;
 const MAX_RECEIPT_BYTES = 1024 * 1024;
 const MAX_REQUEST_BYTES = 1024 * 1024;
 const KEY = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const KIND = /^[a-z][a-z0-9._:-]{0,95}$/;
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export type JournalStatus = 'claimed' | 'checkpointed' | 'finished' | 'inspect_required';
 
@@ -25,6 +31,8 @@ export interface CommandTicket {
   readonly ticketId: string;
   /** Opaque capability. Keep it inside trusted server modules; never serialize it to a client. */
   readonly capability: string;
+  readonly initiatingSessionBinding?: string;
+  readonly oauthInstallStageId?: string;
 }
 
 export interface CommandAdmission {
@@ -106,6 +114,28 @@ export interface CaptureAdoptionCheckpoint {
   readonly captureTimeZone: string;
 }
 
+export interface OAuthInstallCheckpoint {
+  readonly stageId: string;
+  readonly stagePayloadGeneration: number;
+  readonly accountId: string;
+  readonly accountGeneration: number;
+  readonly tokenRef: string;
+}
+
+export interface PreparedOAuthInstallFacts {
+  readonly stageId: string;
+  readonly stagePayloadGeneration: number;
+  readonly provider: OAuthVerifiedPayload['provider'];
+  readonly identity: OAuthVerifiedPayload['identity'];
+  readonly requestedCapabilities: OAuthVerifiedPayload['requestedCapabilities'];
+  readonly capabilities: OAuthVerifiedPayload['capabilities'];
+  readonly grantedScopes: OAuthVerifiedPayload['grantedScopes'];
+  readonly displayName: string;
+  readonly email?: string;
+  readonly expiresAt: number;
+  readonly expectedLifecycle?: OAuthReconnectLifecycle;
+}
+
 const currentTicket = new AsyncLocalStorage<CommandTicketContext>();
 
 export function currentCommandTicket(): CommandTicketContext | undefined {
@@ -146,6 +176,22 @@ function canonical(value: unknown, maxBytes = MAX_RECEIPT_BYTES): { text: string
 
 function digest(value: string): string { return createHash('sha256').update(value, 'utf8').digest('hex'); }
 function sessionDigest(value: string): string { return digest(`session\0${value}`); }
+function installStageFromCanonicalBody(value: JsonValue, commandId: string, expectedRevision: number, expectedPrivacyEpoch: number): string {
+  if (!value || typeof value !== 'object' || Array.isArray(value) ||
+      Object.keys(value).sort().join('\0') !== ['command', 'commandId', 'expectedPrivacyEpoch', 'expectedRevision', 'schemaVersion'].join('\0')) {
+    throw new Error('oauth_install_command_invalid');
+  }
+  const envelope = value as Record<string, JsonValue>;
+  const command = envelope.command;
+  if (envelope.schemaVersion !== 1 || envelope.commandId !== commandId || envelope.expectedRevision !== expectedRevision ||
+      envelope.expectedPrivacyEpoch !== expectedPrivacyEpoch || !command || typeof command !== 'object' || Array.isArray(command) ||
+      Object.keys(command).sort().join('\0') !== ['kind', 'stageId'].join('\0') ||
+      (command as Record<string, JsonValue>).kind !== 'accounts.installOAuth' ||
+      typeof (command as Record<string, JsonValue>).stageId !== 'string' || !UUID_V4.test((command as Record<string, JsonValue>).stageId as string)) {
+    throw new Error('oauth_install_command_invalid');
+  }
+  return (command as Record<string, JsonValue>).stageId as string;
+}
 function requireKey(value: unknown): asserts value is string {
   if (typeof value !== 'string' || !KEY.test(value)) throw new Error('Command idempotency key is invalid.');
 }
@@ -155,6 +201,7 @@ function requireKind(value: unknown): asserts value is string {
 
 interface JournalRow {
   workspace_id: string; owner_id: string; session_digest: string; idempotency_key: string;
+  initiating_session_binding: string | null;
   request_digest: string; command_kind: string; privacy_epoch: number; ticket_id: string; ticket_digest: string;
   status: JournalStatus; created_at: number; updated_at: number; checkpoint_revision: number | null;
   snapshot_digest: string | null; owned_object_ids_json: string | null; receipt_json: string | null;
@@ -163,6 +210,9 @@ interface JournalRow {
 export interface CommandJournalOptions {
   readonly now?: () => number;
   readonly projectOwnedObjectIds?: (snapshot: unknown) => OwnedObjectIds;
+  readonly oauthInstall?: Readonly<{ auth: AuthService; vault: SecretVault; stages: OAuthInstallStages; bindings: ServerOAuthTokenBindings }>;
+  /** Fixed failpoint used only by rollback tests; production composition always omits it. */
+  readonly oauthInstallFailureForTesting?: 'after_workspace' | 'after_vault' | 'after_binding' | 'after_stage' | 'after_receipt';
 }
 
 /** Durable admission and receipt state for async operations; no DB transaction spans awaited work. */
@@ -173,8 +223,13 @@ export class CommandJournal {
   constructor(private readonly kernel: DurableKernel, options: CommandJournalOptions = {}) {
     this.now = options.now ?? Date.now;
     this.projectOwnedObjectIds = options.projectOwnedObjectIds ?? projectDefaultObjectIds;
+    this.oauthInstall = options.oauthInstall;
+    this.oauthInstallFailureForTesting = options.oauthInstallFailureForTesting;
     this.kernel.withTrustedDatabaseTransaction((db) => this.initialize(db));
   }
+
+  private readonly oauthInstall?: CommandJournalOptions['oauthInstall'];
+  private readonly oauthInstallFailureForTesting?: CommandJournalOptions['oauthInstallFailureForTesting'];
 
   private initialize(db: Database.Database): void {
     const exists = (name: string): boolean => Boolean(db.prepare("SELECT 1 AS found FROM sqlite_master WHERE type='table' AND name=?").get(name));
@@ -186,6 +241,7 @@ export class CommandJournal {
         CREATE TABLE async_command_journal (
           workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
           idempotency_key TEXT NOT NULL, owner_id TEXT NOT NULL, session_digest TEXT NOT NULL,
+          initiating_session_binding TEXT CHECK(initiating_session_binding IS NULL OR length(initiating_session_binding)=64),
           request_digest TEXT NOT NULL, command_kind TEXT NOT NULL, privacy_epoch INTEGER NOT NULL,
           ticket_id TEXT NOT NULL UNIQUE, ticket_digest TEXT NOT NULL,
           status TEXT NOT NULL CHECK(status IN ('claimed','checkpointed','finished','inspect_required')),
@@ -206,8 +262,17 @@ export class CommandJournal {
     if (version.version > JOURNAL_SCHEMA_VERSION) throw new Error('The asynchronous command journal was created by a newer server.');
     if (version.version === 1) {
       db.exec(`CREATE INDEX IF NOT EXISTS async_command_journal_history_idx ON async_command_journal(workspace_id,owner_id,privacy_epoch,created_at DESC,idempotency_key DESC);
-        UPDATE command_journal_schema SET version=${JOURNAL_SCHEMA_VERSION} WHERE singleton=1;`);
-    } else if (version.version !== JOURNAL_SCHEMA_VERSION) {
+        UPDATE command_journal_schema SET version=2 WHERE singleton=1;`);
+    }
+    const current = db.prepare('SELECT version FROM command_journal_schema WHERE singleton=1').get() as { version: number };
+    if (current.version === 2) {
+      const columns = db.pragma('table_info(async_command_journal)') as Array<{ name: string }>;
+      if (!columns.some((column) => column.name === 'initiating_session_binding')) {
+        db.exec(`ALTER TABLE async_command_journal ADD COLUMN initiating_session_binding TEXT
+          CHECK(initiating_session_binding IS NULL OR length(initiating_session_binding)=64);`);
+      }
+      db.prepare('UPDATE command_journal_schema SET version=? WHERE singleton=1').run(JOURNAL_SCHEMA_VERSION);
+    } else if (current.version !== JOURNAL_SCHEMA_VERSION) {
       throw new Error('The asynchronous command journal requires an unavailable migration.');
     }
   }
@@ -217,6 +282,8 @@ export class CommandJournal {
     if (!Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 0 || !Number.isSafeInteger(input.expectedPrivacyEpoch) || input.expectedPrivacyEpoch < 0) throw new Error('Command admission revision or epoch is invalid.');
     const parsed = parseCanonical(input.canonicalBody, MAX_REQUEST_BYTES);
     const requestDigest = digest(`${input.kind}\0${parsed.text}`);
+    const oauthInstallStageId = input.kind === 'accounts.installoauth' ? installStageFromCanonicalBody(parsed.value,
+      input.idempotencyKey, input.expectedRevision, input.expectedPrivacyEpoch) : undefined;
     return this.kernel.withOwnedTransaction(input.admissionSessionToken, input.expectedPrivacyEpoch, (context) => {
       const prior = context.db.prepare(`SELECT * FROM async_command_journal WHERE workspace_id=? AND idempotency_key=?`)
         .get(context.workspaceId, input.idempotencyKey) as JournalRow | undefined;
@@ -230,17 +297,23 @@ export class CommandJournal {
           ...(prior.checkpoint_revision === null ? {} : { checkpointRevision: prior.checkpoint_revision }) });
       }
       if (context.revision !== input.expectedRevision) throw new Error('The workspace revision changed before command admission.');
+      const initiatingSessionBinding = oauthInstallStageId
+        ? this.oauthInstall?.auth.bindInitiatingSessionWithinTransaction(context, input.admissionSessionToken)
+        : undefined;
+      if (oauthInstallStageId && !initiatingSessionBinding) throw new Error('oauth_install_unavailable');
       const ticketId = randomUUID();
       const capability = randomBytes(32).toString('base64url');
       const now = this.clock();
-      context.db.prepare(`INSERT INTO async_command_journal(workspace_id,idempotency_key,owner_id,session_digest,request_digest,command_kind,privacy_epoch,
+      context.db.prepare(`INSERT INTO async_command_journal(workspace_id,idempotency_key,owner_id,session_digest,initiating_session_binding,request_digest,command_kind,privacy_epoch,
         ticket_id,ticket_digest,status,created_at,updated_at,checkpoint_revision,snapshot_digest,owned_object_ids_json,receipt_json)
-        VALUES(?,?,?,?,?,?,?,?,?,'claimed',?,?,NULL,NULL,NULL,NULL)`)
-        .run(context.workspaceId, input.idempotencyKey, context.ownerId, sessionDigest(input.admissionSessionToken), requestDigest, input.kind,
+        VALUES(?,?,?,?,?,?,?,?,?,?,'claimed',?,?,NULL,NULL,NULL,NULL)`)
+        .run(context.workspaceId, input.idempotencyKey, context.ownerId, sessionDigest(input.admissionSessionToken), initiatingSessionBinding ?? null, requestDigest, input.kind,
           context.privacyEpoch, ticketId, digest(capability), now, now);
       const ticket: CommandTicket = Object.freeze({ workspaceId: context.workspaceId, ownerId: context.ownerId,
         privacyEpoch: context.privacyEpoch, admissionSessionDigest: sessionDigest(input.admissionSessionToken), idempotencyKey: input.idempotencyKey, kind: input.kind,
-        requestDigest, ticketId, capability });
+        requestDigest, ticketId, capability,
+        ...(initiatingSessionBinding ? { initiatingSessionBinding } : {}),
+        ...(oauthInstallStageId ? { oauthInstallStageId } : {}) });
       return Object.freeze({ fresh: true, status: 'claimed' as const, ticket });
     });
   }
@@ -266,6 +339,7 @@ export class CommandJournal {
   /** Checkpoint the state-store save and journal revision in the same SQLite transaction. */
   checkpoint(ticket: CommandTicketContext, stateFence: { workspaceId: string; revision: number; privacyEpoch: number },
     serializedSnapshot: string, accountGenerations: Readonly<Record<string, number>>): number {
+    if (ticket.kind === 'accounts.installoauth') throw new Error('oauth_install_checkpoint_required');
     const parsed = parseCanonical(serializedSnapshot, 16 * 1024 * 1024);
     const snapshotDigest = digest(parsed.text);
     const ids = canonical(this.projectOwnedObjectIds(parsed.value), 1024 * 1024);
@@ -290,6 +364,107 @@ export class CommandJournal {
       if (update.changes !== 1) throw new Error('The command checkpoint could not be recorded.');
       return receipt.revision;
     });
+  }
+
+  /** Atomically promotes one verified OAuth stage into the workspace and exact encrypted account slot. */
+  checkpointOAuthInstall(ticket: CommandTicketContext, stateFence: { workspaceId: string; revision: number; privacyEpoch: number },
+    serializedSnapshot: string, accountGenerations: Readonly<Record<string, number>>, install: OAuthInstallCheckpoint): number {
+    if (!ticket || ticket.kind !== 'accounts.installoauth' || currentTicket.getStore() !== ticket ||
+        !this.oauthInstall || !install || install.stageId !== ticket.oauthInstallStageId || !UUID_V4.test(install.stageId) ||
+        !Number.isSafeInteger(install.stagePayloadGeneration) || install.stagePayloadGeneration < 1 ||
+        !isValidAccountId(install.accountId) || !Number.isSafeInteger(install.accountGeneration) || install.accountGeneration < 1 ||
+        !isValidOAuthTokenRef(install.tokenRef)) throw new Error('oauth_install_checkpoint_invalid');
+    const oauthInstall = this.oauthInstall;
+    const parsed = parseCanonical(serializedSnapshot, 16 * 1024 * 1024);
+    const snapshotDigest = digest(parsed.text);
+    const ids = canonical(this.projectOwnedObjectIds(parsed.value), 1024 * 1024);
+    const outcome = this.kernel.withOwnedTransaction(ticket.runtimeSessionToken, ticket.privacyEpoch, (context) => {
+      if (stateFence.workspaceId !== ticket.workspaceId || stateFence.revision !== context.revision ||
+          stateFence.privacyEpoch !== context.privacyEpoch || context.workspaceId !== ticket.workspaceId || context.ownerId !== ticket.ownerId ||
+          context.privacyEpoch !== ticket.privacyEpoch) throw new Error('oauth_install_workspace_changed');
+      const row = this.getTicketRow(context, ticket);
+      if (row.status !== 'claimed' || row.command_kind !== 'accounts.installoauth' || !row.initiating_session_binding ||
+          row.initiating_session_binding !== ticket.initiatingSessionBinding) throw new Error('oauth_install_ticket_invalid');
+      const expectedRequest = canonical({ schemaVersion: 1, commandId: ticket.idempotencyKey, expectedRevision: stateFence.revision,
+        expectedPrivacyEpoch: ticket.privacyEpoch, command: { kind: 'accounts.installOAuth', stageId: install.stageId } }, 16 * 1024);
+      if (digest(`${ticket.kind}\0${expectedRequest.text}`) !== row.request_digest) throw new Error('oauth_install_command_binding_mismatch');
+
+      const staged = oauthInstall.stages.readVerifiedForInstall(context, install.stageId, row.initiating_session_binding);
+      if (staged.status.status !== 'verified' || !staged.payload || staged.status.attemptId !== install.stageId ||
+          staged.status.payloadGeneration !== install.stagePayloadGeneration) return staged.status.status;
+      oauthInstall.auth.assertInitiatingSessionWithinTransaction(context, row.initiating_session_binding);
+      validateOAuthInstallCandidate(context, this.kernel, parsed.value, accountGenerations, install, staged.payload,
+        staged.reconnectLifecycle, row);
+
+      const result = this.kernel.runLocalCommand(ticket.runtimeSessionToken, {
+        expectedRevision: context.revision, expectedPrivacyEpoch: context.privacyEpoch, idempotencyKey: randomUUID(),
+        type: 'workspace.snapshot.oauth_install', canonicalRequest: canonical({ command: ticket.idempotencyKey, snapshotDigest }).text,
+      }, () => ({ snapshot: parsed.value, receipt: { kind: 'workspace_snapshot_oauth_install', snapshotDigest }, accountGenerations }));
+      this.failOAuthInstallForTesting('after_workspace');
+      const purpose = staged.payload.provider === 'google' ? 'googleOAuth' : 'microsoftOAuth';
+      const credential = JSON.stringify({ accessToken: staged.payload.accessToken, refreshToken: staged.payload.refreshToken,
+        expiresAt: staged.payload.expiresAt, identity: staged.payload.identity });
+      const metadata = oauthInstall.vault.getMetadataWithinTransaction(context,
+        { type: 'account', accountId: install.accountId, expectedAccountGeneration: install.accountGeneration }, purpose);
+      const saved = oauthInstall.vault.setSecretWithinTransaction(context,
+        { type: 'account', accountId: install.accountId, expectedAccountGeneration: install.accountGeneration }, purpose, metadata.generation, credential);
+      this.failOAuthInstallForTesting('after_vault');
+      oauthInstall.bindings.writeExistingCredentialBindingWithinTransaction(context, { tokenRef: install.tokenRef,
+        accountId: install.accountId, provider: staged.payload.provider, accountGeneration: install.accountGeneration,
+        credentialGeneration: saved.generation });
+      this.failOAuthInstallForTesting('after_binding');
+      this.consumeOAuthStageForInstall(context, row, install);
+      this.failOAuthInstallForTesting('after_stage');
+      const receipt = canonical({ schemaVersion: 1, commandId: ticket.idempotencyKey, kind: 'accounts.installOAuth',
+        objectId: install.accountId, stageId: install.stageId, accountGeneration: install.accountGeneration }, MAX_RECEIPT_BYTES);
+      const updated = context.db.prepare(`UPDATE async_command_journal SET status='finished',updated_at=?,checkpoint_revision=?,snapshot_digest=?,
+        owned_object_ids_json=?,receipt_json=? WHERE workspace_id=? AND idempotency_key=? AND ticket_id=? AND ticket_digest=?
+        AND status='claimed' AND initiating_session_binding=?`)
+        .run(this.clock(), result.revision, snapshotDigest, ids.text, receipt.text, ticket.workspaceId, ticket.idempotencyKey,
+          ticket.ticketId, digest(ticket.capability), row.initiating_session_binding);
+      if (updated.changes !== 1) throw new Error('oauth_install_receipt_conflict');
+      this.failOAuthInstallForTesting('after_receipt');
+      return result.revision;
+    });
+    if (typeof outcome !== 'number') throw new Error(`oauth_install_stage_${outcome}`);
+    return outcome;
+  }
+
+  /** Safe facts only; terminal cleanup commits before an unavailable stage is reported. */
+  prepareOAuthInstallFacts(ticket: CommandTicketContext | undefined, stageId: string): PreparedOAuthInstallFacts {
+    if (!ticket || ticket.kind !== 'accounts.installoauth' || currentTicket.getStore() !== ticket ||
+        ticket.oauthInstallStageId !== stageId || !this.oauthInstall || !UUID_V4.test(stageId)) throw new Error('oauth_install_ticket_invalid');
+    const result = this.kernel.withOwnedTransaction(ticket.runtimeSessionToken, ticket.privacyEpoch, (context) => {
+      const row = this.getTicketRow(context, ticket);
+      if (row.status !== 'claimed' || row.command_kind !== 'accounts.installoauth' || !row.initiating_session_binding ||
+          row.initiating_session_binding !== ticket.initiatingSessionBinding) throw new Error('oauth_install_ticket_invalid');
+      const staged = this.oauthInstall!.stages.readVerifiedForInstall(context, stageId, row.initiating_session_binding);
+      if (staged.status.status !== 'verified' || !staged.payload) return { status: staged.status.status } as const;
+      this.oauthInstall!.auth.assertInitiatingSessionWithinTransaction(context, row.initiating_session_binding);
+      const payload = staged.payload;
+      return { status: 'verified' as const, facts: Object.freeze({ stageId, stagePayloadGeneration: staged.status.payloadGeneration,
+        provider: payload.provider, identity: payload.identity, requestedCapabilities: payload.requestedCapabilities,
+        capabilities: payload.capabilities, grantedScopes: payload.grantedScopes, displayName: payload.displayName,
+        ...(payload.email !== undefined ? { email: payload.email } : {}), expiresAt: payload.expiresAt,
+        ...(staged.reconnectLifecycle ? { expectedLifecycle: staged.reconnectLifecycle } : {}) }) };
+    });
+    if (result.status !== 'verified') throw new Error(`oauth_install_stage_${result.status}`);
+    return result.facts!;
+  }
+
+  private consumeOAuthStageForInstall(context: OwnedTransactionContext, row: JournalRow, install: OAuthInstallCheckpoint): void {
+    if (!this.oauthInstall || row.command_kind !== 'accounts.installoauth' || row.status !== 'claimed' ||
+        row.initiating_session_binding === null) throw new Error('oauth_install_ticket_invalid');
+    const changed = context.db.prepare(`UPDATE oauth_install_stages SET status='consumed',claim_hash=NULL,nonce=NULL,tag=NULL,ciphertext=NULL,
+      consumed_command_id=?,consumed_account_id=?,consumed_account_generation=? WHERE stage_id=? AND owner_id=? AND workspace_id=?
+      AND privacy_epoch=? AND status='verified' AND payload_kind='verified' AND payload_generation=? AND initiating_session_binding=?`)
+      .run(row.idempotency_key, install.accountId, install.accountGeneration, install.stageId, context.ownerId, context.workspaceId,
+        context.privacyEpoch, install.stagePayloadGeneration, row.initiating_session_binding).changes;
+    if (changed !== 1) throw new Error('oauth_install_stage_consume_conflict');
+  }
+
+  private failOAuthInstallForTesting(phase: NonNullable<CommandJournalOptions['oauthInstallFailureForTesting']>): void {
+    if (this.oauthInstallFailureForTesting === phase) throw new Error(`oauth_install_test_failure_${phase}`);
   }
 
   /** Atomically adopts one ready server capture, writes the workspace snapshot, and finishes its command receipt. */
@@ -375,6 +550,7 @@ export class CommandJournal {
         return parseJson(row.receipt_json);
       }
       if (row.status === 'inspect_required') throw new Error('This command requires manual inspection and cannot be finished automatically.');
+      if (ticket.kind === 'accounts.installoauth') throw new Error('oauth_install_checkpoint_required');
       if (ticket.kind === 'notes.transcribe' && receipt.value && typeof receipt.value === 'object' && !Array.isArray(receipt.value) &&
           (receipt.value as Record<string, JsonValue>).kind === 'notes.transcribe') {
         this.validateTranscriptionFinish(context, row, receipt.value as Record<string, JsonValue>);
@@ -533,7 +709,10 @@ export class CommandJournal {
       .get(ticket.workspaceId, ticket.idempotencyKey) as JournalRow | undefined;
     if (!row || row.owner_id !== ticket.ownerId || row.privacy_epoch !== ticket.privacyEpoch || row.command_kind !== ticket.kind ||
       row.request_digest !== ticket.requestDigest || row.ticket_id !== ticket.ticketId || row.ticket_digest !== digest(ticket.capability) ||
-      row.session_digest !== ticket.admissionSessionDigest) throw new Error('The command ticket is invalid for this workspace session.');
+      row.session_digest !== ticket.admissionSessionDigest || row.initiating_session_binding !== (ticket.initiatingSessionBinding ?? null) ||
+      (row.command_kind === 'accounts.installoauth' && (!row.initiating_session_binding || !ticket.oauthInstallStageId || !UUID_V4.test(ticket.oauthInstallStageId)))) {
+      throw new Error('The command ticket is invalid for this workspace session.');
+    }
     return row;
   }
 
@@ -542,6 +721,100 @@ export class CommandJournal {
     if (!Number.isSafeInteger(value) || value < 0) throw new Error('The command journal clock is invalid.');
     return value;
   }
+}
+
+function validateOAuthInstallCandidate(context: OwnedTransactionContext, kernel: DurableKernel, snapshotValue: JsonValue,
+  accountGenerations: Readonly<Record<string, number>>, checkpoint: OAuthInstallCheckpoint, payload: OAuthVerifiedPayload,
+  lifecycle: OAuthReconnectLifecycle | undefined, journalRow: JournalRow): void {
+  if (journalRow.initiating_session_binding === null || payload.provider !== (payload.identity.providerNamespace) ||
+      (payload.provider !== 'google' && payload.provider !== 'microsoft')) throw new Error('oauth_install_stage_invalid');
+  const stored = context.db.prepare('SELECT snapshot_json FROM workspaces WHERE id=? AND revision=? AND privacy_epoch=?')
+    .get(context.workspaceId, context.revision, context.privacyEpoch) as { snapshot_json: string } | undefined;
+  if (!stored) throw new Error('oauth_install_workspace_changed');
+  const priorRoot = parseCanonical(stored.snapshot_json, 16 * 1024 * 1024).value;
+  const priorAccounts = readAccountArray(priorRoot);
+  const candidateAccounts = readAccountArray(snapshotValue);
+  const previousForId = priorAccounts.filter((account) => account.id === checkpoint.accountId);
+  const candidatesForId = candidateAccounts.filter((account) => account.id === checkpoint.accountId);
+  if (candidatesForId.length !== 1) throw new Error('oauth_install_candidate_invalid');
+  const priorAccount = previousForId.length === 1 ? previousForId[0] : undefined;
+  if (previousForId.length > 1) throw new Error('oauth_install_snapshot_corrupt');
+  if (lifecycle) {
+    if (lifecycle.accountId !== checkpoint.accountId || !priorAccount || priorAccount.connectionGeneration !== lifecycle.connectionGeneration ||
+        priorAccount.tokenRef !== lifecycle.tokenRef || priorAccount.connected !== lifecycle.connected || priorAccount.authStatus !== lifecycle.authStatus ||
+        !sameJson(priorAccount.identity ?? null, lifecycle.identity ?? null)) throw new Error('oauth_install_lifecycle_changed');
+  } else if (priorAccount || priorAccounts.some((account) => sameJson(account.identity ?? null, payload.identity))) {
+    throw new Error('oauth_install_identity_already_present');
+  }
+  if (candidateAccounts.some((account) => account !== candidatesForId[0] && account.id === checkpoint.accountId) ||
+      candidateAccounts.some((account) => account !== candidatesForId[0] && sameJson(account.identity ?? null, payload.identity))) {
+    throw new Error('oauth_install_candidate_duplicate');
+  }
+
+  const storedGeneration = context.db.prepare('SELECT generation FROM account_generations WHERE workspace_id=? AND account_id=?')
+    .get(context.workspaceId, checkpoint.accountId) as { generation: number } | undefined;
+  const oldGeneration = storedGeneration?.generation ?? 0;
+  if (!Number.isSafeInteger(oldGeneration) || oldGeneration < 0 || lifecycle && oldGeneration !== lifecycle.connectionGeneration) {
+    throw new Error('oauth_install_account_generation_changed');
+  }
+  const expectedGeneration = oldGeneration + 1;
+  if (!Number.isSafeInteger(expectedGeneration) || checkpoint.accountGeneration !== expectedGeneration ||
+      candidateAccounts[0] === undefined || accountGenerations[checkpoint.accountId] !== expectedGeneration ||
+      !Object.hasOwn(accountGenerations, checkpoint.accountId)) throw new Error('oauth_install_account_generation_invalid');
+
+  const candidate = candidatesForId[0]!;
+  const priorEmail = typeof priorAccount?.email === 'string' ? priorAccount.email : '';
+  const expectedEmail = (payload.email ?? priorEmail).trim().toLowerCase();
+  const effective = payload.requestedCapabilities.filter((capability) => payload.capabilities.includes(capability) &&
+    scopeGrantedCapabilities(payload.provider, payload.grantedScopes).includes(capability));
+  const expectedCapabilities = canonical(effective).text;
+  if (candidate.provider !== payload.provider || candidate.connectionGeneration !== expectedGeneration || candidate.tokenRef !== checkpoint.tokenRef ||
+      !isValidOAuthTokenRef(candidate.tokenRef) || candidate.connected !== true || candidate.authStatus !== 'connected' ||
+      !sameJson(candidate.identity, payload.identity) || candidate.displayName !== payload.displayName.trim() ||
+      typeof candidate.email !== 'string' || candidate.email !== expectedEmail ||
+      (payload.email !== undefined ? candidate.verifiedEmail !== payload.email.trim().toLowerCase() : Object.hasOwn(candidate, 'verifiedEmail')) ||
+      !Array.isArray(candidate.grantedScopes) || canonical(candidate.grantedScopes).text !== canonical(payload.grantedScopes).text ||
+      !Array.isArray(candidate.capabilityLimits) || canonical(candidate.capabilityLimits).text !== canonical(payload.requestedCapabilities).text ||
+      !Array.isArray(candidate.capabilities) || canonical(candidate.capabilities).text !== expectedCapabilities) {
+    throw new Error('oauth_install_candidate_invalid');
+  }
+  // A generation update in the local kernel command is intentionally the final
+  // authority check for the candidate's opaque account key.
+  void kernel;
+}
+
+function readAccountArray(value: JsonValue): Array<Record<string, JsonValue>> {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || !Array.isArray(value.accounts)) throw new Error('oauth_install_snapshot_invalid');
+  return value.accounts.map((entry) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry) || typeof entry.id !== 'string' || !isValidAccountId(entry.id)) {
+      throw new Error('oauth_install_snapshot_invalid');
+    }
+    return entry as Record<string, JsonValue>;
+  });
+}
+
+function sameJson(left: unknown, right: unknown): boolean {
+  try { return canonical(left).text === canonical(right).text; } catch { return false; }
+}
+
+function scopeGrantedCapabilities(provider: OAuthVerifiedPayload['provider'], scopes: readonly string[]): string[] {
+  const values = new Set(scopes.map((scope) => scope.toLowerCase()));
+  const has = (...candidates: string[]) => candidates.some((candidate) => values.has(candidate.toLowerCase()));
+  const result: string[] = [];
+  if (provider === 'google') {
+    if (has('https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/gmail.metadata', 'https://www.googleapis.com/auth/gmail.modify', 'https://mail.google.com/')) result.push('mail.read');
+    if (has('https://www.googleapis.com/auth/gmail.compose', 'https://www.googleapis.com/auth/gmail.modify', 'https://mail.google.com/')) result.push('mail.draft');
+    if (has('https://www.googleapis.com/auth/gmail.send', 'https://www.googleapis.com/auth/gmail.compose', 'https://mail.google.com/')) result.push('mail.send');
+    if (has('https://www.googleapis.com/auth/calendar.readonly', 'https://www.googleapis.com/auth/calendar', 'https://www.googleapis.com/auth/calendar.events.readonly', 'https://www.googleapis.com/auth/calendar.events')) result.push('calendar.read');
+    if (has('https://www.googleapis.com/auth/calendar', 'https://www.googleapis.com/auth/calendar.events')) result.push('calendar.write');
+  } else {
+    if (has('mail.read', 'mail.readbasic', 'mail.readwrite')) result.push('mail.read');
+    if (has('mail.readwrite')) result.push('mail.draft');
+    if (has('mail.send')) result.push('mail.send');
+    if (has('calendars.read', 'calendars.readwrite')) result.push('calendar.read');
+    if (has('calendars.readwrite')) result.push('calendar.write');
+  }
+  return result;
 }
 
 function parseCanonical(text: string, maxBytes = MAX_RECEIPT_BYTES): { text: string; value: JsonValue } {

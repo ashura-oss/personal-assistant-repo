@@ -5,7 +5,7 @@ import { isValidAccountId } from './accountIds.js';
 import type { DurableKernel, OwnedTransactionContext } from './kernel.js';
 import { SecretVault, type OAuthStageBinding, type StageCiphertext } from './vault.js';
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 const STAGE_TTL_MS = 10 * 60 * 1000;
 const MAX_STAGE_PAYLOAD_BYTES = 64 * 1024;
 const MAX_TOKEN_CHARS = 16_384;
@@ -17,7 +17,7 @@ const CAPABILITIES = ['mail.read', 'mail.draft', 'mail.send', 'calendar.read', '
 
 export type OAuthStageProvider = 'google' | 'microsoft';
 export type OAuthStageCapability = typeof CAPABILITIES[number];
-export type OAuthInstallStageState = 'authorization_pending' | 'exchange_claimed' | 'verified' | 'denied' | 'inspect_required' | 'expired';
+export type OAuthInstallStageState = 'authorization_pending' | 'exchange_claimed' | 'verified' | 'denied' | 'inspect_required' | 'expired' | 'consumed';
 
 export interface OAuthStageIdentity {
   readonly providerNamespace: OAuthStageProvider;
@@ -95,8 +95,10 @@ export interface OAuthInstallStageStatus {
   readonly registrationId: string;
   readonly provider: OAuthStageProvider;
   readonly status: OAuthInstallStageState;
+  readonly payloadGeneration: number;
   readonly createdAt: number;
   readonly expiresAt: number;
+  readonly consumption?: Readonly<{ commandId: string; accountId: string; accountGeneration: number }>;
 }
 
 export interface OAuthAuthorizationStartResult {
@@ -136,6 +138,9 @@ interface StageRow {
   nonce: Buffer | null;
   tag: Buffer | null;
   ciphertext: Buffer | null;
+  consumed_command_id: string | null;
+  consumed_account_id: string | null;
+  consumed_account_generation: number | null;
 }
 
 interface NormalizedAuthorizationPayload {
@@ -337,42 +342,67 @@ export class OAuthInstallStages {
       db.exec(`
         CREATE TABLE oauth_install_stage_schema (
           singleton INTEGER PRIMARY KEY CHECK(singleton=1), version INTEGER NOT NULL CHECK(version>0)
-        ) STRICT;
-        CREATE TABLE oauth_install_stages (
-          stage_id TEXT PRIMARY KEY CHECK(length(stage_id)=36),
-          owner_id TEXT NOT NULL CHECK(length(owner_id)=36),
-          workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-          privacy_epoch INTEGER NOT NULL CHECK(privacy_epoch>=0),
-          initiating_session_binding TEXT NOT NULL CHECK(length(initiating_session_binding)=64),
-          registration_id TEXT NOT NULL CHECK(length(registration_id) BETWEEN 1 AND 128),
-          provider TEXT NOT NULL CHECK(provider IN ('google','microsoft')),
-          created_at INTEGER NOT NULL CHECK(created_at>=0),
-          expires_at INTEGER NOT NULL CHECK(expires_at>created_at),
-          state_hash TEXT NOT NULL UNIQUE CHECK(length(state_hash)=64),
-          cookie_hash TEXT NOT NULL CHECK(length(cookie_hash)=64),
-          claim_hash TEXT CHECK(claim_hash IS NULL OR length(claim_hash)=64),
-          payload_generation INTEGER NOT NULL CHECK(payload_generation>0),
-          payload_kind TEXT NOT NULL CHECK(payload_kind IN ('authorization','verified')),
-          status TEXT NOT NULL CHECK(status IN ('authorization_pending','exchange_claimed','verified','denied','inspect_required','expired')),
-          nonce BLOB,
-          tag BLOB,
-          ciphertext BLOB,
-          CHECK((nonce IS NULL AND tag IS NULL AND ciphertext IS NULL) OR
-                (length(nonce)=12 AND length(tag)=16 AND length(ciphertext) BETWEEN 1 AND ${MAX_STAGE_PAYLOAD_BYTES})),
-          CHECK((status IN ('authorization_pending','exchange_claimed','verified') AND ciphertext IS NOT NULL) OR
-                (status IN ('denied','inspect_required','expired') AND ciphertext IS NULL)),
-          CHECK((status='exchange_claimed' AND claim_hash IS NOT NULL) OR (status!='exchange_claimed' AND claim_hash IS NULL))
-        ) STRICT;
-        CREATE INDEX oauth_install_stages_owner_idx ON oauth_install_stages(owner_id,workspace_id,privacy_epoch,created_at);
-        INSERT INTO oauth_install_stage_schema(singleton,version) VALUES(1,${SCHEMA_VERSION});
-      `);
+        ) STRICT;`);
+      this.createStagesTable(db, 'oauth_install_stages');
+      db.prepare('INSERT INTO oauth_install_stage_schema(singleton,version) VALUES(1,?)').run(SCHEMA_VERSION);
       return;
     }
     if (!hasRows) fail('oauth_stage_schema_corrupt', 'The OAuth stage schema is incomplete.');
     const marker = db.prepare('SELECT version FROM oauth_install_stage_schema WHERE singleton=1').get() as { version: number } | undefined;
     if (!marker || !Number.isSafeInteger(marker.version) || marker.version < 1) fail('oauth_stage_schema_corrupt', 'The OAuth stage schema version is invalid.');
     if (marker.version > SCHEMA_VERSION) fail('oauth_stage_newer_schema', 'This server cannot read a newer OAuth stage format.');
-    if (marker.version !== SCHEMA_VERSION) fail('oauth_stage_migration_required', 'No OAuth stage schema migration is available.');
+    if (marker.version === 1) this.migrateV1ToV2(db);
+    else if (marker.version !== SCHEMA_VERSION) fail('oauth_stage_migration_required', 'No OAuth stage schema migration is available.');
+  }
+
+  private createStagesTable(db: Database.Database, tableName: string): void {
+    if (tableName !== 'oauth_install_stages' && tableName !== 'oauth_install_stages_v2') {
+      fail('oauth_stage_schema_corrupt', 'The OAuth stage table name is invalid.');
+    }
+    db.exec(`CREATE TABLE ${tableName} (
+      stage_id TEXT PRIMARY KEY CHECK(length(stage_id)=36),
+      owner_id TEXT NOT NULL CHECK(length(owner_id)=36),
+      workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+      privacy_epoch INTEGER NOT NULL CHECK(privacy_epoch>=0),
+      initiating_session_binding TEXT NOT NULL CHECK(length(initiating_session_binding)=64),
+      registration_id TEXT NOT NULL CHECK(length(registration_id) BETWEEN 1 AND 128),
+      provider TEXT NOT NULL CHECK(provider IN ('google','microsoft')),
+      created_at INTEGER NOT NULL CHECK(created_at>=0),
+      expires_at INTEGER NOT NULL CHECK(expires_at>created_at),
+      state_hash TEXT NOT NULL UNIQUE CHECK(length(state_hash)=64),
+      cookie_hash TEXT NOT NULL CHECK(length(cookie_hash)=64),
+      claim_hash TEXT CHECK(claim_hash IS NULL OR length(claim_hash)=64),
+      payload_generation INTEGER NOT NULL CHECK(payload_generation>0),
+      payload_kind TEXT NOT NULL CHECK(payload_kind IN ('authorization','verified')),
+      status TEXT NOT NULL CHECK(status IN ('authorization_pending','exchange_claimed','verified','denied','inspect_required','expired','consumed')),
+      nonce BLOB, tag BLOB, ciphertext BLOB,
+      consumed_command_id TEXT CHECK(consumed_command_id IS NULL OR length(consumed_command_id)=36),
+      consumed_account_id TEXT CHECK(consumed_account_id IS NULL OR length(CAST(consumed_account_id AS BLOB)) BETWEEN 1 AND 1024),
+      consumed_account_generation INTEGER CHECK(consumed_account_generation IS NULL OR consumed_account_generation>0),
+      CHECK((nonce IS NULL AND tag IS NULL AND ciphertext IS NULL) OR
+            (length(nonce)=12 AND length(tag)=16 AND length(ciphertext) BETWEEN 1 AND ${MAX_STAGE_PAYLOAD_BYTES})),
+      CHECK((status IN ('authorization_pending','exchange_claimed','verified') AND ciphertext IS NOT NULL) OR
+            (status IN ('denied','inspect_required','expired','consumed') AND ciphertext IS NULL)),
+      CHECK((status='exchange_claimed' AND claim_hash IS NOT NULL) OR (status!='exchange_claimed' AND claim_hash IS NULL)),
+      CHECK((status='consumed' AND payload_kind='verified' AND consumed_command_id IS NOT NULL AND consumed_account_id IS NOT NULL AND consumed_account_generation IS NOT NULL) OR
+            (status!='consumed' AND consumed_command_id IS NULL AND consumed_account_id IS NULL AND consumed_account_generation IS NULL))
+    ) STRICT;`);
+    if (tableName === 'oauth_install_stages') {
+      db.exec('CREATE INDEX oauth_install_stages_owner_idx ON oauth_install_stages(owner_id,workspace_id,privacy_epoch,created_at);');
+    }
+  }
+
+  private migrateV1ToV2(db: Database.Database): void {
+    this.createStagesTable(db, 'oauth_install_stages_v2');
+    db.exec(`INSERT INTO oauth_install_stages_v2 (stage_id,owner_id,workspace_id,privacy_epoch,initiating_session_binding,
+      registration_id,provider,created_at,expires_at,state_hash,cookie_hash,claim_hash,payload_generation,payload_kind,status,nonce,tag,ciphertext,
+      consumed_command_id,consumed_account_id,consumed_account_generation)
+      SELECT stage_id,owner_id,workspace_id,privacy_epoch,initiating_session_binding,registration_id,provider,created_at,expires_at,state_hash,cookie_hash,
+      claim_hash,payload_generation,payload_kind,status,nonce,tag,ciphertext,NULL,NULL,NULL FROM oauth_install_stages;
+      DROP TABLE oauth_install_stages;
+      ALTER TABLE oauth_install_stages_v2 RENAME TO oauth_install_stages;
+      CREATE INDEX oauth_install_stages_owner_idx ON oauth_install_stages(owner_id,workspace_id,privacy_epoch,created_at);`);
+    db.prepare('UPDATE oauth_install_stage_schema SET version=? WHERE singleton=1').run(SCHEMA_VERSION);
   }
 
   private assertContext(context: OwnedTransactionContext): void {
@@ -390,7 +420,10 @@ export class OAuthInstallStages {
 
   private status(row: StageRow): OAuthInstallStageStatus {
     return Object.freeze({ attemptId: row.stage_id, registrationId: row.registration_id, provider: row.provider,
-      status: row.status, createdAt: row.created_at, expiresAt: row.expires_at });
+      status: row.status, payloadGeneration: row.payload_generation, createdAt: row.created_at, expiresAt: row.expires_at,
+      ...(row.status === 'consumed' && row.consumed_command_id && row.consumed_account_id && row.consumed_account_generation !== null
+        ? { consumption: Object.freeze({ commandId: row.consumed_command_id, accountId: row.consumed_account_id,
+            accountGeneration: row.consumed_account_generation }) } : {}) });
   }
 
   private binding(row: StageRow, payloadKind: OAuthStageBinding['payloadKind'], payloadGeneration: number): OAuthStageBinding {
@@ -500,7 +533,8 @@ export class OAuthInstallStages {
     const row: StageRow = { stage_id: attemptId, owner_id: context.ownerId, workspace_id: context.workspaceId,
       privacy_epoch: context.privacyEpoch, initiating_session_binding: initiatingSessionBinding, registration_id: input.registrationId,
       provider: input.provider, created_at: createdAt, expires_at: expiresAt, state_hash: sha256(state), cookie_hash: sha256(cookieBinding),
-      claim_hash: null, payload_generation: 1, payload_kind: 'authorization', status: 'authorization_pending', nonce: null, tag: null, ciphertext: null };
+      claim_hash: null, payload_generation: 1, payload_kind: 'authorization', status: 'authorization_pending', nonce: null, tag: null,
+      ciphertext: null, consumed_command_id: null, consumed_account_id: null, consumed_account_generation: null };
     const payload: NormalizedAuthorizationPayload = Object.freeze({ pkceVerifier, nonce,
       requestedCapabilities: input.requestedCapabilities,
       ...(input.reconnectLifecycle ? { reconnectLifecycle: input.reconnectLifecycle } : {}) });

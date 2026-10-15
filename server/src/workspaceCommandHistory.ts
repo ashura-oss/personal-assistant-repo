@@ -3,7 +3,7 @@ export const WORKSPACE_COMMAND_HISTORY_PAGE_SIZE = 50;
 export const WORKSPACE_COMMAND_HISTORY_KINDS = Object.freeze([
   'tasks.complete', 'tasks.reopen', 'chat.create', 'settings.update', 'notes.save', 'notes.capture.adopt',
   'notes.updateTranscript', 'assistant.batch.submitNote', 'assistant.batch.check', 'chat.submit', 'chat.refine',
-  'notes.transcribe',
+  'notes.transcribe', 'accounts.installOAuth',
 ] as const);
 export type WorkspaceCommandHistoryKind = (typeof WORKSPACE_COMMAND_HISTORY_KINDS)[number];
 export type WorkspaceCommandHistoryStatus = 'claimed' | 'checkpointed' | 'finished' | 'inspect_required';
@@ -21,6 +21,7 @@ const JOURNAL_TO_PUBLIC: Readonly<Record<string, WorkspaceCommandHistoryKind>> =
   'assistant.batch.submitnote': 'assistant.batch.submitNote', 'assistant.batch.check': 'assistant.batch.check',
   'chat.submit': 'chat.submit', 'chat.refine': 'chat.refine',
   'notes.transcribe': 'notes.transcribe',
+  'accounts.installoauth': 'accounts.installOAuth',
 });
 export function isWorkspaceCommandId(value: unknown): value is string { return typeof value === 'string' && UUID_V4.test(value); }
 export function workspaceCommandKindFromJournal(value: unknown): WorkspaceCommandHistoryKind | undefined {

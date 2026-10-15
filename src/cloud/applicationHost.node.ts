@@ -4,6 +4,9 @@ import type { SecretVault } from '../../server/src/vault.js';
 import { OwnedWorkspaceRuntime, type OwnedWorkspaceFactoryContext, type OwnedWorkspaceFactoryPorts } from './ownedWorkspaceRuntime.node';
 import { createWorkspaceHttpApi } from './workspaceHttp.node';
 import type { DurableKernel } from '../../server/src/kernel.js';
+import { OAuthInstallStages } from '../../server/src/oauthInstallStages.js';
+import { ServerOAuthTokenBindings } from '../../server/src/oauthTokenBindings.js';
+import type { AuthService } from '../../server/src/auth.js';
 import type { ServerConfig } from '../../server/src/config.js';
 import { createProductionWorkspacePortsFor, type ProductionWorkspacePortsOptions } from './productionWorkspacePorts.node';
 
@@ -23,8 +26,10 @@ export function createCloudApplicationRuntimeFactory(options: CloudApplicationRu
   if (!options || typeof options !== 'object' || typeof options.workspacePortsFor !== 'function') {
     throw new TypeError('application_workspace_ports_factory_required');
   }
-  const factory: ApplicationRuntimeFactory = ({ kernel, vault, runtimeSessionFor }) => {
-    const runtime = new OwnedWorkspaceRuntime({ kernel, runtimeSessionFor,
+  const factory: ApplicationRuntimeFactory = ({ kernel, vault, auth, runtimeSessionFor }) => {
+    const oauthStages = new OAuthInstallStages(kernel, vault, auth);
+    const oauthBindings = new ServerOAuthTokenBindings(kernel);
+    const runtime = new OwnedWorkspaceRuntime({ kernel, runtimeSessionFor, oauthInstall: { auth, vault, stages: oauthStages, bindings: oauthBindings },
       crypto: {
         randomUUID,
         async sha256(value) { return createHash('sha256').update(value).digest('hex'); },
@@ -54,7 +59,7 @@ export function createProductionApplicationRuntimeFactory(config: ServerConfig,
         ...(adapters.fetcher ? { fetcher: adapters.fetcher } : {}),
         ...(adapters.documentFileOperations ? { documentFileOperations: adapters.documentFileOperations } : {}),
       });
-  return ({ kernel, vault, runtimeSessionFor }) => createCloudApplicationRuntimeFactory({
+  return ({ kernel, vault, auth, runtimeSessionFor }) => createCloudApplicationRuntimeFactory({
     workspacePortsFor: (context) => makeWorkspacePorts(context, vault, kernel),
-  })({ kernel, vault, runtimeSessionFor });
+  })({ kernel, vault, auth, runtimeSessionFor });
 }

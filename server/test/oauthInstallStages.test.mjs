@@ -97,6 +97,81 @@ test('authorization stage returns private proofs only at start and completes enc
   } finally { cleanup(f); }
 });
 
+test('stage schema v1 migration preserves pending and verified encrypted payload bytes and rejects future versions unchanged', async () => {
+  const f = setup();
+  try {
+    const session = await login(f);
+    const pending = start(f, session.sessionToken);
+    const verified = start(f, session.sessionToken);
+    const claimResult = claim(f, session.sessionToken, verified);
+    inSession(f, session.sessionToken, (context) => f.stages.completeVerified(context, claimResult.claim, verifiedPayload()));
+    const readState = () => f.kernel.withTrustedDatabaseTransaction((db) => ({
+      version: db.prepare('SELECT version FROM oauth_install_stage_schema WHERE singleton=1').get().version,
+      columns: db.pragma('table_info(oauth_install_stages)').map((column) => column.name),
+      indexes: db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='oauth_install_stages' ORDER BY name").all().map((row) => row.name),
+      rows: db.prepare(`SELECT stage_id,status,payload_generation,payload_kind,nonce,tag,ciphertext FROM oauth_install_stages ORDER BY stage_id`).all(),
+    }));
+    const currentRows = readState().rows;
+    assert.deepEqual(currentRows.map((row) => row.status).sort(), ['authorization_pending', 'verified']);
+    f.kernel.withTrustedDatabaseTransaction((db) => {
+      db.exec(`DROP INDEX oauth_install_stages_owner_idx;
+        ALTER TABLE oauth_install_stages RENAME TO oauth_install_stages_v2_fixture;
+        CREATE TABLE oauth_install_stages (
+          stage_id TEXT PRIMARY KEY CHECK(length(stage_id)=36),
+          owner_id TEXT NOT NULL CHECK(length(owner_id)=36),
+          workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+          privacy_epoch INTEGER NOT NULL CHECK(privacy_epoch>=0),
+          initiating_session_binding TEXT NOT NULL CHECK(length(initiating_session_binding)=64),
+          registration_id TEXT NOT NULL CHECK(length(registration_id) BETWEEN 1 AND 128),
+          provider TEXT NOT NULL CHECK(provider IN ('google','microsoft')),
+          created_at INTEGER NOT NULL CHECK(created_at>=0), expires_at INTEGER NOT NULL CHECK(expires_at>created_at),
+          state_hash TEXT NOT NULL UNIQUE CHECK(length(state_hash)=64), cookie_hash TEXT NOT NULL CHECK(length(cookie_hash)=64),
+          claim_hash TEXT CHECK(claim_hash IS NULL OR length(claim_hash)=64),
+          payload_generation INTEGER NOT NULL CHECK(payload_generation>0),
+          payload_kind TEXT NOT NULL CHECK(payload_kind IN ('authorization','verified')),
+          status TEXT NOT NULL CHECK(status IN ('authorization_pending','exchange_claimed','verified','denied','inspect_required','expired')),
+          nonce BLOB, tag BLOB, ciphertext BLOB,
+          CHECK((nonce IS NULL AND tag IS NULL AND ciphertext IS NULL) OR
+            (length(nonce)=12 AND length(tag)=16 AND length(ciphertext) BETWEEN 1 AND 65536)),
+          CHECK((status IN ('authorization_pending','exchange_claimed','verified') AND ciphertext IS NOT NULL) OR
+            (status IN ('denied','inspect_required','expired') AND ciphertext IS NULL)),
+          CHECK((status='exchange_claimed' AND claim_hash IS NOT NULL) OR (status!='exchange_claimed' AND claim_hash IS NULL))
+        ) STRICT;
+        INSERT INTO oauth_install_stages (stage_id,owner_id,workspace_id,privacy_epoch,initiating_session_binding,registration_id,provider,
+          created_at,expires_at,state_hash,cookie_hash,claim_hash,payload_generation,payload_kind,status,nonce,tag,ciphertext)
+          SELECT stage_id,owner_id,workspace_id,privacy_epoch,initiating_session_binding,registration_id,provider,created_at,expires_at,
+            state_hash,cookie_hash,claim_hash,payload_generation,payload_kind,status,nonce,tag,ciphertext FROM oauth_install_stages_v2_fixture;
+        DROP TABLE oauth_install_stages_v2_fixture;
+        CREATE INDEX oauth_install_stages_owner_idx ON oauth_install_stages(owner_id,workspace_id,privacy_epoch,created_at);
+        UPDATE oauth_install_stage_schema SET version=1 WHERE singleton=1;
+        CREATE TRIGGER reject_stage_v2_marker BEFORE UPDATE OF version ON oauth_install_stage_schema
+          WHEN NEW.version=2 BEGIN SELECT RAISE(ABORT,'synthetic stage marker failure'); END;`);
+    });
+    const before = readState();
+    assert.equal(before.version, 1);
+    assert.equal(before.columns.includes('consumed_command_id'), false);
+    assert.deepEqual(before.rows, currentRows);
+    assert.deepEqual(before.indexes, ['oauth_install_stages_owner_idx', 'sqlite_autoindex_oauth_install_stages_1', 'sqlite_autoindex_oauth_install_stages_2']);
+    assert.throws(() => new OAuthInstallStages(f.kernel, f.vault, f.auth), /synthetic stage marker failure/);
+    assert.deepEqual(readState(), before, 'failed marker publication leaves the genuine v1 table and encrypted rows intact');
+    f.kernel.withTrustedDatabaseTransaction((db) => db.exec('DROP TRIGGER reject_stage_v2_marker'));
+    const migrated = new OAuthInstallStages(f.kernel, f.vault, f.auth);
+    const after = readState();
+    assert.equal(after.version, 2);
+    assert.ok(after.columns.includes('consumed_command_id'));
+    assert.deepEqual(after.rows, currentRows);
+    const binding = inSession(f, session.sessionToken, (context) => f.auth.bindInitiatingSessionWithinTransaction(context, session.sessionToken));
+    const decrypted = inSession(f, session.sessionToken, (context) => migrated.readVerifiedForInstall(context, verified.status.attemptId, binding));
+    assert.equal(decrypted.payload.refreshToken, 'synthetic-refresh-token');
+
+    f.kernel.withTrustedDatabaseTransaction((db) => db.prepare('UPDATE oauth_install_stage_schema SET version=3 WHERE singleton=1').run());
+    const beforeFuture = readState();
+    assert.throws(() => new OAuthInstallStages(f.kernel, f.vault, f.auth), /newer OAuth stage format/i);
+    assert.deepEqual(readState(), beforeFuture);
+    assert.equal(f.kernel.withTrustedDatabaseTransaction((db) => db.prepare('SELECT version FROM oauth_install_stage_schema WHERE singleton=1').get().version), 3);
+  } finally { cleanup(f); }
+});
+
 test('callback claim is one-use and callback proof does not require or accept a raw initiating bearer', async () => {
   const f = setup();
   try {

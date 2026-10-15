@@ -4,7 +4,7 @@ export const WORKSPACE_COMMAND_HISTORY_PAGE_SIZE = 50;
 export const WORKSPACE_COMMAND_HISTORY_KINDS = Object.freeze([
   'tasks.complete', 'tasks.reopen', 'chat.create', 'settings.update', 'notes.save', 'notes.capture.adopt',
   'notes.updateTranscript', 'assistant.batch.submitNote', 'assistant.batch.check', 'chat.submit', 'chat.refine',
-  'notes.transcribe',
+  'notes.transcribe', 'accounts.installOAuth',
 ] as const);
 
 export type WorkspaceCommandHistoryKind = (typeof WORKSPACE_COMMAND_HISTORY_KINDS)[number];
@@ -31,6 +31,7 @@ const JOURNAL_TO_PUBLIC: Readonly<Record<string, WorkspaceCommandHistoryKind>> =
   'assistant.batch.submitnote': 'assistant.batch.submitNote', 'assistant.batch.check': 'assistant.batch.check',
   'chat.submit': 'chat.submit', 'chat.refine': 'chat.refine',
   'notes.transcribe': 'notes.transcribe',
+  'accounts.installoauth': 'accounts.installOAuth',
 });
 
 function readPlainDataRecord(value: unknown, allowed: readonly string[], required: readonly string[]): Record<string, unknown> {

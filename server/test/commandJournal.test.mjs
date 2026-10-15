@@ -197,8 +197,56 @@ test('journal schema v1 migrates in place and preserves prior rows', () => {
     });
     new CommandJournal(f.kernel);
     const version = f.kernel.withTrustedDatabaseTransaction((db) => db.prepare('SELECT version FROM command_journal_schema WHERE singleton=1').get());
-    assert.equal(version.version, 2);
+    assert.equal(version.version, 3);
     assert.equal(f.journal.historyPage(f.admissionSessionA).entries[0].commandId, id);
+  } finally { close(f); }
+});
+
+test('journal schema v2 to v3 migration rolls back its new binding column when marker publication fails', () => {
+  const f = setup();
+  try {
+    const id = randomUUID();
+    admission(f, { key: id, body: '{"preserve":"this row"}' });
+    f.kernel.withTrustedDatabaseTransaction((db) => {
+      db.exec(`DROP INDEX async_command_journal_history_idx;
+        DROP INDEX async_command_journal_status_idx;
+        ALTER TABLE async_command_journal RENAME TO async_command_journal_v3;
+        CREATE TABLE async_command_journal (
+          workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+          idempotency_key TEXT NOT NULL, owner_id TEXT NOT NULL, session_digest TEXT NOT NULL,
+          request_digest TEXT NOT NULL, command_kind TEXT NOT NULL, privacy_epoch INTEGER NOT NULL,
+          ticket_id TEXT NOT NULL UNIQUE, ticket_digest TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('claimed','checkpointed','finished','inspect_required')),
+          created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, checkpoint_revision INTEGER,
+          snapshot_digest TEXT, owned_object_ids_json TEXT, receipt_json TEXT,
+          PRIMARY KEY(workspace_id,idempotency_key),
+          CHECK ((status='finished' AND receipt_json IS NOT NULL) OR (status!='finished' AND receipt_json IS NULL))
+        ) STRICT;
+        INSERT INTO async_command_journal(workspace_id,idempotency_key,owner_id,session_digest,request_digest,command_kind,
+          privacy_epoch,ticket_id,ticket_digest,status,created_at,updated_at,checkpoint_revision,snapshot_digest,owned_object_ids_json,receipt_json)
+          SELECT workspace_id,idempotency_key,owner_id,session_digest,request_digest,command_kind,privacy_epoch,ticket_id,ticket_digest,
+            status,created_at,updated_at,checkpoint_revision,snapshot_digest,owned_object_ids_json,receipt_json FROM async_command_journal_v3;
+        DROP TABLE async_command_journal_v3;
+        CREATE INDEX async_command_journal_status_idx ON async_command_journal(workspace_id,status,updated_at);
+        CREATE INDEX async_command_journal_history_idx ON async_command_journal(workspace_id,owner_id,privacy_epoch,created_at DESC,idempotency_key DESC);
+        UPDATE command_journal_schema SET version=2 WHERE singleton=1;
+        CREATE TRIGGER reject_journal_v3_marker BEFORE UPDATE OF version ON command_journal_schema
+          WHEN NEW.version=3 BEGIN SELECT RAISE(ABORT,'synthetic marker failure'); END;`);
+    });
+    const before = f.kernel.withTrustedDatabaseTransaction((db) => ({
+      version: db.prepare('SELECT version FROM command_journal_schema WHERE singleton=1').get().version,
+      columns: db.pragma('table_info(async_command_journal)').map((column) => column.name),
+      row: db.prepare('SELECT * FROM async_command_journal WHERE idempotency_key=?').get(id),
+    }));
+    assert.equal(before.version, 2);
+    assert.equal(before.columns.includes('initiating_session_binding'), false);
+    assert.throws(() => new CommandJournal(f.kernel), /synthetic marker failure/);
+    const after = f.kernel.withTrustedDatabaseTransaction((db) => ({
+      version: db.prepare('SELECT version FROM command_journal_schema WHERE singleton=1').get().version,
+      columns: db.pragma('table_info(async_command_journal)').map((column) => column.name),
+      row: db.prepare('SELECT * FROM async_command_journal WHERE idempotency_key=?').get(id),
+    }));
+    assert.deepEqual(after, before);
   } finally { close(f); }
 });
 

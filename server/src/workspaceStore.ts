@@ -19,6 +19,11 @@ interface ServerCaptureConsumption {
   readonly mimeType: string; readonly durationSeconds: number; readonly capturedAt: string; readonly captureTimeZone: string;
 }
 
+interface OAuthInstallCheckpoint {
+  readonly stageId: string; readonly stagePayloadGeneration: number; readonly accountId: string;
+  readonly accountGeneration: number; readonly tokenRef: string;
+}
+
 interface LoadedWorkspace {
   workspaceId: string;
   ownerId: string;
@@ -70,10 +75,12 @@ export class ServerWorkspaceStore<TState extends object = Record<string, unknown
   }
 
   async save(state: TState, options?: { consumePendingCapture?: Readonly<{ id: string; revision: string; noteId: string }>;
-    consumeServerPendingCapture?: ServerCaptureConsumption }): Promise<void> {
+    consumeServerPendingCapture?: ServerCaptureConsumption; consumeOAuthInstall?: OAuthInstallCheckpoint }): Promise<void> {
     const loaded = this.requireLoaded();
     this.assertNotAckBlocked();
-    if (options?.consumePendingCapture && options.consumeServerPendingCapture) throw new Error('A workspace save cannot consume two capture sources.');
+    const consumeCount = Number(Boolean(options?.consumePendingCapture)) + Number(Boolean(options?.consumeServerPendingCapture)) +
+      Number(Boolean(options?.consumeOAuthInstall));
+    if (consumeCount > 1) throw new Error('A workspace save cannot consume multiple one-use sources.');
     const serialized = canonicalSnapshot(state);
     const accountGenerations = accountGenerationProjection(state);
     const ticket = currentCommandTicket();
@@ -82,14 +89,16 @@ export class ServerWorkspaceStore<TState extends object = Record<string, unknown
       if (ticket) {
         if (!this.options.journal) throw new Error('An asynchronous command cannot checkpoint without its durable command journal.');
         const fence = { workspaceId: loaded.workspaceId, revision: loaded.revision, privacyEpoch: loaded.privacyEpoch };
-        if (options?.consumeServerPendingCapture) {
+        if (options?.consumeOAuthInstall) {
+          committedRevision = this.options.journal.checkpointOAuthInstall(ticket, fence, serialized, accountGenerations, options.consumeOAuthInstall);
+        } else if (options?.consumeServerPendingCapture) {
           committedRevision = this.options.journal.checkpointCapture(ticket, fence, serialized, accountGenerations, options.consumeServerPendingCapture);
         } else {
-          if (options?.consumePendingCapture) throw new Error('Native pending capture cannot be consumed by a server workspace store.');
+          if (options?.consumePendingCapture || options?.consumeOAuthInstall) throw new Error('A one-use install/capture requires its exact active journal command.');
           committedRevision = this.options.journal.checkpoint(ticket, fence, serialized, accountGenerations);
         }
       } else {
-        if (options?.consumePendingCapture || options?.consumeServerPendingCapture) throw new Error('A pending capture requires an active journal command.');
+        if (options?.consumePendingCapture || options?.consumeServerPendingCapture || options?.consumeOAuthInstall) throw new Error('A one-use install/capture requires an active journal command.');
         committedRevision = this.commitSnapshot(loaded, serialized, accountGenerations);
       }
       await this.options.afterCommitForTesting?.();

@@ -10,6 +10,10 @@ import { NodeSpeechCleanupAdapter } from './speechCleanupAdapter.node';
 import type { NodeProviderResponseLifetimeOwner } from './providerResponseLifetime.node';
 import { randomUUID } from 'node:crypto';
 import type { DurableKernel, JsonValue, OwnedWorkspaceIdentity } from '../../server/src/kernel.js';
+import type { AuthService } from '../../server/src/auth.js';
+import type { SecretVault } from '../../server/src/vault.js';
+import type { OAuthInstallStages } from '../../server/src/oauthInstallStages.js';
+import type { ServerOAuthTokenBindings } from '../../server/src/oauthTokenBindings.js';
 import { CommandJournal, currentCommandTicket, type CommandAdmission } from '../../server/src/commandJournal.js';
 import { SpeechCleanupChildren } from '../../server/src/speechCleanupChildren.js';
 import { WorkspaceControllerFactoryInitializationError, WorkspaceRegistry,
@@ -63,6 +67,7 @@ interface OwnedWorkspaceRuntimeCommonOptions {
   readonly afterSpeechCleanupCommitForTesting?: () => void;
   /** Test-only fault injection after an atomic workspace checkpoint has committed. */
   readonly afterWorkspaceCommitForTesting?: () => void | Promise<void>;
+  readonly oauthInstall?: Readonly<{ auth: AuthService; vault: SecretVault; stages: OAuthInstallStages; bindings: ServerOAuthTokenBindings }>;
 }
 
 export type OwnedWorkspaceRuntimeOptions = OwnedWorkspaceRuntimeCommonOptions & (
@@ -134,7 +139,7 @@ export class OwnedWorkspaceRuntime {
 
   constructor(private readonly options: OwnedWorkspaceRuntimeOptions) {
     validateRuntimeConfiguration(options);
-    this.journal = new CommandJournal(options.kernel);
+    this.journal = new CommandJournal(options.kernel, options.oauthInstall ? { oauthInstall: options.oauthInstall } : {});
     this.registry = new WorkspaceRegistry<AppControllerImpl, AppState>(options.kernel, this.journal,
       options.runtimeSessionFor, async (context) => {
         const children = new SpeechCleanupChildren({ kernel: options.kernel, journal: this.journal,
@@ -150,7 +155,7 @@ export class OwnedWorkspaceRuntime {
           validateRuntimePorts(options);
           const adapter = options.responseLifetimeOwner ? makeAdapter(options.responseLifetimeOwner) : undefined;
           const controller = new AppControllerImpl({ store: context.store, crypto: options.crypto,
-            providers: options.providers, integration: options.integration, ...(adapter ? { speechCleanup: adapter.controllerPort } : {}),
+            providers: options.providers, integration: this.withOAuthInstallLifecycle(options.integration), ...(adapter ? { speechCleanup: adapter.controllerPort } : {}),
             ...(options.pendingCapture ? { pendingCapture: options.pendingCapture } : {}) });
           if (options.mediaResolver) this.mediaResolvers.set(controller, options.mediaResolver);
           if (options.audioHttpApi) this.audioApis.set(controller, options.audioHttpApi);
@@ -201,7 +206,7 @@ export class OwnedWorkspaceRuntime {
           validateResponseLifetimeOwner(returned.responseLifetimeOwner);
           const adapter = makeAdapter(returned.responseLifetimeOwner);
           controller = new AppControllerImpl({ store: context.store, crypto: options.crypto,
-            providers: returned.providers, integration: returned.integration, speechCleanup: adapter.controllerPort, pendingCapture: returned.pendingCapture });
+            providers: returned.providers, integration: this.withOAuthInstallLifecycle(returned.integration), speechCleanup: adapter.controllerPort, pendingCapture: returned.pendingCapture });
           returned.attachController?.(controller);
           if (returned.mediaResolver) this.mediaResolvers.set(controller, returned.mediaResolver);
           if (returned.audioHttpApi) this.audioApis.set(controller, returned.audioHttpApi);
@@ -215,6 +220,17 @@ export class OwnedWorkspaceRuntime {
           throw error;
         }
       }, (controller, teardown) => this.teardownWorkspaceController(controller, teardown), options.afterWorkspaceCommitForTesting);
+  }
+
+  private withOAuthInstallLifecycle(integration: ControllerRuntimePorts['integration']): ControllerRuntimePorts['integration'] {
+    const { oauthInstallLifecycle: _untrustedLifecycle, ...trustedIntegration } = integration;
+    if (!this.options.oauthInstall) return trustedIntegration;
+    return {
+      ...trustedIntegration,
+      oauthInstallLifecycle: Object.freeze({
+        prepare: async (stageId: string) => this.journal.prepareOAuthInstallFacts(currentCommandTicket(), stageId),
+      }),
+    };
   }
 
   /** Authenticated audio routes resolve the exact loaded per-workspace owner entry. */

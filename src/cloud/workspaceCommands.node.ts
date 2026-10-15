@@ -51,6 +51,11 @@ export async function dispatchWorkspaceCommand(runtime: OwnedWorkspaceRuntime, a
         objectId: (await controller.savePendingCapture({ id: command.captureId, revision: command.captureRevision })).id,
         captureId: command.captureId, captureRevision: command.captureRevision,
       });
+      case 'accounts.installOAuth': {
+        const account = await controller.installOAuthStage(command.stageId);
+        return receipt(envelope, command, { objectId: account.id, stageId: command.stageId,
+          accountGeneration: account.connectionGeneration ?? 0 });
+      }
       case 'notes.updateTranscript': return receipt(envelope, command, {
         objectId: (await controller.updateTranscript(command.noteId, command.text, { expectedRevision: command.expectedNoteRevision })).id,
       });
@@ -78,7 +83,8 @@ export async function dispatchWorkspaceCommand(runtime: OwnedWorkspaceRuntime, a
   }, (value): JsonValue => ({ schemaVersion: value.schemaVersion, commandId: value.commandId, kind: value.kind,
     objectId: value.objectId, ...('jobId' in value ? { jobId: value.jobId } : {}), ...('turnId' in value ? { turnId: value.turnId } : {}),
     ...('parentTurnId' in value ? { parentTurnId: value.parentTurnId } : {}),
-    ...('captureId' in value ? { captureId: value.captureId } : {}), ...('captureRevision' in value ? { captureRevision: value.captureRevision } : {}) }));
+    ...('captureId' in value ? { captureId: value.captureId } : {}), ...('captureRevision' in value ? { captureRevision: value.captureRevision } : {}),
+    ...('stageId' in value ? { stageId: value.stageId } : {}), ...('accountGeneration' in value ? { accountGeneration: value.accountGeneration } : {}) }));
 
   const expectation = expectedReceipt(envelope.commandId, command);
   if (result.admission.fresh) {
@@ -114,6 +120,7 @@ export function inspectWorkspaceCommand(runtime: OwnedWorkspaceRuntime, admissio
 function receipt(envelope: WorkspaceCommandEnvelope, command: WorkspaceCommand, fields: {
   readonly objectId: string; readonly jobId?: string; readonly turnId?: string; readonly parentTurnId?: string;
   readonly captureId?: string; readonly captureRevision?: string;
+  readonly stageId?: string; readonly accountGeneration?: number;
 }) {
   return parseWorkspaceCommandReceipt({ schemaVersion: 1, commandId: envelope.commandId, kind: command.kind, ...fields },
     expectedReceipt(envelope.commandId, command));
@@ -126,6 +133,7 @@ function expectedReceipt(commandId: string, command: WorkspaceCommand) {
     case 'chat.create': case 'notes.save': return { commandId, kind: command.kind };
     case 'notes.capture.adopt': return { commandId, kind: command.kind, objectId: command.captureId,
       captureId: command.captureId, captureRevision: command.captureRevision };
+    case 'accounts.installOAuth': return { commandId, kind: command.kind, stageId: command.stageId };
     case 'notes.updateTranscript': return { commandId, kind: command.kind, objectId: command.noteId };
     case 'notes.transcribe': return { commandId, kind: command.kind, objectId: command.noteId, sourceRevision: command.expectedNoteRevision };
     case 'assistant.batch.submitNote': return { commandId, kind: command.kind, objectId: command.noteId };

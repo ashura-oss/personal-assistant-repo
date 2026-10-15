@@ -481,6 +481,8 @@ function expectedReceiptFor(envelope: WorkspaceCommandEnvelope) {
     case 'notes.capture.adopt':
       return { commandId: envelope.commandId, kind: command.kind, objectId: command.captureId,
         captureId: command.captureId, captureRevision: command.captureRevision };
+    case 'accounts.installOAuth':
+      return { commandId: envelope.commandId, kind: command.kind, stageId: command.stageId };
     case 'notes.updateTranscript':
       return { commandId: envelope.commandId, kind: command.kind, objectId: command.noteId };
     case 'notes.transcribe':
