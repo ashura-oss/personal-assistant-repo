@@ -4,7 +4,7 @@ import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import type { WorkspaceSnapshotDTO } from '../cloud/workspaceDto';
 import type { KnowledgeSourceChoicesDTO, KnowledgeSuggestionReviewDTO } from '../cloud/knowledgeHttpContracts';
 import type { WorkspaceCommand, WorkspaceCommandResponse } from '../cloud/workspaceCommands';
-import type { PeriodSummaryResultReview } from '../core';
+import type { PeriodSummaryApplicationPreview, PeriodSummaryResultReview } from '../core';
 import type { DispatchReviewReadDto, MailReplyBatchReviewReadDto, MailReplySourceReadDto, MailReplyTextReadDto, ProposalReviewReadDto } from './mailWorkflowDtos';
 import type { ReplyBatchPlanRead } from './cloudMailClient';
 import { decodeWorkspaceSnapshotDTO } from '../cloud/workspaceSnapshotCodec';
@@ -564,6 +564,9 @@ export class CloudWorkspaceSessionStore {
     return this.readSavedMail(expectedRevision, (client) => client.readPeriodSummaryResult(jobId, expectedRevision));
   }
 
+  readPeriodSummaryApplicationPreview(planId: string, jobId: string, expectedRevision: number): Promise<PeriodSummaryApplicationPreview> {
+    return this.readSavedMail(expectedRevision, (client) => client.readPeriodSummaryApplicationPreview(planId, jobId, expectedRevision));
+  }
 
   async refresh(): Promise<WorkspaceSnapshotDTO | undefined> {
     const owner = this.ownerGeneration;

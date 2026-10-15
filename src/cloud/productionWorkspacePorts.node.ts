@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, open, lstat, rename, unlink } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
-import type { Account, Note } from '../core';
+import type { Account, AppState, Note } from '../core';
 import type { AudioStorageHttpApi, AudioHttpMediaResponse, AudioUploadReceiptDTO } from '../../server/src/audioHttp.js';
 import type { WorkspaceHttpAdmission } from '../../server/src/workspaceHttp.js';
 import type { SecretVault } from '../../server/src/vault.js';
@@ -19,6 +19,8 @@ import { ensurePrivateDirectory } from '../../server/src/config.js';
 import { createNodeProviderResponseLifetimeOwner } from './providerResponseLifetime.node';
 import { createNodeSpeechAudioService } from '../audio/speechUpload.node';
 import { createNodePendingCaptureController } from './pendingCaptureService.node';
+import { DocumentLineage } from '../../server/src/documentLineage.js';
+import { PeriodSummaryApplicationRuntime } from '../../server/src/periodSummaryApplication.js';
 import { SharedAzureSpeechClient } from '../services/azureSpeech.shared';
 import { OpenRouterBatchClient, OpenRouterBatchRequestBuilder } from '../services/openRouter';
 import { OpenRouterSpeechClient } from '../services/openRouterSpeech';
@@ -26,6 +28,7 @@ import { SharedOpenRouterSpeechAdapter } from '../services/openRouterSpeechAdapt
 import { ConnectorClient, type OAuthBridgeResult, type OAuthTokenStore, type StoredOAuthToken } from '../connectors';
 import type { AssistantModelClient } from '../services/assistantClient';
 import type { AppControllerImpl, ControllerRuntimePorts, ControllerSpeechPort } from '../services/controller.shared';
+import type { PeriodSummaryApplicationPort } from '../services/controllerRuntimeContracts';
 import type { PreparedAnalysis } from '../services/azure';
 import type { OwnedWorkspaceFactoryContext, OwnedWorkspaceFactoryPorts } from './ownedWorkspaceRuntime.node';
 import type { RecordingRecoveryService } from '../audio/recovery.types';
@@ -247,9 +250,12 @@ export function createProductionWorkspacePortsFor(config: Pick<ServerConfig,
       ...(options.ffmpegPath ? { ffmpegPath: options.ffmpegPath } : {}), ...(options.ffprobePath ? { ffprobePath: options.ffprobePath } : {}),
       resolveAttachedMedia: resolveCurrentAttachedMedia,
     });
-    context.store.installSnapshotCommitParticipant(composeSnapshotCommitParticipants([
-      { name: 'audio', participant: audioRepo.createSnapshotCommitParticipant() },
-      { name: 'batch_observation', participant: createBatchObservationSnapshotParticipant(new BatchObservationIndex(), Date.now) },
+    const documentLineage = new DocumentLineage(kernel, actorToken);
+    const summaryApplication = new PeriodSummaryApplicationRuntime(kernel, actorToken, documentLineage, context.journal);
+    context.store.installSnapshotCommitParticipant(composeSnapshotCommitParticipants<AppState>([
+      { name: 'period_summary_application', participant: summaryApplication.createSnapshotCommitParticipant<AppState>() },
+      { name: 'audio', participant: audioRepo.createSnapshotCommitParticipant<AppState>() },
+      { name: 'batch_observation', participant: createBatchObservationSnapshotParticipant<AppState>(new BatchObservationIndex(), Date.now) },
       { name: 'proactive_candidates', participant: createBackgroundProactiveCandidateSnapshotParticipant(new BackgroundProactiveCandidateIndex(kernel), Date.now) },
       { name: 'background_paid_mail_reply', participant: createBackgroundPaidMailReplySnapshotParticipant(kernel, context.journal) },
     ]));
@@ -315,6 +321,16 @@ export function createProductionWorkspacePortsFor(config: Pick<ServerConfig,
         ...(config.microsoftClientId ? { microsoft: config.microsoftClientId } : {}),
       } } : {}),
       connectorFactory, verifyOAuthResult, openRouterBatchClient,
+      periodSummaryApplication: Object.freeze({
+        findReceiptByJob: (jobId) => summaryApplication.readReceiptByJob(jobId),
+        findReceipt: (input) => summaryApplication.readReceipt(input.jobId, input.requestSha256, input.resultSha256),
+        prepare: (input) => summaryApplication.prepare(input),
+        readPreview: (input) => summaryApplication.readPreview(input),
+        cancel: (planId) => summaryApplication.cancel(planId),
+        invalidateJobs: (jobIds) => summaryApplication.invalidateJobs(jobIds),
+        invalidateAll: () => summaryApplication.invalidateAll(),
+        apply: (input) => summaryApplication.apply(input),
+      } satisfies PeriodSummaryApplicationPort),
       speechAudioService: speechAudio, openRouterSpeechAdapter: openRouterSpeech,
       writeDocument: async (path, content) => {
         assertActor();

@@ -387,7 +387,8 @@ function strictSummarySchema(sourceIds: readonly string[]) {
 }
 
 function requestUserPayload(binding: OpenRouterPeriodSummaryBinding, regenerationInstructions?: string): string {
-  return JSON.stringify({ period: binding.period, timeZone: binding.timeZone, localInterval: binding.localInterval,
+  return JSON.stringify({ period: binding.period, timeZone: binding.timeZone,
+    localInterval: { start: binding.localInterval.start, end: binding.localInterval.end },
     intervalUtc: { start: binding.startUtc, endExclusive: binding.endUtc }, preparedAt: binding.preparedAt,
     instructions: binding.instructions, ...(regenerationInstructions !== undefined ? { regenerationInstructions } : {}),
     sources: binding.sources.map(({ id, role, kind, revision, version, contentSha256, effectiveAt, observedAt, content }) => ({

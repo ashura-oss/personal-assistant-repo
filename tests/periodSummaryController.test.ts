@@ -2,14 +2,29 @@ import { createHash, randomUUID } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { AppControllerImpl } from '../src/services/controller';
 import { OPENROUTER_BATCH_BODY_MODEL, OPENROUTER_CHAT_COMPLETIONS_PATH, OpenRouterBatchDispatchError, type OpenRouterBatchInspection } from '../src/services/openRouter';
-import { buildOpenRouterPeriodSummaryRequest, createOpenRouterPeriodSummaryBinding, type OpenRouterPeriodSummarySource } from '../src/services/openRouterPeriodSummary';
+import { buildOpenRouterPeriodSummaryRecoveryRequest, buildOpenRouterPeriodSummaryRequest, createOpenRouterPeriodSummaryBinding,
+  isOpenRouterPeriodSummaryRequestBodyShape, type OpenRouterPeriodSummarySource } from '../src/services/openRouterPeriodSummary';
 import type { AppState } from '../src/core';
 import type { StateStore } from '../src/storage/contracts';
 import { tombstoneOpenRouterBatchJob, validateOpenRouterBatchLedger } from '../src/services/openRouterBatchJobs';
 
 const digest = async (value: string): Promise<string> => createHash('sha256').update(value, 'utf8').digest('hex');
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((yes) => { resolve = yes; });
+  return { promise, resolve };
+}
 const SOURCE_NOTE_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const sourceNoteRef = `note:${encodeURIComponent(SOURCE_NOTE_ID)}`;
+
+function persistedCanonicalValue(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(persistedCanonicalValue).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.entries(value as Record<string, unknown>).sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, child]) => `${JSON.stringify(key)}:${persistedCanonicalValue(child)}`).join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
 
 class MemoryStore implements StateStore {
   value?: AppState;
@@ -19,6 +34,26 @@ class MemoryStore implements StateStore {
   async readCurrentSnapshot() { return this.value ? { raw: JSON.stringify(this.value), schemaVersion: 1 } : undefined; }
   async assertCurrent() {}
 }
+
+describe('persisted period summary request bindings', () => {
+  it('keeps exact base and recovery wire bodies valid after kernel-style sorted-key serialization', async () => {
+    const binding = await makeBinding();
+    const base = await buildOpenRouterPeriodSummaryRequest(binding, digest);
+    const baseId = randomUUID();
+    expect(isOpenRouterPeriodSummaryRequestBodyShape(base.body, JSON.parse(persistedCanonicalValue(base.binding)), undefined, baseId,
+      await digest(base.body))).toBe(true);
+
+    const partial = '{"markdown":"incomplete';
+    const parent = { id: baseId, customId: baseId, status: 'result_truncated' as const, failureCode: 'result_truncated' as const,
+      requestProfileVersion: 6 as const, operation: 'period_summary' as const, effort: base.binding.effort, requestBody: base.body,
+      requestSha256: await digest(base.body), resultText: partial, resultSha256: await digest(partial), binding: base.binding };
+    const childId = randomUUID();
+    const recovery = await buildOpenRouterPeriodSummaryRecoveryRequest({ parent, destination: base.binding.destination,
+      childId, childCustomId: childId, effort: 'medium', regenerationInstructions: 'Rebuild the full summary.' }, digest);
+    expect(isOpenRouterPeriodSummaryRequestBodyShape(recovery.body, JSON.parse(persistedCanonicalValue(recovery.binding)),
+      JSON.parse(persistedCanonicalValue(recovery.recoveryBinding)), childId, recovery.recoveryBinding.requestSha256)).toBe(true);
+  });
+});
 
 async function makeBinding(sourceOverride?: OpenRouterPeriodSummarySource) {
   const content = sourceOverride?.content ?? 'A completed event in the selected period.';
@@ -91,6 +126,76 @@ function inspection(content: string, validation: 'valid' | 'truncated' = 'valid'
 }
 
 describe('period summary controller lifecycle', () => {
+  it('rejects a deferred application callback after bootstrap or privacy epoch changes before any document write', async () => {
+    const raw = JSON.stringify({ markdown: '# Daily summary\nOne completed item.', sourceReferences: [sourceNoteRef] });
+    for (const changedScope of ['bootstrap', 'epoch'] as const) {
+      const f = await fixture(inspection(raw));
+      try {
+        await f.app.refreshAssistantBatchForObservation(f.dto!.id);
+        if (changedScope === 'epoch') f.integration.privacySession = { epoch: 0, assertCurrent: async () => undefined };
+        const started = deferred<void>();
+        const continueApply = deferred<void>();
+        const path = f.binding.destination.path;
+        f.integration.periodSummaryApplication = {
+          findReceiptByJob: async () => undefined,
+          apply: async (input: { writeDocument(write: { path: string; content: string }): Promise<number> }) => {
+            started.resolve();
+            await continueApply.promise;
+            return input.writeDocument({ path, content: '# Daily summary\nOne completed item.' });
+          },
+        };
+        const controller = f.app as unknown as { state: AppState; bootstrapGeneration: number; applyPeriodSummary(input: { planId: string; jobId: string }): Promise<unknown> };
+        const beforeDocuments = structuredClone(controller.state.documents);
+        const applying = controller.applyPeriodSummary({ planId: randomUUID(), jobId: f.dto!.id });
+        await started.promise;
+        if (changedScope === 'bootstrap') controller.bootstrapGeneration += 1;
+        else (f.integration.privacySession as { epoch: number }).epoch += 1;
+        continueApply.resolve();
+        await expect(applying).rejects.toThrow(/saved summary changed/i);
+        expect(controller.state.documents).toEqual(beforeDocuments);
+        expect(f.store.value?.documents).toEqual(beforeDocuments);
+      } finally { /* Each controller uses only its isolated in-memory fixture. */ }
+    }
+  });
+
+  it('mirrors only after canonical application and never mirrors an older receipt over a later edit', async () => {
+    const raw = JSON.stringify({ markdown: '# Daily summary\nOne completed item.', sourceReferences: [sourceNoteRef] });
+    const f = await fixture(inspection(raw));
+    await f.app.refreshAssistantBatchForObservation(f.dto!.id);
+    const path = f.binding.destination.path;
+    let savedReceipt: { kind: 'applied'; jobId: string; path: string; documentRevision: number; appliedAt: string } | undefined;
+    let mirrorWrites = 0;
+    f.integration.writeDocument = async (documentPath: string, content: string) => {
+      mirrorWrites += 1;
+      const current = (f.app as unknown as { state: AppState }).state.documents.find((document) => document.path === documentPath);
+      expect(current?.content).toBe(content);
+      if (mirrorWrites === 1) throw new Error('synthetic mirror failure');
+    };
+    f.integration.periodSummaryApplication = {
+      findReceiptByJob: async () => savedReceipt,
+      apply: async (input: { writeDocument(write: { path: string; content: string }): Promise<number> }) => {
+        const documentRevision = await input.writeDocument({ path, content: '# Daily summary\nOne completed item.' });
+        savedReceipt = { kind: 'applied', jobId: f.dto!.id, path, documentRevision, appliedAt: '2026-10-15T00:00:00.000Z' };
+        return savedReceipt;
+      },
+    };
+    const controller = f.app as unknown as { state: AppState; applyPeriodSummary(input: { planId: string; jobId: string }): Promise<unknown>;
+      saveDocument(path: string, content: string, options: { expectedRevision: number }): Promise<unknown> };
+    const first = await controller.applyPeriodSummary({ planId: randomUUID(), jobId: f.dto!.id });
+    expect(first).toMatchObject({ kind: 'applied', path, documentRevision: 1 });
+    expect(mirrorWrites).toBe(1);
+    expect((f.app as any).mirrorDirty.has(path)).toBe(true);
+
+    await controller.applyPeriodSummary({ planId: randomUUID(), jobId: f.dto!.id });
+    expect(mirrorWrites).toBe(2);
+    expect(controller.state.documents.find((document) => document.path === path)?.revision).toBe(1);
+    await controller.saveDocument(path, 'Later human edit', { expectedRevision: 1 });
+    expect(mirrorWrites).toBe(3);
+    await controller.applyPeriodSummary({ planId: randomUUID(), jobId: f.dto!.id });
+    expect(mirrorWrites).toBe(3);
+    expect(controller.state.documents.find((document) => document.path === path)?.content).toBe('Later human edit');
+  });
+
   it('submits only the frozen profile-6 wire, then retains strict Markdown without note or proposal mutation', async () => {
     const raw = JSON.stringify({ markdown: '# Daily summary\nOne completed item.', sourceReferences: [sourceNoteRef] });
     let assertionSawSubmitting = false;

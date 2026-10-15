@@ -51,6 +51,8 @@ async function fixture() {
     async readDispatchReview(_admission, input) { received = ['dispatch', input]; return response; },
     async readMailReplyBatchReview(_admission, input) { received = ['batch', input]; return response; },
     async readPeriodSummaryResult(_admission, input) { received = ['period-summary', input]; return { ...response, review: { jobId: input.jobId, markdown: '# Inert' } }; },
+    async readPeriodSummaryApplicationPreview(_admission, input) { received = ['period-summary-application', input];
+      return { ...response, preview: { planId: input.planId, jobId: input.jobId, markdown: '# Inert' } }; },
   };
   const server = createStillHttpServer({ auth, canonicalOrigin, allowLocalHttp: true, staticRoot, workspaceApi });
   await new Promise((resolve, reject) => server.listen(port, '127.0.0.1', (error) => error ? reject(error) : resolve()));
@@ -89,10 +91,17 @@ test('workflow reads accept decoded singleton opaque IDs and enforce closed quer
     const summary = await f.request(`/api/workspace/assistant/period-summary/result?jobId=${encodeURIComponent('30000000-0000-4000-8000-000000000001')}&expectedRevision=7&expectedPrivacyEpoch=3`);
     assert.equal(summary.status, 200);
     assert.deepEqual(f.received(), ['period-summary', { jobId: '30000000-0000-4000-8000-000000000001', expectedRevision: 7, expectedPrivacyEpoch: 3 }]);
+    const planId = '40000000-0000-4000-8000-000000000001';
+    const jobId = '30000000-0000-4000-8000-000000000001';
+    const preview = await f.request(`/api/workspace/assistant/period-summary/application/preview?planId=${planId}&jobId=${jobId}&expectedRevision=7&expectedPrivacyEpoch=3`);
+    assert.equal(preview.status, 200);
+    assert.equal(preview.headers.get('cache-control'), 'no-store');
+    assert.deepEqual(f.received(), ['period-summary-application', { planId, jobId, expectedRevision: 7, expectedPrivacyEpoch: 3 }]);
     for (const invalid of [
       `/api/workspace/mail/source${query('messageId', opaque, '&messageId=again')}`,
       `/api/workspace/mail/source${query('messageId', opaque, '&other=x')}`,
       '/api/workspace/assistant/period-summary/result?jobId=30000000-0000-4000-8000-000000000001&expectedRevision=7&expectedPrivacyEpoch=3&extra=x',
+      '/api/workspace/assistant/period-summary/application/preview?planId=40000000-0000-4000-8000-000000000001&jobId=30000000-0000-4000-8000-000000000001&expectedRevision=7&expectedPrivacyEpoch=3&extra=x',
       '/api/workspace/mail/source?messageId=%ZZ&expectedRevision=7&expectedPrivacyEpoch=3',
       '/api/workspace/mail/source?messageId=x&expectedRevision=-1&expectedPrivacyEpoch=3',
       '/api/workspace/mail/source?messageId=x&expectedRevision=7&expectedPrivacyEpoch=3&',

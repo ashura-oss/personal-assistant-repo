@@ -512,6 +512,9 @@ export class WorkspaceEraseService {
     scoped('private_audio_uploads', { workspace: 'workspace_id', owner: 'owner_id', epoch: 'privacy_epoch' });
     scoped('document_lineage_heads', { workspace: 'workspace_id', owner: 'owner_id', epoch: 'privacy_epoch' });
     scoped('document_lineage_scopes', { workspace: 'workspace_id', owner: 'owner_id', epoch: 'privacy_epoch' });
+    // Receipt deletion is permitted only while the exact workspace erase proof is active;
+    // the table trigger also rejects deletion without this grant.
+    scoped('period_summary_application_receipts', { workspace: 'workspace_id', owner: 'owner_id', epoch: 'privacy_epoch' });
     scoped('batch_observation_workspaces', { workspace: 'workspace_id', owner: 'owner_id', epoch: 'privacy_epoch' });
     scoped('account_generations', { workspace: 'workspace_id' });
   }

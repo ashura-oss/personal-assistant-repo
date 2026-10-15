@@ -1,5 +1,6 @@
 import type { ReplyGenerationUsage } from './azure';
 import type { OpenRouterPeriodSummarySubmission } from './openRouterPeriodSummary';
+import type { PeriodSummaryApplicationPlan, PeriodSummaryApplicationPreview, PeriodSummaryApplicationReceipt } from '../core';
 export type { DraftAnalysis, PreparedAnalysis, ReplyGenerationInput, ReplyGenerationUsage } from './azure';
 
 /** Private server gateway handoff. Never construct this shape from a browser command. */
@@ -8,6 +9,25 @@ export interface TrustedPeriodSummaryDispatch {
   /** Rechecks the owned policy/occurrence and completed UTC period immediately before POST. */
   readonly assertCurrentAuthorityBeforePost: () => void;
 }
+
+/** Private Node adapter for one-use, lineage-fenced summary document application. */
+export interface PeriodSummaryApplicationPort {
+  findReceiptByJob(jobId: string): Promise<PeriodSummaryApplicationReceipt | undefined>;
+  findReceipt(input: Readonly<{ jobId: string; requestSha256: string; resultSha256?: string }>): Promise<PeriodSummaryApplicationReceipt | undefined>;
+  prepare(input: PeriodSummaryApplicationCapture): Promise<PeriodSummaryApplicationPlan | PeriodSummaryApplicationReceipt>;
+  readPreview(input: Readonly<{ planId: string; jobId: string }>): PeriodSummaryApplicationPreview | undefined;
+  cancel(planId: string): void;
+  invalidateJobs(jobIds: readonly string[]): void;
+  invalidateAll(): void;
+  apply(input: Readonly<{ planId: string; jobId: string; requestSha256: string; resultSha256: string;
+    writeDocument(write: PeriodSummaryApplicationWrite): Promise<number> }>): Promise<PeriodSummaryApplicationReceipt>;
+}
+
+export type PeriodSummaryApplicationCapture = Readonly<{
+  jobId: string; requestSha256: string; resultSha256: string; period: 'daily' | 'weekly' | 'monthly' | 'yearly'; timeZone: string;
+  interval: Readonly<{ start: string; end: string }>; preparedAt: string; resultText: string; markdown: string; sourceReferences: readonly string[];
+}>;
+export type PeriodSummaryApplicationWrite = Readonly<{ path: string; content: string; expectedRevision?: number }>;
 
 export class ReplyGenerationError extends Error {
   constructor(message: string, readonly usage?: ReplyGenerationUsage) { super(message); this.name = 'ReplyGenerationError'; }

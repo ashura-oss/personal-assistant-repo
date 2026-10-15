@@ -844,6 +844,39 @@ export interface PeriodSummaryResultReview {
   readonly sourceReferences: readonly string[];
 }
 
+export interface PeriodSummaryApplicationPlan {
+  readonly planId: string;
+  readonly jobId: string;
+  readonly kind: 'period_summary_application';
+  readonly period: 'daily' | 'weekly' | 'monthly' | 'yearly';
+  readonly timeZone: string;
+  readonly interval: Readonly<{ start: string; end: string }>;
+  readonly preparedAt: string;
+  readonly destinationPath: string;
+  readonly destinationExists: boolean;
+  readonly destinationRevision?: number;
+  readonly expiresAt: string;
+}
+
+export interface PeriodSummaryApplicationPreview {
+  readonly planId: string;
+  readonly jobId: string;
+  readonly period: 'daily' | 'weekly' | 'monthly' | 'yearly';
+  readonly timeZone: string;
+  readonly interval: Readonly<{ start: string; end: string }>;
+  readonly preparedAt: string;
+  readonly markdown: string;
+  readonly sourceReferences: readonly string[];
+}
+
+export interface PeriodSummaryApplicationReceipt {
+  readonly kind: 'applied';
+  readonly jobId: string;
+  readonly path: string;
+  readonly documentRevision: number;
+  readonly appliedAt: string;
+}
+
 export interface AppState {
   notes: Note[];
   proposals: Proposal[];
@@ -1091,6 +1124,10 @@ export interface AppController {
   cancelPeriodSummaryMoreCompute(planId: string): void;
   submitPeriodSummaryMoreCompute(input: { planId: string; jobId: string }): Promise<import('../services/openRouterBatchJobs').AssistantBatchJobDTO>;
   readPeriodSummaryResult(jobId: string): Promise<PeriodSummaryResultReview | undefined>;
+  preparePeriodSummaryApplication(input: { jobId: string }): Promise<PeriodSummaryApplicationPlan | PeriodSummaryApplicationReceipt>;
+  readPeriodSummaryApplicationPreview(input: { planId: string; jobId: string }): Promise<PeriodSummaryApplicationPreview | undefined>;
+  cancelPeriodSummaryApplication(planId: string): void;
+  applyPeriodSummary(input: { planId: string; jobId: string }): Promise<PeriodSummaryApplicationReceipt>;
   submitMailReplyBatch(input: Omit<MailReplyTextGenerationInput, 'forceRefresh'>): Promise<import('../services/openRouterBatchJobs').AssistantBatchJobDTO>;
   submitMailReplyBatchForCommand(input: Omit<MailReplyTextGenerationInput, 'forceRefresh'> & { accountId: string; expectedConnectionGeneration: number }): Promise<import('../services/openRouterBatchJobs').AssistantBatchJobDTO>;
   reviewMailReplyBatch(jobId: string, options?: { operation?: 'draft' | 'send' }): Promise<MailReplyBatchReviewPlan>;

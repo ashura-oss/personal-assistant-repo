@@ -8,7 +8,7 @@ import type {
   MailReplyConversationContextDiscovery, MailReplyContextSelection, MailReplyBatchContextReviewItem, MailReplyBatchSourcesRefreshResult,
   ProactiveCandidateEntry, ProactiveCandidateSourceResult,
   ProactiveState, SavedProactiveRule, RecordingAttachmentPreview,
-  DeviceCalendarAccessState, StartupRecoveryStatus,
+  DeviceCalendarAccessState, StartupRecoveryStatus, PeriodSummaryApplicationPlan, PeriodSummaryApplicationReceipt,
   SavePersonInput, SaveProjectInput, KnowledgeItemCommand, SaveKnowledgeFactInput, SaveKnowledgeContactInput,
   SaveKnowledgeSourceLinkInput, SaveKnowledgeMemberInput, ReviewKnowledgeSuggestionInput, EditKnowledgeSuggestionInput, KnowledgeSelection,
 } from '../core';
@@ -17,7 +17,7 @@ import type { StateStore } from '../storage/contracts';
 import { STATE_SNAPSHOT_READ_MAX_BYTES } from '../storage/contracts';
 import type { OAuthInstallLifecycle, OAuthInstallCheckpoint, PreparedOAuthInstallFacts } from './oauthInstallContracts';
 import { recoveryUtf8Bytes, STARTUP_RECOVERY_SESSION_MS, validateRecoveryId, validateRecoveryIso, validateRecoveryReceipt, validateReplacementSnapshot, type StartupRecoveryInspection, type StartupRecoveryPlan, type StartupRecoveryReceipt, type StartupRecoveryCommitInput } from '../storage/startupRecovery';
-import { ReplyGenerationError, ReplyGenerationPreDispatchError, validateAzureEndpoint, type DraftAnalysis, type PreparedAnalysis, type ReplyGenerationInput, type ReplyGenerationUsage, type TrustedPeriodSummaryDispatch } from './controllerRuntimeContracts';
+import { ReplyGenerationError, ReplyGenerationPreDispatchError, validateAzureEndpoint, type DraftAnalysis, type PreparedAnalysis, type ReplyGenerationInput, type ReplyGenerationUsage, type TrustedPeriodSummaryDispatch, type PeriodSummaryApplicationPort } from './controllerRuntimeContracts';
 import type { AzureSpeechClient } from './azure';
 import { AssistantClientRouter, type AssistantModelClient } from './assistantClient';
 import {
@@ -1468,6 +1468,7 @@ export interface ControllerIntegrationDependencies {
   withMailAlertNotificationWriter?: <T>(actual: (scope: PrivacyWriterScope, store: ExistingWorkspaceWriterStore) => Promise<T>) => Promise<T>;
   openRouterBatchClient?: OpenRouterBatchClient;
   openRouterSpeechAdapter?: OpenRouterSpeechAdapterPort;
+  periodSummaryApplication?: PeriodSummaryApplicationPort;
 }
 
 interface BackupImportSession {
@@ -1804,6 +1805,7 @@ export class AppControllerImpl implements AppController {
 
   async disposeForPrivacy(): Promise<void> {
     this.bootstrapGeneration += 1;
+    this.integration.periodSummaryApplication?.invalidateAll();
     this.speechClient.disposeMemory();
     this.openRouterSpeechAdapter?.disposeMemory();
     this.speechRequestCleanupRetries.clear();
@@ -7983,6 +7985,126 @@ export class AppControllerImpl implements AppController {
       sourceReferences: Object.freeze(result.sourceReferences.map((id) => refs.get(id) ?? 'Saved source')) });
   }
 
+  async preparePeriodSummaryApplication(input: { jobId: string }): Promise<PeriodSummaryApplicationPlan | PeriodSummaryApplicationReceipt> {
+    if (!hasExactPlainDataKeys(input, ['jobId']) || typeof input.jobId !== 'string' || !input.jobId) {
+      throw new Error('period_summary_application_input_invalid');
+    }
+    const jobId = input.jobId;
+    const beforeState = this.state;
+    const generation = this.bootstrapGeneration;
+    const epoch = this.integration.privacySession?.epoch;
+    const applicationPort = this.integration.periodSummaryApplication;
+    if (!applicationPort) throw new Error('period_summary_application_unavailable');
+    const priorReceipt = await applicationPort.findReceiptByJob(jobId);
+    if (this.state !== beforeState || this.bootstrapGeneration !== generation || this.integration.privacySession?.epoch !== epoch || !this.loaded ||
+        this.startupRecoveryPhase !== 'ready') throw new Error('The saved summary changed. Refresh the review.');
+    if (priorReceipt) return priorReceipt;
+    const review = await this.readPeriodSummaryResult(jobId);
+    if (!review) throw new Error('period_summary_result_unavailable');
+    const job = this.assistantBatchLedger.jobs.find((candidate) => candidate.id === jobId);
+    if (!job || job.kind !== 'period_summary' || !job.summaryBinding || !job.requestBody || !job.resultText || !job.requestSha256) {
+      throw new Error('period_summary_result_unavailable');
+    }
+    const resultSha256 = await this.crypto.sha256(job.resultText);
+    if (resultSha256 !== job.resultSha256) throw new Error('The saved summary failed integrity validation.');
+    if (this.state !== beforeState || this.bootstrapGeneration !== generation || this.integration.privacySession?.epoch !== epoch ||
+        !this.loaded || this.startupRecoveryPhase !== 'ready' || this.assistantBatchLedger.jobs.find((candidate) => candidate.id === jobId) !== job) {
+      throw new Error('The saved summary changed. Refresh the review.');
+    }
+    const prepared = await applicationPort.prepare(Object.freeze({ jobId, requestSha256: job.requestSha256,
+      resultSha256, period: review.period, timeZone: review.timeZone, interval: review.interval, preparedAt: review.preparedAt,
+      resultText: job.resultText,
+      markdown: review.markdown, sourceReferences: Object.freeze([...review.sourceReferences]) }));
+    if (this.state !== beforeState || this.bootstrapGeneration !== generation || this.integration.privacySession?.epoch !== epoch || !this.loaded ||
+        this.startupRecoveryPhase !== 'ready') {
+      if (prepared.kind === 'period_summary_application') applicationPort.cancel(prepared.planId);
+      throw new Error('The saved summary changed. Refresh the review.');
+    }
+    return prepared;
+  }
+
+  cancelPeriodSummaryApplication(planId: string): void {
+    if (typeof planId !== 'string' || !planId) return;
+    this.integration.periodSummaryApplication?.cancel(planId);
+  }
+
+  async readPeriodSummaryApplicationPreview(input: { planId: string; jobId: string }): Promise<import('../core').PeriodSummaryApplicationPreview | undefined> {
+    if (!hasExactPlainDataKeys(input, ['planId', 'jobId']) || typeof input.planId !== 'string' || typeof input.jobId !== 'string' ||
+        !input.planId || !input.jobId) throw new Error('period_summary_application_input_invalid');
+    const planId = input.planId;
+    const jobId = input.jobId;
+    const state = this.state;
+    const generation = this.bootstrapGeneration;
+    const epoch = this.integration.privacySession?.epoch;
+    await this.transactionQueue;
+    await this.assertPrivacySessionCurrent();
+    if (this.state !== state || this.bootstrapGeneration !== generation || this.integration.privacySession?.epoch !== epoch || !this.loaded ||
+        this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired) throw new Error('period_summary_application_preview_stale');
+    const review = await this.integration.periodSummaryApplication?.readPreview({ planId, jobId });
+    await this.assertPrivacySessionCurrent();
+    if (this.state !== state || this.bootstrapGeneration !== generation || this.integration.privacySession?.epoch !== epoch || !this.loaded ||
+        this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired) throw new Error('period_summary_application_preview_stale');
+    return review;
+  }
+
+  async applyPeriodSummary(input: { planId: string; jobId: string }): Promise<PeriodSummaryApplicationReceipt> {
+    if (!hasExactPlainDataKeys(input, ['planId', 'jobId']) || typeof input.planId !== 'string' || typeof input.jobId !== 'string' ||
+        !input.planId || !input.jobId) throw new Error('period_summary_application_input_invalid');
+    const planId = input.planId;
+    const jobId = input.jobId;
+    const beforeState = this.state;
+    const generation = this.bootstrapGeneration;
+    const epoch = this.integration.privacySession?.epoch;
+    const applicationPort = this.integration.periodSummaryApplication;
+    if (!applicationPort) throw new Error('period_summary_application_unavailable');
+    const priorReceipt = await applicationPort.findReceiptByJob(jobId);
+    if (this.state !== beforeState || this.bootstrapGeneration !== generation || this.integration.privacySession?.epoch !== epoch || !this.loaded ||
+        this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired) throw new Error('The saved summary changed. Refresh the review.');
+    if (priorReceipt) {
+      await this.mirrorAppliedSummaryReceipt(priorReceipt);
+      return priorReceipt;
+    }
+    const review = await this.readPeriodSummaryResult(jobId);
+    if (!review) throw new Error('period_summary_result_unavailable');
+    const job = this.assistantBatchLedger.jobs.find((candidate) => candidate.id === jobId);
+    if (!job || job.kind !== 'period_summary' || !job.requestSha256 || !job.resultText || !job.resultSha256) throw new Error('period_summary_result_unavailable');
+    const resultSha256 = await this.crypto.sha256(job.resultText);
+    if (resultSha256 !== job.resultSha256) throw new Error('The saved summary failed integrity validation.');
+    if (this.state !== beforeState || this.bootstrapGeneration !== generation || this.integration.privacySession?.epoch !== epoch ||
+        !this.loaded || this.startupRecoveryPhase !== 'ready' || this.assistantBatchLedger.jobs.find((candidate) => candidate.id === jobId) !== job) {
+      throw new Error('The saved summary changed. Refresh the review.');
+    }
+    const receipt = await applicationPort.apply({ planId, jobId, requestSha256: job.requestSha256,
+      resultSha256, writeDocument: async (write) => this.mutate((draft) => {
+        if (this.state !== beforeState || this.bootstrapGeneration !== generation || this.integration.privacySession?.epoch !== epoch ||
+            !this.loaded || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired ||
+            this.assistantBatchLedger.jobs.find((candidate) => candidate.id === jobId) !== job) {
+          throw new Error('The saved summary changed. Refresh the review.');
+        }
+        const index = draft.documents.findIndex((document) => document.path === write.path);
+        if (index < 0) {
+          if (write.expectedRevision !== undefined) throw new Error('period_summary_destination_changed');
+          draft.documents.push({ path: write.path, content: write.content, revision: 1, updatedAt: now() });
+          return 1;
+        }
+        const current = draft.documents[index]!;
+        if (write.expectedRevision !== current.revision) throw new Error('period_summary_destination_changed');
+        const updated = { ...current, content: write.content, revision: current.revision + 1, updatedAt: now() };
+        draft.documents[index] = updated;
+        return updated.revision;
+      }) });
+    if (this.bootstrapGeneration !== generation || this.integration.privacySession?.epoch !== epoch || !this.loaded ||
+        this.startupRecoveryPhase !== 'ready') throw new Error('The saved summary changed. Refresh the review.');
+    await this.mirrorAppliedSummaryReceipt(receipt);
+    return receipt;
+  }
+
+  private async mirrorAppliedSummaryReceipt(receipt: PeriodSummaryApplicationReceipt): Promise<void> {
+    const document = this.state.documents.find((candidate) => candidate.path === receipt.path && candidate.revision === receipt.documentRevision);
+    if (!document) return;
+    await this.mirrorDocument(document);
+  }
+
   private async moreComputePreview(job: OpenRouterBatchJob, state: AppState, prepared?: PreparedOpenRouterAnalysis): Promise<AssistantBatchMoreComputePlan['preview']> {
     if (job.kind === 'mail_reply' && job.mailReplyBinding) {
       const binding = job.mailReplyBinding;
@@ -8624,6 +8746,7 @@ export class AppControllerImpl implements AppController {
           }
         }
         const affectedJobs = this.assistantBatchLedger.jobs.filter((job) => affectedJobIds.has(job.id));
+        this.integration.periodSummaryApplication?.invalidateJobs([...affectedJobIds]);
         for (const [planId, plan] of this.periodSummaryMoreComputePlans) {
           if (affectedJobIds.has(plan.parent.id)) this.periodSummaryMoreComputePlans.delete(planId);
         }

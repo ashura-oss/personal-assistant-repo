@@ -157,8 +157,10 @@ describe('same-origin web workspace command client', () => {
     expect(SERVER_HISTORY_KINDS).toEqual(['tasks.complete', 'tasks.reopen', 'chat.create', 'chat.conversation.delete', 'notes.confirmImportedTimeZone',
       'chat.transcript.prepare', 'chat.transcript.cancel', 'chat.transcript.submit', 'settings.update', 'notes.save', 'notes.capture.adopt',
       'notes.updateTranscript', 'assistant.batch.submitNote', 'assistant.batch.check', 'chat.submit', 'chat.refine', 'notes.transcribe',
-      'assistant.periodSummary.moreCompute.prepare', 'assistant.periodSummary.moreCompute.submit', 'assistant.periodSummary.moreCompute.cancel', 'accounts.installOAuth',
-      'accounts.syncCalendars', 'accounts.refreshMail', 'accounts.continueMailBackfill', 'accounts.disconnect', 'mail.source.loadText', 'mail.reply.create',
+      'assistant.periodSummary.moreCompute.prepare', 'assistant.periodSummary.moreCompute.submit', 'assistant.periodSummary.moreCompute.cancel',
+      'accounts.installOAuth', 'accounts.syncCalendars', 'accounts.refreshMail', 'accounts.continueMailBackfill', 'accounts.disconnect',
+      'assistant.periodSummary.application.prepare', 'assistant.periodSummary.application.cancel', 'assistant.periodSummary.application.apply',
+      'mail.source.loadText', 'mail.reply.create',
       'mail.reply.derive', 'mail.reply.promoteDraft', 'proposals.edit', 'proposals.approve', 'proposals.execute', 'proposals.dismiss', 'dispatch.reconcile', 'mail.replyBatch.submit', 'mail.replyBatch.check',
       'mail.replyBatch.review', 'mail.replyBatch.activate',
       'documents.save', 'knowledge.person.save', 'knowledge.project.save', 'knowledge.entity.archive', 'knowledge.fact.save', 'knowledge.fact.remove',
@@ -171,6 +173,34 @@ describe('same-origin web workspace command client', () => {
     }
     expect(parseWorkspaceCommandHistoryPage({ entries: [{ updatedAt: 2, createdAt: 1, status: 'finished',
       kind: 'tasks.complete', commandId }], schemaVersion: 1 }).entries[0]?.commandId).toBe(commandId);
+  });
+
+  it('reads the exact named summary application preview with current revision and epoch fences', async () => {
+    const planId = 'e8a3f7c7-8ced-4433-978f-3972eac68310';
+    const review = { planId, jobId, period: 'monthly', timeZone: 'Asia/Singapore', interval: { start: '2026-09-01', end: '2026-10-01' },
+      preparedAt: '2026-10-01T02:00:00.000Z', markdown: '# September\n\nExact reviewed text 🧭', sourceReferences: ['Project: North star'] };
+    const fetcher = vi.fn(async (path: string, _init: RequestInit) => path.startsWith('/api/workspace/refresh')
+      ? body(snapshot(1))
+      : body({ schemaVersion: 1, workspaceId, privacyEpoch: 3, revision: 1, review }));
+    const client = createWebWorkspaceClient(session, { assertCurrent() {}, decodeSnapshot: (value) => value as WorkspaceSnapshotDTO, fetcher: fetcher as never });
+    await client.refresh();
+    await expect(client.readPeriodSummaryApplicationPreview(planId, jobId, 1)).resolves.toMatchObject(review);
+    expect(fetcher.mock.calls[0]?.[0]).toBe('/api/workspace/refresh');
+    expect(fetcher.mock.calls[1]?.[0]).toBe(`/api/workspace/assistant/period-summary/application/preview?planId=${planId}&jobId=${jobId}&expectedRevision=1&expectedPrivacyEpoch=3`);
+    expect(fetcher.mock.calls[1]?.[1]).toMatchObject({ method: 'GET', credentials: 'same-origin', cache: 'no-store', redirect: 'error' });
+
+    const mismatched = createWebWorkspaceClient(session, { assertCurrent() {}, decodeSnapshot: (value) => value as WorkspaceSnapshotDTO,
+      fetcher: vi.fn(async (path: string, _init: RequestInit) => path.startsWith('/api/workspace/refresh') ? body(snapshot(1)) :
+        body({ schemaVersion: 1, workspaceId, privacyEpoch: 3, revision: 1, review: { ...review, planId: commandId } })) as never });
+    await mismatched.refresh();
+    await expect(mismatched.readPeriodSummaryApplicationPreview(planId, jobId, 1)).rejects.toMatchObject({ kind: 'malformed' });
+
+    const impossibleDate = createWebWorkspaceClient(session, { assertCurrent() {}, decodeSnapshot: (value) => value as WorkspaceSnapshotDTO,
+      fetcher: vi.fn(async (path: string, _init: RequestInit) => path.startsWith('/api/workspace/refresh') ? body(snapshot(1)) :
+        body({ schemaVersion: 1, workspaceId, privacyEpoch: 3, revision: 1,
+          review: { ...review, interval: { start: '2026-99-99', end: '2026-10-01' } } })) as never });
+    await impossibleDate.refresh();
+    await expect(impossibleDate.readPeriodSummaryApplicationPreview(planId, jobId, 1)).rejects.toMatchObject({ kind: 'malformed' });
   });
 
   it('validates closed document and knowledge editor commands before they can be admitted', () => {

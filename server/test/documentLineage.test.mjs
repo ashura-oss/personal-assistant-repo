@@ -32,6 +32,9 @@ function setup(initial = { documents: [] }, options = {}) {
     }, commit() {},
   } });
   participants.push({ name: 'lineage', participant: lineage.createSnapshotCommitParticipant() });
+  if (options.afterLineageCommit) participants.push({ name: 'summary_application', participant: {
+    commit(context, input) { options.afterLineageCommit(context, input, lineage); },
+  } });
   const store = new ServerWorkspaceStore({ kernel, sessionToken, journal,
     snapshotCommitParticipant: composeSnapshotCommitParticipants(participants), ...options.storeOptions });
   return { directory, kernel, ownerId, workspace, sessionToken, lineage, store };
@@ -105,6 +108,41 @@ test('unrelated snapshot edits do not invalidate a document destination', async 
     const captured = capture(f);
     await f.store.save(saved([document(PATH, 'steady', 2)], { marker: 1 }));
     assert.equal(assertCaptured(f, captured), undefined);
+  } finally { close(f); }
+});
+
+test('reads the resulting private incarnation only after the lineage participant commits', async () => {
+  let committed;
+  const f = setup({ documents: [] }, { afterLineageCommit(context, input, lineage) {
+    committed = lineage.readCommittedDestinationWithinTransaction(context, PATH, input.nextRevision);
+  } });
+  try {
+    await f.store.load();
+    await f.store.save(saved([document(PATH, 'summary content')]));
+    assert.equal(committed.path, PATH);
+    assert.equal(committed.expectedRevision, 1);
+    assert.match(committed.documentId, /^[0-9a-f-]{36}$/i);
+    assert.equal(committed.expectedAbsenceGeneration, null);
+    assert.deepEqual(capture(f), committed);
+  } finally { close(f); }
+});
+
+test('committed-incarnation read rejects precommit, wrong revision, foreign, and expired transaction contexts', async () => {
+  const f = setup({ documents: [] });
+  try {
+    await f.store.load();
+    let expired;
+    f.kernel.withOwnedTransaction(f.sessionToken, 0, (context) => {
+      expired = context;
+      assert.throws(() => f.lineage.readCommittedDestinationWithinTransaction(context, PATH, context.revision + 1), /committed_snapshot_mismatch/);
+      assert.throws(() => f.lineage.readCommittedDestinationWithinTransaction(context, PATH, context.revision + 2), /context_rejected/);
+    });
+    assert.throws(() => f.lineage.readCommittedDestinationWithinTransaction(expired, PATH, expired.revision + 1), /active owned transaction/);
+
+    const foreignWorkspace = f.kernel.createWorkspace(f.ownerId, { accounts: [], documents: [document(PATH, 'foreign')] });
+    const foreignSession = f.kernel.createSession(foreignWorkspace.workspaceId, f.ownerId, Date.now() + 60 * 60_000);
+    assert.throws(() => f.kernel.withOwnedTransaction(foreignSession, 0, (context) =>
+      f.lineage.readCommittedDestinationWithinTransaction(context, PATH, context.revision + 1)), /context_rejected/);
   } finally { close(f); }
 });
 

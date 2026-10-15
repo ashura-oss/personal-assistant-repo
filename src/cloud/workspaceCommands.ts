@@ -74,6 +74,9 @@ export type WorkspaceCommand =
   | { readonly kind: 'assistant.periodSummary.moreCompute.prepare'; readonly jobId: string; readonly effort: 'low' | 'medium' | 'high' | 'max' }
   | { readonly kind: 'assistant.periodSummary.moreCompute.submit'; readonly planId: string; readonly jobId: string }
   | { readonly kind: 'assistant.periodSummary.moreCompute.cancel'; readonly planId: string }
+  | { readonly kind: 'assistant.periodSummary.application.prepare'; readonly jobId: string }
+  | { readonly kind: 'assistant.periodSummary.application.cancel'; readonly planId: string }
+  | { readonly kind: 'assistant.periodSummary.application.apply'; readonly planId: string; readonly jobId: string }
   | { readonly kind: 'chat.submit'; readonly conversationId: string; readonly text: string; readonly knowledgeSelection?: PublicKnowledgeSelection }
   | { readonly kind: 'chat.refine'; readonly conversationId: string; readonly parentTurnId: string; readonly effort: 'medium' | 'high' | 'max' };
 
@@ -154,6 +157,11 @@ export type WorkspaceCommandReceipt =
   | (WorkspaceCommandReceiptBase<'assistant.periodSummary.moreCompute.prepare'> & Readonly<{ jobId: string; plan: PeriodSummaryMoreComputePlan }> )
   | (WorkspaceCommandReceiptBase<'assistant.periodSummary.moreCompute.submit'> & Readonly<{ jobId: string; jobStatus: import('../services/openRouterBatchJobs').AssistantBatchJobDTO['status'] }> )
   | (WorkspaceCommandReceiptBase<'assistant.periodSummary.moreCompute.cancel'> & Readonly<{ planId: string }> )
+  | (WorkspaceCommandReceiptBase<'assistant.periodSummary.application.prepare'> & Readonly<{ jobId: string; applicationPlan?: import('../core').PeriodSummaryApplicationPlan;
+      application?: import('../core').PeriodSummaryApplicationReceipt }> )
+  | (WorkspaceCommandReceiptBase<'assistant.periodSummary.application.cancel'> & Readonly<{ planId: string }> )
+  | (WorkspaceCommandReceiptBase<'assistant.periodSummary.application.apply'> & Readonly<{ jobId: string; path: string;
+      documentRevision: number; appliedAt: string }> )
   | (WorkspaceCommandReceiptBase<'documents.save'> & Readonly<{ documentRevision: number; entityKind?: KnowledgeEntityKind; entityId?: string; entityRevision?: number }>)
   | ((WorkspaceCommandReceiptBase<'knowledge.person.save'> | WorkspaceCommandReceiptBase<'knowledge.project.save'> |
       WorkspaceCommandReceiptBase<'knowledge.entity.archive'>) & Readonly<{ entityKind: KnowledgeEntityKind; entityRevision: number }>)
@@ -229,6 +237,9 @@ const COMMAND_KEYS: Record<WorkspaceCommand['kind'], readonly string[]> = {
   'assistant.periodSummary.moreCompute.prepare': ['kind', 'jobId', 'effort'],
   'assistant.periodSummary.moreCompute.submit': ['kind', 'planId', 'jobId'],
   'assistant.periodSummary.moreCompute.cancel': ['kind', 'planId'],
+  'assistant.periodSummary.application.prepare': ['kind', 'jobId'],
+  'assistant.periodSummary.application.cancel': ['kind', 'planId'],
+  'assistant.periodSummary.application.apply': ['kind', 'planId', 'jobId'],
   'chat.refine': ['kind', 'conversationId', 'parentTurnId', 'effort'],
 };
 const COMMAND_KINDS = Object.keys(COMMAND_KEYS) as WorkspaceCommand['kind'][];
@@ -852,6 +863,21 @@ function freezeCommand(raw: Record<string, unknown>): WorkspaceCommand {
     if (!isUuidV4(raw.planId)) throw new Error('workspace_command_invalid');
     return Object.freeze({ kind, planId: raw.planId });
   }
+  if (kind === 'assistant.periodSummary.application.prepare') {
+    assertExactKeys(raw, COMMAND_KEYS[kind], COMMAND_KEYS[kind]);
+    if (!isUuidV4(raw.jobId)) throw new Error('workspace_command_invalid');
+    return Object.freeze({ kind, jobId: raw.jobId });
+  }
+  if (kind === 'assistant.periodSummary.application.cancel') {
+    assertExactKeys(raw, COMMAND_KEYS[kind], COMMAND_KEYS[kind]);
+    if (!isUuidV4(raw.planId)) throw new Error('workspace_command_invalid');
+    return Object.freeze({ kind, planId: raw.planId });
+  }
+  if (kind === 'assistant.periodSummary.application.apply') {
+    assertExactKeys(raw, COMMAND_KEYS[kind], COMMAND_KEYS[kind]);
+    if (!isUuidV4(raw.planId) || !isUuidV4(raw.jobId)) throw new Error('workspace_command_invalid');
+    return Object.freeze({ kind, planId: raw.planId, jobId: raw.jobId });
+  }
   if (kind === 'assistant.batch.check') {
     assertExactKeys(raw, COMMAND_KEYS[kind], COMMAND_KEYS[kind]);
     if (!isUuidV4(raw.jobId)) throw new Error('workspace_command_invalid');
@@ -941,6 +967,41 @@ function parsePeriodSummaryMoreComputePlan(value: unknown): PeriodSummaryMoreCom
   }
   return Object.freeze({ ...row, interval: Object.freeze({ start: interval.start, end: interval.end }),
     sourceLabels: Object.freeze([...(row.sourceLabels as string[])]), priorAccounting: Object.freeze({ ...accounting }) }) as unknown as PeriodSummaryMoreComputePlan;
+}
+
+function parsePeriodSummaryApplicationPlan(value: unknown): import('../core').PeriodSummaryApplicationPlan {
+  if (!isRecord(value)) throw new Error('workspace_command_receipt_invalid');
+  const required = ['planId', 'jobId', 'kind', 'period', 'timeZone', 'interval', 'preparedAt', 'destinationPath', 'destinationExists', 'expiresAt'];
+  const allowed = [...required, 'destinationRevision'];
+  assertExactKeys(value, allowed, required);
+  const interval = value.interval as Record<string, unknown> | null;
+  if (interval && typeof interval === 'object') assertExactKeys(interval, ['start', 'end'], ['start', 'end']);
+  const localDate = (item: unknown): item is string => typeof item === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(item) &&
+    Number.isFinite(Date.parse(`${item}T00:00:00.000Z`)) && new Date(`${item}T00:00:00.000Z`).toISOString().slice(0, 10) === item;
+  if (!isUuidV4(value.planId) || !isUuidV4(value.jobId) || value.kind !== 'period_summary_application' ||
+      !['daily', 'weekly', 'monthly', 'yearly'].includes(String(value.period)) || !validTimeZone(value.timeZone) || !interval ||
+      !localDate(interval.start) || !localDate(interval.end) || interval.start >= interval.end ||
+      typeof value.preparedAt !== 'string' || !Number.isFinite(Date.parse(value.preparedAt)) ||
+      new Date(value.preparedAt).toISOString() !== value.preparedAt || typeof value.destinationPath !== 'string' ||
+      value.destinationPath !== `memory/summaries/${String(value.period)}/${interval.start}.md` || typeof value.destinationExists !== 'boolean' ||
+      (value.destinationExists ? !Number.isSafeInteger(value.destinationRevision) || Number(value.destinationRevision) < 1 :
+        Object.hasOwn(value, 'destinationRevision')) || typeof value.expiresAt !== 'string' || !Number.isFinite(Date.parse(value.expiresAt)) ||
+      new Date(value.expiresAt).toISOString() !== value.expiresAt) throw new Error('workspace_command_receipt_invalid');
+  return Object.freeze({ planId: value.planId, jobId: value.jobId, kind: 'period_summary_application',
+    period: value.period as 'daily' | 'weekly' | 'monthly' | 'yearly', timeZone: value.timeZone,
+    interval: Object.freeze({ start: interval.start, end: interval.end }), preparedAt: value.preparedAt,
+    destinationPath: value.destinationPath, destinationExists: value.destinationExists,
+    ...(Object.hasOwn(value, 'destinationRevision') ? { destinationRevision: value.destinationRevision as number } : {}), expiresAt: value.expiresAt });
+}
+
+function parsePeriodSummaryApplicationReceipt(value: unknown): import('../core').PeriodSummaryApplicationReceipt {
+  if (!isRecord(value)) throw new Error('workspace_command_receipt_invalid');
+  assertExactKeys(value, ['kind', 'jobId', 'path', 'documentRevision', 'appliedAt'], ['kind', 'jobId', 'path', 'documentRevision', 'appliedAt']);
+  if (value.kind !== 'applied' || !isUuidV4(value.jobId) || typeof value.path !== 'string' ||
+      !/^memory\/summaries\/(daily|weekly|monthly|yearly)\/\d{4}-\d{2}-\d{2}\.md$/.test(value.path) ||
+      !positiveRevision(value.documentRevision) || typeof value.appliedAt !== 'string' || !Number.isFinite(Date.parse(value.appliedAt)) ||
+      new Date(value.appliedAt).toISOString() !== value.appliedAt) throw new Error('workspace_command_receipt_invalid');
+  return Object.freeze({ kind: 'applied', jobId: value.jobId, path: value.path, documentRevision: value.documentRevision, appliedAt: value.appliedAt });
 }
 
 /** Validates a stored or returned receipt before any field is projected to a caller. */
@@ -1042,13 +1103,16 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
     'assistant.periodSummary.moreCompute.prepare': ['commandId', 'jobId', 'kind', 'objectId', 'plan', 'schemaVersion'],
     'assistant.periodSummary.moreCompute.submit': ['commandId', 'jobId', 'jobStatus', 'kind', 'objectId', 'schemaVersion'],
     'assistant.periodSummary.moreCompute.cancel': ['commandId', 'kind', 'objectId', 'planId', 'schemaVersion'],
+    'assistant.periodSummary.application.prepare': ['application', 'applicationPlan', 'commandId', 'jobId', 'kind', 'objectId', 'schemaVersion'],
+    'assistant.periodSummary.application.cancel': ['commandId', 'kind', 'objectId', 'planId', 'schemaVersion'],
+    'assistant.periodSummary.application.apply': ['appliedAt', 'commandId', 'documentRevision', 'jobId', 'kind', 'objectId', 'path', 'schemaVersion'],
     'chat.submit': ['commandId', 'jobId', 'kind', 'objectId', 'schemaVersion', 'turnId'],
     'chat.refine': ['commandId', 'jobId', 'kind', 'objectId', 'parentTurnId', 'schemaVersion', 'turnId'],
   };
   const allowedReceiptKeys = keysByKind[kind as WorkspaceCommand['kind']];
   const optionalReceiptKeys: Partial<Record<WorkspaceCommand['kind'], readonly string[]>> = {
     'mail.source.loadText': ['textDigest', 'bytes'], 'proposals.execute': ['dispatchRecordId', 'operation', 'outcomeAt', 'remoteId'],
-    'dispatch.reconcile': ['providerOutcomeAt'],
+    'dispatch.reconcile': ['providerOutcomeAt'], 'assistant.periodSummary.application.prepare': ['applicationPlan', 'application'],
   };
   const requiredReceiptKeys = kind === 'chat.transcript.submit'
     ? value.outcome === 'submitted'
@@ -1124,6 +1188,15 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
         !['preparing', 'submitting', 'submission_unknown', 'queued', 'processing', 'completed', 'failed', 'expired', 'cancelled',
           'result_stale', 'result_invalid', 'result_truncated', 'result_not_retained', 'cleanup_pending', 'source_removed'].includes(value.jobStatus as string))) ||
       (kind === 'assistant.periodSummary.moreCompute.cancel' && (!uuidId(value.planId) || value.objectId !== value.planId)) ||
+      (kind === 'assistant.periodSummary.application.prepare' && (!uuidId(value.jobId) || value.jobId !== value.objectId ||
+        Object.hasOwn(value, 'applicationPlan') === Object.hasOwn(value, 'application') ||
+        Object.hasOwn(value, 'applicationPlan') && parsePeriodSummaryApplicationPlan(value.applicationPlan).jobId !== value.jobId ||
+        Object.hasOwn(value, 'application') && parsePeriodSummaryApplicationReceipt(value.application).jobId !== value.jobId)) ||
+      (kind === 'assistant.periodSummary.application.cancel' && (!uuidId(value.planId) || value.objectId !== value.planId)) ||
+      (kind === 'assistant.periodSummary.application.apply' && (!uuidId(value.jobId) || value.jobId !== value.objectId ||
+        typeof value.path !== 'string' || !/^memory\/summaries\/(daily|weekly|monthly|yearly)\/\d{4}-\d{2}-\d{2}\.md$/.test(value.path) ||
+        !positiveRevision(value.documentRevision) || typeof value.appliedAt !== 'string' || !Number.isFinite(Date.parse(value.appliedAt)) ||
+        new Date(value.appliedAt).toISOString() !== value.appliedAt)) ||
       (kind === 'documents.save' && (() => {
         const parent = canonicalKnowledgeDocumentParent(value.objectId);
         const hasParent = Object.hasOwn(value, 'entityKind') || Object.hasOwn(value, 'entityId') || Object.hasOwn(value, 'entityRevision');
@@ -1279,6 +1352,15 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
         jobId: jobId(value.jobId), jobStatus: value.jobStatus as import('../services/openRouterBatchJobs').AssistantBatchJobDTO['status'] });
     case 'assistant.periodSummary.moreCompute.cancel':
       return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId, planId: jobId(value.planId) });
+    case 'assistant.periodSummary.application.prepare':
+      return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId, jobId: jobId(value.jobId),
+        ...(Object.hasOwn(value, 'applicationPlan') ? { applicationPlan: parsePeriodSummaryApplicationPlan(value.applicationPlan) } : {}),
+        ...(Object.hasOwn(value, 'application') ? { application: parsePeriodSummaryApplicationReceipt(value.application) } : {}) });
+    case 'assistant.periodSummary.application.cancel':
+      return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId, planId: jobId(value.planId) });
+    case 'assistant.periodSummary.application.apply':
+      return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId, jobId: jobId(value.jobId),
+        path: value.path as string, documentRevision: value.documentRevision as number, appliedAt: value.appliedAt as string });
     case 'documents.save': {
       const parent = canonicalKnowledgeDocumentParent(objectId);
       return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId,

@@ -9,6 +9,7 @@ import { createDurableKernel } from '../dist/kernel.js';
 import { SecretVault } from '../dist/vault.js';
 import { WorkspaceEraseService } from '../dist/workspaceErase.js';
 import { DocumentLineage } from '../dist/documentLineage.js';
+import { PeriodSummaryApplicationRuntime } from '../dist/periodSummaryApplication.js';
 
 const ORIGIN = 'http://127.0.0.1:43210';
 const SECRET = Buffer.alloc(32, 0x5a);
@@ -87,11 +88,23 @@ test('confirmed erase atomically advances the epoch, empties the snapshot, prese
     mkdirSync(documentRoot, { recursive: true });
     writeFileSync(join(documentRoot, 'secret.md'), 'synthetic private document file');
     const lineage = new DocumentLineage(f.kernel, login.sessionToken);
+    new PeriodSummaryApplicationRuntime(f.kernel, login.sessionToken, lineage);
     f.kernel.withOwnedTransaction(login.sessionToken, 0, (context) => {
       lineage.captureDestination(context, 'private/secret.md');
+      const insert = context.db.prepare(`INSERT INTO period_summary_application_receipts
+        (workspace_id,owner_id,privacy_epoch,job_id,command_id,request_sha256,result_sha256,destination_path,document_id,document_revision,applied_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?)`);
+      insert.run(context.workspaceId, context.ownerId, context.privacyEpoch, randomUUID(), randomUUID(), 'a'.repeat(64), 'b'.repeat(64),
+        'memory/summaries/daily/2026-10-14.md', randomUUID(), 1, context.now);
+      insert.run(context.workspaceId, randomUUID(), context.privacyEpoch, randomUUID(), randomUUID(), 'c'.repeat(64), 'd'.repeat(64),
+        'memory/summaries/daily/2026-10-14.md', randomUUID(), 1, context.now);
       f.vault.setSecretWithinTransaction(context, { type: 'workspace' }, 'openrouter', 0, 'synthetic-secret');
     });
     const identity = f.kernel.getOwnedIdentity(login.sessionToken);
+    f.kernel.withOwnedTransaction(login.sessionToken, 0, (context) => {
+      assert.throws(() => context.db.prepare(`DELETE FROM period_summary_application_receipts WHERE workspace_id=? AND owner_id=? AND privacy_epoch=?`)
+        .run(context.workspaceId, context.ownerId, context.privacyEpoch), /period_summary_application_receipts_are_durable/);
+    });
     const hold = Object.freeze({ identity, commandId, assertHeld() {}, releaseAfterCleanup() {}, releaseAfterCancellation() {} });
     const reserve = async (_admission, requestedCommandId) => { assert.equal(requestedCommandId, commandId); return hold; };
     const verify = (actual, requestedCommandId) => { assert.equal(actual, hold); assert.equal(requestedCommandId, commandId); };
@@ -114,12 +127,16 @@ test('confirmed erase atomically advances the epoch, empties the snapshot, prese
     const state = f.kernel.withOwnedTransaction(fresh.sessionToken, 1, (context) => ({
       lineageHeads: context.db.prepare('SELECT count(*) AS count FROM document_lineage_heads WHERE workspace_id=? AND owner_id=?').get(context.workspaceId, context.ownerId).count,
       lineageScopes: context.db.prepare('SELECT count(*) AS count FROM document_lineage_scopes WHERE workspace_id=? AND owner_id=?').get(context.workspaceId, context.ownerId).count,
+      applicationReceipts: context.db.prepare('SELECT count(*) AS count FROM period_summary_application_receipts WHERE workspace_id=? AND owner_id=?').get(context.workspaceId, context.ownerId).count,
+      foreignApplicationReceipts: context.db.prepare('SELECT count(*) AS count FROM period_summary_application_receipts WHERE workspace_id=? AND owner_id<>?').get(context.workspaceId, context.ownerId).count,
       vaultCiphertexts: context.db.prepare('SELECT count(*) AS count FROM vault_ciphertexts WHERE workspace_id=?').get(context.workspaceId).count,
       vaultMetadata: context.db.prepare("SELECT generation,configured FROM vault_metadata WHERE workspace_id=? AND scope_type='workspace' AND purpose='openrouter'").get(context.workspaceId),
       authOwner: context.db.prepare('SELECT count(*) AS count FROM auth_owner WHERE singleton=1 AND owner_id=?').get(context.ownerId).count,
     }));
     assert.equal(state.lineageHeads, 0);
     assert.equal(state.lineageScopes, 0);
+    assert.equal(state.applicationReceipts, 0);
+    assert.equal(state.foreignApplicationReceipts, 1, 'erase must preserve receipt rows outside its exact owner scope');
     assert.equal(state.vaultCiphertexts, 0);
     assert.deepEqual(state.vaultMetadata, { generation: 2, configured: 0 });
     assert.equal(state.authOwner, 1);

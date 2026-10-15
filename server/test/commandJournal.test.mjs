@@ -55,6 +55,53 @@ test('admission binds canonical body, rejects changed content, and returns termi
   } finally { close(f); }
 });
 
+test('period-summary application ticket proof checks the exact live issued journal ticket and accepts checkpointed state', async () => {
+  const f = setup();
+  try {
+    const kind = 'assistant.periodsummary.application.apply';
+    const commandId = randomUUID();
+    const claimed = f.journal.admit({ admissionSessionToken: f.admissionSessionA, expectedRevision: 0, expectedPrivacyEpoch: 0,
+      idempotencyKey: commandId, kind, canonicalBody: JSON.stringify({ jobId: randomUUID(), kind: 'assistant.periodSummary.application.apply', planId: randomUUID() }) });
+    const { withCommandTicket, currentCommandTicket } = await import('../dist/commandJournal.js');
+    f.kernel.withOwnedTransaction(f.runtimeSession, 0, (context) => {
+      assert.throws(() => f.journal.assertPeriodSummaryApplicationWithinTransaction(context, claimed.ticket), /ticket_invalid/,
+        'a valid issued ticket without the matching active async context is rejected');
+    });
+    await f.journal.run(claimed.ticket, f.runtimeSession, async () => {
+      const activeTicket = currentCommandTicket();
+      assert.ok(activeTicket);
+      const store = new ServerWorkspaceStore({ kernel: f.kernel, sessionToken: f.runtimeSession, journal: f.journal });
+      await store.load();
+      f.kernel.withOwnedTransaction(f.runtimeSession, 0, (context) => {
+        assert.throws(() => f.journal.assertPeriodSummaryApplicationWithinTransaction(context, { ...activeTicket }),
+          /ticket_invalid/, 'a copied ticket is not the exact AsyncLocalStorage ticket');
+        f.journal.assertPeriodSummaryApplicationWithinTransaction(context, activeTicket);
+      });
+      await store.save({ accounts: [], notes: [], marker: 'checkpointed' });
+      f.kernel.withOwnedTransaction(f.runtimeSession, 0, (context) => f.journal.assertPeriodSummaryApplicationWithinTransaction(context, activeTicket));
+    });
+    const inactiveTicket = Object.freeze({ ...claimed.ticket, runtimeSessionToken: f.runtimeSession });
+    f.journal.finish(inactiveTicket, { ok: true });
+    await withCommandTicket(inactiveTicket, async () => f.kernel.withOwnedTransaction(f.runtimeSession, 0, (context) => {
+      assert.throws(() => f.journal.assertPeriodSummaryApplicationWithinTransaction(context, inactiveTicket), /ticket_not_active/);
+    }));
+
+    const wrong = f.journal.admit({ admissionSessionToken: f.admissionSessionA, expectedRevision: f.kernel.getOwnedIdentity(f.runtimeSession).revision, expectedPrivacyEpoch: 0,
+      idempotencyKey: randomUUID(), kind: 'test.operation', canonicalBody: '{}' });
+    await f.journal.run(wrong.ticket, f.runtimeSession, async () => withCommandTicket(
+      { ...wrong.ticket, runtimeSessionToken: f.runtimeSession }, async () => f.kernel.withOwnedTransaction(f.runtimeSession, 0, (context) => {
+        assert.throws(() => f.journal.assertPeriodSummaryApplicationWithinTransaction(context,
+          { ...wrong.ticket, runtimeSessionToken: f.runtimeSession }), /ticket_invalid/);
+      })));
+    const foreignOwnerId = randomUUID();
+    const other = f.kernel.createWorkspace(foreignOwnerId, { accounts: [], notes: [] });
+    const foreignSession = f.kernel.createSession(other.workspaceId, foreignOwnerId, Date.now() + 60 * 60_000);
+    await withCommandTicket(inactiveTicket, async () => f.kernel.withOwnedTransaction(foreignSession, 0, (context) => {
+      assert.throws(() => f.journal.assertPeriodSummaryApplicationWithinTransaction(context, inactiveTicket), /transaction|ticket_invalid|runtime session/i);
+    }));
+  } finally { close(f); }
+});
+
 test('admission token revocation does not cancel already-owned runtime work; new login can inspect without rerun', async () => {
   const f = setup();
   try {

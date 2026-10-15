@@ -29,4 +29,5 @@ export interface WorkspaceHttpApi extends Partial<KnowledgeHttpApi>, Partial<Bac
   readDispatchReview?(admission: WorkspaceHttpAdmission, input: Readonly<{ recordId: string; expectedRevision: number; expectedPrivacyEpoch: number }>): Promise<JsonValue>;
   readMailReplyBatchReview?(admission: WorkspaceHttpAdmission, input: Readonly<{ planId: string; jobId: string; accountId: string; expectedConnectionGeneration: number; expectedRevision: number; expectedPrivacyEpoch: number }>): Promise<JsonValue>;
   readPeriodSummaryResult?(admission: WorkspaceHttpAdmission, input: Readonly<{ jobId: string; expectedRevision: number; expectedPrivacyEpoch: number }>): Promise<JsonValue>;
+  readPeriodSummaryApplicationPreview?(admission: WorkspaceHttpAdmission, input: Readonly<{ planId: string; jobId: string; expectedRevision: number; expectedPrivacyEpoch: number }>): Promise<JsonValue>;
 }

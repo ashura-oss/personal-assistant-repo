@@ -23,12 +23,12 @@ export function projectBatchObservationLedger(snapshot: unknown): BatchObservati
   }
 }
 
-export function createBatchObservationSnapshotParticipant(index: BatchObservationIndex, now: () => number): SnapshotCommitParticipant<object> {
+export function createBatchObservationSnapshotParticipant<TState extends object = object>(index: BatchObservationIndex, now: () => number): SnapshotCommitParticipant<TState> {
   if (!index || typeof index.reconcile !== 'function' || typeof now !== 'function' || now.constructor?.name === 'AsyncFunction') {
     throw new Error('batch_observation_participant_unavailable');
   }
   return Object.freeze({
-    commit(context: OwnedTransactionContext, input: SnapshotCommitParticipantInput<object>) {
+    commit(context: OwnedTransactionContext, input: SnapshotCommitParticipantInput<TState>) {
       context.assertActive();
       if (input.nextRevision !== context.revision + 1) throw new Error('batch_observation_snapshot_revision_changed');
       const projection = projectBatchObservationLedger(input.nextSnapshot);

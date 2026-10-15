@@ -957,13 +957,14 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
     return;
   }
-  const workflowReads = new Map<string, { readonly method: keyof Pick<WorkspaceHttpApi, 'readMailReplySource' | 'readMailReplyText' | 'readProposalReview' | 'readDispatchReview' | 'readMailReplyBatchReview' | 'readPeriodSummaryResult'>; readonly keys: readonly string[] }>([
+  const workflowReads = new Map<string, { readonly method: keyof Pick<WorkspaceHttpApi, 'readMailReplySource' | 'readMailReplyText' | 'readProposalReview' | 'readDispatchReview' | 'readMailReplyBatchReview' | 'readPeriodSummaryResult' | 'readPeriodSummaryApplicationPreview'>; readonly keys: readonly string[] }>([
     ['/api/workspace/mail/source', { method: 'readMailReplySource', keys: ['messageId', 'expectedRevision', 'expectedPrivacyEpoch'] }],
     ['/api/workspace/mail/source-text', { method: 'readMailReplyText', keys: ['messageId', 'expectedRevision', 'expectedPrivacyEpoch'] }],
     ['/api/workspace/proposals/review', { method: 'readProposalReview', keys: ['proposalId', 'expectedRevision', 'expectedPrivacyEpoch'] }],
     ['/api/workspace/dispatch/review', { method: 'readDispatchReview', keys: ['recordId', 'expectedRevision', 'expectedPrivacyEpoch'] }],
     ['/api/workspace/mail/reply-batch/review', { method: 'readMailReplyBatchReview', keys: ['planId', 'jobId', 'accountId', 'expectedConnectionGeneration', 'expectedRevision', 'expectedPrivacyEpoch'] }],
     ['/api/workspace/assistant/period-summary/result', { method: 'readPeriodSummaryResult', keys: ['jobId', 'expectedRevision', 'expectedPrivacyEpoch'] }],
+    ['/api/workspace/assistant/period-summary/application/preview', { method: 'readPeriodSummaryApplicationPreview', keys: ['planId', 'jobId', 'expectedRevision', 'expectedPrivacyEpoch'] }],
   ]);
   const workflowRead = workflowReads.get(pathname);
   if (workflowRead) {
@@ -991,6 +992,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
       case 'readMailReplyBatchReview': input = { ...base, planId: opaqueId('planId'), jobId: opaqueId('jobId'), accountId: opaqueId('accountId'),
         expectedConnectionGeneration: decimalValue('expectedConnectionGeneration') }; break;
       case 'readPeriodSummaryResult': input = { ...base, jobId: opaqueId('jobId') }; break;
+      case 'readPeriodSummaryApplicationPreview': input = { ...base, planId: opaqueId('planId'), jobId: opaqueId('jobId') }; break;
     }
     if (!workspaceApi || typeof workspaceApi[workflowRead.method] !== 'function') throw problem(503, 'service_unavailable');
     const admission = workspaceReadAdmission(request, auth, canonicalOrigin);

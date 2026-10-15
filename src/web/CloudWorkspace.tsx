@@ -1,8 +1,9 @@
 import React, { useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { Pressable, ScrollView, Text, View } from 'react-native';
-import type { WorkspaceCommand, WorkspaceCommandResponse, WorkspaceSettingsPatch } from '../cloud/workspaceCommands';
+import type { WorkspaceCommand, WorkspaceCommandReceipt, WorkspaceCommandResponse, WorkspaceSettingsPatch } from '../cloud/workspaceCommands';
 import type { WorkspaceSettingsDTO } from '../cloud/workspaceDto';
-import type { PeriodSummaryMoreComputePlan, PeriodSummaryResultReview } from '../core';
+import type { PeriodSummaryApplicationPlan, PeriodSummaryApplicationPreview, PeriodSummaryApplicationReceipt,
+  PeriodSummaryMoreComputePlan, PeriodSummaryResultReview } from '../core';
 import type { CloudWorkspaceSessionState, CloudWorkspaceSessionStore, CloudWorkspaceVoiceActions } from './CloudWorkspaceSession';
 import { WorkspaceClientError, WorkspaceCommandNotStartedError, type WorkspaceCommandAdmission } from './workspaceClient';
 import { WorkspaceScreen, type WorkspaceTab } from '../ui/WorkspaceScreen';
@@ -46,6 +47,10 @@ export type CloudWorkspaceActions = Readonly<{
     submitSummaryMoreCompute: (planId: string, jobId: string) => Promise<Readonly<{ jobStatus: import('../services/openRouterBatchJobs').AssistantBatchJobDTO['status'] }>>;
     cancelSummaryMoreCompute: (planId: string) => void;
     readSummary: (jobId: string) => Promise<PeriodSummaryResultReview>;
+    prepareSummaryApplication: (jobId: string) => Promise<PeriodSummaryApplicationPlan | PeriodSummaryApplicationReceipt>;
+    cancelSummaryApplication: (planId: string) => void;
+    applySummaryApplication: (planId: string, jobId: string) => Promise<PeriodSummaryApplicationReceipt>;
+    readSummaryApplicationPreview: (planId: string, jobId: string) => Promise<PeriodSummaryApplicationPreview>;
   }>;
 }>;
 
@@ -61,9 +66,9 @@ function validatedAudioMediaId(value: string | undefined) {
   return value && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value) ? value : undefined;
 }
 
-function receiptFor(response: WorkspaceCommandResponse, kind: WorkspaceCommand['kind']) {
+function receiptFor<K extends WorkspaceCommand['kind']>(response: WorkspaceCommandResponse, kind: K): Extract<WorkspaceCommandReceipt, { kind: K }> | undefined {
   if (response.status !== 'finished' || response.receipt?.kind !== kind || response.receipt.commandId !== response.commandId) return undefined;
-  return response.receipt;
+  return response.receipt as Extract<WorkspaceCommandReceipt, { kind: K }>;
 }
 
 function errText(error: unknown) {
@@ -87,7 +92,7 @@ type WorkspaceSettingsBaseline = Readonly<{
 type CloudWorkspaceEraseStoreMethods = 'discoverWorkspaceErase' | 'prepareWorkspaceErase' | 'confirmWorkspaceErase' | 'executeWorkspaceErase' |
   'cancelWorkspaceErase' | 'retryWorkspaceEraseReview' | 'retryWorkspaceEraseCleanup';
 type CloudWorkspaceStorePort = Pick<CloudWorkspaceSessionStore, 'getSnapshot' | 'execute' | 'inspect' | 'refresh'> &
-  Partial<Pick<CloudWorkspaceSessionStore, 'readKnowledgeSourceChoices' | 'readKnowledgeSuggestionReview' | 'readPeriodSummaryResult'>> &
+  Partial<Pick<CloudWorkspaceSessionStore, 'readKnowledgeSourceChoices' | 'readKnowledgeSuggestionReview' | 'readPeriodSummaryResult' | 'readPeriodSummaryApplicationPreview'>> &
   Partial<Pick<CloudWorkspaceSessionStore, CloudWorkspaceEraseStoreMethods>>;
 
 function projectSettingsBaseline(settings: WorkspaceSettingsDTO): WorkspaceSettingsBaseline {
@@ -302,6 +307,26 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
         const current = store.getSnapshot().snapshot;
         if (!current || !store.readPeriodSummaryResult) throw new Error('summary_workspace_unavailable');
         return store.readPeriodSummaryResult(jobId, current.revision);
+      },
+      prepareSummaryApplication: async (jobId: string) => {
+        const response = await store.execute({ kind: 'assistant.periodSummary.application.prepare', jobId });
+        const receipt = receiptFor(response, 'assistant.periodSummary.application.prepare');
+        if (!receipt || (receipt.applicationPlan && receipt.application) || (!receipt.applicationPlan && !receipt.application)) throw new Error('summary_application_plan_unavailable');
+        return receipt.applicationPlan ?? receipt.application!;
+      },
+      cancelSummaryApplication: (planId: string) => {
+        void store.execute({ kind: 'assistant.periodSummary.application.cancel', planId }).catch(() => undefined);
+      },
+      applySummaryApplication: async (planId: string, jobId: string) => {
+        const response = await store.execute({ kind: 'assistant.periodSummary.application.apply', planId, jobId });
+        const receipt = receiptFor(response, 'assistant.periodSummary.application.apply');
+        if (!receipt) throw new Error('summary_application_outcome_unknown');
+        return Object.freeze({ kind: 'applied', jobId: receipt.jobId, path: receipt.path, documentRevision: receipt.documentRevision, appliedAt: receipt.appliedAt });
+      },
+      readSummaryApplicationPreview: (planId: string, jobId: string) => {
+        const current = store.getSnapshot().snapshot;
+        if (!current || !store.readPeriodSummaryApplicationPreview) throw new Error('summary_workspace_unavailable');
+        return store.readPeriodSummaryApplicationPreview(planId, jobId, current.revision);
       },
     },
   };
@@ -1014,7 +1039,9 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
             periodSummaryWorkflow={{ ownerKey: JSON.stringify([snapshot.workspaceId, snapshot.privacyEpoch, job.id, job.updatedAt, job.status]),
               blocked: state.refreshRequired || Boolean(dto.assistantBatchRecoveryStatus),
               onPrepare: actions.batch.prepareSummaryMoreCompute, onSubmit: actions.batch.submitSummaryMoreCompute,
-              onCancel: actions.batch.cancelSummaryMoreCompute, onRead: actions.batch.readSummary }} />)}
+              onCancel: actions.batch.cancelSummaryMoreCompute, onRead: actions.batch.readSummary,
+              onPrepareApplication: actions.batch.prepareSummaryApplication, onCancelApplication: actions.batch.cancelSummaryApplication,
+              onApplyApplication: actions.batch.applySummaryApplication, onReadApplicationPreview: actions.batch.readSummaryApplicationPreview }} />)}
           {!dto.assistantBatchJobs.length ? <Text style={styles.meta}>No Batch requests have been saved.</Text> : null}
           <Text style={s.sectionTitle}>Saved dispatches</Text>
           {dto.dispatchRecords.map((record) => <View key={record.id} style={styles.card}><Text style={styles.cardTitle}>{record.title}</Text><Text style={styles.meta}>{record.operation} · {record.outcome} · {record.dispatchStartedAt}</Text>

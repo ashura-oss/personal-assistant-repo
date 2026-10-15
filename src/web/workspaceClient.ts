@@ -12,8 +12,8 @@ import {
   type WorkspaceCommandResponse,
 } from '../cloud/workspaceCommands';
 import type { AuthenticatedSession } from './authClient';
-import { parsePeriodSummaryReadEnvelope, periodSummaryResultPath } from '../cloud/periodSummaryHttpContracts';
-import type { PeriodSummaryResultReview } from '../core';
+import { parsePeriodSummaryApplicationPreviewEnvelope, parsePeriodSummaryReadEnvelope, periodSummaryApplicationPreviewPath, periodSummaryResultPath } from '../cloud/periodSummaryHttpContracts';
+import type { PeriodSummaryApplicationPreview, PeriodSummaryResultReview } from '../core';
 import { parseWorkspaceCommandHistoryPage, type WorkspaceCommandHistoryEntry, type WorkspaceCommandHistoryKind,
   type WorkspaceCommandHistoryPage } from '../cloud/workspaceCommandHistory';
 import { cloudDispatchReviewPath, cloudMailReadPath, cloudProposalReviewPath, cloudReplyBatchReviewPath,
@@ -56,6 +56,7 @@ export type WorkspaceClient = Readonly<{
   readDispatchReview(recordId: string, expectedRevision: number): Promise<DispatchReviewReadDto>;
   readReplyBatchReview(plan: ReplyBatchPlanRead, expectedRevision: number): Promise<MailReplyBatchReviewReadDto>;
   readPeriodSummaryResult(jobId: string, expectedRevision: number): Promise<PeriodSummaryResultReview>;
+  readPeriodSummaryApplicationPreview(planId: string, jobId: string, expectedRevision: number): Promise<PeriodSummaryApplicationPreview>;
   listBackgroundPolicies(expectedPrivacyEpoch: number, afterPolicyId?: string): Promise<readonly BackgroundPolicyDisplay[]>;
   saveBackgroundPolicy(envelope: SaveBackgroundPolicyEnvelope): Promise<BackgroundPolicyReceipt>;
   pauseBackgroundPolicy(envelope: ChangeBackgroundPolicyEnvelope): Promise<BackgroundPolicyReceipt>;
@@ -357,6 +358,12 @@ export function createWebWorkspaceClient(session: AuthenticatedSession, options:
       'Saved period summary');
   }
 
+  function readPeriodSummaryApplicationPreview(planId: string, jobId: string, expectedRevision: number): Promise<PeriodSummaryApplicationPreview> {
+    assertSavedReadRevision(expectedRevision);
+    return readSavedWorkflow(periodSummaryApplicationPreviewPath(planId, jobId, { expectedRevision, expectedPrivacyEpoch: privacyEpoch }), expectedRevision,
+      (raw) => parsePeriodSummaryApplicationPreviewEnvelope(raw, { workspaceId, privacyEpoch, revision: expectedRevision, planId, jobId }).review,
+      'Period summary application preview');
+  }
 
   async function listBackgroundPolicies(expectedPrivacyEpoch: number, afterPolicyId?: string): Promise<readonly BackgroundPolicyDisplay[]> {
     assertUsable();
@@ -791,6 +798,7 @@ export function createWebWorkspaceClient(session: AuthenticatedSession, options:
     readDispatchReview,
     readReplyBatchReview,
     readPeriodSummaryResult,
+    readPeriodSummaryApplicationPreview,
     listBackgroundPolicies,
     saveBackgroundPolicy,
     pauseBackgroundPolicy,
@@ -900,6 +908,12 @@ function expectedReceiptFor(envelope: WorkspaceCommandEnvelope) {
       return { commandId: envelope.commandId, kind: command.kind, objectId: command.jobId, jobId: command.jobId };
     case 'assistant.periodSummary.moreCompute.cancel':
       return { commandId: envelope.commandId, kind: command.kind, objectId: command.planId, planId: command.planId };
+    case 'assistant.periodSummary.application.prepare':
+      return { commandId: envelope.commandId, kind: command.kind, objectId: command.jobId, jobId: command.jobId };
+    case 'assistant.periodSummary.application.cancel':
+      return { commandId: envelope.commandId, kind: command.kind, objectId: command.planId, planId: command.planId };
+    case 'assistant.periodSummary.application.apply':
+      return { commandId: envelope.commandId, kind: command.kind, objectId: command.jobId, jobId: command.jobId };
     case 'chat.submit':
       return { commandId: envelope.commandId, kind: command.kind, objectId: command.conversationId };
     case 'chat.refine':

@@ -319,6 +319,20 @@ export async function dispatchWorkspaceCommand(runtime: OwnedWorkspaceRuntime, a
         controller.cancelPeriodSummaryMoreCompute(command.planId);
         return receipt(envelope, command, { objectId: command.planId, planId: command.planId });
       }
+      case 'assistant.periodSummary.application.prepare': {
+        const prepared = await controller.preparePeriodSummaryApplication({ jobId: command.jobId });
+        return receipt(envelope, command, { objectId: command.jobId, jobId: command.jobId,
+          ...(prepared.kind === 'applied' ? { application: prepared } : { applicationPlan: prepared }) });
+      }
+      case 'assistant.periodSummary.application.cancel': {
+        controller.cancelPeriodSummaryApplication(command.planId);
+        return receipt(envelope, command, { objectId: command.planId, planId: command.planId });
+      }
+      case 'assistant.periodSummary.application.apply': {
+        const applied = await controller.applyPeriodSummary({ planId: command.planId, jobId: command.jobId });
+        return receipt(envelope, command, { objectId: command.jobId, jobId: command.jobId,
+          path: applied.path, documentRevision: applied.documentRevision, appliedAt: applied.appliedAt });
+      }
       case 'chat.submit': {
         const accepted = await controller.submitChatTurn({ conversationId: command.conversationId, text: command.text,
           knowledgeSelection: command.knowledgeSelection?.map(({ kind, id }) => ({ kind, id })) });
@@ -388,6 +402,9 @@ function receipt(envelope: WorkspaceCommandEnvelope, command: WorkspaceCommand, 
   readonly captureTimeZone?: string; readonly conversationId?: string;
   readonly outcome?: 'submitted' | 'not_submitted'; readonly reason?: 'plan_unavailable';
   readonly plan?: import('../core').PeriodSummaryMoreComputePlan;
+  readonly applicationPlan?: import('../core').PeriodSummaryApplicationPlan;
+  readonly application?: import('../core').PeriodSummaryApplicationReceipt;
+  readonly path?: string; readonly appliedAt?: string;
 }) {
   return parseWorkspaceCommandReceipt({ schemaVersion: 1, commandId: envelope.commandId, kind: command.kind, ...fields },
     expectedReceipt(envelope.commandId, command));
@@ -458,6 +475,9 @@ function expectedReceipt(commandId: string, command: WorkspaceCommand) {
     case 'assistant.periodSummary.moreCompute.prepare': return { commandId, kind: command.kind, objectId: command.jobId, jobId: command.jobId };
     case 'assistant.periodSummary.moreCompute.submit': return { commandId, kind: command.kind, objectId: command.jobId, jobId: command.jobId };
     case 'assistant.periodSummary.moreCompute.cancel': return { commandId, kind: command.kind, objectId: command.planId, planId: command.planId };
+    case 'assistant.periodSummary.application.prepare': return { commandId, kind: command.kind, objectId: command.jobId, jobId: command.jobId };
+    case 'assistant.periodSummary.application.cancel': return { commandId, kind: command.kind, objectId: command.planId, planId: command.planId };
+    case 'assistant.periodSummary.application.apply': return { commandId, kind: command.kind, objectId: command.jobId, jobId: command.jobId };
     case 'chat.submit': return { commandId, kind: command.kind, objectId: command.conversationId };
     case 'chat.refine': return { commandId, kind: command.kind, objectId: command.conversationId, parentTurnId: command.parentTurnId };
     default: return assertNever(command);

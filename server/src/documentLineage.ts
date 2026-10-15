@@ -91,6 +91,37 @@ export class DocumentLineage {
     if (scope.snapshot_revision !== context.revision) throw new Error('document_lineage_snapshot_stale');
   }
 
+  /** Reads the resulting incarnation only after the lineage participant has committed the next snapshot. */
+  readCommittedDestinationWithinTransaction(context: OwnedTransactionContext, path: string, nextRevision: number): CapturedDocumentDestination {
+    this.kernel.assertOwnedTransactionContext(context);
+    if (context.workspaceId !== this.#identity.workspaceId || context.ownerId !== this.#identity.ownerId ||
+        context.privacyEpoch !== this.#identity.privacyEpoch || !Number.isSafeInteger(nextRevision) ||
+        nextRevision !== context.revision + 1 || !context.db.inTransaction) throw new Error('document_lineage_context_rejected');
+    validateDocumentPath(path);
+    const workspace = context.db.prepare(`SELECT id,owner_id,revision,privacy_epoch,snapshot_json FROM workspaces WHERE id=?`)
+      .get(context.workspaceId) as { id: string; owner_id: string; revision: number; privacy_epoch: number; snapshot_json: string } | undefined;
+    if (!workspace || workspace.id !== this.#identity.workspaceId || workspace.owner_id !== this.#identity.ownerId ||
+        workspace.privacy_epoch !== this.#identity.privacyEpoch || workspace.revision !== nextRevision) {
+      throw new Error('document_lineage_committed_snapshot_mismatch');
+    }
+    let snapshot: unknown;
+    try { snapshot = JSON.parse(workspace.snapshot_json); } catch { throw new Error('document_lineage_snapshot_invalid'); }
+    if (canonicalJson(snapshot) !== workspace.snapshot_json) throw new Error('document_lineage_snapshot_invalid');
+    const documents = projectDocuments(snapshot);
+    const scope = this.#scopeRow(context);
+    if (!scope || scope.snapshot_revision !== nextRevision) throw new Error('document_lineage_snapshot_stale');
+    this.#validateHeadsAgainstSnapshot(context, documents);
+    const document = documents.find((item) => item.path === path);
+    const head = this.#head(context, path);
+    if (!document || !head || !head.document_id || !UUID_V4.test(head.document_id) ||
+        head.document_revision !== document.revision || head.content_sha256 !== document.contentSha256 ||
+        !Number.isSafeInteger(head.absence_generation) || head.absence_generation < 0) {
+      throw new Error('document_lineage_head_invalid');
+    }
+    return Object.freeze({ ...this.#identity, path, documentId: head.document_id, expectedRevision: document.revision,
+      expectedAbsenceGeneration: null });
+  }
+
   /**
    * Records a one-context identity proof for a human-authorized replacement. Call only from a
    * purpose-specific trusted precommit hook in the same composed save transaction, before this
