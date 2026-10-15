@@ -18,6 +18,7 @@ import { useCloudCredentials } from './useCloudCredentials';
 import { CloudOAuthCoordinator, type CloudOAuthState } from './cloudOAuthCoordinator';
 import { CloudMailCoordinator, type CloudMailCoordinatorState } from './cloudMailCoordinator';
 import { CloudTranscriptTransferCoordinator, type CloudTranscriptTransferState } from './cloudTranscriptTransferCoordinator';
+import { CloudBackgroundPolicyCoordinator, type CloudBackgroundPolicyState } from './cloudBackgroundPolicyCoordinator';
 
 export type CloudWorkspaceSessionState = Readonly<{
   status: 'loading' | 'ready' | 'error';
@@ -28,6 +29,7 @@ export type CloudWorkspaceSessionState = Readonly<{
   oauth?: CloudOAuthState;
   mail?: CloudMailCoordinatorState;
   transcriptTransfer?: CloudTranscriptTransferState;
+  backgroundPolicies?: CloudBackgroundPolicyState;
   refreshRequired: boolean;
   error?: string;
 }>;
@@ -48,6 +50,8 @@ export class CloudWorkspaceSessionStore {
   private unsubscribeMail?: () => void;
   private transcriptTransferCoordinator?: CloudTranscriptTransferCoordinator;
   private unsubscribeTranscriptTransfer?: () => void;
+  private backgroundPolicyCoordinator?: CloudBackgroundPolicyCoordinator;
+  private unsubscribeBackgroundPolicies?: () => void;
   private ownerGeneration = 0;
   private active = false;
   private operationInFlight = false;
@@ -80,17 +84,21 @@ export class CloudWorkspaceSessionStore {
   };
 
   private publish(next: CloudWorkspaceSessionState): void {
-    const { voice: _callerVoice, oauth: _callerOAuth, mail: _callerMail, transcriptTransfer: _callerTranscriptTransfer, ...withoutCallerOwnedState } = next;
+    const { voice: _callerVoice, oauth: _callerOAuth, mail: _callerMail, transcriptTransfer: _callerTranscriptTransfer,
+      backgroundPolicies: _callerBackgroundPolicies, ...withoutCallerOwnedState } = next;
     void _callerVoice;
     void _callerOAuth;
     void _callerMail;
     void _callerTranscriptTransfer;
+    void _callerBackgroundPolicies;
     const coordinator = this.active ? this.voiceCoordinator : undefined;
     const voice = coordinator?.getSnapshot();
     const oauth = this.active ? this.oauthCoordinator?.getSnapshot() : undefined;
     const mail = this.active ? this.mailCoordinator?.getSnapshot() : undefined;
     const transcriptTransfer = this.active ? this.transcriptTransferCoordinator?.getSnapshot() : undefined;
-    this.value = Object.freeze({ ...withoutCallerOwnedState, ...(voice ? { voice } : {}), ...(oauth ? { oauth } : {}), ...(mail ? { mail } : {}), ...(transcriptTransfer ? { transcriptTransfer } : {}) });
+    const backgroundPolicies = this.active ? this.backgroundPolicyCoordinator?.getSnapshot() : undefined;
+    this.value = Object.freeze({ ...withoutCallerOwnedState, ...(voice ? { voice } : {}), ...(oauth ? { oauth } : {}), ...(mail ? { mail } : {}),
+      ...(transcriptTransfer ? { transcriptTransfer } : {}), ...(backgroundPolicies ? { backgroundPolicies } : {}) });
     for (const listener of this.listeners) listener();
   }
 
@@ -162,6 +170,23 @@ export class CloudWorkspaceSessionStore {
         this.publish({ ...this.value, transcriptTransfer: transcriptTransferCoordinator.getSnapshot() });
       }
     });
+    const backgroundPolicyCoordinator = new CloudBackgroundPolicyCoordinator({
+      readSnapshot: () => this.isCurrent(owner) ? this.value.snapshot : undefined,
+      readOperation: () => ({ busy: this.value.busy, pending: Boolean(this.value.pendingCommand), refreshRequired: this.value.refreshRequired }),
+      list: (expectedEpoch, afterPolicyId) => this.runBackgroundPolicyOperation(false,
+        (client) => client.listBackgroundPolicies(expectedEpoch, afterPolicyId)),
+      save: (envelope) => this.runBackgroundPolicyOperation(true, (client) => client.saveBackgroundPolicy(envelope)),
+      pause: (envelope) => this.runBackgroundPolicyOperation(true, (client) => client.pauseBackgroundPolicy(envelope)),
+      revoke: (envelope) => this.runBackgroundPolicyOperation(true, (client) => client.revokeBackgroundPolicy(envelope)),
+      inspect: (commandId, expectedEpoch) => this.runBackgroundPolicyOperation(false,
+        (client) => client.inspectBackgroundPolicyReceipt(commandId, expectedEpoch)),
+    });
+    this.backgroundPolicyCoordinator = backgroundPolicyCoordinator;
+    this.unsubscribeBackgroundPolicies = backgroundPolicyCoordinator.subscribe(() => {
+      if (this.isCurrent(owner) && this.backgroundPolicyCoordinator === backgroundPolicyCoordinator) {
+        this.publish({ ...this.value, backgroundPolicies: backgroundPolicyCoordinator.getSnapshot() });
+      }
+    });
     if (getCapture) {
       this.audioClient = createWebAudioUploadClient(this.session, {
         assertCurrent: () => { if (!this.isCurrent(owner)) throw new Error('Cloud workspace owner changed.'); },
@@ -201,6 +226,10 @@ export class CloudWorkspaceSessionStore {
   }
 
   private disposeResources(): void {
+    this.unsubscribeBackgroundPolicies?.();
+    this.unsubscribeBackgroundPolicies = undefined;
+    this.backgroundPolicyCoordinator?.dispose();
+    this.backgroundPolicyCoordinator = undefined;
     this.unsubscribeMail?.();
     this.unsubscribeMail = undefined;
     this.mailCoordinator?.dispose();
@@ -228,6 +257,32 @@ export class CloudWorkspaceSessionStore {
     return this.client;
   }
 
+  private async runBackgroundPolicyOperation<T>(mutating: boolean, work: (client: WorkspaceClient) => Promise<T>): Promise<T> {
+    const owner = this.ownerGeneration;
+    const current = this.value.snapshot;
+    if (!current || current.workspaceId !== this.session.workspaceId || current.privacyEpoch !== this.session.privacyEpoch) {
+      throw new WorkspaceCommandNotStartedError('Refresh the current workspace before managing background policies.');
+    }
+    if (mutating && (this.value.pendingCommand || this.value.refreshRequired)) {
+      throw new WorkspaceCommandNotStartedError('Resolve the current workspace command or refresh before changing a background policy.');
+    }
+    let operation: number;
+    try { operation = this.beginOperation(); }
+    catch (error) {
+      if (error instanceof WorkspaceClientError && error.kind === 'busy') throw new WorkspaceCommandNotStartedError(error.message);
+      throw error;
+    }
+    this.publish({ ...this.value, busy: true, error: undefined });
+    try {
+      const result = await work(this.currentClient());
+      const latest = this.value.snapshot;
+      if (!this.isCurrent(owner) || !latest || latest.workspaceId !== current.workspaceId || latest.privacyEpoch !== current.privacyEpoch) {
+        throw new WorkspaceClientError('stale', 'The workspace changed while managing background policies.');
+      }
+      return result;
+    } finally { this.finishOperation(operation, owner); }
+  }
+
   private currentVoiceCoordinator(): CloudVoiceCoordinator {
     if (!this.active || !this.voiceCoordinator) {
       throw new WorkspaceClientError('disposed', 'This workspace voice session is no longer active.');
@@ -248,6 +303,11 @@ export class CloudWorkspaceSessionStore {
   getTranscriptTransferCoordinator(): CloudTranscriptTransferCoordinator | undefined {
     if (!this.active) return undefined;
     return this.transcriptTransferCoordinator;
+  }
+
+  getBackgroundPolicyCoordinator(): CloudBackgroundPolicyCoordinator | undefined {
+    if (!this.active) return undefined;
+    return this.backgroundPolicyCoordinator;
   }
 
   async cancelTranscription(commandId: string): Promise<'cancellation_requested' | 'not_running'> {
@@ -512,7 +572,7 @@ export function CloudWorkspaceSession({ session, onLogout }: { session: Authenti
     );
   }
 
-  return <CloudWorkspace store={store} state={state} onLogout={() => { store.invalidate(); onLogout(); }} credentials={credentials} oauthCoordinator={store.getOAuthCoordinator()} mailCoordinator={store.getMailCoordinator()} transcriptTransferCoordinator={store.getTranscriptTransferCoordinator()} voiceCapability={state.voice ? {
+  return <CloudWorkspace store={store} state={state} onLogout={() => { store.invalidate(); onLogout(); }} credentials={credentials} oauthCoordinator={store.getOAuthCoordinator()} mailCoordinator={store.getMailCoordinator()} transcriptTransferCoordinator={store.getTranscriptTransferCoordinator()} backgroundPolicyCoordinator={store.getBackgroundPolicyCoordinator()} voiceCapability={state.voice ? {
     available: true,
     capture: { status: capture.status, canResume: capture.canResume, durationSeconds: capture.durationSeconds,
       meter: capture.meter, hasPending: capture.hasPending, ...(capture.statusLabel ? { statusLabel: capture.statusLabel } : {}),

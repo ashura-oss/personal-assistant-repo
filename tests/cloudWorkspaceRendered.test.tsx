@@ -2589,3 +2589,33 @@ describe('CloudWorkspace safe DTO presentation', () => {
     expect(host.textContent).not.toContain('Document saved.');
   });
 });
+
+describe('cloud background policy session operation ownership', () => {
+  it('rehydrates held policy UI state across global busy publishes', async () => {
+    const state = createInitialWorkspaceState(() => '11111111-1111-4111-8111-111111111111');
+    const initial = createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: 1 });
+    let releaseList!: (value: readonly unknown[]) => void;
+    const waitingList = new Promise<readonly unknown[]>((resolve) => { releaseList = resolve; });
+    const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url === '/api/workspace/snapshot' && init?.method === 'GET') return { ok: true, status: 200, json: async () => initial };
+      if (url.startsWith('/api/workspace/background/policies?') && init?.method === 'GET') return { ok: true, status: 200, json: async () => waitingList };
+      throw new Error(`Unexpected request ${init?.method ?? 'GET'} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetcher);
+    const store = new CloudWorkspaceSessionStore({ authenticated: true, workspaceId, privacyEpoch: 3, csrfToken: 'csrf' });
+    const stop = store.start();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const coordinator = store.getBackgroundPolicyCoordinator();
+    expect(coordinator).toBeDefined();
+    const loading = coordinator!.loadFirstPage();
+    expect(store.getSnapshot().busy).toBe(true);
+    expect(store.getSnapshot().backgroundPolicies?.loading).toBe(true);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    releaseList([]);
+    await loading;
+    expect(store.getSnapshot().busy).toBe(false);
+    expect(store.getSnapshot().backgroundPolicies?.loaded).toBe(true);
+    stop();
+  });
+});

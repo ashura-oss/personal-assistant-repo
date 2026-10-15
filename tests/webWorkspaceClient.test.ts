@@ -704,3 +704,39 @@ describe('same-origin web workspace command client', () => {
     client.dispose();
   });
 });
+
+describe('browser background policy client', () => {
+  const policyRequest = Object.freeze({ commandId: 'c3b6fe88-e724-4ec6-988c-e62d3ecad231', expectedPrivacyEpoch: 3,
+    policyId: '398fbff1-829f-4e4d-87ec-c41be72886a2', expectedPolicyRevision: 0, enabled: true,
+    specification: { kind: 'account_sync' as const,
+      accounts: [{ accountId: 'ab31b707-9582-41bb-8cbb-a4a1c26df667', expectedConnectionGeneration: 7 }], resources: ['mail' as const], intervalMinutes: 5 } });
+  const policyReceipt = (commandId: string = policyRequest.commandId) => ({ schemaVersion: 1, commandId, operation: 'save', policyId: policyRequest.policyId,
+    policyRevision: 1, status: 'enabled', effectiveFrom: 100 });
+
+  it('validates and canonically sends explicit policy consent with same-origin CSRF', async () => {
+    const fetcher = vi.fn(async (_input: string, _init: RequestInit) => body(policyReceipt()));
+    const client = makeClient(fetcher);
+    await expect(client.saveBackgroundPolicy(policyRequest)).resolves.toMatchObject({ commandId: policyRequest.commandId, status: 'enabled' });
+    const [path, init] = fetcher.mock.calls[0] as unknown as [string, RequestInit];
+    expect(path).toBe('/api/workspace/background/policies');
+    expect(init.credentials).toBe('same-origin');
+    expect(init.redirect).toBe('error');
+    expect(new Headers(init.headers).get('X-Still-CSRF')).toBe('private-csrf');
+    expect(JSON.parse(String(init.body))).toEqual(policyRequest);
+  });
+
+  it('does not dispatch stale or structurally invalid policy envelopes', async () => {
+    const fetcher = vi.fn(async () => body(policyReceipt()));
+    const client = makeClient(fetcher);
+    await expect(client.saveBackgroundPolicy({ ...policyRequest, expectedPrivacyEpoch: 4 })).rejects.toBeInstanceOf(WorkspaceCommandNotStartedError);
+    await expect(client.saveBackgroundPolicy({ ...policyRequest, unexpected: true } as never)).rejects.toBeInstanceOf(WorkspaceCommandNotStartedError);
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it('turns a receipt for another command into an unknown result bound to the submitted ID', async () => {
+    const fetcher = vi.fn(async () => body(policyReceipt('59fd1937-e811-4ed3-ab9e-13e17e0e57e8')));
+    const client = makeClient(fetcher);
+    await expect(client.saveBackgroundPolicy(policyRequest)).rejects.toMatchObject({ name: 'WorkspaceCommandUnknownError', commandId: policyRequest.commandId,
+      reason: 'invalid_acknowledgement' });
+  });
+});

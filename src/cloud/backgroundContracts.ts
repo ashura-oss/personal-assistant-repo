@@ -2,6 +2,7 @@ export {
   BACKGROUND_CONTRACT_VERSION,
   BACKGROUND_PUBLIC_PAGE_MAX,
   BACKGROUND_REQUEST_MAX_BYTES,
+  canonicalBackgroundJson,
   isBackgroundUuidV4,
   isCanonicalBackgroundUuid,
   parseBackgroundOccurrenceDisplay,

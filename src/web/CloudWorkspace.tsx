@@ -29,6 +29,7 @@ import { useCloudOAuth } from './useCloudOAuth';
 import type { CloudOAuthCoordinator } from './cloudOAuthCoordinator';
 import type { CloudMailCoordinator } from './cloudMailCoordinator';
 import type { CloudTranscriptTransferCoordinator, CloudTranscriptTransferState } from './cloudTranscriptTransferCoordinator';
+import type { CloudBackgroundPolicyCoordinator } from './cloudBackgroundPolicyCoordinator';
 import { CloudMailWorkspace } from './CloudMailWorkspace';
 import { InboxWorkspaceContent, inboxAccountDisplay } from '../ui/InboxWorkspaceContent';
 import { AssistantBatchJobCard } from '../ui/AssistantBatchJobCard';
@@ -107,7 +108,7 @@ function equalSettingsBaseline(left: WorkspaceSettingsBaseline, right: Workspace
     left.maxAudioSeconds === right.maxAudioSeconds && left.retention === right.retention;
 }
 
-export function CloudWorkspace({ store, state, onLogout, voiceCapability, credentials, oauthCoordinator, mailCoordinator, transcriptTransferCoordinator }: { store: Pick<CloudWorkspaceSessionStore, 'getSnapshot' | 'execute' | 'inspect' | 'refresh'> & Partial<Pick<CloudWorkspaceSessionStore, 'readKnowledgeSourceChoices' | 'readKnowledgeSuggestionReview'>>; state: CloudWorkspaceSessionState; onLogout: () => void; voiceCapability?: CloudWorkspaceVoiceCapability; credentials?: CloudCredentialController; oauthCoordinator?: CloudOAuthCoordinator; mailCoordinator?: CloudMailCoordinator; transcriptTransferCoordinator?: CloudTranscriptTransferCoordinator }) {
+export function CloudWorkspace({ store, state, onLogout, voiceCapability, credentials, oauthCoordinator, mailCoordinator, transcriptTransferCoordinator, backgroundPolicyCoordinator }: { store: Pick<CloudWorkspaceSessionStore, 'getSnapshot' | 'execute' | 'inspect' | 'refresh'> & Partial<Pick<CloudWorkspaceSessionStore, 'readKnowledgeSourceChoices' | 'readKnowledgeSuggestionReview'>>; state: CloudWorkspaceSessionState; onLogout: () => void; voiceCapability?: CloudWorkspaceVoiceCapability; credentials?: CloudCredentialController; oauthCoordinator?: CloudOAuthCoordinator; mailCoordinator?: CloudMailCoordinator; transcriptTransferCoordinator?: CloudTranscriptTransferCoordinator; backgroundPolicyCoordinator?: CloudBackgroundPolicyCoordinator }) {
   const oauthState = useCloudOAuth(oauthCoordinator);
   const transcriptTransferState = useSyncExternalStore(transcriptTransferCoordinator?.subscribe ?? EMPTY_TRANSCRIPT_SUBSCRIBE,
     transcriptTransferCoordinator?.getSnapshot ?? (() => EMPTY_TRANSCRIPT_TRANSFER),
@@ -364,6 +365,10 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
     busy: state.busy || state.refreshRequired,
     onAction: (accountId: string, action: 'accounts.refreshMail' | 'accounts.continueMailBackfill' | 'accounts.syncCalendars' | 'accounts.disconnect') => { void mailCoordinator.runAccountAction(accountId, action); },
   } : { available: false as const, reason: 'Mail and calendar actions are not available in this workspace session.' };
+  const settingsBackgroundPolicyCapability = backgroundPolicyCoordinator ? {
+    available: true as const, coordinator: backgroundPolicyCoordinator, state: state.backgroundPolicies ?? backgroundPolicyCoordinator.getSnapshot(),
+    accounts: dto.accounts, busy: state.busy, blocked: Boolean(state.pendingCommand || state.refreshRequired),
+  } : { available: false as const, reason: 'Background policy controls are unavailable in this workspace session.' };
   const saveSettings = async () => {
     const draft = settingsDraft;
     const baseline = settingsBaseline;
@@ -721,11 +726,12 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
         preferencesMessage={settingsFormMessage ?? (settingsConflict ? settingsUnavailableReason : settingsSaving ? 'Saving settings…' : undefined)}
         connectionCapability={connectionCapability}
         mailCapability={settingsMailCapability}
+        backgroundPolicyCapability={settingsBackgroundPolicyCapability}
         credentials={credentials
           ? { available: true, controller: credentials }
           : { available: false, reason: 'Provider credentials are unavailable in this workspace view.' } satisfies WorkspaceSettingsCredentialCapability}
         onReloadPreferences={settingsConflict || settingsNeedsReload || state.refreshRequired ? reloadSettings : undefined}
-        busy={state.busy || settingsSaving} onClose={closeSettings}
+        busy={state.busy || settingsSaving} allowCloseWhileBusy={Boolean(state.backgroundPolicies?.heldCommand)} onClose={closeSettings}
       /> : tab === 'chat' ? (
         <ChatSection
           storageLocation="server"

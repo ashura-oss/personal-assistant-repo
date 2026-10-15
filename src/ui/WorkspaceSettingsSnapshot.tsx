@@ -8,6 +8,8 @@ import type { CloudCredentialController } from '../web/useCloudCredentials';
 import { CloudCredentialsPanel } from './CloudCredentialsPanel';
 import { CloudConnectionsPanel, type CloudConnectionsCapability } from './CloudConnectionsPanel';
 import type { WorkspaceAccountDTO, WorkspaceSyncStateDTO } from '../cloud/workspaceDto';
+import { CloudBackgroundPolicies, type CloudBackgroundPolicyAccount } from '../web/CloudBackgroundPolicies';
+import type { CloudBackgroundPolicyCoordinator, CloudBackgroundPolicyState } from '../web/cloudBackgroundPolicyCoordinator';
 
 export type WorkspaceSettingsDisplay = WorkspaceSnapshotDTO['state'];
 export type WorkspaceSettingsAction = Readonly<{ available: true; action: () => void | Promise<void> }> | Readonly<{ available: false; reason: string }>;
@@ -23,6 +25,8 @@ export type WorkspaceSettingsConnectionCapability = CloudConnectionsCapability;
 export type WorkspaceSettingsMailCapability = Readonly<{ available: true; accounts: readonly Readonly<Pick<WorkspaceAccountDTO, 'id' | 'provider' | 'displayName' | 'email' | 'connected' | 'authStatus' | 'connectionGeneration'>>[];
   syncStates: Readonly<Record<string, WorkspaceSyncStateDTO>>; busy: boolean; onAction: (accountId: string, action: 'accounts.refreshMail' | 'accounts.continueMailBackfill' | 'accounts.syncCalendars' | 'accounts.disconnect') => void }> |
   Readonly<{ available: false; reason: string }>;
+export type WorkspaceSettingsBackgroundPolicyCapability = Readonly<{ available: true; coordinator: CloudBackgroundPolicyCoordinator;
+  state: CloudBackgroundPolicyState; accounts: readonly CloudBackgroundPolicyAccount[]; busy: boolean; blocked: boolean }> | Readonly<{ available: false; reason: string }>;
 
 function Unavailable({ capability }: { capability: WorkspaceSettingsAction }) {
   return capability.available ? null : <Text style={styles.meta}>{capability.reason}</Text>;
@@ -34,7 +38,7 @@ function CapabilityButton({ label, capability, busy }: { label: string; capabili
     : <Unavailable capability={capability} />;
 }
 
-export function WorkspaceSettingsScreen({ display, actions, busy, onClose, preferencesDraft, preferencesMessage, onReloadPreferences, credentials, connectionCapability, mailCapability }: { display: WorkspaceSettingsDisplay; actions: WorkspaceSettingsActions; busy: boolean; onClose: () => void; preferencesDraft?: WorkspaceSettingsDraft; preferencesMessage?: string; onReloadPreferences?: () => void; credentials?: WorkspaceSettingsCredentialCapability; connectionCapability?: WorkspaceSettingsConnectionCapability; mailCapability?: WorkspaceSettingsMailCapability }) {
+export function WorkspaceSettingsScreen({ display, actions, busy, onClose, preferencesDraft, preferencesMessage, onReloadPreferences, credentials, connectionCapability, mailCapability, backgroundPolicyCapability, allowCloseWhileBusy }: { display: WorkspaceSettingsDisplay; actions: WorkspaceSettingsActions; busy: boolean; onClose: () => void; preferencesDraft?: WorkspaceSettingsDraft; preferencesMessage?: string; onReloadPreferences?: () => void; credentials?: WorkspaceSettingsCredentialCapability; connectionCapability?: WorkspaceSettingsConnectionCapability; mailCapability?: WorkspaceSettingsMailCapability; backgroundPolicyCapability?: WorkspaceSettingsBackgroundPolicyCapability; allowCloseWhileBusy?: boolean }) {
   const settings = display.settings;
   const activeRules = display.proactive.rules.filter((rule) => rule.enabled).length;
   const pendingSuggestions = display.knowledge.suggestions.filter((suggestion) => suggestion.status === 'pending').length;
@@ -42,7 +46,7 @@ export function WorkspaceSettingsScreen({ display, actions, busy, onClose, prefe
   const runningJobs = display.assistantBatchJobs.filter((job) => job.status === 'preparing' || job.status === 'submitting' || job.status === 'submission_unknown' || job.status === 'queued' || job.status === 'processing').length;
   return <ScrollView contentContainerStyle={s.scroll}>
     <View style={s.modalHeader}>
-      <Button label="Close settings" tone="quiet" disabled={busy} onPress={onClose} />
+      <Button label="Close settings" tone="quiet" disabled={busy && !allowCloseWhileBusy} onPress={onClose} />
       <Text style={s.modalTitle}>Settings</Text>
       <View style={{ width: 46 }} />
     </View>
@@ -64,7 +68,6 @@ export function WorkspaceSettingsScreen({ display, actions, busy, onClose, prefe
       <Text style={styles.meta}>Text provider · {settings.llmProvider ?? 'not configured'} · {settings.openRouterModel ?? 'model not selected'}</Text>
       <Text style={styles.meta}>Reasoning effort · {settings.openRouterReasoningEffort ?? 'not set'}</Text>
       <Text style={styles.meta}>Time zone · {settings.timezone}</Text>
-      <Text style={styles.meta}>Background mail refresh · {settings.backgroundMailRefreshEnabled ? 'on' : 'off'}</Text>
       <Text style={styles.meta}>Audio retention · {settings.audioRetention}</Text>
       <Text style={styles.meta}>Speech · {settings.speechEnabled ? 'enabled' : 'disabled'} · {settings.speechProvider ?? 'not configured'}</Text>
       <Text style={styles.meta}>Maximum audio · {settings.maxAudioSeconds} seconds</Text>
@@ -90,6 +93,9 @@ export function WorkspaceSettingsScreen({ display, actions, busy, onClose, prefe
         </View>
       </View>) : <Text style={styles.meta}>{mailCapability.reason}</Text>}
     </View> : null}
+    {backgroundPolicyCapability?.available ? <CloudBackgroundPolicies coordinator={backgroundPolicyCapability.coordinator}
+      state={backgroundPolicyCapability.state} accounts={backgroundPolicyCapability.accounts} busy={backgroundPolicyCapability.busy}
+      blocked={backgroundPolicyCapability.blocked} /> : backgroundPolicyCapability ? <Text style={styles.meta}>{backgroundPolicyCapability.reason}</Text> : null}
     {connectionCapability ? <CloudConnectionsPanel capability={connectionCapability} busy={busy} /> : <>
     {display.accounts.map((account) => <View key={account.id} style={styles.card}>
       <Text style={styles.title}>{account.displayName}</Text>

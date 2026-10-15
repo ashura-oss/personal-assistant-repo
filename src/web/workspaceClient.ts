@@ -18,6 +18,9 @@ import { cloudDispatchReviewPath, cloudMailReadPath, cloudProposalReviewPath, cl
   parseCloudDispatchReview, parseCloudMailReplySource, parseCloudMailReplyText, parseCloudProposalReview, parseCloudReplyBatchReview,
   type ReplyBatchPlanRead } from './cloudMailClient';
 import type { DispatchReviewReadDto, MailReplyBatchReviewReadDto, MailReplySourceReadDto, MailReplyTextReadDto, ProposalReviewReadDto } from './mailWorkflowDtos';
+import { BACKGROUND_PUBLIC_PAGE_MAX, canonicalBackgroundJson, parseBackgroundPolicyDisplay, parseBackgroundPolicyReceipt,
+  parsePauseBackgroundPolicyEnvelope, parseRevokeBackgroundPolicyEnvelope, parseSaveBackgroundPolicyEnvelope,
+  type BackgroundPolicyDisplay, type BackgroundPolicyReceipt, type ChangeBackgroundPolicyEnvelope, type SaveBackgroundPolicyEnvelope } from '../cloud/backgroundContracts';
 
 export const WORKSPACE_REQUEST_TIMEOUT_MS = 30_000;
 
@@ -48,6 +51,11 @@ export type WorkspaceClient = Readonly<{
   readProposalReview(proposalId: string, expectedRevision: number): Promise<ProposalReviewReadDto>;
   readDispatchReview(recordId: string, expectedRevision: number): Promise<DispatchReviewReadDto>;
   readReplyBatchReview(plan: ReplyBatchPlanRead, expectedRevision: number): Promise<MailReplyBatchReviewReadDto>;
+  listBackgroundPolicies(expectedPrivacyEpoch: number, afterPolicyId?: string): Promise<readonly BackgroundPolicyDisplay[]>;
+  saveBackgroundPolicy(envelope: SaveBackgroundPolicyEnvelope): Promise<BackgroundPolicyReceipt>;
+  pauseBackgroundPolicy(envelope: ChangeBackgroundPolicyEnvelope): Promise<BackgroundPolicyReceipt>;
+  revokeBackgroundPolicy(envelope: ChangeBackgroundPolicyEnvelope): Promise<BackgroundPolicyReceipt>;
+  inspectBackgroundPolicyReceipt(commandId: string, expectedPrivacyEpoch: number): Promise<BackgroundPolicyReceipt | undefined>;
   execute(command: WorkspaceCommand, onAdmitted?: (envelope: WorkspaceCommandAdmission) => void): Promise<WorkspaceCommandResponse>;
   inspectCommand(commandId?: string): Promise<WorkspaceCommandResponse>;
   inspectRecoveredCommand(entry: WorkspaceCommandHistoryEntry): Promise<WorkspaceCommandResponse>;
@@ -102,7 +110,7 @@ function defaultFetch(): FetchLike {
   return globalThis.fetch.bind(globalThis) as FetchLike;
 }
 
-function makeCommandId(): string {
+export function createWorkspaceCommandId(): string {
   const cryptoApi = globalThis.crypto;
   if (typeof cryptoApi?.randomUUID === 'function') return cryptoApi.randomUUID();
   if (typeof cryptoApi?.getRandomValues !== 'function') throw new WorkspaceClientError('network', 'A secure command identifier is unavailable.');
@@ -112,6 +120,8 @@ function makeCommandId(): string {
   const hex = [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
+
+const makeCommandId = createWorkspaceCommandId;
 
 function fixedHttpMessage(status: number): string {
   if (status === 401 || status === 403) return 'Your workspace session needs to be checked before continuing.';
@@ -327,6 +337,95 @@ export function createWebWorkspaceClient(session: AuthenticatedSession, options:
     assertSavedReadRevision(expectedRevision);
     return readSavedWorkflow(cloudReplyBatchReviewPath(plan, { expectedRevision, expectedPrivacyEpoch: privacyEpoch }), expectedRevision,
       (raw) => parseCloudReplyBatchReview(raw, { workspaceId, privacyEpoch, revision: expectedRevision }, plan), 'Reply review');
+  }
+
+  async function listBackgroundPolicies(expectedPrivacyEpoch: number, afterPolicyId?: string): Promise<readonly BackgroundPolicyDisplay[]> {
+    assertUsable();
+    if (expectedPrivacyEpoch !== privacyEpoch || !isGeneration(expectedPrivacyEpoch) ||
+        (afterPolicyId !== undefined && !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(afterPolicyId))) {
+      throw new WorkspaceClientError('stale', 'Refresh the workspace before listing background policies.');
+    }
+    const ticket = beginOperation();
+    const query = new URLSearchParams({ expectedPrivacyEpoch: String(privacyEpoch), limit: String(BACKGROUND_PUBLIC_PAGE_MAX) });
+    if (afterPolicyId) query.set('afterPolicyId', afterPolicyId);
+    const raw = await request(`/api/workspace/background/policies?${query.toString()}`, { method: 'GET' }, ticket);
+    assertOperation(ticket);
+    try {
+      if (!Array.isArray(raw) || raw.length > BACKGROUND_PUBLIC_PAGE_MAX) throw new Error('invalid_page');
+      const page = raw.map((value) => parseBackgroundPolicyDisplay(value));
+      if (new Set(page.map((policy) => policy.policyId)).size !== page.length) throw new Error('duplicate_policy');
+      if (page.some((policy, index) => policy.policyId <= (index === 0 ? afterPolicyId ?? '' : page[index - 1]!.policyId))) throw new Error('unordered_policy_page');
+      return Object.freeze(page);
+    } catch { throw new WorkspaceClientError('malformed', 'The background policy list could not be confirmed.'); }
+  }
+
+  async function postBackgroundPolicy(path: '/api/workspace/background/policies' | '/api/workspace/background/policies/pause' |
+    '/api/workspace/background/policies/revoke', envelope: SaveBackgroundPolicyEnvelope | ChangeBackgroundPolicyEnvelope): Promise<BackgroundPolicyReceipt> {
+    assertUsable();
+    let parsed: SaveBackgroundPolicyEnvelope | ChangeBackgroundPolicyEnvelope;
+    try {
+      parsed = path.endsWith('/pause') ? parsePauseBackgroundPolicyEnvelope(envelope)
+        : path.endsWith('/revoke') ? parseRevokeBackgroundPolicyEnvelope(envelope)
+          : parseSaveBackgroundPolicyEnvelope(envelope);
+      if (parsed.expectedPrivacyEpoch !== privacyEpoch) throw new Error('stale_privacy_epoch');
+    } catch {
+      throw new WorkspaceCommandNotStartedError('The background policy request could not be validated for this workspace. Review it before trying again.');
+    }
+    const ticket = beginOperation();
+    let dispatched = false;
+    try {
+      const raw = await request(path, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Still-CSRF': session.csrfToken },
+        body: canonicalBackgroundJson(parsed) }, ticket, () => { dispatched = true; });
+      assertOperation(ticket);
+      try {
+        const receipt = parseBackgroundPolicyReceipt(raw);
+        if (receipt.commandId !== parsed.commandId) throw new Error('command_id_mismatch');
+        return receipt;
+      } catch { throw new WorkspaceCommandUnknownError(parsed.commandId, 'invalid_acknowledgement'); }
+    } catch (error) {
+      if (!dispatched) {
+        if (error instanceof WorkspaceCommandNotStartedError) throw error;
+        throw new WorkspaceCommandNotStartedError('The background policy request was not sent. Review the workspace and try again.');
+      }
+      if (error instanceof WorkspaceCommandUnknownError) throw error;
+      const status = statusFromError(error);
+      const reason = error instanceof WorkspaceClientError && error.kind === 'timeout' ? 'timeout'
+        : error instanceof WorkspaceClientError && error.kind === 'network' ? 'network'
+          : status !== undefined ? 'server_error' : 'invalid_acknowledgement';
+      throw new WorkspaceCommandUnknownError(parsed.commandId, reason);
+    }
+  }
+
+  function saveBackgroundPolicy(envelope: SaveBackgroundPolicyEnvelope): Promise<BackgroundPolicyReceipt> {
+    return postBackgroundPolicy('/api/workspace/background/policies', envelope);
+  }
+  function pauseBackgroundPolicy(envelope: ChangeBackgroundPolicyEnvelope): Promise<BackgroundPolicyReceipt> {
+    return postBackgroundPolicy('/api/workspace/background/policies/pause', envelope);
+  }
+  function revokeBackgroundPolicy(envelope: ChangeBackgroundPolicyEnvelope): Promise<BackgroundPolicyReceipt> {
+    return postBackgroundPolicy('/api/workspace/background/policies/revoke', envelope);
+  }
+
+  async function inspectBackgroundPolicyReceipt(commandId: string, expectedPrivacyEpoch: number): Promise<BackgroundPolicyReceipt | undefined> {
+    assertUsable();
+    let parsedCommandId: string;
+    try { parsedCommandId = parseWorkspaceCommandId(commandId); }
+    catch { throw new WorkspaceClientError('malformed', 'The background policy command ID is invalid.'); }
+    if (expectedPrivacyEpoch !== privacyEpoch || !isGeneration(expectedPrivacyEpoch)) {
+      throw new WorkspaceClientError('stale', 'The workspace changed before the policy receipt could be inspected.');
+    }
+    const ticket = beginOperation();
+    try {
+      const raw = await request(`/api/workspace/background/policy-receipts/${parsedCommandId}?expectedPrivacyEpoch=${privacyEpoch}`, { method: 'GET' }, ticket);
+      assertOperation(ticket);
+      const receipt = parseBackgroundPolicyReceipt(raw);
+      if (receipt.commandId !== parsedCommandId) throw new Error('command_id_mismatch');
+      return receipt;
+    } catch (error) {
+      if (error instanceof WorkspaceClientError && error.status === 404) return undefined;
+      if (error instanceof WorkspaceClientError) throw error;
+      throw new WorkspaceClientError('malformed', 'The background policy receipt could not be confirmed.');
+    }
   }
 
   function parseResponse(value: unknown, expectedCommand?: WorkspaceCommandEnvelope, expectedHistoryKind?: WorkspaceCommandHistoryKind): WorkspaceCommandResponse {
@@ -556,6 +655,11 @@ export function createWebWorkspaceClient(session: AuthenticatedSession, options:
     readProposalReview,
     readDispatchReview,
     readReplyBatchReview,
+    listBackgroundPolicies,
+    saveBackgroundPolicy,
+    pauseBackgroundPolicy,
+    revokeBackgroundPolicy,
+    inspectBackgroundPolicyReceipt,
     execute,
     inspectCommand,
     inspectRecoveredCommand,
