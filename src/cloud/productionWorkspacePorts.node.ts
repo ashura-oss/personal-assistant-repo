@@ -13,6 +13,8 @@ import { BatchObservationIndex } from '../../server/src/batchObservationIndex.js
 import { composeSnapshotCommitParticipants } from '../../server/src/workspaceStore.js';
 import { createBatchObservationSnapshotParticipant } from './batchObservationProjection.node';
 import { createBackgroundPaidMailReplySnapshotParticipant } from './backgroundPaidWork.node';
+import { BackgroundProactiveCandidateIndex } from '../../server/src/backgroundProactiveCandidates.js';
+import { createBackgroundProactiveCandidateSnapshotParticipant } from './backgroundProactiveCandidateProjection.node';
 import { ensurePrivateDirectory } from '../../server/src/config.js';
 import { createNodeProviderResponseLifetimeOwner } from './providerResponseLifetime.node';
 import { createNodeSpeechAudioService } from '../audio/speechUpload.node';
@@ -248,6 +250,7 @@ export function createProductionWorkspacePortsFor(config: Pick<ServerConfig,
     context.store.installSnapshotCommitParticipant(composeSnapshotCommitParticipants([
       { name: 'audio', participant: audioRepo.createSnapshotCommitParticipant() },
       { name: 'batch_observation', participant: createBatchObservationSnapshotParticipant(new BatchObservationIndex(), Date.now) },
+      { name: 'proactive_candidates', participant: createBackgroundProactiveCandidateSnapshotParticipant(new BackgroundProactiveCandidateIndex(kernel), Date.now) },
       { name: 'background_paid_mail_reply', participant: createBackgroundPaidMailReplySnapshotParticipant(kernel, context.journal) },
     ]));
     const speechAudio = createNodeSpeechAudioService(audioRepo);

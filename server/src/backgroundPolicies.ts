@@ -47,9 +47,16 @@ export interface BackgroundPolicyStoreOptions {
   readonly clock?: () => number;
   /** Synchronous wake signal invoked only after the owned policy transaction commits. */
   readonly onCommitted?: (identity: Readonly<{ workspaceId: string; ownerId: string; privacyEpoch: number }>) => void;
+  /** Synchronous candidate-index reconciliation in the same transaction as proactive consent enablement. */
+  readonly onProactivePolicyEnabledWithinTransaction?: (context: OwnedTransactionContext, now: number) => void;
 }
 
 export interface BackgroundAccountSyncCandidate {
+  readonly policy: BackgroundPolicyDisplay;
+  readonly initialEffectiveFrom: number;
+}
+
+export interface BackgroundProactiveDraftCandidate {
   readonly policy: BackgroundPolicyDisplay;
   readonly initialEffectiveFrom: number;
 }
@@ -161,6 +168,7 @@ export class BackgroundPolicyStore {
   readonly #resolver: BackgroundBindingResolver;
   readonly #clock: () => number;
   readonly #onCommitted?: BackgroundPolicyStoreOptions['onCommitted'];
+  readonly #onProactivePolicyEnabledWithinTransaction?: BackgroundPolicyStoreOptions['onProactivePolicyEnabledWithinTransaction'];
 
   constructor(options: BackgroundPolicyStoreOptions) {
     if (!options || !options.kernel || !options.auth || !options.resolver || typeof options.resolver.resolve !== 'function' ||
@@ -168,11 +176,13 @@ export class BackgroundPolicyStore {
         (options.resolver.captureReminderTargets && options.resolver.captureReminderTargets.constructor?.name === 'AsyncFunction')) {
       throw new TypeError('background_policy_store_invalid');
     }
+    if (options.onProactivePolicyEnabledWithinTransaction?.constructor?.name === 'AsyncFunction') throw new TypeError('background_policy_store_invalid');
     this.#kernel = options.kernel;
     this.#auth = options.auth;
     this.#resolver = options.resolver;
     this.#clock = options.clock ?? Date.now;
     this.#onCommitted = options.onCommitted;
+    this.#onProactivePolicyEnabledWithinTransaction = options.onProactivePolicyEnabledWithinTransaction;
   }
 
   /** Pass the authenticated browser's private kernel admission token for each human-consent mutation. */
@@ -210,6 +220,9 @@ export class BackgroundPolicyStore {
         .run(revision, status, now, context.workspaceId, context.ownerId, context.privacyEpoch, envelope.policyId);
       else context.db.prepare(`INSERT INTO background_policy_heads(workspace_id,owner_id,privacy_epoch,policy_id,current_revision,status,suspension,updated_at)
         VALUES(?,?,?,?,?,?,NULL,?)`).run(context.workspaceId, context.ownerId, context.privacyEpoch, envelope.policyId, revision, status, now);
+      if (envelope.enabled && envelope.specification.kind === 'proactive_draft') {
+        this.#onProactivePolicyEnabledWithinTransaction?.(context, now);
+      }
       return this.#saveReceipt(context, envelope.commandId, request, { schemaVersion: 1, commandId: envelope.commandId,
         operation: 'save', policyId: envelope.policyId, policyRevision: revision, status, effectiveFrom });
     });
@@ -260,6 +273,25 @@ export class BackgroundPolicyStore {
       const candidates: BackgroundAccountSyncCandidate[] = [];
       for (const policy of policies) {
         if (policy.status !== 'enabled' || !policy.enabled || policy.specification.kind !== 'account_sync') continue;
+        const row = context.db.prepare(`SELECT effective_from FROM background_policy_revisions
+          WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND policy_id=? AND revision=1`)
+          .get(context.workspaceId, context.ownerId, context.privacyEpoch, policy.policyId) as { effective_from: number } | undefined;
+        if (!row || !Number.isSafeInteger(row.effective_from) || row.effective_from < 0) return fail('background_policy_storage_invalid');
+        candidates.push(Object.freeze({ policy, initialEffectiveFrom: row.effective_from }));
+      }
+      const nextCursor = policies.length === (input.limit ?? 100) ? policies.at(-1)?.policyId : undefined;
+      return Object.freeze({ candidates: Object.freeze(candidates), ...(nextCursor ? { nextCursor } : {}) });
+    });
+  }
+
+  /** Private scheduler metadata page for enabled proactive-draft policy heads. */
+  listProactiveDraftCandidatePage(actorSessionToken: string, input: { readonly expectedPrivacyEpoch: number; readonly afterPolicyId?: string; readonly limit?: number }): Readonly<{ candidates: readonly BackgroundProactiveDraftCandidate[]; nextCursor?: string }> {
+    const policies = this.list(actorSessionToken, input);
+    return this.#kernel.withOwnedTransaction(actorSessionToken, input.expectedPrivacyEpoch, (context) => {
+      ensureBackgroundSchema(context.db);
+      const candidates: BackgroundProactiveDraftCandidate[] = [];
+      for (const policy of policies) {
+        if (policy.status !== 'enabled' || !policy.enabled || policy.specification.kind !== 'proactive_draft') continue;
         const row = context.db.prepare(`SELECT effective_from FROM background_policy_revisions
           WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND policy_id=? AND revision=1`)
           .get(context.workspaceId, context.ownerId, context.privacyEpoch, policy.policyId) as { effective_from: number } | undefined;

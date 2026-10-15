@@ -673,13 +673,18 @@ export class DurableKernel {
     return transaction.immediate();
   }
 
-  /** Reads and validates the exact canonical application snapshot inside an active owned transaction. */
-  readOwnedSnapshotWithinTransaction(context: OwnedTransactionContext): WorkspaceSnapshot {
+  /** Proves this exact unexpired context belongs to this kernel's active SQLite transaction. */
+  assertOwnedTransactionContext(context: OwnedTransactionContext): void {
     if (!context || typeof context !== 'object' || !this.activeOwnedContexts.has(context) || context.db !== this.db ||
         typeof context.assertActive !== 'function' || !context.db.inTransaction) {
       fail('transaction_context_expired', 'An active owned transaction is required.');
     }
     context.assertActive();
+  }
+
+  /** Reads and validates the exact canonical application snapshot inside an active owned transaction. */
+  readOwnedSnapshotWithinTransaction(context: OwnedTransactionContext): WorkspaceSnapshot {
+    this.assertOwnedTransactionContext(context);
     const row = context.db.prepare(`SELECT id,owner_id,revision,privacy_epoch,schema_version,snapshot_json
       FROM workspaces WHERE id=?`).get(context.workspaceId) as WorkspaceRow | undefined;
     if (!row || row.id !== context.workspaceId || row.owner_id !== context.ownerId || row.revision !== context.revision ||

@@ -2,7 +2,7 @@ import type { DurableKernel, OwnedWorkspaceIdentity } from '../../server/src/ker
 import { BackgroundOccurrenceStore, type BackgroundClaim } from '../../server/src/backgroundOccurrences.js';
 import { BackgroundPolicyStore, type BackgroundAccountSyncCandidate } from '../../server/src/backgroundPolicies.js';
 import { BackgroundScheduler, type BackgroundSchedulerClaim, type BackgroundSchedulerOutcome, type BackgroundSchedulerPorts,
-  type BackgroundSchedulerWork } from '../../server/src/backgroundScheduler.js';
+} from '../../server/src/backgroundScheduler.js';
 import type { AuthService } from '../../server/src/auth.js';
 import type { WorkspaceActorMetadata } from '../../server/src/runtimeActors.js';
 import type { RuntimeSessionResolver } from '../../server/src/workspaceRegistry.js';
@@ -11,6 +11,8 @@ import { ProductionBackgroundBindingResolver } from './backgroundBindingResolver
 import { BatchObservationIndex, type BatchObservationAttempt } from '../../server/src/batchObservationIndex.js';
 import { projectBatchObservationLedger } from './batchObservationProjection.node';
 import { OpenRouterBatchInspectionReadError } from '../services/openRouter';
+import { BackgroundProactiveCandidateIndex } from '../../server/src/backgroundProactiveCandidates.js';
+import { projectBackgroundProactiveCandidates } from './backgroundProactiveCandidateProjection.node';
 
 const PAGE = 100;
 const MINUTE = 60_000;
@@ -55,6 +57,7 @@ export class BackgroundRuntimeOwner {
   readonly #batchClaims = new WeakMap<object, OwnedBatchClaim>();
   readonly #batchFinalizations = new WeakMap<object, Readonly<{ readonly final: { readonly kind: 'deferred' | 'completed' | 'inspect_required'; readonly code: string; readonly nextDueAt: number; readonly terminal: boolean }; readonly settledAt: number }>>();
   readonly #batchIndex = new BatchObservationIndex();
+  readonly #proactiveCandidateIndex: BackgroundProactiveCandidateIndex;
   #stopped = false;
 
   constructor(input: Readonly<{ kernel: DurableKernel; auth: AuthService; runtime: OwnedWorkspaceRuntime;
@@ -65,7 +68,13 @@ export class BackgroundRuntimeOwner {
     this.#runtimeSessionFor = input.runtimeSessionFor;
     this.#metadataPage = input.listWorkspaceMetadataPage;
     this.#resolver = new ProductionBackgroundBindingResolver(input.kernel);
+    this.#proactiveCandidateIndex = new BackgroundProactiveCandidateIndex(input.kernel);
     this.policies = new BackgroundPolicyStore({ kernel: input.kernel, auth: input.auth, resolver: this.#resolver,
+      onProactivePolicyEnabledWithinTransaction: (context, now) => {
+        const current = input.kernel.readOwnedSnapshotWithinTransaction(context);
+        if (current.workspaceId !== context.workspaceId || current.privacyEpoch !== context.privacyEpoch) throw new Error('background_proactive_snapshot_identity_changed');
+        this.#proactiveCandidateIndex.reconcile(context, projectBackgroundProactiveCandidates(current.snapshot, now), context.revision, now);
+      },
       onCommitted: () => this.#scheduler?.wake() });
     this.#scheduler = new BackgroundScheduler({ ports: this.#ports(), clock: {
       now: Date.now,
@@ -75,7 +84,7 @@ export class BackgroundRuntimeOwner {
     // Cold startup backfills content-free Batch metadata once before arming the
     // scheduler. Subsequent timer scans read only this index; snapshot writes
     // maintain it through the composed commit participant.
-    this.#forEachMetadata((metadata) => { this.#batchDue(metadata, Date.now()); });
+    this.#forEachMetadata((metadata) => { this.#ensureCandidateIndexes(metadata, Date.now()); });
     this.#scheduler.start();
   }
 
@@ -95,16 +104,26 @@ export class BackgroundRuntimeOwner {
     return new BackgroundOccurrenceStore({ kernel: this.#kernel, actorSessionToken: this.#actor(metadata), resolver: this.#resolver });
   }
 
-  #batchDue(metadata: WorkspaceActorMetadata, now: number): number | null {
+  #ensureCandidateIndexes(metadata: WorkspaceActorMetadata, now: number): number | null {
     const actor = this.#actor(metadata);
     return this.#kernel.withOwnedTransaction(actor, metadata.privacyEpoch, (context) => {
-      if (!this.#batchIndex.hasWorkspaceScope(context, metadata.privacyEpoch)) {
+      const backfillBatch = !this.#batchIndex.hasWorkspaceScope(context, metadata.privacyEpoch);
+      const backfillProactive = !this.#proactiveCandidateIndex.hasScope(context);
+      if (backfillBatch || backfillProactive) {
         const current = this.#kernel.readOwnedSnapshotWithinTransaction(context);
-        if (current.workspaceId !== metadata.workspaceId || context.ownerId !== metadata.ownerId || current.privacyEpoch !== metadata.privacyEpoch) return null;
-        this.#batchIndex.reconcile(context, projectBatchObservationLedger(current.snapshot), now);
+        if (current.workspaceId !== metadata.workspaceId || context.ownerId !== metadata.ownerId || current.privacyEpoch !== metadata.privacyEpoch) {
+          return null;
+        }
+        if (backfillBatch) this.#batchIndex.reconcile(context, projectBatchObservationLedger(current.snapshot), now);
+        if (backfillProactive) this.#proactiveCandidateIndex.reconcile(context,
+          projectBackgroundProactiveCandidates(current.snapshot, now), current.revision, now);
       }
       return this.#batchIndex.readNextDueAt(context, metadata.privacyEpoch);
     });
+  }
+
+  #batchDue(metadata: WorkspaceActorMetadata, now: number): number | null {
+    return this.#ensureCandidateIndexes(metadata, now);
   }
 
   #forEachMetadata(visitor: (metadata: WorkspaceActorMetadata) => boolean | void, afterWorkspaceId?: string): void {
