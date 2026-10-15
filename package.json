@@ -18,7 +18,10 @@
     "check:ios-config": "node scripts/check-ios-config.mjs",
     "generate:workspace-schema": "node scripts/generate-workspace-snapshot-schema.mjs",
     "check:workspace-schema": "node scripts/generate-workspace-snapshot-schema.mjs --check",
-    "check:server": "npm --prefix server run check && node --test tests/nodeControllerRuntime.test.mjs"
+    "check:server": "npm --prefix server run check && node --test tests/nodeControllerRuntime.test.mjs",
+    "package:server": "node scripts/package-server.mjs",
+    "verify:server-package": "node scripts/verify-server-package.mjs",
+    "test:server-package": "node --test tests/serverPackage.test.mjs"
   },
   "dependencies": {
     "@expo/vector-icons": "^15.0.3",

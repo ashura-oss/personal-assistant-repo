@@ -1,0 +1,34 @@
+[Unit]
+Description=Still private workspace server
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=5min
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=still
+Group=still
+UMask=0077
+EnvironmentFile=/etc/still/still.env
+WorkingDirectory=/opt/still/releases/REPLACE_WITH_RELEASE_ID
+ExecStart=/usr/bin/node /opt/still/releases/REPLACE_WITH_RELEASE_ID/server/scripts/still-server.mjs start
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=90s
+SendSIGKILL=no
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+StateDirectory=still/data still/keys
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/still/data /var/lib/still/keys
+
+[Install]
+WantedBy=multi-user.target

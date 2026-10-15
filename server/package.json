@@ -8,6 +8,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/build-shared-controller.mjs",
+    "build:release": "tsc -p tsconfig.json --sourceMap false --declaration false && node scripts/build-shared-controller.mjs",
     "test": "npm run build && node --test test/*.test.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "check": "npm run typecheck && npm test",
