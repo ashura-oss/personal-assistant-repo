@@ -53,6 +53,9 @@ export interface ConnectorDependencies {
   microsoftClientId?: string;
   /** Authority selected during app configuration: a supported alias or verified tenant UUID. */
   microsoftAuthority?: string;
+  /** Server-only confidential client authentication inserted before the refresh request is dispatched. */
+  applyRefreshClientAuthentication?: (input: Readonly<{ provider: 'google' | 'microsoft'; clientId: string;
+    tokenEndpoint: string; body: URLSearchParams; headers: Headers }>) => void;
   onAuthStatus?: (accountId: string, status: Account['authStatus']) => Promise<void> | void;
   now?: () => number;
   requestTimeoutMs?: number;
@@ -693,8 +696,12 @@ export class ConnectorClient {
     try { endpoint = account.provider === 'google' ? GOOGLE_TOKEN : microsoftTokenEndpoint(this.deps.microsoftAuthority); }
     catch { return this.reauth(account, 'reauth_required', 'Microsoft authority is not configured.'); }
     const body = new URLSearchParams({ grant_type: 'refresh_token', refresh_token: previous.refreshToken, client_id: clientId });
+    const headers = new Headers({ 'content-type': 'application/x-www-form-urlencoded' });
+    try { this.deps.applyRefreshClientAuthentication?.({ provider: account.provider as 'google' | 'microsoft', clientId,
+      tokenEndpoint: endpoint, body, headers }); }
+    catch { throw new Error('Token refresh failed; account state is unchanged.'); }
     let response: Response;
-    try { response = await this.boundedFetch(endpoint, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body, redirect: 'error' }, guard, undefined, undefined, signal); }
+    try { response = await this.boundedFetch(endpoint, { method: 'POST', headers, body, redirect: 'error' }, guard, undefined, undefined, signal); }
     catch { throw new Error('Token refresh failed; account state is unchanged.'); }
     const data = await response.json().catch(() => ({})) as Record<string, unknown>;
     if (!response.ok) {

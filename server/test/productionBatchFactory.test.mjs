@@ -57,7 +57,7 @@ test('real production factory submits and checks one authenticated OpenRouter Ba
   });
   const browserSession = kernel.createSession(workspace.workspaceId, ownerId, Date.now() + 60 * 60_000);
   const admission = { sessionToken: browserSession, assertCurrent() { kernel.getOwnedIdentity(browserSession); } };
-  const runtime = createProductionApplicationRuntimeFactory({ dataDirectory: join(directory, 'private', 'data') }, { fetcher })({ kernel, vault, runtimeSessionFor });
+  const runtime = createProductionApplicationRuntimeFactory({ dataDirectory: join(directory, 'private', 'data'), canonicalOrigin: 'https://app.example.test' }, { fetcher })({ kernel, vault, runtimeSessionFor });
   try {
     const initialSnapshot = await runtime.workspaceApi.getSnapshot(admission);
     const saved = await runtime.workspaceApi.dispatchCommand(admission, { schemaVersion: 1, commandId: randomUUID(),

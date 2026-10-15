@@ -413,7 +413,7 @@ async function verifyMicrosoftIdToken(input: { token: string; config: Configurat
 
 export function createServerOAuthProviderAdapter(options: CreateServerOAuthProviderAdapterOptions): ServerOAuthProviderAdapter {
   if (!options || typeof options.responseLifetime !== 'function' || !Array.isArray(options.registrations) ||
-      options.registrations.length < 1 || options.registrations.length > 16) invalidInput();
+      options.registrations.length > 16) invalidInput();
   const origin = canonicalOrigin(options.canonicalOrigin);
   const responseLifetime = options.responseLifetime;
   const now = options.now ?? Date.now;

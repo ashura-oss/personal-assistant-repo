@@ -28,6 +28,8 @@ async function fixture() {
   const dataDirectory = join(directory, 'private');
   mkdirSync(join(staticRoot, '_expo', 'static', 'js', 'web'), { recursive: true });
   mkdirSync(join(staticRoot, 'assets'), { recursive: true });
+  mkdirSync(join(staticRoot, 'assets', 'node_modules', '@expo', 'vector-icons', 'Fonts'), { recursive: true });
+  mkdirSync(join(staticRoot, 'assets', 'oauth'), { recursive: true });
   mkdirSync(dataDirectory);
   const bundle = '/_expo/static/js/web/index-abcdef0123456789.js';
   const registration = '/pwa-register-0123456789abcdef.js';
@@ -36,6 +38,8 @@ async function fixture() {
   writeFileSync(join(staticRoot, 'manifest.webmanifest'), '{"name":"Still"}');
   writeFileSync(join(staticRoot, 'sw.js'), 'self.addEventListener("fetch",()=>{});');
   writeFileSync(join(staticRoot, 'assets', 'still-icon.png'), Buffer.from([137, 80, 78, 71]));
+  writeFileSync(join(staticRoot, 'assets', 'node_modules', '@expo', 'vector-icons', 'Fonts', 'icons.abcdef0123456789.ttf'), Buffer.from([0, 1, 2]));
+  writeFileSync(join(staticRoot, 'assets', 'oauth', 'private.abcdef0123456789.ttf'), Buffer.from([0, 1, 2]));
   writeFileSync(join(staticRoot, registration.slice(1)), '/* registration */');
   writeFileSync(join(staticRoot, bundle.slice(1)), '/* public app bundle */');
   writeFileSync(join(staticRoot, 'metadata.json'), '{"private":"must not serve"}');
@@ -108,12 +112,22 @@ test('health is fixed and static hosting serves only the generated public shell 
     assert.equal((await f.request('/assets/still-icon.png')).status, 200);
     assert.equal((await f.request('/pwa-register-0123456789abcdef.js')).status, 200);
     assert.equal((await f.request('/_expo/static/js/web/index-abcdef0123456789.js')).status, 200);
+    const root = await f.request('/');
+    assert.equal(root.headers.get('cache-control'), 'no-cache');
+    const oauthHint = await f.request('/?oauth_stage=11111111-1111-4111-8111-111111111111');
+    assert.equal(oauthHint.status, 200);
+    assert.match(oauthHint.headers.get('content-type'), /^text\/html/);
+    assert.equal(oauthHint.headers.get('cache-control'), 'no-store');
+    assert.equal((await f.request('/assets/node_modules/@expo/vector-icons/Fonts/icons.abcdef0123456789.ttf')).status, 200);
+    assert.equal((await f.request('/assets/oauth/private.abcdef0123456789.ttf')).status, 404);
+    assert.equal((await f.request('/assets/node_modules/@expo/vector-icons/Fonts/icons.ttf')).status, 404);
     assert.equal((await f.request('/metadata.json')).status, 404);
     assert.equal((await f.request('/private')).status, 404);
     assert.equal((await f.request('/auth/unknown')).status, 404);
     assert.equal((await f.request('/api/private')).status, 404);
     assert.equal((await f.rawRequest('/%2e%2e/private/still.sqlite')).status, 400);
     assert.equal((await f.rawRequest('/_expo%2fstatic/private.js')).status, 400);
+    assert.equal((await f.rawRequest('/assets/%2e%2e/private/icons.abcdef0123456789.ttf')).status, 400);
   } finally { await f.close(); }
 });
 

@@ -26,6 +26,22 @@ test('server config accepts only canonical origins and private absolute paths', 
     assert.equal(config.canonicalOrigin, 'https://still.example');
     assert.equal(config.databasePath, f.dbPath);
     assert.equal(config.host, '127.0.0.1');
+    assert.equal(config.googleClientSecret, undefined);
+    assert.equal(config.microsoftClientSecret, undefined);
+    const confidential = loadServerConfig({ ...f.env, STILL_GOOGLE_CLIENT_ID: 'google-client', STILL_GOOGLE_CLIENT_SECRET: 'synthetic-google-secret',
+      STILL_MICROSOFT_CLIENT_ID: 'microsoft-client', STILL_MICROSOFT_CLIENT_SECRET: 'synthetic-microsoft-secret' }, { staticRoot: f.staticRoot });
+    assert.equal(confidential.googleClientId, 'google-client');
+    assert.equal(confidential.googleClientSecret, 'synthetic-google-secret');
+    assert.equal(confidential.microsoftClientSecret, 'synthetic-microsoft-secret');
+    for (const partial of [
+      { STILL_GOOGLE_CLIENT_ID: 'google-client' },
+      { STILL_GOOGLE_CLIENT_SECRET: 'synthetic-google-secret' },
+      { STILL_MICROSOFT_CLIENT_ID: 'microsoft-client' },
+      { STILL_MICROSOFT_CLIENT_SECRET: 'synthetic-microsoft-secret' },
+    ]) assert.throws(() => loadServerConfig({ ...f.env, ...partial }, { staticRoot: f.staticRoot }), ServerConfigError);
+    assert.throws(() => loadServerConfig({ ...f.env, STILL_MICROSOFT_CLIENT_ID: 'microsoft-client',
+      STILL_MICROSOFT_CLIENT_SECRET: 'synthetic-microsoft-secret', STILL_MICROSOFT_AUTHORITY: 'organizations' },
+      { staticRoot: f.staticRoot }), ServerConfigError);
     for (const origin of ['https://still.example/path', 'https://user@still.example', 'https://still.example/', 'http://still.example']) {
       assert.throws(() => loadServerConfig({ ...f.env, STILL_ORIGIN: origin }, { staticRoot: f.staticRoot }), ServerConfigError);
     }

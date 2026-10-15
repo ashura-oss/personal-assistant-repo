@@ -32,7 +32,7 @@ test('production workspace factory composes the real Node controller, Batch-only
   const workspace = kernel.createWorkspace(ownerId, createInitialWorkspaceState(randomUUID));
   const userSession = kernel.createSession(workspace.workspaceId, ownerId, Date.now() + 60 * 60_000);
   const actors = new ProcessWorkspaceActors(kernel);
-  const runtime = createProductionApplicationRuntimeFactory({ dataDirectory: join(directory, 'private', 'data') }, {
+  const runtime = createProductionApplicationRuntimeFactory({ dataDirectory: join(directory, 'private', 'data'), canonicalOrigin: 'https://app.example.test' }, {
     fetcher: async (input) => { calls.push(String(input)); throw new Error('unexpected provider request'); },
   })({ kernel, vault, runtimeSessionFor: (identity) => actors.sessionForRegistry(identity) });
   const admission = { sessionToken: userSession, assertCurrent: () => kernel.getOwnedIdentity(userSession) };

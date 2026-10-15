@@ -8,6 +8,8 @@ import { VaultError } from './vault.js';
 import type { SafeCredentialMetadataSnapshot, ServerCredentialCommandService } from './credentialCommands.js';
 import type { WorkspaceHttpAdmission, WorkspaceHttpApi } from './workspaceHttp.js';
 import type { AudioHttpApi, AudioUploadCaptureHeader } from './audioHttp.js';
+import type { OAuthHttpApi } from './oauthHttp.js';
+import { OAuthConnectionServiceError } from './oauthConnectionService.js';
 import { registerAcceptedHttpServer, trackAcceptedHttpRequest } from './httpRequestDrain.js';
 
 const BODY_LIMIT = 16 * 1024;
@@ -39,11 +41,12 @@ export interface StillHttpOptions {
   readonly credentialCommands?: ServerCredentialCommandService;
   readonly workspaceApi?: WorkspaceHttpApi;
   readonly audioApi?: AudioHttpApi;
+  readonly oauthApi?: OAuthHttpApi;
   /** Trusted host lifecycle fence checked at request admission and after awaited request bodies. */
   readonly admissionOpen?: () => boolean;
 }
 
-interface CookieValues { readonly session?: string; readonly preauth?: string }
+interface CookieValues { readonly session?: string; readonly preauth?: string; readonly values: ReadonlyMap<string, string> }
 interface HttpProblem { readonly status: number; readonly code: string }
 
 function problem(status: number, code: string): HttpProblem { return { status, code }; }
@@ -92,12 +95,13 @@ function uniqueHeader(request: IncomingMessage, name: string, required = false):
 
 function readCookies(request: IncomingMessage): CookieValues {
   const cookieHeader = uniqueHeader(request, 'cookie');
-  if (cookieHeader === undefined) return {};
+  if (cookieHeader === undefined) return { values: new Map() };
   if (cookieHeader.length > COOKIE_LIMIT) throw problem(400, 'bad_request');
   const values = new Map<string, string>();
   for (const part of cookieHeader.split(';')) {
     const trimmed = part.trim();
     if (!trimmed) continue;
+    if (values.size >= 32) throw problem(400, 'bad_request');
     const separator = trimmed.indexOf('=');
     if (separator <= 0) throw problem(400, 'bad_request');
     const name = trimmed.slice(0, separator);
@@ -112,7 +116,42 @@ function readCookies(request: IncomingMessage): CookieValues {
   if ((session !== undefined && !TOKEN_RE.test(session)) || (preauth !== undefined && !TOKEN_RE.test(preauth))) {
     throw problem(400, 'bad_request');
   }
-  return { ...(session === undefined ? {} : { session }), ...(preauth === undefined ? {} : { preauth }) };
+  return { ...(session === undefined ? {} : { session }), ...(preauth === undefined ? {} : { preauth }), values };
+}
+
+function strictQuery(raw: string | undefined, allowed: readonly string[]): Map<string, string> {
+  if (typeof raw !== 'string' || raw.length === 0 || raw.length > 8192) throw problem(400, 'bad_request');
+  const result = new Map<string, string>();
+  for (const part of raw.split('&')) {
+    if (!part) throw problem(400, 'bad_request');
+    const separator = part.indexOf('=');
+    if (separator <= 0) throw problem(400, 'bad_request');
+    let key: string; let value: string;
+    try {
+      key = decodeURIComponent(part.slice(0, separator).replace(/\+/g, ' '));
+      value = decodeURIComponent(part.slice(separator + 1).replace(/\+/g, ' '));
+    } catch { throw problem(400, 'bad_request'); }
+    if (!allowed.includes(key) || result.has(key) || /[\u0000-\u001f\u007f]/.test(key + value)) throw problem(400, 'bad_request');
+    result.set(key, value);
+  }
+  return result;
+}
+
+function callbackQuery(raw: string | undefined, provider: 'google' | 'microsoft'):
+  { readonly state: string; readonly code?: string; readonly error?: string } {
+  const allowed = provider === 'google'
+    ? ['state', 'code', 'error', 'scope', 'authuser', 'prompt', 'error_description', 'error_uri']
+    : ['state', 'code', 'error', 'session_state', 'error_description', 'error_uri'];
+  const values = strictQuery(raw, allowed);
+  const state = values.get('state'); const code = values.get('code'); const error = values.get('error');
+  if (!state || !TOKEN_RE.test(state) || (code === undefined) === (error === undefined) ||
+      code !== undefined && (!code || code.length > 4096) || error !== undefined && (!error || error.length > 256)) throw problem(400, 'bad_request');
+  for (const [name, value] of values) {
+    if (['state', 'code', 'error'].includes(name)) continue;
+    const max = name === 'error_uri' || name === 'error_description' ? 2048 : name === 'scope' ? 4096 : 128;
+    if (value.length > max) throw problem(400, 'bad_request');
+  }
+  return Object.freeze({ state, ...(code === undefined ? {} : { code }), ...(error === undefined ? {} : { error }) });
 }
 
 function securityHeaders(response: ServerResponse): void {
@@ -216,6 +255,17 @@ function workspaceMutationAdmission(request: IncomingMessage, auth: AuthService,
 }
 
 function workspaceFailure(error: unknown): { readonly status: number; readonly code: string } {
+  if (error instanceof OAuthConnectionServiceError) {
+    switch (error.code) {
+      case 'oauth_invalid_input': case 'oauth_callback_invalid': return { status: 400, code: 'invalid_oauth_request' };
+      case 'oauth_not_found': return { status: 404, code: 'oauth_not_found' };
+      case 'oauth_conflict': case 'oauth_stale_workspace': case 'oauth_start_in_progress': return { status: 409, code: 'oauth_conflict' };
+      case 'oauth_original_session_inactive': return { status: 401, code: 'unauthenticated' };
+      case 'oauth_unavailable': return { status: 503, code: 'oauth_unavailable' };
+      case 'oauth_exchange_unknown': return { status: 503, code: 'oauth_inspect_required' };
+      default: return { status: 503, code: 'service_unavailable' };
+    }
+  }
   if (isHttpProblem(error)) {
     const expected = new Set(['bad_request', 'unsupported_media_type', 'request_too_large', 'request_timeout',
       'unauthenticated', 'origin_rejected', 'csrf_rejected']);
@@ -454,7 +504,7 @@ function allowedExpoAsset(pathname: string): boolean {
 }
 
 function allowedFont(pathname: string): boolean {
-  return /^\/assets\/[A-Za-z0-9._/-]+\.(?:woff2?|ttf|otf)$/i.test(pathname) &&
+  return /^\/assets\/[A-Za-z0-9._@/-]+\.(?:woff2?|ttf|otf)$/i.test(pathname) &&
     !pathname.split('/').slice(1).some((segment) => !segment || segment === '.' || segment === '..') && isHashedAsset(pathname);
 }
 
@@ -533,13 +583,14 @@ function readSafeFile(root: string, filePath: string): Buffer {
   } finally { closeSync(descriptor); }
 }
 
-function cssOrHtmlCache(pathname: string): string {
-  return pathname === '/' || pathname === '/sw.js' || pathname === '/manifest.webmanifest' ? 'no-cache' :
+function cssOrHtmlCache(pathname: string, hasQuery = false): string {
+  return pathname === '/' && hasQuery ? 'no-store' :
+    pathname === '/' || pathname === '/sw.js' || pathname === '/manifest.webmanifest' ? 'no-cache' :
     isHashedAsset(pathname) ? 'public, max-age=31536000, immutable' : 'no-cache';
 }
 
 function safeStaticResponse(request: IncomingMessage, response: ServerResponse, root: string, paths: Set<string>, index: Buffer,
-  pathname: string): void {
+  pathname: string, hasQuery: boolean): void {
   let servedPath = pathname;
   let bytes: Buffer | undefined;
   if (pathname === '/') bytes = index;
@@ -551,7 +602,7 @@ function safeStaticResponse(request: IncomingMessage, response: ServerResponse, 
   }
   if (!bytes) { sendError(response, 404, 'not_found'); return; }
   response.writeHead(200, { 'Content-Type': servedPath === '/' ? 'text/html; charset=utf-8' : staticMime(servedPath),
-    'Content-Length': String(bytes.length), 'Cache-Control': cssOrHtmlCache(servedPath) });
+    'Content-Length': String(bytes.length), 'Cache-Control': cssOrHtmlCache(servedPath, hasQuery) });
   response.end(request.method === 'HEAD' ? undefined : bytes);
 }
 
@@ -569,7 +620,7 @@ export function createStillHttpServer(options: StillHttpOptions): Server {
   server = createServer((request, response) => {
     securityHeaders(response);
     const handled = Promise.resolve().then(() => handleRequest(request, response, options.auth, origin, realRoot, paths, index, options.credentialCommands,
-      options.workspaceApi, options.audioApi, options.admissionOpen)).catch((error: unknown) => {
+      options.workspaceApi, options.audioApi, options.oauthApi, options.admissionOpen)).catch((error: unknown) => {
       if (response.headersSent) { response.destroy(); return; }
       if (isHttpProblem(error)) { sendError(response, error.status, error.code); return; }
       if (error instanceof AuthError) { sendError(response, authStatus(error), error.code); return; }
@@ -587,7 +638,7 @@ export function createStillHttpServer(options: StillHttpOptions): Server {
 
 async function handleRequest(request: IncomingMessage, response: ServerResponse, auth: AuthService, canonicalOrigin: URL,
   staticRoot: string, staticPaths: Set<string>, index: Buffer, credentialCommands?: ServerCredentialCommandService,
-  workspaceApi?: WorkspaceHttpApi, audioApi?: AudioHttpApi, admissionOpen?: () => boolean): Promise<void> {
+  workspaceApi?: WorkspaceHttpApi, audioApi?: AudioHttpApi, oauthApi?: OAuthHttpApi, admissionOpen?: () => boolean): Promise<void> {
   if (admissionOpen && !admissionOpen()) throw problem(503, 'service_unavailable');
   const host = uniqueHeader(request, 'host', true);
   if (!host || host.toLowerCase() !== canonicalOrigin.host.toLowerCase()) throw problem(403, 'host_rejected');
@@ -662,6 +713,117 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     const challenge = auth.createLoginChallenge(canonicalOrigin.origin);
     sendJson(response, 200, { authenticated: false, setupRequired: false, csrfToken: challenge.csrfToken }, false,
       { 'Set-Cookie': jsonCookies(undefined, challenge.preAuthToken) });
+    return;
+  }
+  const oauthCallbackMatch = /^\/api\/oauth\/(google|microsoft)\/callback$/.exec(pathname);
+  if (oauthCallbackMatch) {
+    if (request.method !== 'GET') { response.setHeader('Allow', 'GET'); throw problem(405, 'method_not_allowed'); }
+    if (!oauthApi) throw problem(503, 'service_unavailable');
+    const provider = oauthCallbackMatch[1] as 'google' | 'microsoft';
+    const query = callbackQuery(rawQuery, provider);
+    const cookies = readCookies(request);
+    const expectedCookie = oauthApi.callbackCookieName(provider, query.state);
+    const cookieBinding = expectedCookie ? cookies.values.get(expectedCookie) : undefined;
+    if (!cookieBinding || !TOKEN_RE.test(cookieBinding)) throw problem(400, 'invalid_oauth_callback');
+    try {
+      const result = await oauthApi.callback(provider, { state: query.state, cookieBinding,
+        ...(query.code === undefined ? {} : { code: query.code }), ...(query.error === undefined ? {} : { error: query.error }) });
+      if (!result.attemptId || !COMMAND_ID_RE.test(result.attemptId)) throw problem(400, 'invalid_oauth_callback');
+      response.statusCode = 303;
+      response.setHeader('Location', `/?oauth_stage=${encodeURIComponent(result.attemptId)}`);
+      if (result.clearCookieName && expectedCookie === result.clearCookieName) {
+        response.setHeader('Set-Cookie', `${result.clearCookieName}=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax`);
+      }
+      response.end();
+    } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
+    return;
+  }
+  const oauthStartMatch = /^\/api\/oauth\/(google|microsoft)\/start$/.exec(pathname);
+  if (pathname === '/api/oauth/availability') {
+    if (request.method !== 'GET') { response.setHeader('Allow', 'GET'); throw problem(405, 'method_not_allowed'); }
+    if (hasQuery) throw problem(400, 'bad_request');
+    if (!oauthApi) throw problem(503, 'service_unavailable');
+    const admission = workspaceReadAdmission(request, auth, canonicalOrigin);
+    try {
+      admission.assertCurrent();
+      const result = oauthApi.availability(admission);
+      admission.assertCurrent();
+      sendJson(response, 200, result);
+    } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
+    return;
+  }
+  if (oauthStartMatch) {
+    if (request.method !== 'POST') { response.setHeader('Allow', 'POST'); throw problem(405, 'method_not_allowed'); }
+    if (hasQuery) throw problem(400, 'bad_request');
+    if (!oauthApi) throw problem(503, 'service_unavailable');
+    const admission = workspaceMutationAdmission(request, auth, canonicalOrigin);
+    try {
+      const input = await readJsonBody(request, response);
+      admission.assertCurrent();
+      if (admissionOpen && !admissionOpen()) throw problem(503, 'service_unavailable');
+      const result = await oauthApi.start(admission, oauthStartMatch[1] as 'google' | 'microsoft', input);
+      admission.assertCurrent();
+      const publicResult = Object.freeze({ kind: result.kind, status: result.status,
+        ...(result.authorizationUrl ? { authorizationUrl: result.authorizationUrl } : {}) });
+      const cookies: string[] = [];
+      for (const name of result.clearCookieNames ?? []) {
+        if (/^__Host-still_oauth_(?:google|microsoft)_[0-9a-f-]{36}$/i.test(name)) {
+          cookies.push(`${name}=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax`);
+        }
+      }
+      if (result.cookie) {
+        if (!/^__Host-still_oauth_(?:google|microsoft)_[0-9a-f-]{36}$/i.test(result.cookie.name) || !TOKEN_RE.test(result.cookie.value)) {
+          throw problem(503, 'service_unavailable');
+        }
+        cookies.push(`${result.cookie.name}=${result.cookie.value}; Path=/; Max-Age=${result.cookie.maxAgeSeconds}; Secure; HttpOnly; SameSite=Lax`);
+      }
+      sendJson(response, result.kind === 'started' ? 201 : 200, publicResult, false, cookies.length ? { 'Set-Cookie': cookies } : {});
+    } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
+    return;
+  }
+  if (pathname === '/api/oauth/starts') {
+    if (request.method !== 'GET') { response.setHeader('Allow', 'GET'); throw problem(405, 'method_not_allowed'); }
+    if (!oauthApi) throw problem(503, 'service_unavailable');
+    const values = hasQuery ? strictQuery(rawQuery, ['provider']) : new Map<string, string>();
+    const provider = values.get('provider');
+    if (provider !== undefined && provider !== 'google' && provider !== 'microsoft') throw problem(400, 'bad_request');
+    const admission = workspaceReadAdmission(request, auth, canonicalOrigin);
+    try {
+      admission.assertCurrent();
+      const result = oauthApi.listStarts(admission, provider as 'google' | 'microsoft' | undefined);
+      admission.assertCurrent();
+      sendJson(response, 200, result);
+    } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
+    return;
+  }
+  const oauthStageMatch = /^\/api\/oauth\/stages\/([0-9a-f-]{36})$/i.exec(pathname);
+  if (oauthStageMatch) {
+    if (request.method !== 'GET') { response.setHeader('Allow', 'GET'); throw problem(405, 'method_not_allowed'); }
+    if (hasQuery) throw problem(400, 'bad_request');
+    if (!oauthApi) throw problem(503, 'service_unavailable');
+    if (!COMMAND_ID_RE.test(oauthStageMatch[1]!)) throw problem(400, 'bad_request');
+    const admission = workspaceReadAdmission(request, auth, canonicalOrigin);
+    try {
+      admission.assertCurrent();
+      const result = oauthApi.inspectStage(admission, oauthStageMatch[1]!);
+      admission.assertCurrent();
+      sendJson(response, 200, result);
+    } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
+    return;
+  }
+  const oauthStartInspectMatch = /^\/api\/oauth\/(google|microsoft)\/starts\/([0-9a-f-]{36})$/i.exec(pathname);
+  if (oauthStartInspectMatch) {
+    if (request.method !== 'GET') { response.setHeader('Allow', 'GET'); throw problem(405, 'method_not_allowed'); }
+    if (hasQuery) throw problem(400, 'bad_request');
+    if (!oauthApi) throw problem(503, 'service_unavailable');
+    if (!COMMAND_ID_RE.test(oauthStartInspectMatch[2]!)) throw problem(400, 'bad_request');
+    const admission = workspaceReadAdmission(request, auth, canonicalOrigin);
+    try {
+      admission.assertCurrent();
+      const result = oauthApi.inspectStart(admission, oauthStartInspectMatch[1] as 'google' | 'microsoft', oauthStartInspectMatch[2]!);
+      admission.assertCurrent();
+      sendJson(response, 200, result);
+    } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
     return;
   }
   if (pathname === '/api/workspace/snapshot') {
@@ -905,5 +1067,5 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
   if (pathname.startsWith('/api/') || PROTECTED_PATH_RE.test(pathname)) { sendError(response, 404, 'not_found'); return; }
   if (hasQuery && pathname !== '/') { sendError(response, 404, 'not_found'); return; }
   if (request.method !== 'GET' && request.method !== 'HEAD') { response.setHeader('Allow', 'GET, HEAD'); throw problem(405, 'method_not_allowed'); }
-  safeStaticResponse(request, response, staticRoot, staticPaths, index, pathname);
+  safeStaticResponse(request, response, staticRoot, staticPaths, index, pathname, hasQuery);
 }

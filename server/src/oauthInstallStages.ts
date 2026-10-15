@@ -101,6 +101,17 @@ export interface OAuthInstallStageStatus {
   readonly consumption?: Readonly<{ commandId: string; accountId: string; accountGeneration: number }>;
 }
 
+export interface OAuthCallbackWorkspaceIdentity {
+  readonly attemptId: string;
+  readonly registrationId: string;
+  readonly provider: OAuthStageProvider;
+  readonly workspaceId: string;
+  readonly ownerId: string;
+  readonly revision: number;
+  readonly privacyEpoch: number;
+  readonly expiresAt: number;
+}
+
 export interface OAuthAuthorizationStartResult {
   /** Private trusted-service inputs for constructing the provider authorization URL and cookie. */
   readonly authorization: Readonly<{ state: string; cookieBinding: string; nonce: string; codeChallenge: string }>;
@@ -494,6 +505,42 @@ export class OAuthInstallStages {
     return row;
   }
 
+  /**
+   * Resolves only the workspace identity proved by both callback secrets. This does not claim an exchange;
+   * claimExchange still rechecks the original live session and stage status in an owned transaction.
+   */
+  resolveCallbackIdentity(provider: OAuthStageProvider, proofValue: OAuthCallbackProof): OAuthCallbackWorkspaceIdentity {
+    if (provider !== 'google' && provider !== 'microsoft') fail('oauth_stage_proof_invalid', 'The OAuth callback proof is invalid.');
+    const proof = normalizeCallbackProof(proofValue);
+    return this.kernel.withTrustedDatabaseTransaction((db) => {
+      const row = db.prepare(`SELECT s.stage_id,s.owner_id,s.workspace_id,s.privacy_epoch,s.initiating_session_binding,
+        s.registration_id,s.provider,s.expires_at,s.state_hash,s.cookie_hash,w.revision,w.owner_id AS current_owner_id,w.privacy_epoch AS current_privacy_epoch
+        FROM oauth_install_stages s JOIN workspaces w ON w.id=s.workspace_id WHERE s.state_hash=?`)
+        .get(sha256(proof.state)) as (StageRow & { revision: number; current_owner_id: string; current_privacy_epoch: number }) | undefined;
+      if (!row || row.provider !== provider || row.owner_id !== row.current_owner_id || row.privacy_epoch !== row.current_privacy_epoch ||
+          !constantTimeHashEqual(row.state_hash, sha256(proof.state)) || !constantTimeHashEqual(row.cookie_hash, sha256(proof.cookieBinding))) {
+        fail('oauth_stage_proof_invalid', 'The OAuth callback proof is invalid.');
+      }
+      return Object.freeze({ attemptId: row.stage_id, registrationId: row.registration_id, provider: row.provider,
+        workspaceId: row.workspace_id, ownerId: row.owner_id, revision: row.revision, privacyEpoch: row.privacy_epoch,
+        expiresAt: row.expires_at });
+    });
+  }
+
+  /** Marks only an unclaimed authorization pending stage unavailable before an explicit replacement start. */
+  supersedeAuthorizationWithinTransaction(context: OwnedTransactionContext, attemptId: string, sessionHash: string): OAuthInstallStageStatus {
+    this.assertContext(context);
+    const row = this.findStage(context, attemptId);
+    if (!row || !constantTimeHashEqual(row.initiating_session_binding, sessionHash)) {
+      fail('oauth_stage_not_found', 'The OAuth stage is unavailable.');
+    }
+    const terminal = this.cleanupDiscoveredState(context, row);
+    if (terminal) return terminal;
+    if (row.status !== 'authorization_pending') return this.status(row);
+    this.auth.assertInitiatingSessionWithinTransaction(context, sessionHash);
+    return this.clearPayload(context, row, 'inspect_required');
+  }
+
   private findClaim(context: OwnedTransactionContext, claimInput: OAuthExchangeClaim): { row: StageRow; claim: OAuthExchangeClaim } {
     const fields = closedFields(claimInput, ['attemptId', 'claimToken', 'payloadGeneration', 'registrationId', 'provider', 'expiresAt'], [],
       'oauth_stage_invalid_claim');
@@ -510,6 +557,14 @@ export class OAuthInstallStages {
       fail('oauth_stage_claim_invalid', 'The OAuth exchange claim is no longer active.');
     }
     return { row, claim };
+  }
+
+  /** Rechecks claim, original session, owner/workspace epoch, and TTL before each external provider request. */
+  assertExchangeClaimCurrent(context: OwnedTransactionContext, claimInput: OAuthExchangeClaim): void {
+    this.assertContext(context);
+    const { row } = this.findClaim(context, claimInput);
+    if (this.claimTerminal(context, row)) fail('oauth_stage_claim_invalid', 'The OAuth exchange claim is no longer active.');
+    this.auth.assertInitiatingSessionWithinTransaction(context, row.initiating_session_binding);
   }
 
   private claimTerminal(context: OwnedTransactionContext, row: StageRow): OAuthInstallStageStatus | undefined {
@@ -617,6 +672,25 @@ export class OAuthInstallStages {
     const { row } = this.findClaim(context, claimInput);
     const terminal = this.claimTerminal(context, row);
     return terminal ?? this.clearPayload(context, row, 'inspect_required');
+  }
+
+  /** Safe status-only fallback after an already-owned callback claim became terminal during provider I/O. */
+  readExchangeClaimStatus(context: OwnedTransactionContext, claimInput: OAuthExchangeClaim): OAuthInstallStageStatus {
+    this.assertContext(context);
+    const fields = closedFields(claimInput, ['attemptId', 'claimToken', 'payloadGeneration', 'registrationId', 'provider', 'expiresAt'], [],
+      'oauth_stage_invalid_claim');
+    if (typeof fields.attemptId !== 'string' || !UUID_V4.test(fields.attemptId) || typeof fields.claimToken !== 'string' ||
+        !TOKEN_PATTERN.test(fields.claimToken) || typeof fields.payloadGeneration !== 'number' || !Number.isSafeInteger(fields.payloadGeneration) ||
+        fields.payloadGeneration < 1 || typeof fields.registrationId !== 'string' || !REGISTRATION_PATTERN.test(fields.registrationId) ||
+        (fields.provider !== 'google' && fields.provider !== 'microsoft') || typeof fields.expiresAt !== 'number' ||
+        !Number.isSafeInteger(fields.expiresAt) || fields.expiresAt <= 0) fail('oauth_stage_invalid_claim', 'The OAuth exchange claim is invalid.');
+    const claim = fields as unknown as OAuthExchangeClaim;
+    const row = this.findStage(context, claim.attemptId);
+    if (!row || row.registration_id !== claim.registrationId || row.provider !== claim.provider || row.expires_at !== claim.expiresAt ||
+        row.payload_generation < claim.payloadGeneration || row.payload_generation > claim.payloadGeneration + 1) {
+      fail('oauth_stage_claim_invalid', 'The OAuth exchange claim is no longer active.');
+    }
+    return this.cleanupDiscoveredState(context, row) ?? this.status(row);
   }
 
   /** Returns metadata only. If expiry or initiating-session revocation is discovered, it is persisted as a safe terminal state. */

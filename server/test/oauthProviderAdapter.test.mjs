@@ -115,6 +115,18 @@ test('Google authorization uses fixed callback, requested scopes, state, nonce, 
   assert.match(url.searchParams.get('scope'), /calendar\.readonly/);
 });
 
+test('empty registrations are an explicit disabled state and cannot reach the provider', async () => {
+  let fetchCount = 0;
+  const adapter = createServerOAuthProviderAdapter({ canonicalOrigin: ORIGIN, registrations: [],
+    responseLifetime: async () => { fetchCount += 1; throw new Error('must not fetch'); } });
+  await assert.rejects(adapter.buildAuthorizationUrl('google', { state: STATE, nonce: NONCE, codeChallenge: CHALLENGE,
+    requestedCapabilities: ['mail.read'] }), (error) => error instanceof OAuthProviderAdapterError && error.code === 'oauth_provider_invalid_input');
+  await assert.rejects(adapter.exchangeVerified('google', { callbackUrl: `${ORIGIN}/api/oauth/google/callback?code=x&state=${STATE}`,
+    state: STATE, nonce: NONCE, pkceVerifier: VERIFIER, requestedCapabilities: ['mail.read'] }),
+    (error) => error instanceof OAuthProviderAdapterError && error.code === 'oauth_provider_invalid_input');
+  assert.equal(fetchCount, 0);
+});
+
 test('Microsoft read-only authorization requests no write scopes', async () => {
   const h = await harness('microsoft');
   const url = await h.adapter.buildAuthorizationUrl(h.registration.registrationId, {

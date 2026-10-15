@@ -17,7 +17,9 @@ export interface ServerConfig {
   readonly host: '127.0.0.1';
   readonly allowLocalHttp: boolean;
   readonly googleClientId?: string;
+  readonly googleClientSecret?: string;
   readonly microsoftClientId?: string;
+  readonly microsoftClientSecret?: string;
   readonly microsoftAuthority?: string;
   readonly ffmpegPath: string;
   readonly ffprobePath: string;
@@ -120,6 +122,14 @@ function optionalClientId(value: unknown, name: string): string | undefined {
   return value;
 }
 
+function optionalClientSecret(value: unknown, name: string): string | undefined {
+  if (value === undefined || value === '') return undefined;
+  if (typeof value !== 'string' || value.length > 4096 || /[\u0000-\u001f\u007f]/.test(value)) {
+    fail('invalid_config', `${name} is invalid.`);
+  }
+  return value;
+}
+
 function optionalMicrosoftAuthority(value: unknown): string | undefined {
   if (value === undefined || value === '') return undefined;
   if (typeof value !== 'string' || value.length > 128 || /[\u0000-\u0020\u007f]/.test(value) ||
@@ -134,8 +144,16 @@ export function loadServerConfig(env: NodeJS.ProcessEnv = process.env, options: 
   const allowLocalHttp = options.allowLocalHttp === true;
   const canonicalOrigin = validOrigin(env.STILL_ORIGIN, allowLocalHttp);
   const googleClientId = optionalClientId(env.STILL_GOOGLE_CLIENT_ID, 'STILL_GOOGLE_CLIENT_ID');
+  const googleClientSecret = optionalClientSecret(env.STILL_GOOGLE_CLIENT_SECRET, 'STILL_GOOGLE_CLIENT_SECRET');
   const microsoftClientId = optionalClientId(env.STILL_MICROSOFT_CLIENT_ID, 'STILL_MICROSOFT_CLIENT_ID');
+  const microsoftClientSecret = optionalClientSecret(env.STILL_MICROSOFT_CLIENT_SECRET, 'STILL_MICROSOFT_CLIENT_SECRET');
   const microsoftAuthority = optionalMicrosoftAuthority(env.STILL_MICROSOFT_AUTHORITY);
+  if (Boolean(googleClientId) !== Boolean(googleClientSecret) || Boolean(microsoftClientId) !== Boolean(microsoftClientSecret)) {
+    fail('invalid_config', 'Each OAuth provider requires both its client ID and client secret.');
+  }
+  if (microsoftClientSecret && microsoftAuthority !== undefined && microsoftAuthority !== 'common') {
+    fail('invalid_config', 'Confidential Microsoft OAuth uses the common authority.');
+  }
   const ffmpegPath = optionalExecutablePath(env, 'STILL_FFMPEG_PATH', '/usr/bin/ffmpeg');
   const ffprobePath = optionalExecutablePath(env, 'STILL_FFPROBE_PATH', '/usr/bin/ffprobe');
   const dataDirectory = requiredAbsolute(env, 'STILL_DATA_DIR');
@@ -162,7 +180,8 @@ export function loadServerConfig(env: NodeJS.ProcessEnv = process.env, options: 
   }
   return Object.freeze({ canonicalOrigin, dataDirectory, databasePath: join(dataDirectory, 'still.sqlite'),
     vaultKeyFile, staticRoot, host: '127.0.0.1', allowLocalHttp,
-    ...(googleClientId ? { googleClientId } : {}), ...(microsoftClientId ? { microsoftClientId } : {}),
+    ...(googleClientId ? { googleClientId } : {}), ...(googleClientSecret ? { googleClientSecret } : {}),
+    ...(microsoftClientId ? { microsoftClientId } : {}), ...(microsoftClientSecret ? { microsoftClientSecret } : {}),
     ...(microsoftAuthority ? { microsoftAuthority } : {}),
     ffmpegPath, ffprobePath,
     googleRedirectUri: `${canonicalOrigin}/api/oauth/google/callback`,

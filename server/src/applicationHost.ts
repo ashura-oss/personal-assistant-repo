@@ -10,12 +10,15 @@ import type { SecretVault } from './vault.js';
 import type { AuthService } from './auth.js';
 import type { RuntimeSessionResolver } from './workspaceRegistry.js';
 import type { WorkspaceHttpApi } from './workspaceHttp.js';
+import type { OAuthHttpApi } from './oauthHttp.js';
 
 /** Trusted runtime owner contract. It contains no caller supplied workspace authority. */
 export interface ApplicationRuntime {
   readonly workspaceApi: WorkspaceHttpApi;
   /** Optional authenticated audio bridge supplied by a real workspace runtime. */
   readonly audioHttpApi?: AudioHttpApi;
+  /** Optional confidential OAuth start/callback and metadata-only status bridge. */
+  readonly oauthHttpApi?: OAuthHttpApi;
   stopAdmission(): void;
   drainAndDispose(): Promise<void>;
 }
@@ -212,6 +215,7 @@ export async function startApplicationHost(options: ApplicationHostOptions): Pro
     const server = createStillHttpServer({ auth: opened.foundation.auth,
       credentialCommands: opened.foundation.credentialCommands, workspaceApi: runtime.workspaceApi,
       ...(runtime.audioHttpApi ? { audioApi: runtime.audioHttpApi } : {}),
+      ...(runtime.oauthHttpApi ? { oauthApi: runtime.oauthHttpApi } : {}),
       canonicalOrigin: options.config.canonicalOrigin, staticRoot: options.config.staticRoot,
       ...(options.config.allowLocalHttp ? { allowLocalHttp: true } : {}),
       admissionOpen: () => owner.isAccepting(),

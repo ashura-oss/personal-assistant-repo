@@ -174,6 +174,38 @@ describe('provider connector clients', () => {
     expect(store.set).toHaveBeenCalledTimes(1);
   });
 
+  it('applies confidential refresh authentication once before dispatch and fails closed when registration is unavailable', async () => {
+    const requests: Array<{ url: string; body: string; headers: Headers }> = [];
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const body = init?.body instanceof URLSearchParams ? init.body.toString() : String(init?.body ?? '');
+      requests.push({ url: String(input), body, headers: new Headers(init?.headers) });
+      if (String(input).includes('/token')) return response({ access_token: 'new-access', expires_in: 3600 });
+      if (String(input).includes('/userinfo')) return response({ sub: tokenIdentity.subject });
+      return response({ items: [] });
+    }) as typeof fetch;
+    const store: OAuthTokenStore = { get: vi.fn(async () => token({ expiresAt: 0 })), set: vi.fn(async () => undefined) };
+    const applyRefreshClientAuthentication = vi.fn(({ provider, clientId, tokenEndpoint, body, headers }) => {
+      expect(provider).toBe('google');
+      expect(clientId).toBe('test-google-client');
+      expect(tokenEndpoint).toBe('https://oauth2.googleapis.com/token');
+      expect([...body.keys()].sort()).toEqual(['client_id', 'grant_type', 'refresh_token']);
+      expect(headers.get('content-type')).toBe('application/x-www-form-urlencoded');
+      body.set('client_secret', 'synthetic-confidential-secret');
+    });
+    const client = new ConnectorClient({ tokenStore: store, fetcher, googleClientId: 'test-google-client',
+      applyRefreshClientAuthentication });
+    await client.listCalendars(account);
+    expect(applyRefreshClientAuthentication).toHaveBeenCalledTimes(1);
+    expect(requests[0]?.body).toContain('client_secret=synthetic-confidential-secret');
+    expect(requests[0]?.headers.get('content-type')).toBe('application/x-www-form-urlencoded');
+
+    const missingAuthFetch = vi.fn(async () => response({ access_token: 'should-not-dispatch', expires_in: 3600 })) as typeof fetch;
+    const failClosed = new ConnectorClient({ tokenStore: store, fetcher: missingAuthFetch, googleClientId: 'test-google-client',
+      applyRefreshClientAuthentication: () => { throw new Error('registration unavailable'); } });
+    await expect(failClosed.listCalendars(account)).rejects.toThrow(/token refresh failed/i);
+    expect(missingAuthFetch).not.toHaveBeenCalled();
+  });
+
   it('keeps the conversation metadata byte cap on a GET retried after token refresh', async () => {
     let resourceCalls = 0;
     const fetcher = vi.fn(async (input: RequestInfo | URL) => {

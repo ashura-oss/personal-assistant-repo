@@ -40,7 +40,9 @@ export interface ProductionWorkspacePortsOptions {
   readonly vault: SecretVault;
   readonly dataDirectory: string;
   readonly googleClientId?: string;
+  readonly googleClientSecret?: string;
   readonly microsoftClientId?: string;
+  readonly microsoftClientSecret?: string;
   readonly microsoftAuthority?: string;
   readonly ffmpegPath?: string;
   readonly ffprobePath?: string;
@@ -125,7 +127,7 @@ class PrivateDocumentFileOwner {
 
 /** Build the real Node providers for one authoritative owner/epoch entry. */
 export function createProductionWorkspacePortsFor(config: Pick<ServerConfig,
-  'dataDirectory' | 'googleClientId' | 'microsoftClientId' | 'microsoftAuthority'>,
+  'dataDirectory' | 'googleClientId' | 'googleClientSecret' | 'microsoftClientId' | 'microsoftClientSecret' | 'microsoftAuthority'>,
   options: Pick<ProductionWorkspacePortsOptions, 'fetcher' | 'ffmpegPath' | 'ffprobePath' | 'documentFileOperations'> = {}) {
   if (!config || typeof config.dataDirectory !== 'string' || !config.dataDirectory || config.dataDirectory.includes('\0')) {
     throw new TypeError('production_workspace_data_directory_required');
@@ -261,6 +263,19 @@ export function createProductionWorkspacePortsFor(config: Pick<ServerConfig,
       connector = new ConnectorClient({ tokenStore: store, ...(config.googleClientId ? { googleClientId: config.googleClientId } : {}),
         ...(config.microsoftClientId ? { microsoftClientId: config.microsoftClientId } : {}),
         ...(config.microsoftAuthority ? { microsoftAuthority: config.microsoftAuthority } : {}), onAuthStatus,
+        applyRefreshClientAuthentication: ({ provider, clientId, tokenEndpoint, body }) => {
+          const expectedClientId = provider === 'google' ? config.googleClientId : config.microsoftClientId;
+          const secret = provider === 'google' ? config.googleClientSecret : config.microsoftClientSecret;
+          const expectedEndpoint = provider === 'google' ? 'https://oauth2.googleapis.com/token'
+            : 'https://login.microsoftonline.com/common/oauth2/v2.0/token';
+          const keys = [...body.keys()].sort();
+          if (!secret || !expectedClientId || clientId !== expectedClientId || tokenEndpoint !== expectedEndpoint ||
+              keys.join(',') !== 'client_id,grant_type,refresh_token' || body.get('client_id') !== expectedClientId ||
+              body.get('grant_type') !== 'refresh_token' || !body.get('refresh_token') || body.get('refresh_token')!.length > 16_384) {
+            throw new Error('confidential_refresh_configuration_invalid');
+          }
+          body.set('client_secret', secret);
+        },
         withProviderOwnership, withResponseLifetime: responseLifetimeOwner.withResponseLifetimeFor('connector'),
         isConnectionCurrent: isAuthoritativeConnectionCurrent,
       });

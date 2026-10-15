@@ -9,6 +9,11 @@ import { ServerOAuthTokenBindings } from '../../server/src/oauthTokenBindings.js
 import type { AuthService } from '../../server/src/auth.js';
 import type { ServerConfig } from '../../server/src/config.js';
 import { createProductionWorkspacePortsFor, type ProductionWorkspacePortsOptions } from './productionWorkspacePorts.node';
+import { createNodeProviderResponseLifetimeOwner } from './providerResponseLifetime.node';
+import { createServerOAuthProviderAdapter } from '../../server/src/oauthProviderAdapter.js';
+import { OAuthConnectionService } from '../../server/src/oauthConnectionService.js';
+import type { NodeProviderResponseLifetimeOwner } from './providerResponseLifetime.node';
+import type { ServerOAuthProviderAdapter } from '../../server/src/oauthProviderAdapter.js';
 
 export { NodeVaultOAuthTokenStore } from './nodeOAuthTokenStore.node';
 export { createProductionWorkspacePortsFor } from './productionWorkspacePorts.node';
@@ -19,6 +24,9 @@ export type ApplicationWorkspacePortsFactory =
 export interface CloudApplicationRuntimeOptions {
   /** Required concrete per-workspace provider/integration composition. */
   readonly workspacePortsFor: ApplicationWorkspacePortsFactory;
+  readonly oauth?: Readonly<{ provider: ServerOAuthProviderAdapter; responseLifetimeOwner: NodeProviderResponseLifetimeOwner;
+    config: Pick<ServerConfig, 'googleClientId' | 'googleClientSecret' | 'microsoftClientId' | 'microsoftClientSecret' |
+      'googleRedirectUri' | 'microsoftRedirectUri'> }>;
 }
 
 /** Creates the Node host adapter. Missing provider composition is a startup error, never a stub. */
@@ -36,9 +44,16 @@ export function createCloudApplicationRuntimeFactory(options: CloudApplicationRu
       },
       workspacePortsFor: (context) => options.workspacePortsFor(context, vault, kernel),
     });
+    const oauthService = options.oauth ? new OAuthConnectionService({ kernel, auth, stages: oauthStages,
+      provider: options.oauth.provider, config: options.oauth.config, runtimeSessionFor }) : undefined;
     return Object.freeze({ workspaceApi: createWorkspaceHttpApi(runtime), audioHttpApi: runtime.createAudioHttpApi(),
-      stopAdmission: () => runtime.stopAdmission(),
-      drainAndDispose: () => runtime.closeAfterDrain(),
+      ...(oauthService ? { oauthHttpApi: oauthService } : {}),
+      stopAdmission: () => { oauthService?.stopAdmission(); options.oauth?.responseLifetimeOwner.stopAdmission(); runtime.stopAdmission(); },
+      drainAndDispose: async () => {
+        await oauthService?.drain();
+        await options.oauth?.responseLifetimeOwner.drain();
+        await runtime.closeAfterDrain();
+      },
     });
   };
   return factory;
@@ -52,14 +67,29 @@ export function createProductionApplicationRuntimeFactory(config: ServerConfig,
   }
   const makeWorkspacePorts = createProductionWorkspacePortsFor({ dataDirectory: config.dataDirectory,
       ...(config.googleClientId ? { googleClientId: config.googleClientId } : {}),
+      ...(config.googleClientSecret ? { googleClientSecret: config.googleClientSecret } : {}),
       ...(config.microsoftClientId ? { microsoftClientId: config.microsoftClientId } : {}),
+      ...(config.microsoftClientSecret ? { microsoftClientSecret: config.microsoftClientSecret } : {}),
       ...(config.microsoftAuthority ? { microsoftAuthority: config.microsoftAuthority } : {}) }, {
         ffmpegPath: adapters.ffmpegPath ?? config.ffmpegPath,
         ffprobePath: adapters.ffprobePath ?? config.ffprobePath,
         ...(adapters.fetcher ? { fetcher: adapters.fetcher } : {}),
         ...(adapters.documentFileOperations ? { documentFileOperations: adapters.documentFileOperations } : {}),
       });
-  return ({ kernel, vault, auth, runtimeSessionFor }) => createCloudApplicationRuntimeFactory({
-    workspacePortsFor: (context) => makeWorkspacePorts(context, vault, kernel),
-  })({ kernel, vault, auth, runtimeSessionFor });
+  return ({ kernel, vault, auth, runtimeSessionFor }) => {
+    const fetcher = adapters.fetcher ?? globalThis.fetch;
+    const responseLifetimeOwner = createNodeProviderResponseLifetimeOwner({ fetcher, createId: randomUUID });
+    const registrations = [
+      ...(config.googleClientId && config.googleClientSecret ? [{ registrationId: 'google' as const, provider: 'google' as const,
+        clientId: config.googleClientId, clientSecret: config.googleClientSecret }] : []),
+      ...(config.microsoftClientId && config.microsoftClientSecret ? [{ registrationId: 'microsoft' as const, provider: 'microsoft' as const,
+        clientId: config.microsoftClientId, clientSecret: config.microsoftClientSecret }] : []),
+    ];
+    const provider = createServerOAuthProviderAdapter({ canonicalOrigin: config.canonicalOrigin, registrations,
+      responseLifetime: responseLifetimeOwner.withResponseLifetimeFor('oauth') });
+    return createCloudApplicationRuntimeFactory({
+      workspacePortsFor: (context) => makeWorkspacePorts(context, vault, kernel),
+      oauth: { provider, responseLifetimeOwner, config },
+    })({ kernel, vault, auth, runtimeSessionFor });
+  };
 }
