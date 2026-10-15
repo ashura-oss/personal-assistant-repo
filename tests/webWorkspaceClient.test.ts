@@ -86,6 +86,21 @@ describe('same-origin web workspace command client', () => {
     expect(parseWorkspaceCommandReceipt({ schemaVersion: 1, commandId, kind: 'chat.transcript.submit', objectId: conversation,
       conversationId: conversation, planId, turnId: parentTurnId, jobId }, { commandId, kind: 'chat.transcript.submit',
       objectId: conversation, conversationId: conversation, planId }).kind).toBe('chat.transcript.submit');
+    const definitelyNotSubmitted = parseWorkspaceCommandReceipt({ schemaVersion: 1, commandId, kind: 'chat.transcript.submit', objectId: conversation,
+      conversationId: conversation, planId, outcome: 'not_submitted', reason: 'plan_unavailable' }, { commandId, kind: 'chat.transcript.submit',
+      objectId: conversation, conversationId: conversation, planId });
+    expect(definitelyNotSubmitted).toMatchObject({ outcome: 'not_submitted', reason: 'plan_unavailable', planId, conversationId: conversation });
+    const newSubmitted = parseWorkspaceCommandReceipt({ schemaVersion: 1, commandId, kind: 'chat.transcript.submit', objectId: conversation,
+      conversationId: conversation, planId, outcome: 'submitted', turnId: parentTurnId, jobId }, { commandId, kind: 'chat.transcript.submit',
+      objectId: conversation, conversationId: conversation, planId });
+    expect(newSubmitted).toMatchObject({ outcome: 'submitted', turnId: parentTurnId, jobId });
+    expect(() => parseWorkspaceCommandReceipt({ schemaVersion: 1, commandId, kind: 'chat.transcript.submit', objectId: conversation,
+      conversationId: conversation, planId, outcome: 'not_submitted', reason: 'plan_unavailable', turnId: parentTurnId, jobId })).toThrow(/invalid/);
+    expect(() => parseWorkspaceCommandReceipt({ schemaVersion: 1, commandId, kind: 'chat.transcript.submit', objectId: conversation,
+      conversationId: conversation, planId, outcome: 'not_submitted', reason: 'unknown' })).toThrow(/invalid/);
+    const legacyWithUndefinedOutcome = { schemaVersion: 1, commandId, kind: 'chat.transcript.submit', objectId: conversation,
+      conversationId: conversation, planId, turnId: parentTurnId, jobId, outcome: undefined };
+    expect(() => parseWorkspaceCommandReceipt(legacyWithUndefinedOutcome)).toThrow(/invalid/);
     expect(() => parseWorkspaceCommandReceipt({ schemaVersion: 1, commandId, kind: 'chat.transcript.submit', objectId: anotherConversationId,
       conversationId: conversation, planId, turnId: parentTurnId, jobId })).toThrow(/invalid/);
   });

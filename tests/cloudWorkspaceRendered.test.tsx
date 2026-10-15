@@ -866,6 +866,139 @@ describe('CloudWorkspace safe DTO presentation', () => {
     } finally { stop(); vi.unstubAllGlobals(); }
   });
 
+  it('recovers a terminal transcript receipt by exact GET and preserves it through a failed explicit refresh', async () => {
+    const { state } = fixture();
+    const note = state.notes[0]!;
+    note.capturedAt = '2026-10-14T23:00:00.000Z'; note.captureTimeZone = 'Asia/Singapore';
+    state.settings.mode = 'provider'; state.settings.llmProvider = 'openrouter';
+    const snapshot = createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: 7 });
+    const session = Object.freeze({ authenticated: true, workspaceId, privacyEpoch: 3, csrfToken: 'terminal-transcript-csrf' });
+    const requests: { path: string; method: string }[] = [];
+    const commands = new Map<string, WorkspaceCommand>();
+    const prepareIds: string[] = [];
+    let submitCommandId = '';
+    let refreshCount = 0;
+    let exactGets = 0;
+    const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const path = String(input); const method = init?.method ?? 'GET'; requests.push({ path, method });
+      if (path === '/api/credentials' && method === 'GET') return { ok: true, status: 200, json: async () => credentialMetadata(true) };
+      if (path === '/api/workspace/snapshot' && method === 'GET') return { ok: true, status: 200, json: async () => snapshot };
+      if (path === '/api/workspace/refresh' && method === 'POST') {
+        refreshCount += 1;
+        if (refreshCount === 1) return { ok: false, status: 503, json: async () => ({ error: 'temporary refresh failure' }) };
+        return { ok: true, status: 200, json: async () => snapshot };
+      }
+      if (path === '/api/workspace/commands' && method === 'POST') {
+        const envelope = JSON.parse(String(init?.body)) as { commandId: string; command: WorkspaceCommand };
+        commands.set(envelope.commandId, envelope.command);
+        if (envelope.command.kind === 'chat.transcript.prepare') {
+          prepareIds.push(envelope.commandId);
+          const planId = prepareIds.length === 1 ? '99999999-9999-4999-8999-999999999999' : 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+          return { ok: true, status: 200, json: async () => ({ schemaVersion: 1, commandId: envelope.commandId, status: 'finished', receipt: {
+            schemaVersion: 1, commandId: envelope.commandId, kind: 'chat.transcript.prepare', objectId: note.id, noteId: note.id,
+            noteRevision: note.revision, planId, expiresAt: new Date(Date.now() + 5 * 60_000).toISOString(),
+            capturedAt: note.capturedAt, captureTimeZone: note.captureTimeZone,
+          }, snapshot }) };
+        }
+        if (envelope.command.kind === 'chat.transcript.submit') {
+          submitCommandId = envelope.commandId;
+          return Promise.reject(new TypeError('connection lost after command admission'));
+        }
+        throw new Error(`Unexpected command ${envelope.command.kind}`);
+      }
+      if (path === `/api/workspace/commands/${submitCommandId}` && method === 'GET') {
+        exactGets += 1;
+        const command = commands.get(submitCommandId);
+        if (command?.kind !== 'chat.transcript.submit') throw new Error('The exact inspection must target the submitted command.');
+        return { ok: true, status: 200, json: async () => ({ schemaVersion: 1, commandId: submitCommandId, status: 'finished', receipt: {
+          schemaVersion: 1, commandId: submitCommandId, kind: command.kind, objectId: command.conversationId,
+          conversationId: command.conversationId, planId: command.planId, outcome: 'not_submitted', reason: 'plan_unavailable',
+        } }) };
+      }
+      throw new Error(`Unexpected transcript recovery request ${method} ${path}`);
+    });
+    vi.stubGlobal('fetch', fetcher);
+    const store = new CloudWorkspaceSessionStore(session);
+    const stop = store.start();
+    function Route() {
+      const current = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
+      if (!current.snapshot) return React.createElement('div', null, current.status);
+      return React.createElement(CloudWorkspace, { store, state: current, onLogout: vi.fn(), credentials: { presence: { openrouter: true } } as never,
+        transcriptTransferCoordinator: store.getTranscriptTransferCoordinator() });
+    }
+    try {
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      await act(async () => root.render(React.createElement(Route)));
+      click('Library'); click('Notes'); click('A saved DTO note'); click('Use saved transcript in Chat');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      click('Saved conversation'); click('Send saved transcript');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(store.getSnapshot().pendingCommand?.commandId).toBe(submitCommandId);
+      click('Inspect exact chat.transcript.submit command');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(exactGets).toBe(1);
+      expect(store.getSnapshot().pendingCommand).toBeUndefined();
+      expect(store.getSnapshot().refreshRequired).toBe(true);
+      expect(store.getSnapshot().transcriptTransfer?.notice).toBe('This command did not submit a Chat message. Review the saved transcript again.');
+
+      click('Refresh workspace');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(refreshCount).toBe(1);
+      expect(store.getSnapshot().refreshRequired).toBe(true);
+      expect(store.getSnapshot().transcriptTransfer?.notice).toBe('This command did not submit a Chat message. Review the saved transcript again.');
+      click('Refresh workspace');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(refreshCount).toBe(2);
+      expect(store.getSnapshot().refreshRequired).toBe(false);
+      click('Library'); click('Notes'); click('A saved DTO note'); click('Use saved transcript in Chat');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(prepareIds).toHaveLength(2);
+      expect(requests.filter((request) => request.path === '/api/workspace/commands' && request.method === 'POST')).toHaveLength(3);
+      expect(requests.filter((request) => request.path === `/api/workspace/commands/${submitCommandId}` && request.method === 'GET')).toHaveLength(1);
+    } finally { stop(); vi.unstubAllGlobals(); }
+  });
+
+  it('offers a new transcript review only after a matching terminal not-submitted receipt', async () => {
+    const { state } = fixture();
+    const note = state.notes[0]!;
+    const conversation = state.assistantChatConversations?.[0];
+    if (!conversation) throw new Error('The fixture needs a saved conversation.');
+    note.capturedAt = '2026-10-14T23:00:00.000Z'; note.captureTimeZone = 'Asia/Singapore';
+    state.settings.mode = 'provider'; state.settings.llmProvider = 'openrouter';
+    const snapshot = createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: 7 });
+    const stateValue = { status: 'ready' as const, snapshot, busy: false, refreshRequired: false };
+    const commands: WorkspaceCommand[] = [];
+    let sequence = 0;
+    const execute = vi.fn(async (command: WorkspaceCommand, admitted?: (envelope: WorkspaceCommandAdmission) => void): Promise<WorkspaceCommandResponse> => {
+      commands.push(command);
+      const commandId = `88888888-8888-4888-8888-${String(++sequence).padStart(12, '0')}`;
+      admitted?.({ schemaVersion: 1, commandId, expectedRevision: snapshot.revision, expectedPrivacyEpoch: snapshot.privacyEpoch, command });
+      if (command.kind === 'chat.transcript.prepare') return { schemaVersion: 1, commandId, status: 'finished', receipt: {
+        schemaVersion: 1, commandId, kind: command.kind, objectId: command.noteId, noteId: command.noteId, noteRevision: command.expectedNoteRevision,
+        planId: `99999999-9999-4999-8999-${String(sequence).padStart(12, '0')}`, expiresAt: new Date(Date.now() + 5 * 60_000).toISOString(),
+        capturedAt: note.capturedAt!, captureTimeZone: note.captureTimeZone!,
+      } };
+      if (command.kind === 'chat.transcript.submit') return { schemaVersion: 1, commandId, status: 'finished', receipt: {
+        schemaVersion: 1, commandId, kind: command.kind, objectId: command.conversationId, planId: command.planId,
+        conversationId: command.conversationId, outcome: 'not_submitted', reason: 'plan_unavailable',
+      } };
+      throw new Error(`Unexpected command ${command.kind}`);
+    });
+    const store = { ...stateValue, getSnapshot: () => stateValue, execute, inspect: vi.fn(), refresh: vi.fn(async () => snapshot) };
+    const transferCoordinator = transcriptCoordinatorFor(store);
+    act(() => root.render(<CloudWorkspace store={store} state={stateValue} onLogout={vi.fn()} credentials={{ presence: { openrouter: true } } as never} transcriptTransferCoordinator={transferCoordinator} />));
+    click('Library'); click('Notes'); click('A saved DTO note'); click('Use saved transcript in Chat');
+    await act(async () => { await Promise.resolve(); });
+    click('Saved conversation'); click('Send saved transcript');
+    await act(async () => { await Promise.resolve(); });
+    expect(commands.map((command) => command.kind)).toEqual(['chat.transcript.prepare', 'chat.transcript.submit']);
+    expect(transferCoordinator.getSnapshot()).toEqual({ busy: false, notice: 'This command did not submit a Chat message. Review the saved transcript again.' });
+    expect(host.textContent).toContain('This command did not submit a Chat message. Review the saved transcript again.');
+    click('Use saved transcript in Chat');
+    await act(async () => { await Promise.resolve(); });
+    expect(commands.map((command) => command.kind)).toEqual(['chat.transcript.prepare', 'chat.transcript.submit', 'chat.transcript.prepare']);
+  });
+
   it('suppresses a transcript inspection result when the session is replaced during its deferred refresh', async () => {
     const { state } = fixture();
     const note = state.notes[0]!;

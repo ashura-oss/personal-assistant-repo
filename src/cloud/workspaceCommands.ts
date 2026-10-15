@@ -117,7 +117,11 @@ export type WorkspaceCommandReceipt =
   | (WorkspaceCommandReceiptBase<'notes.confirmImportedTimeZone'> & Readonly<{ noteId: string; noteRevision: number; timeZone: string }>)
   | (WorkspaceCommandReceiptBase<'chat.transcript.prepare'> & Readonly<{ noteId: string; noteRevision: number; planId: string; expiresAt: string; capturedAt: string; captureTimeZone: string }>)
   | (WorkspaceCommandReceiptBase<'chat.transcript.cancel'> & Readonly<{ planId: string }>)
-  | (WorkspaceCommandReceiptBase<'chat.transcript.submit'> & Readonly<{ planId: string; conversationId: string; turnId: string; jobId: string }>)
+  | (WorkspaceCommandReceiptBase<'chat.transcript.submit'> & Readonly<{ planId: string; conversationId: string }> & (
+      | Readonly<{ outcome: 'submitted'; turnId: string; jobId: string }>
+      | Readonly<{ outcome: 'not_submitted'; reason: 'plan_unavailable' }>
+      | Readonly<{ outcome?: undefined; turnId: string; jobId: string }>
+    ))
   | WorkspaceCommandReceiptBase<'settings.update'>
   | WorkspaceCommandReceiptBase<'notes.save'>
   | (WorkspaceCommandReceiptBase<'notes.capture.adopt'> & Readonly<{ captureId: string; captureRevision: string }>)
@@ -906,7 +910,7 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
     'notes.confirmImportedTimeZone': ['commandId', 'kind', 'noteId', 'noteRevision', 'objectId', 'schemaVersion', 'timeZone'],
     'chat.transcript.prepare': ['capturedAt', 'captureTimeZone', 'commandId', 'expiresAt', 'kind', 'noteId', 'noteRevision', 'objectId', 'planId', 'schemaVersion'],
     'chat.transcript.cancel': ['commandId', 'kind', 'objectId', 'planId', 'schemaVersion'],
-    'chat.transcript.submit': ['commandId', 'conversationId', 'jobId', 'kind', 'objectId', 'planId', 'schemaVersion', 'turnId'],
+    'chat.transcript.submit': ['commandId', 'conversationId', 'jobId', 'kind', 'objectId', 'outcome', 'planId', 'reason', 'schemaVersion', 'turnId'],
     'notes.save': ['commandId', 'kind', 'objectId', 'schemaVersion'],
     'notes.capture.adopt': ['captureId', 'captureRevision', 'commandId', 'kind', 'objectId', 'schemaVersion'],
     'accounts.installOAuth': ['accountGeneration', 'commandId', 'kind', 'objectId', 'schemaVersion', 'stageId'],
@@ -951,7 +955,13 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
     'mail.source.loadText': ['textDigest', 'bytes'], 'proposals.execute': ['dispatchRecordId', 'operation', 'outcomeAt', 'remoteId'],
     'dispatch.reconcile': ['providerOutcomeAt'],
   };
-  const requiredReceiptKeys = kind === 'documents.save' ? ['commandId', 'documentRevision', 'kind', 'objectId', 'schemaVersion'] :
+  const requiredReceiptKeys = kind === 'chat.transcript.submit'
+    ? value.outcome === 'submitted'
+      ? ['commandId', 'conversationId', 'jobId', 'kind', 'objectId', 'outcome', 'planId', 'schemaVersion', 'turnId']
+      : value.outcome === 'not_submitted'
+        ? ['commandId', 'conversationId', 'kind', 'objectId', 'outcome', 'planId', 'reason', 'schemaVersion']
+        : ['commandId', 'conversationId', 'jobId', 'kind', 'objectId', 'planId', 'schemaVersion', 'turnId']
+    : kind === 'documents.save' ? ['commandId', 'documentRevision', 'kind', 'objectId', 'schemaVersion'] :
     allowedReceiptKeys.filter((key) => !optionalReceiptKeys[kind as WorkspaceCommand['kind']]?.includes(key));
   assertExactKeys(value, allowedReceiptKeys, requiredReceiptKeys);
   const textId = (candidate: unknown): candidate is string => boundedString(candidate, MAX_ID_BYTES, { identifier: true });
@@ -962,7 +972,11 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
         (isReservedKnowledgeDocumentPath(value.objectId) && !canonicalKnowledgeDocumentParent(value.objectId)))) ||
       ((kind === 'chat.create' || kind === 'assistant.batch.check' || kind === 'chat.submit' || kind === 'chat.refine') && !uuidId(value.objectId)) ||
       (kind === 'chat.conversation.delete' && (!uuidId(value.objectId) || !uuidId(value.conversationId) || value.objectId !== value.conversationId)) ||
-      (kind === 'chat.transcript.submit' && (!uuidId(value.objectId) || !uuidId(value.conversationId) || value.objectId !== value.conversationId)) ||
+      (kind === 'chat.transcript.submit' && (!uuidId(value.objectId) || !uuidId(value.conversationId) || value.objectId !== value.conversationId ||
+        !uuidId(value.planId) || (value.outcome === 'submitted' && (!uuidId(value.turnId) || !uuidId(value.jobId) || Object.hasOwn(value, 'reason'))) ||
+        (value.outcome === 'not_submitted' && (value.reason !== 'plan_unavailable' || Object.hasOwn(value, 'turnId') || Object.hasOwn(value, 'jobId'))) ||
+        (value.outcome === undefined && (Object.hasOwn(value, 'outcome') || Object.hasOwn(value, 'reason'))) ||
+        (value.outcome !== undefined && value.outcome !== 'submitted' && value.outcome !== 'not_submitted'))) ||
       (kind === 'notes.confirmImportedTimeZone' && (!textId(value.objectId) || value.noteId !== value.objectId || !positiveRevision(value.noteRevision) || !validTimeZone(value.timeZone))) ||
       (kind === 'chat.transcript.prepare' && (!textId(value.objectId) || value.noteId !== value.objectId || !positiveRevision(value.noteRevision) || !uuidId(value.planId) ||
         !validIsoDate(value.expiresAt) || !validIsoDate(value.capturedAt) || !validTimeZone(value.captureTimeZone))) ||
@@ -1080,6 +1094,10 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
     case 'chat.transcript.cancel':
       return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId, planId: jobId(value.planId) });
     case 'chat.transcript.submit':
+      if (value.outcome === 'not_submitted') return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId,
+        conversationId: jobId(value.conversationId), planId: jobId(value.planId), outcome: 'not_submitted', reason: 'plan_unavailable' });
+      if (value.outcome === 'submitted') return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId,
+        conversationId: jobId(value.conversationId), planId: jobId(value.planId), outcome: 'submitted', turnId: jobId(value.turnId), jobId: jobId(value.jobId) });
       return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId,
         conversationId: jobId(value.conversationId), planId: jobId(value.planId), turnId: jobId(value.turnId), jobId: jobId(value.jobId) });
     case 'notes.transcribe':

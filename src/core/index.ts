@@ -1003,6 +1003,10 @@ export interface AppController {
   prepareChatFromTranscript(input: { noteId: string; expectedRevision: number }): Promise<ChatTranscriptTransferPlan>;
   cancelChatFromTranscript(planId: string): Promise<void>;
   submitChatFromTranscript(input: { planId: string; conversationId: string }): Promise<{ kind: 'accepted'; conversationId: string; turnId: string; jobId: string }>;
+  submitChatFromTranscriptForCommand(input: { planId: string; conversationId: string }): Promise<
+    | { kind: 'accepted'; conversationId: string; turnId: string; jobId: string }
+    | { kind: 'not_submitted'; reason: 'plan_unavailable' }
+  >;
   deleteChatConversation(id: string): Promise<void>;
   refreshAssistantBatch(jobId: string): Promise<import('../services/openRouterBatchJobs').AssistantBatchJobDTO>;
   prepareMoreCompute(input: { jobId: string; effort: 'medium' | 'high' | 'max' }): Promise<AssistantBatchMoreComputePlan>;

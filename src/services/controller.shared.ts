@@ -6492,8 +6492,33 @@ export class AppControllerImpl implements AppController {
     this.chatTranscriptTransferPlans.delete(id);
   }
 
-  async submitChatFromTranscript(input: { planId: string; conversationId: string }): Promise<{ kind: 'accepted'; conversationId: string; turnId: string; jobId: string }> {
+  private consumeChatTranscriptTransferPlan(planId: string) {
     this.pruneChatTranscriptTransferPlans();
+    const transfer = this.chatTranscriptTransferPlans.get(planId);
+    this.chatTranscriptTransferPlans.delete(planId);
+    if (!transfer) return null;
+    const submittedAtMs = Date.now();
+    if (submittedAtMs < transfer.preparedAtMs || submittedAtMs >= Date.parse(transfer.expiresAt)) return null;
+    return transfer;
+  }
+
+  async submitChatFromTranscript(input: { planId: string; conversationId: string }): Promise<{ kind: 'accepted'; conversationId: string; turnId: string; jobId: string }> {
+    const result = await this.submitChatFromTranscriptInternal(input);
+    if (result.kind === 'not_submitted') throw new Error('This transcript review expired. Review it again before continuing.');
+    return result;
+  }
+
+  async submitChatFromTranscriptForCommand(input: { planId: string; conversationId: string }): Promise<
+    | { kind: 'accepted'; conversationId: string; turnId: string; jobId: string }
+    | { kind: 'not_submitted'; reason: 'plan_unavailable' }
+  > {
+    return this.submitChatFromTranscriptInternal(input);
+  }
+
+  private async submitChatFromTranscriptInternal(input: { planId: string; conversationId: string }): Promise<
+    | { kind: 'accepted'; conversationId: string; turnId: string; jobId: string }
+    | { kind: 'not_submitted'; reason: 'plan_unavailable' }
+  > {
     const planId = input?.planId;
     const conversationId = input?.conversationId;
     if (typeof planId !== 'string' || typeof conversationId !== 'string' || !conversationId) {
@@ -6501,13 +6526,8 @@ export class AppControllerImpl implements AppController {
     }
     // Consume synchronously before any await or queueing. A failed or uncertain
     // staging attempt requires a new explicit review and cannot replay this plan.
-    const transfer = this.chatTranscriptTransferPlans.get(planId);
-    this.chatTranscriptTransferPlans.delete(planId);
-    if (!transfer) throw new Error('This transcript review expired. Review it again before continuing.');
-    const submittedAtMs = Date.now();
-    if (submittedAtMs < transfer.preparedAtMs || submittedAtMs >= Date.parse(transfer.expiresAt)) {
-      throw new Error('This transcript review expired. Review it again before continuing.');
-    }
+    const transfer = this.consumeChatTranscriptTransferPlan(planId);
+    if (!transfer) return { kind: 'not_submitted', reason: 'plan_unavailable' };
     if (this.activeChatConversationSubmissions.has(conversationId)) throw new Error('A message in this conversation is still being submitted. Try again after it settles.');
     this.activeChatConversationSubmissions.add(conversationId);
     try {

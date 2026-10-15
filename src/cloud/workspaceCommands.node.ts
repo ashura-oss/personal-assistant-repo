@@ -71,9 +71,11 @@ export async function dispatchWorkspaceCommand(runtime: OwnedWorkspaceRuntime, a
         return receipt(envelope, command, { objectId: command.planId, planId: command.planId });
       }
       case 'chat.transcript.submit': {
-        const accepted = await controller.submitChatFromTranscript({ planId: command.planId, conversationId: command.conversationId });
-        return receipt(envelope, command, { objectId: accepted.conversationId, planId: command.planId,
-          conversationId: accepted.conversationId, turnId: accepted.turnId, jobId: accepted.jobId });
+        const result = await controller.submitChatFromTranscriptForCommand({ planId: command.planId, conversationId: command.conversationId });
+        if (result.kind === 'not_submitted') return receipt(envelope, command, { objectId: command.conversationId,
+          planId: command.planId, conversationId: command.conversationId, outcome: 'not_submitted', reason: result.reason });
+        return receipt(envelope, command, { objectId: result.conversationId, planId: command.planId,
+          conversationId: result.conversationId, outcome: 'submitted', turnId: result.turnId, jobId: result.jobId });
       }
       case 'notes.save': return receipt(envelope, command, { objectId: (await controller.saveNote({ transcript: command.transcript })).id });
       case 'notes.capture.adopt': return receipt(envelope, command, {
@@ -355,6 +357,7 @@ function receipt(envelope: WorkspaceCommandEnvelope, command: WorkspaceCommand, 
   readonly jobStatus?: import('../services/openRouterBatchJobs').AssistantBatchJobDTO['status']; readonly planId?: string; readonly expiresAt?: string;
   readonly noteId?: string; readonly noteRevision?: number; readonly timeZone?: string; readonly capturedAt?: string;
   readonly captureTimeZone?: string; readonly conversationId?: string;
+  readonly outcome?: 'submitted' | 'not_submitted'; readonly reason?: 'plan_unavailable';
 }) {
   return parseWorkspaceCommandReceipt({ schemaVersion: 1, commandId: envelope.commandId, kind: command.kind, ...fields },
     expectedReceipt(envelope.commandId, command));

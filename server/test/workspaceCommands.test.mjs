@@ -86,7 +86,7 @@ function fixture({ providerBatchClient, withAudio = false, speechClient, speechE
     },
     async readConsumedEvidence(id) { return audioRepository.readConsumedCaptureEvidence(id); },
   }) : undefined;
-  const runtime = new OwnedWorkspaceRuntime({ kernel, runtimeSessionFor: (identity) => runtimeSessions.get(identity.workspaceId) ?? runtimeSession,
+  const createRuntime = () => new OwnedWorkspaceRuntime({ kernel, runtimeSessionFor: (identity) => runtimeSessions.get(identity.workspaceId) ?? runtimeSession,
     afterWorkspaceCommitForTesting() {
       if (failNextWorkspaceCommitAck) { failNextWorkspaceCommitAck = false; throw new Error('simulated post-commit acknowledgement loss'); }
     },
@@ -113,6 +113,7 @@ function fixture({ providerBatchClient, withAudio = false, speechClient, speechE
       ...(providerBatchClient ? { openRouterBatchClient: providerBatchClient } : {}),
       ...integrationOverrides,
     }, ...(pendingCapture ? { pendingCapture } : {}) });
+  let runtime = createRuntime();
   if (captureController) {
     const executeCommand = runtime.executeCommand.bind(runtime);
     runtime.executeCommand = (input, operation, projectReceipt) => executeCommand(input, (controller, identity) => {
@@ -121,7 +122,8 @@ function fixture({ providerBatchClient, withAudio = false, speechClient, speechE
     }, projectReceipt);
   }
   const admission = { sessionToken: admissionSession, assertCurrent() { kernel.getOwnedIdentity(admissionSession); } };
-  return { directory, kernel, ownerId, workspace, admissionSession, runtimeSession, runtimeSessions, runtime, admission, audioRepository,
+  return { directory, kernel, ownerId, workspace, admissionSession, runtimeSession, runtimeSessions, get runtime() { return runtime; }, admission, audioRepository,
+    async restartRuntime() { await runtime.closeAfterDrain(); runtime = createRuntime(); },
     setAttachedSnapshot(value) { attachedSnapshot = value; }, loseNextWorkspaceCommitAck() { failNextWorkspaceCommitAck = true; } };
 }
 
@@ -1389,7 +1391,10 @@ test('transcript review is private and non-paid until an explicit one-use Chat s
       objectId: prepared.receipt.planId, planId: prepared.receipt.planId });
     const canceledSubmit = envelope({ kind: 'chat.transcript.submit', planId: prepared.receipt.planId, conversationId: randomUUID() },
       canceled.snapshot.revision, canceled.snapshot.privacyEpoch);
-    await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission, canceledSubmit), /expired|review again/i);
+    const canceledResult = await dispatchWorkspaceCommand(f.runtime, f.admission, canceledSubmit);
+    assert.deepEqual(canceledResult.receipt, { schemaVersion: 1, commandId: canceledSubmit.commandId, kind: 'chat.transcript.submit',
+      objectId: canceledSubmit.command.conversationId, conversationId: canceledSubmit.command.conversationId, planId: prepared.receipt.planId,
+      outcome: 'not_submitted', reason: 'plan_unavailable' });
     assert.equal(providerSubmissions, 0, 'a canceled plan cannot trigger paid work');
 
     head = await f.runtime.refreshSnapshot(f.admission);
@@ -1407,6 +1412,11 @@ test('transcript review is private and non-paid until an explicit one-use Chat s
     assert.equal(providerSubmissions, 1, 'only the explicit final submission reaches Batch');
     assert.deepEqual((await dispatchWorkspaceCommand(f.runtime, f.admission, submit)).receipt, sent.receipt);
     assert.equal(providerSubmissions, 1, 'the same command id never causes a second paid submission');
+    const consumedAgain = envelope({ kind: 'chat.transcript.submit', planId: nextPlan.receipt.planId, conversationId: conversation.receipt.objectId },
+      (await f.runtime.getSnapshot(f.admission)).revision, (await f.runtime.getSnapshot(f.admission)).privacyEpoch);
+    const unavailableAfterConsume = await dispatchWorkspaceCommand(f.runtime, f.admission, consumedAgain);
+    assert.equal(unavailableAfterConsume.receipt.outcome, 'not_submitted', 'a new command cannot reuse an already consumed plan');
+    assert.equal(providerSubmissions, 1, 'the consumed plan is never sent twice');
   } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
@@ -1446,6 +1456,7 @@ test('a lost Chat transcript submission acknowledgement remains exact-inspect on
     const submit = envelope({ kind: 'chat.transcript.submit', planId: prepared.receipt.planId, conversationId: conversation.receipt.objectId },
       prepared.snapshot.revision, prepared.snapshot.privacyEpoch);
     await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission, submit), /acknowledgement|simulated|commit|saved data changed/i);
+    await f.restartRuntime();
     const inspection = inspectWorkspaceCommand(f.runtime, f.admission, submit.commandId);
     assert.equal(inspection.status, 'inspect_required');
     assert.equal(Object.hasOwn(inspection, 'receipt'), false);
@@ -1456,6 +1467,132 @@ test('a lost Chat transcript submission acknowledgement remains exact-inspect on
     assert.equal(Object.hasOwn(recovered, 'receipt'), false);
     assert.equal(providerSubmissions, 1, 'the original command ID cannot invoke the provider again');
   } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test('a fresh submit after runtime recreation proves an ephemeral transcript plan was not submitted', async () => {
+  const noteId = 'legacy transcript process restart 26';
+  let providerSubmissions = 0;
+  const providerBatchClient = { async submit(_input, onBeforeDispatch) { providerSubmissions += 1; await onBeforeDispatch(); return { batchId: `restart-transfer-${providerSubmissions}` }; },
+    async inspect() { throw new Error('No provider status check is expected here.'); } };
+  const f = fixture({ providerBatchClient, initialNoteId: noteId, initialNoteCapturedAt: '2026-10-14T23:00:00.000Z', initialNoteCaptureTimeZone: 'Asia/Singapore' });
+  try {
+    let head = await f.runtime.getSnapshot(f.admission);
+    const conversation = await dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'chat.create', title: 'Restart recovery target' }, head.revision, head.privacyEpoch));
+    const prepared = await dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'chat.transcript.prepare', noteId, expectedNoteRevision: 1 }, conversation.snapshot.revision, conversation.snapshot.privacyEpoch));
+    await f.restartRuntime();
+    head = await f.runtime.getSnapshot(f.admission);
+    const submit = envelope({ kind: 'chat.transcript.submit', planId: prepared.receipt.planId, conversationId: conversation.receipt.objectId }, head.revision, head.privacyEpoch);
+    const result = await dispatchWorkspaceCommand(f.runtime, f.admission, submit);
+    assert.deepEqual(result.receipt, { schemaVersion: 1, commandId: submit.commandId, kind: 'chat.transcript.submit',
+      objectId: conversation.receipt.objectId, conversationId: conversation.receipt.objectId, planId: prepared.receipt.planId,
+      outcome: 'not_submitted', reason: 'plan_unavailable' });
+    assert.equal(providerSubmissions, 0, 'the restart-lost plan never reaches the provider');
+    assert.equal(result.snapshot.state.notes.filter((note) => note.origin === 'assistant_chat').length, 0, 'no Chat note or turn is created');
+    const inspection = inspectWorkspaceCommand(f.runtime, f.admission, submit.commandId);
+    assert.equal(inspection.status, 'finished');
+    assert.deepEqual(inspection.receipt, result.receipt, 'the exact terminal receipt is durably inspectable');
+    assert.deepEqual((await dispatchWorkspaceCommand(f.runtime, f.admission, submit)).receipt, result.receipt, 'replay returns the same terminal receipt');
+    assert.equal(providerSubmissions, 0, 'receipt replay does not submit paid work');
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test('a consumed transcript plan that expires before mutation stays inspect-required instead of becoming not-submitted', async () => {
+  const noteId = 'legacy transcript queued expiry 28';
+  let providerSubmissions = 0;
+  let expireBeforeMutation = false;
+  const originalNow = Date.now;
+  const providerBatchClient = { async submit() { providerSubmissions += 1; return { batchId: 'must-not-run' }; },
+    async inspect() { throw new Error('No provider status check is expected here.'); } };
+  const f = fixture({ providerBatchClient, initialNoteId: noteId, initialNoteCapturedAt: '2026-10-14T23:00:00.000Z', initialNoteCaptureTimeZone: 'Asia/Singapore',
+    integrationOverrides: { privacySession: { epoch: 'transcript-test-privacy-epoch', async assertCurrent() {
+      if (expireBeforeMutation) { expireBeforeMutation = false; Date.now = () => originalNow() + 6 * 60_000; }
+    } } } });
+  try {
+    let head = await f.runtime.getSnapshot(f.admission);
+    const conversation = await dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'chat.create', title: 'Queued expiry target' }, head.revision, head.privacyEpoch));
+    const prepared = await dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'chat.transcript.prepare', noteId, expectedNoteRevision: 1 }, conversation.snapshot.revision, conversation.snapshot.privacyEpoch));
+    head = prepared.snapshot;
+    const submit = envelope({ kind: 'chat.transcript.submit', planId: prepared.receipt.planId, conversationId: conversation.receipt.objectId }, head.revision, head.privacyEpoch);
+    expireBeforeMutation = true;
+    await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission, submit), /expired|review again/i);
+    const inspection = inspectWorkspaceCommand(f.runtime, f.admission, submit.commandId);
+    assert.equal(inspection.status, 'inspect_required');
+    assert.equal(Object.hasOwn(inspection, 'receipt'), false, 'a plan that expired after consume is not reclassified as terminal not-submitted');
+    assert.equal(providerSubmissions, 0);
+  } finally { Date.now = originalNow; await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test('a dropped transport acknowledgement after journal finish recovers the exact not-submitted receipt by inspection', async () => {
+  const noteId = 'legacy transcript terminal ack loss 29';
+  let providerSubmissions = 0;
+  let dispatchAttempts = 0;
+  const providerBatchClient = { async submit() { providerSubmissions += 1; return { batchId: 'must-not-run' }; },
+    async inspect() { throw new Error('No provider status check is expected here.'); } };
+  const f = fixture({ providerBatchClient, initialNoteId: noteId, initialNoteCapturedAt: '2026-10-14T23:00:00.000Z', initialNoteCaptureTimeZone: 'Asia/Singapore' });
+  try {
+    let head = await f.runtime.getSnapshot(f.admission);
+    const conversation = await dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'chat.create', title: 'Terminal receipt target' }, head.revision, head.privacyEpoch));
+    const prepared = await dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'chat.transcript.prepare', noteId, expectedNoteRevision: 1 }, conversation.snapshot.revision, conversation.snapshot.privacyEpoch));
+    await f.restartRuntime();
+    head = await f.runtime.getSnapshot(f.admission);
+    const submit = envelope({ kind: 'chat.transcript.submit', planId: prepared.receipt.planId, conversationId: conversation.receipt.objectId }, head.revision, head.privacyEpoch);
+    const originalFinish = CommandJournal.prototype.finish;
+    let finishFaultInjected = false;
+    CommandJournal.prototype.finish = function(ticket, receiptValue) {
+      const result = originalFinish.call(this, ticket, receiptValue);
+      if (ticket.idempotencyKey === submit.commandId) {
+        finishFaultInjected = true;
+        throw new Error('simulated acknowledgement loss after durable journal finish');
+      }
+      return result;
+    };
+    try {
+      dispatchAttempts += 1;
+      await dispatchWorkspaceCommand(f.runtime, f.admission, submit);
+    } catch { /* The handler may return or reject after registry reconciliation; the durable journal is authoritative. */ }
+    finally { CommandJournal.prototype.finish = originalFinish; }
+    assert.equal(finishFaultInjected, true, 'the injected failure occurs only after journal.finish committed');
+    const inspection = inspectWorkspaceCommand(f.runtime, f.admission, submit.commandId);
+    assert.equal(inspection.status, 'finished');
+    assert.deepEqual(inspection.receipt, { schemaVersion: 1, commandId: submit.commandId, kind: 'chat.transcript.submit',
+      objectId: conversation.receipt.objectId, conversationId: conversation.receipt.objectId, planId: prepared.receipt.planId,
+      outcome: 'not_submitted', reason: 'plan_unavailable' });
+    assert.equal(dispatchAttempts, 1, 'inspection is a read and does not post the original command again');
+    assert.equal(providerSubmissions, 0, 'no provider work ran before the terminal receipt');
+    const finalSnapshot = await f.runtime.refreshSnapshot(f.admission);
+    assert.equal(finalSnapshot.state.notes.filter((note) => note.origin === 'assistant_chat').length, 0);
+    assert.equal(finalSnapshot.state.assistantBatchJobs.length, 0);
+    assert.equal(finalSnapshot.state.assistantChatConversations.find((item) => item.id === conversation.receipt.objectId)?.turns.length, 0);
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test('an initially expired transcript plan returns terminal not-submitted before provider work', async () => {
+  const noteId = 'legacy transcript expired plan 27';
+  let providerSubmissions = 0;
+  const providerBatchClient = { async submit() { providerSubmissions += 1; return { batchId: 'must-not-run' }; },
+    async inspect() { throw new Error('No provider status check is expected here.'); } };
+  const f = fixture({ providerBatchClient, initialNoteId: noteId, initialNoteCapturedAt: '2026-10-14T23:00:00.000Z', initialNoteCaptureTimeZone: 'Asia/Singapore' });
+  const originalNow = Date.now;
+  try {
+    let head = await f.runtime.getSnapshot(f.admission);
+    const conversation = await dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'chat.create', title: 'Expired transcript target' }, head.revision, head.privacyEpoch));
+    const prepared = await dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'chat.transcript.prepare', noteId, expectedNoteRevision: 1 }, conversation.snapshot.revision, conversation.snapshot.privacyEpoch));
+    head = prepared.snapshot;
+    const submit = envelope({ kind: 'chat.transcript.submit', planId: prepared.receipt.planId, conversationId: conversation.receipt.objectId }, head.revision, head.privacyEpoch);
+    Date.now = () => originalNow() + 6 * 60_000;
+    const result = await dispatchWorkspaceCommand(f.runtime, f.admission, submit);
+    assert.equal(result.receipt.outcome, 'not_submitted');
+    assert.equal(result.receipt.reason, 'plan_unavailable');
+    assert.equal(providerSubmissions, 0);
+  } finally { Date.now = originalNow; await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test('proposal execution receipt reflects the final persisted proposal state through the actual command runtime', async () => {

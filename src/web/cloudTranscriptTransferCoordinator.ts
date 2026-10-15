@@ -167,7 +167,12 @@ export class CloudTranscriptTransferCoordinator {
         this.publish({ ...this.value, held: Object.freeze({ ...held }) });
       });
       const receipt = receiptFor(response, 'chat.transcript.submit');
-      if (generation !== this.generation || !this.ownerCurrent(owner) || receipt?.planId !== planId || receipt.conversationId !== conversationId || receipt.objectId !== conversationId) {
+      if (generation !== this.generation || !this.ownerCurrent(owner)) return undefined;
+      if (receipt?.planId === planId && receipt.conversationId === conversationId && receipt.objectId === conversationId && receipt.outcome === 'not_submitted') {
+        this.publish({ busy: false, notice: 'This command did not submit a Chat message. Review the saved transcript again.' });
+        return undefined;
+      }
+      if (receipt?.planId !== planId || receipt.conversationId !== conversationId || receipt.objectId !== conversationId) {
         if (generation === this.generation && this.ownerCurrent(owner)) this.publish({ ...this.value, notice: 'The exact Chat submission is still being checked. Do not send it again.' });
         return undefined;
       }
@@ -206,6 +211,10 @@ export class CloudTranscriptTransferCoordinator {
         return undefined;
       }
       if (held.kind === 'chat.transcript.submit' && response.receipt.kind === 'chat.transcript.submit' && response.receipt.planId === held.planId && response.receipt.conversationId === held.conversationId && response.receipt.objectId === held.conversationId) {
+        if (response.receipt.outcome === 'not_submitted') {
+          this.publish({ busy: false, notice: 'This command did not submit a Chat message. Review the saved transcript again.' });
+          return undefined;
+        }
         this.publish({ busy: false, notice: 'The exact Chat submission is confirmed. Refreshing saved messages; no request was resent.' });
         await this.workspace.refresh();
         if (generation !== this.generation || !this.ownerCurrent(held.owner)) return undefined;
