@@ -151,7 +151,7 @@ describe('AuthGate session ownership', () => {
     expect(fetch).toHaveBeenCalledTimes(3);
     expect(fetch.mock.calls[2][0]).toBe('/auth/session');
     expect(host.textContent).toContain('Workspace logout');
-    expect(renderWorkspace).toHaveBeenCalledWith(signedIn, expect.any(Function));
+    expect(renderWorkspace).toHaveBeenCalledWith(signedIn, expect.any(Function), expect.any(Function));
   });
 
   it('keeps the workspace blocked after an uncertain logout until a manual session read confirms guest state', async () => {
@@ -272,6 +272,41 @@ describe('AuthGate session ownership', () => {
     expect(fetch).toHaveBeenCalledTimes(2);
     expect(fetch.mock.calls[1][1].signal?.aborted).toBe(true);
     await act(async () => { finishLogout?.(response(guest)); await logoutResponse; });
+  });
+
+  it('rechecks a captured workspace session without POST logout and rejects a stale owner callback', async () => {
+    const replacement = { ...signedIn, workspaceId: 'f3f3f3f3-f3f3-43f3-83f3-f3f3f3f3f3f3', privacyEpoch: 5, csrfToken: 'replacement-csrf' };
+    const fetch = vi.fn().mockResolvedValueOnce(response(signedIn)).mockResolvedValueOnce(response(replacement));
+    vi.stubGlobal('fetch', fetch);
+    const callbacks: (() => void)[] = [];
+    const renderWorkspace = vi.fn((_session, _logout, recheck) => {
+      callbacks.push(recheck);
+      return React.createElement('span', null, `Workspace ${callbacks.length}`);
+    });
+    await act(async () => { root.render(React.createElement(AuthGate, { renderWorkspace })); });
+    const oldOwnerRecheck = callbacks[0]!;
+    await act(async () => { oldOwnerRecheck(); await Promise.resolve(); });
+    expect(fetch.mock.calls.map(([path]) => path)).toEqual(['/auth/session', '/auth/session']);
+    expect(fetch.mock.calls.some(([path]) => path === '/auth/logout')).toBe(false);
+    expect(host.textContent).toContain('Workspace 2');
+    const callCount = fetch.mock.calls.length;
+    await act(async () => { oldOwnerRecheck(); await Promise.resolve(); });
+    expect(fetch).toHaveBeenCalledTimes(callCount);
+    expect(callbacks.length).toBe(2);
+  });
+
+  it('returns to password sign-in when a post-erasure session recheck finds a revoked session', async () => {
+    const fetch = vi.fn().mockResolvedValueOnce(response(signedIn)).mockResolvedValueOnce(response(guest));
+    vi.stubGlobal('fetch', fetch);
+    let recheck: (() => void) | undefined;
+    await act(async () => { root.render(React.createElement(AuthGate, {
+      renderWorkspace: (_session, _logout, requestRecheck) => { recheck = requestRecheck; return React.createElement('span', null, 'Workspace'); },
+    })); });
+    await act(async () => { recheck?.(); await Promise.resolve(); });
+    expect(host.textContent).toContain('Sign in to Still');
+    expect(host.querySelector('input[aria-label="Workspace password"]')).not.toBeNull();
+    expect(fetch.mock.calls.map(([path]) => path)).toEqual(['/auth/session', '/auth/session']);
+    expect(fetch.mock.calls.some(([path]) => path === '/auth/logout')).toBe(false);
   });
 
   it('does not poll, retry, or persist authentication in browser storage', async () => {

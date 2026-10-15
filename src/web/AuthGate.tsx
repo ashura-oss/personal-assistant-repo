@@ -21,12 +21,12 @@ import {
 } from './authClient';
 
 type Props = {
-  renderWorkspace: (session: AuthenticatedSession, onLogout: () => void) => React.ReactNode;
+  renderWorkspace: (session: AuthenticatedSession, onLogout: () => void, onRecheckSession: () => void) => React.ReactNode;
 };
 
 type Screen = 'loading' | 'guest' | 'authenticated' | 'submitting' | 'checking' | 'loggingOut' | 'blocked';
 type RequestTicket = Readonly<{
-  kind: 'initial' | 'check' | 'login' | 'logout';
+  kind: 'initial' | 'check' | 'login' | 'logout' | 'recheck';
   controller: AbortController;
   generation: number;
 }>;
@@ -40,6 +40,7 @@ function safeErrorMessage(error: unknown): string {
 export function AuthGate({ renderWorkspace }: Props) {
   const [screen, setScreen] = useState<Screen>('loading');
   const [session, setSession] = useState<AuthSession | null>(null);
+  const sessionRef = useRef<AuthSession | null>(null);
   const [csrfToken, setCsrfToken] = useState('');
   const [password, setPassword] = useState('');
   const [passwordVisible, setPasswordVisible] = useState(false);
@@ -66,6 +67,7 @@ export function AuthGate({ renderWorkspace }: Props) {
   }, [isCurrent]);
 
   const acceptSession = useCallback((next: AuthSession) => {
+    sessionRef.current = next;
     setCsrfToken(next.csrfToken);
     setSession(next);
     setMessage('');
@@ -152,6 +154,7 @@ export function AuthGate({ renderWorkspace }: Props) {
     const ticket = admitRequest('logout');
     if (!ticket) return;
     const csrfToken = session.csrfToken;
+    sessionRef.current = null;
     setSession(null);
     setPassword('');
     setPasswordVisible(false);
@@ -179,9 +182,30 @@ export function AuthGate({ renderWorkspace }: Props) {
   const requestLogout = useCallback(() => { void logout(); }, [logout]);
 
   if (screen === 'authenticated' && session?.authenticated) {
-    // This render prop receives the callback for a later user action; it is not invoked during render.
+    const capturedSession = session;
+    const requestRecheck = () => {
+      if (sessionRef.current !== capturedSession || !capturedSession.authenticated || requestRef.current) return;
+      const ticket = admitRequest('recheck');
+      if (!ticket) return;
+      sessionRef.current = null;
+      setSession(null);
+      setPassword('');
+      setPasswordVisible(false);
+      setMessage('');
+      setScreen('checking');
+      void getAuthSession(ticket.controller.signal).then((current) => {
+        if (isCurrent(ticket)) acceptSession(current);
+      }).catch((error: unknown) => {
+        if (!isCurrent(ticket)) return;
+        sessionRef.current = null;
+        setSession(null);
+        setScreen('blocked');
+        setMessage(safeErrorMessage(error));
+      }).finally(() => finishRequest(ticket));
+    };
+    // These callbacks only run after a later user action or owner terminal signal.
     // eslint-disable-next-line react-hooks/refs
-    return <>{renderWorkspace(session, requestLogout)}</>;
+    return <>{renderWorkspace(session, requestLogout, requestRecheck)}</>;
   }
 
   const busy = screen === 'loading' || screen === 'submitting' || screen === 'checking' || screen === 'loggingOut';

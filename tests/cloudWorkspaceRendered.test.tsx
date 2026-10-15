@@ -81,6 +81,12 @@ function credentialMetadata(openrouter = false, speech = false, epoch = 3, owner
     openrouter: { configured: openrouter, generation: openrouter ? 1 : 0 },
   } };
 }
+function stubWorkspaceFetch(fetcher: (input: string | URL | Request, init?: RequestInit) => Promise<unknown>) {
+  vi.stubGlobal('fetch', async (input: string | URL | Request, init?: RequestInit) => {
+    if (String(input) === '/api/workspace/erase/status') return { ok: true, status: 200, json: async () => ({ schemaVersion: 1, status: 'none' }) };
+    return fetcher(input, init);
+  });
+}
 let host: HTMLDivElement;
 let root: Root;
 beforeEach(() => {
@@ -224,7 +230,7 @@ describe('CloudWorkspace safe DTO presentation', () => {
       }
       throw new Error(`Unexpected cloud mail request: ${method} ${path}`);
     });
-    vi.stubGlobal('fetch', fetcher);
+    stubWorkspaceFetch(fetcher);
     try {
       await act(async () => { root.render(<CloudWorkspaceSession session={{ authenticated: true, workspaceId, privacyEpoch: 3, csrfToken: 'mail-csrf' }} onLogout={vi.fn()} />); await new Promise((resolve) => setTimeout(resolve, 0)); });
       click('Mail and calendar section');
@@ -293,7 +299,7 @@ describe('CloudWorkspace safe DTO presentation', () => {
       }
       throw new Error(`Unexpected session workflow request ${method} ${path}`);
     });
-    vi.stubGlobal('fetch', fetcher);
+    stubWorkspaceFetch(fetcher);
     const session = Object.freeze({ authenticated: true, workspaceId, privacyEpoch: 3, csrfToken: 'proposal-csrf' });
     const store = new CloudWorkspaceSessionStore(session);
     const stop = store.start();
@@ -363,7 +369,7 @@ describe('CloudWorkspace safe DTO presentation', () => {
       }
       throw new Error(`Unexpected request ${method} ${path}`);
     });
-    vi.stubGlobal('fetch', fetcher);
+    stubWorkspaceFetch(fetcher);
     const store = new CloudWorkspaceSessionStore(Object.freeze({ authenticated: true, workspaceId, privacyEpoch: 3, csrfToken: 'proposal-csrf' }));
     const stop = store.start();
     function MailRoute() {
@@ -410,7 +416,7 @@ describe('CloudWorkspace safe DTO presentation', () => {
     const storageRead = vi.spyOn(Storage.prototype, 'getItem');
     const storageWrite = vi.spyOn(Storage.prototype, 'setItem');
     const storageRemove = vi.spyOn(Storage.prototype, 'removeItem');
-    vi.stubGlobal('fetch', fetcher);
+    stubWorkspaceFetch(fetcher);
     await act(async () => { root.render(<React.StrictMode><AppWeb /></React.StrictMode>); await new Promise((resolve) => setTimeout(resolve, 0)); });
     expect(host.querySelector('[data-safe-area-provider="true"]')).not.toBeNull();
     expect(host.querySelector('input[aria-label="Workspace password"]')).not.toBeNull();
@@ -429,6 +435,94 @@ describe('CloudWorkspace safe DTO presentation', () => {
     expect(storageRemove).not.toHaveBeenCalled();
   });
 
+  for (const outcome of ['success', 'lost acknowledgement'] as const) {
+    it(`rechecks the AuthGate owner after erase ${outcome} and discovers the receipt after fresh login`, async () => {
+      const state = createInitialWorkspaceState(() => '11111111-1111-4111-8111-111111111111');
+      const freshState = createInitialWorkspaceState(() => '11111111-1111-4111-8111-111111111111');
+      const guest = { authenticated: false, csrfToken: 'fresh-guest-csrf' };
+      const firstSession = { authenticated: true, workspaceId, privacyEpoch: 3, csrfToken: 'first-session-csrf' };
+      const freshSession = { authenticated: true, workspaceId, privacyEpoch: 4, csrfToken: 'fresh-session-csrf' };
+      const receipt = { schemaVersion: 1, commandId: '', status: 'complete', erasedPrivacyEpoch: 3, currentPrivacyEpoch: 4, createdAt: '2026-10-15T11:00:00.000Z' };
+      let authSessionReads = 0;
+      let loginCount = 0;
+      let credentialReads = 0;
+      let firstCredentialSignal: AbortSignal | undefined;
+      let executeCount = 0;
+      let authState: unknown = guest;
+      let eraseStatus: unknown = { schemaVersion: 1, status: 'none' };
+      let erasePlan: Record<string, unknown> | undefined;
+      const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const path = String(input); const method = init?.method ?? 'GET';
+        if (path === '/auth/session') { authSessionReads += 1; return { ok: true, status: 200, json: async () => authState }; }
+        if (path === '/auth/login') { loginCount += 1; authState = loginCount === 1 ? firstSession : freshSession; return { ok: true, status: 200, json: async () => authState }; }
+        if (path === '/auth/logout') throw new Error('Workspace erasure must recheck, not POST logout.');
+        if (path === '/api/credentials' && method === 'GET') {
+          credentialReads += 1;
+          if (credentialReads === 1) return new Promise((_resolve, reject) => {
+            firstCredentialSignal = init?.signal ?? undefined;
+            firstCredentialSignal?.addEventListener('abort', () => reject(new DOMException('Disposed with owner', 'AbortError')), { once: true });
+          });
+          const epoch = loginCount > 1 ? 4 : 3;
+          return { ok: true, status: 200, json: async () => credentialMetadata(false, false, epoch) };
+        }
+        if (path === '/api/workspace/erase/status') return { ok: true, status: 200, json: async () => eraseStatus };
+        if (path === '/api/workspace/snapshot') {
+          const epoch = loginCount > 1 ? 4 : 3;
+          const dto = createWorkspaceSnapshotDTO({ getSnapshot: () => epoch === 4 ? freshState : state }, { workspaceId, privacyEpoch: epoch, revision: epoch === 4 ? 1 : 7 });
+          return { ok: true, status: 200, json: async () => dto };
+        }
+        if (path === '/api/workspace/erase/prepare') {
+          const request = JSON.parse(String(init?.body)) as { commandId: string; expectedRevision: number; expectedPrivacyEpoch: number };
+          erasePlan = { schemaVersion: 1, ...request, expiresAt: '2026-10-15T12:00:00.000Z',
+            counts: { notes: 1, documents: 0, accounts: 0, proposals: 0, audioUploads: 0, backgroundPolicies: 0 }, status: 'prepared' };
+          eraseStatus = { schemaVersion: 1, status: 'prepared', plan: erasePlan };
+          return { ok: true, status: 200, json: async () => erasePlan };
+        }
+        if (path === '/api/workspace/erase/confirm') {
+          erasePlan = { ...erasePlan, status: 'confirmed' };
+          eraseStatus = { schemaVersion: 1, status: 'confirmed', plan: erasePlan };
+          return { ok: true, status: 200, json: async () => erasePlan };
+        }
+        if (path === '/api/workspace/erase/execute') {
+          executeCount += 1;
+          const request = JSON.parse(String(init?.body)) as { commandId: string; expectedPrivacyEpoch: number };
+          eraseStatus = { schemaVersion: 1, status: 'complete', receipt: { ...receipt, commandId: request.commandId } };
+          authState = guest;
+          if (outcome === 'lost acknowledgement') throw new TypeError('Synthetic lost execute acknowledgement.');
+          return { ok: true, status: 200, json: async () => ({ ...receipt, commandId: request.commandId }) };
+        }
+        throw new Error(`Unexpected AuthGate erasure request: ${method} ${path}`);
+      });
+      vi.stubGlobal('fetch', fetcher);
+      await act(async () => { root.render(<AppWeb />); await new Promise((resolve) => setTimeout(resolve, 0)); });
+      setTextField('Workspace password', 'synthetic test password');
+      await act(async () => { click('Sign in'); await new Promise((resolve) => setTimeout(resolve, 0)); await new Promise((resolve) => setTimeout(resolve, 0)); });
+      click('Open settings');
+      click('Review erasure');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(host.textContent).toContain('1 notes');
+      click('Confirm erasure');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      click('Review final erasure confirmation');
+      click('Erase workspace now');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(executeCount).toBe(1);
+      expect(fetcher.mock.calls.some(([path]) => String(path) === '/auth/logout')).toBe(false);
+      expect(authSessionReads).toBe(2);
+      expect(host.querySelector('input[aria-label="Workspace password"]')).not.toBeNull();
+      expect(host.textContent).not.toContain('Opening your saved workspace');
+      expect(firstCredentialSignal?.aborted).toBe(true);
+
+      setTextField('Workspace password', 'synthetic test password');
+      await act(async () => { click('Sign in'); await new Promise((resolve) => setTimeout(resolve, 0)); await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(host.textContent).toContain('Workspace erasure is complete. Your owner login remains available.');
+      expect(credentialReads).toBe(2);
+      expect(executeCount).toBe(1);
+      expect(fetcher.mock.calls.filter(([path]) => String(path) === '/api/workspace/erase/status')).toHaveLength(4);
+      vi.unstubAllGlobals();
+    });
+  }
+
   it('offers an explicit retry after the first workspace snapshot fails', async () => {
     const state = createInitialWorkspaceState(() => '11111111-1111-4111-8111-111111111111');
     const snapshot = createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: 7 });
@@ -445,7 +539,7 @@ describe('CloudWorkspace safe DTO presentation', () => {
       if (path === '/api/workspace/refresh' && init?.method === 'POST') return { ok: true, status: 200, json: async () => snapshot };
       throw new Error(`Unexpected retry request: ${init?.method ?? 'GET'} ${path}`);
     });
-    vi.stubGlobal('fetch', fetcher);
+    stubWorkspaceFetch(fetcher);
     await act(async () => { root.render(<AppWeb />); await new Promise((resolve) => setTimeout(resolve, 0)); });
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); await new Promise((resolve) => setTimeout(resolve, 0)); });
     expect(host.textContent).toContain('Retry workspace');
@@ -476,7 +570,7 @@ describe('CloudWorkspace safe DTO presentation', () => {
       }
       throw new Error(`Unexpected credential composition request: ${method} ${path}`);
     });
-    vi.stubGlobal('fetch', fetcher);
+    stubWorkspaceFetch(fetcher);
     try {
       await act(async () => { root.render(<CloudWorkspaceSession session={{ authenticated: true, workspaceId, privacyEpoch: 3, csrfToken: 'csrf' }} onLogout={vi.fn()} />); await new Promise((resolve) => setTimeout(resolve, 0)); });
       expect(credentialReads).toBe(1);
@@ -526,7 +620,7 @@ describe('CloudWorkspace safe DTO presentation', () => {
       if (path.startsWith('/api/credential-commands/') && method === 'GET') return { ok: true, status: 200, json: async () => ({ status: 'finished' }) };
       throw new Error(`Unexpected credential recovery request: ${method} ${path}`);
     });
-    vi.stubGlobal('fetch', fetcher);
+    stubWorkspaceFetch(fetcher);
     try {
       await act(async () => { root.render(<CloudWorkspaceSession session={{ authenticated: true, workspaceId, privacyEpoch: 3, csrfToken: 'csrf' }} onLogout={vi.fn()} />); await new Promise((resolve) => setTimeout(resolve, 0)); });
       click('Open settings');
@@ -564,7 +658,7 @@ describe('CloudWorkspace safe DTO presentation', () => {
       if (path === '/api/credentials' && method === 'PUT') { putCount += 1; return pendingAck.promise; }
       throw new Error(`Unexpected unmount credential request: ${method} ${path}`);
     });
-    vi.stubGlobal('fetch', fetcher);
+    stubWorkspaceFetch(fetcher);
     await act(async () => { root.render(<CloudWorkspaceSession session={{ authenticated: true, workspaceId, privacyEpoch: 3, csrfToken: 'csrf' }} onLogout={vi.fn()} />); await new Promise((resolve) => setTimeout(resolve, 0)); });
     click('Open settings');
     setTextField('OpenRouter API key', 'late-ack-key');
@@ -619,7 +713,7 @@ describe('CloudWorkspace safe DTO presentation', () => {
       }
       throw new Error(`Unexpected UI integration request: ${method} ${path}`);
     });
-    vi.stubGlobal('fetch', fetcher);
+    stubWorkspaceFetch(fetcher);
     try {
       await act(async () => { root.render(<CloudWorkspaceSession session={session} onLogout={vi.fn()} />); await new Promise((resolve) => setTimeout(resolve, 0)); });
       click('Record');
@@ -819,7 +913,7 @@ describe('CloudWorkspace safe DTO presentation', () => {
       }
       throw new Error(`Unexpected transcript workflow request ${method} ${path}`);
     });
-    vi.stubGlobal('fetch', fetcher);
+    stubWorkspaceFetch(fetcher);
     const session = Object.freeze({ authenticated: true, workspaceId, privacyEpoch: 3, csrfToken: 'transcript-csrf' });
     const store = new CloudWorkspaceSessionStore(session);
     const stop = store.start();
@@ -917,7 +1011,7 @@ describe('CloudWorkspace safe DTO presentation', () => {
       }
       throw new Error(`Unexpected transcript recovery request ${method} ${path}`);
     });
-    vi.stubGlobal('fetch', fetcher);
+    stubWorkspaceFetch(fetcher);
     const store = new CloudWorkspaceSessionStore(session);
     const stop = store.start();
     function Route() {
@@ -1056,7 +1150,7 @@ describe('CloudWorkspace safe DTO presentation', () => {
       }
       throw new Error(`Unexpected session replacement request ${method} ${path}`);
     });
-    vi.stubGlobal('fetch', fetcher);
+    stubWorkspaceFetch(fetcher);
     const oldStore = new CloudWorkspaceSessionStore(Object.freeze({ authenticated: true, workspaceId, privacyEpoch: 3, csrfToken: 'old-csrf' }));
     const stopOld = oldStore.start();
     try {
@@ -1377,7 +1471,7 @@ describe('CloudWorkspace safe DTO presentation', () => {
       if (path.startsWith('/api/workspace/proposals/review?') && method === 'GET') return delayedReview.promise;
       throw new Error(`Unexpected request during review-owner test: ${method} ${path}`);
     });
-    vi.stubGlobal('fetch', fetcher);
+    stubWorkspaceFetch(fetcher);
     try {
       await act(async () => { root.render(<CloudWorkspaceSession key="mail-session-a" session={sessionA} onLogout={vi.fn()} />); await new Promise((resolve) => setTimeout(resolve, 0)); });
       click('Inbox');
@@ -1926,7 +2020,7 @@ describe('CloudWorkspace safe DTO presentation', () => {
       }
       throw new Error(`Unexpected request ${path}`);
     });
-    vi.stubGlobal('fetch', fetcher);
+    stubWorkspaceFetch(fetcher);
     const session = { authenticated: true as const, workspaceId, privacyEpoch: 3, csrfToken: 'csrf' };
     const onLogout = vi.fn();
     act(() => root.render(<CloudWorkspaceSession session={session} onLogout={onLogout} />));
@@ -2009,7 +2103,7 @@ describe('CloudWorkspace safe DTO presentation', () => {
       }
       throw new Error(`Unexpected upload integration request: ${method} ${path}`);
     });
-    vi.stubGlobal('fetch', fetcher);
+    stubWorkspaceFetch(fetcher);
     try {
       await act(async () => { root.render(<CloudWorkspaceSession session={session} onLogout={vi.fn()} />); await new Promise((resolve) => setTimeout(resolve, 0)); });
       click('Record');
@@ -2088,7 +2182,7 @@ describe('CloudWorkspace safe DTO presentation', () => {
           captureId: consumedCaptureId, captureRevision: consumedRevision } }) };
       throw new Error(`Unexpected history integration request: ${method} ${path}`);
     });
-    vi.stubGlobal('fetch', fetcher);
+    stubWorkspaceFetch(fetcher);
     try {
       await act(async () => { root.render(<CloudWorkspaceSession session={{ authenticated: true, workspaceId, privacyEpoch: 3, csrfToken: 'csrf' }} onLogout={vi.fn()} />); await new Promise((resolve) => setTimeout(resolve, 0)); });
       click('Record');
@@ -2149,7 +2243,7 @@ describe('CloudWorkspace safe DTO presentation', () => {
       }
       throw new Error(`Unexpected cancellation request: ${init?.method ?? 'GET'} ${path}`);
     });
-    vi.stubGlobal('fetch', fetcher);
+    stubWorkspaceFetch(fetcher);
     try {
       await act(async () => { root.render(<CloudWorkspaceSession session={{ authenticated: true, workspaceId, privacyEpoch: 3, csrfToken: 'csrf' }} onLogout={vi.fn()} />); await new Promise((resolve) => setTimeout(resolve, 0)); });
       click('Library');
@@ -2203,12 +2297,13 @@ describe('CloudWorkspace safe DTO presentation', () => {
     document.createElement = ((tagName: string, options?: ElementCreationOptions) => tagName.toLowerCase() === 'audio'
       ? audioElements.shift() as unknown as HTMLAudioElement
       : originalCreateElement.call(document, tagName, options)) as typeof document.createElement;
-    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
+    const playbackFetch = vi.fn(async (input: string | URL | Request) => {
       const path = String(input);
       if (path === '/api/credentials') return { ok: true, status: 200, json: async () => credentialMetadata() };
       if (path === '/api/workspace/snapshot' || path === '/api/workspace/refresh') return { ok: true, status: 200, json: async () => snapshot() };
       throw new Error(`Playback must not create unrelated requests: ${path}`);
-    }));
+    });
+    stubWorkspaceFetch(playbackFetch);
     try {
       await act(async () => { root.render(<CloudWorkspaceSession session={{ authenticated: true, workspaceId, privacyEpoch: 3, csrfToken: 'csrf' }} onLogout={vi.fn()} />); await new Promise((resolve) => setTimeout(resolve, 0)); });
       click('Library'); click('Notes'); click('A saved DTO note');
@@ -2284,7 +2379,7 @@ describe('CloudWorkspace safe DTO presentation', () => {
       if (oldUploadId && path === `/api/audio/uploads/${oldUploadId}` && method === 'GET') return oldInspection.promise;
       throw new Error(`Unexpected session replacement request: ${method} ${path}`);
     });
-    vi.stubGlobal('fetch', fetcher);
+    stubWorkspaceFetch(fetcher);
     try {
       await act(async () => { root.render(<CloudWorkspaceSession key="session-a" session={sessionA} onLogout={vi.fn()} />); await new Promise((resolve) => setTimeout(resolve, 0)); });
       click('Record'); click('Start recording a voice note');
@@ -2479,7 +2574,7 @@ describe('CloudWorkspace safe DTO presentation', () => {
       }
       throw new Error(`Unexpected Library request: ${method} ${path}`);
     });
-    vi.stubGlobal('fetch', fetcher);
+    stubWorkspaceFetch(fetcher);
     try {
       await act(async () => { root.render(<CloudWorkspaceSession session={{ authenticated: true, workspaceId, privacyEpoch: 3, csrfToken: 'csrf' }} onLogout={vi.fn()} />); await new Promise((resolve) => setTimeout(resolve, 0)); });
       click('Library');
@@ -2665,7 +2760,7 @@ describe('cloud background policy session operation ownership', () => {
       if (url.startsWith('/api/workspace/background/policies?') && init?.method === 'GET') return { ok: true, status: 200, json: async () => waitingList };
       throw new Error(`Unexpected request ${init?.method ?? 'GET'} ${url}`);
     });
-    vi.stubGlobal('fetch', fetcher);
+    stubWorkspaceFetch(fetcher);
     const store = new CloudWorkspaceSessionStore({ authenticated: true, workspaceId, privacyEpoch: 3, csrfToken: 'csrf' });
     const stop = store.start();
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -2680,5 +2775,118 @@ describe('cloud background policy session operation ownership', () => {
     expect(store.getSnapshot().busy).toBe(false);
     expect(store.getSnapshot().backgroundPolicies?.loaded).toBe(true);
     stop();
+  });
+});
+
+describe('workspace erasure startup recovery', () => {
+  it('discovers an active erasure before requesting the fenced workspace snapshot', async () => {
+    const plan = { schemaVersion: 1, commandId: 'e53e7c18-4128-4e80-a55e-331db010a447', status: 'prepared',
+      expectedRevision: 7, expectedPrivacyEpoch: 3, expiresAt: '2026-10-15T12:00:00.000Z',
+      counts: { notes: 2, documents: 0, accounts: 1, proposals: 0, audioUploads: 0, backgroundPolicies: 0 } };
+    const fetcher = vi.fn(async (input: string | URL | Request) => {
+      if (String(input) === '/api/workspace/erase/status') return { ok: true, status: 200, json: async () => ({ schemaVersion: 1, status: 'prepared', plan }) };
+      if (String(input) === '/api/workspace/snapshot') return { ok: false, status: 409, json: async () => ({ error: 'workspace_erase_in_progress' }) };
+      throw new Error(`Unexpected request ${String(input)}`);
+    });
+    vi.stubGlobal('fetch', fetcher);
+    const store = new CloudWorkspaceSessionStore({ authenticated: true, workspaceId, privacyEpoch: 3, csrfToken: 'erase-csrf' });
+    const stop = store.start();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(fetcher.mock.calls.map(([path]) => String(path))).toEqual(['/api/workspace/erase/status']);
+    expect(store.getSnapshot()).toMatchObject({ status: 'ready', eraseStatus: { status: 'prepared' } });
+    expect(store.getSnapshot().snapshot).toBeUndefined();
+    stop();
+  });
+
+  it('opens cleanup-pending recovery after login without reading the cleared workspace snapshot', async () => {
+    const receipt = { schemaVersion: 1, commandId: 'e53e7c18-4128-4e80-a55e-331db010a447', status: 'cleanup_pending',
+      erasedPrivacyEpoch: 3, currentPrivacyEpoch: 4, createdAt: '2026-10-15T11:00:00.000Z' };
+    const fetcher = vi.fn(async (input: string | URL | Request) => {
+      if (String(input) === '/api/workspace/erase/status') return { ok: true, status: 200, json: async () => ({ schemaVersion: 1, status: 'cleanup_pending', receipt }) };
+      throw new Error(`A pending erase must not read workspace content: ${String(input)}`);
+    });
+    vi.stubGlobal('fetch', fetcher);
+    const store = new CloudWorkspaceSessionStore({ authenticated: true, workspaceId, privacyEpoch: 4, csrfToken: 'fresh-erase-csrf' });
+    const stop = store.start();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(fetcher.mock.calls.map(([path]) => String(path))).toEqual(['/api/workspace/erase/status']);
+    expect(store.getSnapshot()).toMatchObject({ status: 'ready', eraseStatus: { status: 'cleanup_pending', receipt } });
+    expect(store.getSnapshot().snapshot).toBeUndefined();
+    stop();
+  });
+
+  it('recovers the exact held prepare command after a lost acknowledgement', async () => {
+    const state = createInitialWorkspaceState(() => '11111111-1111-4111-8111-111111111111');
+    const snapshot = createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: 7 });
+    let heldCommandId = '';
+    let statusReads = 0;
+    const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const path = String(input);
+      if (path === '/api/workspace/erase/status') {
+        statusReads += 1;
+        return { ok: true, status: 200, json: async () => statusReads === 1 ? { schemaVersion: 1, status: 'none' } : {
+          schemaVersion: 1, status: 'none', hold: { commandId: heldCommandId, status: 'drain_failed', expectedRevision: 8, expectedPrivacyEpoch: 3 },
+        } };
+      }
+      if (path === '/api/workspace/snapshot') return { ok: true, status: 200, json: async () => snapshot };
+      if (path === '/api/workspace/erase/prepare') {
+        heldCommandId = (JSON.parse(String(init?.body)) as { commandId: string }).commandId;
+        return { ok: false, status: 503, json: async () => ({ error: 'service_unavailable' }) };
+      }
+      throw new Error(`Unexpected request ${path}`);
+    });
+    vi.stubGlobal('fetch', fetcher);
+    const store = new CloudWorkspaceSessionStore({ authenticated: true, workspaceId, privacyEpoch: 3, csrfToken: 'erase-csrf' });
+    const stop = store.start();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await expect(store.prepareWorkspaceErase()).rejects.toMatchObject({ kind: 'http', status: 503 });
+    const discovered = await store.discoverWorkspaceErase();
+    expect(discovered).toMatchObject({ status: 'none', hold: { commandId: heldCommandId, status: 'drain_failed', expectedRevision: 8 } });
+    expect(fetcher.mock.calls.filter(([path]) => String(path) === '/api/workspace/erase/prepare')).toHaveLength(1);
+    expect(store.getSnapshot().snapshot).toBeUndefined();
+    stop();
+  });
+
+  it('does not let an old execute failure invalidate a restarted workspace generation', async () => {
+    const state = createInitialWorkspaceState(() => '11111111-1111-4111-8111-111111111111');
+    const snapshot = createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: 7 });
+    let currentStatus: unknown = { schemaVersion: 1, status: 'none' };
+    let currentPlan: Record<string, unknown> | undefined;
+    let rejectExecute!: (cause: Error) => void;
+    const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const path = String(input);
+      if (path === '/api/workspace/erase/status') return { ok: true, status: 200, json: async () => currentStatus };
+      if (path === '/api/workspace/snapshot') return { ok: true, status: 200, json: async () => snapshot };
+      if (path === '/api/workspace/erase/prepare') {
+        const commandId = (JSON.parse(String(init?.body)) as { commandId: string }).commandId;
+        currentPlan = { schemaVersion: 1, commandId, expectedRevision: 7, expectedPrivacyEpoch: 3,
+          expiresAt: '2026-10-15T12:00:00.000Z', counts: { notes: 0, documents: 0, accounts: 0, proposals: 0, audioUploads: 0, backgroundPolicies: 0 }, status: 'prepared' };
+        currentStatus = { schemaVersion: 1, status: 'prepared', plan: currentPlan };
+        return { ok: true, status: 200, json: async () => currentPlan };
+      }
+      if (path === '/api/workspace/erase/confirm') {
+        currentPlan = { ...currentPlan, status: 'confirmed' };
+        currentStatus = { schemaVersion: 1, status: 'confirmed', plan: currentPlan };
+        return { ok: true, status: 200, json: async () => currentPlan };
+      }
+      if (path === '/api/workspace/erase/execute') return new Promise((_resolve, reject) => { rejectExecute = reject; });
+      throw new Error(`Unexpected request ${path}`);
+    });
+    vi.stubGlobal('fetch', fetcher);
+    const store = new CloudWorkspaceSessionStore({ authenticated: true, workspaceId, privacyEpoch: 3, csrfToken: 'erase-csrf' });
+    const stopFirst = store.start();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await store.prepareWorkspaceErase();
+    await store.confirmWorkspaceErase();
+    const executing = store.executeWorkspaceErase();
+    await Promise.resolve();
+    stopFirst();
+    const stopSecond = store.start();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(store.getSnapshot()).toMatchObject({ status: 'ready', eraseStatus: { status: 'confirmed' } });
+    rejectExecute(new TypeError('late old-session network failure'));
+    await expect(executing).rejects.toMatchObject({ kind: 'network' });
+    expect(store.getSnapshot()).toMatchObject({ status: 'ready', eraseStatus: { status: 'confirmed' } });
+    stopSecond();
   });
 });

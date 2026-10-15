@@ -10,6 +10,8 @@ import { CloudConnectionsPanel, type CloudConnectionsCapability } from './CloudC
 import type { WorkspaceAccountDTO, WorkspaceSyncStateDTO } from '../cloud/workspaceDto';
 import { CloudBackgroundPolicies, type CloudBackgroundPolicyAccount } from '../web/CloudBackgroundPolicies';
 import type { CloudBackgroundPolicyCoordinator, CloudBackgroundPolicyState } from '../web/cloudBackgroundPolicyCoordinator';
+import { WorkspaceErasePanel, type WorkspaceEraseActions } from '../web/WorkspaceErasePanel';
+import type { WorkspaceEraseStatus } from '../cloud/workspaceEraseContracts';
 
 export type WorkspaceSettingsDisplay = WorkspaceSnapshotDTO['state'];
 export type WorkspaceSettingsAction = Readonly<{ available: true; action: () => void | Promise<void> }> | Readonly<{ available: false; reason: string }>;
@@ -38,7 +40,7 @@ function CapabilityButton({ label, capability, busy }: { label: string; capabili
     : <Unavailable capability={capability} />;
 }
 
-export function WorkspaceSettingsScreen({ display, actions, busy, onClose, preferencesDraft, preferencesMessage, onReloadPreferences, credentials, connectionCapability, mailCapability, backgroundPolicyCapability, allowCloseWhileBusy }: { display: WorkspaceSettingsDisplay; actions: WorkspaceSettingsActions; busy: boolean; onClose: () => void; preferencesDraft?: WorkspaceSettingsDraft; preferencesMessage?: string; onReloadPreferences?: () => void; credentials?: WorkspaceSettingsCredentialCapability; connectionCapability?: WorkspaceSettingsConnectionCapability; mailCapability?: WorkspaceSettingsMailCapability; backgroundPolicyCapability?: WorkspaceSettingsBackgroundPolicyCapability; allowCloseWhileBusy?: boolean }) {
+export function WorkspaceSettingsScreen({ display, actions, busy, onClose, preferencesDraft, preferencesMessage, onReloadPreferences, credentials, connectionCapability, mailCapability, backgroundPolicyCapability, workspaceEraseCapability, allowCloseWhileBusy }: { display: WorkspaceSettingsDisplay; actions: WorkspaceSettingsActions; busy: boolean; onClose: () => void; preferencesDraft?: WorkspaceSettingsDraft; preferencesMessage?: string; onReloadPreferences?: () => void; credentials?: WorkspaceSettingsCredentialCapability; connectionCapability?: WorkspaceSettingsConnectionCapability; mailCapability?: WorkspaceSettingsMailCapability; backgroundPolicyCapability?: WorkspaceSettingsBackgroundPolicyCapability; workspaceEraseCapability?: Readonly<{ status?: WorkspaceEraseStatus; busy: boolean; error?: string; actions: WorkspaceEraseActions; ownerKey: string }>; allowCloseWhileBusy?: boolean }) {
   const settings = display.settings;
   const activeRules = display.proactive.rules.filter((rule) => rule.enabled).length;
   const pendingSuggestions = display.knowledge.suggestions.filter((suggestion) => suggestion.status === 'pending').length;
@@ -163,6 +165,7 @@ export function WorkspaceSettingsScreen({ display, actions, busy, onClose, prefe
       {display.assistantChatRecoveryStatus?.message ? <Text style={styles.meta}>{display.assistantChatRecoveryStatus.message}</Text> : null}
       {display.credentialCleanup.pendingCount > 0 ? <Text style={styles.meta}>Cleanup by reason · {Object.entries(display.credentialCleanup.reasons).map(([reason, count]) => `${reason}: ${count}`).join(' · ')}</Text> : null}
     </View>
+    {workspaceEraseCapability ? <WorkspaceErasePanel {...workspaceEraseCapability} busy={busy || workspaceEraseCapability.busy} /> : null}
     <CapabilityButton label="Review and recover saved data" capability={actions.recovery} busy={busy} />
     <Unavailable capability={actions.accounts} />
     <Text style={styles.meta}>This view shows saved account, calendar, reminder, recovery, and usage status. Browser actions remain available only when a matching server capability is provided.</Text>

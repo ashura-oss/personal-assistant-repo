@@ -34,6 +34,7 @@ import type { CloudBackgroundPolicyCoordinator } from './cloudBackgroundPolicyCo
 import { CloudMailWorkspace } from './CloudMailWorkspace';
 import { InboxWorkspaceContent, inboxAccountDisplay } from '../ui/InboxWorkspaceContent';
 import { AssistantBatchJobCard } from '../ui/AssistantBatchJobCard';
+import type { WorkspaceEraseActions } from './WorkspaceErasePanel';
 
 export type CloudWorkspaceActions = Readonly<{
   tasks: Readonly<{ complete: (taskId: string) => Promise<WorkspaceCommandResponse>; reopen: (taskId: string) => Promise<WorkspaceCommandResponse> }>;
@@ -83,6 +84,12 @@ type WorkspaceSettingsBaseline = Readonly<{
   retention: WorkspaceSettingsDTO['audioRetention'];
 }>;
 
+type CloudWorkspaceEraseStoreMethods = 'discoverWorkspaceErase' | 'prepareWorkspaceErase' | 'confirmWorkspaceErase' | 'executeWorkspaceErase' |
+  'cancelWorkspaceErase' | 'retryWorkspaceEraseReview' | 'retryWorkspaceEraseCleanup';
+type CloudWorkspaceStorePort = Pick<CloudWorkspaceSessionStore, 'getSnapshot' | 'execute' | 'inspect' | 'refresh'> &
+  Partial<Pick<CloudWorkspaceSessionStore, 'readKnowledgeSourceChoices' | 'readKnowledgeSuggestionReview' | 'readPeriodSummaryResult'>> &
+  Partial<Pick<CloudWorkspaceSessionStore, CloudWorkspaceEraseStoreMethods>>;
+
 function projectSettingsBaseline(settings: WorkspaceSettingsDTO): WorkspaceSettingsBaseline {
   return {
     mode: settings.mode,
@@ -115,7 +122,7 @@ function equalSettingsBaseline(left: WorkspaceSettingsBaseline, right: Workspace
     left.maxAudioSeconds === right.maxAudioSeconds && left.retention === right.retention;
 }
 
-export function CloudWorkspace({ store, state, onLogout, voiceCapability, credentials, oauthCoordinator, mailCoordinator, transcriptTransferCoordinator, backgroundPolicyCoordinator }: { store: Pick<CloudWorkspaceSessionStore, 'getSnapshot' | 'execute' | 'inspect' | 'refresh'> & Partial<Pick<CloudWorkspaceSessionStore, 'readKnowledgeSourceChoices' | 'readKnowledgeSuggestionReview' | 'readPeriodSummaryResult'>>; state: CloudWorkspaceSessionState; onLogout: () => void; voiceCapability?: CloudWorkspaceVoiceCapability; credentials?: CloudCredentialController; oauthCoordinator?: CloudOAuthCoordinator; mailCoordinator?: CloudMailCoordinator; transcriptTransferCoordinator?: CloudTranscriptTransferCoordinator; backgroundPolicyCoordinator?: CloudBackgroundPolicyCoordinator }) {
+export function CloudWorkspace({ store, state, onLogout, voiceCapability, credentials, oauthCoordinator, mailCoordinator, transcriptTransferCoordinator, backgroundPolicyCoordinator }: { store: CloudWorkspaceStorePort; state: CloudWorkspaceSessionState; onLogout: () => void; voiceCapability?: CloudWorkspaceVoiceCapability; credentials?: CloudCredentialController; oauthCoordinator?: CloudOAuthCoordinator; mailCoordinator?: CloudMailCoordinator; transcriptTransferCoordinator?: CloudTranscriptTransferCoordinator; backgroundPolicyCoordinator?: CloudBackgroundPolicyCoordinator }) {
   const oauthState = useCloudOAuth(oauthCoordinator);
   const transcriptTransferState = useSyncExternalStore(transcriptTransferCoordinator?.subscribe ?? EMPTY_TRANSCRIPT_SUBSCRIBE,
     transcriptTransferCoordinator?.getSnapshot ?? (() => EMPTY_TRANSCRIPT_TRANSFER),
@@ -149,6 +156,16 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
   const [libraryQuery, setLibraryQuery] = useState('');
   const [notice, setNotice] = useState<string>();
   const displayedNotice = notice ?? transcriptTransferState.notice;
+  const unavailableEraseAction = () => Promise.reject(new WorkspaceClientError('disposed', 'Workspace erasure is unavailable in this view.'));
+  const eraseActions: WorkspaceEraseActions = {
+    refresh: () => store.discoverWorkspaceErase?.() ?? unavailableEraseAction(),
+    prepare: () => store.prepareWorkspaceErase?.() ?? unavailableEraseAction(),
+    confirm: () => store.confirmWorkspaceErase?.() ?? unavailableEraseAction(),
+    execute: () => store.executeWorkspaceErase?.() ?? unavailableEraseAction(),
+    cancel: () => store.cancelWorkspaceErase?.() ?? unavailableEraseAction(),
+    retryReview: () => store.retryWorkspaceEraseReview?.() ?? unavailableEraseAction(),
+    retryCleanup: () => store.retryWorkspaceEraseCleanup?.() ?? unavailableEraseAction(),
+  };
   const [voiceActionBusy, setVoiceActionBusy] = useState(false);
   const voiceActionLock = useRef<object | undefined>(undefined);
   const [cancelingTranscriptionCommandId, setCancelingTranscriptionCommandId] = useState<string>();
@@ -727,6 +744,12 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
           {state.refreshRequired ? <Button label="Refresh workspace" tone="quiet" disabled={state.busy} onPress={() => void refresh()} /> : null}
         </View>
       ) : null}
+      {state.eraseStatus?.status === 'complete' || state.eraseStatus?.status === 'cancelled' ? <View style={s.notice}>
+        <Text style={s.noticeText}>{state.eraseStatus.status === 'complete'
+          ? 'Workspace erasure is complete. Your owner login remains available.'
+          : 'The previous workspace erasure review was cancelled; saved workspace data remains available.'}</Text>
+        <Button label="View erasure status" tone="quiet" onPress={openSettings} />
+      </View> : null}
       {state.pendingCommand && !displayedNotice && !state.refreshRequired ? (
         <View style={s.notice}>
           <Text style={s.noticeText} accessibilityRole="alert">A {state.pendingCommand.kind} command is awaiting its exact receipt. It will not be sent again automatically.</Text>
@@ -754,6 +777,8 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
         connectionCapability={connectionCapability}
         mailCapability={settingsMailCapability}
         backgroundPolicyCapability={settingsBackgroundPolicyCapability}
+        workspaceEraseCapability={{ status: state.eraseStatus, busy: state.busy, error: state.error, actions: eraseActions,
+          ownerKey: `${snapshot.workspaceId}:${snapshot.privacyEpoch}` }}
         credentials={credentials
           ? { available: true, controller: credentials }
           : { available: false, reason: 'Provider credentials are unavailable in this workspace view.' } satisfies WorkspaceSettingsCredentialCapability}

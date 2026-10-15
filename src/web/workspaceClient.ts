@@ -23,6 +23,8 @@ import type { DispatchReviewReadDto, MailReplyBatchReviewReadDto, MailReplySourc
 import { BACKGROUND_PUBLIC_PAGE_MAX, canonicalBackgroundJson, parseBackgroundPolicyDisplay, parseBackgroundPolicyReceipt,
   parsePauseBackgroundPolicyEnvelope, parseRevokeBackgroundPolicyEnvelope, parseSaveBackgroundPolicyEnvelope,
   type BackgroundPolicyDisplay, type BackgroundPolicyReceipt, type ChangeBackgroundPolicyEnvelope, type SaveBackgroundPolicyEnvelope } from '../cloud/backgroundContracts';
+import { parseWorkspaceEraseCancellation, parseWorkspaceErasePlan, parseWorkspaceEraseReceipt, parseWorkspaceEraseStatus,
+  type WorkspaceEraseCancellation, type WorkspaceErasePlan, type WorkspaceEraseReceipt, type WorkspaceEraseStatus } from '../cloud/workspaceEraseContracts';
 
 export const WORKSPACE_REQUEST_TIMEOUT_MS = 30_000;
 
@@ -59,6 +61,12 @@ export type WorkspaceClient = Readonly<{
   pauseBackgroundPolicy(envelope: ChangeBackgroundPolicyEnvelope): Promise<BackgroundPolicyReceipt>;
   revokeBackgroundPolicy(envelope: ChangeBackgroundPolicyEnvelope): Promise<BackgroundPolicyReceipt>;
   inspectBackgroundPolicyReceipt(commandId: string, expectedPrivacyEpoch: number): Promise<BackgroundPolicyReceipt | undefined>;
+  readWorkspaceEraseStatus(): Promise<WorkspaceEraseStatus>;
+  prepareWorkspaceErase(input: Readonly<{ commandId: string; expectedRevision: number; expectedPrivacyEpoch: number }>): Promise<WorkspaceErasePlan>;
+  confirmWorkspaceErase(input: Readonly<{ commandId: string; expectedRevision: number; expectedPrivacyEpoch: number }>): Promise<WorkspaceErasePlan>;
+  executeWorkspaceErase(input: Readonly<{ commandId: string; expectedRevision: number; expectedPrivacyEpoch: number }>): Promise<WorkspaceEraseReceipt>;
+  cancelWorkspaceErase(input: Readonly<{ commandId: string; expectedRevision: number; expectedPrivacyEpoch: number }>): Promise<WorkspaceEraseCancellation>;
+  retryWorkspaceEraseCleanup(input: Readonly<{ commandId: string; expectedPrivacyEpoch: number }>): Promise<WorkspaceEraseReceipt>;
   execute(command: WorkspaceCommand, onAdmitted?: (envelope: WorkspaceCommandAdmission) => void): Promise<WorkspaceCommandResponse>;
   inspectCommand(commandId?: string): Promise<WorkspaceCommandResponse>;
   inspectRecoveredCommand(entry: WorkspaceCommandHistoryEntry): Promise<WorkspaceCommandResponse>;
@@ -349,6 +357,7 @@ export function createWebWorkspaceClient(session: AuthenticatedSession, options:
       'Saved period summary');
   }
 
+
   async function listBackgroundPolicies(expectedPrivacyEpoch: number, afterPolicyId?: string): Promise<readonly BackgroundPolicyDisplay[]> {
     assertUsable();
     if (expectedPrivacyEpoch !== privacyEpoch || !isGeneration(expectedPrivacyEpoch) ||
@@ -436,6 +445,122 @@ export function createWebWorkspaceClient(session: AuthenticatedSession, options:
       if (error instanceof WorkspaceClientError) throw error;
       throw new WorkspaceClientError('malformed', 'The background policy receipt could not be confirmed.');
     }
+  }
+
+  async function readWorkspaceEraseStatus(): Promise<WorkspaceEraseStatus> {
+    const ticket = beginOperation();
+    const raw = await request('/api/workspace/erase/status', { method: 'GET' }, ticket);
+    assertOperation(ticket);
+    try { return parseWorkspaceEraseStatus(raw); }
+    catch { throw new WorkspaceClientError('malformed', 'The workspace erasure status could not be confirmed.'); }
+  }
+
+  async function postWorkspaceErase<T>(path: string, input: Readonly<Record<string, unknown>>, parse: (value: unknown) => T): Promise<T> {
+    const ticket = beginOperation();
+    const raw = await request(path, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Still-CSRF': session.csrfToken },
+      body: JSON.stringify(input) }, ticket);
+    assertOperation(ticket);
+    try { return parse(raw); }
+    catch { throw new WorkspaceClientError('malformed', 'The workspace erasure response could not be confirmed.'); }
+  }
+
+  function captureEraseRequest(input: unknown): Readonly<{ commandId: string; expectedRevision: number; expectedPrivacyEpoch: number }> {
+    const keys = ['commandId', 'expectedRevision', 'expectedPrivacyEpoch'] as const;
+    let prototype: object | null;
+    let ownKeys: PropertyKey[];
+    try {
+      if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('invalid');
+      prototype = Object.getPrototypeOf(input);
+      ownKeys = Reflect.ownKeys(input);
+      if (prototype !== Object.prototype && prototype !== null || ownKeys.length !== keys.length ||
+          ownKeys.some((key) => typeof key !== 'string' || !keys.includes(key as typeof keys[number]))) throw new Error('invalid');
+      const values = new Map<string, unknown>();
+      for (const key of keys) {
+        const descriptor = Object.getOwnPropertyDescriptor(input, key);
+        if (!descriptor?.enumerable || !Object.hasOwn(descriptor, 'value')) throw new Error('invalid');
+        values.set(key, descriptor.value);
+      }
+      const commandId = values.get('commandId');
+      const expectedRevision = values.get('expectedRevision');
+      const expectedPrivacyEpoch = values.get('expectedPrivacyEpoch');
+      if (typeof commandId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(commandId) ||
+          !isGeneration(expectedRevision) || expectedPrivacyEpoch !== privacyEpoch || !isGeneration(expectedPrivacyEpoch)) {
+        throw new WorkspaceClientError('stale', 'Refresh the authenticated workspace before reviewing erasure.');
+      }
+      return Object.freeze({ commandId, expectedRevision, expectedPrivacyEpoch });
+    } catch (error) {
+      if (error instanceof WorkspaceClientError) throw error;
+      throw new WorkspaceClientError('malformed', 'The workspace erasure request is invalid.');
+    }
+  }
+
+  function captureEraseCleanupRequest(input: unknown): Readonly<{ commandId: string; expectedPrivacyEpoch: number }> {
+    const keys = ['commandId', 'expectedPrivacyEpoch'] as const;
+    try {
+      if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('invalid');
+      const prototype = Object.getPrototypeOf(input);
+      const ownKeys = Reflect.ownKeys(input);
+      if ((prototype !== Object.prototype && prototype !== null) || ownKeys.length !== keys.length ||
+          ownKeys.some((key) => typeof key !== 'string' || !keys.includes(key as typeof keys[number]))) throw new Error('invalid');
+      const commandDescriptor = Object.getOwnPropertyDescriptor(input, 'commandId');
+      const epochDescriptor = Object.getOwnPropertyDescriptor(input, 'expectedPrivacyEpoch');
+      if (!commandDescriptor?.enumerable || !Object.hasOwn(commandDescriptor, 'value') ||
+          !epochDescriptor?.enumerable || !Object.hasOwn(epochDescriptor, 'value')) throw new Error('invalid');
+      const commandId = commandDescriptor.value;
+      const expectedPrivacyEpoch = epochDescriptor.value;
+      if (typeof commandId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(commandId) ||
+          expectedPrivacyEpoch !== privacyEpoch || !isGeneration(expectedPrivacyEpoch)) {
+      throw new WorkspaceClientError('stale', 'Refresh the authenticated workspace before reviewing erasure.');
+      }
+      return Object.freeze({ commandId, expectedPrivacyEpoch });
+    } catch (error) {
+      if (error instanceof WorkspaceClientError) throw error;
+      throw new WorkspaceClientError('malformed', 'The workspace erasure request is invalid.');
+    }
+  }
+
+  async function prepareWorkspaceErase(input: Readonly<{ commandId: string; expectedRevision: number; expectedPrivacyEpoch: number }>): Promise<WorkspaceErasePlan> {
+    const request = captureEraseRequest(input);
+    const plan = await postWorkspaceErase('/api/workspace/erase/prepare', request, parseWorkspaceErasePlan);
+    if (plan.commandId !== request.commandId || plan.expectedPrivacyEpoch !== request.expectedPrivacyEpoch || plan.status !== 'prepared') {
+      throw new WorkspaceClientError('malformed', 'The erasure review could not be confirmed.');
+    }
+    return plan;
+  }
+  async function confirmWorkspaceErase(input: Readonly<{ commandId: string; expectedRevision: number; expectedPrivacyEpoch: number }>): Promise<WorkspaceErasePlan> {
+    const request = captureEraseRequest(input);
+    const plan = await postWorkspaceErase('/api/workspace/erase/confirm', request, parseWorkspaceErasePlan);
+    if (plan.commandId !== request.commandId || plan.expectedRevision !== request.expectedRevision ||
+        plan.expectedPrivacyEpoch !== request.expectedPrivacyEpoch || plan.status !== 'confirmed') {
+      throw new WorkspaceClientError('malformed', 'The erasure confirmation could not be confirmed.');
+    }
+    return plan;
+  }
+  async function executeWorkspaceErase(input: Readonly<{ commandId: string; expectedRevision: number; expectedPrivacyEpoch: number }>): Promise<WorkspaceEraseReceipt> {
+    const request = captureEraseRequest(input);
+    const receipt = await postWorkspaceErase('/api/workspace/erase/execute', request, parseWorkspaceEraseReceipt);
+    if (receipt.commandId !== request.commandId || receipt.erasedPrivacyEpoch !== request.expectedPrivacyEpoch ||
+        receipt.currentPrivacyEpoch !== request.expectedPrivacyEpoch + 1) {
+      throw new WorkspaceClientError('malformed', 'The erasure result could not be confirmed.');
+    }
+    return receipt;
+  }
+  async function cancelWorkspaceErase(input: Readonly<{ commandId: string; expectedRevision: number; expectedPrivacyEpoch: number }>): Promise<WorkspaceEraseCancellation> {
+    const request = captureEraseRequest(input);
+    const cancellation = await postWorkspaceErase('/api/workspace/erase/cancel', request, parseWorkspaceEraseCancellation);
+    if (cancellation.commandId !== request.commandId || cancellation.privacyEpoch !== request.expectedPrivacyEpoch) {
+      throw new WorkspaceClientError('malformed', 'The erasure cancellation could not be confirmed.');
+    }
+    return cancellation;
+  }
+  async function retryWorkspaceEraseCleanup(input: Readonly<{ commandId: string; expectedPrivacyEpoch: number }>): Promise<WorkspaceEraseReceipt> {
+    const request = captureEraseCleanupRequest(input);
+    const receipt = await postWorkspaceErase('/api/workspace/erase/retry-cleanup', request, parseWorkspaceEraseReceipt);
+    if (request.expectedPrivacyEpoch === 0 || receipt.commandId !== request.commandId ||
+        receipt.erasedPrivacyEpoch !== request.expectedPrivacyEpoch - 1 || receipt.currentPrivacyEpoch !== request.expectedPrivacyEpoch) {
+      throw new WorkspaceClientError('malformed', 'The cleanup result could not be confirmed.');
+    }
+    return receipt;
   }
 
   function parseResponse(value: unknown, expectedCommand?: WorkspaceCommandEnvelope, expectedHistoryKind?: WorkspaceCommandHistoryKind): WorkspaceCommandResponse {
@@ -671,6 +796,12 @@ export function createWebWorkspaceClient(session: AuthenticatedSession, options:
     pauseBackgroundPolicy,
     revokeBackgroundPolicy,
     inspectBackgroundPolicyReceipt,
+    readWorkspaceEraseStatus,
+    prepareWorkspaceErase,
+    confirmWorkspaceErase,
+    executeWorkspaceErase,
+    cancelWorkspaceErase,
+    retryWorkspaceEraseCleanup,
     execute,
     inspectCommand,
     inspectRecoveredCommand,

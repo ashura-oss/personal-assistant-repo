@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
-import { ActivityIndicator, Pressable, Text, View } from 'react-native';
+import { ActivityIndicator, Pressable, ScrollView, Text, View } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import type { WorkspaceSnapshotDTO } from '../cloud/workspaceDto';
 import type { KnowledgeSourceChoicesDTO, KnowledgeSuggestionReviewDTO } from '../cloud/knowledgeHttpContracts';
@@ -8,8 +8,11 @@ import type { PeriodSummaryResultReview } from '../core';
 import type { DispatchReviewReadDto, MailReplyBatchReviewReadDto, MailReplySourceReadDto, MailReplyTextReadDto, ProposalReviewReadDto } from './mailWorkflowDtos';
 import type { ReplyBatchPlanRead } from './cloudMailClient';
 import { decodeWorkspaceSnapshotDTO } from '../cloud/workspaceSnapshotCodec';
-import { WorkspaceClientError, WorkspaceCommandNotStartedError, createWebWorkspaceClient, type WorkspaceClient, type WorkspaceCommandAdmission } from './workspaceClient';
+import { WorkspaceClientError, WorkspaceCommandNotStartedError, createWebWorkspaceClient, createWorkspaceCommandId,
+  type WorkspaceClient, type WorkspaceCommandAdmission } from './workspaceClient';
 import type { AuthenticatedSession } from './authClient';
+import type { WorkspaceErasePlan, WorkspaceEraseReceipt, WorkspaceEraseStatus } from '../cloud/workspaceEraseContracts';
+import { WorkspaceErasePanel } from './WorkspaceErasePanel';
 import { CloudWorkspace } from './CloudWorkspace';
 import { createWebAudioUploadClient, type AudioUploadClient } from './audioClient';
 import { CloudVoiceCoordinator, type CloudVoiceCapturePort, type CloudVoiceCoordinatorState } from './cloudVoiceCoordinator';
@@ -23,7 +26,9 @@ import { CloudBackgroundPolicyCoordinator, type CloudBackgroundPolicyState } fro
 
 export type CloudWorkspaceSessionState = Readonly<{
   status: 'loading' | 'ready' | 'error';
+  reauthRequired?: 'erase_completed' | 'erase_outcome_unknown';
   snapshot?: WorkspaceSnapshotDTO;
+  eraseStatus?: WorkspaceEraseStatus;
   busy: boolean;
   pendingCommand?: Readonly<{ commandId: string; kind: WorkspaceCommand['kind'] }>;
   voice?: CloudVoiceCoordinatorState;
@@ -321,15 +326,149 @@ export class CloudWorkspaceSessionStore {
 
   private async loadInitial(owner: number, operation: number): Promise<void> {
     try {
-      const snapshot = await this.currentClient().getSnapshot();
+      const client = this.currentClient();
+      const eraseStatus = await client.readWorkspaceEraseStatus();
       if (!this.isCurrent(owner)) return;
-      this.publish({ status: 'ready', snapshot, busy: false, refreshRequired: false });
+      if (this.needsEraseRecovery(eraseStatus)) {
+        this.publish({ status: 'ready', busy: false, refreshRequired: false, eraseStatus });
+        return;
+      }
+      const snapshot = await client.getSnapshot();
+      if (!this.isCurrent(owner)) return;
+      this.publish({ status: 'ready', snapshot, busy: false, refreshRequired: false, eraseStatus });
     } catch (error) {
       if (!this.isCurrent(owner)) return;
       this.publish({ status: 'error', busy: false, refreshRequired: true, error: this.message(error) });
     } finally {
       this.finishOperation(operation, owner);
     }
+  }
+
+  async discoverWorkspaceErase(): Promise<WorkspaceEraseStatus | undefined> {
+    const owner = this.ownerGeneration;
+    const client = this.currentClient();
+    let operation: number;
+    try { operation = this.beginOperation(); }
+    catch (error) { if (error instanceof WorkspaceClientError && error.kind === 'busy') throw new WorkspaceCommandNotStartedError(error.message); throw error; }
+    this.publish({ ...this.value, busy: true, error: undefined });
+    try {
+      const eraseStatus = await client.readWorkspaceEraseStatus();
+      if (!this.isCurrent(owner)) return undefined;
+      if (this.needsEraseRecovery(eraseStatus)) {
+        this.publish({ ...this.value, status: 'ready', snapshot: undefined, eraseStatus, busy: false, refreshRequired: false, error: undefined });
+        return eraseStatus;
+      }
+      const snapshot = await client.getSnapshot();
+      if (!this.isCurrent(owner)) return undefined;
+      this.publish({ status: 'ready', snapshot, eraseStatus, busy: false, refreshRequired: false });
+      return eraseStatus;
+    } catch (error) {
+      if (this.isCurrent(owner)) this.publish({ ...this.value, status: this.value.snapshot ? 'ready' : 'error', busy: false,
+        refreshRequired: !this.value.snapshot, error: this.message(error) });
+      throw error;
+    } finally { this.finishOperation(operation, owner); }
+  }
+
+  private async refreshEraseStatusAfterAction(owner: number, client: WorkspaceClient): Promise<WorkspaceEraseStatus | undefined> {
+    const eraseStatus = await client.readWorkspaceEraseStatus();
+    if (!this.isCurrent(owner)) return undefined;
+    if (this.needsEraseRecovery(eraseStatus)) {
+      this.publish({ ...this.value, status: 'ready', snapshot: undefined, eraseStatus, busy: false, refreshRequired: false, error: undefined });
+      return eraseStatus;
+    }
+    const snapshot = await client.getSnapshot();
+    if (!this.isCurrent(owner)) return undefined;
+    this.publish({ status: 'ready', snapshot, eraseStatus, busy: false, refreshRequired: false });
+    return eraseStatus;
+  }
+
+  private needsEraseRecovery(status: WorkspaceEraseStatus): boolean {
+    return status.status === 'cleanup_pending' || status.status === 'prepared' || status.status === 'confirmed' ||
+      ('hold' in status && Boolean(status.hold));
+  }
+
+  private async runWorkspaceEraseAction<T>(work: (client: WorkspaceClient) => Promise<T>, refreshAfter: boolean): Promise<T> {
+    const owner = this.ownerGeneration;
+    const client = this.currentClient();
+    let operation: number;
+    try { operation = this.beginOperation(); }
+    catch (error) { if (error instanceof WorkspaceClientError && error.kind === 'busy') throw new WorkspaceCommandNotStartedError(error.message); throw error; }
+    this.publish({ ...this.value, busy: true, error: undefined });
+    try {
+      const result = await work(client);
+      if (!this.isCurrent(owner)) throw new WorkspaceClientError('stale', 'The workspace session changed.');
+      if (refreshAfter) await this.refreshEraseStatusAfterAction(owner, client);
+      else this.publish({ ...this.value, busy: false });
+      return result;
+    } catch (error) {
+      if (this.isCurrent(owner)) this.publish({ ...this.value, busy: false, error: this.message(error) });
+      throw error;
+    } finally { this.finishOperation(operation, owner); }
+  }
+
+  async prepareWorkspaceErase(): Promise<WorkspaceErasePlan> {
+    const current = this.value.snapshot;
+    if (!current || current.workspaceId !== this.session.workspaceId || current.privacyEpoch !== this.session.privacyEpoch) {
+      throw new WorkspaceCommandNotStartedError('Refresh the current workspace before reviewing erasure.');
+    }
+    return this.runWorkspaceEraseAction((client) => client.prepareWorkspaceErase({ commandId: createWorkspaceCommandId(),
+      expectedRevision: current.revision, expectedPrivacyEpoch: current.privacyEpoch }), true);
+  }
+
+  async confirmWorkspaceErase(): Promise<WorkspaceErasePlan> {
+    const plan = this.value.eraseStatus?.status === 'prepared' || this.value.eraseStatus?.status === 'confirmed' ? this.value.eraseStatus.plan : undefined;
+    if (!plan) throw new WorkspaceCommandNotStartedError('Review the current erasure plan before confirming it.');
+    return this.runWorkspaceEraseAction((client) => client.confirmWorkspaceErase({ commandId: plan.commandId,
+      expectedRevision: plan.expectedRevision, expectedPrivacyEpoch: plan.expectedPrivacyEpoch }), true);
+  }
+
+  async cancelWorkspaceErase(): Promise<void> {
+    const status = this.value.eraseStatus;
+    const plan = status?.status === 'prepared' || status?.status === 'confirmed' ? status.plan : undefined;
+    const hold = status && 'hold' in status ? status.hold : undefined;
+    const commandId = plan?.commandId ?? hold?.commandId;
+    const expectedRevision = plan?.expectedRevision ?? hold?.expectedRevision;
+    const expectedPrivacyEpoch = plan?.expectedPrivacyEpoch ?? hold?.expectedPrivacyEpoch;
+    if (!commandId || expectedRevision === undefined || expectedPrivacyEpoch === undefined) throw new WorkspaceCommandNotStartedError('There is no active erasure review to cancel.');
+    await this.runWorkspaceEraseAction((client) => client.cancelWorkspaceErase({ commandId, expectedRevision, expectedPrivacyEpoch }), true);
+  }
+
+  async retryWorkspaceEraseReview(): Promise<WorkspaceErasePlan> {
+    const hold = this.value.eraseStatus && 'hold' in this.value.eraseStatus ? this.value.eraseStatus.hold : undefined;
+    if (!hold || hold.status === 'draining') throw new WorkspaceCommandNotStartedError('The workspace pause is still settling. Check its status again before retrying review.');
+    return this.runWorkspaceEraseAction((client) => client.prepareWorkspaceErase({ commandId: hold.commandId,
+      expectedRevision: hold.expectedRevision, expectedPrivacyEpoch: hold.expectedPrivacyEpoch }), true);
+  }
+
+  async executeWorkspaceErase(): Promise<WorkspaceEraseReceipt> {
+    const plan = this.value.eraseStatus?.status === 'confirmed' ? this.value.eraseStatus.plan : undefined;
+    if (!plan) throw new WorkspaceCommandNotStartedError('Confirm the current erasure review before continuing.');
+    const owner = this.ownerGeneration;
+    const client = this.currentClient();
+    let operation: number;
+    try { operation = this.beginOperation(); }
+    catch (error) { if (error instanceof WorkspaceClientError && error.kind === 'busy') throw new WorkspaceCommandNotStartedError(error.message); throw error; }
+    this.publish({ ...this.value, busy: true, error: undefined });
+    try {
+      const receipt = await client.executeWorkspaceErase({ commandId: plan.commandId, expectedRevision: plan.expectedRevision,
+        expectedPrivacyEpoch: plan.expectedPrivacyEpoch });
+      if (!this.isCurrent(owner)) throw new WorkspaceClientError('stale', 'The workspace session changed.');
+      this.requireSessionRecheck('erase_completed');
+      return receipt;
+    } catch (error) {
+      const unknown = !(error instanceof WorkspaceClientError) || error.kind === 'network' || error.kind === 'timeout' || error.kind === 'malformed' ||
+        (error.kind === 'http' && (error.status === undefined || error.status >= 500));
+      if (unknown && this.isCurrent(owner)) this.requireSessionRecheck('erase_outcome_unknown');
+      else if (this.isCurrent(owner)) this.publish({ ...this.value, busy: false, error: this.message(error) });
+      throw error;
+    } finally { this.finishOperation(operation, owner); }
+  }
+
+  async retryWorkspaceEraseCleanup(): Promise<WorkspaceEraseReceipt> {
+    const receipt = this.value.eraseStatus?.status === 'cleanup_pending' ? this.value.eraseStatus.receipt : undefined;
+    if (!receipt || receipt.currentPrivacyEpoch !== this.session.privacyEpoch) throw new WorkspaceCommandNotStartedError('Sign in to the current workspace before retrying cleanup.');
+    return this.runWorkspaceEraseAction((client) => client.retryWorkspaceEraseCleanup({ commandId: receipt.commandId,
+      expectedPrivacyEpoch: receipt.currentPrivacyEpoch }), true) as Promise<WorkspaceEraseReceipt>;
   }
 
   private message(error: unknown): string {
@@ -425,6 +564,7 @@ export class CloudWorkspaceSessionStore {
     return this.readSavedMail(expectedRevision, (client) => client.readPeriodSummaryResult(jobId, expectedRevision));
   }
 
+
   async refresh(): Promise<WorkspaceSnapshotDTO | undefined> {
     const owner = this.ownerGeneration;
     const client = this.currentClient();
@@ -519,6 +659,12 @@ export class CloudWorkspaceSessionStore {
     this.disposeResources();
     this.publish({ status: 'loading', busy: false, refreshRequired: true });
   }
+
+  private requireSessionRecheck(reason: NonNullable<CloudWorkspaceSessionState['reauthRequired']>): void {
+    this.invalidateGeneration();
+    this.disposeResources();
+    this.publish({ status: 'loading', reauthRequired: reason, busy: false, refreshRequired: true });
+  }
 }
 
 export type CloudWorkspaceVoiceActions = Readonly<{
@@ -536,7 +682,7 @@ export type CloudWorkspaceVoiceActions = Readonly<{
   resetAfterSave(): void;
 }>;
 
-export function CloudWorkspaceSession({ session, onLogout }: { session: AuthenticatedSession; onLogout: () => void }) {
+export function CloudWorkspaceSession({ session, onLogout, onRecheckSession }: { session: AuthenticatedSession; onLogout: () => void; onRecheckSession?: () => void }) {
   const credentials = useCloudCredentials(session);
   const capture = useCloudAudioCapture();
   const captureRef = useRef(capture);
@@ -545,7 +691,15 @@ export function CloudWorkspaceSession({ session, onLogout }: { session: Authenti
   const [store] = useState(() => new CloudWorkspaceSessionStore(session));
   const state = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
   const initialRetryLock = useRef(false);
+  const requestedRecheckFor = useRef<string | undefined>(undefined);
   useEffect(() => store.start(getCapture), [store, getCapture]);
+  useEffect(() => {
+    if (!state.reauthRequired || !onRecheckSession) return;
+    const ownerKey = `${session.workspaceId}:${session.privacyEpoch}`;
+    if (requestedRecheckFor.current === ownerKey) return;
+    requestedRecheckFor.current = ownerKey;
+    onRecheckSession();
+  }, [onRecheckSession, session.privacyEpoch, session.workspaceId, state.reauthRequired]);
 
   const retryWorkspace = async () => {
     if (initialRetryLock.current || state.busy) return;
@@ -559,7 +713,21 @@ export function CloudWorkspaceSession({ session, onLogout }: { session: Authenti
     return (
       <SafeAreaProvider>
         <SafeAreaView style={s.safe}>
-          <View style={[s.viewport, { alignItems: 'center', justifyContent: 'center', gap: 12 }]}>
+          {state.reauthRequired ? <View style={[s.viewport, { alignItems: 'center', justifyContent: 'center', gap: 12 }]}>
+            <ActivityIndicator color={C.sage} />
+            <Text style={s.accountSub}>Checking your session before reopening workspace recovery…</Text>
+          </View> : state.eraseStatus ? <ScrollView contentContainerStyle={s.scroll}>
+            <Text style={s.h1Small}>Workspace recovery</Text>
+            <WorkspaceErasePanel status={state.eraseStatus} busy={state.busy} error={state.error} actions={{
+              refresh: () => store.discoverWorkspaceErase(),
+              prepare: () => store.prepareWorkspaceErase(),
+              confirm: () => store.confirmWorkspaceErase(),
+              execute: () => store.executeWorkspaceErase(),
+              cancel: () => store.cancelWorkspaceErase(),
+              retryReview: () => store.retryWorkspaceEraseReview(),
+              retryCleanup: () => store.retryWorkspaceEraseCleanup(),
+            }} ownerKey={`${session.workspaceId}:${session.privacyEpoch}`} />
+          </ScrollView> : <View style={[s.viewport, { alignItems: 'center', justifyContent: 'center', gap: 12 }]}>
             {state.status === 'loading' ? <ActivityIndicator color={C.sage} /> : null}
             <Text style={s.accountSub}>{state.error ?? 'Opening your saved workspace…'}</Text>
             {state.status === 'error' ? <>
@@ -571,7 +739,7 @@ export function CloudWorkspaceSession({ session, onLogout }: { session: Authenti
                 <Text style={recoveryStyles.secondaryText}>Sign out</Text>
               </Pressable>
             </> : null}
-          </View>
+          </View>}
         </SafeAreaView>
       </SafeAreaProvider>
     );

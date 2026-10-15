@@ -802,4 +802,132 @@ describe('browser background policy client', () => {
     await expect(client.saveBackgroundPolicy(policyRequest)).rejects.toMatchObject({ name: 'WorkspaceCommandUnknownError', commandId: policyRequest.commandId,
       reason: 'invalid_acknowledgement' });
   });
+
+  it('uses the closed same-origin erasure contract and never resends an uncertain action', async () => {
+    const plan = { schemaVersion: 1, commandId, expectedRevision: 9, expectedPrivacyEpoch: 3, expiresAt: '2026-10-15T02:00:00.000Z',
+      counts: { notes: 1, documents: 2, accounts: 1, proposals: 0, audioUploads: 3, backgroundPolicies: 0 }, status: 'prepared' };
+    const confirmed = { ...plan, status: 'confirmed' };
+    const receipt = { schemaVersion: 1, commandId, status: 'cleanup_pending', erasedPrivacyEpoch: 3, currentPrivacyEpoch: 4,
+      createdAt: '2026-10-15T01:00:00.000Z' };
+    const cancellation = { schemaVersion: 1, commandId, status: 'cancelled', privacyEpoch: 3, cancelledAt: '2026-10-15T01:00:00.000Z' };
+    const fetcher = vi.fn(async (path: string, init: RequestInit) => {
+      if (path === '/api/workspace/erase/status') return body({ schemaVersion: 1, status: 'none' });
+      if (path.endsWith('/prepare')) return body(plan);
+      if (path.endsWith('/confirm')) return body(confirmed);
+      if (path.endsWith('/execute')) return body(receipt);
+      if (path.endsWith('/cancel')) return body(cancellation);
+      return body({ schemaVersion: 1, commandId, status: 'complete', erasedPrivacyEpoch: 3, currentPrivacyEpoch: 4,
+        createdAt: '2026-10-15T01:00:00.000Z' });
+    });
+    const client = makeClient(fetcher);
+    expect(await client.readWorkspaceEraseStatus()).toEqual({ schemaVersion: 1, status: 'none' });
+    const input = { commandId, expectedRevision: 9, expectedPrivacyEpoch: 3 };
+    expect(await client.prepareWorkspaceErase(input)).toMatchObject({ status: 'prepared', commandId });
+    expect(await client.confirmWorkspaceErase(input)).toMatchObject({ status: 'confirmed', commandId });
+    expect(await client.cancelWorkspaceErase(input)).toMatchObject({ status: 'cancelled', commandId });
+    expect(await client.executeWorkspaceErase(input)).toMatchObject({ status: 'cleanup_pending', currentPrivacyEpoch: 4 });
+    expect(fetcher.mock.calls.map(([path]) => path)).toEqual([
+      '/api/workspace/erase/status', '/api/workspace/erase/prepare', '/api/workspace/erase/confirm',
+      '/api/workspace/erase/cancel', '/api/workspace/erase/execute',
+    ]);
+    for (const [path, init] of fetcher.mock.calls.slice(1)) {
+      expect(path).toContain('/api/workspace/erase/');
+      expect(init.method).toBe('POST');
+      expect(init.credentials).toBe('same-origin');
+      expect((init.headers as Record<string, string>)['X-Still-CSRF']).toBe('private-csrf');
+    }
+    const ambiguous = makeClient(vi.fn(async () => { throw new Error('synthetic disconnect after dispatch'); }));
+    await expect(ambiguous.executeWorkspaceErase(input)).rejects.toMatchObject({ kind: 'network' });
+    expect(ambiguous.getPendingCommand()).toBeUndefined();
+  });
+
+  it('retries cleanup only at the fresh authenticated epoch supplied by the receipt', async () => {
+    const freshSession = Object.freeze({ ...session, privacyEpoch: 4 });
+    const fetcher = vi.fn(async (_path: string, _init: RequestInit) => body({ schemaVersion: 1, commandId, status: 'complete', erasedPrivacyEpoch: 3,
+      currentPrivacyEpoch: 4, createdAt: '2026-10-15T01:00:00.000Z' }));
+    const client = createWebWorkspaceClient(freshSession, { assertCurrent() {}, decodeSnapshot: (value) => value as WorkspaceSnapshotDTO,
+      fetcher: fetcher as never });
+    await expect(client.retryWorkspaceEraseCleanup({ commandId, expectedPrivacyEpoch: 4 })).resolves.toMatchObject({ status: 'complete' });
+    expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual({ commandId, expectedPrivacyEpoch: 4 });
+    await expect(client.retryWorkspaceEraseCleanup({ commandId, expectedPrivacyEpoch: 3 })).rejects.toMatchObject({ kind: 'stale' });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects erasure mutation replies that are not bound to the requested command, epoch, or phase', async () => {
+    const input = { commandId, expectedRevision: 9, expectedPrivacyEpoch: 3 };
+    const counts = { notes: 0, documents: 0, accounts: 0, proposals: 0, audioUploads: 0, backgroundPolicies: 0 };
+    const plan = { schemaVersion: 1, commandId, expectedRevision: 9, expectedPrivacyEpoch: 3,
+      expiresAt: '2026-10-15T02:00:00.000Z', counts, status: 'prepared' };
+    const confirmedPlan = { ...plan, status: 'confirmed' };
+    const receipt = { schemaVersion: 1, commandId, status: 'complete', erasedPrivacyEpoch: 3, currentPrivacyEpoch: 4,
+      createdAt: '2026-10-15T01:00:00.000Z' };
+    const cancellation = { schemaVersion: 1, commandId, status: 'cancelled', privacyEpoch: 3, cancelledAt: '2026-10-15T01:00:00.000Z' };
+    const mismatchCases: readonly (readonly [string, (client: ReturnType<typeof makeClient>) => Promise<unknown>, unknown])[] = [
+      ['prepare command ID', (client) => client.prepareWorkspaceErase(input), { ...plan, commandId: nextCommandId }],
+      ['prepare phase', (client) => client.prepareWorkspaceErase(input), { ...plan, status: 'confirmed' }],
+      ['confirm command ID', (client) => client.confirmWorkspaceErase(input), { ...confirmedPlan, commandId: nextCommandId }],
+      ['confirm phase', (client) => client.confirmWorkspaceErase(input), { ...confirmedPlan, status: 'prepared' }],
+      ['confirm revision', (client) => client.confirmWorkspaceErase(input), { ...confirmedPlan, expectedRevision: 10 }],
+      ['execute command ID', (client) => client.executeWorkspaceErase(input), { ...receipt, commandId: nextCommandId }],
+      ['execute epoch', (client) => client.executeWorkspaceErase(input), { ...receipt, erasedPrivacyEpoch: 2, currentPrivacyEpoch: 3 }],
+      ['cancel epoch', (client) => client.cancelWorkspaceErase(input), { ...cancellation, privacyEpoch: 4 }],
+    ];
+    for (const [label, operation, response] of mismatchCases) {
+      const client = makeClient(vi.fn(async () => body(response)));
+      await expect(operation(client), label).rejects.toMatchObject({ kind: 'malformed' });
+    }
+
+    const freshSession = Object.freeze({ ...session, privacyEpoch: 4 });
+    const wrongReceipt = { ...receipt, erasedPrivacyEpoch: 3, currentPrivacyEpoch: 4, commandId: nextCommandId };
+    const retryClient = createWebWorkspaceClient(freshSession, { assertCurrent() {}, decodeSnapshot: (value) => value as WorkspaceSnapshotDTO,
+      fetcher: vi.fn(async () => body(wrongReceipt)) as never });
+    await expect(retryClient.retryWorkspaceEraseCleanup({ commandId, expectedPrivacyEpoch: 4 })).rejects.toMatchObject({ kind: 'malformed' });
+    const wrongEpochRetry = createWebWorkspaceClient(freshSession, { assertCurrent() {}, decodeSnapshot: (value) => value as WorkspaceSnapshotDTO,
+      fetcher: vi.fn(async () => body({ ...receipt, currentPrivacyEpoch: 5, erasedPrivacyEpoch: 4 })) as never });
+    await expect(wrongEpochRetry.retryWorkspaceEraseCleanup({ commandId, expectedPrivacyEpoch: 4 })).rejects.toMatchObject({ kind: 'malformed' });
+  });
+
+  it('binds deferred erasure acknowledgements to a closed request captured before fetch', async () => {
+    const matchingPlan = { schemaVersion: 1, commandId, expectedRevision: 10, expectedPrivacyEpoch: 3,
+      expiresAt: '2026-10-15T02:00:00.000Z', counts: { notes: 0, documents: 0, accounts: 0, proposals: 0, audioUploads: 0, backgroundPolicies: 0 }, status: 'prepared' };
+    let resolveMatching!: (response: ReturnType<typeof body>) => void;
+    const matchingFetcher = vi.fn((_path: string, _init: RequestInit) => new Promise<ReturnType<typeof body>>((resolve) => { resolveMatching = resolve; }));
+    const matchingClient = makeClient(matchingFetcher);
+    const matchingInput = { commandId, expectedRevision: 9, expectedPrivacyEpoch: 3 };
+    const matchingRequest = matchingClient.prepareWorkspaceErase(matchingInput);
+    matchingInput.commandId = nextCommandId;
+    matchingInput.expectedRevision = 12;
+    matchingInput.expectedPrivacyEpoch = 2;
+    resolveMatching(body(matchingPlan));
+    await expect(matchingRequest).resolves.toMatchObject({ commandId, expectedPrivacyEpoch: 3, status: 'prepared' });
+    expect(JSON.parse(String(matchingFetcher.mock.calls[0]?.[1]?.body))).toEqual({ commandId, expectedRevision: 9, expectedPrivacyEpoch: 3 });
+
+    let resolveUnrelated!: (response: ReturnType<typeof body>) => void;
+    const unrelatedFetcher = vi.fn((_path: string, _init: RequestInit) => new Promise<ReturnType<typeof body>>((resolve) => { resolveUnrelated = resolve; }));
+    const unrelatedClient = makeClient(unrelatedFetcher);
+    const unrelatedInput = { commandId, expectedRevision: 9, expectedPrivacyEpoch: 3 };
+    const unrelatedRequest = unrelatedClient.executeWorkspaceErase(unrelatedInput);
+    unrelatedInput.commandId = nextCommandId;
+    unrelatedInput.expectedPrivacyEpoch = 4;
+    resolveUnrelated(body({ schemaVersion: 1, commandId: nextCommandId, status: 'complete', erasedPrivacyEpoch: 4,
+      currentPrivacyEpoch: 5, createdAt: '2026-10-15T01:00:00.000Z' }));
+    await expect(unrelatedRequest).rejects.toMatchObject({ kind: 'malformed' });
+  });
+
+  it('rejects accessor, symbol, and trapping proxy erase requests before network dispatch', async () => {
+    const fetcher = vi.fn(async () => body({}));
+    const client = makeClient(fetcher);
+    let getterCalls = 0;
+    const accessor = { expectedRevision: 9, expectedPrivacyEpoch: 3 };
+    Object.defineProperty(accessor, 'commandId', { enumerable: true, get() { getterCalls += 1; return commandId; } });
+    const symbolKey = { commandId, expectedRevision: 9, expectedPrivacyEpoch: 3, [Symbol('extra')]: true };
+    const trappedProxy = new Proxy({ commandId, expectedRevision: 9, expectedPrivacyEpoch: 3 }, {
+      ownKeys() { throw new Error('synthetic proxy trap'); },
+    });
+    await expect(client.prepareWorkspaceErase(accessor as never)).rejects.toMatchObject({ kind: 'malformed' });
+    await expect(client.confirmWorkspaceErase(symbolKey)).rejects.toMatchObject({ kind: 'malformed' });
+    await expect(client.executeWorkspaceErase(trappedProxy)).rejects.toMatchObject({ kind: 'malformed' });
+    expect(getterCalls).toBe(0);
+    expect(fetcher).not.toHaveBeenCalled();
+  });
 });
