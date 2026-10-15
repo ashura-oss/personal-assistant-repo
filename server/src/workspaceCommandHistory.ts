@@ -6,6 +6,7 @@ export const WORKSPACE_COMMAND_HISTORY_KINDS = Object.freeze([
   'notes.transcribe', 'accounts.installOAuth', 'documents.save', 'knowledge.person.save', 'knowledge.project.save',
   'knowledge.entity.archive', 'knowledge.fact.save', 'knowledge.fact.remove', 'knowledge.contact.save', 'knowledge.contact.remove',
   'knowledge.member.save', 'knowledge.member.remove',
+  'knowledge.sourceLink.save', 'knowledge.sourceLink.remove', 'knowledge.suggestion.edit', 'knowledge.suggestion.review',
 ] as const);
 export type WorkspaceCommandHistoryKind = (typeof WORKSPACE_COMMAND_HISTORY_KINDS)[number];
 export type WorkspaceCommandHistoryStatus = 'claimed' | 'checkpointed' | 'finished' | 'inspect_required';
@@ -28,6 +29,8 @@ const JOURNAL_TO_PUBLIC: Readonly<Record<string, WorkspaceCommandHistoryKind>> =
   'knowledge.entity.archive': 'knowledge.entity.archive', 'knowledge.fact.save': 'knowledge.fact.save', 'knowledge.fact.remove': 'knowledge.fact.remove',
   'knowledge.contact.save': 'knowledge.contact.save', 'knowledge.contact.remove': 'knowledge.contact.remove',
   'knowledge.member.save': 'knowledge.member.save', 'knowledge.member.remove': 'knowledge.member.remove',
+  'knowledge.sourcelink.save': 'knowledge.sourceLink.save', 'knowledge.sourcelink.remove': 'knowledge.sourceLink.remove',
+  'knowledge.suggestion.edit': 'knowledge.suggestion.edit', 'knowledge.suggestion.review': 'knowledge.suggestion.review',
 });
 export function isWorkspaceCommandId(value: unknown): value is string { return typeof value === 'string' && UUID_V4.test(value); }
 export function workspaceCommandKindFromJournal(value: unknown): WorkspaceCommandHistoryKind | undefined {

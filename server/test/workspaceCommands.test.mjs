@@ -21,7 +21,7 @@ import {
 } from '../dist/workspaceCommands.node.mjs';
 
 function fixture({ providerBatchClient, withAudio = false, speechClient, speechEnabled = false, withSpeechCleanup = false,
-  initialNoteId, initialKnowledge, initialDocuments = [], writeDocument } = {}) {
+  initialNoteId, initialKnowledge, initialDocuments = [], writeDocument, captureController } = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'still-workspace-commands-'));
   const kernel = createDurableKernel({ databasePath: join(directory, 'workspace.sqlite'),
     validateSnapshot: (value) => assert.ok(value && typeof value === 'object' && !Array.isArray(value)) });
@@ -105,6 +105,13 @@ function fixture({ providerBatchClient, withAudio = false, speechClient, speechE
       bindRecordingRecovery(service) { return service; },
       ...(providerBatchClient ? { openRouterBatchClient: providerBatchClient } : {}),
     }, ...(pendingCapture ? { pendingCapture } : {}) });
+  if (captureController) {
+    const executeCommand = runtime.executeCommand.bind(runtime);
+    runtime.executeCommand = (input, operation, projectReceipt) => executeCommand(input, (controller, identity) => {
+      captureController(controller);
+      return operation(controller, identity);
+    }, projectReceipt);
+  }
   const admission = { sessionToken: admissionSession, assertCurrent() { kernel.getOwnedIdentity(admissionSession); } };
   return { directory, kernel, ownerId, workspace, admissionSession, runtimeSession, runtimeSessions, runtime, admission, audioRepository,
     setAttachedSnapshot(value) { attachedSnapshot = value; }, loseNextWorkspaceCommitAck() { failNextWorkspaceCommitAck = true; } };
@@ -648,6 +655,225 @@ test('transcription dispatcher rejects a stale note revision before any provider
     const command = envelope({ kind: 'notes.transcribe', noteId: note.id, expectedNoteRevision: note.revision + 1 },
       saved.snapshot.revision, saved.snapshot.privacyEpoch);
     await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission, command), /revision|changed|stale/i);
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test('cloud source-link commands preserve omitted references and reject a changed opaque source choice', async () => {
+  let controller;
+  const f = fixture({ captureController(value) { controller = value; } });
+  try {
+    let current = await f.runtime.getSnapshot(f.admission);
+    const person = await dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'knowledge.person.save', operation: 'create', input: { name: 'Morgan', aliases: [], narrative: '' } }, current.revision, current.privacyEpoch));
+    current = person.snapshot;
+    const note = await dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'notes.save', transcript: 'A source that will change.' }, current.revision, current.privacyEpoch));
+    current = note.snapshot;
+    let identity = f.kernel.getOwnedIdentity(f.admission.sessionToken);
+    const choices = await f.runtime.readKnowledgeSourceChoices(f.admission, { expectedRevision: identity.revision, expectedPrivacyEpoch: identity.privacyEpoch });
+    const source = choices.choices.find((choice) => choice.reference.kind === 'note' && choice.reference.id === note.receipt.objectId);
+    assert.ok(source);
+    const personRow = current.state.knowledge.people.find((item) => item.id === person.receipt.objectId);
+    const linked = await dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'knowledge.sourceLink.save', entityKind: 'person', entityId: person.receipt.objectId,
+        expectedEntityRevision: personRow.revision, referenceChoiceId: source.id, label: 'Original label' }, current.revision, current.privacyEpoch));
+    const itemId = linked.receipt.itemId;
+    const originalReference = linked.snapshot.state.knowledge.people.find((item) => item.id === person.receipt.objectId).sourceLinks.find((item) => item.id === itemId).reference;
+
+    current = linked.snapshot;
+    const renameCommand = envelope({ kind: 'knowledge.sourceLink.save', entityKind: 'person', entityId: person.receipt.objectId,
+        expectedEntityRevision: current.state.knowledge.people.find((item) => item.id === person.receipt.objectId).revision,
+        itemId, label: 'Renamed without changing the source' }, current.revision, current.privacyEpoch);
+    f.loseNextWorkspaceCommitAck();
+    await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission, renameCommand), /acknowledgement|simulated|commit/i);
+    assert.equal(inspectWorkspaceCommand(f.runtime, f.admission, renameCommand.commandId).status, 'inspect_required');
+    current = await f.runtime.refreshSnapshot(f.admission);
+    const exactRetry = await dispatchWorkspaceCommand(f.runtime, f.admission, renameCommand);
+    assert.equal(exactRetry.status, 'inspect_required', 'a lost acknowledgement is inspected without replaying the source-link write');
+    current = await f.runtime.refreshSnapshot(f.admission);
+    const renamed = current.state.knowledge.people.find((item) => item.id === person.receipt.objectId).sourceLinks.find((item) => item.id === itemId);
+    assert.equal(renamed.label, 'Renamed without changing the source');
+    assert.deepEqual(renamed.reference, originalReference);
+
+    const editedNote = await dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'notes.updateTranscript', noteId: note.receipt.objectId, text: 'The source changed.',
+        expectedNoteRevision: current.state.notes.find((item) => item.id === note.receipt.objectId).revision }, current.revision, current.privacyEpoch));
+    current = editedNote.snapshot;
+    identity = f.kernel.getOwnedIdentity(f.admission.sessionToken);
+    const latestPerson = current.state.knowledge.people.find((item) => item.id === person.receipt.objectId);
+    await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'knowledge.sourceLink.save', entityKind: 'person', entityId: person.receipt.objectId,
+        expectedEntityRevision: latestPerson.revision, referenceChoiceId: source.id, label: 'Stale source' }, current.revision, current.privacyEpoch)),
+    /source changed|no longer available/i);
+    assert.equal(current.state.knowledge.people.find((item) => item.id === person.receipt.objectId).sourceLinks.length, 1,
+      'the rejected stale selector cannot add a second source link');
+
+    current = await f.runtime.refreshSnapshot(f.admission);
+    identity = f.kernel.getOwnedIdentity(f.admission.sessionToken);
+    const refreshedChoices = await f.runtime.readKnowledgeSourceChoices(f.admission, { expectedRevision: identity.revision, expectedPrivacyEpoch: identity.privacyEpoch });
+    const refreshedSource = refreshedChoices.choices.find((choice) => choice.reference.kind === 'note' && choice.reference.id === note.receipt.objectId);
+    assert.ok(refreshedSource);
+    const resolved = deferred(), continueSave = deferred();
+    const originalSave = controller.saveKnowledgeSourceLink.bind(controller);
+    controller.saveKnowledgeSourceLink = async (input) => { resolved.resolve(input); await continueSave.promise; return originalSave(input); };
+    const currentPerson = current.state.knowledge.people.find((item) => item.id === person.receipt.objectId);
+    const queuedCommand = envelope({ kind: 'knowledge.sourceLink.save', entityKind: 'person', entityId: person.receipt.objectId,
+      expectedEntityRevision: currentPerson.revision, referenceChoiceId: refreshedSource.id, label: 'Raced source' }, current.revision, current.privacyEpoch);
+    const queuedSave = dispatchWorkspaceCommand(f.runtime, f.admission, queuedCommand);
+    const resolvedInput = await resolved.promise;
+    assert.equal(typeof resolvedInput.expectedSourceBinding, 'string', 'the private binding reaches the controller boundary');
+    await controller.updateTranscript(note.receipt.objectId, 'Changed after selector resolution.', {
+      expectedRevision: current.state.notes.find((item) => item.id === note.receipt.objectId).revision,
+    });
+    continueSave.resolve();
+    await assert.rejects(queuedSave, /source changed|no longer available|revision changed/i);
+    current = await f.runtime.refreshSnapshot(f.admission);
+    assert.equal(current.state.knowledge.people.find((item) => item.id === person.receipt.objectId).sourceLinks.length, 1,
+      'the queued native mutation cannot persist the selector resolved against older source state');
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test('suggestion review rejects stale evidence, target, and project-member revisions inside the actual controller', async () => {
+  const f = fixture();
+  try {
+    let current = await f.runtime.getSnapshot(f.admission);
+    const personResult = await dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'knowledge.person.save', operation: 'create', input: { name: 'Morgan', aliases: [], narrative: '' } }, current.revision, current.privacyEpoch));
+    current = personResult.snapshot;
+    const projectResult = await dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'knowledge.project.save', operation: 'create', input: { name: 'Still project', aliases: [], narrative: '', status: 'active', goal: '' } }, current.revision, current.privacyEpoch));
+    current = projectResult.snapshot;
+    const noteResult = await dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'notes.save', transcript: 'First exact evidence. Second exact evidence. Member evidence.' }, current.revision, current.privacyEpoch));
+    current = noteResult.snapshot;
+    const noteId = noteResult.receipt.objectId;
+    let person = current.state.knowledge.people.find((item) => item.id === personResult.receipt.objectId);
+    let project = current.state.knowledge.projects.find((item) => item.id === projectResult.receipt.objectId);
+    const createSuggestion = async (evidenceNoteId, quote, targetKind, targetId, change) => {
+      const identity = f.kernel.getOwnedIdentity(f.admission.sessionToken);
+      return f.runtime.executeCommand({ ...f.admission, expectedRevision: identity.revision, expectedPrivacyEpoch: identity.privacyEpoch,
+        idempotencyKey: randomUUID(), kind: 'knowledge.suggestion.edit', canonicalBody: JSON.stringify({ setupQuote: quote, targetId }) },
+      (controller) => controller.createKnowledgeSuggestionFromNote({ noteId: evidenceNoteId, sourceId: 'transcript', quote, targetKind, targetId, change }),
+      (suggestion) => ({ objectId: suggestion.id }));
+    };
+
+    const evidenceSuggestion = await createSuggestion(noteId, 'First exact evidence', 'person', person.id,
+      { type: 'add_fact', entityKind: 'person', entityId: person.id, statement: 'Evidence-bound fact.' });
+    current = await f.runtime.getSnapshot(f.admission);
+    const noteUpdate = await dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'notes.updateTranscript', noteId, text: 'The source text has changed.',
+        expectedNoteRevision: current.state.notes.find((item) => item.id === noteId).revision }, current.revision, current.privacyEpoch));
+    current = noteUpdate.snapshot;
+    await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'knowledge.suggestion.review', suggestionId: evidenceSuggestion.result.id, expectedSuggestionRevision: 1,
+        decision: 'accept', targetRevision: person.revision }, current.revision, current.privacyEpoch)), /evidence|source|stale|changed/i);
+    current = await f.runtime.refreshSnapshot(f.admission);
+
+    const targetNote = await dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'notes.save', transcript: 'Fresh target evidence.' }, current.revision, current.privacyEpoch));
+    current = targetNote.snapshot;
+    const targetSuggestion = await createSuggestion(targetNote.receipt.objectId, 'Fresh target evidence', 'person', person.id,
+      { type: 'add_fact', entityKind: 'person', entityId: person.id, statement: 'Target-bound fact.' });
+    current = await f.runtime.getSnapshot(f.admission);
+    const identity = f.kernel.getOwnedIdentity(f.admission.sessionToken);
+    const choices = await f.runtime.readKnowledgeSourceChoices(f.admission, { expectedRevision: identity.revision, expectedPrivacyEpoch: identity.privacyEpoch });
+    const choice = choices.choices.find((item) => item.reference.kind === 'note' && item.reference.id === targetNote.receipt.objectId);
+    assert.ok(choice);
+    const suggestionEdit = await dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'knowledge.suggestion.edit', suggestionId: targetSuggestion.result.id, expectedSuggestionRevision: 1,
+        expectedTargetRevision: person.revision,
+        change: { type: 'add_source_link', entityKind: 'person', entityId: person.id, referenceChoiceId: choice.id, label: 'Chosen evidence' },
+        evidence: targetSuggestion.result.evidence }, current.revision, current.privacyEpoch));
+    current = suggestionEdit.snapshot;
+    assert.equal(current.state.knowledge.suggestions.find((item) => item.id === targetSuggestion.result.id).change.reference.id, targetNote.receipt.objectId);
+    const updatedPerson = await dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'knowledge.fact.save', entityKind: 'person', entityId: person.id, expectedEntityRevision: person.revision,
+        statement: 'A direct change advances the target.' }, current.revision, current.privacyEpoch));
+    current = updatedPerson.snapshot;
+    await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'knowledge.suggestion.review', suggestionId: targetSuggestion.result.id, expectedSuggestionRevision: 2,
+        decision: 'accept', targetRevision: person.revision }, current.revision, current.privacyEpoch)), /target|changed|stale/i);
+    current = await f.runtime.refreshSnapshot(f.admission);
+
+    const memberNote = await dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'notes.save', transcript: 'Member evidence.' }, current.revision, current.privacyEpoch));
+    current = memberNote.snapshot;
+    person = current.state.knowledge.people.find((item) => item.id === person.id);
+    project = current.state.knowledge.projects.find((item) => item.id === project.id);
+    const memberSuggestion = await createSuggestion(memberNote.receipt.objectId, 'Member evidence', 'project', project.id,
+      { type: 'add_member', entityKind: 'project', entityId: project.id, personId: person.id, personRevision: person.revision, role: 'Designer' });
+    current = await f.runtime.getSnapshot(f.admission);
+    const personChanged = await dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'knowledge.fact.save', entityKind: 'person', entityId: person.id, expectedEntityRevision: person.revision,
+        statement: 'A direct change advances the member.' }, current.revision, current.privacyEpoch));
+    current = personChanged.snapshot;
+    project = current.state.knowledge.projects.find((item) => item.id === project.id);
+    await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'knowledge.suggestion.review', suggestionId: memberSuggestion.result.id, expectedSuggestionRevision: 1,
+        decision: 'accept', targetRevision: project.revision, memberPersonRevision: person.revision }, current.revision, current.privacyEpoch)), /member|person|changed|stale/i);
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test('suggestion edit and review receipts survive journal inspection, exact retries, and a lost acknowledgement', async () => {
+  const f = fixture();
+  try {
+    let current = await f.runtime.getSnapshot(f.admission);
+    const personResult = await dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'knowledge.person.save', operation: 'create', input: { name: 'Morgan', aliases: [], narrative: '' } }, current.revision, current.privacyEpoch));
+    current = personResult.snapshot;
+    const noteResult = await dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'notes.save', transcript: 'Review this exact quote.' }, current.revision, current.privacyEpoch));
+    current = noteResult.snapshot;
+    const personId = personResult.receipt.objectId, noteId = noteResult.receipt.objectId;
+    const seedSuggestion = async (statement) => {
+      const identity = f.kernel.getOwnedIdentity(f.admission.sessionToken);
+      return f.runtime.executeCommand({ ...f.admission, expectedRevision: identity.revision, expectedPrivacyEpoch: identity.privacyEpoch,
+        idempotencyKey: randomUUID(), kind: 'knowledge.suggestion.edit', canonicalBody: JSON.stringify({ seed: statement }) },
+      (controller) => controller.createKnowledgeSuggestionFromNote({ noteId, sourceId: 'transcript', quote: 'Review this exact quote.',
+        targetKind: 'person', targetId: personId,
+        change: { type: 'add_fact', entityKind: 'person', entityId: personId, statement } }),
+      (suggestion) => ({ objectId: suggestion.id }));
+    };
+    const first = await seedSuggestion('Proposed first fact.');
+    current = await f.runtime.getSnapshot(f.admission);
+    const target = current.state.knowledge.people.find((item) => item.id === personId);
+    const editCommand = envelope({ kind: 'knowledge.suggestion.edit', suggestionId: first.result.id,
+      expectedSuggestionRevision: first.result.revision, expectedTargetRevision: target.revision,
+      change: { type: 'add_fact', entityKind: 'person', entityId: personId, statement: 'Edited first fact.' }, evidence: first.result.evidence },
+    current.revision, current.privacyEpoch);
+    const edited = await dispatchWorkspaceCommand(f.runtime, f.admission, editCommand);
+    assert.equal(edited.receipt.suggestionId, first.result.id);
+    assert.equal(edited.receipt.suggestionRevision, 2);
+    assert.equal(edited.receipt.status, 'pending');
+    assert.deepEqual(inspectWorkspaceCommand(f.runtime, f.admission, editCommand.commandId).receipt, edited.receipt);
+    const editRetry = await dispatchWorkspaceCommand(f.runtime, f.admission, editCommand);
+    assert.deepEqual(editRetry.receipt, edited.receipt);
+    assert.equal(editRetry.snapshot.state.knowledge.suggestions.find((item) => item.id === first.result.id).revision, 2);
+
+    current = editRetry.snapshot;
+    const reviewCommand = envelope({ kind: 'knowledge.suggestion.review', suggestionId: first.result.id,
+      expectedSuggestionRevision: 2, decision: 'accept', targetRevision: target.revision }, current.revision, current.privacyEpoch);
+    const reviewed = await dispatchWorkspaceCommand(f.runtime, f.admission, reviewCommand);
+    assert.equal(reviewed.receipt.suggestionId, first.result.id);
+    assert.equal(reviewed.receipt.suggestionRevision, 3);
+    assert.equal(reviewed.receipt.status, 'accepted');
+    assert.deepEqual(inspectWorkspaceCommand(f.runtime, f.admission, reviewCommand.commandId).receipt, reviewed.receipt);
+    assert.deepEqual((await dispatchWorkspaceCommand(f.runtime, f.admission, reviewCommand)).receipt, reviewed.receipt);
+
+    const second = await seedSuggestion('Proposed second fact.');
+    current = await f.runtime.getSnapshot(f.admission);
+    const latestTargetRevision = current.state.knowledge.people.find((item) => item.id === personId).revision;
+    const lostAckReview = envelope({ kind: 'knowledge.suggestion.review', suggestionId: second.result.id,
+      expectedSuggestionRevision: 1, decision: 'dismiss', targetRevision: latestTargetRevision }, current.revision, current.privacyEpoch);
+    f.loseNextWorkspaceCommitAck();
+    await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission, lostAckReview), /acknowledgement|simulated|commit/i);
+    assert.equal(inspectWorkspaceCommand(f.runtime, f.admission, lostAckReview.commandId).status, 'inspect_required');
+    current = await f.runtime.refreshSnapshot(f.admission);
+    assert.equal((await dispatchWorkspaceCommand(f.runtime, f.admission, lostAckReview)).status, 'inspect_required');
+    current = await f.runtime.refreshSnapshot(f.admission);
+    const dismissed = current.state.knowledge.suggestions.find((item) => item.id === second.result.id);
+    assert.equal(dismissed.status, 'dismissed');
+    assert.equal(dismissed.revision, 2, 'inspect-only retry does not dismiss twice');
   } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 

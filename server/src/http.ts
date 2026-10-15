@@ -7,6 +7,7 @@ import { KernelError } from './kernel.js';
 import { VaultError } from './vault.js';
 import type { SafeCredentialMetadataSnapshot, ServerCredentialCommandService } from './credentialCommands.js';
 import type { WorkspaceHttpAdmission, WorkspaceHttpApi } from './workspaceHttp.js';
+import { KNOWLEDGE_SOURCE_CHOICES_PATH, KNOWLEDGE_SUGGESTION_REVIEW_PATH, parseKnowledgeHttpRead } from './knowledgeHttp.js';
 import type { AudioHttpApi, AudioUploadCaptureHeader } from './audioHttp.js';
 import type { OAuthHttpApi } from './oauthHttp.js';
 import { OAuthConnectionServiceError } from './oauthConnectionService.js';
@@ -291,6 +292,7 @@ function workspaceFailure(error: unknown): { readonly status: number; readonly c
       return { status: 400, code: 'invalid_workspace_command' };
     }
     if (error.message === 'workspace_refresh_required') return { status: 409, code: 'workspace_refresh_required' };
+    if (['workspace_read_stale', 'workspace_runtime_busy'].includes(error.message)) return { status: 409, code: 'workspace_conflict' };
     if (['This command idempotency key is already bound to different ownership or request content.',
       'The workspace revision changed before command admission.', 'The workspace runtime is busy.',
       'workspace_ownership_changed', 'workspace_loaded_revision_mismatch'].includes(error.message)) {
@@ -852,6 +854,27 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     try {
       admission.assertCurrent();
       const result = workspaceApi.listCommandHistory(admission, cursor);
+      admission.assertCurrent();
+      if (!response.destroyed) sendJson(response, 200, result);
+    } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
+    return;
+  }
+  if (pathname === KNOWLEDGE_SOURCE_CHOICES_PATH || pathname === KNOWLEDGE_SUGGESTION_REVIEW_PATH) {
+    if (request.method !== 'GET') { response.setHeader('Allow', 'GET'); throw problem(405, 'method_not_allowed'); }
+    let read;
+    try { read = parseKnowledgeHttpRead(pathname, rawQuery ?? ''); }
+    catch { throw problem(400, 'bad_request'); }
+    if (!workspaceApi) throw problem(503, 'service_unavailable');
+    if (read.kind === 'source_choices' && typeof workspaceApi.readKnowledgeSourceChoices !== 'function' ||
+        read.kind === 'suggestion_review' && typeof workspaceApi.readKnowledgeSuggestionReview !== 'function') {
+      throw problem(503, 'service_unavailable');
+    }
+    const admission = workspaceReadAdmission(request, auth, canonicalOrigin);
+    try {
+      admission.assertCurrent();
+      const result = read.kind === 'source_choices'
+        ? await workspaceApi.readKnowledgeSourceChoices!(admission, read)
+        : await workspaceApi.readKnowledgeSuggestionReview!(admission, read);
       admission.assertCurrent();
       if (!response.destroyed) sendJson(response, 200, result);
     } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }

@@ -13,6 +13,8 @@ import {
   type WorkspaceCommandStatus,
 } from './workspaceCommands';
 import { workspaceCommandKindFromJournal } from './workspaceCommandHistory';
+import { resolveKnowledgeSourceChoice } from './knowledgeSourceChoices.node';
+import type { OwnedWorkspaceIdentity } from '../../server/src/kernel.js';
 
 export * from './workspaceCommands';
 
@@ -39,7 +41,7 @@ export async function dispatchWorkspaceCommand(runtime: OwnedWorkspaceRuntime, a
     }
     return Object.freeze({ schemaVersion: 1, commandId: envelope.commandId, status });
   }
-  const result = await runtime.executeCommand(commandInput, async (controller) => {
+  const result = await runtime.executeCommand(commandInput, async (controller, identity) => {
     switch (command.kind) {
       case 'settings.update': {
         await controller.saveSettings({ ...command.patch, llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
@@ -122,6 +124,53 @@ export async function dispatchWorkspaceCommand(runtime: OwnedWorkspaceRuntime, a
         const entityRevision = knowledgeEntityRevision(controller.getSnapshot(), 'project', command.entityId);
         return receipt(envelope, command, { objectId: command.entityId, entityKind: 'project', entityRevision, itemId: command.itemId });
       }
+      case 'knowledge.sourceLink.save': {
+        const current = controller.getSnapshot();
+        const existing = command.itemId ? (command.entityKind === 'person'
+          ? current.knowledge.people.find((entity) => entity.id === command.entityId)?.sourceLinks.find((link) => link.id === command.itemId)
+          : current.knowledge.projects.find((entity) => entity.id === command.entityId)?.sourceLinks.find((link) => link.id === command.itemId)) : undefined;
+        if (command.itemId && !existing) throw new Error('Source link was not found.');
+        const selected = command.referenceChoiceId ? requiredSourceChoice(current, identity, command.referenceChoiceId) : undefined;
+        const item = await controller.saveKnowledgeSourceLink({ entityKind: command.entityKind, entityId: command.entityId,
+          expectedEntityRevision: command.expectedEntityRevision, ...(command.itemId ? { itemId: command.itemId } : {}),
+          reference: selected?.reference ?? existing!.reference, ...(selected ? { expectedSourceBinding: selected.binding } : {}), label: command.label });
+        const entityRevision = knowledgeEntityRevision(controller.getSnapshot(), command.entityKind, command.entityId);
+        return receipt(envelope, command, { objectId: command.entityId, entityKind: command.entityKind, entityRevision, itemId: item.id });
+      }
+      case 'knowledge.sourceLink.remove': {
+        await controller.removeKnowledgeSourceLink({ entityKind: command.entityKind, entityId: command.entityId,
+          expectedEntityRevision: command.expectedEntityRevision, itemId: command.itemId });
+        const entityRevision = knowledgeEntityRevision(controller.getSnapshot(), command.entityKind, command.entityId);
+        return receipt(envelope, command, { objectId: command.entityId, entityKind: command.entityKind, entityRevision, itemId: command.itemId });
+      }
+      case 'knowledge.suggestion.edit': {
+        let change: import('../knowledge/types').KnowledgeChange;
+        let expectedSourceBinding: string | undefined;
+        if (command.change.type === 'add_source_link') {
+          const selected = requiredSourceChoice(controller.getSnapshot(), identity, command.change.referenceChoiceId);
+          expectedSourceBinding = selected.binding;
+          const selectedReference = selected.reference;
+          let currentRelatedRevision: number | undefined;
+          if (selectedReference.kind === 'person') currentRelatedRevision = controller.getSnapshot().knowledge.people.find((item) => item.id === selectedReference.id)?.revision;
+          else if (selectedReference.kind === 'project') currentRelatedRevision = controller.getSnapshot().knowledge.projects.find((item) => item.id === selectedReference.id)?.revision;
+          const relatedRevision = command.change.referenceRevision ?? currentRelatedRevision;
+          change = { type: 'add_source_link', entityKind: command.change.entityKind, entityId: command.change.entityId,
+            reference: selected.reference, ...(relatedRevision !== undefined ? { referenceRevision: relatedRevision } : {}), label: command.change.label };
+        } else change = command.change;
+        const suggestion = await controller.editKnowledgeSuggestion(command.suggestionId, { expectedRevision: command.expectedSuggestionRevision,
+          expectedTargetRevision: command.expectedTargetRevision, expectedSourceBinding, change, evidence: [...command.evidence] });
+        return receipt(envelope, command, { objectId: suggestion.id, suggestionId: suggestion.id, suggestionRevision: suggestion.revision, status: 'pending' });
+      }
+      case 'knowledge.suggestion.review': {
+        const currentSuggestion = controller.getSnapshot().knowledge.suggestions.find((item) => item.id === command.suggestionId);
+        if (!currentSuggestion) throw new Error('Memory suggestion was not found.');
+        if (currentSuggestion.change.type === 'add_member'
+          ? command.memberPersonRevision !== currentSuggestion.change.personRevision
+          : command.memberPersonRevision !== undefined) throw new Error('The selected project member changed. Refresh the suggestion before reviewing it.');
+        const suggestion = await controller.reviewKnowledgeSuggestion(command.suggestionId, { expectedRevision: command.expectedSuggestionRevision,
+          decision: command.decision, targetRevision: command.targetRevision, memberPersonRevision: command.memberPersonRevision });
+        return receipt(envelope, command, { objectId: suggestion.id, suggestionId: suggestion.id, suggestionRevision: suggestion.revision, status: suggestion.status as 'accepted' | 'dismissed' });
+      }
       case 'notes.updateTranscript': return receipt(envelope, command, {
         objectId: (await controller.updateTranscript(command.noteId, command.text, { expectedRevision: command.expectedNoteRevision })).id,
       });
@@ -153,7 +202,10 @@ export async function dispatchWorkspaceCommand(runtime: OwnedWorkspaceRuntime, a
     ...('stageId' in value ? { stageId: value.stageId } : {}), ...('accountGeneration' in value ? { accountGeneration: value.accountGeneration } : {}),
     ...('documentRevision' in value ? { documentRevision: value.documentRevision } : {}),
     ...('entityKind' in value ? { entityKind: value.entityKind } : {}), ...('entityId' in value ? { entityId: value.entityId } : {}),
-    ...('entityRevision' in value ? { entityRevision: value.entityRevision } : {}), ...('itemId' in value ? { itemId: value.itemId } : {}) }));
+    ...('entityRevision' in value ? { entityRevision: value.entityRevision } : {}), ...('itemId' in value ? { itemId: value.itemId } : {}),
+    ...('suggestionId' in value ? { suggestionId: value.suggestionId } : {}),
+    ...('suggestionRevision' in value ? { suggestionRevision: value.suggestionRevision } : {}),
+    ...('status' in value ? { status: value.status } : {}) }));
 
   const expectation = expectedReceipt(envelope.commandId, command);
   if (result.admission.fresh) {
@@ -192,6 +244,7 @@ function receipt(envelope: WorkspaceCommandEnvelope, command: WorkspaceCommand, 
   readonly stageId?: string; readonly accountGeneration?: number;
   readonly documentRevision?: number; readonly entityKind?: 'person' | 'project'; readonly entityId?: string;
   readonly entityRevision?: number; readonly itemId?: string;
+  readonly suggestionId?: string; readonly suggestionRevision?: number; readonly status?: 'pending' | 'accepted' | 'dismissed';
 }) {
   return parseWorkspaceCommandReceipt({ schemaVersion: 1, commandId: envelope.commandId, kind: command.kind, ...fields },
     expectedReceipt(envelope.commandId, command));
@@ -224,6 +277,14 @@ function expectedReceipt(commandId: string, command: WorkspaceCommand) {
     case 'knowledge.member.save': return { commandId, kind: command.kind, objectId: command.entityId, entityKind: 'project' as const,
       ...(command.itemId ? { itemId: command.itemId } : {}) };
     case 'knowledge.member.remove': return { commandId, kind: command.kind, objectId: command.entityId, entityKind: 'project' as const, itemId: command.itemId };
+    case 'knowledge.sourceLink.save': return { commandId, kind: command.kind, objectId: command.entityId, entityKind: command.entityKind,
+      ...(command.itemId ? { itemId: command.itemId } : {}) };
+    case 'knowledge.sourceLink.remove': return { commandId, kind: command.kind, objectId: command.entityId, entityKind: command.entityKind, itemId: command.itemId };
+    case 'knowledge.suggestion.edit': return { commandId, kind: command.kind, objectId: command.suggestionId, suggestionId: command.suggestionId,
+      suggestionRevision: command.expectedSuggestionRevision + 1, status: 'pending' as const };
+    case 'knowledge.suggestion.review': return { commandId, kind: command.kind, objectId: command.suggestionId, suggestionId: command.suggestionId,
+      suggestionRevision: command.expectedSuggestionRevision + 1,
+      status: command.decision === 'accept' ? 'accepted' as const : 'dismissed' as const };
     case 'notes.updateTranscript': return { commandId, kind: command.kind, objectId: command.noteId };
     case 'notes.transcribe': return { commandId, kind: command.kind, objectId: command.noteId, sourceRevision: command.expectedNoteRevision };
     case 'assistant.batch.submitNote': return { commandId, kind: command.kind, objectId: command.noteId };
@@ -232,6 +293,12 @@ function expectedReceipt(commandId: string, command: WorkspaceCommand) {
     case 'chat.refine': return { commandId, kind: command.kind, objectId: command.conversationId, parentTurnId: command.parentTurnId };
     default: return assertNever(command);
   }
+}
+
+function requiredSourceChoice(state: AppState, identity: OwnedWorkspaceIdentity, choiceId: string) {
+  const choice = resolveKnowledgeSourceChoice(state, identity.workspaceId, identity.privacyEpoch, choiceId);
+  if (!choice) throw new Error('The selected source changed or is no longer available. Refresh the source choices.');
+  return choice;
 }
 
 function assertNever(_value: never): never { throw new Error('workspace_command_unsupported'); }

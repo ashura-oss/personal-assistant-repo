@@ -1,5 +1,5 @@
 import type { AssistIntent, SavePersonInput, SaveProjectInput } from '../core';
-import type { KnowledgeEntityKind } from '../knowledge/types';
+import type { KnowledgeChange, KnowledgeEntityKind, KnowledgeEvidence } from '../knowledge/types';
 import { isCanonicalKnowledgeId, KNOWLEDGE_LIMITS } from '../knowledge';
 import { safeRelativeMarkdownPath } from '../privacy/eraseAdapter.shared';
 import type { WorkspaceSnapshotDTO } from './workspaceDto';
@@ -37,6 +37,10 @@ export type WorkspaceCommand =
   | { readonly kind: 'knowledge.contact.remove'; readonly entityKind: 'person'; readonly entityId: string; readonly expectedEntityRevision: number; readonly itemId: string }
   | { readonly kind: 'knowledge.member.save'; readonly entityKind: 'project'; readonly entityId: string; readonly expectedEntityRevision: number; readonly itemId?: string; readonly personId: string; readonly personRevision: number; readonly role: string }
   | { readonly kind: 'knowledge.member.remove'; readonly entityKind: 'project'; readonly entityId: string; readonly expectedEntityRevision: number; readonly itemId: string }
+  | { readonly kind: 'knowledge.sourceLink.save'; readonly entityKind: KnowledgeEntityKind; readonly entityId: string; readonly expectedEntityRevision: number; readonly itemId?: string; readonly referenceChoiceId?: string; readonly label: string }
+  | { readonly kind: 'knowledge.sourceLink.remove'; readonly entityKind: KnowledgeEntityKind; readonly entityId: string; readonly expectedEntityRevision: number; readonly itemId: string }
+  | { readonly kind: 'knowledge.suggestion.edit'; readonly suggestionId: string; readonly expectedSuggestionRevision: number; readonly expectedTargetRevision: number; readonly expectedMemberPersonRevision?: number; readonly change: PublicKnowledgeChange; readonly evidence: readonly KnowledgeEvidence[] }
+  | { readonly kind: 'knowledge.suggestion.review'; readonly suggestionId: string; readonly expectedSuggestionRevision: number; readonly decision: 'accept' | 'dismiss'; readonly targetRevision: number; readonly memberPersonRevision?: number }
   | { readonly kind: 'notes.updateTranscript'; readonly noteId: string; readonly text: string; readonly expectedNoteRevision: number }
   | { readonly kind: 'notes.transcribe'; readonly noteId: string; readonly expectedNoteRevision: number }
   | { readonly kind: 'assistant.batch.submitNote'; readonly noteId: string; readonly intent?: AssistIntent; readonly question?: string; readonly knowledgeSelection?: PublicKnowledgeSelection }
@@ -45,6 +49,8 @@ export type WorkspaceCommand =
   | { readonly kind: 'chat.refine'; readonly conversationId: string; readonly parentTurnId: string; readonly effort: 'medium' | 'high' | 'max' };
 
 export type PublicKnowledgeSelection = readonly Readonly<{ kind: 'person' | 'project'; id: string }>[];
+export type PublicKnowledgeChange = Exclude<KnowledgeChange, { type: 'add_source_link' }> |
+  (Omit<Extract<KnowledgeChange, { type: 'add_source_link' }>, 'reference'> & Readonly<{ referenceChoiceId: string }>);
 
 /** Deliberately narrow public settings surface; provider credentials and request policy stay private. */
 export type WorkspaceSettingsPatch = Readonly<{
@@ -86,8 +92,11 @@ export type WorkspaceCommandReceipt =
       WorkspaceCommandReceiptBase<'knowledge.entity.archive'>) & Readonly<{ entityKind: KnowledgeEntityKind; entityRevision: number }>)
   | ((WorkspaceCommandReceiptBase<'knowledge.fact.save'> | WorkspaceCommandReceiptBase<'knowledge.fact.remove'> |
       WorkspaceCommandReceiptBase<'knowledge.contact.save'> | WorkspaceCommandReceiptBase<'knowledge.contact.remove'> |
-      WorkspaceCommandReceiptBase<'knowledge.member.save'> | WorkspaceCommandReceiptBase<'knowledge.member.remove'>) &
+      WorkspaceCommandReceiptBase<'knowledge.member.save'> | WorkspaceCommandReceiptBase<'knowledge.member.remove'> |
+      WorkspaceCommandReceiptBase<'knowledge.sourceLink.save'> | WorkspaceCommandReceiptBase<'knowledge.sourceLink.remove'>) &
       Readonly<{ entityKind: KnowledgeEntityKind; entityRevision: number; itemId: string }>)
+  | (WorkspaceCommandReceiptBase<'knowledge.suggestion.edit'> & Readonly<{ suggestionId: string; suggestionRevision: number; status: 'pending' }>)
+  | (WorkspaceCommandReceiptBase<'knowledge.suggestion.review'> & Readonly<{ suggestionId: string; suggestionRevision: number; status: 'accepted' | 'dismissed' }>)
   | WorkspaceCommandReceiptBase<'notes.updateTranscript'>
   | (WorkspaceCommandReceiptBase<'notes.transcribe'> & Readonly<{ attemptId: string; sourceRevision: number; outcome: 'completed' | 'no_speech' | 'cancelled' | 'failed' | 'unknown' | 'discarded' }> )
   | (WorkspaceCommandReceiptBase<'assistant.batch.submitNote'> & Readonly<{ jobId: string }>)
@@ -121,6 +130,10 @@ const COMMAND_KEYS: Record<WorkspaceCommand['kind'], readonly string[]> = {
   'knowledge.contact.remove': ['kind', 'entityKind', 'entityId', 'expectedEntityRevision', 'itemId'],
   'knowledge.member.save': ['kind', 'entityKind', 'entityId', 'expectedEntityRevision', 'itemId', 'personId', 'personRevision', 'role'],
   'knowledge.member.remove': ['kind', 'entityKind', 'entityId', 'expectedEntityRevision', 'itemId'],
+  'knowledge.sourceLink.save': ['kind', 'entityKind', 'entityId', 'expectedEntityRevision', 'itemId', 'referenceChoiceId', 'label'],
+  'knowledge.sourceLink.remove': ['kind', 'entityKind', 'entityId', 'expectedEntityRevision', 'itemId'],
+  'knowledge.suggestion.edit': ['kind', 'suggestionId', 'expectedSuggestionRevision', 'expectedTargetRevision', 'expectedMemberPersonRevision', 'change', 'evidence'],
+  'knowledge.suggestion.review': ['kind', 'suggestionId', 'expectedSuggestionRevision', 'decision', 'targetRevision', 'memberPersonRevision'],
   'notes.transcribe': ['kind', 'noteId', 'expectedNoteRevision'],
   'assistant.batch.submitNote': ['kind', 'noteId', 'intent', 'question', 'knowledgeSelection'],
   'assistant.batch.check': ['kind', 'jobId'], 'chat.submit': ['kind', 'conversationId', 'text', 'knowledgeSelection'],
@@ -390,6 +403,53 @@ function parseKnowledgeItem(raw: Record<string, unknown>, kind: 'fact' | 'contac
     : Object.freeze({ kind: 'knowledge.member.remove', entityKind: 'project', entityId: raw.entityId, expectedEntityRevision: raw.expectedEntityRevision as number, itemId: raw.itemId as string });
 }
 
+function parsePublicKnowledgeChange(value: unknown): PublicKnowledgeChange {
+  if (!isRecord(value)) throw new Error('workspace_command_invalid');
+  const type = value.type;
+  if (type === 'add_fact') {
+    assertExactKeys(value, ['type', 'entityKind', 'entityId', 'statement'], ['type', 'entityKind', 'entityId', 'statement']);
+    if ((value.entityKind !== 'person' && value.entityKind !== 'project') || !isCanonicalKnowledgeId(value.entityId) ||
+        !boundedString(value.statement, KNOWLEDGE_LIMITS.statementBytes, { allowEmpty: true })) throw new Error('workspace_command_invalid');
+    return Object.freeze({ type, entityKind: value.entityKind, entityId: value.entityId, statement: value.statement }) as PublicKnowledgeChange;
+  }
+  if (type === 'add_contact') {
+    assertExactKeys(value, ['type', 'entityKind', 'entityId', 'address', 'label'], ['type', 'entityKind', 'entityId', 'address', 'label']);
+    if (value.entityKind !== 'person' || !isCanonicalKnowledgeId(value.entityId) || !boundedString(value.address, KNOWLEDGE_LIMITS.addressChars) ||
+        !boundedString(value.label, KNOWLEDGE_LIMITS.labelChars) || CONTROL.test(value.address) || CONTROL.test(value.label)) throw new Error('workspace_command_invalid');
+    return Object.freeze({ type, entityKind: 'person', entityId: value.entityId, address: value.address, label: value.label }) as PublicKnowledgeChange;
+  }
+  if (type === 'add_member') {
+    assertExactKeys(value, ['type', 'entityKind', 'entityId', 'personId', 'personRevision', 'role'], ['type', 'entityKind', 'entityId', 'personId', 'personRevision', 'role']);
+    if (value.entityKind !== 'project' || !isCanonicalKnowledgeId(value.entityId) || !isCanonicalKnowledgeId(value.personId) ||
+        !positiveRevision(value.personRevision) || !boundedString(value.role, KNOWLEDGE_LIMITS.labelChars) || CONTROL.test(value.role)) throw new Error('workspace_command_invalid');
+    return Object.freeze({ type, entityKind: 'project', entityId: value.entityId, personId: value.personId, personRevision: value.personRevision as number, role: value.role }) as PublicKnowledgeChange;
+  }
+  if (type === 'add_source_link') {
+    assertExactKeys(value, ['type', 'entityKind', 'entityId', 'referenceChoiceId', 'referenceRevision', 'label'], ['type', 'entityKind', 'entityId', 'referenceChoiceId', 'label']);
+    if ((value.entityKind !== 'person' && value.entityKind !== 'project') || !isCanonicalKnowledgeId(value.entityId) ||
+        typeof value.referenceChoiceId !== 'string' || !/^knowledge-choice-[a-f0-9]{64}$/.test(value.referenceChoiceId) ||
+        (Object.hasOwn(value, 'referenceRevision') && !positiveRevision(value.referenceRevision)) ||
+        !boundedString(value.label, KNOWLEDGE_LIMITS.labelChars) || CONTROL.test(value.label)) throw new Error('workspace_command_invalid');
+    return Object.freeze({ type, entityKind: value.entityKind, entityId: value.entityId, referenceChoiceId: value.referenceChoiceId,
+      ...(Object.hasOwn(value, 'referenceRevision') ? { referenceRevision: value.referenceRevision as number } : {}), label: value.label }) as PublicKnowledgeChange;
+  }
+  throw new Error('workspace_command_invalid');
+}
+
+function parseKnowledgeSuggestionEvidence(value: unknown): readonly KnowledgeEvidence[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > KNOWLEDGE_LIMITS.evidencePerItem) throw new Error('workspace_command_invalid');
+  return Object.freeze(value.map((candidate) => {
+    if (!isRecord(candidate)) throw new Error('workspace_command_invalid');
+    assertExactKeys(candidate, ['sourceId', 'sourceVersion', 'revision', 'quote'], ['sourceId', 'sourceVersion', 'revision', 'quote']);
+    if (!boundedString(candidate.sourceId, KNOWLEDGE_LIMITS.sourceIdChars) || typeof candidate.sourceVersion !== 'string' || !/^\d+:[a-f0-9]{64}$/.test(candidate.sourceVersion) ||
+        !Number.isSafeInteger(candidate.revision) || (candidate.revision as number) < 0 || !candidate.sourceVersion.startsWith(`${candidate.revision}:`) ||
+        !boundedString(candidate.quote, KNOWLEDGE_LIMITS.quoteBytes) || !candidate.quote.trim() || CONTROL.test(candidate.sourceId)) {
+      throw new Error('workspace_command_invalid');
+    }
+    return Object.freeze({ sourceId: candidate.sourceId, sourceVersion: candidate.sourceVersion, revision: candidate.revision as number, quote: candidate.quote });
+  }));
+}
+
 function freezeCommand(raw: Record<string, unknown>): WorkspaceCommand {
   const kind = raw.kind;
   if (kind === 'settings.update') {
@@ -464,6 +524,41 @@ function freezeCommand(raw: Record<string, unknown>): WorkspaceCommand {
   if (kind === 'knowledge.member.save' || kind === 'knowledge.member.remove') {
       assertExactKeys(raw, COMMAND_KEYS[kind], kind.endsWith('.save') ? COMMAND_KEYS[kind].filter((key) => key !== 'itemId') : COMMAND_KEYS[kind]);
     return parseKnowledgeItem(raw, 'member', kind.endsWith('.save') ? 'save' : 'remove');
+  }
+  if (kind === 'knowledge.sourceLink.save' || kind === 'knowledge.sourceLink.remove') {
+    assertExactKeys(raw, COMMAND_KEYS[kind], kind === 'knowledge.sourceLink.save'
+      ? COMMAND_KEYS[kind].filter((key) => key !== 'itemId' && key !== 'referenceChoiceId')
+      : COMMAND_KEYS[kind]);
+    if ((raw.entityKind !== 'person' && raw.entityKind !== 'project') || !isCanonicalKnowledgeId(raw.entityId) || !positiveRevision(raw.expectedEntityRevision) ||
+        (Object.hasOwn(raw, 'itemId') && !isCanonicalKnowledgeId(raw.itemId))) throw new Error('workspace_command_invalid');
+    if (kind === 'knowledge.sourceLink.remove') return Object.freeze({ kind, entityKind: raw.entityKind, entityId: raw.entityId,
+      expectedEntityRevision: raw.expectedEntityRevision as number, itemId: raw.itemId as string });
+    if ((Object.hasOwn(raw, 'referenceChoiceId') && (typeof raw.referenceChoiceId !== 'string' || !/^knowledge-choice-[a-f0-9]{64}$/.test(raw.referenceChoiceId))) ||
+        (!Object.hasOwn(raw, 'itemId') && !Object.hasOwn(raw, 'referenceChoiceId')) ||
+        !boundedString(raw.label, KNOWLEDGE_LIMITS.labelChars) || CONTROL.test(raw.label)) throw new Error('workspace_command_invalid');
+    return Object.freeze({ kind: 'knowledge.sourceLink.save', entityKind: raw.entityKind, entityId: raw.entityId, expectedEntityRevision: raw.expectedEntityRevision as number,
+      ...(Object.hasOwn(raw, 'itemId') ? { itemId: raw.itemId as string } : {}), ...(Object.hasOwn(raw, 'referenceChoiceId') ? { referenceChoiceId: raw.referenceChoiceId as string } : {}), label: raw.label });
+  }
+  if (kind === 'knowledge.suggestion.edit') {
+    assertExactKeys(raw, COMMAND_KEYS[kind], ['kind', 'suggestionId', 'expectedSuggestionRevision', 'expectedTargetRevision', 'change', 'evidence']);
+    if (!isCanonicalKnowledgeId(raw.suggestionId) || !positiveRevision(raw.expectedSuggestionRevision) || !positiveRevision(raw.expectedTargetRevision) ||
+        (Object.hasOwn(raw, 'expectedMemberPersonRevision') && !positiveRevision(raw.expectedMemberPersonRevision))) throw new Error('workspace_command_invalid');
+    const change = parsePublicKnowledgeChange(raw.change);
+    if ((change.type === 'add_member') !== Object.hasOwn(raw, 'expectedMemberPersonRevision') ||
+        (change.type === 'add_member' && change.personRevision !== raw.expectedMemberPersonRevision)) throw new Error('workspace_command_invalid');
+    return Object.freeze({ kind, suggestionId: raw.suggestionId, expectedSuggestionRevision: raw.expectedSuggestionRevision as number,
+      expectedTargetRevision: raw.expectedTargetRevision as number,
+      ...(Object.hasOwn(raw, 'expectedMemberPersonRevision') ? { expectedMemberPersonRevision: raw.expectedMemberPersonRevision as number } : {}),
+      change, evidence: parseKnowledgeSuggestionEvidence(raw.evidence) });
+  }
+  if (kind === 'knowledge.suggestion.review') {
+    assertExactKeys(raw, COMMAND_KEYS[kind], ['kind', 'suggestionId', 'expectedSuggestionRevision', 'decision', 'targetRevision']);
+    if (!isCanonicalKnowledgeId(raw.suggestionId) || !positiveRevision(raw.expectedSuggestionRevision) || !positiveRevision(raw.targetRevision) ||
+        (raw.decision !== 'accept' && raw.decision !== 'dismiss') ||
+        (Object.hasOwn(raw, 'memberPersonRevision') && !positiveRevision(raw.memberPersonRevision))) throw new Error('workspace_command_invalid');
+    return Object.freeze({ kind, suggestionId: raw.suggestionId, expectedSuggestionRevision: raw.expectedSuggestionRevision as number,
+      decision: raw.decision, targetRevision: raw.targetRevision as number,
+      ...(Object.hasOwn(raw, 'memberPersonRevision') ? { memberPersonRevision: raw.memberPersonRevision as number } : {}) });
   }
   if (kind === 'notes.updateTranscript') {
     assertExactKeys(raw, COMMAND_KEYS[kind], COMMAND_KEYS[kind]);
@@ -565,6 +660,9 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
   readonly entityRevision?: number;
   readonly documentRevision?: number;
   readonly itemId?: string;
+  readonly suggestionId?: string;
+  readonly suggestionRevision?: number;
+  readonly status?: 'pending' | 'accepted' | 'dismissed';
 }): WorkspaceCommandReceipt {
   if (!isRecord(value)) throw new Error('workspace_command_receipt_invalid');
   assertPlainDataProperties(value);
@@ -588,6 +686,10 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
     'knowledge.contact.remove': ['commandId', 'entityKind', 'entityRevision', 'itemId', 'kind', 'objectId', 'schemaVersion'],
     'knowledge.member.save': ['commandId', 'entityKind', 'entityRevision', 'itemId', 'kind', 'objectId', 'schemaVersion'],
     'knowledge.member.remove': ['commandId', 'entityKind', 'entityRevision', 'itemId', 'kind', 'objectId', 'schemaVersion'],
+    'knowledge.sourceLink.save': ['commandId', 'entityKind', 'entityRevision', 'itemId', 'kind', 'objectId', 'schemaVersion'],
+    'knowledge.sourceLink.remove': ['commandId', 'entityKind', 'entityRevision', 'itemId', 'kind', 'objectId', 'schemaVersion'],
+    'knowledge.suggestion.edit': ['commandId', 'kind', 'objectId', 'schemaVersion', 'suggestionId', 'suggestionRevision', 'status'],
+    'knowledge.suggestion.review': ['commandId', 'kind', 'objectId', 'schemaVersion', 'suggestionId', 'suggestionRevision', 'status'],
     'notes.updateTranscript': ['commandId', 'kind', 'objectId', 'schemaVersion'],
     'notes.transcribe': ['attemptId', 'commandId', 'kind', 'objectId', 'outcome', 'schemaVersion', 'sourceRevision'],
     'assistant.batch.submitNote': ['commandId', 'jobId', 'kind', 'objectId', 'schemaVersion'],
@@ -624,11 +726,15 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
         ((kind === 'knowledge.person.save' && value.entityKind !== 'person') || (kind === 'knowledge.project.save' && value.entityKind !== 'project') ||
           (kind === 'knowledge.entity.archive' && value.entityKind !== 'person' && value.entityKind !== 'project') || !positiveRevision(value.entityRevision) || !knowledgeId(value.objectId))) ||
       (['knowledge.fact.save', 'knowledge.fact.remove', 'knowledge.contact.save', 'knowledge.contact.remove',
-        'knowledge.member.save', 'knowledge.member.remove'].includes(kind) &&
+        'knowledge.member.save', 'knowledge.member.remove', 'knowledge.sourceLink.save', 'knowledge.sourceLink.remove'].includes(kind) &&
         (!knowledgeId(value.objectId) || !knowledgeId(value.itemId) || !positiveRevision(value.entityRevision) ||
           (['knowledge.contact.save', 'knowledge.contact.remove'].includes(kind) && value.entityKind !== 'person') ||
           (['knowledge.member.save', 'knowledge.member.remove'].includes(kind) && value.entityKind !== 'project') ||
           (['knowledge.fact.save', 'knowledge.fact.remove'].includes(kind) && value.entityKind !== 'person' && value.entityKind !== 'project'))) ||
+      (['knowledge.suggestion.edit', 'knowledge.suggestion.review'].includes(kind) &&
+        (!knowledgeId(value.objectId) || value.suggestionId !== value.objectId || !positiveRevision(value.suggestionRevision) ||
+          (kind === 'knowledge.suggestion.edit' && value.status !== 'pending') ||
+          (kind === 'knowledge.suggestion.review' && value.status !== 'accepted' && value.status !== 'dismissed'))) ||
       (kind === 'notes.transcribe' && (!uuidId(value.attemptId) || !Number.isSafeInteger(value.sourceRevision) || (value.sourceRevision as number) < 1 ||
         !['completed', 'no_speech', 'cancelled', 'failed', 'unknown', 'discarded'].includes(value.outcome as string))) ||
       (expected && (value.commandId !== expected.commandId || (expected.kind !== undefined && kind !== expected.kind) ||
@@ -642,6 +748,9 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
         (expected.entityRevision !== undefined && value.entityRevision !== expected.entityRevision) ||
         (expected.documentRevision !== undefined && value.documentRevision !== expected.documentRevision) ||
         (expected.itemId !== undefined && value.itemId !== expected.itemId) ||
+        (expected.suggestionId !== undefined && value.suggestionId !== expected.suggestionId) ||
+        (expected.suggestionRevision !== undefined && value.suggestionRevision !== expected.suggestionRevision) ||
+        (expected.status !== undefined && value.status !== expected.status) ||
         (expected.attemptId !== undefined && value.attemptId !== expected.attemptId) || (expected.sourceRevision !== undefined && value.sourceRevision !== expected.sourceRevision) ||
         (expected.outcome !== undefined && value.outcome !== expected.outcome)))) {
     throw new Error('workspace_command_receipt_invalid');
@@ -677,9 +786,17 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
       return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId,
         entityKind: value.entityKind as KnowledgeEntityKind, entityRevision: value.entityRevision as number });
     case 'knowledge.fact.save': case 'knowledge.fact.remove': case 'knowledge.contact.save': case 'knowledge.contact.remove':
-    case 'knowledge.member.save': case 'knowledge.member.remove':
+    case 'knowledge.member.save': case 'knowledge.member.remove': case 'knowledge.sourceLink.save': case 'knowledge.sourceLink.remove':
       return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId,
         entityKind: value.entityKind as KnowledgeEntityKind, entityRevision: value.entityRevision as number, itemId: value.itemId as string });
+    case 'knowledge.suggestion.edit':
+      return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId,
+        suggestionId: knowledgeId(value.suggestionId) ? value.suggestionId : (() => { throw new Error('workspace_command_receipt_invalid'); })(),
+        suggestionRevision: value.suggestionRevision as number, status: 'pending' });
+    case 'knowledge.suggestion.review':
+      return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId,
+        suggestionId: knowledgeId(value.suggestionId) ? value.suggestionId : (() => { throw new Error('workspace_command_receipt_invalid'); })(),
+        suggestionRevision: value.suggestionRevision as number, status: value.status as 'accepted' | 'dismissed' });
     case 'assistant.batch.submitNote':
       return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId, jobId: jobId(value.jobId) });
     case 'chat.submit':

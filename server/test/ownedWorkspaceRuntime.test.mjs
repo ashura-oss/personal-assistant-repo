@@ -90,6 +90,42 @@ async function executeAtCurrent(runtime, kernel, admission, kind, canonicalBody,
     idempotencyKey: randomUUID(), kind, canonicalBody }, operation, receipt);
 }
 
+test('knowledge source and suggestion reads return current projections without journal admission or snapshot publication', async () => {
+  const f = fixture();
+  try {
+    await f.runtime.getSnapshot(f.admission);
+    const created = await executeAtCurrent(f.runtime, f.kernel, f.admission, 'knowledge.person.save', '{"kind":"setup"}', async (controller) => {
+      const person = await controller.savePerson({ name: 'Morgan', aliases: [], narrative: '' });
+      const note = await controller.saveNote({ transcript: 'A source quote for review.' });
+      const suggestion = await controller.createKnowledgeSuggestionFromNote({ noteId: note.id, sourceId: 'transcript',
+        quote: 'A source quote', targetKind: 'person', targetId: person.id,
+        change: { type: 'add_fact', entityKind: 'person', entityId: person.id, statement: 'Works on the Still project.' } });
+      return { person, note, suggestion };
+    }, (value) => ({ kind: 'knowledge.person.save', suggestionId: value.suggestion.id }));
+    const identity = f.kernel.getOwnedIdentity(f.admission.sessionToken);
+    const beforeSnapshot = await f.runtime.getSnapshot(f.admission);
+    const beforeHistory = f.runtime.listCommandHistory(f.admission).entries;
+    const sourceChoices = await f.runtime.readKnowledgeSourceChoices(f.admission, {
+      expectedRevision: identity.revision, expectedPrivacyEpoch: identity.privacyEpoch,
+    });
+    assert.equal(sourceChoices.workspaceId, identity.workspaceId);
+    assert.equal(sourceChoices.revision, identity.revision);
+    assert.ok(sourceChoices.choices.some((choice) => choice.reference.kind === 'note' && choice.reference.id === created.result.note.id));
+
+    const suggestionReview = await f.runtime.readKnowledgeSuggestionReview(f.admission, {
+      suggestionId: created.result.suggestion.id, expectedSuggestionRevision: created.result.suggestion.revision,
+      expectedRevision: identity.revision, expectedPrivacyEpoch: identity.privacyEpoch,
+    });
+    assert.equal(suggestionReview.review.suggestion.id, created.result.suggestion.id);
+    assert.equal(suggestionReview.review.suggestion.status, 'pending');
+    assert.equal(suggestionReview.review.canEdit, true);
+    assert.deepEqual(f.runtime.listCommandHistory(f.admission).entries, beforeHistory);
+    assert.equal(await f.runtime.getSnapshot(f.admission), beforeSnapshot, 'named reads must not publish a snapshot');
+    await assert.rejects(f.runtime.readKnowledgeSourceChoices(f.admission, { expectedRevision: identity.revision + 1,
+      expectedPrivacyEpoch: identity.privacyEpoch }), /workspace_read_stale/);
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
 test('actual Node controller and response owner register speech cleanup before dispatch and settle after parent receipt', async () => {
   const cleanup = deferred();
   let dispatched = 0;

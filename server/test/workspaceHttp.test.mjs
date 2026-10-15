@@ -237,6 +237,103 @@ test('authenticated workspace snapshot, refresh, command dispatch, and receipt i
   } finally { await f.close(); }
 });
 
+test('named knowledge reads are authenticated, strict, revision-bound, safe, and read-only over the real runtime', async () => {
+  const f = await fixture();
+  try {
+    const choicesPath = '/api/workspace/knowledge/source-choices';
+    const reviewPath = '/api/workspace/knowledge/suggestion-review';
+    assert.equal((await f.request(`${choicesPath}?expectedRevision=0&expectedPrivacyEpoch=0`)).status, 401);
+    const auth = await login(f);
+    const sessionToken = auth.cookie.slice('__Host-still_session='.length);
+    const admission = { sessionToken, assertCurrent() { f.kernel.getOwnedIdentity(sessionToken); } };
+
+    const initial = await (await f.request('/api/workspace/snapshot', { headers: { Cookie: auth.cookie } })).json();
+    let current = initial;
+    const sendCommand = async (command) => {
+      const commandId = randomUUID();
+      const response = await f.request('/api/workspace/commands', { method: 'POST',
+        headers: { ...mutationHeaders(f, auth), 'X-Still-Command': commandId },
+        body: JSON.stringify({ schemaVersion: 1, commandId, expectedRevision: current.revision, expectedPrivacyEpoch: current.privacyEpoch, command }) });
+      assert.equal(response.status, 200, await response.clone().text());
+      const result = await response.json();
+      current = result.snapshot;
+      return result;
+    };
+    const personResult = await sendCommand({ kind: 'knowledge.person.save', operation: 'create',
+      input: { name: 'Morgan', aliases: [], narrative: '' } });
+    const noteResult = await sendCommand({ kind: 'notes.save', transcript: 'A note for cloud suggestion review.' });
+    const noteId = noteResult.receipt.objectId;
+    const personId = personResult.receipt.objectId;
+    const identityBeforeRead = f.kernel.getOwnedIdentity(sessionToken);
+    const beforeSnapshot = await f.runtime.getSnapshot(admission);
+    const beforeHistory = f.runtime.listCommandHistory(admission);
+
+    const sourceUrl = `${choicesPath}?expectedRevision=${identityBeforeRead.revision}&expectedPrivacyEpoch=${identityBeforeRead.privacyEpoch}`;
+    const sourceResponse = await f.request(sourceUrl, { headers: { Cookie: auth.cookie } });
+    assert.equal(sourceResponse.status, 200, await sourceResponse.clone().text());
+    assert.equal(sourceResponse.headers.get('cache-control'), 'no-store');
+    const choices = await sourceResponse.json();
+    assert.equal(choices.workspaceId, f.enrolled.workspaceId);
+    assert.equal(choices.privacyEpoch, identityBeforeRead.privacyEpoch);
+    assert.equal(choices.revision, identityBeforeRead.revision);
+    assert.ok(choices.choices.some((choice) => choice.reference.kind === 'note' && choice.reference.id === noteId));
+    assert.equal(JSON.stringify(choices).includes(sessionToken), false);
+    assert.deepEqual(f.runtime.listCommandHistory(admission), beforeHistory, 'source-choice reads must not admit commands');
+    assert.equal(await f.runtime.getSnapshot(admission), beforeSnapshot, 'source-choice reads must not publish a snapshot');
+
+    const seededSuggestion = await f.runtime.executeCommand({ ...admission, expectedRevision: identityBeforeRead.revision,
+      expectedPrivacyEpoch: identityBeforeRead.privacyEpoch, idempotencyKey: randomUUID(), kind: 'knowledge.suggestion.edit',
+      canonicalBody: JSON.stringify({ setup: 'http-knowledge-review' }) },
+    (controller) => controller.createKnowledgeSuggestionFromNote({ noteId, sourceId: 'transcript', quote: 'cloud suggestion review',
+      targetKind: 'person', targetId: personId,
+      change: { type: 'add_fact', entityKind: 'person', entityId: personId, statement: 'HTTP review fact.' } }),
+    (suggestion) => ({ objectId: suggestion.id }));
+    const identityForReview = f.kernel.getOwnedIdentity(sessionToken);
+    const suggestion = seededSuggestion.result;
+    const beforeReviewSnapshot = await f.runtime.getSnapshot(admission);
+    const beforeReviewHistory = f.runtime.listCommandHistory(admission);
+    const reviewUrl = `${reviewPath}?suggestionId=${suggestion.id}&expectedSuggestionRevision=${suggestion.revision}`+
+      `&expectedRevision=${identityForReview.revision}&expectedPrivacyEpoch=${identityForReview.privacyEpoch}`;
+    const reviewResponse = await f.request(reviewUrl, { headers: { Cookie: auth.cookie } });
+    assert.equal(reviewResponse.status, 200, await reviewResponse.clone().text());
+    assert.equal(reviewResponse.headers.get('cache-control'), 'no-store');
+    const review = await reviewResponse.json();
+    assert.equal(review.review.suggestion.id, suggestion.id);
+    assert.equal(review.review.canEdit, true);
+    for (const privateField of ['sourceNoteId', 'sourceAnalysisFingerprint', 'inputPolicyVersion']) {
+      assert.equal(Object.hasOwn(review.review.suggestion, privateField), false);
+    }
+
+    for (const url of [
+      `${choicesPath}?expectedRevision=${identityForReview.revision}&expectedPrivacyEpoch=${identityForReview.privacyEpoch}&extra=1`,
+      `${choicesPath}?expectedRevision=${identityForReview.revision}&expectedPrivacyEpoch=${identityForReview.privacyEpoch}&expectedPrivacyEpoch=${identityForReview.privacyEpoch}`,
+      `${choicesPath}?expectedRevision=%31&expectedPrivacyEpoch=${identityForReview.privacyEpoch}`,
+      `${reviewPath}?suggestionId=${suggestion.id}&expectedSuggestionRevision=${suggestion.revision}&expectedRevision=${identityForReview.revision}&expectedPrivacyEpoch=${identityForReview.privacyEpoch}&x=y`,
+    ]) assert.equal((await f.request(url, { headers: { Cookie: auth.cookie } })).status, 400, url);
+    assert.equal((await f.request(choicesPath, { method: 'POST', headers: { Cookie: auth.cookie } })).status, 405);
+
+    assert.equal((await f.request(`${choicesPath}?expectedRevision=${identityForReview.revision + 1}&expectedPrivacyEpoch=${identityForReview.privacyEpoch}`,
+      { headers: { Cookie: auth.cookie } })).status, 409);
+    assert.equal((await f.request(`${choicesPath}?expectedRevision=${identityForReview.revision}&expectedPrivacyEpoch=${identityForReview.privacyEpoch + 1}`,
+      { headers: { Cookie: auth.cookie } })).status, 409);
+    assert.deepEqual(f.runtime.listCommandHistory(admission), beforeReviewHistory, 'suggestion-review reads must not admit commands');
+    assert.equal(await f.runtime.getSnapshot(admission), beforeReviewSnapshot, 'suggestion-review reads must not publish a snapshot');
+    assert.ok(current.state.notes.some((note) => note.id === noteId));
+  } finally { await f.close(); }
+});
+
+test('knowledge reads return unavailable when an older workspace HTTP adapter omits the optional named read port', async () => {
+  const f = await fixture({ wrapWorkspaceApi(api) {
+    const { readKnowledgeSourceChoices: _read, ...rest } = api;
+    return Object.freeze(rest);
+  } });
+  try {
+    const auth = await login(f);
+    const response = await f.request('/api/workspace/knowledge/source-choices?expectedRevision=0&expectedPrivacyEpoch=0', { headers: { Cookie: auth.cookie } });
+    assert.equal(response.status, 503);
+  } finally { await f.close(); }
+});
+
 test('transcription cancellation is an authenticated, exact empty-body signal route', async () => {
   const f = await fixture();
   try {
@@ -509,11 +606,11 @@ test('workspace HTTP rechecks authorization after an awaited read and after a co
   const committed = deferred();
   const releaseResponse = deferred();
   const f = await fixture({ wrapWorkspaceApi(api) {
-    return { ...api, async getSnapshot(admission) {
-      const snapshot = await api.getSnapshot(admission);
+    return { ...api, async readKnowledgeSourceChoices(admission, input) {
+      const choices = await api.readKnowledgeSourceChoices(admission, input);
       readStarted.resolve();
       await releaseRead.promise;
-      return snapshot;
+      return choices;
     }, async dispatchCommand(admission, envelope) {
       const result = await api.dispatchCommand(admission, envelope);
       committed.resolve();
@@ -523,11 +620,14 @@ test('workspace HTTP rechecks authorization after an awaited read and after a co
   } });
   try {
     const firstAuth = await login(f);
-    const readRequest = f.request('/api/workspace/snapshot', { headers: { Cookie: firstAuth.cookie } });
+    const firstToken = firstAuth.cookie.split('=')[1];
+    const firstIdentity = f.kernel.getOwnedIdentity(firstToken);
+    const readRequest = f.request(`/api/workspace/knowledge/source-choices?expectedRevision=${firstIdentity.revision}&expectedPrivacyEpoch=${firstIdentity.privacyEpoch}`,
+      { headers: { Cookie: firstAuth.cookie } });
     await readStarted.promise;
     f.kernel.revokeSession(firstAuth.cookie.split('=')[1]);
     releaseRead.resolve();
-    assert.equal((await readRequest).status, 401, 'a snapshot completed during an authorization change is not returned');
+    assert.equal((await readRequest).status, 401, 'a named knowledge read completed during an authorization change is not returned');
 
     const currentToken = f.kernel.createSession(f.enrolled.workspaceId, f.enrolled.ownerId, 2_000_000_000_000);
     const currentSession = { sessionToken: currentToken, assertCurrent() { f.kernel.getOwnedIdentity(currentToken); } };

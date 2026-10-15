@@ -61,7 +61,8 @@ describe('same-origin web workspace command client', () => {
     expect(SERVER_HISTORY_KINDS).toEqual(['tasks.complete', 'tasks.reopen', 'chat.create', 'settings.update', 'notes.save', 'notes.capture.adopt',
       'notes.updateTranscript', 'assistant.batch.submitNote', 'assistant.batch.check', 'chat.submit', 'chat.refine', 'notes.transcribe', 'accounts.installOAuth',
       'documents.save', 'knowledge.person.save', 'knowledge.project.save', 'knowledge.entity.archive', 'knowledge.fact.save', 'knowledge.fact.remove',
-      'knowledge.contact.save', 'knowledge.contact.remove', 'knowledge.member.save', 'knowledge.member.remove']);
+      'knowledge.contact.save', 'knowledge.contact.remove', 'knowledge.member.save', 'knowledge.member.remove',
+      'knowledge.sourceLink.save', 'knowledge.sourceLink.remove', 'knowledge.suggestion.edit', 'knowledge.suggestion.review']);
     expect(CLIENT_HISTORY_KINDS).toEqual(SERVER_HISTORY_KINDS);
     for (const kind of SERVER_HISTORY_KINDS) {
       expect(serverJournalKind(kind.toLowerCase())).toBe(kind);
@@ -108,6 +109,29 @@ describe('same-origin web workspace command client', () => {
       entityKind: 'person', itemId })).toMatchObject({ entityRevision: 5, itemId });
     expect(() => parseWorkspaceCommandReceipt({ schemaVersion: 1, commandId, kind: 'knowledge.contact.remove', objectId: personId,
       entityKind: 'project', entityRevision: 5, itemId }, { commandId, kind: 'knowledge.contact.remove' })).toThrow('workspace_command_receipt_invalid');
+  });
+
+  it('accepts only opaque source selectors and closed suggestion evidence in cloud commands', () => {
+    const entityId = '20000000-0000-4000-8000-000000000001';
+    const suggestionId = '20000000-0000-4000-8000-000000000002';
+    const choiceId = `knowledge-choice-${'a'.repeat(64)}`;
+    const sourceLinkCreate = { kind: 'knowledge.sourceLink.save', entityKind: 'person', entityId, expectedEntityRevision: 2,
+      referenceChoiceId: choiceId, label: 'Meeting notes' } as const;
+    expect(parseWorkspaceCommandEnvelope({ schemaVersion: 1, commandId, expectedRevision: 1, expectedPrivacyEpoch: 3, command: sourceLinkCreate }).command).toEqual(sourceLinkCreate);
+    const sourceLinkUpdate = { ...sourceLinkCreate, itemId: '20000000-0000-4000-8000-000000000003', referenceChoiceId: undefined };
+    expect(() => parseWorkspaceCommandEnvelope({ schemaVersion: 1, commandId, expectedRevision: 1, expectedPrivacyEpoch: 3, command: sourceLinkUpdate })).toThrow('workspace_command_invalid');
+    const sourceLinkUpdateOmitted = { kind: 'knowledge.sourceLink.save', entityKind: 'person', entityId, expectedEntityRevision: 2,
+      itemId: '20000000-0000-4000-8000-000000000003', label: 'Rename only' } as const;
+    expect(parseWorkspaceCommandEnvelope({ schemaVersion: 1, commandId, expectedRevision: 1, expectedPrivacyEpoch: 3, command: sourceLinkUpdateOmitted }).command).toEqual(sourceLinkUpdateOmitted);
+    expect(() => parseWorkspaceCommandEnvelope({ schemaVersion: 1, commandId, expectedRevision: 1, expectedPrivacyEpoch: 3,
+      command: { ...sourceLinkCreate, reference: { kind: 'note', id: 'private' } } })).toThrow('workspace_command_invalid');
+
+    const evidence = [{ sourceId: 'note:note-a', sourceVersion: `1:${'b'.repeat(64)}`, revision: 1, quote: 'Exact evidence' }];
+    const suggestionEdit = { kind: 'knowledge.suggestion.edit', suggestionId, expectedSuggestionRevision: 2, expectedTargetRevision: 5,
+      change: { type: 'add_fact', entityKind: 'person', entityId, statement: 'Works on design' }, evidence } as const;
+    expect(parseWorkspaceCommandEnvelope({ schemaVersion: 1, commandId, expectedRevision: 1, expectedPrivacyEpoch: 3, command: suggestionEdit }).command).toEqual(suggestionEdit);
+    expect(() => parseWorkspaceCommandEnvelope({ schemaVersion: 1, commandId, expectedRevision: 1, expectedPrivacyEpoch: 3,
+      command: { ...suggestionEdit, change: { type: 'add_source_link', entityKind: 'person', entityId, reference: { kind: 'note', id: 'private' }, label: 'x' } } })).toThrow('workspace_command_invalid');
   });
 
   it('signals cancellation independently while a command POST remains pending', async () => {

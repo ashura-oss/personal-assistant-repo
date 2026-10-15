@@ -31,6 +31,7 @@ import {
 import type { LegacyReminderCancellation, ReminderIntent, ReminderPayload, ReminderRecord, ReminderState } from '../reminders';
 import type { NotificationBackend, PendingNotificationRequest } from './notificationBackend';
 import type { DeviceCalendarState } from '../deviceCalendars/types';
+import { knowledgeReferenceBindingIsCurrent } from '../knowledge/sourceChoices';
 import {
   appendDeviceEventReconciliation, createDeviceEventDispatchRecord,
   validateDeviceCalendarReadWindow,
@@ -10371,8 +10372,11 @@ export class AppControllerImpl implements AppController {
   async removeKnowledgeContact(input: KnowledgeItemCommand & { entityKind: 'person' }): Promise<void> {
     await this.updateKnowledgeItem(input, (entity) => { if (!('contacts' in entity)) throw new Error('Person was not found.'); const index = entity.contacts.findIndex((item) => item.id === input.itemId); if (index < 0) throw new Error('Contact was not found.'); entity.contacts.splice(index, 1); }, true);
   }
-  async saveKnowledgeSourceLink(input: SaveKnowledgeSourceLinkInput): Promise<KnowledgeSourceLink> {
+  async saveKnowledgeSourceLink(input: SaveKnowledgeSourceLinkInput & { expectedSourceBinding?: string }): Promise<KnowledgeSourceLink> {
     return this.updateKnowledgeItem(input, (entity, state) => {
+      if (input.expectedSourceBinding !== undefined && !knowledgeReferenceBindingIsCurrent(state, input.expectedSourceBinding, input.reference)) {
+        throw new Error('The selected source changed or is no longer available. Refresh the source choices.');
+      }
       this.assertKnowledgeReferenceExists(state, input.reference);
       const found = input.itemId ? entity.sourceLinks.find((item) => item.id === input.itemId) : undefined;
       if (input.itemId && !found) throw new Error('Source link was not found.');
@@ -10442,7 +10446,7 @@ export class AppControllerImpl implements AppController {
     return result;
   }
 
-  async editKnowledgeSuggestion(id: string, input: EditKnowledgeSuggestionInput): Promise<KnowledgeSuggestion> {
+  async editKnowledgeSuggestion(id: string, input: EditKnowledgeSuggestionInput & { expectedTargetRevision?: number; expectedSourceBinding?: string }): Promise<KnowledgeSuggestion> {
     this.assertKnowledgeWritable();
     const result = await this.mutate(async (state) => {
       this.assertKnowledgeWritable();
@@ -10456,7 +10460,11 @@ export class AppControllerImpl implements AppController {
       let editedChange = input.change;
       const target = this.findKnowledgeEntity(state, editedChange.entityKind, editedChange.entityId);
       if (target.archivedAt) throw new Error('Unarchive the person or project before editing its suggestion.');
+      if (input.expectedTargetRevision !== undefined && target.revision !== input.expectedTargetRevision) throw new Error('The target person or project changed. Refresh the suggestion before editing it.');
       if (editedChange.type === 'add_source_link') {
+        if (input.expectedSourceBinding !== undefined && !knowledgeReferenceBindingIsCurrent(state, input.expectedSourceBinding, editedChange.reference)) {
+          throw new Error('The selected source changed or is no longer available. Refresh the source choices.');
+        }
         this.assertKnowledgeReferenceExists(state, editedChange.reference);
         if (editedChange.reference.kind === 'person' || editedChange.reference.kind === 'project') {
           const related = this.findKnowledgeEntity(state, editedChange.reference.kind, editedChange.reference.id);
@@ -10636,8 +10644,14 @@ export class AppControllerImpl implements AppController {
       if (!suggestion) throw new Error('Memory suggestion was not found.');
       if (suggestion.status !== 'pending' || suggestion.revision !== input.expectedRevision) throw new Error('This memory suggestion changed or is no longer pending.');
       if (input.decision === 'dismiss') {
-        suggestion.status = 'dismissed'; suggestion.reviewedAt = now(); suggestion.updatedAt = suggestion.reviewedAt; suggestion.revision += 1;
         const target = this.findKnowledgeEntity(state, suggestion.change.entityKind, suggestion.change.entityId);
+        const memberChange = suggestion.change.type === 'add_member' ? suggestion.change : undefined;
+        if (input.targetRevision !== undefined && target.revision !== input.targetRevision) throw new Error('The target person or project changed. Refresh the suggestion before reviewing it.');
+        if (memberChange && input.memberPersonRevision !== undefined) {
+          const member = state.knowledge.people.find((item) => item.id === memberChange.personId);
+          if (!member || member.archivedAt || member.revision !== input.memberPersonRevision) throw new Error('The selected project member changed. Refresh the suggestion before reviewing it.');
+        }
+        suggestion.status = 'dismissed'; suggestion.reviewedAt = now(); suggestion.updatedAt = suggestion.reviewedAt; suggestion.revision += 1;
         this.journalKnowledgeReview(state, 'dismissed', suggestion, target.name);
         addActivity(state, 'local_action', 'A memory suggestion was dismissed.', { noteId: suggestion.sourceNoteId }, this.newId);
         this.validateKnowledgeAndBackup(state);

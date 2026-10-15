@@ -22,6 +22,9 @@ import type { LoadedWorkspaceIdentity } from '../../server/src/workspaceStore.js
 import type { ServerWorkspaceStore } from '../../server/src/workspaceStore.js';
 import type { WorkspaceCommandHistoryPage } from './workspaceCommandHistory';
 import type { WorkspaceCommandReceipt } from './workspaceCommands';
+import { projectKnowledgeSourceChoiceReference } from '../knowledge/sourceChoices';
+import { projectKnowledgeSuggestionForHttp, type KnowledgeSourceChoicesDTO, type KnowledgeSuggestionReviewDTO } from './knowledgeHttpContracts';
+import { buildCloudKnowledgeSourceChoiceOptions, knowledgeSourceChoiceId } from './knowledgeSourceChoices.node';
 
 export type OwnedWorkspaceFactoryContext = WorkspaceRuntimeContext<AppState> & {
   readonly speechCleanupChildren: SpeechCleanupChildren;
@@ -310,6 +313,52 @@ export class OwnedWorkspaceRuntime {
     });
   }
 
+  /** Reads only safe source-choice projections and never publishes or caches a workspace snapshot. */
+  readKnowledgeSourceChoices(admission: OwnedWorkspaceAdmission, input: Readonly<{ expectedRevision: number; expectedPrivacyEpoch: number }>): Promise<KnowledgeSourceChoicesDTO> {
+    this.assertAdmission(admission);
+    const identity = this.options.kernel.getOwnedIdentity(admission.sessionToken);
+    if (!Number.isSafeInteger(input?.expectedRevision) || input.expectedRevision !== identity.revision ||
+        !Number.isSafeInteger(input?.expectedPrivacyEpoch) || input.expectedPrivacyEpoch !== identity.privacyEpoch) return Promise.reject(new Error('workspace_read_stale'));
+    if (this.busy.has(identity.workspaceId)) return Promise.reject(new Error('workspace_runtime_busy'));
+    if (this.refreshRequired.has(identity.workspaceId)) return Promise.reject(new Error('workspace_refresh_required'));
+    return this.track(identity.workspaceId, () => undefined, async () => {
+      const runtime = await this.registry.get(admission.sessionToken);
+      admission.assertCurrent();
+      const loaded = runtime.store.getLoadedIdentity();
+      this.assertStillCurrent(admission, identity, loaded, this.options.kernel.getOwnedIdentity(admission.sessionToken));
+      const choices = buildCloudKnowledgeSourceChoiceOptions(runtime.controller.getSnapshot()).map(({ reference, label, binding }) => {
+        return Object.freeze({ id: knowledgeSourceChoiceId(identity.workspaceId, identity.privacyEpoch, binding), label, reference: projectKnowledgeSourceChoiceReference(reference) });
+      });
+      admission.assertCurrent();
+      this.assertStillCurrent(admission, identity, runtime.store.getLoadedIdentity(), this.options.kernel.getOwnedIdentity(admission.sessionToken));
+      return Object.freeze({ schemaVersion: 1, workspaceId: identity.workspaceId, privacyEpoch: identity.privacyEpoch,
+        revision: identity.revision, choices: Object.freeze(choices) });
+    });
+  }
+
+  /** Uses the controller's serialized read boundary; it performs no write or journal admission. */
+  readKnowledgeSuggestionReview(admission: OwnedWorkspaceAdmission, input: Readonly<{ suggestionId: string; expectedSuggestionRevision: number; expectedRevision: number; expectedPrivacyEpoch: number }>): Promise<KnowledgeSuggestionReviewDTO> {
+    this.assertAdmission(admission);
+    const identity = this.options.kernel.getOwnedIdentity(admission.sessionToken);
+    if (typeof input?.suggestionId !== 'string' || !input.suggestionId || !Number.isSafeInteger(input.expectedSuggestionRevision) || input.expectedSuggestionRevision < 1 ||
+        !Number.isSafeInteger(input.expectedRevision) || input.expectedRevision !== identity.revision ||
+        !Number.isSafeInteger(input.expectedPrivacyEpoch) || input.expectedPrivacyEpoch !== identity.privacyEpoch) return Promise.reject(new Error('workspace_read_stale'));
+    if (this.busy.has(identity.workspaceId)) return Promise.reject(new Error('workspace_runtime_busy'));
+    if (this.refreshRequired.has(identity.workspaceId)) return Promise.reject(new Error('workspace_refresh_required'));
+    return this.track(identity.workspaceId, () => undefined, async () => {
+      const runtime = await this.registry.get(admission.sessionToken);
+      admission.assertCurrent();
+      const loaded = runtime.store.getLoadedIdentity();
+      this.assertStillCurrent(admission, identity, loaded, this.options.kernel.getOwnedIdentity(admission.sessionToken));
+      const review = await runtime.controller.prepareKnowledgeSuggestionReview(input.suggestionId, { expectedRevision: input.expectedSuggestionRevision });
+      admission.assertCurrent();
+      this.assertStillCurrent(admission, identity, runtime.store.getLoadedIdentity(), this.options.kernel.getOwnedIdentity(admission.sessionToken));
+      return Object.freeze({ schemaVersion: 1, workspaceId: identity.workspaceId, privacyEpoch: identity.privacyEpoch,
+        revision: identity.revision, review: Object.freeze({ suggestion: projectKnowledgeSuggestionForHttp(review.suggestion),
+          canEdit: review.canEdit, canAccept: review.canAccept, ...(review.reason ? { reason: review.reason } : {}) }) });
+    });
+  }
+
   /** Explicitly reloads controller state after a caller-directed recovery/refresh. */
   refreshSnapshot(admission: OwnedWorkspaceAdmission): Promise<WorkspaceSnapshotDTO> {
     this.assertAdmission(admission);
@@ -438,7 +487,7 @@ export class OwnedWorkspaceRuntime {
   }
 
   executeCommand<T>(input: OwnedWorkspaceCommandInput,
-    operation: (controller: AppControllerImpl) => Promise<T>,
+    operation: (controller: AppControllerImpl, identity: OwnedWorkspaceIdentity) => Promise<T>,
     projectReceipt: (result: T) => JsonValue): Promise<OwnedWorkspaceCommandResult<T>> {
     this.assertAdmission(input);
     if (typeof operation !== 'function' || typeof projectReceipt !== 'function') throw new TypeError('trusted_command_operation_required');
@@ -457,7 +506,7 @@ export class OwnedWorkspaceRuntime {
             commandController = controller;
             parentTicketId = currentCommandTicket()?.ticketId;
             input.assertCurrent();
-            return operation(controller);
+            return operation(controller, identity);
           }, projectReceipt);
         input.assertCurrent();
         if (!result.admission.fresh && result.admission.status !== 'finished') {

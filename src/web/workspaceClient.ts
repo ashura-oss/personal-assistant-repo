@@ -503,6 +503,13 @@ function expectedReceiptFor(envelope: WorkspaceCommandEnvelope) {
     case 'knowledge.member.save': return { commandId: envelope.commandId, kind: command.kind, objectId: command.entityId, entityKind: 'project' as const,
       ...(command.itemId ? { itemId: command.itemId } : {}) };
     case 'knowledge.member.remove': return { commandId: envelope.commandId, kind: command.kind, objectId: command.entityId, entityKind: 'project' as const, itemId: command.itemId };
+    case 'knowledge.sourceLink.save': return { commandId: envelope.commandId, kind: command.kind, objectId: command.entityId, entityKind: command.entityKind,
+      ...(command.itemId ? { itemId: command.itemId } : {}) };
+    case 'knowledge.sourceLink.remove': return { commandId: envelope.commandId, kind: command.kind, objectId: command.entityId, entityKind: command.entityKind, itemId: command.itemId };
+    case 'knowledge.suggestion.edit': return { commandId: envelope.commandId, kind: command.kind, objectId: command.suggestionId, suggestionId: command.suggestionId,
+      suggestionRevision: command.expectedSuggestionRevision + 1, status: 'pending' as const };
+    case 'knowledge.suggestion.review': return { commandId: envelope.commandId, kind: command.kind, objectId: command.suggestionId, suggestionId: command.suggestionId,
+      suggestionRevision: command.expectedSuggestionRevision + 1, status: command.decision === 'accept' ? 'accepted' as const : 'dismissed' as const };
     case 'notes.updateTranscript':
       return { commandId: envelope.commandId, kind: command.kind, objectId: command.noteId };
     case 'notes.transcribe':

@@ -134,6 +134,17 @@ function normalizeReference(value: unknown): KnowledgeReference {
   }
   return fail('Knowledge reference kind is invalid.');
 }
+/** Validates a reference without allowing normalization to silently change its identity. */
+export function validateCanonicalKnowledgeReference(value: unknown): KnowledgeReference {
+  const normalized = normalizeReference(value);
+  if (!record(value)) fail('Knowledge reference must be an object.');
+  const originalKeys = Object.keys(value).sort();
+  const normalizedKeys = Object.keys(normalized).sort();
+  if (originalKeys.length !== normalizedKeys.length || originalKeys.some((key, index) => key !== normalizedKeys[index] || value[key] !== (normalized as unknown as Record<string, unknown>)[key])) {
+    fail('Knowledge reference is not canonical.');
+  }
+  return normalized;
+}
 function normalizeLink(value: unknown): KnowledgeSourceLink {
   if (!record(value)) fail('Knowledge source link must be an object.');
   ownKeys(value, ['id', 'provenance', 'createdAt', 'evidence', 'suggestionId', 'reference', 'label'], 'Knowledge source link');

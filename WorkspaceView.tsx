@@ -34,6 +34,7 @@ import { findCurrentNativeDetailNote } from "./src/ui/nativeDetailSelection";
 import { RecordingAttachmentSheet } from "./src/ui/RecordingAttachmentSheet";
 import type { KnowledgeReferenceDisplay, KnowledgeSourceChoiceDisplay } from "./src/ui/knowledgeDisplayTypes";
 import { projectKnowledgeDisplay, projectKnowledgeSuggestionDisplay } from "./src/ui/libraryDisplay";
+import { buildKnowledgeReferenceOptions, projectKnowledgeSourceChoiceReference } from "./src/knowledge/sourceChoices";
 import { KnowledgeReferenceChoiceOwnership, resolveKnowledgeSourceLinkReference } from "./src/ui/knowledgeReferenceChoiceOwnership";
 import { runWithBusyLock } from "./src/ui/busyActionRunner";
 import { ReminderReview } from "./src/ui/ReminderReview";
@@ -242,73 +243,8 @@ function knowledgeAccountIdentityKey(account: AppState['accounts'][number]) {
   return [identity.providerNamespace, identity.clientId, identity.subject, identity.resourceUserId ?? ''].join(':');
 }
 
-function knowledgeReferenceOptions(state: AppState) {
-  const structuredNarrativePaths = new Set([
-    ...state.knowledge.people.map((entity) => entity.narrativePath),
-    ...state.knowledge.projects.map((entity) => entity.narrativePath),
-  ]);
-  const references: { reference: KnowledgeReference; label: string; binding: string }[] = [
-    ...state.notes.filter((note) => note.origin !== 'assistant_chat').map((note) => ({ reference: { kind: 'note' as const, id: note.id }, label: `Note · ${(note.transcript || 'Untitled note').slice(0, 70)}`, binding: JSON.stringify(['note', note]) })),
-    ...state.tasks.map((task) => ({ reference: { kind: 'task' as const, id: task.id }, label: `Task · ${task.title}`, binding: JSON.stringify(['task', task]) })),
-    ...state.documents.filter((document) => !structuredNarrativePaths.has(document.path)).map((document) => ({ reference: { kind: 'document' as const, id: document.path }, label: `Document · ${friendlyDocumentName(document.path)}`, binding: JSON.stringify(['document', document]) })),
-    ...state.knowledge.people.filter((person) => !person.archivedAt).map((person) => ({ reference: { kind: 'person' as const, id: person.id }, label: `Person · ${person.name}${person.importOrigin?.kind === 'backup_knowledge' ? ' · Imported copy' : ''}`, binding: JSON.stringify(['person', person]) })),
-    ...state.knowledge.projects.filter((project) => !project.archivedAt).map((project) => ({ reference: { kind: 'project' as const, id: project.id }, label: `Project · ${project.name}${project.importOrigin?.kind === 'backup_knowledge' ? ' · Imported copy' : ''}`, binding: JSON.stringify(['project', project]) })),
-  ];
-  for (const message of state.mailbox) {
-    const account = state.accounts.find((item) => item.id === message.accountId);
-    const identityKey = account && knowledgeAccountIdentityKey(account);
-    if (!account || !identityKey || !account.capabilities?.includes('mail.read') ||
-        typeof message.connectionGeneration !== 'number' || message.providerDeletedAt ||
-        message.verifiedIdentityKey !== identityKey || message.identityKey !== `${identityKey}:${message.providerMessageId}` ||
-        message.connectionGeneration !== account.connectionGeneration) continue;
-    references.push({ reference: { kind: 'mail', id: message.providerMessageId, identityKey, connectionGeneration: message.connectionGeneration }, label: `Saved mail · ${message.subject || message.from || 'No subject'}`, binding: JSON.stringify(['mail', account, message]) });
-  }
-  for (const event of state.calendarEvents) {
-    const account = state.accounts.find((item) => item.id === event.accountId);
-    const identityKey = account && knowledgeAccountIdentityKey(account);
-    if (!account || !identityKey || !account.capabilities?.includes('calendar.read') ||
-        typeof event.connectionGeneration !== 'number' || event.providerDeletedAt ||
-        event.verifiedIdentityKey !== identityKey || event.connectionGeneration !== account.connectionGeneration) continue;
-    const calendar = state.calendars.find((item) => item.id === event.calendarId && item.accountId === event.accountId && item.connected);
-    if (!calendar) continue;
-    references.push({ reference: { kind: 'calendar', id: event.providerEventId, calendarId: calendar.providerId ?? calendar.id, identityKey, connectionGeneration: event.connectionGeneration }, label: `Saved calendar item · ${event.subject || 'Untitled event'}`, binding: JSON.stringify(['calendar', account, calendar, event]) });
-  }
-  if (state.deviceCalendars.enabled && state.deviceCalendarAccess.status === 'full_access') {
-    const now = Date.now();
-    for (const event of state.deviceCalendars.events) {
-      const calendar = state.deviceCalendars.calendars.find((item) => item.localId === event.calendarId);
-      const age = now - Date.parse(event.observedAt);
-      if (!calendar || event.cancelled || event.generation !== state.deviceCalendars.generation ||
-          !state.deviceCalendars.selectedCalendarIds.includes(event.calendarId) || !Number.isFinite(age) || age < 0 || age > 15 * 60_000) continue;
-      references.push({
-        reference: { kind: 'device_calendar_event', installationId: state.deviceCalendars.installationId, generation: event.generation,
-          calendarId: event.calendarId, eventId: event.nativeEventId, occurrenceStart: event.occurrenceStart },
-        label: `On this iPhone · ${calendar.title} · ${event.title || 'Untitled event'}`,
-        binding: JSON.stringify(['device_calendar_event', state.deviceCalendars.installationId, state.deviceCalendars.generation,
-          state.deviceCalendars.enabled, state.deviceCalendars.selectedCalendarIds, state.deviceCalendarAccess.status, calendar, event]),
-      });
-    }
-  }
-  return references;
-}
-
-function knowledgeReferenceDisplay(reference: KnowledgeReference): KnowledgeReferenceDisplay {
-  switch (reference.kind) {
-    case 'note': case 'task': case 'document': case 'person': case 'project':
-      return { kind: reference.kind, id: reference.id };
-    case 'mail':
-      return { kind: 'mail', id: reference.id, identityKey: reference.identityKey, connectionGeneration: reference.connectionGeneration };
-    case 'calendar':
-      return { kind: 'calendar', id: reference.id, calendarId: reference.calendarId, identityKey: reference.identityKey, connectionGeneration: reference.connectionGeneration };
-    case 'device_calendar_event':
-      return { kind: 'historical', label: `Device calendar event (${reference.occurrenceStart})`, originalKind: 'device_calendar_event' };
-    case 'historical':
-      return { kind: 'historical', label: reference.label, originalKind: reference.originalKind };
-  }
-}
-
 function knowledgeReferenceChoices(state: AppState, ownership: KnowledgeReferenceChoiceOwnership): KnowledgeSourceChoiceDisplay[] {
-  return ownership.project(knowledgeReferenceOptions(state), knowledgeReferenceDisplay);
+  return ownership.project(buildKnowledgeReferenceOptions(state), projectKnowledgeSourceChoiceReference);
 }
 
 function knowledgeEvidenceLabels(state: AppState) {
@@ -3811,7 +3747,7 @@ export function WorkspaceView({ controller, credentials, platform, workspaceGene
                     ? state.knowledge.people.find((item) => item.id === input.entityId && item.revision === input.expectedEntityRevision)
                     : state.knowledge.projects.find((item) => item.id === input.entityId && item.revision === input.expectedEntityRevision);
                   const existing = input.itemId ? entity?.sourceLinks.find((item) => item.id === input.itemId) : undefined;
-                  const selectedReference = resolveKnowledgeSourceLinkReference(knowledgeReferenceChoiceOwnership, input.referenceChoiceId, knowledgeReferenceOptions(state), existing?.reference);
+                  const selectedReference = resolveKnowledgeSourceLinkReference(knowledgeReferenceChoiceOwnership, input.referenceChoiceId, buildKnowledgeReferenceOptions(state), existing?.reference);
                   const { referenceChoiceId: _referenceChoiceId, ...command } = input;
                   if (!entity || (input.itemId && !existing) || !selectedReference) return Promise.resolve(undefined);
                   return run(() => controller.saveKnowledgeSourceLink({ ...command, reference: selectedReference }));
