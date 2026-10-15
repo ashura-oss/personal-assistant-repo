@@ -97,6 +97,20 @@ test('history is owner and epoch scoped, stable across tied pages and excludes s
   } finally { cleanup(f); }
 });
 
+test('history reads schema 4 metadata without changing the database', () => {
+  const f = setup();
+  try {
+    const version = f.kernel.withTrustedDatabaseTransaction((db) =>
+      db.prepare('SELECT version FROM private_audio_schema WHERE singleton=1').get().version);
+    assert.equal(version, 4);
+    const changesBefore = f.kernel.withTrustedDatabaseTransaction((db) => db.prepare('SELECT total_changes() AS count').get().count);
+    const page = readAudioUploadHistory(f.kernel, f.sessionToken);
+    const changesAfter = f.kernel.withTrustedDatabaseTransaction((db) => db.prepare('SELECT total_changes() AS count').get().count);
+    assert.deepEqual(page, { schemaVersion: 1, entries: [] });
+    assert.equal(changesAfter, changesBefore, 'schema 4 history read performs no SQLite writes');
+  } finally { cleanup(f); }
+});
+
 test('history safely reads a workspace without an audio table and fails closed on incomplete or future schemas', () => {
   const f = setup();
   const freshDirectory = mkdtempSync(join(tmpdir(), 'still-audio-history-fresh-'));
@@ -115,7 +129,7 @@ test('history safely reads a workspace without an audio table and fails closed o
     const workspace = f.kernel.createWorkspace(owner, { notes: [] });
     const session = f.kernel.createSession(workspace.workspaceId, owner, Date.now() + 60 * 60_000);
     f.kernel.withTrustedDatabaseTransaction((db) => {
-      db.prepare('UPDATE private_audio_schema SET version=99 WHERE singleton=1').run();
+      db.prepare('UPDATE private_audio_schema SET version=5 WHERE singleton=1').run();
     });
     assert.throws(() => readAudioUploadHistory(f.kernel, f.sessionToken), /schema_unsupported/);
     f.kernel.withTrustedDatabaseTransaction((db) => {

@@ -65,7 +65,7 @@ function ensureReadableSchema(db: OwnedTransactionContext['db']): boolean {
   if (markerColumns.length !== 2 || markerColumns[0]?.name !== 'singleton' || markerColumns[0]?.type !== 'INTEGER' ||
       markerColumns[1]?.name !== 'version' || markerColumns[1]?.type !== 'INTEGER') throw new Error('audio_schema_invalid');
   const versions = db.prepare('SELECT singleton,version FROM private_audio_schema').all() as { singleton: number; version: number }[];
-  if (versions.length !== 1 || versions[0]?.singleton !== 1 || ![2, 3].includes(versions[0]?.version ?? -1)) {
+  if (versions.length !== 1 || versions[0]?.singleton !== 1 || ![2, 3, 4].includes(versions[0]?.version ?? -1)) {
     throw new Error('audio_schema_unsupported');
   }
   const required = [

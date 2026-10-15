@@ -1,14 +1,30 @@
 import { createHash, randomUUID } from 'node:crypto';
-import type { DurableKernel, JsonValue } from './kernel.js';
+import type { DurableKernel, JsonValue, OwnedTransactionContext } from './kernel.js';
 import { currentCommandTicket, type CommandJournal } from './commandJournal.js';
 
 export const SERVER_SNAPSHOT_MAX_BYTES = 16 * 1024 * 1024;
 
-export interface ServerWorkspaceStoreOptions {
+export interface SnapshotCommitParticipantInput<TState extends object> {
+  readonly previousSnapshot: TState;
+  readonly nextSnapshot: TState;
+  readonly nextRevision: number;
+  readonly commandId?: string;
+}
+
+/** Trusted synchronous side effects that must commit atomically with a persisted snapshot. */
+export interface SnapshotCommitParticipant<TState extends object = Record<string, unknown>> {
+  commit(context: OwnedTransactionContext, input: SnapshotCommitParticipantInput<TState>): readonly string[] | void;
+  /** Starts best-effort physical work only after the snapshot acknowledgement was adopted. */
+  afterAcknowledged?(intentIds: readonly string[]): void;
+}
+
+export interface ServerWorkspaceStoreOptions<TState extends object = Record<string, unknown>> {
   readonly kernel: DurableKernel;
   /** Trusted, private kernel-issued session token. Never pass this through HTTP or browser state. */
   readonly sessionToken: string;
   readonly journal?: CommandJournal;
+  /** Private Node composition hook; never populated from browser or HTTP input. */
+  readonly snapshotCommitParticipant?: SnapshotCommitParticipant<TState>;
   /** Test seam for the ambiguous-ack boundary; production callers should omit it. */
   readonly afterCommitForTesting?: () => void | Promise<void>;
 }
@@ -50,10 +66,26 @@ export class ServerWorkspaceStore<TState extends object = Record<string, unknown
   private loaded?: LoadedWorkspace;
   private loadedStateProof?: LoadedWorkspaceStateProof;
   private blockedUntilLoad = false;
+  private loadStarted = false;
+  private saveStarted = false;
+  private snapshotCommitParticipant: SnapshotCommitParticipant<TState> | undefined;
 
-  constructor(private readonly options: ServerWorkspaceStoreOptions) {}
+  constructor(private readonly options: ServerWorkspaceStoreOptions<TState>) {
+    this.snapshotCommitParticipant = options.snapshotCommitParticipant;
+    if (this.snapshotCommitParticipant) validateSnapshotCommitParticipant(this.snapshotCommitParticipant);
+  }
+
+  /** One-time private runtime installation before this store loads or commits any state. */
+  installSnapshotCommitParticipant(participant: SnapshotCommitParticipant<TState>): void {
+    if (this.loadStarted || this.saveStarted || this.snapshotCommitParticipant || !participant) {
+      throw new Error('workspace_snapshot_commit_participant_unavailable');
+    }
+    validateSnapshotCommitParticipant(participant);
+    this.snapshotCommitParticipant = participant;
+  }
 
   async load(): Promise<TState | undefined> {
+    this.loadStarted = true;
     const snapshot = this.options.kernel.getOwnedSnapshot(this.options.sessionToken);
     const raw = this.readExactSnapshot(snapshot.workspaceId, snapshot.revision, snapshot.privacyEpoch);
     if (raw.schemaVersion !== snapshot.schemaVersion) throw new Error('Workspace snapshot schema changed during load; reload before writing.');
@@ -76,6 +108,7 @@ export class ServerWorkspaceStore<TState extends object = Record<string, unknown
 
   async save(state: TState, options?: { consumePendingCapture?: Readonly<{ id: string; revision: string; noteId: string }>;
     consumeServerPendingCapture?: ServerCaptureConsumption; consumeOAuthInstall?: OAuthInstallCheckpoint }): Promise<void> {
+    this.saveStarted = true;
     const loaded = this.requireLoaded();
     this.assertNotAckBlocked();
     const consumeCount = Number(Boolean(options?.consumePendingCapture)) + Number(Boolean(options?.consumeServerPendingCapture)) +
@@ -86,26 +119,48 @@ export class ServerWorkspaceStore<TState extends object = Record<string, unknown
     const ticket = currentCommandTicket();
     try {
       let committedRevision: number;
-      if (ticket) {
-        if (!this.options.journal) throw new Error('An asynchronous command cannot checkpoint without its durable command journal.');
-        const fence = { workspaceId: loaded.workspaceId, revision: loaded.revision, privacyEpoch: loaded.privacyEpoch };
-        if (options?.consumeOAuthInstall) {
-          committedRevision = this.options.journal.checkpointOAuthInstall(ticket, fence, serialized, accountGenerations, options.consumeOAuthInstall);
-        } else if (options?.consumeServerPendingCapture) {
-          committedRevision = this.options.journal.checkpointCapture(ticket, fence, serialized, accountGenerations, options.consumeServerPendingCapture);
-        } else {
-          if (options?.consumePendingCapture || options?.consumeOAuthInstall) throw new Error('A one-use install/capture requires its exact active journal command.');
-          committedRevision = this.options.journal.checkpoint(ticket, fence, serialized, accountGenerations);
-        }
+      let committedIntentIds: readonly string[] = Object.freeze([]);
+      const participant = this.snapshotCommitParticipant;
+      if (participant) {
+        const committed = this.options.kernel.withOwnedTransaction(this.options.sessionToken, loaded.privacyEpoch, (context) => {
+          context.assertActive();
+          if (context.workspaceId !== loaded.workspaceId || context.ownerId !== loaded.ownerId ||
+              context.revision !== loaded.revision || context.privacyEpoch !== loaded.privacyEpoch) {
+            throw new Error('Workspace changed before the snapshot and private cleanup could commit together.');
+          }
+          const previous = context.db.prepare('SELECT snapshot_json,schema_version,revision,privacy_epoch FROM workspaces WHERE id=?')
+            .get(context.workspaceId) as { snapshot_json: string; schema_version: number; revision: number; privacy_epoch: number } | undefined;
+          if (!previous || previous.revision !== loaded.revision || previous.privacy_epoch !== loaded.privacyEpoch ||
+              previous.schema_version !== loaded.schemaVersion || Buffer.byteLength(previous.snapshot_json, 'utf8') > SERVER_SNAPSHOT_MAX_BYTES) {
+            throw new Error('Workspace changed while preparing the snapshot and private cleanup.');
+          }
+          const previousSnapshot = parseState<TState>(previous.snapshot_json);
+          const revision = this.commitExistingSnapshotPath(loaded, serialized, accountGenerations, ticket, options);
+          context.assertActive();
+          const intentIds = participant.commit(context, { previousSnapshot, nextSnapshot: JSON.parse(serialized) as TState,
+            nextRevision: revision, ...(ticket ? { commandId: ticket.idempotencyKey } : {}) });
+          if (isPromiseLike(intentIds)) { void Promise.resolve(intentIds).catch(() => undefined); throw new Error('workspace_snapshot_commit_participant_must_be_synchronous'); }
+          if (intentIds !== undefined && (!Array.isArray(intentIds) || intentIds.some((id) => typeof id !== 'string'))) {
+            throw new Error('workspace_snapshot_commit_participant_invalid_result');
+          }
+          return Object.freeze({ revision, intentIds: Object.freeze([...(intentIds ?? [])]) });
+        });
+        committedRevision = committed.revision;
+        committedIntentIds = committed.intentIds;
+      } else if (ticket) {
+        committedRevision = this.commitExistingSnapshotPath(loaded, serialized, accountGenerations, ticket, options);
       } else {
-        if (options?.consumePendingCapture || options?.consumeServerPendingCapture || options?.consumeOAuthInstall) throw new Error('A one-use install/capture requires an active journal command.');
-        committedRevision = this.commitSnapshot(loaded, serialized, accountGenerations);
+        committedRevision = this.commitExistingSnapshotPath(loaded, serialized, accountGenerations, ticket, options);
       }
       await this.options.afterCommitForTesting?.();
       this.loaded = Object.freeze({ ...loaded, revision: committedRevision });
       this.loadedStateProof = Object.freeze({ workspaceId: loaded.workspaceId, ownerId: loaded.ownerId,
         revision: committedRevision, privacyEpoch: loaded.privacyEpoch, schemaVersion: loaded.schemaVersion,
         sha256: sha256(serialized) });
+      try {
+        const acknowledgement = participant?.afterAcknowledged?.(committedIntentIds);
+        if (isPromiseLike(acknowledgement)) void Promise.resolve(acknowledgement).catch(() => undefined);
+      } catch { /* Durable pending intents resume on explicit retry or a later runtime start. */ }
     } catch (error) {
       // A command may have committed before its acknowledgement was lost. Never
       // allow this in-memory controller to overwrite that newer workspace.
@@ -166,6 +221,27 @@ export class ServerWorkspaceStore<TState extends object = Record<string, unknown
     return receipt.revision;
   }
 
+  private commitExistingSnapshotPath(loaded: LoadedWorkspace, serialized: string, accountGenerations: Readonly<Record<string, number>>,
+    ticket: ReturnType<typeof currentCommandTicket>, options?: { consumePendingCapture?: Readonly<{ id: string; revision: string; noteId: string }>;
+      consumeServerPendingCapture?: ServerCaptureConsumption; consumeOAuthInstall?: OAuthInstallCheckpoint }): number {
+    if (ticket) {
+      if (!this.options.journal) throw new Error('An asynchronous command cannot checkpoint without its durable command journal.');
+      const fence = { workspaceId: loaded.workspaceId, revision: loaded.revision, privacyEpoch: loaded.privacyEpoch };
+      if (options?.consumeOAuthInstall) {
+        return this.options.journal.checkpointOAuthInstall(ticket, fence, serialized, accountGenerations, options.consumeOAuthInstall);
+      }
+      if (options?.consumeServerPendingCapture) {
+        return this.options.journal.checkpointCapture(ticket, fence, serialized, accountGenerations, options.consumeServerPendingCapture);
+      }
+      if (options?.consumePendingCapture || options?.consumeOAuthInstall) throw new Error('A one-use install/capture requires its exact active journal command.');
+      return this.options.journal.checkpoint(ticket, fence, serialized, accountGenerations);
+    }
+    if (options?.consumePendingCapture || options?.consumeServerPendingCapture || options?.consumeOAuthInstall) {
+      throw new Error('A one-use install/capture requires an active journal command.');
+    }
+    return this.commitSnapshot(loaded, serialized, accountGenerations);
+  }
+
   private readExactSnapshot(expectedWorkspaceId: string, expectedRevision: number, expectedPrivacyEpoch: number): { raw: string; schemaVersion: number; ownerId: string } {
     const raw = this.options.kernel.withOwnedTransaction(this.options.sessionToken, expectedPrivacyEpoch, (context) => {
       if (context.revision !== expectedRevision || context.privacyEpoch !== expectedPrivacyEpoch ||
@@ -221,6 +297,17 @@ function canonicalValue(value: unknown): JsonValue {
 
 function canonicalJson(value: unknown): string { return JSON.stringify(canonicalValue(value)); }
 function sha256(value: string): string { return createHash('sha256').update(value, 'utf8').digest('hex'); }
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+  return value !== null && (typeof value === 'object' || typeof value === 'function') &&
+    typeof (value as { then?: unknown }).then === 'function';
+}
+function validateSnapshotCommitParticipant<TState extends object>(participant: SnapshotCommitParticipant<TState>): void {
+  if (!participant || typeof participant !== 'object' || typeof participant.commit !== 'function' ||
+      participant.commit.constructor?.name === 'AsyncFunction' || participant.afterAcknowledged !== undefined &&
+      (typeof participant.afterAcknowledged !== 'function' || participant.afterAcknowledged.constructor?.name === 'AsyncFunction')) {
+    throw new Error('workspace_snapshot_commit_participant_unavailable');
+  }
+}
 
 function accountGenerationProjection(state: object): Readonly<Record<string, number>> {
   const result: Record<string, number> = Object.create(null) as Record<string, number>;
@@ -236,6 +323,6 @@ function accountGenerationProjection(state: object): Readonly<Record<string, num
   return Object.freeze(result);
 }
 
-export function createServerWorkspaceStore<TState extends object = Record<string, unknown>>(options: ServerWorkspaceStoreOptions): ServerWorkspaceStore<TState> {
+export function createServerWorkspaceStore<TState extends object = Record<string, unknown>>(options: ServerWorkspaceStoreOptions<TState>): ServerWorkspaceStore<TState> {
   return new ServerWorkspaceStore<TState>(options);
 }

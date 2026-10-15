@@ -4949,7 +4949,7 @@ export class AppControllerImpl implements AppController {
       const docs = [...ensureMemoryDocuments(state), ...recordJournal(state, `note:${note.id}:r${note.revision}`, `Saved note ${note.title} (note ID ${note.id}, transcript revision ${note.revision}).`), ...ensurePeriodDocuments(state)];
       return { note, docs };
     });
-    await Promise.all(result.docs.map((document) => this.mirrorDocument(document)));
+    await this.mirrorDocuments(result.docs);
     return result.note;
   }
 
@@ -5093,7 +5093,7 @@ export class AppControllerImpl implements AppController {
         }
         return { consumePendingCapture: { id: receipt.id, revision: receipt.revision, noteId: receipt.id } };
       });
-      await Promise.all(result.docs.map((document) => this.mirrorDocument(document)));
+      await this.mirrorDocuments(result.docs);
       return result.note;
     } catch {
       if (!consumeWriteStarted) {
@@ -6611,7 +6611,7 @@ export class AppControllerImpl implements AppController {
       (_draft, result) => result.nextChatLedger);
       if (!isOpenRouterBatchContentJob(staged.job)) throw new Error('The prepared chat request could not be retained.');
       const stagedState = this.state;
-      await Promise.all(staged.docs.map((document) => this.mirrorDocument(document)));
+      await this.mirrorDocuments(staged.docs);
       try {
         await this.dispatchPreparedBatch(staged.job, capturedBootstrapGeneration, stagedState, async () => {
           const latest = this.state.notes.find((note) => note.id === transfer.noteId);
@@ -6720,7 +6720,7 @@ export class AppControllerImpl implements AppController {
       (_draft, result) => result.nextChatLedger);
       if (!isOpenRouterBatchContentJob(staged.job)) throw new Error('The prepared chat request could not be retained.');
       const stagedState = this.state;
-      await Promise.all(staged.docs.map((document) => this.mirrorDocument(document)));
+      await this.mirrorDocuments(staged.docs);
       // The user turn and immutable request were already durably saved. Network or
       // acknowledgement failures remain visible on that same safe job receipt.
       try {
@@ -7411,7 +7411,7 @@ export class AppControllerImpl implements AppController {
       if (this.state !== plan.capturedState || this.bootstrapGeneration !== plan.bootstrapGeneration || this.integration.privacySession?.epoch !== plan.privacyEpoch ||
           Date.now() < plan.preparedAtMs || Date.now() >= Date.parse(plan.publicPlan.expiresAt)) throw new Error('The review expired or the workspace changed. Prepare a new review.');
       const child = await this.stageMoreComputeChild(plan, prepared);
-      await Promise.all(child.docs.map((document) => this.mirrorDocument(document)));
+      await this.mirrorDocuments(child.docs);
       const dto = await this.dispatchPreparedBatch(child.job, plan.bootstrapGeneration, child.stagedState);
       return Object.freeze({ ...dto, ...(child.conversationId ? { recoveredConversationId: child.conversationId } : {}), ...(child.turnId ? { recoveredTurnId: child.turnId } : {}) });
     } finally { this.activeMoreComputeParents.delete(plan.parent.id); }
@@ -8227,7 +8227,7 @@ export class AppControllerImpl implements AppController {
     }, undefined, batch ? (_draft, applied) => batch.nextLedger(applied.analysis) : undefined,
     batch?.nextChatLedger ? () => batch.nextChatLedger!() : undefined);
     const resultNotRetained = batch && this.assistantBatchLedger.jobs.some((job) => job.id === batch.jobId && job.status === 'result_not_retained');
-    if (!resultNotRetained) await Promise.all(result.docs.map((document) => this.mirrorDocument(document)));
+    if (!resultNotRetained) await this.mirrorDocuments(result.docs);
     return result.analysis;
   }
 
@@ -11063,10 +11063,14 @@ export class AppControllerImpl implements AppController {
 
   private async mirrorDocument(document: ContextDocument): Promise<void> {
     try { await this.integration.writeDocument(document.path, document.content); this.mirrorDirty.delete(document.path); }
-    catch (error) {
+    catch {
       this.mirrorDirty.add(document.path);
-      await this.mutate((state) => addActivity(state, 'error', `Local document mirror for ${document.path} will retry on next launch: ${error instanceof Error ? error.message : 'write failed'}.`, this.newId));
     }
+  }
+
+  /** Mirror writes are derived projections; wait for every started sibling without changing canonical state. */
+  private async mirrorDocuments(documents: readonly ContextDocument[]): Promise<void> {
+    await Promise.allSettled(documents.map((document) => this.mirrorDocument(document)));
   }
 
   private async retryDocumentMirrors(): Promise<void> {

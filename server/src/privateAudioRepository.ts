@@ -5,11 +5,13 @@ import type { FileHandle } from 'node:fs/promises';
 import { dirname, isAbsolute, resolve } from 'node:path';
 import { Readable } from 'node:stream';
 import type { DurableKernel, OwnedTransactionContext, OwnedWorkspaceIdentity } from './kernel.js';
+import type { SnapshotCommitParticipant, SnapshotCommitParticipantInput } from './workspaceStore.js';
 import { ensurePrivateDirectory } from './config.js';
+import { currentCommandTicket } from './commandJournal.js';
 import { AudioVerificationError, verifyPrivateAudioFile, type PrivateAudioFormat } from './audioVerification.js';
 
 const MAX_AUDIO_BYTES = 40 * 1024 * 1024;
-const AUDIO_SCHEMA_VERSION = 3;
+const AUDIO_SCHEMA_VERSION = 4;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SHA256 = /^[a-f0-9]{64}$/i;
 const MIME: Readonly<Record<PrivateAudioFormat, string>> = Object.freeze({
@@ -34,6 +36,17 @@ export type CaptureUploadReceipt = Readonly<{
   consumption?: Readonly<{ commandId: string; noteId: string; noteRevision: number }>;
   media?: Readonly<{ mediaId: `still-media:${string}`; sha256: string; byteLength: number;
     durationSeconds: number; format: PrivateAudioFormat; mimeType: string }>;
+}>;
+export type PrivateAudioCleanupIntent = Readonly<{
+  intentId: string;
+  workspaceId: string;
+  ownerId: string;
+  privacyEpoch: number;
+  mediaId: string;
+  sourceNoteId: string;
+  snapshotRevision: number;
+  commandId?: string;
+  status: 'pending' | 'complete';
 }>;
 export type AttachedAudioReference = Readonly<{ mediaId: string; noteId: string; noteRevision: number; sha256?: string; byteLength?: number }>;
 export type AudioRangeResponse = Readonly<{
@@ -61,6 +74,9 @@ export interface PrivateAudioRepositoryOptions {
   readonly closeSpeechLeaseHandle?: (handle: FileHandle) => Promise<void>;
   readonly afterSpeechFileHandleOpenForTesting?: (cleanupId: string, handle: FileHandle) => void;
   readonly afterReaderHandleOpenForTesting?: (readerId: string, handle: FileHandle) => void;
+  readonly afterCleanupUnlinkForTesting?: (intentId: string) => void;
+  readonly afterCleanupDirectorySyncForTesting?: (intentId: string) => void;
+  readonly beforeCleanupCompleteForTesting?: (intentId: string) => void;
   readonly closeUploadHandle?: (handle: FileHandle) => Promise<void>;
   /** Trusted app-state resolver. It must return the currently attached exact media reference. */
   readonly resolveAttachedMedia: (input: { workspaceId: string; ownerId: string; privacyEpoch: number; noteId: string; noteRevision: number }) => AttachedAudioReference | undefined;
@@ -70,6 +86,10 @@ interface AudioRow {
   upload_id: string; media_id: string; workspace_id: string; owner_id: string; privacy_epoch: number; status: PrivateAudioStatus;
   temp_name: string; final_name: string; file_name: string; format: PrivateAudioFormat; mime_type: string;
   expected_bytes: number | null; sha256: string | null; byte_length: number | null; duration_seconds: number | null; process_id: string;
+}
+interface CleanupIntentRow {
+  intent_id: string; workspace_id: string; owner_id: string; privacy_epoch: number; media_id: string; source_note_id: string;
+  snapshot_revision: number; command_id: string | null; status: 'pending' | 'complete';
 }
 interface CaptureUploadRow {
   upload_id: string; capture_id: string; capture_revision: string; workspace_id: string; owner_id: string; privacy_epoch: number;
@@ -126,14 +146,46 @@ function asSafeRecord(row: AudioRow): PrivateAudioRecord {
     mimeType: row.mime_type, ...(row.byte_length === null ? {} : { byteLength: row.byte_length }),
     ...(row.sha256 === null ? {} : { sha256: row.sha256 }), ...(row.duration_seconds === null ? {} : { durationSeconds: row.duration_seconds }) });
 }
+function projectCleanupIntent(row: CleanupIntentRow): PrivateAudioCleanupIntent {
+  return Object.freeze({ intentId: row.intent_id, workspaceId: row.workspace_id, ownerId: row.owner_id, privacyEpoch: row.privacy_epoch,
+    mediaId: row.media_id, sourceNoteId: row.source_note_id, snapshotRevision: row.snapshot_revision,
+    ...(row.command_id ? { commandId: row.command_id } : {}), status: row.status });
+}
+function snapshotMediaReferences(value: object): Map<string, Set<string>> {
+  const result = new Map<string, Set<string>>();
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('audio_cleanup_snapshot_invalid');
+  const notes = (value as { notes?: unknown }).notes;
+  if (!Array.isArray(notes)) throw new Error('audio_cleanup_snapshot_invalid');
+  const seenNoteIds = new Set<string>();
+  for (const raw of notes) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('audio_cleanup_snapshot_invalid');
+    const note = raw as { id?: unknown; audioUri?: unknown };
+    requireOpaqueNoteId(note.id);
+    if (seenNoteIds.has(note.id)) throw new Error('audio_cleanup_snapshot_invalid');
+    seenNoteIds.add(note.id);
+    if (note.audioUri === undefined) continue;
+    if (typeof note.audioUri !== 'string') throw new Error('audio_cleanup_snapshot_invalid');
+    if (!note.audioUri.startsWith('still-media:')) continue;
+    const match = /^still-media:([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i.exec(note.audioUri);
+    if (!match || match[0] !== note.audioUri) throw new Error('audio_cleanup_snapshot_invalid');
+    const mediaId = match[1]!.toLowerCase();
+    const ids = result.get(mediaId) ?? new Set<string>();
+    ids.add(note.id);
+    result.set(mediaId, ids);
+  }
+  return result;
+}
 function syncDirectory(path: string): void {
   let handle;
   try { handle = openSync(path, constants.O_RDONLY); fsyncSync(handle); }
   catch (error) {
     const code = error && typeof error === 'object' && 'code' in error ? error.code : undefined;
-    if (!['EINVAL', 'ENOTSUP', 'EISDIR', 'EPERM', 'EACCES'].includes(String(code))) throw error;
+    if (!isUnsupportedDirectorySyncError(process.platform, code)) throw error;
   }
   finally { if (handle !== undefined) closeSync(handle); }
+}
+export function isUnsupportedDirectorySyncError(platform: NodeJS.Platform, code: unknown): boolean {
+  return platform === 'win32' && ['EINVAL', 'ENOTSUP', 'EISDIR', 'EPERM', 'EACCES'].includes(String(code));
 }
 function pathInside(root: string, name: string): string {
   if (!/^[0-9a-f-]{36}\.(?:part|audio)$/i.test(name)) throw new Error('audio_path_invalid');
@@ -157,6 +209,9 @@ export class PrivateAudioRepository {
   readonly #closeSpeechLeaseHandle: NonNullable<PrivateAudioRepositoryOptions['closeSpeechLeaseHandle']>;
   readonly #afterSpeechFileHandleOpenForTesting: PrivateAudioRepositoryOptions['afterSpeechFileHandleOpenForTesting'];
   readonly #afterReaderHandleOpenForTesting: PrivateAudioRepositoryOptions['afterReaderHandleOpenForTesting'];
+  readonly #afterCleanupUnlinkForTesting: PrivateAudioRepositoryOptions['afterCleanupUnlinkForTesting'];
+  readonly #afterCleanupDirectorySyncForTesting: PrivateAudioRepositoryOptions['afterCleanupDirectorySyncForTesting'];
+  readonly #beforeCleanupCompleteForTesting: PrivateAudioRepositoryOptions['beforeCleanupCompleteForTesting'];
   readonly #closeUploadHandle: NonNullable<PrivateAudioRepositoryOptions['closeUploadHandle']>;
   readonly #resolveAttached: PrivateAudioRepositoryOptions['resolveAttachedMedia'];
   readonly #identity: Readonly<{ workspaceId: string; ownerId: string; privacyEpoch: number }>;
@@ -168,6 +223,7 @@ export class PrivateAudioRepository {
   readonly #pendingUploadCloses = new Map<string, { readonly mediaId: string; readonly handle: FileHandle; fileClosed: boolean; operation?: Promise<void> }>();
   readonly #activeMedia = new Set<string>();
   readonly #failedLeaseReleases = new Set<string>();
+  readonly #cleanupIntentOperations = new Map<string, Promise<void>>();
   #preserveHistoricalRows = false;
   #accepting = true;
 
@@ -191,13 +247,16 @@ export class PrivateAudioRepository {
     this.#closeSpeechLeaseHandle = options.closeSpeechLeaseHandle ?? ((handle) => handle.close());
     this.#afterSpeechFileHandleOpenForTesting = options.afterSpeechFileHandleOpenForTesting;
     this.#afterReaderHandleOpenForTesting = options.afterReaderHandleOpenForTesting;
+    this.#afterCleanupUnlinkForTesting = options.afterCleanupUnlinkForTesting;
+    this.#afterCleanupDirectorySyncForTesting = options.afterCleanupDirectorySyncForTesting;
+    this.#beforeCleanupCompleteForTesting = options.beforeCleanupCompleteForTesting;
     this.#closeUploadHandle = options.closeUploadHandle ?? ((handle) => handle.close());
     this.#resolveAttached = options.resolveAttachedMedia;
     ensurePrivateDirectory(resolve(options.privateRoot));
     ensurePrivateDirectory(this.#root);
     this.#kernel.withTrustedDatabaseTransaction((db) => {
       const marker = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='private_audio_schema'").get();
-      const knownTables = ['private_audio_uploads', 'private_audio_speech_leases', 'private_audio_readers', 'private_audio_capture_uploads'];
+      const knownTables = ['private_audio_uploads', 'private_audio_speech_leases', 'private_audio_readers', 'private_audio_capture_uploads', 'private_audio_cleanup_intents'];
       if (!marker) {
         const existing = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name IN (${knownTables.map(() => '?').join(',')})`)
           .all(...knownTables) as { name: string }[];
@@ -211,6 +270,14 @@ export class PrivateAudioRepository {
         mime_type TEXT NOT NULL, expected_bytes INTEGER, sha256 TEXT, byte_length INTEGER, duration_seconds REAL, process_id TEXT NOT NULL,
         created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
       ) STRICT;
+      CREATE TABLE private_audio_cleanup_intents (
+        intent_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, owner_id TEXT NOT NULL, privacy_epoch INTEGER NOT NULL CHECK(privacy_epoch >= 0),
+        media_id TEXT NOT NULL, source_note_id TEXT NOT NULL, snapshot_revision INTEGER NOT NULL CHECK(snapshot_revision > 0),
+        command_id TEXT, status TEXT NOT NULL CHECK(status IN ('pending','complete')), created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+        UNIQUE(workspace_id,owner_id,privacy_epoch,media_id),
+        FOREIGN KEY(media_id) REFERENCES private_audio_uploads(media_id)
+      ) STRICT;
+      CREATE INDEX private_audio_cleanup_intents_pending ON private_audio_cleanup_intents(workspace_id,owner_id,privacy_epoch,status,created_at,intent_id);
       CREATE TABLE private_audio_speech_leases (
         lease_id TEXT PRIMARY KEY, upload_id TEXT NOT NULL, media_id TEXT NOT NULL, workspace_id TEXT NOT NULL, owner_id TEXT NOT NULL,
         privacy_epoch INTEGER NOT NULL, note_id TEXT NOT NULL, note_revision INTEGER NOT NULL,
@@ -244,7 +311,7 @@ export class PrivateAudioRepository {
         if (markerColumns.length !== 2 || markerColumns[0]?.name !== 'singleton' || markerColumns[0]?.type !== 'INTEGER' ||
           markerColumns[1]?.name !== 'version' || markerColumns[1]?.type !== 'INTEGER') throw new Error('audio_schema_invalid');
         const versions = db.prepare('SELECT singleton,version FROM private_audio_schema').all() as { singleton: number; version: number }[];
-        if (versions.length !== 1 || versions[0]?.singleton !== 1 || ![1, 2, AUDIO_SCHEMA_VERSION].includes(versions[0]?.version ?? -1)) throw new Error('audio_schema_unsupported');
+        if (versions.length !== 1 || versions[0]?.singleton !== 1 || ![1, 2, 3, AUDIO_SCHEMA_VERSION].includes(versions[0]?.version ?? -1)) throw new Error('audio_schema_unsupported');
         if (versions[0]!.version === 1) {
           if (db.prepare("SELECT 1 AS found FROM sqlite_master WHERE type='table' AND name='private_audio_capture_uploads'").get()) throw new Error('audio_schema_invalid');
           db.exec(`CREATE TABLE private_audio_capture_uploads (
@@ -267,7 +334,17 @@ export class PrivateAudioRepository {
         if (versions[0]!.version <= 2) {
           db.exec(`CREATE INDEX IF NOT EXISTS private_audio_capture_upload_history
             ON private_audio_capture_uploads(workspace_id,owner_id,privacy_epoch,created_at DESC,upload_id DESC);
-            UPDATE private_audio_schema SET version=${AUDIO_SCHEMA_VERSION} WHERE singleton=1 AND version=2;`);
+            UPDATE private_audio_schema SET version=3 WHERE singleton=1 AND version=2;`);
+        }
+        if (versions[0]!.version <= 3) {
+          db.exec(`CREATE TABLE private_audio_cleanup_intents (
+            intent_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, owner_id TEXT NOT NULL, privacy_epoch INTEGER NOT NULL CHECK(privacy_epoch >= 0),
+            media_id TEXT NOT NULL, source_note_id TEXT NOT NULL, snapshot_revision INTEGER NOT NULL CHECK(snapshot_revision > 0),
+            command_id TEXT, status TEXT NOT NULL CHECK(status IN ('pending','complete')), created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+            UNIQUE(workspace_id,owner_id,privacy_epoch,media_id), FOREIGN KEY(media_id) REFERENCES private_audio_uploads(media_id)
+          ) STRICT;
+          CREATE INDEX private_audio_cleanup_intents_pending ON private_audio_cleanup_intents(workspace_id,owner_id,privacy_epoch,status,created_at,intent_id);
+          UPDATE private_audio_schema SET version=${AUDIO_SCHEMA_VERSION} WHERE singleton=1 AND version=3;`);
         }
       }
       const expectedColumns: Record<string, readonly { name: string; type: string; notnull: number; pk: number }[]> = {
@@ -296,6 +373,11 @@ export class PrivateAudioRepository {
           ['consumed_command_id', 'TEXT', 0, 0], ['note_id', 'TEXT', 0, 0], ['note_revision', 'INTEGER', 0, 0],
           ['created_at', 'INTEGER', 1, 0], ['updated_at', 'INTEGER', 1, 0],
         ].map(([name, type, notnull, pk]) => ({ name: String(name), type: String(type), notnull: Number(notnull), pk: Number(pk) })),
+        private_audio_cleanup_intents: [
+          ['intent_id', 'TEXT', 1, 1], ['workspace_id', 'TEXT', 1, 0], ['owner_id', 'TEXT', 1, 0], ['privacy_epoch', 'INTEGER', 1, 0],
+          ['media_id', 'TEXT', 1, 0], ['source_note_id', 'TEXT', 1, 0], ['snapshot_revision', 'INTEGER', 1, 0], ['command_id', 'TEXT', 0, 0],
+          ['status', 'TEXT', 1, 0], ['created_at', 'INTEGER', 1, 0], ['updated_at', 'INTEGER', 1, 0],
+        ].map(([name, type, notnull, pk]) => ({ name: String(name), type: String(type), notnull: Number(notnull), pk: Number(pk) })),
       };
       for (const [table, expected] of Object.entries(expectedColumns)) {
         const columns = db.pragma(`table_info(${table})`) as { name: string; type: string; notnull: number; pk: number }[];
@@ -315,10 +397,129 @@ export class PrivateAudioRepository {
       return operation(context);
     });
   }
+
+  /** Trusted store hook: detach detection and the logical delete share the workspace save transaction. */
+  createSnapshotCommitParticipant<TState extends object>(): SnapshotCommitParticipant<TState> {
+    return Object.freeze({
+      commit: (context: OwnedTransactionContext, input: SnapshotCommitParticipantInput<TState>) =>
+        this.#createSnapshotCleanupIntents(context, input),
+      afterAcknowledged: (intentIds: readonly string[]) => {
+        for (const intentId of intentIds) void this.#startCleanupIntent(intentId).catch(() => undefined);
+      },
+    });
+  }
+
+  /** Safe local projection for a committed cleanup intent; no path or raw row is returned. */
+  inspectCleanupIntent(intentId: string): PrivateAudioCleanupIntent | undefined {
+    requireUuid(intentId, 'cleanup_intent_id');
+    const row = this.#trustedDb((db) => db.prepare(`SELECT * FROM private_audio_cleanup_intents WHERE intent_id=? AND workspace_id=? AND owner_id=? AND privacy_epoch=?`)
+      .get(intentId, this.#identity.workspaceId, this.#identity.ownerId, this.#identity.privacyEpoch) as CleanupIntentRow | undefined);
+    return row ? projectCleanupIntent(row) : undefined;
+  }
+
+  /** Explicit exact retry; callers identify an existing intent and cannot supply media paths or ownership fields. */
+  async retryCleanupIntent(intentId: string): Promise<PrivateAudioCleanupIntent> {
+    requireUuid(intentId, 'cleanup_intent_id');
+    await this.#startCleanupIntent(intentId);
+    const intent = this.inspectCleanupIntent(intentId);
+    if (!intent) throw new Error('audio_cleanup_intent_unavailable');
+    return intent;
+  }
+
+  /** Runs only an intent already atomically committed with a workspace snapshot. */
+  async cleanupCommittedMedia(mediaId: string): Promise<void> {
+    requireUuid(mediaId, 'media_id');
+    const row = this.#trustedDb((db) => db.prepare(`SELECT intent_id FROM private_audio_cleanup_intents WHERE media_id=? AND workspace_id=? AND owner_id=? AND privacy_epoch=?`)
+      .get(mediaId, this.#identity.workspaceId, this.#identity.ownerId, this.#identity.privacyEpoch) as { intent_id: string } | undefined);
+    if (row) await this.#startCleanupIntent(row.intent_id);
+  }
+
+  /** Initial per-workspace recovery runs under the application's exclusive database owner. */
+  async resumePendingSnapshotCleanup(options: { readonly exclusiveOwnerStartup?: boolean } = {}): Promise<void> {
+    const rows = this.#trustedDb((db) => db.prepare(`SELECT intent_id,media_id FROM private_audio_cleanup_intents WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND status='pending' ORDER BY created_at,intent_id`)
+      .all(this.#identity.workspaceId, this.#identity.ownerId, this.#identity.privacyEpoch) as { intent_id: string; media_id: string }[]);
+    if (options.exclusiveOwnerStartup) {
+      // The application's exclusive owner is held before this per-workspace startup hook runs.
+      // Retire only old-process holders for media already durably marked for deletion.
+      for (const row of rows) this.#trustedDb((db) => {
+        db.prepare('DELETE FROM private_audio_readers WHERE media_id=? AND workspace_id=? AND owner_id=? AND privacy_epoch=? AND process_id<>?')
+          .run(row.media_id, this.#identity.workspaceId, this.#identity.ownerId, this.#identity.privacyEpoch, this.#processId);
+        db.prepare('DELETE FROM private_audio_speech_leases WHERE media_id=? AND workspace_id=? AND owner_id=? AND privacy_epoch=? AND process_id<>?')
+          .run(row.media_id, this.#identity.workspaceId, this.#identity.ownerId, this.#identity.privacyEpoch, this.#processId);
+      });
+    }
+    await Promise.all(rows.map(async ({ intent_id }) => { try { await this.#startCleanupIntent(intent_id); } catch { /* Intent remains pending for exact inspection/retry. */ } }));
+  }
+
+  #createSnapshotCleanupIntents(context: OwnedTransactionContext, input: SnapshotCommitParticipantInput<object>): readonly string[] {
+    context.assertActive();
+    if (context.workspaceId !== this.#identity.workspaceId || context.ownerId !== this.#identity.ownerId ||
+        context.privacyEpoch !== this.#identity.privacyEpoch || !Number.isSafeInteger(input.nextRevision) || input.nextRevision !== context.revision + 1) {
+      throw new Error('audio_cleanup_snapshot_identity_changed');
+    }
+    const before = snapshotMediaReferences(input.previousSnapshot);
+    const after = snapshotMediaReferences(input.nextSnapshot);
+    const intentIds: string[] = [];
+    for (const [mediaId, sourceNoteIds] of before) {
+      if (after.has(mediaId)) continue;
+      const sourceNoteId = [...sourceNoteIds].sort()[0];
+      if (!sourceNoteId) continue;
+      const audio = context.db.prepare(`SELECT status FROM private_audio_uploads WHERE media_id=? AND workspace_id=? AND owner_id=? AND privacy_epoch=?`)
+        .get(mediaId, context.workspaceId, context.ownerId, context.privacyEpoch) as { status: PrivateAudioStatus } | undefined;
+      if (!audio) throw new Error('audio_cleanup_record_unavailable');
+      const existing = context.db.prepare(`SELECT intent_id,status FROM private_audio_cleanup_intents WHERE media_id=? AND workspace_id=? AND owner_id=? AND privacy_epoch=?`)
+        .get(mediaId, context.workspaceId, context.ownerId, context.privacyEpoch) as { intent_id: string; status: 'pending' | 'complete' } | undefined;
+      if (existing) {
+        if (existing.status === 'pending' && audio.status === 'deletion_pending') {
+          intentIds.push(existing.intent_id);
+          continue;
+        }
+        if (existing.status === 'complete' && audio.status === 'unavailable') continue;
+        // A completed intent is evidence only when the matching audio row is
+        // unavailable. Never repair contradictory durable state by inventing
+        // a completed cleanup claim.
+        throw new Error('audio_cleanup_record_changed');
+      }
+      if (audio.status !== 'ready' && audio.status !== 'deletion_pending' && audio.status !== 'unavailable') throw new Error('audio_cleanup_record_unavailable');
+      if (audio.status === 'ready' || audio.status === 'unavailable') {
+        const update = context.db.prepare(`UPDATE private_audio_uploads SET status='deletion_pending',updated_at=? WHERE media_id=? AND workspace_id=? AND owner_id=? AND privacy_epoch=? AND status=?`)
+          .run(context.now, mediaId, context.workspaceId, context.ownerId, context.privacyEpoch, audio.status);
+        if (update.changes !== 1) throw new Error('audio_cleanup_record_changed');
+      }
+      const intentId = randomUUID();
+      const ticket = currentCommandTicket();
+      context.db.prepare(`INSERT INTO private_audio_cleanup_intents (intent_id,workspace_id,owner_id,privacy_epoch,media_id,source_note_id,snapshot_revision,command_id,status,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?, 'pending',?,?)`).run(intentId, context.workspaceId, context.ownerId, context.privacyEpoch,
+        mediaId, sourceNoteId, input.nextRevision, input.commandId ?? null, context.now, context.now);
+      // Ensure a supplied command identity came from the active trusted journal context.
+      if (input.commandId !== undefined && (!ticket || ticket.idempotencyKey !== input.commandId)) throw new Error('audio_cleanup_command_binding_invalid');
+      intentIds.push(intentId);
+    }
+    return Object.freeze(intentIds);
+  }
+
+  #startCleanupIntent(intentId: string, replacement?: { readonly identity: OwnedWorkspaceIdentity; readonly admissionSessionToken: string }): Promise<void> {
+    const current = this.#cleanupIntentOperations.get(intentId);
+    if (current) return current;
+    if (replacement) this.#assertReplacementProof(replacement);
+    const intent = this.#trustedDb((db) => db.prepare(`SELECT * FROM private_audio_cleanup_intents WHERE intent_id=? AND workspace_id=? AND owner_id=? AND privacy_epoch=?`)
+      .get(intentId, this.#identity.workspaceId, this.#identity.ownerId, this.#identity.privacyEpoch) as CleanupIntentRow | undefined);
+    if (!intent) return Promise.reject(new Error('audio_cleanup_intent_unavailable'));
+    if (intent.status === 'complete') return Promise.resolve();
+    const operation = this.#finishDelete(intent.media_id, intent.intent_id, replacement).finally(() => {
+      if (this.#cleanupIntentOperations.get(intentId) === operation) this.#cleanupIntentOperations.delete(intentId);
+    });
+    this.#cleanupIntentOperations.set(intentId, operation);
+    return operation;
+  }
   #trustedDb<T>(operation: (db: import('better-sqlite3').Database) => T): T {
     return this.#kernel.withTrustedDatabaseTransaction(operation);
   }
   #resourceKey(mediaId: string): string { return `${this.#root}:${this.#identity.workspaceId}:${this.#identity.ownerId}:${this.#identity.privacyEpoch}:${mediaId}`; }
+  #hasPendingCleanupIntent(mediaId: string): boolean {
+    return Boolean(this.#trustedDb((db) => db.prepare(`SELECT 1 FROM private_audio_cleanup_intents WHERE media_id=? AND workspace_id=? AND owner_id=? AND privacy_epoch=? AND status='pending'`)
+      .get(mediaId, this.#identity.workspaceId, this.#identity.ownerId, this.#identity.privacyEpoch)));
+  }
   #isActive(mediaId: string): boolean { return activeAudioOperations.has(this.#resourceKey(mediaId)); }
   #setActive(mediaId: string, active: boolean): void {
     const key = this.#resourceKey(mediaId);
@@ -331,14 +532,15 @@ export class PrivateAudioRepository {
 
   /** Wait for this exact epoch's owned upload/read/lease work and persisted holders to drain. */
   async drain(replacement?: { readonly identity: OwnedWorkspaceIdentity; readonly admissionSessionToken: string }): Promise<void> {
-    if (replacement) {
-      const current = this.#kernel.getOwnedIdentity(replacement.admissionSessionToken);
-      if (current.workspaceId !== replacement.identity.workspaceId || current.ownerId !== replacement.identity.ownerId ||
-          current.revision !== replacement.identity.revision || current.privacyEpoch !== replacement.identity.privacyEpoch ||
-          current.workspaceId !== this.#identity.workspaceId || current.ownerId !== this.#identity.ownerId ||
-          current.privacyEpoch <= this.#identity.privacyEpoch) throw new Error('audio_replacement_proof_invalid');
-      this.#preserveHistoricalRows = true;
-    }
+    if (replacement) this.#assertReplacementProof(replacement);
+    while (this.#cleanupIntentOperations.size > 0) await Promise.allSettled([...this.#cleanupIntentOperations.values()]);
+    if (replacement) await this.#resumePendingForReplacement(replacement);
+    else await this.resumePendingSnapshotCleanup();
+    while (this.#cleanupIntentOperations.size > 0) await Promise.allSettled([...this.#cleanupIntentOperations.values()]);
+    const pendingIntents = this.#trustedDb((db) => db.prepare(`SELECT count(*) AS count FROM private_audio_cleanup_intents WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND status='pending'`)
+      .get(this.#identity.workspaceId, this.#identity.ownerId, this.#identity.privacyEpoch) as { count: number });
+    if (pendingIntents.count > 0) throw new Error('audio_cleanup_required');
+    if (replacement) this.#preserveHistoricalRows = true;
     if (!replacement && this.#pendingUploadCloses.size > 0) throw new Error('audio_cleanup_required');
     while (this.#activeMedia.size > 0) {
       const active = [...this.#activeMedia];
@@ -384,6 +586,19 @@ export class PrivateAudioRepository {
     if (!waiters) return;
     audioWaiters.delete(key);
     for (const wake of waiters) wake();
+  }
+  #assertReplacementProof(replacement: { readonly identity: OwnedWorkspaceIdentity; readonly admissionSessionToken: string }): void {
+    const current = this.#kernel.getOwnedIdentity(replacement.admissionSessionToken);
+    if (current.workspaceId !== replacement.identity.workspaceId || current.ownerId !== replacement.identity.ownerId ||
+        current.revision !== replacement.identity.revision || current.privacyEpoch !== replacement.identity.privacyEpoch ||
+        current.workspaceId !== this.#identity.workspaceId || current.ownerId !== this.#identity.ownerId ||
+        current.privacyEpoch <= this.#identity.privacyEpoch) throw new Error('audio_replacement_proof_invalid');
+  }
+  async #resumePendingForReplacement(replacement: { readonly identity: OwnedWorkspaceIdentity; readonly admissionSessionToken: string }): Promise<void> {
+    this.#assertReplacementProof(replacement);
+    const rows = this.#trustedDb((db) => db.prepare(`SELECT intent_id FROM private_audio_cleanup_intents WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND status='pending' ORDER BY created_at,intent_id`)
+      .all(this.#identity.workspaceId, this.#identity.ownerId, this.#identity.privacyEpoch) as { intent_id: string }[]);
+    for (const { intent_id } of rows) await this.#startCleanupIntent(intent_id, replacement);
   }
   async #waitForMediaIdle(mediaId: string): Promise<void> {
     while (true) {
@@ -811,7 +1026,10 @@ export class PrivateAudioRepository {
             .run(this.#now(), row.upload_id));
         }
       } else if (row.status === 'deletion_pending') {
-        await this.#finishDelete(row.media_id);
+        const intent = this.#trustedDb((db) => db.prepare(`SELECT intent_id FROM private_audio_cleanup_intents WHERE media_id=? AND workspace_id=? AND owner_id=? AND privacy_epoch=? AND status='pending'`)
+          .get(row.media_id, this.#identity.workspaceId, this.#identity.ownerId, this.#identity.privacyEpoch) as { intent_id: string } | undefined);
+        if (intent) await this.#startCleanupIntent(intent.intent_id);
+        else await this.#finishDelete(row.media_id);
       }
       output.push(this.getRecord(row.media_id));
     }
@@ -885,7 +1103,9 @@ export class PrivateAudioRepository {
       if (handles.some((entry) => entry.reading)) throw new Error('audio_cleanup_required');
       for (const entry of handles) await this.#closeSpeechFile(entry);
       if (this.#preserveHistoricalRows) {
-        this.#speechLeaseMedia.delete(leaseId);
+        // Keep the exact closed lease in memory while its pending cleanup intent
+        // needs it as proof to retire this holder row before unlinking media.
+        if (!mediaId || !this.#hasPendingCleanupIntent(mediaId)) this.#speechLeaseMedia.delete(leaseId);
         this.#failedLeaseReleases.delete(leaseId);
         if (mediaId) this.#notifyMedia(mediaId);
         return;
@@ -922,6 +1142,12 @@ export class PrivateAudioRepository {
     delete cleanup.fileHandle;
     cleanup.resolveFileClosed();
     if (this.#preserveHistoricalRows) {
+      if (this.#hasPendingCleanupIntent(cleanup.mediaId)) {
+        // The descriptor is now closed. Retire only its exact holder row so a
+        // durable deletion intent can proceed; failures retain this object.
+        void this.#releaseReaderCleanup(cleanup).catch(() => undefined);
+        return;
+      }
       if (this.#readerCleanups.get(cleanup.readerId) === cleanup) this.#readerCleanups.delete(cleanup.readerId);
       activeReaderCleanups.delete(cleanup.readerId);
       return;
@@ -1123,7 +1349,10 @@ export class PrivateAudioRepository {
     });
   }
 
-  async #finishDelete(mediaId: string): Promise<void> {
+  async #finishDelete(mediaId: string, intentId?: string,
+    replacement?: { readonly identity: OwnedWorkspaceIdentity; readonly admissionSessionToken: string }): Promise<void> {
+    if (replacement) this.#assertReplacementProof(replacement);
+    if (replacement && intentId) await this.#releaseReplacementIntentHolders(mediaId, replacement);
     await this.#waitForMediaIdle(mediaId);
     const row = this.#trustedDb((db) => {
       const value = db.prepare('SELECT * FROM private_audio_uploads WHERE media_id=? AND workspace_id=? AND owner_id=? AND privacy_epoch=?')
@@ -1132,14 +1361,72 @@ export class PrivateAudioRepository {
       return value;
     });
     try {
+      if (replacement) this.#assertReplacementProof(replacement);
       await rm(this.#safePath(row.final_name), { force: true });
       await rm(this.#safePath(row.temp_name), { force: true });
+      if (intentId) this.#afterCleanupUnlinkForTesting?.(intentId);
       syncDirectory(this.#directory());
+      if (intentId) this.#afterCleanupDirectorySyncForTesting?.(intentId);
+      if (intentId) this.#beforeCleanupCompleteForTesting?.(intentId);
+      if (replacement) this.#assertReplacementProof(replacement);
       this.#trustedDb((db) => {
-        db.prepare(`UPDATE private_audio_uploads SET status='unavailable',updated_at=? WHERE media_id=? AND workspace_id=? AND owner_id=? AND privacy_epoch=? AND status='deletion_pending'`)
-          .run(this.#now(), mediaId, this.#identity.workspaceId, this.#identity.ownerId, this.#identity.privacyEpoch);
+        const transaction = db.transaction(() => {
+          const current = db.prepare(`SELECT status FROM private_audio_uploads WHERE media_id=? AND workspace_id=? AND owner_id=? AND privacy_epoch=?`)
+            .get(mediaId, this.#identity.workspaceId, this.#identity.ownerId, this.#identity.privacyEpoch) as { status: PrivateAudioStatus } | undefined;
+          if (!current || current.status !== 'deletion_pending') throw new Error('audio_cleanup_record_changed');
+          if (intentId) {
+            const intent = db.prepare(`SELECT status,media_id FROM private_audio_cleanup_intents WHERE intent_id=? AND workspace_id=? AND owner_id=? AND privacy_epoch=?`)
+              .get(intentId, this.#identity.workspaceId, this.#identity.ownerId, this.#identity.privacyEpoch) as { status: string; media_id: string } | undefined;
+            if (!intent || intent.status !== 'pending' || intent.media_id !== mediaId) throw new Error('audio_cleanup_intent_changed');
+          }
+          const audioUpdate = db.prepare(`UPDATE private_audio_uploads SET status='unavailable',updated_at=? WHERE media_id=? AND workspace_id=? AND owner_id=? AND privacy_epoch=? AND status='deletion_pending'`)
+            .run(this.#now(), mediaId, this.#identity.workspaceId, this.#identity.ownerId, this.#identity.privacyEpoch);
+          if (audioUpdate.changes !== 1) throw new Error('audio_cleanup_record_changed');
+          if (intentId) {
+            const intentUpdate = db.prepare(`UPDATE private_audio_cleanup_intents SET status='complete',updated_at=? WHERE intent_id=? AND workspace_id=? AND owner_id=? AND privacy_epoch=? AND media_id=? AND status='pending'`)
+              .run(this.#now(), intentId, this.#identity.workspaceId, this.#identity.ownerId, this.#identity.privacyEpoch, mediaId);
+            if (intentUpdate.changes !== 1) throw new Error('audio_cleanup_intent_changed');
+          }
+        });
+        transaction.immediate();
       });
     } catch { throw new Error('audio_delete_pending'); }
+  }
+
+  /** Retires only old-epoch holders whose exact local file handles are known closed. */
+  async #releaseReplacementIntentHolders(mediaId: string,
+    replacement: { readonly identity: OwnedWorkspaceIdentity; readonly admissionSessionToken: string }): Promise<void> {
+    this.#assertReplacementProof(replacement);
+    const readers = this.#trustedDb((db) => db.prepare(`SELECT reader_id,process_id FROM private_audio_readers
+      WHERE media_id=? AND workspace_id=? AND owner_id=? AND privacy_epoch=?`).all(mediaId, this.#identity.workspaceId,
+      this.#identity.ownerId, this.#identity.privacyEpoch) as { reader_id: string; process_id: string }[]);
+    for (const row of readers) {
+      if (row.process_id !== this.#processId) throw new Error('audio_external_holder_requires_inspection');
+      const cleanup = this.#readerCleanups.get(row.reader_id);
+      if (!cleanup) throw new Error('audio_external_holder_requires_inspection');
+      await cleanup.fileClosedPromise;
+      if (!cleanup.fileClosed) throw new Error('audio_cleanup_required');
+      this.#assertReplacementProof(replacement);
+      await this.#releaseReaderCleanup(cleanup);
+    }
+
+    const leases = this.#trustedDb((db) => db.prepare(`SELECT lease_id,process_id FROM private_audio_speech_leases
+      WHERE media_id=? AND workspace_id=? AND owner_id=? AND privacy_epoch=?`).all(mediaId, this.#identity.workspaceId,
+      this.#identity.ownerId, this.#identity.privacyEpoch) as { lease_id: string; process_id: string }[]);
+    for (const row of leases) {
+      if (row.process_id !== this.#processId || this.#speechLeaseMedia.get(row.lease_id) !== mediaId ||
+          this.#speechLeaseOperations.has(row.lease_id)) throw new Error('audio_external_holder_requires_inspection');
+      const handles = [...this.#speechFileCleanups.values()].filter((entry) => entry.leaseId === row.lease_id);
+      if (handles.some((entry) => entry.reading || !entry.closed)) throw new Error('audio_cleanup_required');
+      this.#assertReplacementProof(replacement);
+      this.#trustedDb((db) => {
+        const deleted = db.prepare(`DELETE FROM private_audio_speech_leases WHERE lease_id=? AND media_id=? AND workspace_id=? AND owner_id=? AND privacy_epoch=? AND process_id=?`)
+          .run(row.lease_id, mediaId, this.#identity.workspaceId, this.#identity.ownerId, this.#identity.privacyEpoch, this.#processId);
+        if (deleted.changes !== 1) throw new Error('audio_cleanup_holder_changed');
+      });
+      this.#speechLeaseMedia.delete(row.lease_id);
+      this.#failedLeaseReleases.delete(row.lease_id);
+    }
   }
 
   #ownSpeechFileHandle(leaseId: string, mediaId: string, handle: FileHandle): SpeechFileCleanup {

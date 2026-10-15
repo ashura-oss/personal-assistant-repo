@@ -199,12 +199,13 @@ test('private audio schema upgrades an exact v1 marker and preserves existing re
     f.kernel.withTrustedDatabaseTransaction((db) => {
       db.exec('DROP TRIGGER private_audio_consumed_capture_immutable');
       db.exec('DROP TABLE private_audio_capture_uploads');
+      db.exec('DROP TABLE private_audio_cleanup_intents');
       db.prepare('UPDATE private_audio_schema SET version=1 WHERE singleton=1').run();
     });
     const migrated = new PrivateAudioRepository({ kernel: f.kernel, actorSessionToken: f.actorSessionToken, privateRoot: f.privateRoot,
       processId: f.processId, resolveAttachedMedia: () => undefined });
     const marker = f.kernel.withTrustedDatabaseTransaction((db) => db.prepare('SELECT version FROM private_audio_schema WHERE singleton=1').get().version);
-    assert.equal(marker, 3);
+    assert.equal(marker, 4);
     assert.equal(migrated.getRecord(original.mediaId).status, 'ready');
     assert.equal(migrated.getRecord(original.mediaId).sha256, original.sha256);
     assert.equal(migrated.getRecord(original.mediaId).byteLength, bytes.length);
@@ -224,6 +225,7 @@ test('private audio schema upgrades v2 with only the scoped history index and pr
         identity.privacyEpoch, '2026-10-15T02:03:04.000Z', 'Asia/Singapore', 'audio/mp4', null, randomUUID(), 'm4a', null, null, null,
         'failed', 'audio_invalid', null, null, null, 1000, 1000);
       db.exec('DROP INDEX private_audio_capture_upload_history');
+      db.exec('DROP TABLE private_audio_cleanup_intents');
       db.prepare('UPDATE private_audio_schema SET version=2 WHERE singleton=1').run();
     });
     const migrated = new PrivateAudioRepository({ kernel: f.kernel, actorSessionToken: f.actorSessionToken, privateRoot: f.privateRoot,
@@ -233,7 +235,7 @@ test('private audio schema upgrades v2 with only the scoped history index and pr
       index: db.prepare("SELECT sql FROM sqlite_master WHERE type='index' AND name='private_audio_capture_upload_history'").get()?.sql,
       count: db.prepare('SELECT count(*) AS count FROM private_audio_capture_uploads WHERE upload_id=?').get(uploadId).count,
     }));
-    assert.equal(outcome.version, 3);
+    assert.equal(outcome.version, 4);
     assert.match(outcome.index, /workspace_id,owner_id,privacy_epoch,created_at DESC,upload_id DESC/);
     assert.equal(outcome.count, 1);
     assert.ok(migrated);

@@ -236,6 +236,10 @@ export function createProductionWorkspacePortsFor(config: Pick<ServerConfig,
       ...(options.ffmpegPath ? { ffmpegPath: options.ffmpegPath } : {}), ...(options.ffprobePath ? { ffprobePath: options.ffprobePath } : {}),
       resolveAttachedMedia: resolveCurrentAttachedMedia,
     });
+    context.store.installSnapshotCommitParticipant(audioRepo.createSnapshotCommitParticipant());
+    // This workspace/epoch is reached only after the application owner is held. Other workspace
+    // epochs remain lazy and are recovered when their authoritative runtime is first constructed.
+    await audioRepo.resumePendingSnapshotCleanup({ exclusiveOwnerStartup: true });
     const speechAudio = createNodeSpeechAudioService(audioRepo);
     const azureSpeech = new SharedAzureSpeechClient({ fetcher, audio: speechAudio,
       readKeySnapshot: async (capturedGeneration) => {
@@ -319,7 +323,7 @@ export function createProductionWorkspacePortsFor(config: Pick<ServerConfig,
         assertActor();
         const match = /^still-media:([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i.exec(uri);
         if (!match) throw new Error('Server audio reference is unavailable.');
-        await audioRepo.eraseOwnedMedia(match[1]!);
+        await audioRepo.cleanupCommittedMedia(match[1]!);
       },
       loadRecordingRecovery: async () => recordingRecoveryUnavailable,
       bindRecordingRecovery: (service) => service,

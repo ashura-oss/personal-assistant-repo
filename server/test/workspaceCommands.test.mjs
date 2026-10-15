@@ -319,13 +319,18 @@ test('knowledge entity mirror failure keeps canonical content durable and return
       input: { name: 'Mirrored Person', aliases: [], narrative: 'Canonical narrative.' } }, initial.revision, initial.privacyEpoch);
     const result = await dispatchWorkspaceCommand(f.runtime, f.admission, command);
     assert.equal(result.status, 'finished');
+    assert.equal(result.snapshot.revision, initial.revision + 1, 'mirror failure does not create a second canonical write');
+    const personId = result.snapshot.state.knowledge.people[0].id;
+    assert.deepEqual(result.receipt, { schemaVersion: 1, commandId: command.commandId, kind: 'knowledge.person.save',
+      objectId: personId, entityKind: 'person', entityRevision: 1 });
     const matchingWrites = writes.filter((write) => write.content === 'Canonical narrative.');
     assert.equal(matchingWrites.length, 1);
     const mirroredWrite = matchingWrites[0];
     assert.match(mirroredWrite.path, /^people\/[0-9a-f-]+\.md$/);
     assert.equal(mirroredWrite.content, 'Canonical narrative.');
     assert.equal(result.snapshot.state.documents.find((document) => document.path === mirroredWrite.path).content, mirroredWrite.content);
-    assert.ok(result.snapshot.state.activity.some((item) => item.type === 'error' && item.message.includes('Local document mirror')));
+    assert.equal(result.snapshot.state.activity.some((item) => item.message.includes('Local document mirror')), false,
+      'derived mirror failure never adds activity to canonical state');
     assert.equal(inspectWorkspaceCommand(f.runtime, f.admission, command.commandId).status, 'finished');
   } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
