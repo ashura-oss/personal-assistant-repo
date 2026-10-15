@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import type { DurableKernel, OwnedTransactionContext } from './kernel.js';
+import type { CommandJournal, CommandTicketContext } from './commandJournal.js';
 import type { ApplicationStartupCapability } from './applicationStartup.js';
 import { ensureBackgroundSchema } from './backgroundSchema.js';
 import { BACKGROUND_REQUEST_MAX_BYTES, canonicalBackgroundJson, isBackgroundUuidV4, parseBackgroundOccurrenceDisplay, type BackgroundAccounting, type BackgroundOccurrenceDisplay, type BackgroundPolicyKind, type BackgroundPolicySpecification } from './backgroundContracts.js';
@@ -63,6 +64,26 @@ export interface BackgroundAccountSyncClaimMetadata {
   readonly scheduledAt: number;
 }
 
+/** Private, frozen inputs for the one scheduled mail-reply checkpoint path. */
+export interface BackgroundPaidMailReplyInputs {
+  readonly occurrenceId: string;
+  readonly attemptId: string;
+  readonly policyId: string;
+  readonly policyRevision: number;
+  readonly policyDigest: string;
+  readonly ruleSpecificationDigest: string;
+  readonly accountId: string;
+  readonly accountIdentityKey: string;
+  readonly connectionGeneration: number;
+  readonly providerMessageId: string;
+  readonly sourceVersionDigest?: string;
+  readonly specification: BackgroundPolicySpecification;
+  readonly descriptor: BackgroundOccurrenceDescriptor;
+  readonly source: unknown;
+  readonly request: unknown;
+  readonly requestDigest: string;
+}
+
 interface PolicyRow {
   current_revision: number; status: string; suspension: string | null; updated_at: number;
 }
@@ -106,6 +127,11 @@ function timestamp(value: unknown): number {
 function safeStored<T>(text: string): T {
   if (Buffer.byteLength(text, 'utf8') > PRIVATE_MAX) return fail('background_occurrence_storage_invalid');
   try { return JSON.parse(text) as T; } catch { return fail('background_occurrence_storage_invalid'); }
+}
+function freezeJson<T>(value: T): T {
+  if (!value || typeof value !== 'object') return value;
+  for (const child of Object.values(value as Record<string, unknown>)) freezeJson(child);
+  return Object.freeze(value);
 }
 function accounting(value: unknown): BackgroundAccounting {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return fail('background_accounting_invalid');
@@ -638,6 +664,120 @@ export class BackgroundOccurrenceStore {
       context.db.prepare(`UPDATE background_occurrences SET status='dispatching',updated_at=? WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND occurrence_id=?`)
         .run(now, context.workspaceId, context.ownerId, context.privacyEpoch, occurrence.occurrence_id);
     });
+  }
+
+  /**
+   * Reads the exact current, claimed proactive occurrence in an already-active
+   * kernel transaction. The kernel read proves this is the owning transaction;
+   * the returned frozen private inputs are not authority by themselves and must
+   * still be checked against the next snapshot and the current policy here.
+   */
+  readPaidMailReplyInputsWithinTransaction(context: OwnedTransactionContext, claim: BackgroundClaim,
+    expectedPrivacyEpoch: number): BackgroundPaidMailReplyInputs {
+    this.#kernel.readOwnedSnapshotWithinTransaction(context);
+    if (!claim || !isBackgroundUuidV4(claim.occurrenceId) || !isBackgroundUuidV4(claim.attemptId) || !isBackgroundUuidV4(claim.capability) ||
+        typeof expectedPrivacyEpoch !== 'number' || !Number.isSafeInteger(expectedPrivacyEpoch) || expectedPrivacyEpoch !== context.privacyEpoch) {
+      return fail('background_claim_invalid');
+    }
+    ensureBackgroundSchema(context.db);
+    const occurrence = readOccurrence(context.db, context, claim.occurrenceId);
+    const attempt = context.db.prepare(`SELECT attempt_id,occurrence_id,target_id,target_generation,capability_hash,status,claimed_at,
+      dispatch_started_at,settled_at,accounting_json,result_code,finalization_operation,finalization_request_json,finalization_receipt_json,finalization_receipt_digest
+      FROM background_occurrence_attempts WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND attempt_id=? AND occurrence_id=?`)
+      .get(context.workspaceId, context.ownerId, context.privacyEpoch, claim.attemptId, claim.occurrenceId) as AttemptRow | undefined;
+    if (!occurrence || !attempt || attempt.capability_hash !== hash(claim.capability) || attempt.target_id !== claim.targetId ||
+        attempt.target_generation !== (claim.targetGeneration ?? 0) || occurrence.policy_kind !== 'proactive_draft' ||
+        occurrence.status !== 'claimed' || attempt.status !== 'claimed' || attempt.finalization_operation !== null) {
+      return fail('background_claim_invalid');
+    }
+    const verified = verifyPolicy(context, context.db, this.#resolver, occurrence);
+    if (verified.spec.kind !== 'proactive_draft') return fail('background_occurrence_policy_stale');
+    const descriptor = safeStored<BackgroundOccurrenceDescriptor>(occurrence.descriptor_json);
+    if (descriptor.kind !== 'proactive_draft' || !allowedTarget(verified.spec, verified.binding, occurrence, attempt.target_id, attempt.target_generation)) {
+      return fail('background_target_not_bound');
+    }
+    const account = (verified.binding.accounts ?? []).find((item) => item.identityKey === descriptor.accountIdentityKey);
+    const selection = account && verified.spec.accounts.find((row) => row.accountId === account.accountId);
+    if (!account || !selection || selection.expectedConnectionGeneration !== account.connectionGeneration ||
+        attempt.target_id !== account.identityKey || attempt.target_generation !== account.connectionGeneration) return fail('background_target_not_bound');
+    const source = freezeJson(safeStored<unknown>(occurrence.source_json));
+    const request = freezeJson(safeStored<unknown>(occurrence.request_json));
+    return Object.freeze({ occurrenceId: occurrence.occurrence_id, attemptId: attempt.attempt_id,
+      policyId: occurrence.policy_id, policyRevision: occurrence.policy_revision, policyDigest: occurrence.policy_digest,
+      accountId: account.accountId, accountIdentityKey: account.identityKey, connectionGeneration: account.connectionGeneration,
+      providerMessageId: descriptor.providerMessageId,
+      ...(descriptor.sourceVersionDigest ? { sourceVersionDigest: descriptor.sourceVersionDigest } : {}),
+      ruleSpecificationDigest: verified.binding.rule?.specificationDigest ?? fail('background_rule_binding_missing'),
+      specification: verified.spec, descriptor, source, request, requestDigest: occurrence.request_digest });
+  }
+
+  /**
+   * Binds the exact live journal ticket and preparing mail-reply job to this
+   * claim in the same transaction that saves the `submitting` snapshot.
+   */
+  beginPaidSubmissionWithinTransaction(context: OwnedTransactionContext, claim: BackgroundClaim, expectedPrivacyEpoch: number,
+    ticket: CommandTicketContext, journal: CommandJournal, jobId: string): BackgroundPaidMailReplyInputs {
+    if (!journal || typeof jobId !== 'string' || !isBackgroundUuidV4(jobId)) return fail('background_paid_submission_invalid');
+    const inputs = this.readPaidMailReplyInputsWithinTransaction(context, claim, expectedPrivacyEpoch);
+    journal.assertPaidMailReplySubmissionWithinTransaction(context, ticket);
+    const occurrence = readOccurrence(context.db, context, claim.occurrenceId);
+    const attempt = context.db.prepare(`SELECT status FROM background_occurrence_attempts WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND attempt_id=?`)
+      .get(context.workspaceId, context.ownerId, context.privacyEpoch, claim.attemptId) as { status: string } | undefined;
+    if (!occurrence || !attempt || occurrence.status !== 'claimed' || attempt.status !== 'claimed' || occurrence.batch_job_id !== null) {
+      return fail('background_claim_not_dispatchable');
+    }
+    const now = timestamp(this.#clock());
+    const attemptUpdated = context.db.prepare(`UPDATE background_occurrence_attempts SET status='dispatching',dispatch_started_at=?
+      WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND attempt_id=? AND status='claimed' AND finalization_operation IS NULL`)
+      .run(now, context.workspaceId, context.ownerId, context.privacyEpoch, claim.attemptId);
+    const targetUpdated = context.db.prepare(`UPDATE background_occurrence_targets SET status='dispatching',updated_at=?
+      WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND occurrence_id=? AND target_id=? AND target_generation=?
+        AND attempt_id=? AND status='claimed'`)
+      .run(now, context.workspaceId, context.ownerId, context.privacyEpoch, claim.occurrenceId, claim.targetId,
+        claim.targetGeneration ?? 0, claim.attemptId);
+    const occurrenceUpdated = context.db.prepare(`UPDATE background_occurrences SET status='dispatching',batch_job_id=?,updated_at=?
+      WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND occurrence_id=? AND status='claimed' AND batch_job_id IS NULL`)
+      .run(jobId, now, context.workspaceId, context.ownerId, context.privacyEpoch, claim.occurrenceId);
+    if (attemptUpdated.changes !== 1 || targetUpdated.changes !== 1 || occurrenceUpdated.changes !== 1) return fail('background_claim_not_dispatchable');
+    return inputs;
+  }
+
+  /** Confirms the already-dispatched claim identity during settlement without reauthorizing new work. */
+  assertPaidSubmissionSettlementWithinTransaction(context: OwnedTransactionContext, claim: BackgroundClaim,
+    expectedPrivacyEpoch: number, jobId: string): void {
+    this.#kernel.readOwnedSnapshotWithinTransaction(context);
+    if (!claim || !isBackgroundUuidV4(claim.occurrenceId) || !isBackgroundUuidV4(claim.attemptId) ||
+        !isBackgroundUuidV4(claim.capability) || !isBackgroundUuidV4(jobId) || expectedPrivacyEpoch !== context.privacyEpoch) {
+      return fail('background_claim_invalid');
+    }
+    ensureBackgroundSchema(context.db);
+    const occurrence = readOccurrence(context.db, context, claim.occurrenceId);
+    const attempt = context.db.prepare(`SELECT target_id,target_generation,capability_hash,status FROM background_occurrence_attempts
+      WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND attempt_id=? AND occurrence_id=?`)
+      .get(context.workspaceId, context.ownerId, context.privacyEpoch, claim.attemptId, claim.occurrenceId) as
+      { target_id: string; target_generation: number; capability_hash: string; status: string } | undefined;
+    if (!occurrence || !attempt || attempt.capability_hash !== hash(claim.capability) || attempt.target_id !== claim.targetId ||
+        attempt.target_generation !== (claim.targetGeneration ?? 0) || attempt.status !== 'dispatching' || occurrence.status !== 'dispatching' ||
+        occurrence.policy_kind !== 'proactive_draft' || occurrence.batch_job_id !== jobId) return fail('background_claim_not_dispatchable');
+  }
+
+  /** Confirms a precise pre-provider failure may settle without reauthorizing or linking a Batch job. */
+  assertPaidPreDispatchSettlementWithinTransaction(context: OwnedTransactionContext, claim: BackgroundClaim,
+    expectedPrivacyEpoch: number): void {
+    this.#kernel.readOwnedSnapshotWithinTransaction(context);
+    if (!claim || !isBackgroundUuidV4(claim.occurrenceId) || !isBackgroundUuidV4(claim.attemptId) ||
+        !isBackgroundUuidV4(claim.capability) || expectedPrivacyEpoch !== context.privacyEpoch) return fail('background_claim_invalid');
+    ensureBackgroundSchema(context.db);
+    const occurrence = readOccurrence(context.db, context, claim.occurrenceId);
+    const attempt = context.db.prepare(`SELECT target_id,target_generation,capability_hash,status,finalization_operation FROM background_occurrence_attempts
+      WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND attempt_id=? AND occurrence_id=?`)
+      .get(context.workspaceId, context.ownerId, context.privacyEpoch, claim.attemptId, claim.occurrenceId) as
+      { target_id: string; target_generation: number; capability_hash: string; status: string; finalization_operation: string | null } | undefined;
+    if (!occurrence || !attempt || attempt.capability_hash !== hash(claim.capability) || attempt.target_id !== claim.targetId ||
+        attempt.target_generation !== (claim.targetGeneration ?? 0) || attempt.status !== 'claimed' || attempt.finalization_operation !== null ||
+        occurrence.status !== 'claimed' || occurrence.policy_kind !== 'proactive_draft' || occurrence.batch_job_id !== null) {
+      return fail('background_claim_not_dispatchable');
+    }
   }
 
   /** Final synchronous provider-read fence, called after any credential lookup and before fetch admission. */

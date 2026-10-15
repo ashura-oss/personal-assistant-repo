@@ -1,0 +1,387 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { createHash } from 'node:crypto';
+import type { Account, AppState, MailboxSnapshotMessage, SelectedMailTextSnapshot } from '../core';
+import { canonicalVerifiedProviderIdentity } from '../core';
+import { scopeGrantsCapability } from '../connectors/oauth';
+import { canonicalMailReplySource, defaultReplyRecipients, type MailReplySourceSnapshot } from '../mailReply';
+import { evaluateProactive, type ProactiveMailSource } from '../proactive';
+import { isMailTextFresh, validSelectedMailTextSnapshot, utf8Bytes } from '../mailText';
+import { OPENROUTER_BATCH_REQUEST_PROFILE_VERSION, OpenRouterBatchRequestBuilder } from '../services/openRouter';
+import { isOpenRouterMailReplyContentJob, validateOpenRouterBatchLedger, type OpenRouterBatchJob, type OpenRouterMailReplyContentJob } from '../services/openRouterBatchJobs';
+import { validOpenRouterMailReplyBinding, type OpenRouterMailReplyBinding } from '../services/openRouterMailReply';
+import { canonicalBackgroundJson } from '../../server/src/backgroundContracts.js';
+import type { BackgroundClaim, BackgroundOccurrenceStore, BackgroundPaidMailReplyInputs } from '../../server/src/backgroundOccurrences.js';
+import { currentCommandTicket, type CommandJournal, type CommandTicketContext } from '../../server/src/commandJournal.js';
+import type { SnapshotCommitParticipant, SnapshotCommitParticipantInput } from '../../server/src/workspaceStore.js';
+import type { DurableKernel, OwnedTransactionContext } from '../../server/src/kernel.js';
+import { BackgroundBatchLinkStore } from '../../server/src/backgroundBatchLink.js';
+import { currentSavedProactiveRule, backgroundProactiveRuleDigest } from './backgroundBindingResolver.node';
+
+const PRIVATE_MAX = 16 * 1024 * 1024;
+const SHA256 = /^[a-f0-9]{64}$/;
+const MAILBOX_KEYS = new Set(['id', 'accountId', 'providerMessageId', 'identityKey', 'verifiedIdentityKey', 'connectionGeneration', 'idFormat',
+  'threadId', 'subject', 'from', 'senderEmail', 'receivedAt', 'snippet', 'isRead', 'replyMetadataComplete', 'internetMessageId',
+  'providerVersion', 'sizeEstimate', 'sizeCheckedAt', 'replyTo', 'to', 'cc', 'references', 'inReplyTo', 'headers', 'observedAt', 'providerDeletedAt']);
+
+interface SourceEnvelope {
+  readonly schemaVersion: 1;
+  readonly accountId: string;
+  readonly connectionGeneration: number;
+  readonly messageId: string;
+  readonly source: MailReplySourceSnapshot;
+  readonly body: OpenRouterMailReplyBinding['body'];
+}
+interface RequestEnvelope {
+  readonly schemaVersion: 1;
+  readonly bindingVersion: 1 | 2;
+  readonly mode: 'reply' | 'reply_all';
+  readonly subject: string;
+  readonly to: readonly string[];
+  readonly cc: readonly string[];
+  readonly brief: string;
+  readonly policy: OpenRouterMailReplyBinding['policy'];
+  readonly settingsFingerprint: string;
+  readonly settingsSnapshot: string;
+  readonly requestAsOf: string;
+  readonly timeZone: string;
+  readonly note?: unknown;
+  readonly context?: unknown;
+}
+interface CheckpointScope {
+  readonly occurrences: BackgroundOccurrenceStore;
+  readonly links: BackgroundBatchLinkStore;
+  readonly claim: BackgroundClaim;
+  readonly privacyEpoch: number;
+  inputs?: BackgroundPaidMailReplyInputs;
+  ticketId?: string;
+  linkInput?: import('../../server/src/backgroundBatchLink.js').BackgroundPaidBatchLinkInput;
+  preparingJob?: OpenRouterMailReplyContentJob;
+  linked: boolean;
+}
+
+const checkpointScope = new AsyncLocalStorage<CheckpointScope>();
+
+function fail(code: string): never { throw new Error(code); }
+function record(value: unknown): value is Record<string, unknown> { return Boolean(value && typeof value === 'object' && !Array.isArray(value)); }
+function exact(value: Record<string, unknown>, required: readonly string[], optional: readonly string[] = []): boolean {
+  return required.every((key) => Object.hasOwn(value, key)) && Object.keys(value).every((key) => required.includes(key) || optional.includes(key));
+}
+function sha256(value: string): string { return createHash('sha256').update(value, 'utf8').digest('hex'); }
+function same(left: unknown, right: unknown): boolean {
+  return canonicalBackgroundJson(left, PRIVATE_MAX) === canonicalBackgroundJson(right, PRIVATE_MAX);
+}
+function freezeJson<T>(value: T): T {
+  if (value && typeof value === 'object') {
+    Object.freeze(value);
+    for (const child of Object.values(value as Record<string, unknown>)) freezeJson(child);
+  }
+  return value;
+}
+function identityKey(account: Account): string {
+  const identity = account.identity;
+  if (!identity?.providerNamespace || !identity.clientId || !identity.subject ||
+      (account.provider === 'microsoft' && !identity.resourceUserId)) return fail('background_mail_identity_invalid');
+  return [identity.providerNamespace, identity.clientId, identity.subject, identity.resourceUserId ?? ''].join(':');
+}
+function settingsProjection(state: AppState): Record<string, unknown> {
+  return { mode: state.settings.mode, llmProvider: state.settings.llmProvider ?? 'azure',
+    openRouterModel: state.settings.openRouterModel ?? 'openai/gpt-6-luna:batch',
+    openRouterReasoningEffort: state.settings.openRouterReasoningEffort ?? 'low',
+    llmRequestContractVersion: state.settings.llmRequestContractVersion ?? 1, timezone: state.settings.timezone };
+}
+function parseSource(value: unknown): SourceEnvelope {
+  if (!record(value) || !exact(value, ['schemaVersion', 'accountId', 'connectionGeneration', 'messageId', 'source', 'body']) ||
+      value.schemaVersion !== 1 || typeof value.accountId !== 'string' || !value.accountId ||
+      !Number.isSafeInteger(value.connectionGeneration) || (value.connectionGeneration as number) < 1 ||
+      typeof value.messageId !== 'string' || !value.messageId || !record(value.source) || !record(value.body)) return fail('background_mail_source_invalid');
+  const source = value.source as unknown as MailReplySourceSnapshot;
+  const body = value.body as unknown as OpenRouterMailReplyBinding['body'];
+  if (source.accountId !== value.accountId || source.connectionGeneration !== value.connectionGeneration ||
+      source.localMessageId !== value.messageId || !SHA256.test(source.sourceDigest)) return fail('background_mail_source_invalid');
+  return freezeJson({ schemaVersion: 1, accountId: value.accountId, connectionGeneration: value.connectionGeneration,
+    messageId: value.messageId, source, body });
+}
+function parseRequest(value: unknown): RequestEnvelope {
+  const required = ['schemaVersion', 'bindingVersion', 'mode', 'subject', 'to', 'cc', 'brief', 'policy', 'settingsFingerprint',
+    'settingsSnapshot', 'requestAsOf', 'timeZone'];
+  if (!record(value) || !exact(value, required, ['note', 'context']) || value.schemaVersion !== 1 ||
+      (value.bindingVersion !== 1 && value.bindingVersion !== 2) || !['reply', 'reply_all'].includes(String(value.mode)) ||
+      typeof value.subject !== 'string' || !Array.isArray(value.to) || !Array.isArray(value.cc) ||
+      value.to.some((item) => typeof item !== 'string') || value.cc.some((item) => typeof item !== 'string') ||
+      typeof value.brief !== 'string' || !Array.isArray(value.policy) || !SHA256.test(String(value.settingsFingerprint)) ||
+      typeof value.settingsSnapshot !== 'string' || typeof value.requestAsOf !== 'string' ||
+      !Number.isFinite(Date.parse(value.requestAsOf)) || new Date(value.requestAsOf).toISOString() !== value.requestAsOf ||
+      typeof value.timeZone !== 'string') return fail('background_mail_request_invalid');
+  // This tranche grants no standing consent for note or conversation context.
+  if (value.note !== undefined || (value.context !== undefined && (!Array.isArray(value.context) || value.context.length !== 0)) || value.bindingVersion !== 1) {
+    return fail('background_mail_request_scope_unsupported');
+  }
+  return freezeJson(value as unknown as RequestEnvelope);
+}
+function strictMailboxMessage(value: unknown): MailboxSnapshotMessage {
+  if (!record(value) || Object.keys(value).some((key) => !MAILBOX_KEYS.has(key)) ||
+      typeof value.id !== 'string' || !value.id || typeof value.accountId !== 'string' || !value.accountId ||
+      typeof value.providerMessageId !== 'string' || !value.providerMessageId || typeof value.identityKey !== 'string' || !value.identityKey ||
+      (value.verifiedIdentityKey !== undefined && typeof value.verifiedIdentityKey !== 'string') ||
+      (value.connectionGeneration !== undefined && (!Number.isSafeInteger(value.connectionGeneration) || (value.connectionGeneration as number) < 0)) ||
+      (value.idFormat !== undefined && value.idFormat !== 'gmail' && value.idFormat !== 'graph-immutable') ||
+      ['threadId', 'subject', 'from', 'senderEmail', 'receivedAt', 'snippet', 'internetMessageId', 'providerVersion', 'references', 'inReplyTo', 'observedAt', 'providerDeletedAt']
+        .some((key) => value[key] !== undefined && typeof value[key] !== 'string') ||
+      (value.isRead !== undefined && typeof value.isRead !== 'boolean') ||
+      (value.replyMetadataComplete !== undefined && typeof value.replyMetadataComplete !== 'boolean') ||
+      (value.sizeEstimate !== undefined && (!Number.isSafeInteger(value.sizeEstimate) || (value.sizeEstimate as number) < 0)) ||
+      (value.sizeCheckedAt !== undefined && typeof value.sizeCheckedAt !== 'string') ||
+      ['replyTo', 'to', 'cc'].some((key) => value[key] !== undefined && (!Array.isArray(value[key]) || value[key].some((item) => typeof item !== 'string'))) ||
+      (value.headers !== undefined && (!Array.isArray(value.headers) || value.headers.some((item) => !record(item) || !exact(item, ['name', 'value']) ||
+        typeof item.name !== 'string' || typeof item.value !== 'string')))) return fail('background_mail_snapshot_invalid');
+  return value as unknown as MailboxSnapshotMessage;
+}
+function currentReplySource(account: Account, message: MailboxSnapshotMessage): MailReplySourceSnapshot {
+  const identity = account.identity;
+  if (!identity || !message.observedAt || !Number.isFinite(Date.parse(message.observedAt)) ||
+      new Date(message.observedAt).toISOString() !== message.observedAt || message.providerDeletedAt !== undefined ||
+      message.replyMetadataComplete !== true || !message.internetMessageId || !message.idFormat ||
+      message.verifiedIdentityKey !== identityKey(account) || message.identityKey !== `${identityKey(account)}:${message.providerMessageId}` ||
+      message.connectionGeneration !== account.connectionGeneration) return fail('background_mail_source_changed');
+  const candidate: MailReplySourceSnapshot = { version: 1, accountId: account.id, accountEmail: account.email,
+    ...(account.verifiedEmail ? { verifiedSelfEmail: account.verifiedEmail } : {}), identity,
+    connectionGeneration: message.connectionGeneration!, localMessageId: message.id, providerMessageId: message.providerMessageId,
+    idFormat: message.idFormat, ...(message.providerVersion ? { providerVersion: message.providerVersion } : {}),
+    ...(message.threadId ? { threadId: message.threadId } : {}), internetMessageId: message.internetMessageId,
+    ...(message.references ? { references: message.references } : {}), ...(message.inReplyTo ? { inReplyTo: message.inReplyTo } : {}),
+    subject: message.subject ?? '', ...(message.from ? { from: message.from } : {}), ...(message.senderEmail ? { senderEmail: message.senderEmail } : {}),
+    ...(message.replyTo ? { replyTo: [...message.replyTo] } : {}), ...(message.to ? { to: [...message.to] } : {}),
+    ...(message.cc ? { cc: [...message.cc] } : {}), ...(message.snippet !== undefined ? { snippet: message.snippet } : {}),
+    replyMetadataComplete: true, observedAt: message.observedAt, sourceDigest: '0'.repeat(64) };
+  const digest = sha256(canonicalMailReplySource(candidate));
+  return freezeJson({ ...candidate, sourceDigest: digest });
+}
+function currentBody(state: AppState, account: Account, source: MailReplySourceSnapshot): SelectedMailTextSnapshot {
+  const selected = state.selectedMailTexts.find((item) => item.messageId === source.localMessageId && item.accountId === source.accountId &&
+    item.providerMessageId === source.providerMessageId);
+  if (!selected || !validSelectedMailTextSnapshot(selected) || !isMailTextFresh(selected) || selected.sourceDigest !== source.sourceDigest ||
+      selected.connectionGeneration !== source.connectionGeneration || selected.idFormat !== source.idFormat ||
+      selected.identityKey !== identityKey(account) ||
+      !same(selected.identity, source.identity) || !selected.text || !selected.textDigest ||
+      utf8Bytes(selected.text) !== selected.bytes || sha256(selected.text) !== selected.textDigest) return fail('background_mail_body_changed');
+  return selected;
+}
+function sourceIsFresh(message: MailboxSnapshotMessage, now: number): boolean {
+  if (!message.observedAt) return false;
+  const at = Date.parse(message.observedAt);
+  return Number.isFinite(at) && at <= now && now - at < 15 * 60_000;
+}
+function assertRuleMatch(state: AppState, inputs: BackgroundPaidMailReplyInputs, source: MailReplySourceSnapshot,
+  message: MailboxSnapshotMessage, now: number, timeZone: string): void {
+  const spec = inputs.specification;
+  if (spec.kind !== 'proactive_draft') return fail('background_mail_policy_changed');
+  const rule = currentSavedProactiveRule(state, spec.ruleId);
+  if (rule.revision !== spec.expectedRuleRevision || !rule.enabled || backgroundProactiveRuleDigest(rule) !== inputs.ruleSpecificationDigest) {
+    return fail('background_mail_policy_changed');
+  }
+  const sourceId = JSON.stringify([source.identity.providerNamespace, source.accountId, source.providerMessageId]);
+  const candidateSource: ProactiveMailSource = { kind: 'mail', sourceId, namespace: source.identity.providerNamespace!, accountId: source.accountId,
+    providerId: source.providerMessageId, sourceVersion: source.sourceDigest, availability: 'available', freshness: 'fresh',
+    ...(message.senderEmail ? { senderEmail: message.senderEmail } : {}), ...(message.isRead !== undefined ? { isRead: message.isRead } : {}),
+    ...(message.subject !== undefined ? { subject: message.subject } : {}), ...(message.snippet !== undefined ? { snippet: message.snippet } : {}),
+    ...(message.receivedAt !== undefined ? { receivedAt: message.receivedAt } : {}) };
+  const evaluation = evaluateProactive({ nowUtc: new Date(now).toISOString(), timeZone, rules: [rule], sources: [candidateSource], sourceSnapshotComplete: true });
+  if (!evaluation.activeCandidates.some((candidate) => candidate.ruleId === rule.id && candidate.sourceId === sourceId && candidate.sourceKind === 'mail')) {
+    return fail('background_mail_rule_not_currently_eligible');
+  }
+}
+
+function parseLedger(state: AppState): ReturnType<typeof validateOpenRouterBatchLedger> {
+  const raw = (state as unknown as Record<string, unknown>).openRouterBatchLedger;
+  return validateOpenRouterBatchLedger(raw ?? { version: 1, jobs: [] });
+}
+function changedJobs(previous: ReturnType<typeof validateOpenRouterBatchLedger>, next: ReturnType<typeof validateOpenRouterBatchLedger>):
+  { added: OpenRouterBatchJob[]; removed: OpenRouterBatchJob[]; changed: { before: OpenRouterBatchJob; after: OpenRouterBatchJob }[] } {
+  const before = new Map(previous.jobs.map((job) => [job.id, job]));
+  const after = new Map(next.jobs.map((job) => [job.id, job]));
+  return { added: next.jobs.filter((job) => !before.has(job.id)), removed: previous.jobs.filter((job) => !after.has(job.id)),
+    changed: previous.jobs.flatMap((job) => { const current = after.get(job.id); return current && !same(job, current) ? [{ before: job, after: current }] : []; }) };
+}
+function frozenJobMatches(job: OpenRouterMailReplyContentJob, inputs: BackgroundPaidMailReplyInputs, state: AppState, now: number): void {
+  const sourceEnvelope = parseSource(inputs.source);
+  const request = parseRequest(inputs.request);
+  const account = state.accounts.find((item) => item.id === inputs.accountId);
+  if (!account || !account.connected || account.authStatus !== 'connected' || !account.tokenRef || account.connectionGeneration !== inputs.connectionGeneration ||
+      sha256(canonicalVerifiedProviderIdentity(account)) !== inputs.accountIdentityKey ||
+      inputs.sourceVersionDigest !== (inputs.specification.kind === 'proactive_draft' && inputs.specification.sourceChangePolicy === 'each_changed_source'
+        ? sha256(canonicalBackgroundJson({ sourceDigest: sourceEnvelope.source.sourceDigest, textDigest: sourceEnvelope.body.textDigest,
+          extractionVersion: sourceEnvelope.body.extractionVersion, representation: sourceEnvelope.body.representation,
+          completeness: sourceEnvelope.body.completeness, omissionReasons: sourceEnvelope.body.omissionReasons }, PRIVATE_MAX)) : undefined)) {
+    return fail('background_mail_binding_changed');
+  }
+  const messageRaw = state.mailbox.find((item) => item.id === sourceEnvelope.messageId);
+  if (!messageRaw) return fail('background_mail_source_changed');
+  const message = strictMailboxMessage(messageRaw);
+  if (message.accountId !== account.id || message.providerMessageId !== inputs.providerMessageId || !sourceIsFresh(message, now)) {
+    return fail('background_mail_source_changed');
+  }
+  const currentSource = currentReplySource(account, message);
+  if (!same(currentSource, sourceEnvelope.source)) return fail('background_mail_source_changed');
+  const body = currentBody(state, account, currentSource);
+  if (!same({ text: body.text, textDigest: body.textDigest, bytes: body.bytes, extractionVersion: body.extractionVersion,
+    representation: body.representation, completeness: body.completeness, omissionReasons: body.omissionReasons }, sourceEnvelope.body)) {
+    return fail('background_mail_body_changed');
+  }
+  const spec = inputs.specification;
+  if (spec.kind !== 'proactive_draft' || !spec.accounts.some((selection) => selection.accountId === account.id &&
+      selection.expectedConnectionGeneration === account.connectionGeneration) || !account.capabilities?.includes('mail.read') ||
+      !account.grantedScopes || (account.provider !== 'google' && account.provider !== 'microsoft') ||
+      !scopeGrantsCapability(account.provider, [...account.grantedScopes], 'mail.read') || !account.identity ||
+      (account.capabilityLimits !== undefined && !account.capabilityLimits.includes('mail.read'))) return fail('background_mail_binding_changed');
+  const settingsSnapshot = canonicalBackgroundJson(settingsProjection(state));
+  if (request.settingsSnapshot !== settingsSnapshot || request.settingsFingerprint !== sha256(settingsSnapshot) || request.timeZone !== state.settings.timezone ||
+      request.brief !== spec.brief || request.mode !== spec.replyMode || state.settings.mode !== 'provider' || state.settings.llmProvider !== 'openrouter' ||
+      (state.settings.openRouterReasoningEffort ?? 'low') !== spec.paidConsent.effort) {
+    return fail('background_mail_settings_changed');
+  }
+  const documents = state.documents;
+  const policies = request.policy;
+  if (policies.some((item) => !record(item) || !exact(item, ['path', 'revision', 'content', 'sha256']) ||
+      typeof item.path !== 'string' || !Number.isSafeInteger(item.revision) || typeof item.content !== 'string' || item.sha256 !== sha256(item.content))) {
+    return fail('background_mail_policy_document_changed');
+  }
+  const selectedDocs = documents.filter((doc) => /^memory\/(?:RULES|ROUTINES)\.md$/i.test(doc.path));
+  const currentDocs = policies.map((item) => documents.find((doc) => doc.path === item.path));
+  if (policies.length !== selectedDocs.length || currentDocs.some((doc, index) => !doc || doc.revision !== policies[index]!.revision ||
+      doc.content !== policies[index]!.content || selectedDocs[index]?.path !== policies[index]!.path ||
+      selectedDocs[index]?.revision !== policies[index]!.revision || selectedDocs[index]?.content !== policies[index]!.content)) {
+    return fail('background_mail_policy_document_changed');
+  }
+  const recipients = defaultReplyRecipients(currentSource, account.verifiedEmail, request.mode);
+  if (currentSource.subject !== request.subject || !same(recipients.to, request.to) || !same(recipients.cc, request.cc)) {
+    return fail('background_mail_reply_facts_changed');
+  }
+  assertRuleMatch(state, inputs, currentSource, message, now, request.timeZone);
+  const binding: OpenRouterMailReplyBinding = { version: request.bindingVersion, messageId: sourceEnvelope.messageId,
+    mode: request.mode, source: currentSource, body: sourceEnvelope.body, subject: request.subject, to: request.to, cc: request.cc,
+    brief: request.brief, policy: request.policy, settingsFingerprint: request.settingsFingerprint,
+    settingsSnapshot: request.settingsSnapshot, requestAsOf: request.requestAsOf, timeZone: request.timeZone };
+  if (!validOpenRouterMailReplyBinding(binding, 2) || !same(job.mailReplyBinding, binding) || job.id !== job.customId ||
+      job.kind !== 'mail_reply' || job.operation !== undefined || job.requestProfileVersion !== OPENROUTER_BATCH_REQUEST_PROFILE_VERSION || job.inputPolicyVersion !== 2 ||
+      job.outputPolicyVersion !== 2 || job.requestSha256 !== sha256(job.requestBody) || job.settingsFingerprint !== request.settingsFingerprint ||
+      job.effort !== spec.paidConsent.effort || job.model !== 'openai/gpt-6-luna:batch' || job.omittedSourceCount !== 0 ||
+      job.requestBytes !== utf8Bytes(job.requestBody) || Object.keys(job.sourceVersions).length !== 0) return fail('background_mail_job_binding_invalid');
+  const policyContext = policies.map((item) => `### ${item.path} (revision ${item.revision})\n${item.content}`).join('\n\n');
+  const expectedBody = new OpenRouterBatchRequestBuilder().prepareReply({ sourceText: body.text!, sourceRepresentation: body.representation,
+    sourceCompleteness: body.completeness, subject: request.subject, to: [...request.to], cc: [...request.cc], brief: request.brief,
+    policyContext, asOf: request.requestAsOf, timeZone: request.timeZone }, state.settings, 2).body;
+  if (expectedBody !== job.requestBody) return fail('background_mail_request_body_changed');
+  const expectedSourceFingerprint = sha256(canonicalBackgroundJson({ source: canonicalMailReplySource(currentSource),
+    body: { textDigest: body.textDigest, representation: body.representation, completeness: body.completeness,
+      extractionVersion: body.extractionVersion, omissionReasons: body.omissionReasons }, note: null, policy: policies,
+    settingsFingerprint: request.settingsFingerprint, recipients: { to: request.to, cc: request.cc }, inputPolicyVersion: 2 }, PRIVATE_MAX));
+  if (job.sourceFingerprint !== expectedSourceFingerprint) return fail('background_mail_source_fingerprint_changed');
+}
+
+function onlyStatusTransition(before: OpenRouterBatchJob, after: OpenRouterBatchJob): boolean {
+  if (before.id !== after.id || before.customId !== after.customId || before.kind !== after.kind || before.requestSha256 !== after.requestSha256 ||
+      before.requestBody !== after.requestBody || !same(before.mailReplyBinding, after.mailReplyBinding) || before.sourceFingerprint !== after.sourceFingerprint ||
+      before.settingsFingerprint !== after.settingsFingerprint || before.requestProfileVersion !== after.requestProfileVersion ||
+      before.inputPolicyVersion !== after.inputPolicyVersion || before.outputPolicyVersion !== after.outputPolicyVersion ||
+      before.requestBytes !== after.requestBytes || before.effort !== after.effort || before.model !== after.model ||
+      before.createdAt !== after.createdAt || before.omittedSourceCount !== after.omittedSourceCount || !same(before.sourceVersions, after.sourceVersions)) return false;
+  const allowed = new Set(['status', 'unknownCharge', 'updatedAt', 'batchId', 'failureCode']);
+  const a = before as unknown as Record<string, unknown>;
+  const b = after as unknown as Record<string, unknown>;
+  return [...new Set([...Object.keys(a), ...Object.keys(b)])].every((key) => allowed.has(key) || same(a[key], b[key]));
+}
+function validProviderSettlement(before: OpenRouterMailReplyContentJob, after: OpenRouterMailReplyContentJob): boolean {
+  if (before.status !== 'submitting' || before.batchId !== undefined || before.unknownCharge !== true) return false;
+  if (after.status === 'queued') return typeof after.batchId === 'string' && after.batchId.length > 0 && after.unknownCharge === true &&
+    after.failureCode === undefined;
+  if (after.status === 'submission_unknown') return after.batchId === undefined && after.unknownCharge === true && after.failureCode === undefined;
+  if (after.status === 'failed') return after.batchId === undefined && after.unknownCharge === false && after.failureCode === 'not_submitted';
+  return false;
+}
+
+/** Runs exactly the paid scheduled mail-reply command under a private, non-HTTP checkpoint scope. */
+export function runBackgroundPaidMailReplyCheckpoint<T>(input: Readonly<{ occurrences: BackgroundOccurrenceStore; links: BackgroundBatchLinkStore;
+  claim: BackgroundClaim; privacyEpoch: number }>, operation: () => T): T {
+  if (!input || checkpointScope.getStore() || !input.occurrences || !input.links || !input.claim ||
+      !Number.isSafeInteger(input.privacyEpoch) || input.privacyEpoch < 0 || typeof operation !== 'function') {
+    return fail('background_paid_checkpoint_scope_invalid');
+  }
+  return checkpointScope.run({ ...input, linked: false }, operation);
+}
+
+/** Installed alongside other synchronous snapshot participants. It only acts inside the named trusted gateway scope. */
+export function createBackgroundPaidMailReplySnapshotParticipant(kernel: DurableKernel, journal: CommandJournal,
+  clock: () => number = Date.now): SnapshotCommitParticipant<AppState> {
+  if (!kernel || !journal || typeof clock !== 'function') throw new TypeError('background_paid_participant_invalid');
+  return Object.freeze({
+    beforeCommit(context: OwnedTransactionContext, input: SnapshotCommitParticipantInput<AppState>): void {
+      const scope = checkpointScope.getStore();
+      if (!scope) return;
+      const ticket = currentCommandTicket() as CommandTicketContext | undefined;
+      if (!ticket) return fail('background_paid_command_ticket_missing');
+      journal.assertPaidMailReplySubmissionWithinTransaction(context, ticket);
+      const previousLedger = parseLedger(input.previousSnapshot);
+      const nextLedger = parseLedger(input.nextSnapshot);
+      const delta = changedJobs(previousLedger, nextLedger);
+      if (delta.removed.length || delta.changed.length > 1 || delta.added.length > 1) return fail('background_paid_ledger_delta_invalid');
+      const previousJob = scope.preparingJob;
+      if (!previousJob) {
+        const inputs = scope.occurrences.readPaidMailReplyInputsWithinTransaction(context, scope.claim, scope.privacyEpoch);
+        const added = delta.added[0];
+        if (!added || added.status !== 'preparing' || delta.changed.length || delta.added.length !== 1 ||
+            !isOpenRouterMailReplyContentJob(added)) return fail('background_paid_prepare_transition_invalid');
+        frozenJobMatches(added, inputs, input.previousSnapshot, clock());
+        frozenJobMatches(added, inputs, input.nextSnapshot, clock());
+        scope.inputs = inputs;
+        scope.ticketId = ticket.ticketId;
+        scope.preparingJob = freezeJson(added);
+        return;
+      }
+      if (!scope.linked) {
+        const changed = delta.changed[0];
+        if (scope.ticketId !== ticket.ticketId || !scope.inputs || !changed || delta.added.length || delta.changed.length !== 1 ||
+            changed.before.id !== previousJob.id || !same(previousJob, changed.before) || !isOpenRouterMailReplyContentJob(changed.after) ||
+            !onlyStatusTransition(changed.before, changed.after)) return fail('background_paid_checkpoint_transition_invalid');
+        if (changed.after.status === 'failed' && changed.after.failureCode === 'not_submitted' && changed.after.unknownCharge === false &&
+            changed.after.batchId === undefined && changed.before.status === 'preparing') {
+          scope.occurrences.assertPaidPreDispatchSettlementWithinTransaction(context, scope.claim, scope.privacyEpoch);
+          scope.links.assertNoLinkWithinTransaction(context, scope.claim.occurrenceId, scope.claim.attemptId);
+          scope.preparingJob = freezeJson(changed.after);
+          return;
+        }
+        const inputs = scope.occurrences.readPaidMailReplyInputsWithinTransaction(context, scope.claim, scope.privacyEpoch);
+        if (inputs.occurrenceId !== scope.inputs.occurrenceId || inputs.attemptId !== scope.inputs.attemptId ||
+            inputs.requestDigest !== scope.inputs.requestDigest) return fail('background_paid_occurrence_changed');
+        if (!changed || delta.added.length || changed.before.id !== previousJob.id || changed.after.status !== 'submitting' ||
+            changed.before.status !== 'preparing' || !isOpenRouterMailReplyContentJob(changed.after) || !onlyStatusTransition(changed.before, changed.after)) {
+          return fail('background_paid_checkpoint_transition_invalid');
+        }
+        frozenJobMatches(changed.after, inputs, input.previousSnapshot, clock());
+        frozenJobMatches(changed.after, inputs, input.nextSnapshot, clock());
+        const captured = scope.occurrences.beginPaidSubmissionWithinTransaction(context, scope.claim, scope.privacyEpoch, ticket, journal, changed.after.id);
+        if (captured.occurrenceId !== inputs.occurrenceId || captured.requestDigest !== inputs.requestDigest) return fail('background_paid_occurrence_changed');
+        const linkInput = Object.freeze({ occurrenceId: inputs.occurrenceId, attemptId: inputs.attemptId,
+          commandId: ticket.idempotencyKey, ticketId: ticket.ticketId, policyId: inputs.policyId, policyRevision: inputs.policyRevision,
+          policyDigest: inputs.policyDigest, jobId: changed.after.id, customId: changed.after.customId,
+          requestSha256: changed.after.requestSha256, sourceDigest: sha256(canonicalBackgroundJson(inputs.source, PRIVATE_MAX)),
+          ...(inputs.sourceVersionDigest ? { sourceVersionDigest: inputs.sourceVersionDigest } : {}), requestDigest: inputs.requestDigest, createdAt: clock() });
+        scope.links.linkWithinTransaction(context, linkInput);
+        scope.linkInput = linkInput;
+        scope.linked = true;
+        scope.preparingJob = freezeJson(changed.after);
+        return;
+      }
+      if (scope.ticketId !== ticket.ticketId || !scope.inputs || !scope.linkInput || !scope.linked) return fail('background_paid_checkpoint_scope_invalid');
+      scope.occurrences.assertPaidSubmissionSettlementWithinTransaction(context, scope.claim, scope.privacyEpoch, previousJob.id);
+      scope.links.assertExistingLinkWithinTransaction(context, scope.linkInput);
+      if (delta.added.length || delta.changed.length > 1 || (delta.changed.length === 1 &&
+          (delta.changed[0]!.before.id !== previousJob.id || !onlyStatusTransition(delta.changed[0]!.before, delta.changed[0]!.after) ||
+            !isOpenRouterMailReplyContentJob(delta.changed[0]!.after) || !validProviderSettlement(delta.changed[0]!.before as OpenRouterMailReplyContentJob,
+              delta.changed[0]!.after as OpenRouterMailReplyContentJob)))) {
+        return fail('background_paid_settlement_transition_invalid');
+      }
+      if (delta.changed.length === 1) scope.preparingJob = freezeJson(delta.changed[0]!.after as OpenRouterMailReplyContentJob);
+    },
+    commit(): void { /* The paid claim, private link, journal checkpoint and snapshot were committed in beforeCommit's same transaction. */ },
+  });
+}

@@ -366,6 +366,23 @@ export class CommandJournal {
     });
   }
 
+  /**
+   * Trusted same-transaction proof for the one scheduled paid mail-reply
+   * submission checkpoint. This deliberately accepts no public command data:
+   * the ticket must be the exact AsyncLocalStorage object currently executing
+   * and its durable row must still be claimed/checkpointed in this workspace.
+   */
+  assertPaidMailReplySubmissionWithinTransaction(context: OwnedTransactionContext, ticket: CommandTicketContext): void {
+    if (!context || !ticket || currentTicket.getStore() !== ticket || ticket.kind !== workspaceCommandKindToJournal('mail.replyBatch.submit')) {
+      throw new Error('background_paid_command_ticket_invalid');
+    }
+    // Also proves this context belongs to this kernel and is the active outer
+    // transaction before the private ticket row is inspected.
+    this.kernel.readOwnedSnapshotWithinTransaction(context);
+    const row = this.getTicketRow(context, ticket);
+    if (row.status !== 'claimed' && row.status !== 'checkpointed') throw new Error('background_paid_command_ticket_not_active');
+  }
+
   /** Atomically promotes one verified OAuth stage into the workspace and exact encrypted account slot. */
   checkpointOAuthInstall(ticket: CommandTicketContext, stateFence: { workspaceId: string; revision: number; privacyEpoch: number },
     serializedSnapshot: string, accountGenerations: Readonly<Record<string, number>>, install: OAuthInstallCheckpoint): number {

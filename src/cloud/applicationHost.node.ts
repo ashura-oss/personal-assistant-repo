@@ -16,6 +16,10 @@ import type { NodeProviderResponseLifetimeOwner } from './providerResponseLifeti
 import type { ServerOAuthProviderAdapter } from '../../server/src/oauthProviderAdapter.js';
 import { BackgroundRuntimeOwner } from './backgroundRuntime.node';
 
+// Private Node gateway seam: callers must already hold an immutable occurrence claim.
+// This export shares the exact AsyncLocalStorage instance used by the production participant.
+export { runBackgroundPaidMailReplyCheckpoint } from './backgroundPaidWork.node';
+
 export { NodeVaultOAuthTokenStore } from './nodeOAuthTokenStore.node';
 export { createProductionWorkspacePortsFor } from './productionWorkspacePorts.node';
 
