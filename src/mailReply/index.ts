@@ -148,7 +148,7 @@ export function validateReplyBinding(payload: EmailProposalPayload, provenance: 
       payload.reply.references !== replyReferences(source) || payload.reply.inReplyTo !== (source.internetMessageId || source.inReplyTo)) {
     fail('Reply draft is not bound to the verified original message.');
   }
-  clean(payload.text, 'Reply body', 100_000, true);
+  clean(payload.text, 'Reply body', provenance.outputPolicyVersion === 2 ? Number.MAX_SAFE_INTEGER : 100_000, true);
   if (!payload.to.length || payload.to.length > 100 || payload.cc.length > 100) fail('Reply recipient list is invalid.');
   for (const recipient of [...payload.to, ...payload.cc]) if (!validEmail(recipient)) fail('Reply recipient address is invalid.');
 }

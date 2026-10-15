@@ -24,8 +24,8 @@ function cleanString(value: unknown, label: string, max: number, allowEmpty = fa
   if (typeof value !== 'string' || value.length > max || (!allowEmpty && !value.trim()) || /[\u0000-\u001f\u007f]/.test(value)) fail(`${label} is invalid.`);
   return value;
 }
-function contentString(value: unknown, label: string, max: number, allowEmpty = false): string {
-  if (typeof value !== 'string' || value.length > max || (!allowEmpty && !value.trim()) || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value)) fail(`${label} is invalid.`);
+function contentString(value: unknown, label: string, max: number, allowEmpty = false, unlimited = false): string {
+  if (typeof value !== 'string' || (!unlimited && value.length > max) || (!allowEmpty && !value.trim()) || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value)) fail(`${label} is invalid.`);
   return value;
 }
 function canonicalJson(value: unknown): string {
@@ -78,8 +78,8 @@ function identityActionKey(identity: DispatchIdentitySnapshot, sourceActionKey: 
   return JSON.stringify(['dispatch-v1', identity.providerNamespace, identity.clientId, identity.subject, identity.resourceUserId ?? '', sourceActionKey, operation]);
 }
 
-function sourceList(value: unknown, label: string): NoteProposalProvenance['sources'] {
-  if (!Array.isArray(value) || value.length > 200) fail(`${label} is invalid.`);
+function sourceList(value: unknown, label: string, inputPolicyVersion: 1 | 2 = 1): NoteProposalProvenance['sources'] {
+  if (!Array.isArray(value) || inputPolicyVersion !== 2 && value.length > 200) fail(`${label} is invalid.`);
   const result = value.map((raw) => {
     if (!raw || typeof raw !== 'object') fail(`${label} is invalid.`);
     const item = raw as Record<string, unknown>;
@@ -95,8 +95,8 @@ function sourceList(value: unknown, label: string): NoteProposalProvenance['sour
   return result;
 }
 
-function knowledgeSelection(value: unknown): NonNullable<NoteProposalProvenance['knowledgeSelection']> {
-  if (!Array.isArray(value) || value.length > 5) fail('Provenance knowledge selection is invalid.');
+function knowledgeSelection(value: unknown, inputPolicyVersion: 1 | 2 = 1): NonNullable<NoteProposalProvenance['knowledgeSelection']> {
+  if (!Array.isArray(value) || inputPolicyVersion !== 2 && value.length > 5) fail('Provenance knowledge selection is invalid.');
   const result = value.map((raw) => {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) fail('Provenance knowledge selection is invalid.');
     const item = raw as Record<string, unknown>;
@@ -112,7 +112,8 @@ function knowledgeSelection(value: unknown): NonNullable<NoteProposalProvenance[
 function snapshotProvenance(value: AnyProposalProvenance | undefined): AnyProposalProvenance {
   if (!value) return fail('Dispatch source provenance is missing or unsupported.');
   if (value.version === 2 && value.kind === 'mail_reply') {
-    onlyKeys(value, ['version', 'kind', 'sourceDigest', 'source', 'expiresAt', 'batchJobId'], 'Mail reply provenance');
+    onlyKeys(value, ['version', 'kind', 'sourceDigest', 'source', 'expiresAt', 'batchJobId', 'outputPolicyVersion'], 'Mail reply provenance');
+    if (value.outputPolicyVersion !== undefined && value.outputPolicyVersion !== 1 && value.outputPolicyVersion !== 2) fail('Mail reply output policy version is invalid.');
     if (value.batchJobId !== undefined && (typeof value.batchJobId !== 'string' || value.batchJobId.length !== 36 || !BATCH_JOB_UUID_V4.test(value.batchJobId))) {
       fail('Mail reply Batch job reference is invalid.');
     }
@@ -127,12 +128,15 @@ function snapshotProvenance(value: AnyProposalProvenance | undefined): AnyPropos
     return structuredClone(value);
   }
   if (value.version !== 1) return fail('Dispatch source provenance is missing or unsupported.');
-  onlyKeys(value, ['version', 'assistContractVersion', 'analysisFingerprint', 'noteId', 'noteRevision', 'capturedAt', 'captureTimeZone', 'intent', 'question', 'knowledgeSelection', 'sources', 'policySources', 'settingsFingerprint', 'answeredAsOf', 'expiresAt'], 'Dispatch provenance');
+  onlyKeys(value, ['version', 'assistContractVersion', 'analysisFingerprint', 'noteId', 'noteRevision', 'capturedAt', 'captureTimeZone', 'intent', 'question', 'knowledgeSelection', 'sources', 'policySources', 'settingsFingerprint', 'answeredAsOf', 'expiresAt', 'outputPolicyVersion', 'inputPolicyVersion'], 'Dispatch provenance');
   assertRevision(value.noteRevision, 'Provenance note revision');
   const intent = value.intent;
   if (!['assist', 'summarize', 'answer', 'extract'].includes(intent)) fail('Provenance intent is invalid.');
-  const sources = sourceList(value.sources, 'Provenance sources');
-  const policySources = sourceList(value.policySources, 'Policy provenance sources');
+  if (value.outputPolicyVersion !== undefined && value.outputPolicyVersion !== 1 && value.outputPolicyVersion !== 2) fail('Provenance output policy version is invalid.');
+  if (value.inputPolicyVersion !== undefined && value.inputPolicyVersion !== 1 && value.inputPolicyVersion !== 2) fail('Provenance input policy version is invalid.');
+  const inputPolicyVersion = (value.inputPolicyVersion ?? 1) as 1 | 2;
+  const sources = sourceList(value.sources, 'Provenance sources', inputPolicyVersion);
+  const policySources = sourceList(value.policySources, 'Policy provenance sources', inputPolicyVersion);
   const result: NoteProposalProvenance = {
     version: 1,
     assistContractVersion: cleanString(value.assistContractVersion, 'Assist contract version', 64),
@@ -143,25 +147,27 @@ function snapshotProvenance(value: AnyProposalProvenance | undefined): AnyPropos
     captureTimeZone: validTimeZone(value.captureTimeZone, 'Provenance time zone'),
     intent,
     ...(value.question !== undefined ? { question: contentString(value.question, 'Provenance question', 16 * 1024, true) } : {}),
-    ...(value.knowledgeSelection !== undefined ? { knowledgeSelection: knowledgeSelection(value.knowledgeSelection) } : {}),
+    ...(value.knowledgeSelection !== undefined ? { knowledgeSelection: knowledgeSelection(value.knowledgeSelection, inputPolicyVersion) } : {}),
     sources,
     policySources,
     settingsFingerprint: cleanString(value.settingsFingerprint, 'Settings fingerprint', 16 * 1024),
     ...(value.answeredAsOf !== undefined ? { answeredAsOf: canonicalTime(value.answeredAsOf, 'Answer snapshot time') } : {}),
     ...(value.expiresAt !== undefined ? { expiresAt: canonicalTime(value.expiresAt, 'Provenance expiry') } : {}),
+    ...(value.outputPolicyVersion !== undefined ? { outputPolicyVersion: value.outputPolicyVersion as 1 | 2 } : {}),
+    ...(value.inputPolicyVersion !== undefined ? { inputPolicyVersion } : {}),
   };
   if (Boolean(value.expiresAt) !== Boolean(value.answeredAsOf)) fail('Answer snapshot and expiry must be supplied together.');
   if (value.expiresAt && value.answeredAsOf && Date.parse(value.expiresAt) < Date.parse(value.answeredAsOf)) fail('Provenance expiry predates its answer snapshot.');
   return result;
 }
 
-function projectEmail(value: EmailProposalPayload, operation: 'draft' | 'send'): DispatchPayload {
+function projectEmail(value: EmailProposalPayload, operation: 'draft' | 'send', outputPolicyVersion: 1 | 2 = 1): DispatchPayload {
   if (value.operation !== operation) fail('Approved email operation does not match its payload.');
   if (!Array.isArray(value.to) || value.to.length < 1 || value.to.length > 100 || !Array.isArray(value.cc) || value.cc.length > 100 || !Array.isArray(value.bcc) || value.bcc.length > 100) fail('Approved email recipients are invalid.');
   if (!Array.isArray(value.attachments) || value.attachments.length > 10) fail('Approved email attachments are invalid.');
   const subject = cleanString(value.subject, 'Email subject', 998, true);
   if (/[\r\n]/.test(subject)) fail('Email subject contains an invalid line break.');
-  const text = contentString(value.text, 'Email body', 100_000, true);
+  const text = contentString(value.text, 'Email body', 100_000, true, outputPolicyVersion === 2);
   const attachments = value.attachments.map((attachment) => {
     const fileName = cleanString(attachment.fileName, 'Attachment filename', 200);
     const mimeType = cleanString(attachment.mimeType, 'Attachment media type', 255);
@@ -177,7 +183,7 @@ function projectEmail(value: EmailProposalPayload, operation: 'draft' | 'send'):
   } };
 }
 
-function projectEvent(value: EventProposalPayload): DispatchPayload {
+function projectEvent(value: EventProposalPayload, outputPolicyVersion: 1 | 2 = 1): DispatchPayload {
   const start = cleanString(value.start, 'Event start', 100);
   const end = cleanString(value.end, 'Event end', 100);
   const isoDateTime = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?(?:Z|[+-]\d{2}:\d{2})$/i;
@@ -186,8 +192,8 @@ function projectEvent(value: EventProposalPayload): DispatchPayload {
   try { new Intl.DateTimeFormat('en', { timeZone }).format(0); } catch { fail('Approved event time zone is invalid.'); }
   if (!Array.isArray(value.attendees) || value.attendees.length > 100 || !['send', 'none'].includes(value.invitePolicy)) fail('Approved event attendees or invitation policy are invalid.');
   return { kind: 'event', event: {
-    ...(value.title !== undefined ? { title: cleanString(value.title, 'Event title', 1000, true) } : {}),
-    ...(value.description !== undefined ? { description: contentString(value.description, 'Event description', 100_000, true) } : {}),
+    ...(value.title !== undefined ? { title: cleanString(value.title, 'Event title', outputPolicyVersion === 2 ? Number.MAX_SAFE_INTEGER : 1000, true) } : {}),
+    ...(value.description !== undefined ? { description: contentString(value.description, 'Event description', 100_000, true, outputPolicyVersion === 2) } : {}),
     start, end, timeZone, attendees: value.attendees.map((item) => email(item, 'Event attendee')), invitePolicy: value.invitePolicy,
   } };
 }
@@ -246,8 +252,9 @@ export function createDispatchRecord(input: CreateDispatchRecordInput): Dispatch
     email: email(account.email, 'Account email'),
   };
   const proposalId = cleanString(proposal.id, 'Proposal ID', 160);
-  const title = cleanString(proposal.title, 'Approved title', 1000);
-  const body = contentString(proposal.body, 'Approved body', 100_000, true);
+  const outputPolicyVersion = sourceProvenance.outputPolicyVersion ?? 1;
+  const title = cleanString(proposal.title, 'Approved title', outputPolicyVersion === 2 ? Number.MAX_SAFE_INTEGER : 1000);
+  const body = contentString(proposal.body, 'Approved body', 100_000, true, outputPolicyVersion === 2);
   const common = { version: 1 as const, id, proposalId, approvedRevision: proposal.revision, ...(proposal.sourceRevision !== undefined ? { sourceRevision: proposal.sourceRevision } : {}), payloadDigest: payloadDigest.toLowerCase(), sourceActionKey,
     duplicateKey: '', sourceProvenance,
     ...(sourceProvenance.version === 2 && sourceProvenance.batchJobId ? { mailReplyBatchBinding: {
@@ -262,7 +269,7 @@ export function createDispatchRecord(input: CreateDispatchRecordInput): Dispatch
         account.id !== sourceProvenance.source.accountId || !sameIdentitySnapshot(identity, sourceProvenance.source.identity))) {
       fail('Mail reply dispatch account does not match the frozen source identity.');
     }
-    const record = { ...common, operation, payload: projectEmail(proposal.email, operation) };
+    const record = { ...common, operation, payload: projectEmail(proposal.email, operation, outputPolicyVersion) };
     record.duplicateKey = identityActionKey(identity, sourceActionKey, operation);
     return freezeClone(record);
   }
@@ -273,7 +280,7 @@ export function createDispatchRecord(input: CreateDispatchRecordInput): Dispatch
     const providerIdempotencyKey = cleanString(proposal.eventTransactionId, 'Event provider idempotency key', 64);
     if (!UUID.test(providerIdempotencyKey)) fail('Event provider idempotency key must be a UUID.');
     const operation: DispatchOperation = 'event';
-    const record = { ...common, operation, calendar: calendarSnapshot, providerIdempotencyKey, payload: projectEvent(proposal.event) };
+    const record = { ...common, operation, calendar: calendarSnapshot, providerIdempotencyKey, payload: projectEvent(proposal.event, outputPolicyVersion) };
     record.duplicateKey = identityActionKey(identity, sourceActionKey, operation);
     return freezeClone(record);
   }

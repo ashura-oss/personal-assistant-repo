@@ -1,7 +1,7 @@
 import type { MailReplySourceSnapshot, SelectedMailTextSnapshot } from '../core';
 import { canonicalMailReplySource } from '../mailReply';
 import { MAX_SELECTED_MAIL_TEXT_BYTES, utf8Bytes } from '../mailText';
-import { OPENROUTER_BATCH_BODY_MODEL, OPENROUTER_CHAT_COMPLETIONS_PATH, type OpenRouterBatchInspection } from './openRouter';
+import { OPENROUTER_BATCH_BODY_MODEL, OPENROUTER_CHAT_COMPLETIONS_PATH, type OpenRouterBatchInspection, type OpenRouterBatchOutputPolicyVersion } from './openRouter';
 
 const SHA256 = /^[a-f0-9]{64}$/;
 const object = (value: unknown): Record<string, unknown> | undefined => value && typeof value === 'object' && !Array.isArray(value)
@@ -154,7 +154,7 @@ function sameCanonicalIdentity(a: unknown, b: unknown): boolean {
 }
 
 /** Strictly parses one inert Batch result. It never creates a proposal or performs side effects. */
-export function parseOpenRouterMailReplyResult(inspection: OpenRouterBatchInspection, requestBody: string): { text: string; sha256Input: string } {
+export function parseOpenRouterMailReplyResult(inspection: OpenRouterBatchInspection, requestBody: string, outputPolicyVersion: OpenRouterBatchOutputPolicyVersion = 1): { text: string; sha256Input: string } {
   const body = object(inspection.result?.responseBody);
   const choices = body?.choices;
   let request: Record<string, unknown> | undefined;
@@ -174,12 +174,12 @@ export function parseOpenRouterMailReplyResult(inspection: OpenRouterBatchInspec
   let parsed: unknown;
   try { parsed = JSON.parse(message.content) as unknown; } catch { throw new Error('The mail reply Batch result was invalid.'); }
   const result = object(parsed);
-  if (!result || !exact(result, ['text']) || typeof result.text !== 'string' || !validReplyText(result.text)) throw new Error('The mail reply Batch result was invalid.');
+  if (!result || !exact(result, ['text']) || typeof result.text !== 'string' || !validReplyText(result.text, outputPolicyVersion === 2 ? Number.MAX_SAFE_INTEGER : 100_000)) throw new Error('The mail reply Batch result was invalid.');
   return { text: result.text, sha256Input: result.text };
 }
 
 export function validReplyText(text: string, maxChars = 100_000): boolean {
-  if (!text.trim() || text.length > maxChars || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(text)) return false;
+  if (!text.trim() || text.length > maxChars || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u.test(text)) return false;
   for (let index = 0; index < text.length; index += 1) {
     const code = text.charCodeAt(index);
     if (code >= 0xd800 && code <= 0xdbff) {

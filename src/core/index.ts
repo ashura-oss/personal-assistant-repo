@@ -47,6 +47,8 @@ export interface NoteAssistResult {
   stale?: boolean;
   /** Saved input-policy identity; absent results retain the exact legacy policy-1 fingerprint. */
   inputPolicyVersion?: 1 | 2;
+  /** Generated-output contract; absent historical results mean policy 1. */
+  outputPolicyVersion?: 1 | 2;
 }
 
 export interface ImportedTaskOrigin {
@@ -124,6 +126,10 @@ export interface NoteProposalProvenance {
   settingsFingerprint: string;
   answeredAsOf?: string;
   expiresAt?: string;
+  /** Generated-output contract; absent historical proposals mean policy 1. */
+  outputPolicyVersion?: 1 | 2;
+  /** Source-selection contract; absent historical proposals mean policy 1. */
+  inputPolicyVersion?: 1 | 2;
 }
 
 export interface MailReplySourceSnapshot {
@@ -161,6 +167,8 @@ export interface MailReplyProvenance {
   expiresAt: string;
   /** Present only when this immutable reply text came from a retained Batch result. */
   batchJobId?: string;
+  /** Generated-output contract; absent historical proposals mean policy 1. */
+  outputPolicyVersion?: 1 | 2;
 }
 
 /** Backward-compatible name for note-derived provenance; new proposals use the explicit union. */

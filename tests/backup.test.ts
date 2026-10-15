@@ -3,9 +3,9 @@ import type { AppState } from '../src/core';
 import {
   BACKUP_LIMITS, PORTABLE_BACKUP_FORMAT, canonicalPortableContent, createPortableBackup, createPortableKnowledge,
   parsePortableBackup, summarizePortableBackup, validateImportedBackupArchive, legacyCanonicalPortableContentV2, legacyCanonicalPortableContentV3,
-  validatePortableDocumentPath, type PortableBackupV4,
+  PORTABLE_BACKUP_V5_FORMAT, validatePortableDocumentPath, type PortableBackupV4, type PortableBackupV5,
 } from '../src/backup';
-import { emptyKnowledgeState } from '../src/knowledge';
+import { emptyKnowledgeState, type KnowledgeState } from '../src/knowledge';
 import { emptyReminderState } from '../src/reminders';
 import { emptyProactiveMailAlertState } from '../src/proactiveMailAlerts/state';
 
@@ -71,6 +71,58 @@ describe('portable backup schema', () => {
     expect(text).not.toContain('CHAT_PRIVATE');
     expect(text).toContain('Legacy orphan');
     expect(text).toContain('Keep unrelated orphan activity');
+  });
+
+  it('roundtrips long policy-2 analysis and proposal history through V5 under the aggregate restore budget', () => {
+    const state = emptyState();
+    const longSummary = '🧪'.repeat(140_000);
+    const longProposal = 'é'.repeat(180_000);
+    state.notes.push({ id: 'policy2-note', title: 'Generated note', transcript: 'Source transcript', durationSeconds: 5,
+      createdAt: at, capturedAt: at, captureTimeZone: 'Asia/Singapore', status: 'processed', revision: 1,
+      analysis: { noteId: 'policy2-note', sourceRevision: 1, intent: 'summarize', fingerprint: 'a'.repeat(64), analyzedAt: at, capturedAt: at,
+        captureTimeZone: 'Asia/Singapore', summary: longSummary, answer: '', decisions: [], citations: [], clarifications: [], proposalIds: [],
+        source: 'provider', includedSourceIds: [], includedSources: [], omittedSourceIds: [], omittedSourceCount: 0, sourceVersions: {}, knowledgeSelection: [], outputPolicyVersion: 2 } });
+    state.proposals.push({ id: 'policy2-proposal', noteId: 'policy2-note', kind: 'task', title: 'Generated task', body: longProposal,
+      status: 'draft', revision: 1, recipients: [], evidence: [], provenance: { version: 2, outputPolicyVersion: 2 } } as unknown as AppState['proposals'][number]);
+    const backup = createPortableBackup(state, { exportId: 'policy2-large', exportedAt: at });
+    expect(backup.format).toBe('still-backup-v5');
+    const parsed = parsePortableBackup(JSON.stringify(backup));
+    expect(parsed.backup.format).toBe('still-backup-v5');
+    expect(parsed.backup.history.find((item) => item.sourceId === 'analysis:policy2-note:summary')).toMatchObject({ outputPolicyVersion: 2, content: longSummary });
+    expect(parsed.backup.history.find((item) => item.sourceId === 'proposal:policy2-proposal')?.content).toContain(longProposal);
+    expect(JSON.stringify(parsed.backup).length).toBeGreaterThan(256 * 1024);
+  });
+
+  it('omits explicit default policy 1 markers so an otherwise legacy backup keeps its V4 shape', () => {
+    const state = emptyState();
+    state.notes.push({ id: 'legacy-policy-one', title: 'Legacy', transcript: 'Transcript', durationSeconds: 1, createdAt: at,
+      status: 'processed', revision: 1, analysis: { noteId: 'legacy-policy-one', sourceRevision: 1, intent: 'summarize', fingerprint: 'a'.repeat(64),
+        analyzedAt: at, capturedAt: at, captureTimeZone: 'UTC', summary: 'Old summary', answer: '', decisions: [], citations: [], clarifications: [], proposalIds: [],
+        source: 'provider', includedSourceIds: [], includedSources: [], omittedSourceIds: [], omittedSourceCount: 0, sourceVersions: {}, knowledgeSelection: [], outputPolicyVersion: 1 } });
+    const backup = createPortableBackup(state, { exportId: 'policy1-shape', exportedAt: at });
+    expect(backup.format).toBe(PORTABLE_BACKUP_FORMAT);
+    expect(JSON.stringify(backup)).not.toContain('outputPolicyVersion');
+  });
+
+  it('does not let one policy-2 knowledge entity relax an unrelated legacy narrative', () => {
+    const knowledge = knowledgeWithProviderReference() as KnowledgeState;
+    knowledge.people[0]!.facts[0]!.outputPolicyVersion = 2;
+    const otherId = '123e4567-e89b-42d3-a456-426614174030';
+    knowledge.people.push({ id: otherId, revision: 1, name: 'Grace', aliases: [], narrativePath: `people/${otherId}.md`, createdAt: at, updatedAt: at,
+      facts: [], contacts: [], sourceLinks: [] });
+    expect(() => createPortableKnowledge(knowledge, [
+      { path: `people/${personUuid}.md`, content: 'Policy-two narrative '.repeat(1_000), revision: 1, updatedAt: at },
+      { path: `people/${otherId}.md`, content: 'Legacy narrative '.repeat(1_000), revision: 1, updatedAt: at },
+    ])).toThrow(/knowledge narrative/i);
+  });
+
+  it('keeps the legacy history row cap in V5 when policy-2 and legacy history are mixed', () => {
+    const base = createPortableBackup(emptyState(), { exportId: 'v5-mixed-history-count', exportedAt: at });
+    const legacyRows = Array.from({ length: BACKUP_LIMITS.history + 1 }, (_, index) => ({ kind: 'activity' as const,
+      sourceId: `legacy-history:${index}`, title: 'Legacy', content: 'Text', status: 'old' }));
+    const mixed = { ...base, format: PORTABLE_BACKUP_V5_FORMAT, schemaVersion: 5,
+      history: [...legacyRows, { kind: 'analysis' as const, sourceId: 'generated-history', title: 'Generated', content: 'More content', status: 'saved', outputPolicyVersion: 2 as const }] } as PortableBackupV5;
+    expect(() => parsePortableBackup(JSON.stringify(mixed))).toThrow(/legacy history exceeds/i);
   });
 
   it('projects only portable content and strips local audio paths and authority fields', () => {

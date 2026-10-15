@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
-  assistantResponseSchema, assistantResponseSchemaV2, buildLocalSourceInputs, buildLocalSourceSet, buildOfflinePreview, createSourceCatalog, selectContext, validateAssistantResponse, validateAssistantResponseV2,
+  assistantResponseSchema, assistantResponseSchemaV2, assistantResponseSchemaV3, buildLocalSourceInputs, buildLocalSourceSet, buildOfflinePreview, createSourceCatalog, selectContext,
+  validateAssistantResponse, validateAssistantResponseV2, validateAssistantResponseV3,
 } from '../src/assistant';
 import type { AssistantSourceInput } from '../src/assistant/types';
 
@@ -176,6 +177,31 @@ describe('local assistant context and response validation', () => {
     expect(() => validateAssistantResponse({ ...good, citations: [{ ...good.citations[0], quote: 'The draft is nearly ready.' }] }, catalog, selection)).toThrow(/exact quote/i);
     expect(() => validateAssistantResponse({ ...good, proposals: [{ ...good.proposals[0], evidence: [] }] }, catalog, selection)).toThrow(/exact transcript quote/i);
     expect(() => validateAssistantResponse({ ...good, decisions: [{ ...good.decisions[0], sourceId: 'doc:memory/PROFILE.md', revision: 1, sourceVersion: catalog.byId.get('doc:memory/PROFILE.md')!.version, quote: 'I decided to call Mina tomorrow.' }] }, catalog, selection)).toThrow(/exact quote/i);
+  });
+
+  it('uses policy-v2 response schema without generated prose or item-count ceilings while retaining evidence checks', async () => {
+    const catalog = await createSourceCatalog([transcript, rules, profile], fakeSha256);
+    const selection = selectContext(catalog, { query: 'North', byteBudget: 4000, buildBody: (context) => JSON.stringify({ context }) });
+    const source = catalog.byId.get('transcript')!;
+    const evidence = { sourceId: 'transcript', revision: 3, sourceVersion: source.version, quote: transcript.text };
+    const longProse = '🛰️ detail '.repeat(900);
+    const response = {
+      summary: longProse, answer: longProse,
+      decisions: Array.from({ length: 25 }, () => ({ text: longProse, ...evidence })),
+      citations: Array.from({ length: 35 }, () => evidence),
+      clarifications: Array.from({ length: 15 }, () => longProse),
+      proposals: Array.from({ length: 25 }, (_, index) => ({ kind: 'task', title: longProse, body: longProse,
+        recipients: Array.from({ length: 12 }, (_, recipient) => `person-${index}-${recipient}@example.test`), dueAt: null, evidence: [transcript.text] })),
+      memorySuggestions: [],
+    };
+    const schemaProperties = assistantResponseSchemaV3.properties as Record<string, Record<string, unknown>>;
+    expect(schemaProperties.summary?.maxLength).toBeUndefined();
+    expect(schemaProperties.decisions?.maxItems).toBeUndefined();
+    expect(validateAssistantResponseV3(response, catalog, selection).proposals).toHaveLength(25);
+    expect(() => validateAssistantResponseV3({ ...response, citations: [ { ...evidence, quote: 'fabricated' } ] }, catalog, selection))
+      .toThrow(/exact quote/i);
+    expect(() => validateAssistantResponseV3({ ...response, answer: `${longProse}\u0000` }, catalog, selection))
+      .toThrow(/answer is invalid/i);
   });
 
   it('rejects citations to a source whose selected excerpt was omitted', async () => {

@@ -14,10 +14,17 @@ class MemoryStore implements StateStore {
   value?: AppState;
   saves = 0;
   failAfterCommit = false;
+  afterProviderObservationSave?: () => void;
   async load() { return this.value ? structuredClone(this.value) : undefined; }
   async save(state: AppState) {
     this.saves += 1;
     this.value = structuredClone(state);
+    const ledger = (state as AppState & { openRouterBatchLedger?: { jobs?: { providerObservation?: unknown }[] } }).openRouterBatchLedger;
+    if (ledger?.jobs?.some((job) => job.providerObservation) && this.afterProviderObservationSave) {
+      const hook = this.afterProviderObservationSave;
+      this.afterProviderObservationSave = undefined;
+      hook();
+    }
     if (this.failAfterCommit) { this.failAfterCommit = false; throw new Error('fixture lost the save acknowledgement'); }
   }
   async clear() { this.value = undefined; }
@@ -174,6 +181,150 @@ function truncatedInspection(customId: string, batchId = 'batch_truncated_fixtur
 }
 
 describe('OpenRouter Batch controller lifecycle', () => {
+  it('recovers a checkpoint after save-acknowledgement loss by inspecting the same Batch ID without resubmitting', async () => {
+    let submissions = 0;
+    const inspectedBatchIds: string[] = [];
+    const fakeClient = {
+      submit: async (_input: unknown, before: () => Promise<void>, assert: () => void) => {
+        submissions += 1; await before(); assert();
+        return { batchId: 'batch_checkpoint_fixture', status: 'validating' as const, endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH,
+          model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h' as const, total: 1, completed: 0, failed: 0 };
+      },
+      inspect: async (batchId: string, customId: string) => {
+        inspectedBatchIds.push(batchId);
+        return { ...completedInspection(customId, JSON.stringify({ text: 'Reply observed exactly once.' })), batchId };
+      },
+    } as unknown as OpenRouterBatchClient;
+    const fixture = await mailFixture(fakeClient);
+    const queued = await fixture.app.submitMailReplyBatch({ messageId: fixture.message.id, sourceDigest: fixture.source.source!.sourceDigest,
+      textDigest: fixture.textDigest, mode: 'reply', to: ['sam@example.test'], cc: [], brief: 'Reply briefly.', composerRevision: 1 });
+    fixture.store.failAfterCommit = true;
+    await expect(fixture.app.refreshAssistantBatch(queued.id)).rejects.toThrow(/acknowledgement/i);
+    const persisted = (fixture.store.value as AppState & { openRouterBatchLedger: { jobs: { id: string; providerObservation?: { resultSha256: string }; status: string; accounting?: { providerReportedCostUsd?: number } }[] } })
+      .openRouterBatchLedger.jobs.find((job) => job.id === queued.id)!;
+    expect(persisted).toMatchObject({ status: 'processing', providerObservation: { resultSha256: expect.stringMatching(/^[0-9a-f]{64}$/) }, accounting: { providerReportedCostUsd: 0.001 } });
+
+    const restarted = new AppControllerImpl(fixture.store, {}, fixture.integration);
+    await restarted.load();
+    await expect(restarted.refreshAssistantBatch(queued.id)).resolves.toMatchObject({ status: 'completed', providerReportedCostUsd: 0.001, hasMailReplyResult: true });
+    expect(submissions).toBe(1);
+    expect(inspectedBatchIds).toEqual(['batch_checkpoint_fixture', 'batch_checkpoint_fixture']);
+    expect((fixture.store.value as AppState & { openRouterBatchLedger: { jobs: { id: string; providerObservation?: { resultSha256: string } }[] } })
+      .openRouterBatchLedger.jobs.find((job) => job.id === queued.id)?.providerObservation?.resultSha256).toBe(persisted.providerObservation!.resultSha256);
+  });
+
+  it('rejects a different second result without replacing the durable checkpoint or its accounting', async () => {
+    let submissions = 0;
+    let inspectionCount = 0;
+    const fakeClient = {
+      submit: async (_input: unknown, before: () => Promise<void>, assert: () => void) => {
+        submissions += 1; await before(); assert();
+        return { batchId: 'batch_checkpoint_mismatch', status: 'validating' as const, endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH,
+          model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h' as const, total: 1, completed: 0, failed: 0 };
+      },
+      inspect: async (batchId: string, customId: string) => {
+        const body = inspectionCount++ === 0 ? 'First provider result.' : 'Contradictory provider result.';
+        return { ...completedInspection(customId, JSON.stringify({ text: body })), batchId,
+          usage: { cost: inspectionCount === 1 ? 0.001 : 99, totalTokens: inspectionCount === 1 ? 17 : 999 } };
+      },
+    } as unknown as OpenRouterBatchClient;
+    const fixture = await mailFixture(fakeClient);
+    const queued = await fixture.app.submitMailReplyBatch({ messageId: fixture.message.id, sourceDigest: fixture.source.source!.sourceDigest,
+      textDigest: fixture.textDigest, mode: 'reply', to: ['sam@example.test'], cc: [], brief: 'Reply briefly.', composerRevision: 1 });
+    fixture.store.failAfterCommit = true;
+    await expect(fixture.app.refreshAssistantBatch(queued.id)).rejects.toThrow(/acknowledgement/i);
+    const first = (fixture.store.value as AppState & { openRouterBatchLedger: { jobs: { id: string; providerObservation: { resultSha256: string }; accounting: { providerReportedCostUsd?: number; totalTokens?: number }; status: string }[] } })
+      .openRouterBatchLedger.jobs.find((job) => job.id === queued.id)!;
+    const restarted = new AppControllerImpl(fixture.store, {}, fixture.integration);
+    await restarted.load();
+    await expect(restarted.refreshAssistantBatch(queued.id)).rejects.toThrow(/different result/i);
+    const after = (fixture.store.value as AppState & { openRouterBatchLedger: { jobs: { id: string; providerObservation: { resultSha256: string }; accounting: { providerReportedCostUsd?: number; totalTokens?: number }; status: string }[] } })
+      .openRouterBatchLedger.jobs.find((job) => job.id === queued.id)!;
+    expect(after).toMatchObject({ status: 'processing', providerObservation: first.providerObservation, accounting: first.accounting });
+    expect(submissions).toBe(1);
+  });
+
+  it.each(['processing response', 'malformed completed response', 'changed source with a different valid result'] as const)(
+    'preserves first checkpoint accounting after a %s', async (scenario) => {
+      let submissions = 0;
+      let inspectionCount = 0;
+      const firstContent = JSON.stringify({ summary: 'First observed result.', answer: '', decisions: [], citations: [], clarifications: [], proposals: [], memorySuggestions: [] });
+      const fakeClient = {
+        submit: async (_input: unknown, before: () => Promise<void>, assert: () => void) => {
+          submissions += 1; await before(); assert();
+          return { batchId: 'batch_observation_conflict', status: 'validating' as const, endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH,
+            model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h' as const, total: 1, completed: 0, failed: 0 };
+        },
+        inspect: async (batchId: string, customId: string) => {
+          inspectionCount += 1;
+          if (inspectionCount === 1) return { ...completedInspection(customId, firstContent), batchId,
+            usage: { cost: 0.001, promptTokens: 12, completionTokens: 5, totalTokens: 17 } };
+          const changedContent = JSON.stringify({ summary: 'Contradictory second result.', answer: '', decisions: [], citations: [], clarifications: [], proposals: [], memorySuggestions: [] });
+          if (scenario === 'processing response') return { ...completedInspection(customId, changedContent), batchId, status: 'in_progress' as const,
+            usage: { cost: 99, promptTokens: 999, completionTokens: 999, totalTokens: 1998 } };
+          if (scenario === 'malformed completed response') return { ...completedInspection(customId, changedContent), batchId,
+            metadataValidation: 'invalid' as const, resultValidation: 'invalid' as const,
+            usage: { cost: 99, promptTokens: 999, completionTokens: 999, totalTokens: 1998 } };
+          return { ...completedInspection(customId, changedContent), batchId,
+            usage: { cost: 99, promptTokens: 999, completionTokens: 999, totalTokens: 1998 } };
+        },
+      } as unknown as OpenRouterBatchClient;
+      const store = new MemoryStore();
+      const integration = { openRouterBatchClient: fakeClient };
+      let app = new AppControllerImpl(store, {}, integration);
+      await app.load();
+      await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
+      const note = await app.saveNote({ transcript: 'one two three four five six seven first observation conflict' });
+      const job = await app.submitNoteBatch(note.id);
+      store.failAfterCommit = true;
+      await expect(app.refreshAssistantBatch(job.id)).rejects.toThrow(/acknowledgement/i);
+      const firstSaved = (store.value as AppState & { openRouterBatchLedger: { jobs: { id: string; providerObservation: { resultSha256: string }; accounting: Record<string, unknown> }[] } })
+        .openRouterBatchLedger.jobs.find((row) => row.id === job.id)!;
+
+      app = new AppControllerImpl(store, {}, integration);
+      await app.load();
+      if (scenario === 'changed source with a different valid result') await app.saveSettings({ timezone: 'America/Los_Angeles' });
+      await expect(app.refreshAssistantBatch(job.id)).resolves.toMatchObject({ status: 'processing', providerReportedCostUsd: 0.001 });
+      const after = (store.value as AppState & { openRouterBatchLedger: { jobs: { id: string; status: string; providerObservation: { resultSha256: string }; accounting: Record<string, unknown> }[] } })
+        .openRouterBatchLedger.jobs.find((row) => row.id === job.id)!;
+      expect(after).toMatchObject({ status: 'processing', providerObservation: firstSaved.providerObservation, accounting: firstSaved.accounting });
+      expect(after.accounting).toEqual({ providerReportedCostUsd: 0.001, promptTokens: 12, completionTokens: 5, totalTokens: 17 });
+      expect(store.value?.notes.find((row) => row.id === note.id)?.analysis).toBeUndefined();
+      expect(submissions).toBe(1);
+      expect(inspectionCount).toBe(2);
+    },
+  );
+
+  it('keeps the exact checkpoint state fence when a source edit queues before materialization resumes', async () => {
+    const fakeClient = {
+      submit: (input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => fakeSubmit('batch_checkpoint_source_race', input, before, assert),
+      inspect: async (_batchId: string, customId: string) => ({ ...completedInspection(customId), batchId: 'batch_checkpoint_source_race' }),
+    } as unknown as OpenRouterBatchClient;
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient });
+    await app.load();
+    await app.saveSettings({ mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
+    const note = await app.saveNote({ transcript: 'one two three four five six seven checkpoint source race' });
+    const job = await app.submitNoteBatch(note.id);
+    let sourceEdit: Promise<unknown> | undefined;
+    store.afterProviderObservationSave = () => {
+      sourceEdit = (app as unknown as { mutate(operation: (draft: AppState) => void): Promise<void> }).mutate((draft) => {
+        const current = draft.notes.find((row) => row.id === note.id)!;
+        current.transcript = 'one two three four five six seven changed while result was checkpointed';
+        current.revision += 1;
+      });
+    };
+
+    await expect(app.refreshAssistantBatch(job.id)).rejects.toThrow(/changed during inspection|earlier workspace session/i);
+    await sourceEdit;
+    const persisted = store.value as AppState & { openRouterBatchLedger: { jobs: { id: string; status: string; providerObservation?: { resultSha256: string }; accounting?: { providerReportedCostUsd?: number } }[] } };
+    expect(persisted.notes.find((row) => row.id === note.id)?.analysis).toBeUndefined();
+    expect(persisted.openRouterBatchLedger.jobs.find((row) => row.id === job.id)).toMatchObject({
+      status: 'processing', providerObservation: { resultSha256: expect.stringMatching(/^[0-9a-f]{64}$/) },
+      accounting: { providerReportedCostUsd: 0.001 },
+    });
+  });
+
   it('keeps >16 KiB target and conversation bodies through policy-v2 submission and a current source proof', async () => {
     const fakeClient = {
       submit: async (_input: unknown, before: () => Promise<void>, assert: () => void) => {
@@ -1744,6 +1895,7 @@ describe('OpenRouter Batch controller lifecycle', () => {
       recovered.failureCode = 'result_truncated';
       delete recovered.resultText;
       delete recovered.resultSha256;
+      delete recovered.providerObservation;
       await fixture.store.save(raw);
       fixture.app = new AppControllerImpl(fixture.store, {}, fixture.integration);
       await fixture.app.load();
@@ -2155,7 +2307,7 @@ describe('OpenRouter Batch controller lifecycle', () => {
       expect(childTurn).toMatchObject({ parentTurnId: parent.turnId, operation: 'chat_refinement', capturedAt: '2026-10-13T10:00:00.000Z' });
       expect(childTurn.createdAt).toBe('2026-10-13T10:05:00.000Z');
       expect(childTurn.capturedAt).not.toBe(childTurn.createdAt);
-      expect(childJob).toMatchObject({ operation: 'chat_refinement', effort: 'high', reasoningEffort: 'high', requestProfileVersion: 2, parentTurnId: parent.turnId });
+      expect(childJob).toMatchObject({ operation: 'chat_refinement', effort: 'high', reasoningEffort: 'high', requestProfileVersion: 5, parentTurnId: parent.turnId });
       expect(childJob.chatBinding?.context).toEqual(originalParentJob.chatBinding?.context);
       const childWire = postedBodies.at(-1)?.body as { reasoning: { effort: string }; response_format: { json_schema: { name: string } }; messages: { content: string }[] };
       expect(childWire.reasoning.effort).toBe('high');
@@ -2808,6 +2960,7 @@ describe('OpenRouter Batch controller lifecycle', () => {
       requestProfileVersion: 1, requestBody, requestBytes: new TextEncoder().encode(requestBody).byteLength,
       requestSha256: await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, requestBody, { encoding: Crypto.CryptoEncoding.HEX }),
     });
+    delete job.outputPolicyVersion;
 
     const restored = new AppControllerImpl(store, {}, { openRouterBatchClient: fakeClient });
     await restored.load();
@@ -3028,7 +3181,7 @@ describe('OpenRouter Batch controller lifecycle', () => {
     await app.savePerson({ id: person.id, expectedRevision: savedPerson.revision, expectedDocumentRevision: narrative.revision,
       name: 'Maya', aliases: [], narrative: 'Updated local narrative.' });
     const saved = store.value as (AppState & { openRouterBatchLedger: { jobs: Record<string, unknown>[] } });
-    expect(saved.openRouterBatchLedger.jobs[0]).toMatchObject({ id: queued.id, status: 'source_removed', requestProfileVersion: 2 });
+    expect(saved.openRouterBatchLedger.jobs[0]).toMatchObject({ id: queued.id, status: 'source_removed', requestProfileVersion: 5, outputPolicyVersion: 2 });
     expect(JSON.stringify(saved)).not.toContain('PRIVATE_KNOWLEDGE_NARRATIVE');
   });
 
@@ -3046,7 +3199,7 @@ describe('OpenRouter Batch controller lifecycle', () => {
 
     await app.saveDocument(document.path, 'Project Phoenix identifier was removed.', { expectedRevision: document.revision });
     const saved = store.value as (AppState & { openRouterBatchLedger: { jobs: Record<string, unknown>[] } });
-    expect(saved.openRouterBatchLedger.jobs[0]).toMatchObject({ id: queued.id, status: 'source_removed', requestProfileVersion: 2 });
+    expect(saved.openRouterBatchLedger.jobs[0]).toMatchObject({ id: queued.id, status: 'source_removed', requestProfileVersion: 5, outputPolicyVersion: 2 });
     expect(JSON.stringify(saved)).not.toContain('PRIVATE_DOCUMENT_CANARY');
   });
 
@@ -3134,7 +3287,7 @@ describe('OpenRouter Batch controller lifecycle', () => {
 
     await app.reviewKnowledgeSuggestion(suggestion.id, { expectedRevision: suggestion.revision, decision: 'accept', targetRevision: person.revision });
     const saved = store.value as (AppState & { openRouterBatchLedger: { jobs: Record<string, unknown>[] } });
-    expect(saved.openRouterBatchLedger.jobs[0]).toMatchObject({ id: job.id, status: 'source_removed', requestProfileVersion: 2 });
+    expect(saved.openRouterBatchLedger.jobs[0]).toMatchObject({ id: job.id, status: 'source_removed', requestProfileVersion: 5, outputPolicyVersion: 2 });
     expect(saved.openRouterBatchLedger.jobs[0]).not.toHaveProperty('requestBody');
     expect(JSON.stringify(saved.openRouterBatchLedger)).not.toContain('PRIVATE_KNOWLEDGE_BEFORE_REVIEW');
   });

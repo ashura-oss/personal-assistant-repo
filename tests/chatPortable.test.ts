@@ -5,7 +5,9 @@ import {
   IMPORTED_CHAT_HISTORY_ORIGIN,
   createPortableChatHistory,
   materializeInertChatHistory,
+  projectInertImportedChatHistory,
   serializePortableChatHistory,
+  validateInertImportedChatHistory,
   validatePortableChatHistory,
 } from '../src/chat/portable';
 import { OPENROUTER_BATCH_BODY_MODEL } from '../src/services/openRouter';
@@ -110,6 +112,18 @@ describe('inert portable Chat history', () => {
     expect(turn?.origin).toBe(IMPORTED_CHAT_HISTORY_ORIGIN);
     expect(turn).not.toHaveProperty('noteId');
     expect(turn).not.toHaveProperty('jobId');
+  });
+
+  it('preserves explicit legacy output policy metadata through inert import and re-export', () => {
+    const imported = validateInertImportedChatHistory([{
+      id: '50000000-0000-4000-8000-000000000001', origin: IMPORTED_CHAT_HISTORY_ORIGIN, title: 'Imported', createdAt: at, updatedAt: at,
+      turns: [{ id: '60000000-0000-4000-8000-000000000001', origin: IMPORTED_CHAT_HISTORY_ORIGIN, userText: 'An inert turn.', createdAt: at,
+        capturedAt: at, captureTimeZone: 'UTC', reply: { summary: 'Old reply.', answer: '', clarifications: [], completedAt: at, outputPolicyVersion: 1 } }],
+    }]);
+    expect(imported[0]?.turns[0]?.reply?.outputPolicyVersion).toBe(1);
+    const portable = projectInertImportedChatHistory(imported);
+    expect(portable.version).toBe(2);
+    expect(portable.conversations[0]?.turns[0]?.reply?.outputPolicyVersion).toBe(1);
   });
 
   it('strictly rejects authority fields, malformed accounting, invalid Unicode and invalid time zones', () => {

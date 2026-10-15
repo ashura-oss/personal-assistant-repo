@@ -1102,6 +1102,37 @@ describe('provider connector clients', () => {
     expect(sent.transactionId).toBe('12345678-1234-4234-8234-123456789abc');
   });
 
+  it('dispatches an approved email with generated body and title above former prose caps', async () => {
+    const fetcherMock = vi.fn(async (_url: RequestInfo | URL, _init?: RequestInit) => response({ id: 'large-draft' }));
+    const { client } = fixture({ fetcher: fetcherMock as typeof fetch });
+    const longBody = '🛰️ email detail '.repeat(9_000);
+    const longTitle = 'Approved generated title '.repeat(60);
+    const longEnvelope = { ...envelope, operation: 'draft' as const, title: longTitle, body: longBody,
+      payload: { ...payload, text: longBody } };
+    await expect(client.createDraft(account, longEnvelope, verifier)).resolves.toMatchObject({ status: 'accepted', id: 'large-draft' });
+    const post = fetcherMock.mock.calls.find(([url, init]) => String(url).endsWith('/drafts') && (init as RequestInit | undefined)?.method === 'POST');
+    expect(post).toBeDefined();
+    const wire = JSON.parse(String(post?.[1]?.body)) as { message: { raw: string } };
+    expect(wire.message.raw.length).toBeGreaterThan(100_000);
+  });
+
+  it('dispatches an approved calendar event with generated title and description above former prose caps', async () => {
+    const fetcherMock = vi.fn(async (_url: RequestInfo | URL, _init?: RequestInit) => response({ id: 'large-event' }));
+    const { client } = fixture({ fetcher: fetcherMock as typeof fetch });
+    const longTitle = 'Event title detail '.repeat(90);
+    const longDescription = '🗓️ event description detail '.repeat(5_000);
+    const eventPayload = { title: longTitle, description: longDescription, start: '2026-01-01T12:00:00Z', end: '2026-01-01T13:00:00Z',
+      timeZone: 'Asia/Singapore', attendees: [], invitePolicy: 'none' as const };
+    const eventEnvelope: ApprovedDispatch = { ...envelope, title: longTitle, body: longDescription, operation: 'event',
+      payloadDigest: 'b'.repeat(64), calendarId: 'calendar-1', payload: eventPayload };
+    await expect(client.createEvent(account, 'calendar-1', eventEnvelope, verifier, '12345678-1234-4234-8234-123456789abc'))
+      .resolves.toMatchObject({ status: 'accepted', id: 'large-event' });
+    const post = fetcherMock.mock.calls.find(([url, init]) => String(url).includes('/events?') && (init as RequestInit | undefined)?.method === 'POST');
+    const wire = JSON.parse(String(post?.[1]?.body)) as { summary: string; description: string };
+    expect(wire.summary).toBe(longTitle);
+    expect(wire.description).toBe(longDescription);
+  });
+
   it('includes checked attachment bytes in Gmail MIME', async () => {
     const bytes = new TextEncoder().encode('approved attachment');
     const fetcherMock = vi.fn(async (_url: RequestInfo | URL, _init?: RequestInit) => response({ id: 'draft-attachment' }));

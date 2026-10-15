@@ -422,12 +422,53 @@ export const assistantChatRefinementSchemaV2 = {
   },
 } as const;
 
-function requireString(value: unknown, label: string, maxLength: number, allowEmpty = true): string {
-  if (typeof value !== 'string' || value.length > maxLength || (!allowEmpty && !value.trim())) throw new Error(`Assistant response ${label} is invalid.`);
+function unlimitedOutputSchema<T extends object>(schema: T): T {
+  const copy = JSON.parse(JSON.stringify(schema)) as Record<string, unknown>;
+  const visit = (value: unknown): void => {
+    if (!value || typeof value !== 'object') return;
+    if (Array.isArray(value)) { value.forEach(visit); return; }
+    const row = value as Record<string, unknown>;
+    delete row.maxLength;
+    delete row.maxItems;
+    for (const child of Object.values(row)) visit(child);
+  };
+  visit(copy);
+  return copy as T;
+}
+
+/** Output-policy 2 removes arbitrary prose and list-size ceilings while retaining the same closed structure. */
+export const assistantResponseSchemaV3 = unlimitedOutputSchema(assistantResponseSchemaV2);
+
+/** Refinement remains prose-only under output-policy 2. */
+export const assistantChatRefinementSchemaV3 = {
+  ...assistantResponseSchemaV3,
+  properties: {
+    ...assistantResponseSchemaV3.properties,
+    decisions: { ...assistantResponseSchemaV3.properties.decisions, maxItems: 0 },
+    proposals: { ...assistantResponseSchemaV3.properties.proposals, maxItems: 0 },
+    memorySuggestions: { ...assistantResponseSchemaV3.properties.memorySuggestions, maxItems: 0 },
+  },
+} as const;
+
+function validScalarText(value: string): boolean {
+  if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u.test(value)) return false;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) return false;
+  }
+  return true;
+}
+
+function requireString(value: unknown, label: string, maxLength: number, allowEmpty = true, unlimited = false): string {
+  if (typeof value !== 'string' || (!unlimited && value.length > maxLength) || (unlimited && !validScalarText(value)) || (!allowEmpty && !value.trim())) throw new Error(`Assistant response ${label} is invalid.`);
   return value;
 }
 
-function validateCitation(value: unknown, catalog: SourceCatalog, selection?: ContextSelection, decision = false): AssistantCitation {
+function validateCitation(value: unknown, catalog: SourceCatalog, selection?: ContextSelection, decision = false, unlimited = false): AssistantCitation {
   if (!value || typeof value !== 'object') throw new Error('Assistant returned an invalid citation.');
   const record = value as Record<string, unknown>;
   const keys = Object.keys(record).sort().join(',');
@@ -436,29 +477,30 @@ function validateCitation(value: unknown, catalog: SourceCatalog, selection?: Co
   const source = catalog.byId.get(sourceId);
   if (!source || typeof record.revision !== 'number' || record.revision !== source.revision) throw new Error('Assistant citation refers to an unknown or stale source revision.');
   if (record.sourceVersion !== source.version) throw new Error('Assistant citation refers to a different source version.');
-  const quote = requireString(record.quote, 'citation quote', 1000, false);
+  const quote = requireString(record.quote, 'citation quote', 1000, false, unlimited);
   const visible = selection ? selection.excerpts[sourceId] : source.text;
   if (!visible || !visible.includes(quote)) throw new Error('Assistant citation quote is not an exact quote from included source text.');
   return { sourceId, revision: source.revision, sourceVersion: source.version, quote, source: source.title ?? source.id };
 }
 
 /** Rejects fabricated, stale, omitted-context, or approximate evidence without asking the provider to repair it. */
-function validateAssistantResponseWithLimits(value: unknown, catalog: SourceCatalog, selection: ContextSelection | undefined, transcriptSourceId: string, summaryLimit: number, answerLimit: number): AssistantResponse {
+function validateAssistantResponseWithLimits(value: unknown, catalog: SourceCatalog, selection: ContextSelection | undefined, transcriptSourceId: string, summaryLimit: number, answerLimit: number, unlimited = false): AssistantResponse {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Assistant response must be an object.');
   const raw = value as Record<string, unknown>;
   const allowed = ['summary', 'answer', 'decisions', 'citations', 'clarifications', 'proposals', 'memorySuggestions'];
   if (Object.keys(raw).some((key) => !allowed.includes(key)) || allowed.some((key) => !(key in raw))) throw new Error('Assistant response does not match the required schema.');
-  const summary = requireString(raw.summary, 'summary', summaryLimit);
-  const answer = requireString(raw.answer, 'answer', answerLimit);
-  if (!Array.isArray(raw.citations) || raw.citations.length > 30 || !Array.isArray(raw.decisions) || raw.decisions.length > 20 || !Array.isArray(raw.clarifications) || raw.clarifications.length > 10 || !Array.isArray(raw.proposals) || raw.proposals.length > 20 || !Array.isArray(raw.memorySuggestions) || raw.memorySuggestions.length > 4) throw new Error('Assistant response contains too many structured items.');
-  const citations = raw.citations.map((citation) => validateCitation(citation, catalog, selection));
+  const summary = requireString(raw.summary, 'summary', summaryLimit, true, unlimited);
+  const answer = requireString(raw.answer, 'answer', answerLimit, true, unlimited);
+  if (!Array.isArray(raw.citations) || !Array.isArray(raw.decisions) || !Array.isArray(raw.clarifications) || !Array.isArray(raw.proposals) || !Array.isArray(raw.memorySuggestions) ||
+      (!unlimited && (raw.citations.length > 30 || raw.decisions.length > 20 || raw.clarifications.length > 10 || raw.proposals.length > 20 || raw.memorySuggestions.length > 4))) throw new Error('Assistant response contains too many structured items.');
+  const citations = raw.citations.map((citation) => validateCitation(citation, catalog, selection, false, unlimited));
   const decisions: AssistantDecision[] = raw.decisions.map((decision) => {
     if (!decision || typeof decision !== 'object') throw new Error('Assistant returned an invalid decision.');
     const record = decision as Record<string, unknown>;
-    const evidence = validateCitation(record, catalog, selection, true);
-    return { text: requireString(record.text, 'decision', 1000, false), ...evidence };
+    const evidence = validateCitation(record, catalog, selection, true, unlimited);
+    return { text: requireString(record.text, 'decision', 1000, false, unlimited), ...evidence };
   });
-  const clarifications = raw.clarifications.map((item) => requireString(item, 'clarification', 1000));
+  const clarifications = raw.clarifications.map((item) => requireString(item, 'clarification', 1000, true, unlimited));
   const transcript = catalog.byId.get(transcriptSourceId);
   const proposals: AssistantProposal[] = raw.proposals.map((proposal) => {
     if (!proposal || typeof proposal !== 'object') throw new Error('Assistant returned an invalid proposal.');
@@ -466,22 +508,22 @@ function validateAssistantResponseWithLimits(value: unknown, catalog: SourceCata
     if (Object.keys(record).sort().join(',') !== 'body,dueAt,evidence,kind,recipients,title') throw new Error('Assistant proposal contains unsupported fields.');
     const kinds = ['task', 'reminder', 'email', 'event', 'memory'];
     if (typeof record.kind !== 'string' || !kinds.includes(record.kind)) throw new Error('Assistant proposal has an invalid kind.');
-    if (!Array.isArray(record.recipients) || record.recipients.length > 10 || record.recipients.some((item) => typeof item !== 'string' || item.length > 320 || /[\r\n\u0000]/.test(item))) throw new Error('Assistant proposal recipients are invalid.');
-    if (record.dueAt !== null && (typeof record.dueAt !== 'string' || record.dueAt.length > 80 || !Number.isFinite(Date.parse(record.dueAt)))) throw new Error('Assistant proposal date is invalid.');
-    if (!Array.isArray(record.evidence) || record.evidence.length < 1 || record.evidence.length > 5 || record.evidence.some((item) => typeof item !== 'string' || !item || item.length > 1000 || !transcript?.text.includes(item) || (selection && !selection.excerpts[transcriptSourceId]?.includes(item)))) throw new Error('Assistant proposal evidence is not an exact transcript quote.');
-    return { kind: record.kind as AssistantProposal['kind'], title: requireString(record.title, 'proposal title', 140, false), body: requireString(record.body, 'proposal body', 2000), recipients: [...record.recipients] as string[], dueAt: record.dueAt as string | null, evidence: [...record.evidence] as string[] };
+    if (!Array.isArray(record.recipients) || (!unlimited && record.recipients.length > 10) || record.recipients.some((item) => typeof item !== 'string' || (!unlimited && item.length > 320) || /[\r\n\u0000]/.test(item) || (unlimited && !validScalarText(item)))) throw new Error('Assistant proposal recipients are invalid.');
+    if (record.dueAt !== null && (typeof record.dueAt !== 'string' || (!unlimited && record.dueAt.length > 80) || !Number.isFinite(Date.parse(record.dueAt)))) throw new Error('Assistant proposal date is invalid.');
+    if (!Array.isArray(record.evidence) || record.evidence.length < 1 || (!unlimited && record.evidence.length > 5) || record.evidence.some((item) => typeof item !== 'string' || !item || (!unlimited && item.length > 1000) || (unlimited && !validScalarText(item)) || !transcript?.text.includes(item) || (selection && !selection.excerpts[transcriptSourceId]?.includes(item)))) throw new Error('Assistant proposal evidence is not an exact transcript quote.');
+    return { kind: record.kind as AssistantProposal['kind'], title: requireString(record.title, 'proposal title', 140, false, unlimited), body: requireString(record.body, 'proposal body', 2000, true, unlimited), recipients: [...record.recipients] as string[], dueAt: record.dueAt as string | null, evidence: [...record.evidence] as string[] };
   });
   const memorySuggestions: AssistantMemorySuggestion[] = raw.memorySuggestions.map((candidate) => {
     if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) throw new Error('Assistant memory suggestion is invalid.');
     const item = candidate as Record<string, unknown>;
-    if (Object.keys(item).sort().join(',') !== 'address,evidence,label,relatedSourceId,role,statement,targetRevision,targetSourceId,type' || !Array.isArray(item.evidence) || item.evidence.length < 1 || item.evidence.length > 4) throw new Error('Assistant memory suggestion contains unsupported fields.');
+    if (Object.keys(item).sort().join(',') !== 'address,evidence,label,relatedSourceId,role,statement,targetRevision,targetSourceId,type' || !Array.isArray(item.evidence) || item.evidence.length < 1 || (!unlimited && item.evidence.length > 4)) throw new Error('Assistant memory suggestion contains unsupported fields.');
     const targetSourceId = requireString(item.targetSourceId, 'memory target source ID', 512, false);
     const target = catalog.byId.get(targetSourceId);
     if (!target || target.kind !== 'knowledge' || target.revision !== item.targetRevision || !Number.isSafeInteger(item.targetRevision)) throw new Error('Assistant memory suggestion refers to an unknown or stale knowledge target.');
     if (selection && !selection.excerpts[targetSourceId]) throw new Error('Assistant memory suggestion target was not included in request context.');
     const type = item.type;
     if (typeof type !== 'string' || !['add_fact', 'add_contact', 'add_source_link', 'add_member'].includes(type)) throw new Error('Assistant memory change type is invalid.');
-    const nullable = (key: string, max: number): string | null => item[key] === null ? null : requireString(item[key], key, max, false);
+    const nullable = (key: string, max: number): string | null => item[key] === null ? null : requireString(item[key], key, max, false, unlimited);
     const statement = nullable('statement', 1024), address = nullable('address', 512), label = nullable('label', 120), relatedSourceId = nullable('relatedSourceId', 512), role = nullable('role', 120);
     const expected: Record<string, string[]> = {
       add_fact: ['statement'], add_contact: ['address', 'label'], add_source_link: ['relatedSourceId', 'label'], add_member: ['relatedSourceId', 'role'],
@@ -498,7 +540,7 @@ function validateAssistantResponseWithLimits(value: unknown, catalog: SourceCata
       if (!person || (selection && !selection.excerpts[personId])) throw new Error('Assistant memory suggestion refers to an unknown or omitted source.');
       if (type === 'add_member' && (person.kind !== 'knowledge' || !personId.startsWith('knowledge:person:'))) throw new Error('A project member must reference an included person source.');
     }
-    const evidence = item.evidence.map((entry) => validateCitation(entry, catalog, selection));
+    const evidence = item.evidence.map((entry) => validateCitation(entry, catalog, selection, false, unlimited));
     return { targetSourceId, targetRevision: item.targetRevision as number, type: type as AssistantMemorySuggestion['type'], statement, address, label, relatedSourceId, role, evidence };
   });
   return { summary, answer, decisions, citations, clarifications, proposals, memorySuggestions };
@@ -520,6 +562,18 @@ export function validateChatRefinementResponse(value: unknown, catalog: SourceCa
   if (response.decisions.length || response.proposals.length || response.memorySuggestions.length) {
     throw new Error('Chat refinement responses cannot include actions or memory changes.');
   }
+  return response;
+}
+
+/** OpenRouter output-policy 2 validator: no arbitrary prose or item-count ceilings. */
+export function validateAssistantResponseV3(value: unknown, catalog: SourceCatalog, selection?: ContextSelection, transcriptSourceId = 'transcript'): AssistantResponse {
+  return validateAssistantResponseWithLimits(value, catalog, selection, transcriptSourceId, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER, true);
+}
+
+/** Chat refinement stays action-free under output-policy 2. */
+export function validateChatRefinementResponseV2(value: unknown, catalog: SourceCatalog, selection?: ContextSelection, transcriptSourceId = 'transcript'): AssistantResponse {
+  const response = validateAssistantResponseV3(value, catalog, selection, transcriptSourceId);
+  if (response.decisions.length || response.proposals.length || response.memorySuggestions.length) throw new Error('Chat refinement responses cannot include actions or memory changes.');
   return response;
 }
 

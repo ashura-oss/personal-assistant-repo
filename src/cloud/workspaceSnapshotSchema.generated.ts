@@ -718,6 +718,9 @@ export const workspaceSnapshotSchema = {
         "requestBytes": {
           "kind": "number"
         },
+        "resultObservedAt": {
+          "kind": "string"
+        },
         "sourceRemoved": {
           "kind": "literal",
           "value": true

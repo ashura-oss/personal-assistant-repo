@@ -1,5 +1,5 @@
 import type { AssistIntent, KnowledgeSelection } from '../core';
-import { higherOpenRouterRecoveryEfforts, type OpenRouterBatchBaseOperation, type OpenRouterBatchInspection, type OpenRouterBatchRequestProfileVersion, type OpenRouterChatRefinementEffort } from './openRouter';
+import { higherOpenRouterRecoveryEfforts, type OpenRouterBatchBaseOperation, type OpenRouterBatchInspection, type OpenRouterBatchOutputPolicyVersion, type OpenRouterBatchRequestProfileVersion, type OpenRouterChatRefinementEffort } from './openRouter';
 import { validOpenRouterMailReplyBinding, type OpenRouterMailReplyBinding } from './openRouterMailReply';
 import { validReplyText } from './openRouterMailReply';
 import { isOpenRouterBatchRequestProfile, OPENROUTER_BATCH_MODEL } from './openRouter';
@@ -26,7 +26,7 @@ export interface OpenRouterBatchRecoveryBinding {
   readonly parentEffort: OpenRouterBatchJob['effort'];
   readonly parentRequestSha256: string;
   readonly parentSourceFingerprint: string;
-  readonly baseRequestProfileVersion: 1 | 2 | 3;
+  readonly baseRequestProfileVersion: 1 | 2 | 3 | 5;
   readonly baseOperation: OpenRouterBatchBaseOperation;
   readonly baseRequestSha256: string;
   readonly baseSourceFingerprint: string;
@@ -41,13 +41,21 @@ export interface OpenRouterBatchAccounting {
   readonly totalTokens?: number;
 }
 
+/** Compact private proof that a validated provider result was observed before materialization. */
+export interface OpenRouterProviderObservation {
+  readonly version: 1;
+  readonly observedAt: string;
+  readonly resultSha256: string;
+}
+
 export interface OpenRouterChatContextReference {
   readonly turnId: string;
   readonly jobId: string;
   readonly noteId: string;
   readonly noteRevision: number;
   readonly replySha256: string;
-  readonly replyProfileVersion: 1 | 2 | 4;
+  readonly replyProfileVersion: 1 | 2 | 4 | 5;
+  readonly outputPolicyVersion?: OpenRouterBatchOutputPolicyVersion;
 }
 
 /** Private binding for the exact ordered history used by one assistant_chat request. */
@@ -85,6 +93,7 @@ export interface OpenRouterBatchJob {
   readonly batchId?: string;
   readonly unknownCharge: boolean;
   readonly accounting?: OpenRouterBatchAccounting;
+  readonly providerObservation?: OpenRouterProviderObservation;
   readonly failureCode?: 'not_submitted' | 'provider_failed' | 'expired' | 'invalid_result' | 'stale_result' | 'result_truncated' | 'result_not_retained';
   readonly noteId?: string;
   readonly noteRevision?: number;
@@ -99,6 +108,8 @@ export interface OpenRouterBatchJob {
   readonly requestProfileVersion?: OpenRouterBatchRequestProfileVersion;
   /** Private input-selection policy captured when this Batch request was first built. Missing is legacy v1. */
   readonly inputPolicyVersion?: 1 | 2;
+  /** Generated-output contract captured at submission; missing legacy jobs mean policy 1. */
+  readonly outputPolicyVersion?: OpenRouterBatchOutputPolicyVersion;
   readonly requestBytes?: number;
   readonly omittedSourceCount?: number;
   readonly requestBody?: string;
@@ -144,6 +155,8 @@ export interface AssistantBatchJobDTO {
   readonly canCheck: boolean;
   readonly createdAt: string;
   readonly updatedAt: string;
+  /** Present only after a provider result was observed but before its reply was retained. */
+  readonly resultObservedAt?: string;
   readonly noteId?: string;
   readonly noteRevision?: number;
   readonly model: typeof OPENROUTER_BATCH_MODEL;
@@ -209,6 +222,13 @@ function validAccounting(value: unknown): value is OpenRouterBatchAccounting {
   return true;
 }
 
+function validProviderObservation(value: unknown, status: unknown): value is OpenRouterProviderObservation {
+  const row = record(value);
+  return Boolean(row && exactKeys(row, ['version', 'observedAt', 'resultSha256']) && row.version === 1 &&
+    canonicalIso(row.observedAt) && typeof row.resultSha256 === 'string' && row.resultSha256.length === 64 && SHA256.test(row.resultSha256) &&
+    (status === 'processing' || status === 'completed' || status === 'result_stale' || status === 'result_not_retained'));
+}
+
 function validRecoveryBinding(value: unknown, job?: Record<string, unknown>): value is OpenRouterBatchRecoveryBinding {
   const row = record(value);
   if (!row || !exactKeys(row,
@@ -217,11 +237,11 @@ function validRecoveryBinding(value: unknown, job?: Record<string, unknown>): va
     ['parentOperation', 'noteRemap']) || row.version !== 1 ||
       typeof row.parentJobId !== 'string' || !UUID_V4.test(row.parentJobId) ||
       (row.parentKind !== 'note_assistance' && row.parentKind !== 'mail_reply') ||
-      (row.parentRequestProfileVersion !== 1 && row.parentRequestProfileVersion !== 2 && row.parentRequestProfileVersion !== 3 && row.parentRequestProfileVersion !== 4) ||
+      (row.parentRequestProfileVersion !== 1 && row.parentRequestProfileVersion !== 2 && row.parentRequestProfileVersion !== 3 && row.parentRequestProfileVersion !== 4 && row.parentRequestProfileVersion !== 5) ||
       (row.parentEffort !== 'none' && row.parentEffort !== 'low' && row.parentEffort !== 'medium' && row.parentEffort !== 'high' && row.parentEffort !== 'max') ||
       typeof row.parentRequestSha256 !== 'string' || row.parentRequestSha256.length !== 64 || !SHA256.test(row.parentRequestSha256) ||
       typeof row.parentSourceFingerprint !== 'string' || row.parentSourceFingerprint.length !== 64 || !SHA256.test(row.parentSourceFingerprint) ||
-      (row.baseRequestProfileVersion !== 1 && row.baseRequestProfileVersion !== 2 && row.baseRequestProfileVersion !== 3) ||
+      (row.baseRequestProfileVersion !== 1 && row.baseRequestProfileVersion !== 2 && row.baseRequestProfileVersion !== 3 && row.baseRequestProfileVersion !== 5) ||
       (row.baseOperation !== 'note_assistance' && row.baseOperation !== 'chat_refinement' && row.baseOperation !== 'mail_reply_body' && row.baseOperation !== 'mail_reply_context') ||
       typeof row.baseRequestSha256 !== 'string' || row.baseRequestSha256.length !== 64 || !SHA256.test(row.baseRequestSha256) ||
       typeof row.baseSourceFingerprint !== 'string' || row.baseSourceFingerprint.length !== 64 || !SHA256.test(row.baseSourceFingerprint) ||
@@ -268,13 +288,14 @@ function validChatBinding(value: unknown): value is OpenRouterChatBinding {
       })) return false;
   const validReference = (candidate: unknown): candidate is OpenRouterChatContextReference => {
     const item = record(candidate);
-    return Boolean(item && plainDataObject(item) && exactKeys(item, ['turnId', 'jobId', 'noteId', 'noteRevision', 'replySha256', 'replyProfileVersion']) &&
+    return Boolean(item && plainDataObject(item) && exactKeys(item, ['turnId', 'jobId', 'noteId', 'noteRevision', 'replySha256', 'replyProfileVersion'], ['outputPolicyVersion']) &&
       typeof item.turnId === 'string' && item.turnId.length === 36 && UUID_V4.test(item.turnId) &&
       typeof item.jobId === 'string' && item.jobId.length === 36 && UUID_V4.test(item.jobId) &&
       typeof item.noteId === 'string' && item.noteId.length === 36 && UUID_V4.test(item.noteId) &&
       Number.isSafeInteger(item.noteRevision) && (item.noteRevision as number) > 0 &&
       typeof item.replySha256 === 'string' && item.replySha256.length === 64 && SHA256.test(item.replySha256) &&
-      (item.replyProfileVersion === 1 || item.replyProfileVersion === 2 || item.replyProfileVersion === 4));
+      (item.replyProfileVersion === 1 || item.replyProfileVersion === 2 || item.replyProfileVersion === 4 || item.replyProfileVersion === 5) &&
+      (item.outputPolicyVersion === undefined || item.outputPolicyVersion === 1 || item.outputPolicyVersion === 2));
   };
   if (row.refinementParent !== undefined && !validReference(row.refinementParent)) return false;
   if (row.refinementParent !== undefined && row.transcriptSource !== undefined) return false;
@@ -304,9 +325,10 @@ function validJob(value: unknown): value is OpenRouterBatchJob {
   const row = record(value);
   if (row?.kind === 'mail_reply') return validMailReplyJob(row);
   const commonRequired = ['id', 'customId', 'kind', 'status', 'createdAt', 'updatedAt', 'model', 'effort', 'requestSha256', 'unknownCharge'];
-  const commonOptional = ['batchId', 'accounting', 'failureCode'];
-  if (!row || !exactKeys(row, commonRequired, [...commonOptional, 'operation', 'reasoningEffort', 'parentTurnId', 'recoveryBinding', 'sourceRemoved', 'noteId', 'noteRevision', 'intent', 'question', 'knowledgeSelection', 'capturedAt', 'captureTimeZone', 'answeredAsOf', 'settingsFingerprint', 'sourceFingerprint', 'requestProfileVersion', 'inputPolicyVersion', 'requestBytes', 'omittedSourceCount', 'requestBody', 'sourceVersions', 'appliedNoteRevision', 'chatBinding'])) return false;
+  const commonOptional = ['batchId', 'accounting', 'failureCode', 'providerObservation'];
+  if (!row || !exactKeys(row, commonRequired, [...commonOptional, 'operation', 'reasoningEffort', 'parentTurnId', 'recoveryBinding', 'sourceRemoved', 'noteId', 'noteRevision', 'intent', 'question', 'knowledgeSelection', 'capturedAt', 'captureTimeZone', 'answeredAsOf', 'settingsFingerprint', 'sourceFingerprint', 'requestProfileVersion', 'inputPolicyVersion', 'outputPolicyVersion', 'requestBytes', 'omittedSourceCount', 'requestBody', 'sourceVersions', 'appliedNoteRevision', 'chatBinding'])) return false;
   if (row.inputPolicyVersion !== undefined && row.inputPolicyVersion !== 1 && row.inputPolicyVersion !== 2) return false;
+  if (row.outputPolicyVersion !== undefined && row.outputPolicyVersion !== 1 && row.outputPolicyVersion !== 2) return false;
   if (typeof row.id !== 'string' || row.id.length !== 36 || !UUID_V4.test(row.id) || row.customId !== row.id ||
       row.kind !== 'note_assistance' || typeof row.status !== 'string' || !STATUSES.has(row.status) ||
       !canonicalIso(row.createdAt) || !canonicalIso(row.updatedAt) ||
@@ -321,32 +343,37 @@ function validJob(value: unknown): value is OpenRouterBatchJob {
       (row.operation !== 'chat_refinement' && row.parentTurnId !== undefined)) return false;
   if (row.batchId !== undefined && (typeof row.batchId !== 'string' || row.batchId.length < 1 || row.batchId.length > 256 || /[^A-Za-z0-9_-]/.test(row.batchId))) return false;
   if (row.accounting !== undefined && !validAccounting(row.accounting)) return false;
+  if (row.providerObservation !== undefined && !validProviderObservation(row.providerObservation, row.status)) return false;
   if (row.chatBinding !== undefined && !validChatBinding(row.chatBinding)) return false;
   if (row.failureCode !== undefined && (typeof row.failureCode !== 'string' || !['not_submitted', 'provider_failed', 'expired', 'invalid_result', 'stale_result', 'result_truncated', 'result_not_retained'].includes(row.failureCode))) return false;
   if ((row.status === 'result_not_retained') !== (row.failureCode === 'result_not_retained') ||
       (row.status === 'result_truncated') !== (row.failureCode === 'result_truncated')) return false;
   if (row.recoveryBinding !== undefined && !validRecoveryBinding(row.recoveryBinding, row)) return false;
   if (row.sourceRemoved === true) {
-    return row.status === 'source_removed' && (row.requestProfileVersion === 1 || row.requestProfileVersion === 2 || row.requestProfileVersion === 4) &&
-      (row.operation !== 'chat_refinement' || ((row.requestProfileVersion === 2 || row.requestProfileVersion === 4) && row.reasoningEffort === row.effort)) &&
-      exactKeys(row, [...commonRequired, 'sourceRemoved', 'requestProfileVersion'], [...commonOptional, 'operation', 'reasoningEffort', 'parentTurnId', 'recoveryBinding', 'chatBinding', 'inputPolicyVersion']);
+    if ((row.requestProfileVersion === 5 && row.outputPolicyVersion !== 2) ||
+        (row.kind === 'note_assistance' && row.outputPolicyVersion === 2 && row.requestProfileVersion !== 4 && row.requestProfileVersion !== 5)) return false;
+    return row.status === 'source_removed' && (row.requestProfileVersion === 1 || row.requestProfileVersion === 2 || row.requestProfileVersion === 4 || row.requestProfileVersion === 5) &&
+      (row.operation !== 'chat_refinement' || ((row.requestProfileVersion === 2 || row.requestProfileVersion === 4 || row.requestProfileVersion === 5) && row.reasoningEffort === row.effort)) &&
+      exactKeys(row, [...commonRequired, 'sourceRemoved', 'requestProfileVersion'], [...commonOptional, 'operation', 'reasoningEffort', 'parentTurnId', 'recoveryBinding', 'chatBinding', 'inputPolicyVersion', 'outputPolicyVersion']);
   }
   if (row.sourceRemoved !== undefined || row.status === 'source_removed' || !exactKeys(row,
     [...commonRequired, 'settingsFingerprint', 'sourceFingerprint', 'requestProfileVersion', 'requestBytes', 'omittedSourceCount', 'requestBody', 'sourceVersions'],
-    [...commonOptional, 'operation', 'reasoningEffort', 'parentTurnId', 'recoveryBinding', 'noteId', 'noteRevision', 'intent', 'question', 'knowledgeSelection', 'capturedAt', 'captureTimeZone', 'answeredAsOf', 'appliedNoteRevision', 'chatBinding', 'inputPolicyVersion'])) return false;
+    [...commonOptional, 'operation', 'reasoningEffort', 'parentTurnId', 'recoveryBinding', 'noteId', 'noteRevision', 'intent', 'question', 'knowledgeSelection', 'capturedAt', 'captureTimeZone', 'answeredAsOf', 'appliedNoteRevision', 'chatBinding', 'inputPolicyVersion', 'outputPolicyVersion'])) return false;
   if (typeof row.settingsFingerprint !== 'string' || row.settingsFingerprint.length !== 64 || !SHA256.test(row.settingsFingerprint) ||
       typeof row.sourceFingerprint !== 'string' || row.sourceFingerprint.length !== 64 || !SHA256.test(row.sourceFingerprint) ||
-      (row.requestProfileVersion !== 1 && row.requestProfileVersion !== 2 && row.requestProfileVersion !== 4) ||
+      (row.requestProfileVersion !== 1 && row.requestProfileVersion !== 2 && row.requestProfileVersion !== 4 && row.requestProfileVersion !== 5) ||
       !Number.isSafeInteger(row.requestBytes) || (row.requestBytes as number) < 1 || (row.requestBytes as number) > 1024 * 1024 ||
       !Number.isSafeInteger(row.omittedSourceCount) || (row.omittedSourceCount as number) < 0 ||
       typeof row.requestBody !== 'string' || new TextEncoder().encode(row.requestBody).byteLength > 1024 * 1024 ||
       new TextEncoder().encode(row.requestBody).byteLength !== row.requestBytes) return false;
   try {
     if (!isOpenRouterBatchRequestProfile(JSON.parse(row.requestBody), row.requestProfileVersion, row.operation ?? 'note_assistance',
-      row.requestProfileVersion === 4 && record(row.recoveryBinding) ? { profileVersion: record(row.recoveryBinding)!.baseRequestProfileVersion as 1 | 2 | 3,
+      row.requestProfileVersion === 4 && record(row.recoveryBinding) ? { profileVersion: record(row.recoveryBinding)!.baseRequestProfileVersion as 1 | 2 | 3 | 5,
         operation: record(row.recoveryBinding)!.baseOperation as OpenRouterBatchBaseOperation } : undefined)) return false;
   } catch { return false; }
-  if ((row.requestProfileVersion === 4) !== (row.recoveryBinding !== undefined)) return false;
+  if ((row.requestProfileVersion === 4) !== (row.recoveryBinding !== undefined) ||
+      (row.kind === 'note_assistance' && row.outputPolicyVersion === 2 && row.requestProfileVersion !== 4 && row.requestProfileVersion !== 5) ||
+      (row.requestProfileVersion === 5 && row.outputPolicyVersion !== 2)) return false;
   if (row.kind === 'note_assistance') {
     if (typeof row.noteId !== 'string' || !row.noteId || row.noteId.length > 512 || !Number.isSafeInteger(row.noteRevision) || (row.noteRevision as number) < 1 ||
         typeof row.intent !== 'string' || !['assist', 'summarize', 'answer', 'extract'].includes(row.intent) || !canonicalIso(row.capturedAt) ||
@@ -357,7 +384,7 @@ function validJob(value: unknown): value is OpenRouterBatchJob {
             : row.question.length > 16_384))) ||
         (row.answeredAsOf !== undefined && !canonicalIso(row.answeredAsOf)) ||
         (row.knowledgeSelection !== undefined && !validKnowledgeSelection(row.knowledgeSelection, row.inputPolicyVersion === 2 ? 2 : 1))) return false;
-    if (row.operation === 'chat_refinement' && (row.intent !== 'answer' || (row.requestProfileVersion !== 2 && row.requestProfileVersion !== 4) ||
+    if (row.operation === 'chat_refinement' && (row.intent !== 'answer' || (row.requestProfileVersion !== 2 && row.requestProfileVersion !== 4 && row.requestProfileVersion !== 5) ||
         !row.chatBinding || !row.chatBinding.refinementParent || row.reasoningEffort !== row.effort)) return false;
     if (row.operation !== 'chat_refinement' && (row.reasoningEffort !== undefined || row.chatBinding?.refinementParent !== undefined)) return false;
   }
@@ -371,8 +398,8 @@ function validJob(value: unknown): value is OpenRouterBatchJob {
 
 function validMailReplyJob(row: Record<string, unknown>): boolean {
   const commonRequired = ['id', 'customId', 'kind', 'status', 'createdAt', 'updatedAt', 'model', 'effort', 'requestSha256', 'unknownCharge'];
-  const commonOptional = ['batchId', 'accounting', 'failureCode', 'proposalId', 'mailReplyActivationOperation', 'recoveryBinding'];
-  if (!exactKeys(row, commonRequired, [...commonOptional, 'operation', 'sourceRemoved', 'requestProfileVersion', 'inputPolicyVersion', 'settingsFingerprint', 'sourceFingerprint',
+  const commonOptional = ['batchId', 'accounting', 'failureCode', 'proposalId', 'mailReplyActivationOperation', 'recoveryBinding', 'providerObservation'];
+  if (!exactKeys(row, commonRequired, [...commonOptional, 'operation', 'sourceRemoved', 'requestProfileVersion', 'inputPolicyVersion', 'outputPolicyVersion', 'settingsFingerprint', 'sourceFingerprint',
       'requestBytes', 'omittedSourceCount', 'requestBody', 'sourceVersions', 'mailReplyBinding', 'resultText', 'resultSha256']) ||
       typeof row.id !== 'string' || row.id.length !== 36 || !UUID_V4.test(row.id) || row.customId !== row.id ||
       row.kind !== 'mail_reply' || typeof row.status !== 'string' || !STATUSES.has(row.status) ||
@@ -388,13 +415,15 @@ function validMailReplyJob(row: Record<string, unknown>): boolean {
   if ((row.status === 'result_not_retained') !== (row.failureCode === 'result_not_retained') ||
       (row.status === 'result_truncated') !== (row.failureCode === 'result_truncated') ||
       (row.recoveryBinding !== undefined && !validRecoveryBinding(row.recoveryBinding, row)) ||
-      (row.inputPolicyVersion !== undefined && row.inputPolicyVersion !== 1 && row.inputPolicyVersion !== 2)) return false;
+      (row.inputPolicyVersion !== undefined && row.inputPolicyVersion !== 1 && row.inputPolicyVersion !== 2) ||
+      (row.outputPolicyVersion !== undefined && row.outputPolicyVersion !== 1 && row.outputPolicyVersion !== 2)) return false;
+  if (row.providerObservation !== undefined && !validProviderObservation(row.providerObservation, row.status)) return false;
   if (row.sourceRemoved === true) {
       return row.status === 'source_removed' && (row.requestProfileVersion === 1 || row.requestProfileVersion === 2 || row.requestProfileVersion === 3 || row.requestProfileVersion === 4) &&
       (row.requestProfileVersion === 3 ? row.operation === 'mail_reply_context' :
         row.requestProfileVersion === 4 ? row.recoveryBinding !== undefined :
           row.operation === undefined) &&
-      exactKeys(row, [...commonRequired, 'sourceRemoved', 'requestProfileVersion'], [...commonOptional, 'operation', 'inputPolicyVersion']);
+      exactKeys(row, [...commonRequired, 'sourceRemoved', 'requestProfileVersion'], [...commonOptional, 'operation', 'inputPolicyVersion', 'outputPolicyVersion']);
   }
   if (row.sourceRemoved !== undefined || row.status === 'source_removed' || !validOpenRouterMailReplyBinding(row.mailReplyBinding, row.inputPolicyVersion === 2 ? 2 : 1) ||
       typeof row.settingsFingerprint !== 'string' || row.settingsFingerprint.length !== 64 || !SHA256.test(row.settingsFingerprint) ||
@@ -410,7 +439,7 @@ function validMailReplyJob(row: Record<string, unknown>): boolean {
     const schema = record(responseFormat?.json_schema);
     const contextOperation = row.operation === 'mail_reply_context';
     const recovery = record(row.recoveryBinding);
-    const recoveryBase = row.requestProfileVersion === 4 && recovery ? { profileVersion: recovery.baseRequestProfileVersion as 1 | 2 | 3,
+    const recoveryBase = row.requestProfileVersion === 4 && recovery ? { profileVersion: recovery.baseRequestProfileVersion as 1 | 2 | 3 | 5,
       operation: recovery.baseOperation as OpenRouterBatchBaseOperation } : undefined;
     if ((row.requestProfileVersion === 4) !== Boolean(recovery) ||
         (contextOperation && (row.requestProfileVersion !== 3 && row.requestProfileVersion !== 4 || row.mailReplyBinding?.version !== 2)) ||
@@ -420,7 +449,7 @@ function validMailReplyJob(row: Record<string, unknown>): boolean {
   const versions = record(row.sourceVersions)!;
   if (Object.entries(versions).some(([key, version]) => !key || key.length > 512 || typeof version !== 'string' || version.length > 320)) return false;
   const resultPair = row.resultText !== undefined || row.resultSha256 !== undefined;
-  if (resultPair && (typeof row.resultText !== 'string' || !validReplyText(row.resultText) || typeof row.resultSha256 !== 'string' || row.resultSha256.length !== 64 || !SHA256.test(row.resultSha256))) return false;
+  if (resultPair && (typeof row.resultText !== 'string' || !validReplyText(row.resultText, row.outputPolicyVersion === 2 ? Number.MAX_SAFE_INTEGER : 100_000) || typeof row.resultSha256 !== 'string' || row.resultSha256.length !== 64 || !SHA256.test(row.resultSha256))) return false;
   if ((row.status === 'completed') !== resultPair || (row.status === 'result_truncated' && resultPair)) return false;
   if (['queued', 'processing', 'completed', 'expired', 'cancelled', 'result_stale', 'result_invalid', 'result_truncated', 'result_not_retained'].includes(String(row.status)) && !row.batchId) return false;
   if (row.status === 'failed' && !row.batchId && !(row.failureCode === 'not_submitted' && row.unknownCharge === false)) return false;
@@ -464,7 +493,7 @@ export function validateOpenRouterBatchLedger(value: unknown): OpenRouterBatchLe
     if (!recovery) continue;
     const parent = byId.get(recovery.parentJobId);
     if (!parent || parent.kind !== recovery.parentKind || parent.requestProfileVersion !== recovery.parentRequestProfileVersion ||
-        (parent.inputPolicyVersion ?? 1) !== (job.inputPolicyVersion ?? 1) ||
+        (parent.inputPolicyVersion ?? 1) !== (job.inputPolicyVersion ?? 1) || (parent.outputPolicyVersion ?? 1) !== (job.outputPolicyVersion ?? 1) ||
         parent.effort !== recovery.parentEffort || (parent.operation ?? undefined) !== (recovery.parentOperation ?? undefined) ||
         parent.requestSha256 !== recovery.parentRequestSha256 || (!parent.sourceRemoved && parent.sourceFingerprint !== recovery.parentSourceFingerprint) ||
         (parent.sourceRemoved && !job.sourceRemoved)) throw new Error('OpenRouter Batch recovery lineage failed integrity validation.');
@@ -517,6 +546,7 @@ export function assistantBatchJobDTO(job: OpenRouterBatchJob, cleanupPending = f
         job.accounting?.providerReportedCostUsd === undefined))),
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
+    ...(job.providerObservation ? { resultObservedAt: job.providerObservation.observedAt } : {}),
     ...(job.noteId ? { noteId: job.noteId } : {}),
     ...(job.noteRevision !== undefined ? { noteRevision: job.noteRevision } : {}),
     model: job.model,
@@ -548,7 +578,7 @@ export function assistantBatchJobDTO(job: OpenRouterBatchJob, cleanupPending = f
 export function isOpenRouterBatchContentJob(job: OpenRouterBatchJob): job is OpenRouterBatchContentJob {
   return job.kind === 'note_assistance' && job.sourceRemoved !== true && job.status !== 'source_removed' && typeof job.requestBody === 'string' &&
     typeof job.requestBytes === 'number' && typeof job.settingsFingerprint === 'string' &&
-    typeof job.sourceFingerprint === 'string' && (job.requestProfileVersion === 1 || job.requestProfileVersion === 2 || job.requestProfileVersion === 4) && !!job.sourceVersions;
+    typeof job.sourceFingerprint === 'string' && (job.requestProfileVersion === 1 || job.requestProfileVersion === 2 || job.requestProfileVersion === 4 || job.requestProfileVersion === 5) && !!job.sourceVersions;
 }
 
 export type OpenRouterMailReplyContentJob = OpenRouterBatchJob & {
@@ -584,6 +614,7 @@ export function tombstoneOpenRouterBatchJob(job: OpenRouterBatchJob, updatedAt: 
     ...(job.reasoningEffort ? { reasoningEffort: job.reasoningEffort } : {}),
     ...(job.recoveryBinding ? { recoveryBinding: job.recoveryBinding } : {}),
     ...(job.inputPolicyVersion !== undefined ? { inputPolicyVersion: job.inputPolicyVersion } : {}),
+    ...(job.outputPolicyVersion !== undefined ? { outputPolicyVersion: job.outputPolicyVersion } : {}),
     ...(!stripChatBinding && job.chatBinding ? { chatBinding: job.chatBinding } : {}),
     ...(job.batchId ? { batchId: job.batchId } : {}),
     unknownCharge: job.unknownCharge,

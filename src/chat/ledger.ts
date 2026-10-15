@@ -81,10 +81,14 @@ function frozenArray<T>(items: T[]): readonly T[] { return Object.freeze(items);
 
 function parseReply(value: unknown): ChatReplySnapshot {
   if (!object(value)) fail('Chat reply is invalid.');
-  exactKeys(value, ['summary', 'answer', 'clarifications', 'completedAt', 'requestSha256', 'requestProfileVersion']);
+  exactKeys(value, ['summary', 'answer', 'clarifications', 'completedAt', 'requestSha256', 'requestProfileVersion'], ['outputPolicyVersion']);
   const clarifications = validArray(value.clarifications, 'Chat clarifications').map((item) => text(item, 'Chat clarification'));
-  if (clarifications.length > 10 || clarifications.some((item) => item.length > 1000)) fail('Chat clarifications exceed the supported structure.');
-  if (value.requestProfileVersion !== 1 && value.requestProfileVersion !== 2 && value.requestProfileVersion !== 4) fail('Chat request profile is invalid.');
+  if ((value.outputPolicyVersion !== undefined && value.outputPolicyVersion !== 1 && value.outputPolicyVersion !== 2) ||
+      (value.outputPolicyVersion === 2 && value.requestProfileVersion !== 4 && value.requestProfileVersion !== 5) ||
+      (value.requestProfileVersion === 5 && value.outputPolicyVersion !== 2)) fail('Chat output policy version is invalid.');
+  if ((value.outputPolicyVersion !== 2 && clarifications.length > 10) ||
+      (value.outputPolicyVersion !== 2 && clarifications.some((item) => item.length > 1000))) fail('Chat clarifications exceed the supported structure.');
+  if (value.requestProfileVersion !== 1 && value.requestProfileVersion !== 2 && value.requestProfileVersion !== 4 && value.requestProfileVersion !== 5) fail('Chat request profile is invalid.');
   if (typeof value.requestSha256 !== 'string' || value.requestSha256.length !== 64 || !SHA256.test(value.requestSha256)) fail('Chat request digest is invalid.');
   return Object.freeze({
     summary: text(value.summary, 'Chat reply summary', true),
@@ -93,6 +97,7 @@ function parseReply(value: unknown): ChatReplySnapshot {
     completedAt: timestamp(value.completedAt, 'Chat reply time'),
     requestSha256: value.requestSha256,
     requestProfileVersion: value.requestProfileVersion,
+    ...(value.outputPolicyVersion !== undefined ? { outputPolicyVersion: value.outputPolicyVersion as 1 | 2 } : {}),
   });
 }
 

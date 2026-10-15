@@ -57,6 +57,8 @@ describe('assistant Batch job presentation', () => {
     expect(canRetryBatchJobCleanup(job({ status: 'cleanup_pending' }))).toBe(true);
     expect(canRetryBatchJobCleanup(job({ status: 'queued' }))).toBe(false);
     expect(assistantBatchStatusLabel('submission_unknown')).toBe('Submission status uncertain');
+    expect(assistantBatchStatusLabel('processing', 'note_assistance', '2026-10-13T12:01:00.000Z')).toBe('Provider finished; result storage awaits confirmation');
+    expect(batchCheckLabel(job({ status: 'processing', resultObservedAt: '2026-10-13T12:01:00.000Z' }))).toBe('Check to recover reply');
     expect(assistantBatchStatusLabel('result_stale')).toContain('not applied');
     expect(assistantBatchStatusLabel('result_truncated')).toBe('Provider response was cut off; no output applied');
     expect(assistantBatchStatusLabel('result_not_retained')).toBe('Reply could not be saved');

@@ -4,7 +4,8 @@ export type ChatReplySnapshot = Readonly<{
   clarifications: readonly string[];
   completedAt: string;
   requestSha256: string;
-  requestProfileVersion: 1 | 2 | 4;
+  requestProfileVersion: 1 | 2 | 4 | 5;
+  outputPolicyVersion?: 1 | 2;
 }>;
 
 export type ChatTurn = Readonly<{

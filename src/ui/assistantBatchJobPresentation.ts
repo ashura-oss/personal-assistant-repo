@@ -1,7 +1,8 @@
 import type { WorkspaceAssistantBatchJobDisplay } from './workspaceChatDisplayTypes';
 import { formatProviderReportedCostUsd } from './formatProviderReportedCostUsd';
 
-export function assistantBatchStatusLabel(status: WorkspaceAssistantBatchJobDisplay['status'], kind: WorkspaceAssistantBatchJobDisplay['kind'] = 'note_assistance'): string {
+export function assistantBatchStatusLabel(status: WorkspaceAssistantBatchJobDisplay['status'], kind: WorkspaceAssistantBatchJobDisplay['kind'] = 'note_assistance', resultObservedAt?: string): string {
+  if (status === 'processing' && resultObservedAt) return 'Provider finished; result storage awaits confirmation';
   switch (status) {
     case 'preparing': return 'Preparing request';
     case 'submitting': return 'Submitting request';
@@ -40,7 +41,8 @@ export function canCheckBatchJob(job: WorkspaceAssistantBatchJobDisplay): boolea
   return job.canCheck;
 }
 
-export function batchCheckLabel(job: WorkspaceAssistantBatchJobDisplay): 'Check for reply' | 'Check provider usage' {
+export function batchCheckLabel(job: WorkspaceAssistantBatchJobDisplay): 'Check for reply' | 'Check provider usage' | 'Check to recover reply' {
+  if (job.status === 'processing' && job.resultObservedAt) return 'Check to recover reply';
   return job.status === 'queued' || job.status === 'processing'
     ? 'Check for reply'
     : 'Check provider usage';

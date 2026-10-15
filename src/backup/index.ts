@@ -5,11 +5,13 @@ import { PORTABLE_CHAT_HISTORY_VERSION, projectInertImportedChatHistory, validat
 
 export const PORTABLE_BACKUP_FORMAT = 'still-backup-v4' as const;
 export const PORTABLE_BACKUP_SCHEMA_VERSION = 4 as const;
+export const PORTABLE_BACKUP_V5_FORMAT = 'still-backup-v5' as const;
+export const PORTABLE_BACKUP_V5_SCHEMA_VERSION = 5 as const;
 export const PORTABLE_BACKUP_V3_FORMAT = 'still-backup-v3' as const;
 export const PORTABLE_BACKUP_V3_SCHEMA_VERSION = 3 as const;
 const V2_FORMAT = 'still-backup-v2' as const;
 const V2_SCHEMA_VERSION = 2 as const;
-type PortableSourceFormat = typeof PORTABLE_BACKUP_FORMAT | typeof PORTABLE_BACKUP_V3_FORMAT | typeof V2_FORMAT | 'voice-assistant-export-v1';
+type PortableSourceFormat = typeof PORTABLE_BACKUP_V5_FORMAT | typeof PORTABLE_BACKUP_FORMAT | typeof PORTABLE_BACKUP_V3_FORMAT | typeof V2_FORMAT | 'voice-assistant-export-v1';
 
 export const BACKUP_LIMITS = Object.freeze({
   maxBytes: 32 * 1024 * 1024,
@@ -76,6 +78,7 @@ export interface PortableHistoryEntry {
   occurredAt?: string;
   provider?: string;
   reference?: string;
+  outputPolicyVersion?: 1 | 2;
 }
 
 export interface PortableBackupV2 {
@@ -109,6 +112,11 @@ export interface PortableBackupV4 extends Omit<PortableBackupV3, 'format' | 'sch
   schemaVersion: typeof PORTABLE_BACKUP_SCHEMA_VERSION;
   chatHistory: PortableChatHistory;
 }
+export interface PortableBackupV5 extends Omit<PortableBackupV4, 'format' | 'schemaVersion'> {
+  format: typeof PORTABLE_BACKUP_V5_FORMAT;
+  schemaVersion: typeof PORTABLE_BACKUP_V5_SCHEMA_VERSION;
+}
+export type PortableBackup = PortableBackupV4 | PortableBackupV5;
 
 export interface KnowledgeActivationLink {
   entityKind: 'person' | 'project'; sourceEntityId: string; entityId: string; sourceDigest: string; activatedAt: string;
@@ -131,7 +139,7 @@ export interface ImportedBackupArchive {
 }
 
 export interface PortableBackupParseResult {
-  backup: PortableBackupV4;
+  backup: PortableBackup;
   sourceFormat: PortableSourceFormat;
   warnings: string[];
   ignoredFieldCount: number;
@@ -250,7 +258,7 @@ function baseRestoredTextBytes(backup: Pick<PortableBackupV2, 'notes' | 'tasks' 
   return total;
 }
 
-function normalizeV2(value: unknown): PortableBackupV2 {
+function normalizeV2(value: unknown, allowOutputPolicy2 = false): PortableBackupV2 {
   if (!isRecord(value)) fail('Backup must be a JSON object.');
   ownKeys(value, ['format', 'schemaVersion', 'exportId', 'exportedAt', 'audioIncluded', 'notes', 'tasks', 'documents', 'archivedDocuments', 'history'], 'Backup');
   if (value.format !== V2_FORMAT || value.schemaVersion !== V2_SCHEMA_VERSION) fail('Backup format or schema version is not supported.');
@@ -268,7 +276,7 @@ function normalizeV2(value: unknown): PortableBackupV2 {
   const documents = arrayField(value.documents, BACKUP_LIMITS.documents, 'Documents');
   const archivedDocuments = arrayField(value.archivedDocuments, BACKUP_LIMITS.documents, 'Archived documents');
   if (documents.length + archivedDocuments.length > BACKUP_LIMITS.documents) fail('Documents exceed the allowed item count.');
-  const history = arrayField(value.history, BACKUP_LIMITS.history, 'History');
+  const history = arrayField(value.history, allowOutputPolicy2 ? BACKUP_LIMITS.maxNodes : BACKUP_LIMITS.history, 'History');
   backup.notes = notes.map((item) => {
     if (!isRecord(item)) fail('Note entry must be an object.');
     ownKeys(item, ['sourceId', 'title', 'transcript', 'durationSeconds', 'createdAt', 'capturedAt', 'captureTimeZone', 'originalTimeZoneUnknown', 'audioMissing'], 'Note entry');
@@ -336,19 +344,26 @@ function normalizeV2(value: unknown): PortableBackupV2 {
   duplicateIds(backup.archivedDocuments, 'Archived documents');
   backup.history = history.map((item) => {
     if (!isRecord(item)) fail('History entry must be an object.');
-    ownKeys(item, ['kind', 'sourceId', 'sourceNoteId', 'title', 'content', 'status', 'occurredAt', 'provider', 'reference'], 'History entry');
-    if (!['analysis', 'proposal', 'dispatch', 'mail', 'calendar', 'activity', 'imported_history'].includes(String(item.kind))) fail('History kind is invalid.');
+    ownKeys(item, ['kind', 'sourceId', 'sourceNoteId', 'title', 'content', 'status', 'occurredAt', 'provider', 'reference', ...(allowOutputPolicy2 ? ['outputPolicyVersion'] : [])], 'History entry');
+    if (typeof item.kind !== 'string' || !['analysis', 'proposal', 'dispatch', 'mail', 'calendar', 'activity', 'imported_history'].includes(item.kind)) fail('History kind is invalid.');
+    if (item.outputPolicyVersion !== undefined && (!allowOutputPolicy2 || (item.outputPolicyVersion !== 1 && item.outputPolicyVersion !== 2))) fail('History output policy version is invalid.');
+    const generatedV2 = item.outputPolicyVersion === 2;
     const provider = item.provider === undefined ? undefined : boundedString(item.provider, 'History provider', 256);
     const reference = item.reference === undefined ? undefined : boundedString(item.reference, 'History reference', 2048);
     const occurredAt = optionalDate(item, 'occurredAt', 'History date');
     return {
       kind: item.kind as PortableHistoryKind, sourceId: validateHistoryId(item.sourceId),
       ...(optionalId(item, 'sourceNoteId', 'History source note ID') ? { sourceNoteId: item.sourceNoteId as string } : {}),
-      title: validateTitle(item.title, 'History title'), content: boundedString(item.content, 'History content'),
+      title: generatedV2 ? boundedString(item.title, 'History title', BACKUP_LIMITS.maxRestoredTextBytes) : validateTitle(item.title, 'History title'),
+      content: boundedString(item.content, 'History content', generatedV2 ? BACKUP_LIMITS.maxRestoredTextBytes : BACKUP_LIMITS.textBytes),
       status: boundedString(item.status, 'History status', 512), ...(occurredAt ? { occurredAt } : {}),
+      ...(item.outputPolicyVersion !== undefined ? { outputPolicyVersion: item.outputPolicyVersion as 1 | 2 } : {}),
       ...(provider !== undefined ? { provider } : {}), ...(reference !== undefined ? { reference } : {}),
     };
   });
+  if (allowOutputPolicy2 && backup.history.filter((item) => item.outputPolicyVersion !== 2).length > BACKUP_LIMITS.history) {
+    fail('Legacy history exceeds the allowed item count.');
+  }
   duplicateIds(backup.history, 'History');
   if (baseRestoredTextBytes(backup) > BACKUP_LIMITS.maxRestoredTextBytes) fail('Backup text exceeds the total restore limit.');
   return backup;
@@ -412,17 +427,30 @@ export function createPortableKnowledge(
     ...projected.people.map((entity) => narrativeFor(entity, 'person')),
     ...projected.projects.map((entity) => narrativeFor(entity, 'project')),
   ];
-  return normalizePortableKnowledge({ state: projected, narratives });
+  return normalizePortableKnowledge({ state: omitDefaultOutputPolicy(projected) as KnowledgeState, narratives }, true);
 }
 
-function normalizePortableKnowledge(value: unknown): PortableKnowledge {
+function containsOutputPolicyMarker(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(containsOutputPolicyMarker);
+  if (!isRecord(value)) return false;
+  return Object.prototype.hasOwnProperty.call(value, 'outputPolicyVersion') || Object.values(value).some(containsOutputPolicyMarker);
+}
+function omitDefaultOutputPolicy(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(omitDefaultOutputPolicy);
+  if (!isRecord(value)) return value;
+  return Object.fromEntries(Object.entries(value)
+    .filter(([key, child]) => key !== 'outputPolicyVersion' || child !== 1)
+    .map(([key, child]) => [key, omitDefaultOutputPolicy(child)]));
+}
+function normalizePortableKnowledge(value: unknown, allowOutputPolicy2 = false): PortableKnowledge {
   if (!isRecord(value)) fail('Portable knowledge must be an object.');
   ownKeys(value, ['state', 'narratives'], 'Portable knowledge');
+  if (!allowOutputPolicy2 && containsOutputPolicyMarker(value.state)) fail('Legacy portable knowledge cannot contain output policy metadata.');
   if (!isRecord(value.state) || !Array.isArray(value.state.people) || !Array.isArray(value.state.projects)
     || [...value.state.people, ...value.state.projects].some((entity) => isRecord(entity) && Object.prototype.hasOwnProperty.call(entity, 'importOrigin'))) fail('Portable knowledge cannot contain runtime import authority.');
   const state = validateKnowledgeState(value.state);
   const rows = arrayField(value.narratives, BACKUP_LIMITS.knowledgeCohorts * 20, 'Knowledge narratives');
-  const expected = new Map<string, { revision: number; updatedAt: string }>();
+  const expected = new Map<string, KnowledgeState['people'][number] | KnowledgeState['projects'][number]>();
   for (const person of state.people) expected.set(`person:${person.id}`, person);
   for (const project of state.projects) expected.set(`project:${project.id}`, project);
   if (rows.length !== expected.size) fail('Portable knowledge must include one narrative for each entity.');
@@ -437,7 +465,14 @@ function normalizePortableKnowledge(value: unknown): PortableKnowledge {
     if (!entity || seen.has(key)) fail('Knowledge narrative entity is missing or duplicated.');
     seen.add(key);
     if (!Number.isSafeInteger(row.revision) || (row.revision as number) < 1) fail('Knowledge narrative revision is invalid.');
-    return { entityKind: row.entityKind as 'person' | 'project', entityId, content: boundedString(row.content, 'Knowledge narrative', 16 * 1024), revision: row.revision as number, updatedAt: validateDate(row.updatedAt, 'Knowledge narrative update time') };
+    const narrativeEntity = expected.get(key)!;
+    const policy2 = allowOutputPolicy2 && [
+      ...narrativeEntity.facts, ...narrativeEntity.sourceLinks,
+      ...( 'contacts' in narrativeEntity ? narrativeEntity.contacts : []),
+      ...( 'members' in narrativeEntity ? narrativeEntity.members : []),
+    ].some((item) => item.outputPolicyVersion === 2);
+    return { entityKind: row.entityKind as 'person' | 'project', entityId,
+      content: boundedString(row.content, 'Knowledge narrative', policy2 ? BACKUP_LIMITS.maxRestoredTextBytes : 16 * 1024), revision: row.revision as number, updatedAt: validateDate(row.updatedAt, 'Knowledge narrative update time') };
   });
   return { state, narratives };
 }
@@ -446,14 +481,14 @@ function validateKnowledgeEntityId(value: unknown): string {
   return value;
 }
 
-function normalizeKnowledgeCohorts(value: unknown, label: string): PortableKnowledgeCohort[] {
+function normalizeKnowledgeCohorts(value: unknown, label: string, allowOutputPolicy2 = false): PortableKnowledgeCohort[] {
   const rows = arrayField(value, BACKUP_LIMITS.knowledgeCohorts, label);
   const cohorts = rows.map((row) => {
     if (!isRecord(row)) fail(`${label} cohort must be an object.`);
     ownKeys(row, ['sourceId', 'knowledge'], `${label} cohort`);
     const sourceId = validateHistoryId(row.sourceId);
     if (sourceId.length > BACKUP_LIMITS.knowledgeSourceIdChars) fail(`${label} source ID is too long.`);
-    return { sourceId, knowledge: normalizePortableKnowledge(row.knowledge) };
+    return { sourceId, knowledge: normalizePortableKnowledge(row.knowledge, allowOutputPolicy2) };
   });
   if (new Set(cohorts.map(({ sourceId }) => sourceId)).size !== cohorts.length) fail(`${label} contains duplicate source IDs.`);
   return cohorts;
@@ -490,6 +525,21 @@ function normalizeV4(value: unknown): PortableBackupV4 {
   if (totalText > BACKUP_LIMITS.maxRestoredTextBytes) fail('Backup text exceeds the total restore limit.');
   return { ...v3, format: PORTABLE_BACKUP_FORMAT, schemaVersion: PORTABLE_BACKUP_SCHEMA_VERSION, chatHistory };
 }
+function normalizeV5(value: unknown): PortableBackupV5 {
+  if (!isRecord(value)) fail('Backup must be a JSON object.');
+  ownKeys(value, ['format', 'schemaVersion', 'exportId', 'exportedAt', 'audioIncluded', 'notes', 'tasks', 'documents', 'archivedDocuments', 'history', 'knowledge', 'archivedKnowledge', 'chatHistory'], 'Backup');
+  if (value.format !== PORTABLE_BACKUP_V5_FORMAT || value.schemaVersion !== PORTABLE_BACKUP_V5_SCHEMA_VERSION) fail('Backup format or schema version is not supported.');
+  const base = normalizeV2({ format: V2_FORMAT, schemaVersion: V2_SCHEMA_VERSION, exportId: value.exportId, exportedAt: value.exportedAt, audioIncluded: value.audioIncluded,
+    notes: value.notes, tasks: value.tasks, documents: value.documents, archivedDocuments: value.archivedDocuments, history: value.history }, true);
+  const knowledge = normalizePortableKnowledge(value.knowledge, true);
+  const archivedKnowledge = normalizeKnowledgeCohorts(value.archivedKnowledge, 'Archived knowledge', true);
+  if (archivedKnowledge.length + (hasKnowledge(knowledge) ? 1 : 0) > BACKUP_LIMITS.knowledgeCohorts) fail('Knowledge cohorts exceed the allowed item count.');
+  const chatHistory = validatePortableChatHistory(value.chatHistory);
+  const totalText = baseRestoredTextBytes(base) + utf8Length(JSON.stringify(knowledge)) +
+    archivedKnowledge.reduce((total, cohort) => total + utf8Length(JSON.stringify(cohort.knowledge)), 0) + utf8Length(JSON.stringify(chatHistory));
+  if (totalText > BACKUP_LIMITS.maxRestoredTextBytes) fail('Backup text exceeds the total restore limit.');
+  return { ...base, format: PORTABLE_BACKUP_V5_FORMAT, schemaVersion: PORTABLE_BACKUP_V5_SCHEMA_VERSION, knowledge, archivedKnowledge, chatHistory };
+}
 function upgradeV3(backup: PortableBackupV3): PortableBackupV4 {
   return normalizeV4({ ...backup, format: PORTABLE_BACKUP_FORMAT, schemaVersion: PORTABLE_BACKUP_SCHEMA_VERSION,
     chatHistory: { version: PORTABLE_CHAT_HISTORY_VERSION, conversations: [] } });
@@ -497,6 +547,17 @@ function upgradeV3(backup: PortableBackupV3): PortableBackupV4 {
 function upgradeV2(backup: PortableBackupV2): PortableBackupV4 {
   return upgradeV3(normalizeV3({ ...backup, format: PORTABLE_BACKUP_V3_FORMAT, schemaVersion: PORTABLE_BACKUP_V3_SCHEMA_VERSION,
     knowledge: emptyPortableKnowledge(), archivedKnowledge: [] }));
+}
+function normalizeBackup(value: PortableBackup): PortableBackup {
+  return value.format === PORTABLE_BACKUP_V5_FORMAT ? normalizeV5(value) : normalizeV4(value);
+}
+function asV4IfRepresentable(value: PortableBackup): PortableBackupV4 | undefined {
+  const normalized = normalizeBackup(value);
+  if (normalized.format !== PORTABLE_BACKUP_V5_FORMAT) return normalized;
+  if (normalized.history.some((item) => item.outputPolicyVersion === 2) || normalized.chatHistory.version !== PORTABLE_CHAT_HISTORY_VERSION ||
+      containsOutputPolicyMarker(normalized.knowledge.state) || normalized.archivedKnowledge.some((cohort) => containsOutputPolicyMarker(cohort.knowledge.state)) ||
+      normalized.chatHistory.conversations.some((conversation) => conversation.turns.some((turn) => turn.reply?.outputPolicyVersion !== undefined))) return undefined;
+  return normalizeV4({ ...normalized, format: PORTABLE_BACKUP_FORMAT, schemaVersion: PORTABLE_BACKUP_SCHEMA_VERSION });
 }
 
 function scanDepth(text: string): void {
@@ -679,6 +740,10 @@ export function parsePortableBackup(input: string | Uint8Array): PortableBackupP
     const backup = upgradeV3(normalizeV3(raw));
     return { backup, sourceFormat: PORTABLE_BACKUP_V3_FORMAT, warnings: [AUTHORITY_WARNING, AUDIO_WARNING], ignoredFieldCount: 0, migratedFromV1: false };
   }
+  if (raw.format === PORTABLE_BACKUP_V5_FORMAT) {
+    const backup = normalizeV5(raw);
+    return { backup, sourceFormat: PORTABLE_BACKUP_V5_FORMAT, warnings: [AUTHORITY_WARNING, AUDIO_WARNING], ignoredFieldCount: 0, migratedFromV1: false };
+  }
   if (raw.format !== PORTABLE_BACKUP_FORMAT) fail('Backup format or schema version is not supported.');
   const backup = normalizeV4(raw);
   return { backup, sourceFormat: PORTABLE_BACKUP_FORMAT, warnings: [AUTHORITY_WARNING, AUDIO_WARNING], ignoredFieldCount: 0, migratedFromV1: false };
@@ -691,13 +756,14 @@ export function validateImportedBackupArchive(value: unknown): ImportedBackupArc
     ownKeys(value, ['id', 'contentHash', 'fileHash', 'sourceFormat', 'exportedAt', 'importedAt', 'noteLinks', 'taskLinks', 'documents', 'history', 'archivedKnowledge', 'chatHistory'], 'Imported archive');
     const id = validateId(value.id, 'Imported archive ID');
     for (const key of ['contentHash', 'fileHash'] as const) if (typeof value[key] !== 'string' || !/^[a-f\d]{64}$/i.test(value[key] as string)) return undefined;
-    if (value.sourceFormat !== PORTABLE_BACKUP_FORMAT && value.sourceFormat !== PORTABLE_BACKUP_V3_FORMAT && value.sourceFormat !== V2_FORMAT && value.sourceFormat !== 'voice-assistant-export-v1') return undefined;
-    if (value.sourceFormat === PORTABLE_BACKUP_FORMAT && !Object.prototype.hasOwnProperty.call(value, 'chatHistory')) return undefined;
-    if (value.sourceFormat !== PORTABLE_BACKUP_FORMAT && Object.prototype.hasOwnProperty.call(value, 'chatHistory')) return undefined;
+    if (value.sourceFormat !== PORTABLE_BACKUP_V5_FORMAT && value.sourceFormat !== PORTABLE_BACKUP_FORMAT && value.sourceFormat !== PORTABLE_BACKUP_V3_FORMAT && value.sourceFormat !== V2_FORMAT && value.sourceFormat !== 'voice-assistant-export-v1') return undefined;
+    if ((value.sourceFormat === PORTABLE_BACKUP_FORMAT || value.sourceFormat === PORTABLE_BACKUP_V5_FORMAT) && !Object.prototype.hasOwnProperty.call(value, 'chatHistory')) return undefined;
+    if (value.sourceFormat !== PORTABLE_BACKUP_FORMAT && value.sourceFormat !== PORTABLE_BACKUP_V5_FORMAT && Object.prototype.hasOwnProperty.call(value, 'chatHistory')) return undefined;
     const noteLinksRaw = arrayField(value.noteLinks, BACKUP_LIMITS.notes, 'Archive note links');
     const taskLinksRaw = arrayField(value.taskLinks, BACKUP_LIMITS.tasks, 'Archive task links');
     const docsRaw = arrayField(value.documents, BACKUP_LIMITS.documents, 'Archive documents');
-    const historyRaw = arrayField(value.history, BACKUP_LIMITS.history, 'Archive history');
+    const historyRaw = arrayField(value.history,
+      value.sourceFormat === PORTABLE_BACKUP_V5_FORMAT ? BACKUP_LIMITS.maxNodes : BACKUP_LIMITS.history, 'Archive history');
     const archivedKnowledgeRaw = value.archivedKnowledge === undefined ? [] : arrayField(value.archivedKnowledge, BACKUP_LIMITS.knowledgeCohorts, 'Archive knowledge cohorts');
     const chatHistory = value.chatHistory === undefined ? undefined : validateInertImportedChatHistory(value.chatHistory);
     const noteLinks = noteLinksRaw.map((row) => {
@@ -726,15 +792,19 @@ export function validateImportedBackupArchive(value: unknown): ImportedBackupArc
     if (new Set(documents.map((document) => document.id)).size !== documents.length) fail('Archive documents contain duplicate IDs.');
     const history = historyRaw.map((row) => {
       if (!isRecord(row)) fail('Archive history entry is invalid.');
-      ownKeys(row, ['id', 'kind', 'sourceId', 'sourceNoteId', 'localNoteId', 'title', 'content', 'status', 'occurredAt', 'provider', 'reference'], 'Archive history entry');
+      ownKeys(row, ['id', 'kind', 'sourceId', 'sourceNoteId', 'localNoteId', 'title', 'content', 'status', 'occurredAt', 'provider', 'reference', ...(value.sourceFormat === PORTABLE_BACKUP_V5_FORMAT ? ['outputPolicyVersion'] : [])], 'Archive history entry');
       const entry = normalizeV2({ format: V2_FORMAT, schemaVersion: V2_SCHEMA_VERSION, exportId: id, exportedAt: value.exportedAt,
         audioIncluded: false, notes: [], tasks: [], documents: [], archivedDocuments: [], history: [{
           kind: row.kind, sourceId: row.sourceId, ...(row.sourceNoteId !== undefined ? { sourceNoteId: row.sourceNoteId } : {}),
           title: row.title, content: row.content, status: row.status, ...(row.occurredAt !== undefined ? { occurredAt: row.occurredAt } : {}),
           ...(row.provider !== undefined ? { provider: row.provider } : {}), ...(row.reference !== undefined ? { reference: row.reference } : {}),
-        }] }).history[0]!;
+          ...(row.outputPolicyVersion !== undefined ? { outputPolicyVersion: row.outputPolicyVersion } : {}),
+        }] }, value.sourceFormat === PORTABLE_BACKUP_V5_FORMAT).history[0]!;
       return { ...entry, id: validateId(row.id, 'Archive history ID'), ...(row.localNoteId !== undefined ? { localNoteId: validateId(row.localNoteId, 'Archive history local note ID') } : {}) };
     });
+    if (value.sourceFormat === PORTABLE_BACKUP_V5_FORMAT && history.filter((entry) => entry.outputPolicyVersion !== 2).length > BACKUP_LIMITS.history) {
+      fail('Legacy archive history exceeds the allowed item count.');
+    }
     duplicateIds(history, 'Archive history');
     if (new Set(history.map((entry) => entry.id)).size !== history.length) fail('Archive history contains duplicate local IDs.');
     const archivedKnowledge = archivedKnowledgeRaw.map((row) => {
@@ -752,7 +822,7 @@ export function validateImportedBackupArchive(value: unknown): ImportedBackupArc
       });
       if (activationLinks && (new Set(activationLinks.map(({ entityKind, sourceEntityId }) => `${entityKind}:${sourceEntityId}`)).size !== activationLinks.length
         || new Set(activationLinks.map(({ entityId }) => entityId)).size !== activationLinks.length)) fail('Knowledge activation links contain duplicate IDs.');
-      return { id: validateId(row.id, 'Archive knowledge cohort ID'), sourceId, knowledge: normalizePortableKnowledge(row.knowledge), ...(activationLinks ? { activationLinks } : {}) };
+      return { id: validateId(row.id, 'Archive knowledge cohort ID'), sourceId, knowledge: normalizePortableKnowledge(row.knowledge, value.sourceFormat === PORTABLE_BACKUP_V5_FORMAT), ...(activationLinks ? { activationLinks } : {}) };
     });
     if (new Set(archivedKnowledge.map(({ id: cohortId }) => cohortId)).size !== archivedKnowledge.length || new Set(archivedKnowledge.map(({ sourceId }) => sourceId)).size !== archivedKnowledge.length) fail('Archive knowledge cohorts contain duplicate IDs.');
     let restoredTextBytes = 0;
@@ -778,6 +848,7 @@ function proposalHistory(proposal: Proposal, activity: AppState['activity']): Po
   return { kind: 'proposal', sourceId: `proposal:${proposal.id}`, ...(proposal.noteId ? { sourceNoteId: proposal.noteId } : {}),
     title: 'Saved suggestion — imported history', content: lines.join('\n\n'),
     status: `${proposal.status} (unverified imported history)${activityItem?.createdAt || proposal.remoteAcceptedAt ? '' : ' — Original time unavailable'}`,
+    ...(proposal.provenance?.outputPolicyVersion === 2 ? { outputPolicyVersion: 2 as const } : {}),
     ...(activityItem?.createdAt || proposal.remoteAcceptedAt ? { occurredAt: activityItem?.createdAt ?? proposal.remoteAcceptedAt } : {}),
     ...(proposal.remoteId ? { reference: proposal.remoteId } : {}) };
 }
@@ -793,11 +864,12 @@ function analysisHistory(note: AppState['notes'][number]): PortableHistoryEntry[
   return values.filter(([, content]) => Boolean(content)).map(([section, content]) => ({ kind: 'analysis', sourceId: `analysis:${note.id}:${section}`, sourceNoteId: note.id,
     title: `${section[0].toUpperCase()}${section.slice(1)} — imported analysis`, content,
     status: `Unverified historical result${analysis.analyzedAt ? '' : ' — Original time unavailable'}`,
+    ...(analysis.outputPolicyVersion === 2 ? { outputPolicyVersion: 2 as const } : {}),
     ...(analysis.analyzedAt ? { occurredAt: analysis.analyzedAt } : {}) }));
 }
 
 /** Build an allowlisted DTO. Runtime-only fields and authority are deliberately not projected. */
-export function createPortableBackup(state: AppState, metadata: PortableBackupMetadata, liveChatHistory?: PortableChatHistory): PortableBackupV4 {
+export function createPortableBackup(state: AppState, metadata: PortableBackupMetadata, liveChatHistory?: PortableChatHistory): PortableBackup {
   const history: PortableHistoryEntry[] = [];
   // Chat conversations have their own future inert export contract. The legacy
   // note backup must not accidentally serialize their canonical message notes.
@@ -852,6 +924,7 @@ export function createPortableBackup(state: AppState, metadata: PortableBackupMe
     content: [`Title: ${record.title}`, `Body: ${record.body}`, ...payload,
       ...record.reconciliations.map((item) => `Reconciliation (${item.disposition}): ${item.note}`)].filter(Boolean).join('\n\n'),
     status: `${record.outcome} (unverified imported history)`, occurredAt: record.dispatchStartedAt, provider: record.account.provider,
+    ...(record.sourceProvenance.outputPolicyVersion === 2 ? { outputPolicyVersion: 2 as const } : {}),
     ...(record.remoteId ? { reference: record.remoteId } : {}) });
   }
   for (const record of state.deviceCalendars.dispatchRecords) {
@@ -884,6 +957,7 @@ export function createPortableBackup(state: AppState, metadata: PortableBackupMe
       content: document.content, revision: document.revision, updatedAt: document.updatedAt });
     for (const item of archive.history) history.push({ kind: item.kind, sourceId: `archive:${archive.id}:history:${item.id}`,
       ...((item.localNoteId ?? item.sourceNoteId) ? { sourceNoteId: item.localNoteId ?? item.sourceNoteId } : {}), title: item.title, content: item.content, status: item.status,
+      ...(item.outputPolicyVersion === 2 ? { outputPolicyVersion: 2 as const } : {}),
       ...(item.occurredAt ? { occurredAt: item.occurredAt } : {}),
       ...(item.provider ? { provider: item.provider } : {}), ...(item.reference ? { reference: item.reference } : {}) });
     for (const cohort of archive.archivedKnowledge ?? []) backup.archivedKnowledge.push({ sourceId: `archive:${archive.id}:knowledge:${cohort.id}`,
@@ -892,12 +966,16 @@ export function createPortableBackup(state: AppState, metadata: PortableBackupMe
         return { path: entity?.narrativePath ?? '', content: narrative.content, revision: narrative.revision, updatedAt: narrative.updatedAt };
       }), true) });
   }
+  const outputPolicyMarker = history.some((item) => item.outputPolicyVersion === 2) || containsOutputPolicyMarker(backup.knowledge.state) ||
+    backup.archivedKnowledge.some((cohort) => containsOutputPolicyMarker(cohort.knowledge.state)) ||
+    backup.chatHistory.conversations.some((conversation) => conversation.turns.some((turn) => turn.reply?.outputPolicyVersion !== undefined));
+  if (outputPolicyMarker) return normalizeV5({ ...backup, format: PORTABLE_BACKUP_V5_FORMAT, schemaVersion: PORTABLE_BACKUP_V5_SCHEMA_VERSION });
   return normalizeV4(backup);
 }
 
 /** Canonical content string for an idempotency digest; excludes export identity and time. */
-export function canonicalPortableContent(backup: PortableBackupV4): string {
-  const normalized = normalizeV4(backup);
+export function canonicalPortableContent(backup: PortableBackup): string {
+  const normalized = normalizeBackup(backup);
   return JSON.stringify({ format: normalized.format, schemaVersion: normalized.schemaVersion, audioIncluded: false,
     notes: [...normalized.notes].sort((a, b) => a.sourceId.localeCompare(b.sourceId)),
     tasks: [...normalized.tasks].sort((a, b) => a.sourceId.localeCompare(b.sourceId)),
@@ -910,8 +988,9 @@ export function canonicalPortableContent(backup: PortableBackupV4): string {
 }
 
 /** Canonical bytes used to recognize V3 archives after export advanced to V4. */
-export function legacyCanonicalPortableContentV3(backup: PortableBackupV4): string | undefined {
-  const normalized = normalizeV4(backup);
+export function legacyCanonicalPortableContentV3(backup: PortableBackup): string | undefined {
+  const normalized = asV4IfRepresentable(backup);
+  if (!normalized) return undefined;
   if (normalized.chatHistory.conversations.length > 0) return undefined;
   return JSON.stringify({ format: PORTABLE_BACKUP_V3_FORMAT, schemaVersion: PORTABLE_BACKUP_V3_SCHEMA_VERSION, audioIncluded: false,
     notes: [...normalized.notes].sort((a, b) => a.sourceId.localeCompare(b.sourceId)),
@@ -924,8 +1003,9 @@ export function legacyCanonicalPortableContentV3(backup: PortableBackupV4): stri
 }
 
 /** Legacy canonical bytes used only to recover content hashes written by v2 archives. */
-export function legacyCanonicalPortableContentV2(backup: PortableBackupV4): string | undefined {
-  const normalized = normalizeV4(backup);
+export function legacyCanonicalPortableContentV2(backup: PortableBackup): string | undefined {
+  const normalized = asV4IfRepresentable(backup);
+  if (!normalized) return undefined;
   if (normalized.chatHistory.conversations.length > 0 || hasKnowledge(normalized.knowledge) || normalized.archivedKnowledge.length > 0) return undefined;
   return JSON.stringify({ format: V2_FORMAT, schemaVersion: V2_SCHEMA_VERSION, audioIncluded: false,
     notes: [...normalized.notes].sort((a, b) => a.sourceId.localeCompare(b.sourceId)),
@@ -942,8 +1022,8 @@ export interface PortableBackupPreview {
 }
 
 /** Content-only preview. Current documents are read-only inputs and are never changed here. */
-export function summarizePortableBackup(backup: PortableBackupV4, currentDocuments: readonly Pick<PortableDocument, 'path' | 'content'>[] = []): PortableBackupPreview {
-  const normalized = normalizeV4(backup);
+export function summarizePortableBackup(backup: PortableBackup, currentDocuments: readonly Pick<PortableDocument, 'path' | 'content'>[] = []): PortableBackupPreview {
+  const normalized = normalizeBackup(backup);
   const current = new Map(currentDocuments.map((document) => [document.path.normalize('NFC').toLocaleLowerCase('en-US'), document]));
   const documentConflicts = normalized.documents.flatMap((document) => {
     const existing = current.get(document.path.normalize('NFC').toLocaleLowerCase('en-US'));

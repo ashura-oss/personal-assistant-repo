@@ -4,12 +4,12 @@ import {
   validateOpenRouterBatchLedger, type OpenRouterBatchJob,
 } from '../src/services/openRouterBatchJobs';
 import { OPENROUTER_BATCH_MODEL } from '../src/services/openRouter';
-import { assistantChatRefinementSchemaV2, assistantResponseSchema, assistantResponseSchemaV2 } from '../src/assistant';
+import { assistantChatRefinementSchemaV2, assistantResponseSchema, assistantResponseSchemaV2, assistantResponseSchemaV3 } from '../src/assistant';
 
 const operationId = '20000000-0000-4000-8000-000000000001';
-function bodyFor(version: 1 | 2): string {
+function bodyFor(version: 1 | 2 | 5): string {
   return JSON.stringify({ model: 'openai/gpt-6-luna', messages: [{ role: 'system', content: 'SYSTEM' }, { role: 'user', content: 'CANARY PRIVATE TRANSCRIPT' }],
-    reasoning: { effort: 'low', exclude: true }, response_format: { type: 'json_schema', json_schema: { name: 'note_assistance', strict: true, schema: version === 1 ? assistantResponseSchema : assistantResponseSchemaV2 } }, stream: false });
+    reasoning: { effort: 'low', exclude: true }, response_format: { type: 'json_schema', json_schema: { name: 'note_assistance', strict: true, schema: version === 1 ? assistantResponseSchema : version === 2 ? assistantResponseSchemaV2 : assistantResponseSchemaV3 } }, stream: false });
 }
 function refinementBody(): string {
   return JSON.stringify({ model: 'openai/gpt-6-luna', messages: [{ role: 'system', content: 'SYSTEM' }, { role: 'user', content: 'CANARY PRIVATE TRANSCRIPT' }],
@@ -18,7 +18,7 @@ function refinementBody(): string {
 const at = '2026-10-13T10:00:00.000Z';
 
 function contentJob(overrides: Partial<OpenRouterBatchJob> = {}): OpenRouterBatchJob {
-  const requestProfileVersion: 1 | 2 = overrides.requestProfileVersion === 2 ? 2 : 1;
+  const requestProfileVersion: 1 | 2 | 5 = overrides.requestProfileVersion === 2 ? 2 : overrides.requestProfileVersion === 5 ? 5 : 1;
   const requestBody = overrides.requestBody ?? bodyFor(requestProfileVersion);
   return {
     id: operationId, customId: operationId, kind: 'note_assistance', status: 'queued', createdAt: at, updatedAt: at,
@@ -56,6 +56,26 @@ describe('private OpenRouter Batch ledger receipts', () => {
     expect(assistantBatchJobDTO(contentJob({ status: 'source_removed', sourceRemoved: true, batchId: undefined })).canCheck).toBe(false);
     expect(assistantBatchJobDTO(contentJob({ status: 'source_removed', sourceRemoved: true })).canCheck).toBe(true);
     expect(assistantBatchJobDTO(contentJob({ status: 'queued' }), true).canCheck).toBe(false);
+  });
+
+  it('keeps an observed provider result as a private, reloadable processing checkpoint', () => {
+    const observedAt = '2026-10-13T10:03:00.000Z';
+    const observation = { version: 1 as const, observedAt, resultSha256: 'e'.repeat(64) };
+    const validated = validateOpenRouterBatchLedger({ version: 1, jobs: [contentJob({ status: 'processing', providerObservation: observation,
+      accounting: { providerReportedCostUsd: 0.002, totalTokens: 42 }, unknownCharge: false })] });
+    expect(validated.jobs[0]).toMatchObject({ status: 'processing', providerObservation: observation, accounting: { providerReportedCostUsd: 0.002 } });
+    expect(assistantBatchJobDTO(validated.jobs[0]!)).toMatchObject({ status: 'processing', resultObservedAt: observedAt, costStatus: 'reported', providerReportedCostUsd: 0.002 });
+    expect(() => validateOpenRouterBatchLedger({ version: 1, jobs: [contentJob({ providerObservation: observation, status: 'queued' })] })).toThrow(/integrity validation/i);
+    expect(() => validateOpenRouterBatchLedger({ version: 1, jobs: [contentJob({ providerObservation: { ...observation, resultSha256: 'E'.repeat(64) }, status: 'processing' })] })).toThrow(/integrity validation/i);
+    expect(() => validateOpenRouterBatchLedger({ version: 1, jobs: [contentJob({ providerObservation: { ...observation, resultSha256: `${'e'.repeat(64)}\n` }, status: 'processing' })] })).toThrow(/integrity validation/i);
+  });
+
+  it('preserves policy 2 on source-removal receipts and rejects tampered profile-policy combinations', () => {
+    const job = contentJob({ requestProfileVersion: 5, outputPolicyVersion: 2, requestBody: bodyFor(5) });
+    const tombstone = tombstoneOpenRouterBatchJob(job, at);
+    expect(validateOpenRouterBatchLedger({ version: 1, jobs: [tombstone] }).jobs[0]).toMatchObject({ requestProfileVersion: 5, outputPolicyVersion: 2 });
+    expect(() => validateOpenRouterBatchLedger({ version: 1, jobs: [{ ...tombstone, outputPolicyVersion: undefined }] })).toThrow(/integrity validation/i);
+    expect(() => validateOpenRouterBatchLedger({ version: 1, jobs: [{ ...tombstone, requestProfileVersion: 2 }] })).toThrow(/integrity validation/i);
   });
 
   it('rejects UUID, opaque provider ID, and digest fields with a trailing newline', () => {

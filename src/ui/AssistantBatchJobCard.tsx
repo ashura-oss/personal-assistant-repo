@@ -70,9 +70,11 @@ export function AssistantBatchJobCard({ job, chatContext, storageLocation = 'dev
   return (
     <View style={styles.card}>
       <Text style={s.sectionTitle}>OpenRouter Batch · {title}</Text>
-      <Text style={styles.status}>{assistantBatchStatusLabel(job.status, job.kind)}</Text>
+      <Text style={styles.status}>{assistantBatchStatusLabel(job.status, job.kind, job.resultObservedAt)}</Text>
       <Text style={styles.meta}>Added {dateLabel(job.createdAt)} · {job.model} · {job.effort} reasoning</Text>
-      {job.status === 'queued' || job.status === 'processing' ? (
+      {job.status === 'processing' && job.resultObservedAt ? (
+        <Text style={styles.helper}>Check this request to recover it. The provider result was observed; storage awaits confirmation.</Text>
+      ) : job.status === 'queued' || job.status === 'processing' ? (
         <Text style={styles.helper}>Batch replies may take up to 24 hours. Checks happen only when you ask.</Text>
       ) : null}
       {job.status === 'submission_unknown' ? (

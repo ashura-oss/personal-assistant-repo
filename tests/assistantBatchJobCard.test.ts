@@ -62,6 +62,15 @@ describe('AssistantBatchJobCard action ownership', () => {
     expect([...host.querySelectorAll('button')].some((button) => button.textContent?.includes('Review higher'))).toBe(false);
   });
 
+  it('distinguishes an observed provider result from a still-running Batch request', () => {
+    act(() => root.render(React.createElement(AssistantBatchJobCard, { job: queuedJob({ status: 'processing',
+      resultObservedAt: '2026-10-13T12:01:00.000Z' }), onCheck: vi.fn() })));
+    expect(host.textContent).toContain('Provider finished; result storage awaits confirmation');
+    expect(host.textContent).toContain('Check this request to recover it');
+    expect(host.textContent).not.toContain('Batch replies may take up to 24 hours');
+    expect([...host.querySelectorAll('button')].some((button) => button.textContent === 'Check to recover reply')).toBe(true);
+  });
+
   it('does not describe an active higher-effort child as unavailable', () => {
     act(() => root.render(React.createElement(AssistantBatchJobCard, { job: queuedJob({
       status: 'result_truncated', canCheck: false, effort: 'low', canRecoverMoreCompute: false,

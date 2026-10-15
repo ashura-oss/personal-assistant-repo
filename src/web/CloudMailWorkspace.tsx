@@ -119,7 +119,7 @@ export function CloudMailWorkspace({ coordinator, snapshot, busy, blocked }: Pro
         <Button label="Queue delayed reply request" tone="quiet" disabled={!coordinator || mutationBlocked || state.replyNeedsRebind || state.replyBusy !== undefined || !state.replyDraft.useSavedText || !state.replyDraft.brief.trim()}
           onPress={() => { void coordinator?.submitReplyBatch(); }} />
         {dto.assistantBatchJobs.filter((job) => job.kind === 'mail_reply' && job.mailMessageId === state.replyDraft?.messageId).map((job) => <View key={job.id} style={styles.card}>
-          <Text style={styles.meta}>Reply request · {job.status} · provider-reported usage {job.promptTokens !== undefined || job.completionTokens !== undefined ? `${job.promptTokens ?? 'unknown'} input · ${job.completionTokens ?? 'unknown'} output tokens` : 'not reported'}</Text>
+          <Text style={styles.meta}>Reply request · {job.status === 'processing' && job.resultObservedAt ? 'provider finished; result storage awaits confirmation' : job.status} · provider-reported usage {job.promptTokens !== undefined || job.completionTokens !== undefined ? `${job.promptTokens ?? 'unknown'} input · ${job.completionTokens ?? 'unknown'} output tokens` : 'not reported'}</Text>
           {job.costStatus === 'reported' ? <Text style={styles.meta}>{job.billingScope === 'byok_fee_only' ? 'OpenRouter-reported BYOK fee' : 'OpenRouter-reported cost'} · {formatReportedBatchCost(job.providerReportedCostUsd) ?? 'amount unavailable'}</Text>
             : job.costStatus === 'waiting' ? <Text style={styles.meta}>Provider-reported usage is not available yet.</Text>
               : job.costStatus === 'unavailable' ? <Text style={styles.meta}>The provider did not report a cost for this request.</Text>

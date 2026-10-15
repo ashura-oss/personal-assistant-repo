@@ -88,6 +88,32 @@ describe('knowledge schema', () => {
     expect(knowledgeContextSources(changed)[0]?.versionMaterial).not.toBe(source.versionMaterial);
   });
 
+  it('roundtrips policy-2 knowledge counts, labels, evidence, and narrative content without relaxing legacy rows', () => {
+    const value = sample();
+    const longText = 'é'.repeat(1_200);
+    const facts = Array.from({ length: 70 }, (_, index) => ({ id: `123e4567-e89b-42d3-a456-${String(index + 1000).padStart(12, '0')}`,
+      provenance: 'accepted_inference' as const, createdAt: at, outputPolicyVersion: 2 as const,
+      evidence: Array.from({ length: 5 }, (_, itemIndex) => ({ sourceId: `note-${itemIndex}`, sourceVersion: `2:${digest}`, revision: 2, quote: longText })),
+      statement: `${index} ${longText}` }));
+    const suggestions = Array.from({ length: 205 }, (_, index) => ({ id: `123e4567-e89b-42d3-a456-${String(index + 5000).padStart(12, '0')}`,
+      revision: 1, change: { type: 'add_fact' as const, entityKind: 'person' as const, entityId: personId, statement: `${index} ${longText}` },
+      targetRevision: 1, evidence: Array.from({ length: 5 }, (_, itemIndex) => ({ sourceId: `note-${itemIndex}`, sourceVersion: `2:${digest}`, revision: 2, quote: longText })),
+      status: 'pending' as const, createdAt: at, updatedAt: at, outputPolicyVersion: 2 as const }));
+    const state = validateKnowledgeState({ ...value, people: [{ ...value.people[0], facts, contacts: value.people[0]!.contacts,
+      sourceLinks: [{ ...value.people[0]!.sourceLinks[0], outputPolicyVersion: 2, label: longText }] }], suggestions });
+    expect(state.people[0]?.facts).toHaveLength(70);
+    expect(state.suggestions).toHaveLength(205);
+    expect(state.people[0]?.sourceLinks[0]?.label).toBe(longText);
+    expect(state.people[0]?.facts[0]?.evidence).toHaveLength(5);
+    expect(renderKnowledgeMarkdown(state, 'person', personId).length).toBeGreaterThan(16 * 1024);
+    expect(() => validateKnowledgeState({ ...value, suggestions: [{ ...value.suggestions[0], status: ['pending'] }] })).toThrow(/status/i);
+    expect(() => validateKnowledgeState({ ...value, people: [{ ...value.people[0], contacts: [{ ...value.people[0]!.contacts[0], outputPolicyVersion: 2, address: 'a'.repeat(513) }] }] })).toThrow(/contact address/i);
+
+    const legacyFacts = Array.from({ length: 65 }, (_, index) => ({ id: `123e4567-e89b-42d3-a456-${String(index + 1000).padStart(12, '0')}`,
+      provenance: 'accepted_inference' as const, createdAt: at, evidence: [{ sourceId: 'note', sourceVersion: `2:${digest}`, revision: 2, quote: 'short quote' }], statement: `legacy ${index}` }));
+    expect(() => validateKnowledgeState({ ...value, people: [{ ...value.people[0], facts: legacyFacts }] })).toThrow(/legacy facts/i);
+  });
+
   it('fingerprints one-hop member and entity-link labels, and exposes project aliases and dates', () => {
     const value = sample();
     value.projects[0]!.aliases = ['Atlas'] as never[];

@@ -1445,7 +1445,8 @@ export class ConnectorClient {
         !sameIdentity(envelope.identity, accountIdentity(account)) || !/^[^\r\n\0]{1,160}$/.test(envelope.proposalId) ||
         !Number.isInteger(envelope.revision) || envelope.revision < 1 ||
         (envelope.replySource ? envelope.sourceRevision !== undefined : !Number.isInteger(envelope.sourceRevision) || envelope.sourceRevision! < 1) ||
-        !/^[a-f0-9]{64}$/i.test(envelope.payloadDigest) || !envelope.title || envelope.title.length > 1000 || envelope.body.length > 100_000 || /[\r\n\0]/.test(envelope.title)) {
+        !/^[a-f0-9]{64}$/i.test(envelope.payloadDigest) || typeof envelope.title !== 'string' || !envelope.title ||
+        typeof envelope.body !== 'string' || /[\r\n\0]/.test(envelope.title)) {
       throw new Error('Dispatch approval does not match this account and operation.');
     }
   }
@@ -1459,7 +1460,7 @@ export class ConnectorClient {
     if (p.reply) {
       if (p.subject.length > 998 || /[\r\n\0]/.test(p.subject) || p.subject !== p.subject.trim()) throw new Error('Reply subject contains an invalid header value.');
     } else headerValue(p.subject, 'Subject');
-    if (p.subject.length > 998 || p.text.length > 100_000 || p.attachments.length > 10) throw new Error('Email payload exceeds limits.');
+    if (typeof p.text !== 'string' || p.subject.length > 998 || p.attachments.length > 10) throw new Error('Email payload exceeds limits.');
     if (p.reply) {
       if (operation !== 'draft' && operation !== 'send' || envelope.operation !== operation) throw new Error('Reply operation does not match its approved action.');
       if (operation === 'send' && (!envelope.replySource?.batchJobId || envelope.mailReplyBatchBinding?.jobId !== envelope.replySource.batchJobId ||
@@ -1593,8 +1594,8 @@ function validateEvent(event: EventProposalPayload): void {
   if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start || end - start > 366 * 24 * 60 * 60 * 1000) throw new Error('Invalid event time range.');
   if (!event.timeZone || event.timeZone.length > 100 || /[\r\n]/.test(event.timeZone)) throw new Error('Invalid event time zone.');
   try { new Intl.DateTimeFormat('en', { timeZone: event.timeZone }).format(0); } catch { throw new Error('Invalid event time zone.'); }
-  if (event.title !== undefined && (!event.title || event.title.length > 1000 || /[\r\n\0]/.test(event.title))) throw new Error('Invalid event title.');
-  if (event.description !== undefined && event.description.length > 100_000) throw new Error('Event description is too long.');
+  if (event.title !== undefined && (typeof event.title !== 'string' || !event.title || /[\r\n\0]/.test(event.title))) throw new Error('Invalid event title.');
+  if (event.description !== undefined && typeof event.description !== 'string') throw new Error('Invalid event description.');
   emailList(event.attendees, 'attendee');
   if (!['send', 'none'].includes(event.invitePolicy)) throw new Error('Invalid invite policy.');
 }

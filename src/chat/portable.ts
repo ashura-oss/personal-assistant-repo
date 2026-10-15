@@ -4,6 +4,7 @@ import { validateOpenRouterBatchLedger } from '../services/openRouterBatchJobs';
 import type { OpenRouterBatchLedger, OpenRouterBatchJob } from '../services/openRouterBatchJobs';
 
 export const PORTABLE_CHAT_HISTORY_VERSION = 1 as const;
+export const PORTABLE_CHAT_HISTORY_V2 = 2 as const;
 export const PORTABLE_CHAT_HISTORY_MAX_BYTES = 32 * 1024 * 1024;
 export const IMPORTED_CHAT_HISTORY_ORIGIN = 'portable_backup_unverified' as const;
 
@@ -20,6 +21,7 @@ export type PortableChatReply = Readonly<{
   answer: string;
   clarifications: readonly string[];
   completedAt: string;
+  outputPolicyVersion?: 1 | 2;
 }>;
 
 export type PortableChatTurn = Readonly<{
@@ -43,7 +45,7 @@ export type PortableChatConversation = Readonly<{
 
 /** Content-only history. It deliberately contains no local source or execution identifiers. */
 export type PortableChatHistory = Readonly<{
-  version: typeof PORTABLE_CHAT_HISTORY_VERSION;
+  version: typeof PORTABLE_CHAT_HISTORY_VERSION | typeof PORTABLE_CHAT_HISTORY_V2;
   conversations: readonly PortableChatConversation[];
 }>;
 
@@ -145,15 +147,18 @@ function accounting(value: unknown): PortableChatAccounting {
   }
   return Object.freeze(result);
 }
-function parseReply(value: unknown): PortableChatReply {
+function parseReply(value: unknown, allowOutputPolicy: boolean): PortableChatReply {
   if (!object(value)) fail('Portable Chat reply is invalid.');
-  exactKeys(value, ['summary', 'answer', 'clarifications', 'completedAt']);
+  exactKeys(value, ['summary', 'answer', 'clarifications', 'completedAt'], allowOutputPolicy ? ['outputPolicyVersion'] : []);
+  if (value.outputPolicyVersion !== undefined && value.outputPolicyVersion !== 1 && value.outputPolicyVersion !== 2) fail('Portable Chat output policy version is invalid.');
+  if (value.outputPolicyVersion === 2 && !allowOutputPolicy) fail('Portable Chat output policy requires history version 2.');
   const clarifications = denseArray(value.clarifications, 'Portable Chat clarifications').map((item) => text(item, 'Portable Chat clarification'));
-  if (clarifications.length > 10 || clarifications.some((item) => item.length > 1000)) fail('Portable Chat clarifications exceed the supported structure.');
+  if (value.outputPolicyVersion !== 2 && (clarifications.length > 10 || clarifications.some((item) => item.length > 1000))) fail('Portable Chat clarifications exceed the supported structure.');
   return Object.freeze({ summary: text(value.summary, 'Portable Chat summary', true), answer: text(value.answer, 'Portable Chat answer', true),
-    clarifications: Object.freeze(clarifications), completedAt: timestamp(value.completedAt, 'Portable Chat reply time') });
+    clarifications: Object.freeze(clarifications), completedAt: timestamp(value.completedAt, 'Portable Chat reply time'),
+    ...(value.outputPolicyVersion !== undefined ? { outputPolicyVersion: value.outputPolicyVersion as 1 | 2 } : {}) });
 }
-function parseTurn(value: unknown, conversationCreated: string, conversationUpdated: string): PortableChatTurn {
+function parseTurn(value: unknown, conversationCreated: string, conversationUpdated: string, historyVersion: number): PortableChatTurn {
   if (!object(value)) fail('Portable Chat turn is invalid.');
   exactKeys(value, ['userText', 'createdAt', 'capturedAt', 'captureTimeZone'], ['reply', 'accounting', 'operation', 'reasoningEffort', 'messageOrigin']);
   const createdAt = timestamp(value.createdAt, 'Portable Chat turn time');
@@ -161,10 +166,10 @@ function parseTurn(value: unknown, conversationCreated: string, conversationUpda
   if (Date.parse(createdAt) < Date.parse(conversationCreated) || Date.parse(createdAt) > Date.parse(conversationUpdated) || Date.parse(capturedAt) > Date.parse(createdAt)) {
     fail('Portable Chat turn times are outside their conversation.');
   }
-  const reply = value.reply === undefined ? undefined : parseReply(value.reply);
+  const reply = value.reply === undefined ? undefined : parseReply(value.reply, historyVersion === PORTABLE_CHAT_HISTORY_V2);
   if ((value.operation !== undefined && value.operation !== 'chat_refinement') ||
       ((value.operation === 'chat_refinement') !== (value.reasoningEffort !== undefined)) ||
-      (value.reasoningEffort !== undefined && !['medium', 'high', 'max'].includes(String(value.reasoningEffort))) ||
+      (value.reasoningEffort !== undefined && (typeof value.reasoningEffort !== 'string' || !['medium', 'high', 'max'].includes(value.reasoningEffort))) ||
       (value.operation === 'chat_refinement' && value.messageOrigin !== undefined)) fail('Portable Chat operation annotation is invalid.');
   if (reply && (Date.parse(reply.completedAt) < Date.parse(createdAt) || Date.parse(reply.completedAt) > Date.parse(conversationUpdated))) fail('Portable Chat reply time is outside its conversation.');
   if (value.messageOrigin !== undefined && value.messageOrigin !== 'saved_transcript') fail('Portable Chat message origin is invalid.');
@@ -179,20 +184,20 @@ export function validatePortableChatHistory(value: unknown, maxBytes = PORTABLE_
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) fail('Portable Chat byte limit is invalid.');
   if (!object(value)) fail('Portable Chat history must be an object.');
   exactKeys(value, ['version', 'conversations']);
-  if (value.version !== PORTABLE_CHAT_HISTORY_VERSION) fail('Portable Chat history version is unsupported.');
+  if (value.version !== PORTABLE_CHAT_HISTORY_VERSION && value.version !== PORTABLE_CHAT_HISTORY_V2) fail('Portable Chat history version is unsupported.');
   const conversations = denseArray(value.conversations, 'Portable Chat conversations').map((entry) => {
     if (!object(entry)) fail('Portable Chat conversation is invalid.');
     exactKeys(entry, ['title', 'createdAt', 'updatedAt', 'turns']);
     const createdAt = timestamp(entry.createdAt, 'Portable Chat conversation time');
     const updatedAt = timestamp(entry.updatedAt, 'Portable Chat update time');
     if (Date.parse(updatedAt) < Date.parse(createdAt)) fail('Portable Chat conversation times are not monotonic.');
-    const turns = denseArray(entry.turns, 'Portable Chat turns').map((turn) => parseTurn(turn, createdAt, updatedAt));
+    const turns = denseArray(entry.turns, 'Portable Chat turns').map((turn) => parseTurn(turn, createdAt, updatedAt, value.version as number));
     for (let index = 1; index < turns.length; index += 1) {
       if (Date.parse(turns[index]!.createdAt) < Date.parse(turns[index - 1]!.createdAt)) fail('Portable Chat turns are not chronological.');
     }
     return Object.freeze({ title: text(entry.title, 'Portable Chat title'), createdAt, updatedAt, turns: Object.freeze(turns) });
   });
-  const result: PortableChatHistory = Object.freeze({ version: PORTABLE_CHAT_HISTORY_VERSION, conversations: Object.freeze(conversations) });
+  const result: PortableChatHistory = Object.freeze({ version: value.version as 1 | 2, conversations: Object.freeze(conversations) });
   let serialized: string;
   try { serialized = JSON.stringify(result); } catch { fail('Portable Chat history cannot be serialized.'); }
   if (new TextEncoder().encode(serialized).byteLength > maxBytes) fail('Portable Chat history exceeds the file size limit.');
@@ -230,7 +235,9 @@ export function validateInertImportedChatHistory(value: unknown): readonly Inert
     }
     portableConversations.push({ title: raw.title, createdAt: raw.createdAt, updatedAt: raw.updatedAt, turns, conversationId });
   }
-  const payload = validatePortableChatHistory({ version: PORTABLE_CHAT_HISTORY_VERSION,
+  const hasOutputPolicyMarker = rawConversations.some((conversation) => object(conversation) && Array.isArray(conversation.turns) && conversation.turns.some((turn) => object(turn) && object(turn.reply) && Object.prototype.hasOwnProperty.call(turn.reply, 'outputPolicyVersion')));
+  const historyVersion = hasOutputPolicyMarker ? PORTABLE_CHAT_HISTORY_V2 : PORTABLE_CHAT_HISTORY_VERSION;
+  const payload = validatePortableChatHistory({ version: historyVersion,
     conversations: portableConversations.map((rawConversation) => {
       const conversation = rawConversation as Record<string, unknown>;
       return { title: conversation.title, createdAt: conversation.createdAt, updatedAt: conversation.updatedAt, turns: conversation.turns };
@@ -247,7 +254,8 @@ export function validateInertImportedChatHistory(value: unknown): readonly Inert
 /** Removes archive-local identity before imported Chat is included in another portable backup. */
 export function projectInertImportedChatHistory(value: unknown): PortableChatHistory {
   const conversations = validateInertImportedChatHistory(value);
-  return validatePortableChatHistory({ version: PORTABLE_CHAT_HISTORY_VERSION, conversations: conversations.map(({ title, createdAt, updatedAt, turns }) => ({
+  const historyVersion = conversations.some((conversation) => conversation.turns.some((turn) => turn.reply && Object.prototype.hasOwnProperty.call(turn.reply, 'outputPolicyVersion'))) ? PORTABLE_CHAT_HISTORY_V2 : PORTABLE_CHAT_HISTORY_VERSION;
+  return validatePortableChatHistory({ version: historyVersion, conversations: conversations.map(({ title, createdAt, updatedAt, turns }) => ({
     title, createdAt, updatedAt, turns: turns.map(({ userText, createdAt: turnCreatedAt, messageOrigin, capturedAt, captureTimeZone, operation, reasoningEffort, reply, accounting }) => ({
       userText, createdAt: turnCreatedAt, capturedAt, captureTimeZone, ...(messageOrigin ? { messageOrigin } : {}), ...(operation ? { operation, reasoningEffort } : {}), ...(reply ? { reply } : {}), ...(accounting ? { accounting } : {}),
     })),
@@ -303,6 +311,7 @@ export async function createPortableChatHistory(
       }
       if (turn.reply) {
         if (job.status !== 'completed' || job.sourceRemoved || job.requestSha256 !== turn.reply.requestSha256 || job.requestProfileVersion !== turn.reply.requestProfileVersion ||
+            (job.outputPolicyVersion ?? 1) !== (turn.reply.outputPolicyVersion ?? 1) ||
             !(await verifyTurn(turn))) fail('A Chat reply did not pass its immutable digest check.');
       }
       if (job.chatBinding) {
@@ -331,7 +340,8 @@ export async function createPortableChatHistory(
         }
       }
       const reply = turn.reply ? Object.freeze({ summary: turn.reply.summary, answer: turn.reply.answer,
-        clarifications: Object.freeze([...turn.reply.clarifications]), completedAt: turn.reply.completedAt }) : undefined;
+        clarifications: Object.freeze([...turn.reply.clarifications]), completedAt: turn.reply.completedAt,
+        ...(turn.reply.outputPolicyVersion === 2 ? { outputPolicyVersion: 2 as const } : {}) }) : undefined;
       const receipt = projectedAccounting(job);
       turns.push(Object.freeze({ userText: turn.userText, createdAt: turn.createdAt, capturedAt: turn.capturedAt ?? turn.createdAt, captureTimeZone: turn.captureTimeZone,
         ...(turn.messageOrigin === 'saved_transcript' ? { messageOrigin: turn.messageOrigin } : {}),
@@ -340,7 +350,8 @@ export async function createPortableChatHistory(
     }
     conversations.push(Object.freeze({ title: conversation.title, createdAt: conversation.createdAt, updatedAt: conversation.updatedAt, turns: Object.freeze(turns) }));
   }
-  return validatePortableChatHistory({ version: PORTABLE_CHAT_HISTORY_VERSION, conversations });
+  const historyVersion = conversations.some((conversation) => conversation.turns.some((turn) => turn.reply?.outputPolicyVersion === 2)) ? PORTABLE_CHAT_HISTORY_V2 : PORTABLE_CHAT_HISTORY_VERSION;
+  return validatePortableChatHistory({ version: historyVersion, conversations });
 }
 
 /** Materializes inert, read-only archive DTOs with fresh local IDs and no execution links. */

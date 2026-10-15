@@ -21,6 +21,7 @@ export interface KnowledgeSourceLink {
   createdAt: string;
   evidence?: KnowledgeEvidence[];
   suggestionId?: string;
+  outputPolicyVersion?: 1 | 2;
   reference: KnowledgeReference;
   label: string;
 }
@@ -31,6 +32,7 @@ export interface KnowledgeFact {
   createdAt: string;
   evidence?: KnowledgeEvidence[];
   suggestionId?: string;
+  outputPolicyVersion?: 1 | 2;
   statement: string;
 }
 
@@ -40,6 +42,7 @@ export interface ContactClaim {
   createdAt: string;
   evidence?: KnowledgeEvidence[];
   suggestionId?: string;
+  outputPolicyVersion?: 1 | 2;
   address: string;
   label: string;
 }
@@ -50,6 +53,7 @@ interface ProjectMemberBase {
   createdAt: string;
   evidence?: KnowledgeEvidence[];
   suggestionId?: string;
+  outputPolicyVersion?: 1 | 2;
   role: string;
 }
 
@@ -109,6 +113,8 @@ export interface KnowledgeSuggestion {
   sourceAnalysisFingerprint?: string;
   /** Input-selection policy captured when note evidence was fingerprinted; absent legacy values mean policy 1. */
   inputPolicyVersion?: 1 | 2;
+  /** Generated-output contract captured with this suggestion; absent historical values mean policy 1. */
+  outputPolicyVersion?: 1 | 2;
   staleReason?: string;
 }
 

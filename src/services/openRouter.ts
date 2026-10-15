@@ -1,5 +1,5 @@
 import type { AppSettings, ContextDocument, Note } from '../core';
-import { assistantChatRefinementSchemaV2, assistantResponseSchema, assistantResponseSchemaV2 } from '../assistant';
+import { assistantChatRefinementSchemaV2, assistantChatRefinementSchemaV3, assistantResponseSchema, assistantResponseSchemaV2, assistantResponseSchemaV3 } from '../assistant';
 import { assistantReplyTextSchema, prepareAssistantWireRequest } from './assistantWire';
 import type { AssistantPrepareRequest, PreparedAnalysis } from './assistantWire';
 import type { ReplyGenerationInput } from './azure';
@@ -13,7 +13,9 @@ type OpenRouterBatchMetadataModel = typeof OPENROUTER_BATCH_BODY_MODEL | typeof 
 export const OPENROUTER_BATCH_LEGACY_REQUEST_PROFILE_VERSION = 1 as const;
 export const OPENROUTER_BATCH_REQUEST_PROFILE_VERSION = 1 as const;
 export const OPENROUTER_BATCH_NOTE_RESPONSE_PROFILE_VERSION = 2 as const;
-export type OpenRouterBatchRequestProfileVersion = 1 | 2 | 3 | 4;
+export type OpenRouterBatchRequestProfileVersion = 1 | 2 | 3 | 4 | 5;
+export type OpenRouterBatchOutputPolicyVersion = 1 | 2;
+export const OPENROUTER_BATCH_CURRENT_OUTPUT_POLICY_VERSION = 2 as const;
 export type OpenRouterBatchInputPolicyVersion = 1 | 2;
 export const OPENROUTER_BATCH_CURRENT_INPUT_POLICY_VERSION = 2 as const;
 export type OpenRouterBatchOperation = 'note_assistance' | 'chat_refinement' | 'mail_reply_context';
@@ -63,10 +65,10 @@ export interface OpenRouterBatchClientDependencies {
 }
 
 /** Exact persisted-wire validator shared by submit and future saved-job inspection. */
-export function isOpenRouterBatchRequestProfile(value: unknown, profileVersion: OpenRouterBatchRequestProfileVersion = OPENROUTER_BATCH_REQUEST_PROFILE_VERSION, operation: OpenRouterBatchOperation = 'note_assistance', recoveryBase?: { profileVersion: 1 | 2 | 3; operation: OpenRouterBatchBaseOperation }): value is OpenRouterBatchRequest {
-  if (profileVersion !== 1 && profileVersion !== 2 && profileVersion !== 3 && profileVersion !== 4) return false;
+export function isOpenRouterBatchRequestProfile(value: unknown, profileVersion: OpenRouterBatchRequestProfileVersion = OPENROUTER_BATCH_REQUEST_PROFILE_VERSION, operation: OpenRouterBatchOperation = 'note_assistance', recoveryBase?: { profileVersion: 1 | 2 | 3 | 5; operation: OpenRouterBatchBaseOperation }): value is OpenRouterBatchRequest {
+  if (profileVersion !== 1 && profileVersion !== 2 && profileVersion !== 3 && profileVersion !== 4 && profileVersion !== 5) return false;
   if ((profileVersion === 4) !== Boolean(recoveryBase) || (recoveryBase &&
-      ((recoveryBase.profileVersion !== 1 && recoveryBase.profileVersion !== 2 && recoveryBase.profileVersion !== 3) ||
+      ((recoveryBase.profileVersion !== 1 && recoveryBase.profileVersion !== 2 && recoveryBase.profileVersion !== 3 && recoveryBase.profileVersion !== 5) ||
        !['note_assistance', 'chat_refinement', 'mail_reply_context', 'mail_reply_body'].includes(recoveryBase.operation)))) return false;
   const baseProfile = profileVersion === 4 ? recoveryBase!.profileVersion : profileVersion;
   const baseOperation = profileVersion === 4 ? recoveryBase!.operation : operation;
@@ -78,10 +80,10 @@ export function isOpenRouterBatchRequestProfile(value: unknown, profileVersion: 
   const messages = body?.messages;
   const systemMessage = Array.isArray(messages) ? safeObject(messages[0]) : undefined;
   const userMessage = Array.isArray(messages) ? safeObject(messages[1]) : undefined;
-  const expectedSchema = schemaEnvelope?.name === 'note_assistance' && baseOperation === 'note_assistance' && (baseProfile === 1 || baseProfile === 2)
-    ? baseProfile === 1 ? assistantResponseSchema : assistantResponseSchemaV2
-    : schemaEnvelope?.name === 'chat_refinement' && baseOperation === 'chat_refinement' && baseProfile === 2
-      ? assistantChatRefinementSchemaV2
+  const expectedSchema = schemaEnvelope?.name === 'note_assistance' && baseOperation === 'note_assistance' && (baseProfile === 1 || baseProfile === 2 || baseProfile === 5)
+    ? baseProfile === 1 ? assistantResponseSchema : baseProfile === 2 ? assistantResponseSchemaV2 : assistantResponseSchemaV3
+    : schemaEnvelope?.name === 'chat_refinement' && baseOperation === 'chat_refinement' && (baseProfile === 2 || baseProfile === 5)
+      ? baseProfile === 2 ? assistantChatRefinementSchemaV2 : assistantChatRefinementSchemaV3
       : schemaEnvelope?.name === 'mail_reply_body' && profileVersion !== 4 && operation === 'note_assistance' && (profileVersion === 1 || profileVersion === 2) ? assistantReplyTextSchema
         : schemaEnvelope?.name === 'mail_reply_body' && profileVersion === 3 && operation === 'mail_reply_context' ? assistantReplyTextSchema
           : schemaEnvelope?.name === 'mail_reply_body' && profileVersion === 4 && (baseOperation === 'mail_reply_body' && (baseProfile === 1 || baseProfile === 2) ||
@@ -109,11 +111,11 @@ export function higherOpenRouterRecoveryEfforts(effort: OpenRouterBatchRequest['
 /** Reuses the exact reviewed schema and messages, changing only the explicit reasoning effort. */
 export function buildMoreComputeRequestBody(
   originalBody: string,
-  parentProfileVersion: OpenRouterBatchRequestProfileVersion,
+      parentProfileVersion: OpenRouterBatchRequestProfileVersion,
   baseOperation: OpenRouterBatchBaseOperation,
   operation: OpenRouterBatchOperation,
   effort: OpenRouterRecoveryEffort,
-  parentRecoveryBase?: { profileVersion: 1 | 2 | 3; operation: OpenRouterBatchBaseOperation },
+  parentRecoveryBase?: { profileVersion: 1 | 2 | 3 | 5; operation: OpenRouterBatchBaseOperation },
 ): string {
   let parsed: unknown;
   try { parsed = JSON.parse(originalBody) as unknown; } catch { throw new Error('The saved parent request could not be rebuilt.'); }
@@ -341,7 +343,7 @@ const isOpaqueBatchId = (value: unknown): value is string => typeof value === 's
 const isCanonicalUuidV4 = (value: unknown): value is string => typeof value === 'string' && value.length === 36 && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
 
 function buildOpenRouterAnalysisBody(instructions: string, userInput: string, settings: AppSettings, profileVersion: OpenRouterBatchRequestProfileVersion, operation: OpenRouterBatchOperation = 'note_assistance', reasoningEffortOverride?: OpenRouterChatRefinementEffort): string {
-  if (operation === 'chat_refinement' && (profileVersion !== 2 || !reasoningEffortOverride)) throw new Error('Chat refinement requires an explicit profile-2 reasoning effort.');
+  if (operation === 'chat_refinement' && ((profileVersion !== 2 && profileVersion !== 5) || !reasoningEffortOverride)) throw new Error('Chat refinement requires an explicit reasoning effort.');
   const body: OpenRouterBatchRequest = Object.freeze({
     model: OPENROUTER_BATCH_BODY_MODEL,
     messages: Object.freeze([{ role: 'system' as const, content: instructions }, { role: 'user' as const, content: userInput }]),
@@ -349,7 +351,9 @@ function buildOpenRouterAnalysisBody(instructions: string, userInput: string, se
     response_format: Object.freeze({
       type: 'json_schema',
       json_schema: Object.freeze({ name: operation === 'chat_refinement' ? 'chat_refinement' : 'note_assistance', strict: true,
-        schema: operation === 'chat_refinement' ? assistantChatRefinementSchemaV2 : profileVersion === 1 ? assistantResponseSchema : assistantResponseSchemaV2 }),
+        schema: operation === 'chat_refinement'
+          ? profileVersion === 5 ? assistantChatRefinementSchemaV3 : assistantChatRefinementSchemaV2
+          : profileVersion === 1 ? assistantResponseSchema : profileVersion === 5 ? assistantResponseSchemaV3 : assistantResponseSchemaV2 }),
     }),
     stream: false,
   });
@@ -370,13 +374,13 @@ export class OpenRouterBatchRequestBuilder {
   ): Promise<PreparedOpenRouterAnalysis> {
     if ((settings.llmProvider ?? 'azure') !== 'openrouter') throw new Error('OpenRouter is not selected for this request.');
     if ((settings.openRouterModel ?? OPENROUTER_BATCH_MODEL) !== OPENROUTER_BATCH_MODEL) throw new Error('The selected OpenRouter Batch model is not supported by this request profile.');
-    if (profileVersion !== 1 && profileVersion !== 2) throw new Error('The saved OpenRouter request profile is invalid.');
+    if (profileVersion !== 1 && profileVersion !== 2 && profileVersion !== 5) throw new Error('The saved OpenRouter request profile is invalid.');
     if (inputPolicyVersion !== 1 && inputPolicyVersion !== 2) throw new Error('The saved Batch input policy is invalid.');
     const operation = request.operation ?? 'note_assistance';
     if ((operation === 'chat_refinement') !== (request.chatRefinement === true) || (operation === 'chat_refinement' && request.chatMode !== true)) {
       throw new Error('Answer refinement is reserved for an explicit local Chat refinement request.');
     }
-    if (operation === 'chat_refinement' && (profileVersion !== 2 || typeof request.reasoningEffortOverride !== 'string' || !['medium', 'high', 'max'].includes(request.reasoningEffortOverride))) throw new Error('Chat refinement requires a profile-2 request and explicit reasoning effort.');
+    if (operation === 'chat_refinement' && ((profileVersion !== 2 && profileVersion !== 5) || typeof request.reasoningEffortOverride !== 'string' || !['medium', 'high', 'max'].includes(request.reasoningEffortOverride))) throw new Error('Chat refinement requires an explicit request profile and reasoning effort.');
     if (operation !== 'chat_refinement' && request.reasoningEffortOverride !== undefined) throw new Error('Request-local reasoning is reserved for explicit chat refinement.');
     if (settings.llmRequestContractVersion !== undefined && settings.llmRequestContractVersion !== OPENROUTER_BATCH_REQUEST_PROFILE_VERSION) throw new Error('The OpenRouter request profile is out of date.');
     const prepared = await prepareAssistantWireRequest(note, docs, settings, { ...request, inputPolicyVersion }, {
