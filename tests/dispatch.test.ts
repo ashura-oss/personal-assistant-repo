@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { Account, AppState, Calendar, Proposal } from '../src/core';
+import type { Account, AppState, Calendar, ManualMailReplyProvenance, Proposal } from '../src/core';
 import { appendDispatchReconciliation, createDispatchRecord, recordDispatchOutcome, validateDispatchRecord } from '../src/dispatch';
 import { AppControllerImpl } from '../src/services/controller';
 import type { StateStore } from '../src/storage/contracts';
@@ -158,6 +158,50 @@ describe('immutable dispatch records', () => {
     expect(() => createDispatchRecord({ id: 'manual-mismatched-operation', dispatchStartedAt: startedAt,
       proposal: { ...editedManualReply, email: { ...editedManualReply.email!, operation: 'draft' } }, account: googleAccount(), mailReplyActivationOperation: 'send' }))
       .toThrow(/operation does not match/i);
+
+    const acceptedDraftLineage: Extract<ManualMailReplyProvenance['lineage'], { kind: 'accepted_draft' }> = { kind: 'accepted_draft', parentProposalId: 'parent-proposal',
+      parentRevision: 3, parentPayloadDigest: 'a'.repeat(64), draftDispatchRecordId: 'draft-record',
+      draftDispatchRecordDigest: 'b'.repeat(64), remoteDraftId: 'provider-draft-id' };
+    const acceptedDraftProvenance: ManualMailReplyProvenance = { ...manualProvenance, lineage: acceptedDraftLineage };
+    const acceptedDraftProposal: Proposal = { ...editedManualReply, id: 'accepted-draft-send', provenance: acceptedDraftProvenance };
+    const acceptedDraftSend = createDispatchRecord({ id: 'accepted-draft-dispatch', dispatchStartedAt: startedAt,
+      proposal: acceptedDraftProposal, account: googleAccount(), mailReplyActivationOperation: 'send' });
+    expect(acceptedDraftSend).toMatchObject({ operation: 'send', sourceProvenance: { lineage: { kind: 'accepted_draft', remoteDraftId: 'provider-draft-id' } } });
+    expect(validateDispatchRecord(JSON.parse(JSON.stringify(acceptedDraftSend)))).toMatchObject({ operation: 'send', sourceProvenance: { lineage: { kind: 'accepted_draft' } } });
+    const acceptedDraftAsDraft: Proposal = { ...acceptedDraftProposal,
+      provenance: { ...acceptedDraftProvenance, operation: 'draft' },
+      email: { ...acceptedDraftProposal.email!, operation: 'draft' } };
+    expect(() => createDispatchRecord({ id: 'accepted-draft-recreate', dispatchStartedAt: startedAt,
+      proposal: acceptedDraftAsDraft, account: googleAccount() })).toThrow(/accepted provider draft can only be dispatched as a send/i);
+    const malformedRemoteId = { ...acceptedDraftProposal, provenance: { ...acceptedDraftProvenance,
+      lineage: { ...acceptedDraftLineage, remoteDraftId: 'invalid\ud800id' } } };
+    expect(() => createDispatchRecord({ id: 'accepted-draft-invalid-id', dispatchStartedAt: startedAt,
+      proposal: malformedRemoteId, account: googleAccount(), mailReplyActivationOperation: 'send' })).toThrow(/invalid unicode/i);
+    const malformedAcceptedDraftLineages: ManualMailReplyProvenance['lineage'][] = [
+      { ...acceptedDraftLineage, parentProposalId: '' },
+      { ...acceptedDraftLineage, parentRevision: 0 },
+      { ...acceptedDraftLineage, parentPayloadDigest: 'not-a-hash' },
+      { ...acceptedDraftLineage, draftDispatchRecordId: '' },
+      { ...acceptedDraftLineage, draftDispatchRecordDigest: 'not-a-hash' },
+      { ...acceptedDraftLineage, remoteDraftId: '' },
+    ];
+    for (const [index, lineage] of malformedAcceptedDraftLineages.entries()) {
+      expect(() => createDispatchRecord({ id: `accepted-draft-malformed-${index}`, dispatchStartedAt: startedAt,
+        proposal: { ...acceptedDraftProposal, provenance: { ...acceptedDraftProvenance, lineage } }, account: googleAccount(), mailReplyActivationOperation: 'send' }))
+        .toThrow(/invalid|digest/i);
+    }
+    for (const digestField of ['parentPayloadDigest', 'draftDispatchRecordDigest'] as const) {
+      const malformedProposal: unknown = JSON.parse(JSON.stringify(acceptedDraftProposal));
+      const rawProposal = malformedProposal as { provenance: { lineage: Record<string, unknown> } };
+      rawProposal.provenance.lineage[digestField] = ['a'.repeat(64)];
+      expect(() => createDispatchRecord({ id: `accepted-draft-array-${digestField}`, dispatchStartedAt: startedAt,
+        proposal: malformedProposal as Proposal, account: googleAccount(), mailReplyActivationOperation: 'send' })).toThrow(/digest is invalid/i);
+
+      const malformedRecord: unknown = JSON.parse(JSON.stringify(acceptedDraftSend));
+      const rawRecord = malformedRecord as { sourceProvenance: { lineage: Record<string, unknown> } };
+      rawRecord.sourceProvenance.lineage[digestField] = ['a'.repeat(64)];
+      expect(() => validateDispatchRecord(malformedRecord)).toThrow(/digest is invalid/i);
+    }
   });
 
   it('binds Batch reply sends to an explicit Send activation while keeping Draft receipts unchanged', () => {

@@ -478,6 +478,46 @@ function validateReplyPayload(account: Account, payload: EmailProposalPayload, r
   if (!validMessageId(reply.internetMessageId)) throw new Error('Reply source message ID is invalid.');
 }
 
+type AcceptedDraftLineage = Extract<ManualMailReplyProvenance['lineage'], { kind: 'accepted_draft' }>;
+function acceptedDraftLineage(envelope: ApprovedDispatch): AcceptedDraftLineage | undefined {
+  const source = envelope.replySource;
+  if (!source || source.version !== 3 || !source.lineage || source.lineage.kind !== 'accepted_draft') return undefined;
+  const lineage = source.lineage;
+  const sourceKeys = ['version', 'kind', 'sourceDigest', 'source', 'expiresAt', 'outputPolicyVersion', 'operation', 'lineage'];
+  const lineageKeys = ['kind', 'parentProposalId', 'parentRevision', 'parentPayloadDigest', 'draftDispatchRecordId', 'draftDispatchRecordDigest', 'remoteDraftId'];
+  if (Object.keys(source).some((key) => !sourceKeys.includes(key)) || Object.keys(source).length !== sourceKeys.length ||
+      Object.keys(lineage).some((key) => !lineageKeys.includes(key)) ||
+      Object.keys(lineage).length !== lineageKeys.length) throw new Error('Accepted provider draft lineage is invalid.');
+  try { canonicalMailReplySource(source.source); }
+  catch { throw new Error('Accepted provider draft source is invalid.'); }
+  if (source.kind !== 'manual_mail_reply' || source.outputPolicyVersion !== 2 || source.operation !== 'send' ||
+      typeof source.sourceDigest !== 'string' || !/^[a-f\d]{64}$/i.test(source.sourceDigest) ||
+      source.sourceDigest.toLowerCase() !== source.source.sourceDigest?.toLowerCase() || envelope.proposalId === lineage.parentProposalId) {
+    throw new Error('Accepted provider draft lineage is invalid.');
+  }
+  const scalarString = (value: string) => {
+    try { return new TextDecoder('utf-8', { fatal: true }).decode(new TextEncoder().encode(value)) === value; }
+    catch { return false; }
+  };
+  if (typeof lineage.parentProposalId !== 'string' || !lineage.parentProposalId.trim() || lineage.parentProposalId.length > 160 ||
+      /[\u0000-\u001f\u007f]/.test(lineage.parentProposalId) || !Number.isSafeInteger(lineage.parentRevision) || lineage.parentRevision < 1 ||
+      typeof lineage.parentPayloadDigest !== 'string' || !/^[a-f\d]{64}$/i.test(lineage.parentPayloadDigest) ||
+      typeof lineage.draftDispatchRecordId !== 'string' || !lineage.draftDispatchRecordId.trim() || lineage.draftDispatchRecordId.length > 160 || /[\u0000-\u001f\u007f]/.test(lineage.draftDispatchRecordId) ||
+      typeof lineage.draftDispatchRecordDigest !== 'string' || !/^[a-f\d]{64}$/i.test(lineage.draftDispatchRecordDigest) ||
+      typeof lineage.remoteDraftId !== 'string' || !lineage.remoteDraftId.trim() || lineage.remoteDraftId.length > 1024 || /[\u0000-\u001f\u007f]/.test(lineage.remoteDraftId) || !scalarString(lineage.remoteDraftId)) {
+    throw new Error('Accepted provider draft lineage is invalid.');
+  }
+  return lineage;
+}
+
+function assertAcceptedDraftOperation(envelope: ApprovedDispatch, expected: 'draft' | 'send'): AcceptedDraftLineage | undefined {
+  const lineage = acceptedDraftLineage(envelope);
+  if (lineage && (expected !== 'send' || envelope.operation !== 'send' || envelope.replySource?.version !== 3 || envelope.replySource.operation !== 'send')) {
+    throw new Error('An accepted provider draft can only be dispatched as a send.');
+  }
+  return lineage;
+}
+
 function graphAddressList(value: unknown): { addresses?: string[]; complete: boolean } {
   if (!Array.isArray(value)) return { complete: false };
   const addresses: string[] = [];
@@ -1341,6 +1381,7 @@ export class ConnectorClient {
   }
 
   async createDraft(account: Account, envelope: ApprovedDispatch, verifier: DispatchVerifier): Promise<MutationReceipt> {
+    if (assertAcceptedDraftOperation(envelope, 'draft')) throw new Error('An accepted provider draft cannot be created again.');
     capability(account, 'mail.draft');
     const payload = await this.verifiedEmail(account, envelope, verifier, 'draft');
     if (payload.reply) return this.createReplyDraft(account, envelope, verifier, payload);
@@ -1353,18 +1394,23 @@ export class ConnectorClient {
   }
 
   async sendEmail(account: Account, envelope: ApprovedDispatch, verifier: DispatchVerifier): Promise<MutationReceipt> {
+    const acceptedDraft = assertAcceptedDraftOperation(envelope, 'send');
+    if (acceptedDraft && (!('to' in envelope.payload) || !envelope.payload.reply)) throw new Error('Accepted provider draft must retain its reviewed reply payload.');
+    const acceptedDraftProof = acceptedDraft ? JSON.stringify(acceptedDraft) : undefined;
+    if (acceptedDraft && account.provider === 'google') this.requireAcceptedDraftGooglePermissions(account);
     capability(account, 'mail.send');
     const payload = await this.verifiedEmail(account, envelope, verifier, 'send');
     if (payload.reply) {
       const reply = payload.reply;
       if (account.provider === 'google') {
         const raw = await this.gmailReplyRaw(payload, envelope.replySource!.source);
+        if (acceptedDraft) return this.sendAcceptedGoogleDraft(account, envelope, verifier, payload, raw, acceptedDraftProof!);
         return this.writeJson(account, `${GOOGLE_API}/messages/send`, 'mail', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ raw, threadId: reply.threadId }) }, () => this.finalVerify(envelope, verifier));
       }
       const raw = await this.graphReplyMime(payload, envelope.replySource!.source);
       let response: Response;
       let dispatched = false;
-      try { response = await this.request(account, `${GRAPH_API}/me/sendMail`, 'mail', { method: 'POST', headers: { 'content-type': 'text/plain' }, body: raw }, true, undefined, () => { dispatched = true; }, undefined, () => this.finalVerify(envelope, verifier)); }
+      try { response = await this.request(account, `${GRAPH_API}/me/sendMail`, 'mail', { method: 'POST', headers: { 'content-type': 'text/plain' }, body: raw }, true, undefined, () => { dispatched = true; }, undefined, () => this.finalVerifyAcceptedDraft(envelope, verifier, acceptedDraftProof)); }
       catch (error) { if (dispatched) return { status: 'unknown' }; throw error; }
       if (response.status === 202 || response.ok) return { status: 'accepted' };
       if (response.status >= 500) return { status: 'unknown' };
@@ -1440,6 +1486,52 @@ export class ConnectorClient {
         throw new Error('Reply source approval has expired. Review the source and approve the reply again.');
       }
     }
+  }
+
+  private requireAcceptedDraftGooglePermissions(account: Account): void {
+    capability(account, 'mail.send');
+    capability(account, 'mail.draft');
+    const scopes = account.grantedScopes;
+    if (account.provider !== 'google' || !Array.isArray(scopes) ||
+        !scopeGrantsCapability('google', scopes, 'mail.send') || !scopeGrantsCapability('google', scopes, 'mail.draft')) {
+      throw new Error('Google send and draft permission are required to send this accepted draft.');
+    }
+  }
+
+  private finalVerifyAcceptedDraft(envelope: ApprovedDispatch, verifier: DispatchVerifier, expectedLineageProof: string | undefined): void {
+    this.finalVerify(envelope, verifier);
+    if (expectedLineageProof === undefined) return;
+    const currentLineage = assertAcceptedDraftOperation(envelope, 'send');
+    if (!currentLineage || JSON.stringify(currentLineage) !== expectedLineageProof) throw new Error('Accepted provider draft changed before dispatch.');
+  }
+
+  private async sendAcceptedGoogleDraft(account: Account, envelope: ApprovedDispatch, verifier: DispatchVerifier,
+    payload: EmailProposalPayload, raw: string, expectedLineageProof: string): Promise<MutationReceipt> {
+    const lineage = assertAcceptedDraftOperation(envelope, 'send');
+    if (!lineage || account.provider !== 'google' || !payload.reply?.threadId) throw new Error('Accepted Google draft lineage is incomplete.');
+    const url = `${GOOGLE_API}/drafts/send`;
+    const init: RequestInit = { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id: lineage.remoteDraftId, message: { raw, threadId: payload.reply.threadId } }) };
+    let response: Response;
+    let dispatched = false;
+    try {
+      response = await this.request(account, url, 'mail', init, true, undefined, () => { dispatched = true; }, undefined, () => {
+        this.requireAcceptedDraftGooglePermissions(account);
+        this.finalVerifyAcceptedDraft(envelope, verifier, expectedLineageProof);
+      });
+    } catch (error) {
+      if (dispatched) return { status: 'unknown' };
+      throw error;
+    }
+    if (response.status >= 500) return { status: 'unknown' };
+    if (response.status >= 400 && response.status < 500) throw new ProviderWriteRejectedError(response.status);
+    if (!response.ok) return { status: 'unknown' };
+    const data = await response.json().catch(() => undefined) as Record<string, unknown> | undefined;
+    const sentMessageId = data?.id;
+    if (typeof sentMessageId !== 'string' || !sentMessageId.trim() || sentMessageId.length > 2048 ||
+        /[\u0000-\u001f\u007f]/.test(sentMessageId) ||
+        new TextDecoder('utf-8', { fatal: true }).decode(new TextEncoder().encode(sentMessageId)) !== sentMessageId) return { status: 'unknown' };
+    return { status: 'accepted', id: sentMessageId };
   }
 
   private async verifyDispatch(account: Account, envelope: ApprovedDispatch, verifier: DispatchVerifier, operation: ApprovedDispatch['operation']): Promise<void> {

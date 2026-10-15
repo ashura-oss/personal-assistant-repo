@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ConnectorClient, describeMessageWindowQuery, messageWindowQueryFingerprint, ProviderHttpError, ProviderWriteRejectedError, type ApprovedDispatch, type OAuthTokenStore, type StoredOAuthToken } from '../src/connectors';
 import { exchangeAuthorizationCode } from '../src/connectors/oauth';
-import type { Account, EmailProposalPayload } from '../src/core';
+import type { Account, EmailProposalPayload, ManualMailReplyProvenance } from '../src/core';
 import type { MailReplyProvenance } from '../src/mailReply';
 
 const tokenIdentity = { subject: 'sub-1', providerNamespace: 'google' as const, clientId: 'test-google-client', issuer: 'https://accounts.google.com' };
@@ -42,6 +42,22 @@ function replyFixture(provider: 'google' | 'microsoft' = 'google', mode: 'reply'
   const dispatch: ApprovedDispatch = { ...envelope, operation: 'draft', sourceRevision: undefined, accountId: selectedAccount.id, identity,
     title: 'Reply draft', body: payload.text, payload, replySource };
   return { selectedAccount, payload, dispatch, replySource };
+}
+
+function acceptedDraftFixture(provider: 'google' | 'microsoft' = 'google') {
+  const base = replyFixture(provider, 'reply_all');
+  const selectedAccount: Account = { ...base.selectedAccount, grantedScopes: provider === 'google'
+    ? ['https://www.googleapis.com/auth/gmail.compose'] : ['Mail.ReadWrite', 'Mail.Send'] };
+  const source = { ...base.replySource.source, ...(provider === 'microsoft' ? { verifiedSelfEmail: selectedAccount.email! } : {}), observedAt: new Date().toISOString() };
+  const lineage: Extract<ManualMailReplyProvenance['lineage'], { kind: 'accepted_draft' }> = { kind: 'accepted_draft', parentProposalId: 'parent-proposal', parentRevision: 7,
+    parentPayloadDigest: 'a'.repeat(64), draftDispatchRecordId: 'draft-dispatch-record', draftDispatchRecordDigest: 'b'.repeat(64), remoteDraftId: 'provider-draft-opaque-id' };
+  const replySource: ManualMailReplyProvenance = { version: 3, kind: 'manual_mail_reply', sourceDigest: source.sourceDigest, source,
+    expiresAt: new Date(Date.parse(source.observedAt) + 15 * 60_000).toISOString(), outputPolicyVersion: 2, operation: 'send', lineage };
+  const payload = { ...base.payload, operation: 'send' as const, text: 'Edited approved reply body.',
+    to: ['edited-to@example.test'], cc: ['edited-cc@example.test'] };
+  const dispatch: ApprovedDispatch = { ...base.dispatch, operation: 'send', accountId: selectedAccount.id, identity: selectedAccount.identity!,
+    title: 'Approved accepted-draft send', body: payload.text, payload, replySource };
+  return { selectedAccount, payload, dispatch, replySource, lineage };
 }
 
 function token(overrides: Partial<StoredOAuthToken> = {}): StoredOAuthToken {
@@ -867,6 +883,166 @@ describe('provider connector clients', () => {
     expect(mime).toContain('In-Reply-To: <original@example.test>');
     expect(mime).toContain('References: <prior@example.test> <original@example.test>');
     expect(mime).toContain('To: reply@example.test');
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it('sends an accepted Gmail provider draft exactly once with the approved edited reply', async () => {
+    const value = acceptedDraftFixture('google');
+    let requestUrl = '';
+    let requestBody: Record<string, unknown> | undefined;
+    const fetcher = vi.fn(async (url: RequestInfo | URL, init?: RequestInit) => {
+      requestUrl = String(url); requestBody = JSON.parse(String(init?.body));
+      return response({ id: 'new-sent-message-id', threadId: 'gmail-thread-id' });
+    }) as typeof fetch;
+    const client = fixture({ fetcher }).client;
+    await expect(client.sendEmail(value.selectedAccount, value.dispatch, verifier)).resolves.toEqual({ status: 'accepted', id: 'new-sent-message-id' });
+    expect(requestUrl).toBe('https://gmail.googleapis.com/gmail/v1/users/me/drafts/send');
+    expect(requestBody).toMatchObject({ id: value.lineage.remoteDraftId, message: { threadId: 'gmail-thread-id', raw: expect.any(String) } });
+    const encoded = String((requestBody?.message as Record<string, unknown>).raw).replace(/-/g, '+').replace(/_/g, '/');
+    const mime = new TextDecoder().decode(Uint8Array.from(atob(encoded + '='.repeat((4 - encoded.length % 4) % 4)), (char) => char.charCodeAt(0)));
+    expect(mime).toContain('To: edited-to@example.test');
+    expect(mime).toContain('Cc: edited-cc@example.test');
+    expect(mime).toContain(btoa('Edited approved reply body.'));
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps accepted Microsoft drafts on the single reviewed sendMail path', async () => {
+    const value = acceptedDraftFixture('microsoft');
+    let requestUrl = '';
+    let requestBody = '';
+    const fetcher = vi.fn(async (url: RequestInfo | URL, init?: RequestInit) => {
+      requestUrl = String(url); requestBody = String(init?.body);
+      return new Response(null, { status: 202 });
+    }) as typeof fetch;
+    const client = fixture({ fetcher, token: token({ identity: microsoftIdentity }) }).client;
+    await expect(client.sendEmail(value.selectedAccount, value.dispatch, verifier)).resolves.toEqual({ status: 'accepted' });
+    expect(requestUrl).toBe('https://graph.microsoft.com/v1.0/me/sendMail');
+    const graphMime = atob(requestBody);
+    expect(graphMime).toContain('To: edited-to@example.test');
+    expect(graphMime).toContain('Cc: edited-cc@example.test');
+    expect(graphMime).toContain(btoa('Edited approved reply body.'));
+    expect(requestBody).not.toContain(value.lineage.remoteDraftId);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it('rechecks the captured accepted-draft lineage after Microsoft credential access', async () => {
+    const mutations: ((value: ReturnType<typeof acceptedDraftFixture>) => void)[] = [
+      (value) => { (value.replySource.lineage as Extract<ManualMailReplyProvenance['lineage'], { kind: 'accepted_draft' }>).remoteDraftId = 'replacement-draft-id'; },
+      (value) => { (value.replySource.lineage as Extract<ManualMailReplyProvenance['lineage'], { kind: 'accepted_draft' }>).parentRevision += 1; },
+      (value) => { value.replySource.lineage = { kind: 'manual' }; },
+    ];
+    for (const mutate of mutations) {
+      const value = acceptedDraftFixture('microsoft');
+      let releaseToken!: (value: StoredOAuthToken) => void;
+      let signalRequested!: () => void;
+      const requested = new Promise<void>((resolve) => { signalRequested = resolve; });
+      const delayedToken = new Promise<StoredOAuthToken>((resolve) => { releaseToken = resolve; });
+      const store: OAuthTokenStore = { get: vi.fn(async () => { signalRequested(); return delayedToken; }), set: async () => {} };
+      const fetcher = vi.fn() as typeof fetch;
+      const client = new ConnectorClient({ tokenStore: store, fetcher });
+      const sending = client.sendEmail(value.selectedAccount, value.dispatch, verifier);
+      await requested;
+      mutate(value);
+      releaseToken(token({ identity: microsoftIdentity }));
+      await expect(sending).rejects.toThrow(/changed before dispatch/i);
+      expect(fetcher).not.toHaveBeenCalled();
+    }
+  });
+
+  it('rejects accepted-draft create and malformed remote draft IDs before credential or provider access', async () => {
+    const value = acceptedDraftFixture('google');
+    const tokenGet = vi.fn(async () => token());
+    const fetcher = vi.fn() as typeof fetch;
+    const client = new ConnectorClient({ tokenStore: { get: tokenGet, set: async () => {} }, fetcher });
+    const createDraftEnvelope = { ...value.dispatch, operation: 'draft' as const };
+    await expect(client.createDraft(value.selectedAccount, createDraftEnvelope, verifier)).rejects.toThrow(/cannot be created again|only be dispatched as a send/i);
+    const malformed = { ...value.dispatch, replySource: { ...value.replySource,
+      lineage: { ...value.lineage, remoteDraftId: 'bad\u0000id' } } };
+    await expect(client.sendEmail(value.selectedAccount, malformed, verifier)).rejects.toThrow(/lineage is invalid/i);
+    const malformedUnicode = { ...value.dispatch, replySource: { ...value.replySource,
+      lineage: { ...value.lineage, remoteDraftId: 'bad\ud800id' } } };
+    await expect(client.sendEmail(value.selectedAccount, malformedUnicode, verifier)).rejects.toThrow(/lineage is invalid/i);
+    const unclosedLineage = { ...value.dispatch, replySource: { ...value.replySource,
+      lineage: { ...value.lineage, extra: 'not-approved' } } };
+    await expect(client.sendEmail(value.selectedAccount, unclosedLineage, verifier)).rejects.toThrow(/lineage is invalid/i);
+    expect(tokenGet).not.toHaveBeenCalled();
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it('requires effective Google send and draft scopes before token lookup and rechecks them after credential access', async () => {
+    const value = acceptedDraftFixture('google');
+    const tokenGet = vi.fn(async () => token());
+    const fetcher = vi.fn() as typeof fetch;
+    const missingCapability = { ...value.selectedAccount, capabilities: ['mail.send'] as Account['capabilities'] };
+    const client = new ConnectorClient({ tokenStore: { get: tokenGet, set: async () => {} }, fetcher });
+    await expect(client.sendEmail(missingCapability, value.dispatch, verifier)).rejects.toThrow(/mail\.draft/i);
+    expect(tokenGet).not.toHaveBeenCalled();
+    const missingScopes = { ...value.selectedAccount, grantedScopes: ['https://www.googleapis.com/auth/gmail.send'] };
+    await expect(client.sendEmail(missingScopes, value.dispatch, verifier)).rejects.toThrow(/send and draft permission/i);
+    expect(tokenGet).not.toHaveBeenCalled();
+
+    let releaseToken!: (value: StoredOAuthToken) => void;
+    let tokenRequested!: () => void;
+    const requested = new Promise<void>((resolve) => { tokenRequested = resolve; });
+    const delayedToken = new Promise<StoredOAuthToken>((resolve) => { releaseToken = resolve; });
+    const raceStore: OAuthTokenStore = { get: vi.fn(async () => { tokenRequested(); return delayedToken; }), set: async () => {} };
+    const raceFetcher = vi.fn() as typeof fetch;
+    const raceClient = new ConnectorClient({ tokenStore: raceStore, fetcher: raceFetcher });
+    const sending = raceClient.sendEmail(value.selectedAccount, value.dispatch, verifier);
+    await requested;
+    value.selectedAccount.grantedScopes = ['https://www.googleapis.com/auth/gmail.send'];
+    releaseToken(token());
+    await expect(sending).rejects.toThrow(/send and draft permission/i);
+    expect(raceFetcher).not.toHaveBeenCalled();
+
+    const capValue = acceptedDraftFixture('google');
+    let releaseCapToken!: (value: StoredOAuthToken) => void;
+    let capTokenRequested!: () => void;
+    const capRequested = new Promise<void>((resolve) => { capTokenRequested = resolve; });
+    const delayedCapToken = new Promise<StoredOAuthToken>((resolve) => { releaseCapToken = resolve; });
+    const capStore: OAuthTokenStore = { get: vi.fn(async () => { capTokenRequested(); return delayedCapToken; }), set: async () => {} };
+    const capFetcher = vi.fn() as typeof fetch;
+    const capClient = new ConnectorClient({ tokenStore: capStore, fetcher: capFetcher });
+    const capSending = capClient.sendEmail(capValue.selectedAccount, capValue.dispatch, verifier);
+    await capRequested;
+    capValue.selectedAccount.capabilities = ['mail.send'];
+    releaseCapToken(token());
+    await expect(capSending).rejects.toThrow(/mail\.draft/i);
+    expect(capFetcher).not.toHaveBeenCalled();
+
+    const changedVerifier = { verify: vi.fn(async () => true), verifyBeforeDispatch: vi.fn(() => false) };
+    const changedFetch = vi.fn() as typeof fetch;
+    const changedClient = fixture({ fetcher: changedFetch }).client;
+    const verifyValue = acceptedDraftFixture('google');
+    await expect(changedClient.sendEmail(verifyValue.selectedAccount, verifyValue.dispatch, changedVerifier)).rejects.toThrow(/changed before provider dispatch/i);
+    expect(changedFetch).not.toHaveBeenCalled();
+  });
+
+  it('does not fall back or replay an accepted Gmail draft write after rejection or ambiguity', async () => {
+    const value = acceptedDraftFixture('google');
+    const cases: { label: string; fetcher: ReturnType<typeof vi.fn>; expected: 'rejected' | 'unknown' }[] = [
+      { label: 'not found', fetcher: vi.fn(async () => response({ error: 'notFound' }, 404)), expected: 'rejected' },
+      { label: 'unauthorized', fetcher: vi.fn(async () => response({ error: 'unauthorized' }, 401)), expected: 'rejected' },
+      { label: 'server error', fetcher: vi.fn(async () => response({ error: 'unavailable' }, 503)), expected: 'unknown' },
+      { label: 'missing sent message ID', fetcher: vi.fn(async () => response({ threadId: 'gmail-thread-id' })), expected: 'unknown' },
+      { label: 'ambiguous network failure', fetcher: vi.fn(async () => { throw new Error('socket closed'); }), expected: 'unknown' },
+    ];
+    for (const item of cases) {
+      const client = fixture({ fetcher: item.fetcher as typeof fetch }).client;
+      if (item.expected === 'rejected') await expect(client.sendEmail(value.selectedAccount, value.dispatch, verifier)).rejects.toBeInstanceOf(ProviderWriteRejectedError);
+      else await expect(client.sendEmail(value.selectedAccount, value.dispatch, verifier)).resolves.toEqual({ status: 'unknown' });
+      expect(item.fetcher).toHaveBeenCalledTimes(1);
+      expect(String(item.fetcher.mock.calls[0][0])).toBe('https://gmail.googleapis.com/gmail/v1/users/me/drafts/send');
+    }
+  });
+
+  it('keeps ordinary manual Gmail replies on messages/send', async () => {
+    const value = acceptedDraftFixture('google');
+    const ordinary = { ...value.dispatch, replySource: { ...value.replySource, lineage: { kind: 'manual' as const } } };
+    let requestUrl = '';
+    const fetcher = vi.fn(async (url: RequestInfo | URL) => { requestUrl = String(url); return response({ id: 'sent-ordinary' }); }) as typeof fetch;
+    await fixture({ fetcher }).client.sendEmail(value.selectedAccount, ordinary, verifier);
+    expect(requestUrl).toBe('https://gmail.googleapis.com/gmail/v1/users/me/messages/send');
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
 

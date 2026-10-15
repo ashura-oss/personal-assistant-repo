@@ -1,4 +1,4 @@
-import type { Account, AnyProposalProvenance, Calendar, EmailProposalPayload, EventProposalPayload, ManualMailReplyProvenance, MailReplyProvenance, MailReplySourceSnapshot, NoteProposalProvenance, Proposal } from '../core';
+import type { Account, AnyProposalProvenance, Calendar, EmailProposalPayload, EventProposalPayload, ManualMailReplyProvenance, MailReplySourceSnapshot, NoteProposalProvenance, Proposal } from '../core';
 import { canonicalMailReplySource, validateReplyBinding } from '../mailReply';
 import type {
   CreateDispatchRecordInput, DispatchAccountSnapshot, DispatchCalendarSnapshot, DispatchIdentitySnapshot,
@@ -23,6 +23,10 @@ function onlyKeys(value: unknown, allowed: readonly string[], label: string): vo
 function cleanString(value: unknown, label: string, max: number, allowEmpty = false): string {
   if (typeof value !== 'string' || value.length > max || (!allowEmpty && !value.trim()) || /[\u0000-\u001f\u007f]/.test(value)) fail(`${label} is invalid.`);
   return value;
+}
+function validUnicodeScalarString(value: string): boolean {
+  try { return new TextDecoder('utf-8', { fatal: true }).decode(new TextEncoder().encode(value)) === value; }
+  catch { return false; }
 }
 function contentString(value: unknown, label: string, max: number, allowEmpty = false, unlimited = false): string {
   if (typeof value !== 'string' || (!unlimited && value.length > max) || (!allowEmpty && !value.trim()) || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value)) fail(`${label} is invalid.`);
@@ -146,10 +150,14 @@ function snapshotProvenance(value: AnyProposalProvenance | undefined): AnyPropos
       if (!HASH.test(lineage.parentPayloadDigest) || (lineage.parentBatchResultDigest !== undefined && !HASH.test(lineage.parentBatchResultDigest))) fail('Derived mail reply lineage digest is invalid.');
     } else if (lineage.kind === 'accepted_draft') {
       onlyKeys(lineage, ['kind', 'parentProposalId', 'parentRevision', 'parentPayloadDigest', 'draftDispatchRecordId', 'draftDispatchRecordDigest', 'remoteDraftId'], 'Accepted draft lineage');
+      if (value.operation !== 'send') fail('An accepted provider draft can only be dispatched as a send.');
       cleanString(lineage.parentProposalId, 'Parent proposal ID', 160); assertRevision(lineage.parentRevision, 'Parent proposal revision');
       if (lineage.parentRevision < 1) fail('Parent proposal revision is invalid.');
-      cleanString(lineage.draftDispatchRecordId, 'Draft dispatch record ID', 160); cleanString(lineage.remoteDraftId, 'Remote draft ID', 1024);
-      if (!HASH.test(lineage.parentPayloadDigest) || !HASH.test(lineage.draftDispatchRecordDigest)) fail('Accepted draft lineage digest is invalid.');
+      cleanString(lineage.draftDispatchRecordId, 'Draft dispatch record ID', 160);
+      const remoteDraftId = cleanString(lineage.remoteDraftId, 'Remote draft ID', 1024);
+      if (!validUnicodeScalarString(remoteDraftId)) fail('Remote draft ID contains invalid Unicode.');
+      if (typeof lineage.parentPayloadDigest !== 'string' || typeof lineage.draftDispatchRecordDigest !== 'string' ||
+          !HASH.test(lineage.parentPayloadDigest) || !HASH.test(lineage.draftDispatchRecordDigest)) fail('Accepted draft lineage digest is invalid.');
     } else fail('Manual mail reply lineage kind is unsupported.');
     return structuredClone(value);
   }
@@ -264,6 +272,9 @@ export function createDispatchRecord(input: CreateDispatchRecordInput): Dispatch
   if (proposal.kind === 'email' && proposal.email?.reply) {
     if (sourceProvenance.version !== 2 && sourceProvenance.version !== 3) fail('Reply draft is missing its original message provenance.');
     const expectedReplyOperation = input.mailReplyActivationOperation ?? 'draft';
+    if (sourceProvenance.version === 3 && sourceProvenance.lineage.kind === 'accepted_draft' && expectedReplyOperation !== 'send') {
+      fail('An accepted provider draft can only be dispatched as a send.');
+    }
     if (sourceProvenance.version === 2 && expectedReplyOperation === 'send' && !sourceProvenance.batchJobId) fail('Only an activated Batch reply can be sent.');
     if (sourceProvenance.version === 3 && (sourceProvenance.operation !== expectedReplyOperation || proposal.email.operation !== sourceProvenance.operation)) fail('Manual reply operation does not match its explicit review.');
     validateReplyBinding(proposal.email, sourceProvenance, expectedReplyOperation);
