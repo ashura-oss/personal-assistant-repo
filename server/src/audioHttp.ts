@@ -1,5 +1,6 @@
 import type { Readable } from 'node:stream';
 import type { WorkspaceHttpAdmission } from './workspaceHttp.js';
+import type { AudioUploadHistoryPage } from './audioUploadHistory.js';
 
 export interface AudioUploadCaptureHeader {
   readonly id: string;
@@ -34,8 +35,8 @@ export interface AudioHttpMediaResponse {
   readonly body?: Readable;
 }
 
-/** Trusted server-to-runtime bridge. It accepts only authenticated admissions and opaque media IDs. */
-export interface AudioHttpApi {
+/** Per-workspace private media owner. This is only one part of the top-level audio gateway. */
+export interface AudioStorageHttpApi {
   upload(admission: WorkspaceHttpAdmission, input: Readonly<{
     uploadId: string;
     capture: AudioUploadCaptureHeader;
@@ -49,4 +50,9 @@ export interface AudioHttpApi {
     range?: string;
     signal?: AbortSignal;
   }>): Promise<AudioHttpMediaResponse>;
+}
+
+/** Trusted server-to-runtime bridge. History is read directly from the owned kernel, without loading a workspace. */
+export interface AudioHttpApi extends AudioStorageHttpApi {
+  listUploads(admission: WorkspaceHttpAdmission, cursor?: string): Promise<AudioUploadHistoryPage>;
 }

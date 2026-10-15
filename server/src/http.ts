@@ -236,6 +236,7 @@ function workspaceFailure(error: unknown): { readonly status: number; readonly c
   }
   if (error instanceof Error) {
     if (error.message === 'command_history_cursor_invalid') return { status: 400, code: 'bad_request' };
+    if (error.message === 'audio_history_cursor_invalid') return { status: 400, code: 'bad_request' };
     if (['workspace_command_invalid', 'workspace_command_id_invalid', 'workspace_command_receipt_invalid'].includes(error.message)) {
       return { status: 400, code: 'invalid_workspace_command' };
     }
@@ -758,6 +759,25 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     try {
       admission.assertCurrent();
       const result = workspaceApi.inspectCommand(admission, commandId);
+      admission.assertCurrent();
+      if (!response.destroyed) sendJson(response, 200, result);
+    } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
+    return;
+  }
+  if (pathname === '/api/audio/upload-history') {
+    if (request.method !== 'GET') { response.setHeader('Allow', 'GET'); throw problem(405, 'method_not_allowed'); }
+    let cursor: string | undefined;
+    if (hasQuery) {
+      const match = /^cursor=([A-Za-z0-9_-]{1,2048})$/.exec(rawQuery ?? '');
+      if (!match) throw problem(400, 'bad_request');
+      cursor = match[1];
+    }
+    if (!audioApi) throw problem(503, 'service_unavailable');
+    const admission = workspaceReadAdmission(request, auth, canonicalOrigin);
+    try {
+      admission.assertCurrent();
+      if (admissionOpen && !admissionOpen()) throw problem(503, 'service_unavailable');
+      const result = await audioApi.listUploads(admission, cursor);
       admission.assertCurrent();
       if (!response.destroyed) sendJson(response, 200, result);
     } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }

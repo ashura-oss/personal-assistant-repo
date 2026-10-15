@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { Buffer } from 'node:buffer';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer as createNetServer } from 'node:net';
@@ -16,6 +16,7 @@ import { createWorkspaceHttpApi } from '../dist/workspaceHttp.node.mjs';
 import { PrivateAudioRepository } from '../dist/privateAudioRepository.js';
 
 const authSecret = Buffer.from(Array.from({ length: 32 }, (_, index) => index + 61));
+const AUDIO_PROCESS_ID = randomUUID();
 
 async function freePort() {
   const blockedPorts = new Set([1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69, 77, 79, 87, 95,
@@ -32,7 +33,7 @@ async function freePort() {
   throw new Error('unable_to_allocate_fetch_compatible_port');
 }
 
-async function fixture({ withWorkspaceApi = true, wrapWorkspaceApi, withAudioApi = false } = {}) {
+async function fixture({ withWorkspaceApi = true, wrapWorkspaceApi, withAudioApi = false, exposeAudioHistory = false, gateAudioSource = false } = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'still-workspace-http-'));
   const staticRoot = join(directory, 'public');
   mkdirSync(join(staticRoot, 'assets'), { recursive: true });
@@ -55,15 +56,25 @@ async function fixture({ withWorkspaceApi = true, wrapWorkspaceApi, withAudioApi
   let runtime;
   let attachedMedia;
   let audioUploadId;
+  const audioSourceStarted = deferred();
+  const releaseAudioSource = deferred();
   const audioRepository = withAudioApi ? new PrivateAudioRepository({ kernel, actorSessionToken: runtimeSession,
-    privateRoot: join(directory, 'private-audio'), processId: randomUUID(),
+    privateRoot: join(directory, 'private-audio'), processId: AUDIO_PROCESS_ID,
     resolveAttachedMedia: ({ noteId, noteRevision }) => attachedMedia?.noteId === noteId && attachedMedia.noteRevision === noteRevision
       ? attachedMedia : undefined }) : undefined;
   const projectAudioReceipt = (receipt) => ({ schemaVersion: 1, uploadId: receipt.uploadId, status: receipt.status,
     capture: receipt.capture, ...(receipt.consumption ? { consumption: receipt.consumption } : {}), ...(receipt.media ? { media: receipt.media } : {}) });
   const directAudioApi = audioRepository ? Object.freeze({
     async upload(admission, input) {
-      const receipt = await audioRepository.uploadCapture(input.source, { uploadId: input.uploadId, captureId: input.capture.id,
+      let source = input.source;
+      if (gateAudioSource) source = (async function* () {
+        let didPause = false;
+        for await (const chunk of input.source) {
+          yield chunk;
+          if (!didPause) { didPause = true; audioSourceStarted.resolve(); await releaseAudioSource.promise; }
+        }
+      })();
+      const receipt = await audioRepository.uploadCapture(source, { uploadId: input.uploadId, captureId: input.capture.id,
         capturedAt: input.capture.capturedAt, timeZone: input.capture.timeZone, mimeType: input.mimeType,
         ...(input.expectedByteLength === undefined ? {} : { expectedByteLength: input.expectedByteLength }) });
       audioUploadId = input.uploadId;
@@ -125,10 +136,11 @@ async function fixture({ withWorkspaceApi = true, wrapWorkspaceApi, withAudioApi
   const actualWorkspaceApi = withWorkspaceApi ? createWorkspaceHttpApi(runtime) : undefined;
   const workspaceApi = actualWorkspaceApi ? (wrapWorkspaceApi ? wrapWorkspaceApi(actualWorkspaceApi) : actualWorkspaceApi) : undefined;
   const server = createStillHttpServer({ auth, canonicalOrigin, allowLocalHttp: true, staticRoot,
-    ...(workspaceApi ? { workspaceApi } : {}), ...(directAudioApi ? { audioApi: runtime.createAudioHttpApi() } : {}) });
+    ...(workspaceApi ? { workspaceApi } : {}), ...(withAudioApi || exposeAudioHistory ? { audioApi: runtime.createAudioHttpApi() } : {}) });
   await new Promise((resolve, reject) => server.listen(port, '127.0.0.1', (error) => error ? reject(error) : resolve()));
   const request = (path, init = {}) => fetch(`${canonicalOrigin}${path}`, init);
   return { directory, canonicalOrigin, enrolled, kernel, auth, runtime, server, request, workspaceApi, audioRepository,
+    audioSourceStarted: audioSourceStarted.promise, releaseAudioSource: () => releaseAudioSource.resolve(),
     setTime(value) { now = value; },
     async close() {
       await new Promise((resolve) => server.close(() => resolve()));
@@ -265,6 +277,17 @@ test('authenticated raw audio upload, inspect, adoption and range playback use t
     assert.equal(uploaded.media.byteLength, bytes.length);
     assert.equal('privateRoot' in uploaded, false);
 
+    const historyResponse = await f.request('/api/audio/upload-history', { headers: { Cookie: auth.cookie } });
+    assert.equal(historyResponse.status, 200, await historyResponse.clone().text());
+    assert.equal(historyResponse.headers.get('cache-control'), 'no-store');
+    const history = await historyResponse.json();
+    assert.equal(history.entries.length, 1);
+    assert.deepEqual(history.entries[0], { uploadId, capture: uploaded.capture, status: 'ready',
+      createdAt: history.entries[0].createdAt, updatedAt: history.entries[0].updatedAt });
+    assert.deepEqual(Object.keys(history.entries[0]).sort(), ['capture', 'createdAt', 'status', 'updatedAt', 'uploadId']);
+    assert.equal('media' in history.entries[0], false);
+    assert.equal('sha256' in history.entries[0], false);
+
     const inspection = await f.request(`/api/audio/uploads/${uploadId}`, { headers: { Cookie: auth.cookie } });
     assert.equal(inspection.status, 200);
     assert.equal((await inspection.json()).media.sha256, uploaded.media.sha256);
@@ -289,6 +312,9 @@ test('authenticated raw audio upload, inspect, adoption and range playback use t
     const consumedReceipt = await consumedInspection.json();
     assert.equal(consumedReceipt.status, 'consumed');
     assert.deepEqual(consumedReceipt.consumption, { commandId, noteId: captureId, noteRevision: 1 });
+    const consumedHistory = await (await f.request('/api/audio/upload-history', { headers: { Cookie: auth.cookie } })).json();
+    assert.equal(consumedHistory.entries[0].status, 'consumed');
+    assert.deepEqual(Object.keys(consumedHistory.entries[0]).sort(), ['capture', 'createdAt', 'status', 'updatedAt', 'uploadId']);
 
     const rawMediaId = uploaded.media.mediaId.slice('still-media:'.length);
     const mediaResponse = await f.request(`/api/audio/${rawMediaId}`, { headers: { Cookie: auth.cookie, Range: 'bytes=0-15' } });
@@ -300,6 +326,87 @@ test('authenticated raw audio upload, inspect, adoption and range playback use t
     assert.equal(head.headers.get('content-length'), '4');
     assert.equal((await head.arrayBuffer()).byteLength, 0);
     assert.equal((await f.request(`/api/audio/${rawMediaId}`)).status, 401);
+  } finally { await f.close(); }
+});
+
+test('audio upload history validates its sole cursor query and uses authenticated read admission', async () => {
+  const f = await fixture({ withAudioApi: true });
+  try {
+    assert.equal((await f.request('/api/audio/upload-history')).status, 401);
+    const auth = await login(f);
+    assert.equal((await f.request('/api/audio/upload-history?cursor=', { headers: { Cookie: auth.cookie } })).status, 400);
+    assert.equal((await f.request('/api/audio/upload-history?cursor=abc', { headers: { Cookie: auth.cookie } })).status, 400,
+      'well-formed query text that is not a valid scoped history cursor is a client error');
+    assert.equal((await f.request('/api/audio/upload-history?cursor=abc&cursor=def', { headers: { Cookie: auth.cookie } })).status, 400);
+    assert.equal((await f.request('/api/audio/upload-history?other=x', { headers: { Cookie: auth.cookie } })).status, 400);
+    assert.equal((await f.request('/api/audio/upload-history?cursor=%61bc', { headers: { Cookie: auth.cookie } })).status, 400);
+    assert.equal((await f.request('/api/audio/upload-history?cursor=abc=', { headers: { Cookie: auth.cookie } })).status, 400);
+    const wrongOrigin = await f.request('/api/audio/upload-history', { headers: { Cookie: auth.cookie, Origin: 'https://elsewhere.test',
+      'X-Still-CSRF': 'wrong-token' } });
+    assert.equal(wrongOrigin.status, 403, 'the shared same-origin gate rejects cross-origin requests');
+    const wrongCsrf = await f.request('/api/audio/upload-history', { headers: { Cookie: auth.cookie, Origin: f.canonicalOrigin,
+      'X-Still-CSRF': 'wrong-token' } });
+    assert.equal(wrongCsrf.status, 200, 'safe GET history does not require a mutation CSRF token');
+    const rawSession = auth.cookie.slice('__Host-still_session='.length);
+    f.auth.logout(rawSession, f.canonicalOrigin, auth.csrf);
+    assert.equal((await f.request('/api/audio/upload-history', { headers: { Cookie: auth.cookie } })).status, 401,
+      'the same session cannot read history after it has been revoked');
+    const wrongMethod = await f.request('/api/audio/upload-history', { method: 'POST', headers: { Cookie: auth.cookie } });
+    assert.equal(wrongMethod.status, 405);
+    assert.equal(wrongMethod.headers.get('allow'), 'GET');
+  } finally { await f.close(); }
+});
+
+test('history reads a durable receiving upload while the upload owner is busy without registry or database writes', async () => {
+  const f = await fixture({ withAudioApi: true, gateAudioSource: true });
+  try {
+    const auth = await login(f);
+    f.kernel.withTrustedDatabaseTransaction((db) => db.exec(`CREATE TABLE audio_history_read_audit (event TEXT NOT NULL) STRICT;
+      CREATE TRIGGER audio_history_read_insert AFTER INSERT ON private_audio_capture_uploads BEGIN INSERT INTO audio_history_read_audit VALUES ('insert'); END;
+      CREATE TRIGGER audio_history_read_update AFTER UPDATE ON private_audio_capture_uploads BEGIN INSERT INTO audio_history_read_audit VALUES ('update'); END;
+      CREATE TRIGGER audio_history_read_delete AFTER DELETE ON private_audio_capture_uploads BEGIN INSERT INTO audio_history_read_audit VALUES ('delete'); END;`));
+    const registry = f.runtime.registry;
+    const originalGet = registry.get.bind(registry);
+    let registryCalls = 0;
+    registry.get = (...args) => { registryCalls += 1; return originalGet(...args); };
+    const uploadId = randomUUID();
+    const upload = f.request('/api/audio/uploads', { method: 'POST', headers: {
+      ...mutationHeaders(f, auth), 'X-Still-Upload-ID': uploadId,
+      'X-Still-Capture': JSON.stringify({ id: randomUUID(), capturedAt: '2026-10-15T00:00:00.000Z', timeZone: 'Asia/Singapore' }),
+      'Content-Type': 'audio/wav',
+    }, body: wavFixture() });
+    await f.audioSourceStarted;
+    assert.equal(registryCalls, 1, 'the active upload has entered its per-workspace owner');
+    const before = f.kernel.withTrustedDatabaseTransaction((db) => db.prepare('SELECT count(*) AS count FROM audio_history_read_audit').get().count);
+    assert.ok(before > 0);
+    const historyResponse = await f.request('/api/audio/upload-history', { headers: { Cookie: auth.cookie } });
+    assert.equal(historyResponse.status, 200, await historyResponse.clone().text());
+    const history = await historyResponse.json();
+    assert.equal(history.entries[0].uploadId, uploadId);
+    assert.equal(history.entries[0].status, 'receiving');
+    assert.equal(registryCalls, 1, 'history bypasses registry access even while the upload has it busy');
+    assert.equal(f.kernel.withTrustedDatabaseTransaction((db) => db.prepare('SELECT count(*) AS count FROM audio_history_read_audit').get().count), before);
+    f.releaseAudioSource();
+    assert.equal((await upload).status, 201);
+  } finally { f.releaseAudioSource(); await f.close(); }
+});
+
+test('fresh authenticated history returns empty without initializing private audio schema, directories, or a controller', async () => {
+  const f = await fixture({ exposeAudioHistory: true });
+  try {
+    const auth = await login(f);
+    const registry = f.runtime.registry;
+    const originalGet = registry.get.bind(registry);
+    let registryCalls = 0;
+    registry.get = (...args) => { registryCalls += 1; return originalGet(...args); };
+    const before = f.kernel.withTrustedDatabaseTransaction((db) => db.prepare("SELECT count(*) AS count FROM sqlite_master WHERE name LIKE 'private_audio_%'").get().count);
+    const response = await f.request('/api/audio/upload-history', { headers: { Cookie: auth.cookie } });
+    assert.equal(response.status, 200, await response.clone().text());
+    assert.deepEqual(await response.json(), { schemaVersion: 1, entries: [] });
+    const after = f.kernel.withTrustedDatabaseTransaction((db) => db.prepare("SELECT count(*) AS count FROM sqlite_master WHERE name LIKE 'private_audio_%'").get().count);
+    assert.equal(after, before);
+    assert.equal(registryCalls, 0);
+    assert.equal(existsSync(join(f.directory, 'private-audio')), false);
   } finally { await f.close(); }
 });
 

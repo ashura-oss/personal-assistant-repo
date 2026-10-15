@@ -230,6 +230,19 @@ describe('web audio upload transport', () => {
     client.dispose();
   });
 
+  it('a new client can discover an old upload, then inspect its full receipt only on explicit selection', async () => {
+    const fetcher = vi.fn().mockResolvedValueOnce(response({ schemaVersion: 1, entries: [historyEntry] }))
+      .mockResolvedValueOnce(response(receipt('ready', { media })));
+    const reloadedClient = makeClient(fetcher);
+    await expect(reloadedClient.listUploads()).resolves.toMatchObject({ entries: [{ uploadId, status: 'ready' }] });
+    expect(reloadedClient.getPendingUpload()).toBeUndefined();
+    await expect(reloadedClient.inspectUpload(uploadId)).resolves.toMatchObject({ uploadId, status: 'ready', media });
+    expect(fetcher.mock.calls.map(([path, init]) => [path, init.method])).toEqual([
+      ['/api/audio/upload-history', 'GET'], [`/api/audio/uploads/${uploadId}`, 'GET'],
+    ]);
+    reloadedClient.dispose();
+  });
+
   it('rejects malformed history and fences owner changes and disposal without changing pending state', async () => {
     const malformed = { schemaVersion: 1, entries: [{ ...historyEntry, sha256: 'private' }] };
     const fetcher = vi.fn().mockResolvedValueOnce(response(malformed));

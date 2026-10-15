@@ -2,7 +2,8 @@ import type { AppState } from '../core';
 import { AppControllerImpl, type ControllerCryptoPort, type ControllerRuntimePorts } from '../services/controller.shared';
 export { SpeechTranscriptionError } from '../services/controller.shared';
 import type { PendingCaptureControllerPort } from '../audio/pendingCaptureService.types';
-import type { AudioHttpApi, AudioHttpMediaResponse, AudioUploadCaptureHeader, AudioUploadReceiptDTO } from '../../server/src/audioHttp.js';
+import type { AudioHttpApi, AudioStorageHttpApi, AudioHttpMediaResponse, AudioUploadCaptureHeader, AudioUploadReceiptDTO } from '../../server/src/audioHttp.js';
+import { readAudioUploadHistory, type AudioUploadHistoryPage } from '../../server/src/audioUploadHistory.js';
 import type { WorkspaceHttpAdmission } from '../../server/src/workspaceHttp.js';
 import { createWorkspaceSnapshotDTO, type WorkspaceMediaResolver, type WorkspaceSnapshotDTO } from './workspaceDto';
 import { NodeSpeechCleanupAdapter } from './speechCleanupAdapter.node';
@@ -37,7 +38,7 @@ export interface OwnedWorkspaceRuntimePorts {
   readonly mediaResolver?: WorkspaceMediaResolver;
   readonly pendingCapture?: PendingCaptureControllerPort;
   /** Per-entry bridge; the runtime never exposes its backing repository/controller. */
-  readonly audioHttpApi?: AudioHttpApi;
+  readonly audioHttpApi?: AudioStorageHttpApi;
   readonly attachController?: (controller: AppControllerImpl) => void;
   readonly attachedLifecycle?: Readonly<{
     stopAdmission(): void;
@@ -111,7 +112,7 @@ export class OwnedWorkspaceRuntime {
   private readonly registry: WorkspaceRegistry<AppControllerImpl, AppState>;
   private readonly cache = new Map<string, CachedWorkspaceSnapshot>();
   private readonly mediaResolvers = new WeakMap<AppControllerImpl, WorkspaceMediaResolver>();
-  private readonly audioApis = new WeakMap<AppControllerImpl, AudioHttpApi>();
+  private readonly audioApis = new WeakMap<AppControllerImpl, AudioStorageHttpApi>();
   private readonly attachedLifecycles = new WeakMap<AppControllerImpl, NonNullable<OwnedWorkspaceRuntimePorts['attachedLifecycle']>>();
   private readonly speechAdapters = new WeakMap<AppControllerImpl, NodeSpeechCleanupAdapter>();
   private readonly speechAdapterByWorkspace = new Map<string, NodeSpeechCleanupAdapter>();
@@ -218,7 +219,7 @@ export class OwnedWorkspaceRuntime {
 
   /** Authenticated audio routes resolve the exact loaded per-workspace owner entry. */
   createAudioHttpApi(): AudioHttpApi {
-    const invoke = async <T>(admission: WorkspaceHttpAdmission, operation: (api: AudioHttpApi) => Promise<T>,
+    const invoke = async <T>(admission: WorkspaceHttpAdmission, operation: (api: AudioStorageHttpApi) => Promise<T>,
       cleanupIfPostcheckFails?: (result: T) => Promise<void>): Promise<T> => {
       this.assertAdmission(admission);
       const initial = this.options.kernel.getOwnedIdentity(admission.sessionToken);
@@ -244,6 +245,8 @@ export class OwnedWorkspaceRuntime {
       });
     };
     return Object.freeze({
+      listUploads: (admission: WorkspaceHttpAdmission, cursor?: string): Promise<AudioUploadHistoryPage> =>
+        this.listAudioUploadHistory(admission, cursor),
       upload: (admission: WorkspaceHttpAdmission, input: Readonly<{ uploadId: string; capture: AudioUploadCaptureHeader;
         mimeType: string; expectedByteLength?: number; source: AsyncIterable<Uint8Array> }>): Promise<AudioUploadReceiptDTO> =>
         invoke(admission, (api) => api.upload(admission, input)),
@@ -252,6 +255,20 @@ export class OwnedWorkspaceRuntime {
       openMedia: (admission: WorkspaceHttpAdmission, mediaId: string, input: Readonly<{ method: 'GET' | 'HEAD'; range?: string; signal?: AbortSignal }>): Promise<AudioHttpMediaResponse> =>
         invoke(admission, (api) => api.openMedia(admission, mediaId, input), closeOpenedMediaResponse),
     });
+  }
+
+  /** Metadata-only recovery path; deliberately bypasses the workspace registry and controller lifecycle. */
+  async listAudioUploadHistory(admission: WorkspaceHttpAdmission, cursor?: string): Promise<AudioUploadHistoryPage> {
+    this.assertAdmission(admission);
+    admission.assertCurrent();
+    const initial = this.options.kernel.getOwnedIdentity(admission.sessionToken);
+    admission.assertCurrent();
+    const result = readAudioUploadHistory(this.options.kernel, admission.sessionToken, cursor);
+    admission.assertCurrent();
+    const current = this.options.kernel.getOwnedIdentity(admission.sessionToken);
+    if (current.workspaceId !== initial.workspaceId || current.ownerId !== initial.ownerId ||
+        current.privacyEpoch !== initial.privacyEpoch) throw new Error('workspace_ownership_changed');
+    return result;
   }
 
   getSnapshot(admission: OwnedWorkspaceAdmission): Promise<WorkspaceSnapshotDTO> {

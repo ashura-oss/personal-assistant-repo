@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, open, lstat, rename, unlink } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import type { Account, Note } from '../core';
-import type { AudioHttpApi, AudioHttpMediaResponse, AudioUploadReceiptDTO } from '../../server/src/audioHttp.js';
+import type { AudioStorageHttpApi, AudioHttpMediaResponse, AudioUploadReceiptDTO } from '../../server/src/audioHttp.js';
 import type { WorkspaceHttpAdmission } from '../../server/src/workspaceHttp.js';
 import type { SecretVault } from '../../server/src/vault.js';
 import type { DurableKernel, OwnedWorkspaceIdentity } from '../../server/src/kernel.js';
@@ -313,8 +313,8 @@ export function createProductionWorkspacePortsFor(config: Pick<ServerConfig,
       deviceCalendarBackend: unavailableDeviceCalendarBackend,
       mailAlertTapBackend: unavailableMailAlertTapBackend,
     };
-    const audioHttpApi: AudioHttpApi = Object.freeze({
-      upload: async (admission: WorkspaceHttpAdmission, input: Parameters<AudioHttpApi['upload']>[1]) => {
+    const audioHttpApi: AudioStorageHttpApi = Object.freeze({
+      upload: async (admission: WorkspaceHttpAdmission, input: Parameters<AudioStorageHttpApi['upload']>[1]) => {
         assertActor();
         const admitted = kernel.getOwnedIdentity(admission.sessionToken);
         if (admitted.workspaceId !== identity.workspaceId || admitted.ownerId !== identity.ownerId || admitted.privacyEpoch !== identity.privacyEpoch) {
@@ -337,7 +337,7 @@ export function createProductionWorkspacePortsFor(config: Pick<ServerConfig,
         return projectCaptureReceipt(receipt);
       },
       openMedia: async (admission: WorkspaceHttpAdmission, mediaId: string,
-        input: Parameters<AudioHttpApi['openMedia']>[2]): Promise<AudioHttpMediaResponse> => {
+        input: Parameters<AudioStorageHttpApi['openMedia']>[2]): Promise<AudioHttpMediaResponse> => {
         assertActor();
         const admitted = kernel.getOwnedIdentity(admission.sessionToken);
         if (admitted.workspaceId !== identity.workspaceId || admitted.ownerId !== identity.ownerId || admitted.privacyEpoch !== identity.privacyEpoch) {
