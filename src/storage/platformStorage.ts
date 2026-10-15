@@ -2,6 +2,7 @@ import * as SQLite from 'expo-sqlite';
 import * as Crypto from 'expo-crypto';
 import type { AppState } from '../core';
 import type { ServerPendingCaptureConsumption } from '../audio/pendingCaptureService.types';
+import type { OAuthInstallCheckpoint } from '../services/oauthInstallContracts';
 import { STATE_SNAPSHOT_READ_MAX_BYTES, STORAGE_KEY, type StateStore } from './contracts';
 import {
   PENDING_CAPTURE_MAX_BYTES, PENDING_CAPTURE_STORAGE_KEY, assertPendingCaptureConsumption,
@@ -401,7 +402,8 @@ export class SQLiteStateStore implements StateStore {
     });
   }
 
-  async save(state: AppState, options?: { consumePendingCapture?: ConsumePendingCapture; consumeServerPendingCapture?: ServerPendingCaptureConsumption }): Promise<void> {
+  async save(state: AppState, options?: { consumePendingCapture?: ConsumePendingCapture; consumeServerPendingCapture?: ServerPendingCaptureConsumption; consumeOAuthInstall?: OAuthInstallCheckpoint }): Promise<void> {
+    if (options?.consumeOAuthInstall) throw new Error('Server OAuth installation is unavailable in native storage.');
     if (options?.consumeServerPendingCapture) throw new Error('Server pending recordings are unavailable in native storage.');
     const rawSnapshot = JSON.stringify(state);
     const stateSnapshot = JSON.parse(rawSnapshot) as AppState;

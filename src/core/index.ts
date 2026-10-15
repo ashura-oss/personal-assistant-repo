@@ -1029,6 +1029,7 @@ export interface AppController {
   saveSettings(patch: SettingsPatch): Promise<AppSettings>;
   saveAccount(config: AccountConfig): Promise<Account>;
   installVerifiedAccount(config: AccountConfig, result: OAuthInstallResult, options?: { assertCurrent?: () => void }): Promise<Account>;
+  installOAuthStage(stageId: string): Promise<Account>;
   retryCredentialCleanup(): Promise<void>;
   disconnectAccount(id: string): Promise<Account>;
   saveCalendar(config: CalendarConfig): Promise<Calendar>;
@@ -1098,3 +1099,4 @@ export interface StartupRecoveryStatus {
   phase: StartupRecoveryPhase;
   inspection?: StartupRecoveryInspection;
 }
+export { isValidAccountId } from './accountIds';

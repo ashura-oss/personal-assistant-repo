@@ -41,6 +41,7 @@ import { createPrivacyAudioBoundary, createPrivacyBoundRecordingRecoveryService,
 import { createProviderCredentialService, type ProviderCredentialService } from './credentials';
 import { credentialStore } from '../storage/credentials';
 import type { BackgroundTaskBackend } from '../background/backend.types';
+import type { OAuthInstallLifecycle } from './oauthInstallContracts';
 import { OpenRouterBatchClient } from './openRouter';
 import { OpenRouterSpeechClient } from './openRouterSpeech';
 import { OpenRouterSpeechAdapter } from './openRouterSpeechAdapter';
@@ -58,6 +59,7 @@ export function extractPreviewProposals(note: Note): Proposal[] {
 
 export interface ControllerIntegrationDependencies {
   privacySession?: { epoch: string; assertCurrent(): Promise<void>; getStatus?(): Promise<import('../privacy/types').PrivacyPublicStatus> };
+  oauthInstallLifecycle?: OAuthInstallLifecycle;
   credentials?: ProviderCredentialService;
   writeDocument?: (path: string, content: string) => Promise<void>;
   tokenStore?: OAuthTokenStore;

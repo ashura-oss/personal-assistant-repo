@@ -12,8 +12,10 @@ import type {
   SavePersonInput, SaveProjectInput, KnowledgeItemCommand, SaveKnowledgeFactInput, SaveKnowledgeContactInput,
   SaveKnowledgeSourceLinkInput, SaveKnowledgeMemberInput, ReviewKnowledgeSuggestionInput, EditKnowledgeSuggestionInput, KnowledgeSelection,
 } from '../core';
+import { isValidAccountId } from '../core/accountIds';
 import type { StateStore } from '../storage/contracts';
 import { STATE_SNAPSHOT_READ_MAX_BYTES } from '../storage/contracts';
+import type { OAuthInstallLifecycle, OAuthInstallCheckpoint, PreparedOAuthInstallFacts } from './oauthInstallContracts';
 import { recoveryUtf8Bytes, STARTUP_RECOVERY_SESSION_MS, validateRecoveryId, validateRecoveryIso, validateRecoveryReceipt, validateReplacementSnapshot, type StartupRecoveryInspection, type StartupRecoveryPlan, type StartupRecoveryReceipt, type StartupRecoveryCommitInput } from '../storage/startupRecovery';
 import { ReplyGenerationError, ReplyGenerationPreDispatchError, validateAzureEndpoint, type DraftAnalysis, type PreparedAnalysis, type ReplyGenerationInput, type ReplyGenerationUsage } from './controllerRuntimeContracts';
 import type { AzureSpeechClient } from './azure';
@@ -476,6 +478,20 @@ function sameAccountIdentity(a: Account['identity'], b: Account['identity']): bo
     a.subject === b.subject && a.resourceUserId === b.resourceUserId && a.issuer === b.issuer && a.tenantId === b.tenantId);
 }
 
+function validBoundedOpaqueText(value: unknown, maxUtf8Bytes: number, maxCodePoints?: number): value is string {
+  if (typeof value !== 'string' || value.length === 0 || /[\u0000-\u001f\u007f]/.test(value)) return false;
+  let bytes = 0;
+  let codePoints = 0;
+  for (const point of value) {
+    const code = point.codePointAt(0)!;
+    if (code >= 0xd800 && code <= 0xdfff) return false;
+    bytes += code <= 0x7f ? 1 : code <= 0x7ff ? 2 : code <= 0xffff ? 3 : 4;
+    codePoints += 1;
+    if (bytes > maxUtf8Bytes || (maxCodePoints !== undefined && codePoints > maxCodePoints)) return false;
+  }
+  return true;
+}
+
 function dispatchIdentityMatches(record: DispatchRecord, account: Account): boolean {
   const identity = account.identity;
   return Boolean(identity && record.account.identity.providerNamespace === identity.providerNamespace &&
@@ -574,13 +590,13 @@ function normalizeKnowledgeSelection(value: unknown, inputPolicyVersion: 1 | 2 =
 
 function validMailboxCacheRow(value: unknown): value is MailboxSnapshotMessage {
   if (!isRecord(value)) return false;
-  return typeof value.accountId === 'string' && value.accountId.length > 0 && value.accountId.length <= 256 &&
+  return isValidAccountId(value.accountId) &&
     typeof value.providerMessageId === 'string' && value.providerMessageId.length > 0 && value.providerMessageId.length <= 1024;
 }
 
 function validCalendarCacheRow(value: unknown): value is CalendarEventSnapshot {
   if (!isRecord(value)) return false;
-  return typeof value.accountId === 'string' && value.accountId.length > 0 && value.accountId.length <= 256 &&
+  return isValidAccountId(value.accountId) &&
     typeof value.calendarId === 'string' && value.calendarId.length > 0 && value.calendarId.length <= 256 &&
     typeof value.providerEventId === 'string' && value.providerEventId.length > 0 && value.providerEventId.length <= 1024;
 }
@@ -1389,6 +1405,7 @@ export interface ControllerIntegrationDependencies {
   deleteToken?: (tokenRef: string) => Promise<void>;
   verifyOAuthResult?: (result: OAuthBridgeResult, stored: StoredOAuthToken, assertCurrent?: () => void) => Promise<boolean>;
   clientIds?: Partial<Record<'google' | 'microsoft', string>>;
+  oauthInstallLifecycle?: OAuthInstallLifecycle;
   connectorFactory?: (
     tokenStore: OAuthTokenStore,
     onAuthStatus: (accountId: string, status: Account['authStatus']) => Promise<void>,
@@ -3013,8 +3030,9 @@ export class AppControllerImpl implements AppController {
         throw new Error('The complete saved data would exceed the storage limit. No changes were saved.');
       }
       await this.assertPrivacySessionCurrent();
+      const resolvedSaveOptions = saveOptions?.(draft, result);
       try {
-        await this.store.save(persistedCandidate, saveOptions?.(draft, result));
+        await this.store.save(persistedCandidate, resolvedSaveOptions);
         await this.assertPrivacySessionCurrent();
         if (capturedBootstrapGeneration !== this.bootstrapGeneration || this.startupRecoveryPhase !== 'ready') {
           throw new Error('The app workspace changed while the update was being saved. Reopen the app before continuing.');
@@ -3040,7 +3058,7 @@ export class AppControllerImpl implements AppController {
         if (capturedBootstrapGeneration === this.bootstrapGeneration) this.setMailAlertRefreshRequired();
         throw error;
       }
-      await this.cancelNewMailAlertIntents(newCancellationIntents);
+      if (!resolvedSaveOptions?.consumeOAuthInstall) await this.cancelNewMailAlertIntents(newCancellationIntents);
       return clone(result);
     });
     this.transactionQueue = run.then(() => undefined, () => undefined);
@@ -10855,6 +10873,151 @@ export class AppControllerImpl implements AppController {
     });
   }
 
+  private applyVerifiedAccountInstall(
+    state: AppState,
+    config: AccountConfig,
+    facts: Pick<PreparedOAuthInstallFacts, 'provider' | 'identity' | 'requestedCapabilities' | 'capabilities' | 'grantedScopes' | 'displayName' | 'email'>,
+    email: string,
+    tokenRef: string,
+    expectedLifecycle?: { id: string; generation: number; tokenRef?: string; identity?: Account['identity']; authStatus: Account['authStatus']; connected: boolean },
+  ): Account {
+    const existing = state.accounts.find((account) => sameAccountIdentity(account.identity, facts.identity));
+    const configured = config.id ? state.accounts.find((account) => account.id === config.id) : undefined;
+    if (config.id) {
+      const reusablePlaceholder = configured && configured.provider === facts.provider && !configured.identity && configured.authStatus === 'configured' && !configured.tokenRef;
+      if (configured && !sameAccountIdentity(configured.identity, facts.identity) && !reusablePlaceholder) throw new Error('Choose a new account entry for a different provider identity.');
+      if (existing && existing.id !== config.id) throw new Error('This provider identity is already connected under another account entry.');
+    }
+    const prior = existing ?? configured;
+    if (expectedLifecycle) {
+      const current = state.accounts.find((account) => account.id === expectedLifecycle.id);
+      if (!current || current.connectionGeneration !== expectedLifecycle.generation || current.tokenRef !== expectedLifecycle.tokenRef ||
+          JSON.stringify(current.identity ?? null) !== JSON.stringify(expectedLifecycle.identity ?? null) || current.authStatus !== expectedLifecycle.authStatus ||
+          current.connected !== expectedLifecycle.connected) {
+        throw new Error('The account changed while reconnecting. Restart sign-in to protect the active connection.');
+      }
+    } else if (prior) throw new Error('The account was connected or changed while sign-in was being verified. Restart sign-in.');
+    const oldTokenRef = prior?.tokenRef;
+    const account: Account = {
+      id: prior?.id ?? config.id ?? this.newId(), provider: facts.provider,
+      displayName: (facts.displayName || config.displayName).trim(), email,
+      ...(facts.email ? { verifiedEmail: email } : {}),
+      connected: true, authStatus: 'connected', identity: clone(facts.identity), tokenRef,
+      grantedScopes: [...new Set(facts.grantedScopes)],
+      capabilities: intersectCapabilities([...facts.requestedCapabilities], [...facts.capabilities], grantedCapabilities(facts.provider, [...facts.grantedScopes])),
+      capabilityLimits: [...facts.requestedCapabilities], syncStatus: 'idle', configuredAt: prior?.configuredAt ?? now(),
+      connectionGeneration: (prior?.connectionGeneration ?? 0) + 1,
+    };
+    if (state.accounts.some((candidate) => candidate.id === account.id && candidate !== prior)) throw new Error('Account identifier is already in use.');
+    if (prior?.identity && prior.connected) {
+      const priorIdentity = encodeURIComponent(identityKey(prior));
+      markAnalysesStale(state, [], [`mail:${priorIdentity}:`, `calendar:${priorIdentity}:`, `calendar-event:${priorIdentity}:`]);
+    }
+    for (const proposal of state.proposals.filter((item) => item.accountId === account.id && ['draft', 'approved', 'failed'].includes(item.status))) {
+      this.invalidate(proposal); proposal.status = 'draft';
+    }
+    if (prior) { Object.assign(prior, account); if (!facts.email) delete prior.verifiedEmail; } else state.accounts.push(account);
+    state.pendingCredentialCleanup = state.pendingCredentialCleanup.filter((item) => item.tokenRef !== tokenRef);
+    if (oldTokenRef && oldTokenRef !== tokenRef && !state.pendingCredentialCleanup.some((item) => item.tokenRef === oldTokenRef)) {
+      state.pendingCredentialCleanup.push({ tokenRef: oldTokenRef, reason: 'replaced', createdAt: now() });
+    }
+    for (const calendar of state.calendars.filter((item) => item.accountId === account.id)) { calendar.connected = false; calendar.writable = false; }
+    state.syncStates[account.id] ??= emptySyncState(account.id);
+    interruptMailLanes(state.syncStates[account.id], 'Account identity changed during mail sync. Refresh the inbox or continue backfill explicitly.');
+    addActivity(state, 'local_action', `${account.displayName || account.email} was connected after provider identity verification.`, this.newId);
+    return account;
+  }
+
+  async installOAuthStage(stageId: string): Promise<Account> {
+    const lifecycle = this.integration.oauthInstallLifecycle;
+    if (!lifecycle) throw new Error('Verified server account installation is unavailable on this platform.');
+    if (typeof stageId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(stageId)) throw new Error('The OAuth installation stage is invalid.');
+    await this.load();
+    await this.assertPrivacySessionCurrent();
+    await this.store.assertCurrent?.();
+    const capturedBootstrapGeneration = this.bootstrapGeneration;
+    const installBaseline = this.snapshot;
+    const prepared = await lifecycle.prepare(stageId);
+    await this.assertPrivacySessionCurrent();
+    if (capturedBootstrapGeneration !== this.bootstrapGeneration || this.startupRecoveryPhase !== 'ready') throw new Error('The app workspace changed while the account installation was being prepared. Restart sign-in.');
+    this.validatePreparedOAuthInstallFacts(stageId, prepared);
+    if (prepared.expectedLifecycle) {
+      const expected = prepared.expectedLifecycle;
+      const baselineAccount = installBaseline.accounts.find((account) => account.id === expected.accountId);
+      if (!baselineAccount || baselineAccount.connectionGeneration !== expected.connectionGeneration || baselineAccount.tokenRef !== expected.tokenRef ||
+          JSON.stringify(baselineAccount.identity ?? null) !== JSON.stringify(expected.identity ?? null) || baselineAccount.connected !== expected.connected ||
+          baselineAccount.authStatus !== expected.authStatus) {
+        throw new Error('The account changed while sign-in was being prepared. Restart sign-in.');
+      }
+    } else if (installBaseline.accounts.some((account) => sameAccountIdentity(account.identity, prepared.identity))) {
+      throw new Error('This provider identity is already connected. Restart sign-in to confirm the current account lifecycle.');
+    }
+    const tokenRef = `oauth-${this.newId()}`;
+    const expected = prepared.expectedLifecycle;
+    const config: AccountConfig = { provider: prepared.provider, displayName: prepared.displayName, email: prepared.email ?? '', ...(expected ? { id: expected.accountId } : {}) };
+    const expectedLifecycle = expected ? {
+      id: expected.accountId, generation: expected.connectionGeneration, tokenRef: expected.tokenRef,
+      identity: expected.identity ? clone(expected.identity) : undefined, authStatus: expected.authStatus, connected: expected.connected,
+    } : undefined;
+    const priorEmail = expected ? this.snapshot.accounts.find((account) => account.id === expected.accountId)?.email : undefined;
+    const email = (prepared.email ?? priorEmail ?? '').trim().toLowerCase();
+    if (!validEmail(email)) throw new Error('The verified account did not provide a valid email address.');
+    const installed = await this.mutate((state) => {
+      if (capturedBootstrapGeneration !== this.bootstrapGeneration || this.startupRecoveryPhase !== 'ready') throw new Error('The app workspace changed while the account installation was being committed. Restart sign-in.');
+      if (expectedLifecycle) {
+        const capturedAccount = state.accounts.find((account) => account.id === expectedLifecycle.id);
+        if (!capturedAccount || JSON.stringify(capturedAccount.identity ?? null) !== JSON.stringify(expectedLifecycle.identity ?? null) ||
+            (capturedAccount.identity && !sameAccountIdentity(capturedAccount.identity, prepared.identity))) {
+          throw new Error('The account changed while reconnecting. Restart sign-in to protect the active connection.');
+        }
+      } else if (state.accounts.some((account) => sameAccountIdentity(account.identity, prepared.identity))) {
+        throw new Error('This provider identity is already connected. Restart sign-in to confirm the current account lifecycle.');
+      }
+      return this.applyVerifiedAccountInstall(state, config, prepared, email, tokenRef, expectedLifecycle);
+    }, (_state, account) => ({ consumeOAuthInstall: Object.freeze({
+      stageId: prepared.stageId,
+      stagePayloadGeneration: prepared.stagePayloadGeneration,
+      accountId: account.id,
+      accountGeneration: account.connectionGeneration ?? 0,
+      tokenRef: account.tokenRef!,
+    }) satisfies OAuthInstallCheckpoint }));
+    this.clearMailReplyBatchReviewPlansForAccount(installed.id);
+    this.syncGeneration.set(installed.id, installed.connectionGeneration ?? 0);
+    this.syncAbortControllers.get(installed.id)?.abort();
+    return installed;
+  }
+
+  private validatePreparedOAuthInstallFacts(stageId: string, facts: PreparedOAuthInstallFacts): void {
+    const validCapabilities = new Set<AccountCapability>(['mail.read', 'mail.draft', 'mail.send', 'calendar.read', 'calendar.write']);
+    const validIdentity = facts && facts.identity && facts.identity.providerNamespace === facts.provider &&
+      typeof facts.identity.clientId === 'string' && facts.identity.clientId.trim().length > 0 && facts.identity.clientId.length <= 512 &&
+      typeof facts.identity.subject === 'string' && facts.identity.subject.trim().length > 0 && facts.identity.subject.length <= 1024 &&
+      (facts.provider !== 'microsoft' || (typeof facts.identity.resourceUserId === 'string' && facts.identity.resourceUserId.trim().length > 0 && facts.identity.resourceUserId.length <= 1024));
+    const validCapabilityList = (values: readonly AccountCapability[]) => Array.isArray(values) && values.length <= validCapabilities.size &&
+      values.every((value) => validCapabilities.has(value)) && new Set(values).size === values.length;
+    if (!facts || facts.stageId !== stageId || !Number.isSafeInteger(facts.stagePayloadGeneration) || facts.stagePayloadGeneration <= 0 ||
+        !['google', 'microsoft'].includes(facts.provider) || !validIdentity ||
+        !Number.isFinite(facts.expiresAt) || facts.expiresAt <= Date.now() ||
+        typeof facts.displayName !== 'string' || facts.displayName.trim().length === 0 || facts.displayName.length > 256 ||
+        !validCapabilityList(facts.requestedCapabilities) || !validCapabilityList(facts.capabilities) ||
+        facts.capabilities.some((capability) => !facts.requestedCapabilities.includes(capability)) ||
+        !Array.isArray(facts.grantedScopes) || facts.grantedScopes.length > 64 || facts.grantedScopes.some((scope) => typeof scope !== 'string' || scope.length === 0 || scope.length > 512) ||
+        (facts.email !== undefined && (typeof facts.email !== 'string' || !validEmail(facts.email.trim())))) {
+      throw new Error('The prepared OAuth installation facts are incomplete or invalid.');
+    }
+    const expected = facts.expectedLifecycle;
+    if (expected && (!isValidAccountId(expected.accountId) ||
+        !Number.isSafeInteger(expected.connectionGeneration) || expected.connectionGeneration < 0 || typeof expected.connected !== 'boolean' ||
+        !['configured', 'connected', 'reauth_required', 'revoked'].includes(expected.authStatus) ||
+        (expected.tokenRef !== undefined && (expected.tokenRef.length > 128 || !validBoundedOpaqueText(expected.tokenRef, 512))) ||
+        (expected.identity !== undefined && (!expected.identity || expected.identity.providerNamespace !== facts.provider ||
+          expected.identity.clientId !== facts.identity.clientId || expected.identity.subject !== facts.identity.subject ||
+          expected.identity.resourceUserId !== facts.identity.resourceUserId || expected.identity.issuer !== facts.identity.issuer ||
+          expected.identity.tenantId !== facts.identity.tenantId)))) {
+      throw new Error('The prepared OAuth account lifecycle is invalid.');
+    }
+  }
+
   async installVerifiedAccount(config: AccountConfig, result: OAuthInstallResult, options: { assertCurrent?: () => void } = {}): Promise<Account> {
     const tokenStore = this.integration.tokenStore;
     if (!tokenStore || !this.integration.verifyOAuthResult || !this.connector) throw new Error('Verified account connection is unavailable until the OAuth and connector services are configured.');
@@ -10903,8 +11066,15 @@ export class AppControllerImpl implements AppController {
       }
       const email = (result.email || config.email).trim().toLowerCase();
       if (!validEmail(email)) throw new Error('The verified account did not provide a valid email address.');
-      const scopeCapabilities = grantedCapabilities(result.provider, result.grantedScopes);
-      const effectiveCapabilities = intersectCapabilities(result.requestedCapabilities, result.capabilities, scopeCapabilities);
+      const approvedFacts = Object.freeze({
+        provider: result.provider,
+        identity: Object.freeze(clone(result.identity)),
+        requestedCapabilities: Object.freeze([...result.requestedCapabilities]),
+        capabilities: Object.freeze([...result.capabilities]),
+        grantedScopes: Object.freeze([...result.grantedScopes]),
+        displayName: result.displayName,
+        email: result.email,
+      });
       const commitInstall = async (): Promise<Account> => {
         assertCurrent();
         let expectedRefreshToken = result.refreshToken;
@@ -10926,52 +11096,9 @@ export class AppControllerImpl implements AppController {
         throw new Error('The secure account credential could not be verified after storage.');
         }
         assertCurrent();
-      return this.mutate((state) => {
-        assertCurrent();
-        const existing = state.accounts.find((account) => sameAccountIdentity(account.identity, result.identity));
-        const configured = config.id ? state.accounts.find((account) => account.id === config.id) : undefined;
-        if (config.id) {
-          const reusablePlaceholder = configured && configured.provider === result.provider && !configured.identity && configured.authStatus === 'configured' && !configured.tokenRef;
-          if (configured && !sameAccountIdentity(configured.identity, result.identity) && !reusablePlaceholder) throw new Error('Choose a new account entry for a different provider identity.');
-          if (existing && existing.id !== config.id) throw new Error('This provider identity is already connected under another account entry.');
-        }
-        const prior = existing ?? configured;
-        if (expectedLifecycle) {
-          const current = state.accounts.find((account) => account.id === expectedLifecycle.id);
-          if (!current || current.connectionGeneration !== expectedLifecycle.generation || current.tokenRef !== expectedLifecycle.tokenRef ||
-              JSON.stringify(current.identity ?? null) !== JSON.stringify(expectedLifecycle.identity ?? null) || current.authStatus !== expectedLifecycle.authStatus ||
-              current.connected !== expectedLifecycle.connected) {
-            throw new Error('The account changed while reconnecting. Restart sign-in to protect the active connection.');
-          }
-        } else if (prior) throw new Error('The account was connected or changed while sign-in was being verified. Restart sign-in.');
-        const oldTokenRef = prior?.tokenRef;
-        const account: Account = {
-          id: prior?.id ?? config.id ?? this.newId(), provider: result.provider,
-          displayName: (result.displayName || config.displayName).trim(), email,
-          ...(result.email ? { verifiedEmail: email } : {}),
-          connected: true, authStatus: 'connected', identity: clone(result.identity), tokenRef,
-          grantedScopes: [...new Set(result.grantedScopes)], capabilities: effectiveCapabilities,
-          capabilityLimits: [...result.requestedCapabilities], syncStatus: 'idle', configuredAt: prior?.configuredAt ?? now(),
-          connectionGeneration: (prior?.connectionGeneration ?? 0) + 1,
-        };
-        if (state.accounts.some((candidate) => candidate.id === account.id && candidate !== prior)) throw new Error('Account identifier is already in use.');
-        if (prior?.identity && prior.connected) {
-          const priorIdentity = encodeURIComponent(identityKey(prior));
-          markAnalysesStale(state, [], [`mail:${priorIdentity}:`, `calendar:${priorIdentity}:`, `calendar-event:${priorIdentity}:`]);
-        }
-        for (const proposal of state.proposals.filter((item) => item.accountId === account.id && ['draft', 'approved', 'failed'].includes(item.status))) {
-          this.invalidate(proposal); proposal.status = 'draft';
-        }
-        if (prior) { Object.assign(prior, account); if (!result.email) delete prior.verifiedEmail; } else state.accounts.push(account);
-        state.pendingCredentialCleanup = state.pendingCredentialCleanup.filter((item) => item.tokenRef !== tokenRef);
-        if (oldTokenRef && oldTokenRef !== tokenRef && !state.pendingCredentialCleanup.some((item) => item.tokenRef === oldTokenRef)) {
-          state.pendingCredentialCleanup.push({ tokenRef: oldTokenRef, reason: 'replaced', createdAt: now() });
-        }
-        for (const calendar of state.calendars.filter((item) => item.accountId === account.id)) { calendar.connected = false; calendar.writable = false; }
-        state.syncStates[account.id] ??= emptySyncState(account.id);
-        interruptMailLanes(state.syncStates[account.id], 'Account identity changed during mail sync. Refresh the inbox or continue backfill explicitly.');
-        addActivity(state, 'local_action', `${account.displayName || account.email} was connected after provider identity verification.`, this.newId);
-        return account;
+        return this.mutate((state) => {
+          assertCurrent();
+          return this.applyVerifiedAccountInstall(state, config, approvedFacts, email, tokenRef, expectedLifecycle);
         }, () => { assertCurrent(); return undefined; });
       };
       const priorRef = expectedLifecycle?.tokenRef;

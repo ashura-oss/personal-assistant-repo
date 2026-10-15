@@ -2,6 +2,7 @@ import type {
   MailAlertAccountBinding, MailAlertCancellationEvidence, ProactiveMailAlertConsent,
   ProactiveMailAlertReceipt, ProactiveMailAlertState,
 } from './types';
+import { isValidAccountId } from '../core/accountIds';
 
 export const MAX_MAIL_ALERT_CONSENTS = 64;
 export const MAX_MAIL_ALERT_ACCOUNTS_PER_CONSENT = 64;
@@ -25,6 +26,10 @@ function boundedString(value: unknown, label: string, max: number): string {
 }
 function safeIdentifier(value: unknown, label: string, max = 256): string {
   return boundedString(value, label, max);
+}
+function accountIdentifier(value: unknown): string {
+  if (!isValidAccountId(value)) fail('Mail alert account ID is invalid.');
+  return value;
 }
 function uuid(value: unknown, label: string): string {
   const text = boundedString(value, label, 36);
@@ -52,7 +57,7 @@ function binding(value: unknown): MailAlertAccountBinding {
   if (!object(value)) fail('Mail alert account binding is invalid.');
   exactKeys(value, ['accountId', 'identityKey', 'connectionGeneration']);
   return {
-    accountId: safeIdentifier(value.accountId, 'Mail alert account ID'),
+    accountId: accountIdentifier(value.accountId),
     identityKey: boundedString(value.identityKey, 'Verified identity key', 2048),
     connectionGeneration: revision(value.connectionGeneration, 'Connection generation', 0),
   };
@@ -119,7 +124,7 @@ function receipt(value: unknown, installationId: string): ProactiveMailAlertRece
     consentId: uuid(value.consentId, 'Mail alert consent ID'), ruleId: safeIdentifier(value.ruleId, 'Mail alert rule ID'),
     ruleVersion: revision(value.ruleVersion, 'Mail alert rule version'),
     ruleRevision: revision(value.ruleRevision, 'Mail alert rule revision'), timeZone: timeZone(value.timeZone),
-    consentActivatedAt: timestamp(value.consentActivatedAt, 'Receipt consent activation time'), accountId: safeIdentifier(value.accountId, 'Mail alert account ID'),
+    consentActivatedAt: timestamp(value.consentActivatedAt, 'Receipt consent activation time'), accountId: accountIdentifier(value.accountId),
     identityKey: boundedString(value.identityKey, 'Receipt identity key', 2048), connectionGeneration: revision(value.connectionGeneration, 'Receipt connection generation', 0),
     providerMessageId: boundedString(value.providerMessageId, 'Provider message ID', 1024),
     sourceVersion: boundedString(value.sourceVersion, 'Mail source version', 512), receivedAt: timestamp(value.receivedAt, 'Mail received time'),

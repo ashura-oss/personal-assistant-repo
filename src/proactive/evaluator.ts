@@ -2,6 +2,8 @@ import type {
   EvaluateProactiveInput, ProactiveCandidate, ProactiveEvaluation, ProactiveRule,
   ProactiveSource, ProactiveTrigger,
 } from './types';
+import { isValidAccountId } from '../core/accountIds';
+import { MAX_PROACTIVE_CANDIDATE_ID, MAX_PROACTIVE_SOURCE_ID, MAX_PROACTIVE_SUPPRESSION_KEY } from './identifierBounds';
 export type {
   EvaluateProactiveInput, ProactiveCandidate, ProactiveEvaluation, ProactiveMailSource, ProactiveMeetingSource,
   ProactiveReasonCode, ProactiveRule, ProactiveSnooze, ProactiveSource, ProactiveTaskSource,
@@ -89,7 +91,10 @@ function validateRule(rule: ProactiveRule): void {
   if (!Number.isSafeInteger(rule.revision) || rule.revision < 1) fail('Rule revision is invalid.');
   if (typeof rule.enabled !== 'boolean') fail('Rule enabled flag is invalid.');
   if (!Array.isArray(rule.accountIds) || rule.accountIds.length > 64) fail('Rule account filter must contain at most 64 account IDs.');
-  const accounts = rule.accountIds.map((id) => string(id, 'Rule account ID', 256));
+  const accounts = rule.accountIds.map((id) => {
+    if (!isValidAccountId(id)) fail('Rule account ID is invalid.');
+    return id;
+  });
   if (new Set(accounts).size !== accounts.length) fail('Rule account IDs must be unique.');
   if (!rule.trigger || !['unread_from', 'keyword', 'meeting_soon', 'task_due'].includes(rule.trigger.type)) fail('Rule trigger is invalid.');
   if (rule.trigger.type === 'unread_from') {
@@ -111,7 +116,7 @@ function sourceId(source: Pick<ProactiveSource, 'namespace' | 'accountId' | 'pro
 }
 function validateSource(source: ProactiveSource): void {
   string(source.namespace, 'Source namespace', 128);
-  if (source.accountId !== undefined) string(source.accountId, 'Source account ID', 256);
+  if (source.accountId !== undefined && !isValidAccountId(source.accountId)) fail('Source account ID is invalid.');
   string(source.providerId, 'Provider source ID', 1024);
   if (source.namespace === 'local') {
     if (source.kind !== 'task' || source.accountId !== undefined) fail('Only accountless local tasks are supported as local sources.');
@@ -125,7 +130,8 @@ function validateSource(source: ProactiveSource): void {
     const expectedProviderId = JSON.stringify([binding.installationId, binding.calendarId, binding.nativeEventId, binding.occurrenceStart]);
     if (source.providerId !== expectedProviderId) fail('Device calendar provider ID does not match its frozen tuple.');
   } else if (!source.accountId) fail('Remote mail, meeting, and task sources must identify their account.');
-  if (source.sourceId !== sourceId(source)) fail('Source ID does not match its immutable namespace/account/provider identity.');
+  const expectedSourceId = sourceId(source);
+  if (expectedSourceId.length > MAX_PROACTIVE_SOURCE_ID || source.sourceId !== expectedSourceId) fail('Source ID does not match its immutable namespace/account/provider identity.');
   string(source.sourceVersion, 'Source version', 512);
   if (source.availability !== 'available' && source.availability !== 'unavailable') fail('Source availability is invalid.');
   if (!['fresh', 'stale', 'unknown'].includes(source.freshness)) fail('Source freshness is invalid.');
@@ -286,9 +292,9 @@ export function evaluateProactive(input: EvaluateProactiveInput): ProactiveEvalu
   if (!Array.isArray(previousInput)) fail('Previous proactive candidates must be an array.');
   if (previousInput.length > MAX_PREVIOUS_INPUT) fail(`Previous proactive candidates exceed ${MAX_PREVIOUS_INPUT} entries.`);
   for (const item of previousInput) {
-    string(item.id, 'Previous candidate ID', 4096);
+    string(item.id, 'Previous candidate ID', MAX_PROACTIVE_CANDIDATE_ID);
     string(item.ruleId, 'Previous candidate rule ID', 160);
-    string(item.sourceId, 'Previous candidate source ID', 2048);
+    string(item.sourceId, 'Previous candidate source ID', MAX_PROACTIVE_SOURCE_ID);
     string(item.sourceVersion, 'Previous candidate source version', 512);
   }
   const orderedPrevious = [...previousInput].sort(priorSort);
@@ -303,12 +309,12 @@ export function evaluateProactive(input: EvaluateProactiveInput): ProactiveEvalu
   }
   const dismissedInput = input.dismissedCandidateIds ?? [];
   if (!Array.isArray(dismissedInput) || dismissedInput.length > MAX_DISMISSALS) fail(`Dismissals must be an array of at most ${MAX_DISMISSALS} IDs.`);
-  const dismissed = new Set(dismissedInput.map((id) => string(id, 'Dismissed candidate ID', 4096)));
+  const dismissed = new Set(dismissedInput.map((id) => string(id, 'Dismissed candidate ID', MAX_PROACTIVE_CANDIDATE_ID)));
   const snoozes = new Map<string, number>();
   const snoozeInput = input.snoozes ?? [];
   if (!Array.isArray(snoozeInput) || snoozeInput.length > MAX_SOURCES) fail('Snooze list is invalid or exceeds the bounded limit.');
   for (const snooze of snoozeInput) {
-    const key = string(snooze.suppressionKey, 'Snooze key', 2048);
+    const key = string(snooze.suppressionKey, 'Snooze key', MAX_PROACTIVE_SUPPRESSION_KEY);
     const until = parseTimestamp(snooze.until, false, 'Snooze expiry');
     if (until === undefined) fail('Snooze expiry is invalid.');
     if (snooze.snoozedAt !== undefined) {
@@ -361,7 +367,7 @@ export function evaluateProactive(input: EvaluateProactiveInput): ProactiveEvalu
   const invalidated = new Set<string>();
   const deferredIds = new Set<string>(deferredCandidates.map((candidate) => candidate.id));
   const unevaluatedIds = new Set<string>();
-  for (const old of orderedPrevious.slice(MAX_PREVIOUS)) unevaluatedIds.add(string(old.id, 'Previous candidate ID', 4096));
+  for (const old of orderedPrevious.slice(MAX_PREVIOUS)) unevaluatedIds.add(string(old.id, 'Previous candidate ID', MAX_PROACTIVE_CANDIDATE_ID));
   const effectiveComplete = input.sourceSnapshotComplete === true;
   for (const old of previous) {
     if (retainedIds.has(old.id) || dismissed.has(old.id)) continue;

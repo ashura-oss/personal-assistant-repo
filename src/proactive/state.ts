@@ -1,12 +1,13 @@
 import { evaluateProactive, type ProactiveCandidate } from './index';
 import type { ProactiveState, ProactiveCandidateEntry, SavedProactiveRule } from '../core';
+import { isValidAccountId } from '../core/accountIds';
+import { MAX_PROACTIVE_CANDIDATE_ID, MAX_PROACTIVE_SOURCE_ID, MAX_PROACTIVE_SUPPRESSION_KEY } from './identifierBounds';
 
 export const PROACTIVE_INTEGRITY_ERROR = 'Saved proactive data failed validation. Local candidate generation is paused.';
 const MAX_RULES = 64;
 const MAX_CANDIDATES = 200;
 const MAX_SUPPRESSIONS = 2000;
 const MAX_RULE_ID = 160;
-const MAX_SOURCE_ID = 2048;
 const MAX_SOURCE_VERSION = 512;
 const MAX_PROVIDER_ID = 1024;
 
@@ -31,12 +32,13 @@ function canonicalTime(value: unknown): value is string {
 }
 
 function sourceTupleValid(sourceId: unknown): boolean {
-  if (typeof sourceId !== 'string' || !sourceId || sourceId.length > MAX_SOURCE_ID) return false;
+  if (typeof sourceId !== 'string' || !sourceId || sourceId.length > MAX_PROACTIVE_SOURCE_ID) return false;
   try {
     const tuple = JSON.parse(sourceId) as unknown;
-    return Array.isArray(tuple) && tuple.length === 3 && typeof tuple[0] === 'string' && tuple[0].length > 0 && tuple[0].length <= 128 &&
-      (tuple[1] === null || typeof tuple[1] === 'string' && tuple[1].length > 0 && tuple[1].length <= 256) &&
-      typeof tuple[2] === 'string' && tuple[2].length > 0 && tuple[2].length <= MAX_PROVIDER_ID &&
+    const validComponent = (value: unknown, max: number) => typeof value === 'string' && Boolean(value.trim()) && value.length <= max && !/[\u0000-\u001f\u007f]/.test(value);
+    return Array.isArray(tuple) && tuple.length === 3 && validComponent(tuple[0], 128) &&
+      (tuple[1] === null || isValidAccountId(tuple[1])) &&
+      validComponent(tuple[2], MAX_PROVIDER_ID) &&
       JSON.stringify(tuple) === sourceId;
   } catch { return false; }
 }
@@ -49,7 +51,7 @@ function candidateValid(value: unknown, rules: Map<string, SavedProactiveRule>):
       typeof candidate.ruleId !== 'string' || candidate.ruleId.length > MAX_RULE_ID || !sourceTupleValid(candidate.sourceId) ||
       typeof candidate.sourceVersion !== 'string' || !candidate.sourceVersion || candidate.sourceVersion.length > MAX_SOURCE_VERSION ||
       !canonicalTime(candidate.eligibleAt) || typeof candidate.id !== 'string' ||
-      candidate.id.length > 4096 ||
+      candidate.id.length > MAX_PROACTIVE_CANDIDATE_ID ||
       candidate.id !== JSON.stringify([candidate.ruleId, candidate.ruleRevision, candidate.sourceId, candidate.sourceVersion]) ||
       candidate.sourceId !== JSON.stringify([candidate.namespace, candidate.accountId ?? null, candidate.providerId]) ||
       candidate.suppressionKey !== JSON.stringify([candidate.ruleId, candidate.sourceId]) ||
@@ -57,7 +59,7 @@ function candidateValid(value: unknown, rules: Map<string, SavedProactiveRule>):
       typeof candidate.providerId !== 'string' || !candidate.providerId || candidate.providerId.length > MAX_PROVIDER_ID || typeof candidate.quote !== 'string' || candidate.quote.length > 2000 ||
       !['unread_sender', 'keyword', 'meeting_soon', 'task_due'].includes(candidate.reasonCode) ||
       !['senderEmail', 'subject', 'snippet', 'startAt', 'dueAt', 'title'].includes(candidate.quoteField)) return false;
-  if (candidate.accountId !== undefined && (typeof candidate.accountId !== 'string' || !candidate.accountId || candidate.accountId.length > 256)) return false;
+  if (candidate.accountId !== undefined && !isValidAccountId(candidate.accountId)) return false;
   if (candidate.namespace === 'local') {
     if (candidate.sourceKind !== 'task' || candidate.accountId !== undefined) return false;
   } else if (!candidate.accountId) return false;
@@ -77,7 +79,7 @@ export function validateProactiveState(value: unknown): ProactiveState {
         !Number.isSafeInteger(rule.revision) || rule.revision < 1 || !Number.isSafeInteger(rule.version) || rule.version < rule.revision ||
         !canonicalTime(rule.createdAt) || !canonicalTime(rule.updatedAt) ||
         !Array.isArray(rule.accountIds) || rule.accountIds.length > 64 ||
-        rule.accountIds.some((id) => typeof id !== 'string' || !id || id.length > 256) || new Set(rule.accountIds).size !== rule.accountIds.length ||
+        rule.accountIds.some((id) => !isValidAccountId(id)) || new Set(rule.accountIds).size !== rule.accountIds.length ||
         (rule.trigger?.type === 'task_due' && rule.accountIds.length !== 0)) throw new Error('invalid');
     byId.set(rule.id, rule);
   }
@@ -96,7 +98,7 @@ export function validateProactiveState(value: unknown): ProactiveState {
     if (!object(dismissal) || !rule || !Number.isSafeInteger(dismissal.ruleRevision) || dismissal.ruleRevision < 1 || dismissal.ruleRevision > rule.revision ||
         typeof dismissal.ruleId !== 'string' || dismissal.ruleId.length > MAX_RULE_ID || !sourceTupleValid(dismissal.sourceId) ||
         typeof dismissal.sourceVersion !== 'string' || !dismissal.sourceVersion || dismissal.sourceVersion.length > MAX_SOURCE_VERSION ||
-        typeof dismissal.candidateId !== 'string' || dismissal.candidateId.length > 4096 ||
+        typeof dismissal.candidateId !== 'string' || dismissal.candidateId.length > MAX_PROACTIVE_CANDIDATE_ID ||
         dismissal.candidateId !== JSON.stringify([dismissal.ruleId, dismissal.ruleRevision, dismissal.sourceId, dismissal.sourceVersion]) ||
         !canonicalTime(dismissal.dismissedAt) || dismissalIds.has(dismissal.candidateId)) throw new Error('invalid');
     dismissalIds.add(dismissal.candidateId);
@@ -109,7 +111,7 @@ export function validateProactiveState(value: unknown): ProactiveState {
     const until = typeof snooze.until === 'string' ? Date.parse(snooze.until) : NaN;
     const snoozedAt = typeof snooze.snoozedAt === 'string' ? Date.parse(snooze.snoozedAt) : NaN;
     if (!rule || typeof snooze.ruleId !== 'string' || snooze.ruleId.length > MAX_RULE_ID || !sourceTupleValid(snooze.sourceId) ||
-        typeof snooze.suppressionKey !== 'string' || snooze.suppressionKey.length > 4096 || snooze.suppressionKey !== expectedKey ||
+        typeof snooze.suppressionKey !== 'string' || snooze.suppressionKey.length > MAX_PROACTIVE_SUPPRESSION_KEY || snooze.suppressionKey !== expectedKey ||
         !canonicalTime(snooze.until) || !canonicalTime(snooze.snoozedAt) || until <= snoozedAt || until - snoozedAt > 7 * 86_400_000 ||
         snoozeIds.has(snooze.suppressionKey)) throw new Error('invalid');
     snoozeIds.add(snooze.suppressionKey);

@@ -1,6 +1,7 @@
 import type { AppState, CalendarEventSnapshot, MailboxSnapshotMessage } from '../core';
 import { proactiveSourceId, validateProactiveSource, type ProactiveCandidate, type ProactiveSource } from './index';
 import type { DeviceEventSnapshot } from '../deviceCalendars';
+import { isValidAccountId } from '../core/accountIds';
 
 export interface ProactiveSourceHashMemoEntry { canonical: string; version: string }
 export type ProactiveSourceHashMemo = Map<string, ProactiveSourceHashMemoEntry>;
@@ -10,12 +11,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function validMailRow(value: unknown): value is MailboxSnapshotMessage {
-  return isRecord(value) && typeof value.accountId === 'string' && value.accountId.length > 0 && value.accountId.length <= 256 &&
+  return isRecord(value) && isValidAccountId(value.accountId) &&
     typeof value.providerMessageId === 'string' && value.providerMessageId.length > 0 && value.providerMessageId.length <= 1024;
 }
 
 function validEventRow(value: unknown): value is CalendarEventSnapshot {
-  return isRecord(value) && typeof value.accountId === 'string' && value.accountId.length > 0 && value.accountId.length <= 256 &&
+  return isRecord(value) && isValidAccountId(value.accountId) &&
     typeof value.calendarId === 'string' && value.calendarId.length > 0 && value.calendarId.length <= 256 &&
     typeof value.providerEventId === 'string' && value.providerEventId.length > 0 && value.providerEventId.length <= 1024;
 }

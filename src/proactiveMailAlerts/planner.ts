@@ -1,4 +1,5 @@
 import { evaluateProactive, normalizeProactiveOffsetTimestamp, validateProactiveSource, type ProactiveRule } from '../proactive';
+import { isValidAccountId } from '../core/accountIds';
 import { MAX_MAIL_ALERT_ACCOUNTS_PER_CONSENT, MAX_MAIL_ALERT_CONSENTS, MAX_MAIL_ALERT_RECEIPTS, validateProactiveMailAlertConsent, validateProactiveMailAlertState } from './state';
 import type {
   MailAlertAccountBinding, MailAlertVerifiedAccount, CommittedMailAlertPage, MailAlertRule, ProactiveMailAlertConsent,
@@ -16,6 +17,10 @@ const PAGE_FRESHNESS_MS = 15 * 60_000;
 function fail(message: string): never { throw new Error(message); }
 function validateIdentifier(value: string, label: string, max = 256): string {
   if (typeof value !== 'string' || !value.trim() || value.length > max || /[\u0000-\u001f\u007f]/.test(value)) fail(`${label} is invalid.`);
+  return value;
+}
+function validateAccountId(value: unknown): string {
+  if (!isValidAccountId(value)) fail('Mail alert account ID is invalid.');
   return value;
 }
 function validateUuid(value: string, label: string): string {
@@ -41,11 +46,11 @@ function verifiedIdentity(account: MailAlertVerifiedAccount): boolean {
       typeof account.identityKey !== 'string' || !account.identityKey || account.identityKey.length > 2048 ||
       /[\u0000-\u001f\u007f]/.test(account.identityKey) ||
       account.identityKey.split(':').length !== 4 || account.identityKey.slice(0, account.identityKey.indexOf(':')) !== account.providerNamespace) return false;
-  try { validateIdentifier(account.accountId, 'Mail alert account ID'); } catch { return false; }
+  try { validateAccountId(account.accountId); } catch { return false; }
   return true;
 }
 function bindingOf(account: MailAlertVerifiedAccount): MailAlertAccountBinding {
-  return { accountId: validateIdentifier(account.accountId, 'Mail alert account ID'), identityKey: account.identityKey,
+  return { accountId: validateAccountId(account.accountId), identityKey: account.identityKey,
     connectionGeneration: account.connectionGeneration };
 }
 function sameBinding(a: MailAlertAccountBinding, b: MailAlertAccountBinding): boolean {
@@ -183,7 +188,7 @@ export function planProactiveMailAlerts(input: ProactiveMailAlertPlanInput): Pro
   const accountMap = new Map<string, MailAlertVerifiedAccount>();
   for (const account of input.accounts) {
     if (!account || accountMap.has(account.accountId)) fail('Mail alert planner received duplicate or invalid account IDs.');
-    validateIdentifier(account.accountId, 'Mail alert account ID');
+    validateAccountId(account.accountId);
     accountMap.set(account.accountId, account);
   }
   const pageAccounts = new Set<string>();
