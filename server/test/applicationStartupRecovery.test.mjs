@@ -356,13 +356,21 @@ test('a direct kernel permanently consumes cold-start startup reservation before
   const directory = mkdtempSync(join(tmpdir(), 'still-direct-kernel-'));
   const databasePath = join(directory, 'workspace.sqlite');
   const ownership = acquireApplicationOwnership(databasePath);
-  const kernel = createDurableKernel({ databasePath, applicationOwnership: ownership, validateSnapshot() {} });
+  let kernel;
+  let reopened;
   try {
+    kernel = createDurableKernel({ databasePath, applicationOwnership: ownership, validateSnapshot() {} });
     kernel.assertRuntimeStartupSealed();
     assert.throws(() => registerApplicationStartup(kernel, ownership, databasePath, randomUUID()),
       (error) => error?.code === 'application_owner_path_unsafe');
-  } finally {
     kernel.close();
+    reopened = createDurableKernel({ databasePath, applicationOwnership: ownership, validateSnapshot() {} });
+    reopened.assertRuntimeStartupSealed();
+    assert.throws(() => registerApplicationStartup(reopened, ownership, databasePath, randomUUID()),
+      (error) => error?.code === 'application_owner_path_unsafe', 'standalone close/reopen never remints cold-start authority');
+  } finally {
+    try { reopened?.close(); } catch {}
+    try { kernel?.close(); } catch {}
     ownership.release();
     rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 30 });
   }

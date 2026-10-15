@@ -82,12 +82,25 @@ export function consumeApplicationStartupReservation(handle: ApplicationOwnershi
     state.startupKernels = new Set([kernel]);
     state.startupPhase = 'initializing';
   } else {
-    if (state.startupReservation || (state.startupClaimed && (state.startupHostReserved || state.startupPhase !== 'sealed'))) {
-      throw new ApplicationOwnershipError('application_owner_unavailable');
-    }
+    if (state.startupReservation) throw new ApplicationOwnershipError('application_owner_unavailable');
     if (state.startupClaimed) {
-      state.startupKernels?.add(kernel);
+      if (state.startupHostReserved) throw new ApplicationOwnershipError('application_owner_unavailable');
+      if (state.startupPhase === 'sealed') {
+        state.startupKernels?.add(kernel);
+        return;
+      }
+      if (state.startupPhase !== 'closed' || state.startupKernels?.size) {
+        throw new ApplicationOwnershipError('application_owner_unavailable');
+      }
+      // A drained direct kernel may reopen under its still-live standalone guard.
+      // The one-shot cold-start claim remains consumed; this creates no reservation or capability.
+      state.startupKernel = kernel;
+      state.startupKernels = new Set([kernel]);
+      state.startupPhase = 'sealed';
       return;
+    }
+    if (state.startupHostReserved) {
+      throw new ApplicationOwnershipError('application_owner_unavailable');
     }
     state.startupClaimed = true;
     state.startupKernel = kernel;
