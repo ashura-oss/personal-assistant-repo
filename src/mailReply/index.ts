@@ -1,4 +1,4 @@
-import type { EmailProposalPayload, MailReplyProvenance, MailReplySourceSnapshot } from '../core';
+import type { EmailProposalPayload, ManualMailReplyProvenance, MailReplyProvenance, MailReplySourceSnapshot } from '../core';
 
 const HASH = /^[a-f\d]{64}$/i;
 const EMAIL = /^[^\s<>@,;]+@[^\s<>@,;]+\.[^\s<>@,;]+$/;
@@ -136,11 +136,11 @@ export function replyReferences(source: MailReplySourceSnapshot): string | undef
   return result || undefined;
 }
 
-export function validateReplyBinding(payload: EmailProposalPayload, provenance: MailReplyProvenance, expectedOperation: 'draft' | 'send' = 'draft'): void {
+export function validateReplyBinding(payload: EmailProposalPayload, provenance: MailReplyProvenance | ManualMailReplyProvenance, expectedOperation: 'draft' | 'send' = 'draft'): void {
   const source = provenance.source;
   if (payload.operation !== expectedOperation || !payload.reply || payload.reply.mode !== 'reply' && payload.reply.mode !== 'reply_all') fail('Mail reply operation does not match its reviewed operation.');
   if (!Array.isArray(payload.bcc) || !Array.isArray(payload.attachments) || payload.bcc.length || payload.attachments.length) fail('Reply drafts cannot add Bcc recipients or attachments.');
-  if (provenance.version !== 2 || provenance.kind !== 'mail_reply' || source.sourceDigest !== provenance.sourceDigest ||
+  if (!((provenance.version === 2 && provenance.kind === 'mail_reply') || (provenance.version === 3 && provenance.kind === 'manual_mail_reply' && provenance.operation === expectedOperation)) || source.sourceDigest !== provenance.sourceDigest ||
       payload.reply.sourceDigest !== source.sourceDigest || payload.reply.localMessageId !== source.localMessageId ||
       payload.reply.providerMessageId !== source.providerMessageId || payload.reply.idFormat !== source.idFormat ||
       payload.reply.internetMessageId !== source.internetMessageId || payload.reply.threadId !== source.threadId ||

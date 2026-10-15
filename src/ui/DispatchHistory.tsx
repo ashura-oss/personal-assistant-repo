@@ -34,7 +34,7 @@ export type DispatchHistoryRecord = Pick<WorkspaceDispatchRecord,
   payload: DispatchPayloadDisplay;
   account: Pick<WorkspaceDispatchRecord["account"], "provider" | "displayName" | "email">;
   calendar?: Pick<NonNullable<WorkspaceDispatchRecord["calendar"]>, "name" | "providerId">;
-  sourceProvenance: Readonly<{ version: 1 }> | Readonly<{ version: 2; source: ReplySourceDisplay }>;
+  sourceProvenance: Readonly<{ version: 1 }> | Readonly<{ version: 2 | 3; source: ReplySourceDisplay }>;
   reconciliations: readonly Pick<WorkspaceDispatchRecord["reconciliations"][number], "id" | "disposition" | "at" | "note" | "remoteId">[];
 }>;
 
@@ -168,7 +168,7 @@ function DispatchRecordView({
               <Text style={s.analysisSource}>
                 {record.payload.email.reply.mode === "reply_all" ? "Reply all" : "Reply"} draft
               </Text>
-              {record.sourceProvenance.version === 2 ? (
+              {record.sourceProvenance.version !== 1 ? (
                 <>
                   <Text style={s.analysisSource}>
                     Original sender · {record.sourceProvenance.source.from || record.sourceProvenance.source.senderEmail || "Sender unavailable"}

@@ -29,7 +29,7 @@ describe('cloud saved-mail read paths', () => {
       internetMessageId: source.internetMessageId, subject: source.subject, from: source.from, senderEmail: source.senderEmail, replyTo: [...source.replyTo],
       to: [...source.to], cc: [...source.cc], replyMetadataComplete: true, observedAt: source.observedAt, sourceDigest: source.sourceDigest };
     let proposalValue: unknown = { id: 'proposal-1', kind: 'email', title: 'Reply', body: 'Saved body', status: 'draft', revision: 2, recipients: ['sender@example.test'],
-      accountId: source.accountId, email: { operation: 'draft', to: ['sender@example.test'], cc: [], bcc: [], subject: 'Saved subject', text: 'Saved body', attachments: [] },
+      accountId: source.accountId, sourceActionKey: 'reply-source-action', email: { operation: 'draft', to: ['sender@example.test'], cc: [], bcc: [], subject: 'Saved subject', text: 'Saved body', attachments: [], reply: {} },
       provenance: { version: 2, kind: 'mail_reply', sourceDigest: source.sourceDigest, source: producerSource, expiresAt: '2026-10-16T10:00:00.000Z' } };
     const dispatchValue = { recordVersion: 'c'.repeat(64), record: { id: 'dispatch-1', proposalId: 'proposal-1', accountId: source.accountId,
       account: { provider: 'google', displayName: 'Work', email: 'me@example.test', identity: { providerNamespace: 'google', subject: 'private' } }, operation: 'send',
@@ -59,8 +59,13 @@ describe('cloud saved-mail read paths', () => {
     expect(parseCloudMailReplyText(JSON.parse(JSON.stringify(producedText)), expected, source.localMessageId, parsedSource.source!).snapshot?.text).toBe('Saved context');
     const producedProposal = await api.readProposalReview!(admission, { proposalId: 'proposal-1', expectedRevision: expected.revision, expectedPrivacyEpoch: expected.privacyEpoch });
     expect(parseCloudProposalReview(JSON.parse(JSON.stringify(producedProposal)), expected, 'proposal-1').proposal).toMatchObject({
-      editPolicy: 'source_reply_fields', sourceDigest: source.sourceDigest,
+      editPolicy: 'source_reply_fields', canDeriveManualReply: true, sourceDigest: source.sourceDigest,
     });
+    proposalValue = { ...(proposalValue as Record<string, unknown>), provenance: { version: 3, kind: 'manual_mail_reply', sourceDigest: source.sourceDigest,
+      source: producerSource, expiresAt: '2026-10-16T10:00:00.000Z', outputPolicyVersion: 2, operation: 'draft', lineage: { kind: 'manual' } } };
+    const manualProposal = await api.readProposalReview!(admission, { proposalId: 'proposal-1', expectedRevision: expected.revision, expectedPrivacyEpoch: expected.privacyEpoch });
+    expect(parseCloudProposalReview(JSON.parse(JSON.stringify(manualProposal)), expected, 'proposal-1').proposal)
+      .toMatchObject({ editPolicy: 'manual_reply_fields', canDeriveManualReply: true });
     proposalValue = { ...(proposalValue as Record<string, unknown>), provenance: { version: 2, kind: 'mail_reply', sourceDigest: source.sourceDigest,
       source: producerSource, expiresAt: '2026-10-16T10:00:00.000Z', batchJobId: '11111111-1111-4111-8111-111111111111' } };
     const batchProposal = await api.readProposalReview!(admission, { proposalId: 'proposal-1', expectedRevision: expected.revision, expectedPrivacyEpoch: expected.privacyEpoch });
@@ -140,7 +145,7 @@ describe('cloud saved-mail read paths', () => {
   it('accepts producer-sized proposal and frozen dispatch content without imposing smaller text caps', () => {
     const longText = 'm'.repeat(100_000);
     const proposal = parseCloudProposalReview({ schemaVersion: 1, ...expected, proposal: {
-      editPolicy: 'email_fields', id: 'proposal-1', kind: 'email', title: 'Reply', body: longText, status: 'draft', revision: 2, recipients: ['person@example.test'], accountId: 'acct-1',
+      editPolicy: 'email_fields', canDeriveManualReply: false, id: 'proposal-1', kind: 'email', title: 'Reply', body: longText, status: 'draft', revision: 2, recipients: ['person@example.test'], accountId: 'acct-1',
       email: { operation: 'draft', to: ['person@example.test'], cc: [], bcc: [], subject: 'Saved reply', text: longText, attachments: [] },
     } }, expected, 'proposal-1');
     expect(proposal.proposal?.email?.text).toHaveLength(100_000);
@@ -180,7 +185,7 @@ describe('cloud saved-mail read paths', () => {
   it('rejects array or object values in every closed enum field', () => {
     const sourceRead = { schemaVersion: 1, ...expected, status: 'current', source,
       defaults: { reply: { to: [], cc: [] }, reply_all: { to: [], cc: [] } }, bodyCache: { status: 'current', completeness: 'excerpt', representation: 'plain' } };
-    const proposalRead = { schemaVersion: 1, ...expected, proposal: { editPolicy: 'email_fields', id: 'proposal-1', kind: 'email', title: 'Reply', body: '', status: 'draft', revision: 2,
+    const proposalRead = { schemaVersion: 1, ...expected, proposal: { editPolicy: 'email_fields', canDeriveManualReply: false, id: 'proposal-1', kind: 'email', title: 'Reply', body: '', status: 'draft', revision: 2,
       recipients: [], email: { operation: 'draft', to: [], cc: [], bcc: [], subject: '', text: '', attachments: [] } } };
     const dispatchRead = { schemaVersion: 1, ...expected, recordVersion: 'c'.repeat(64), record: { id: 'dispatch-1', proposalId: 'proposal-1', accountId: 'acct-1',
       account: { provider: 'google', displayName: 'Account', email: 'person@example.test' }, operation: 'send', title: 'Reply', body: '',

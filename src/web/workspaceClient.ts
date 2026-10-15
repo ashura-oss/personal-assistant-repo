@@ -605,6 +605,7 @@ function expectedReceiptFor(envelope: WorkspaceCommandEnvelope) {
     case 'mail.source.loadText': return { commandId: envelope.commandId, kind: command.kind, objectId: command.messageId, accountId: command.accountId,
       connectionGeneration: command.expectedConnectionGeneration, sourceDigest: command.sourceDigest };
     case 'mail.reply.create': return { commandId: envelope.commandId, kind: command.kind };
+    case 'mail.reply.derive': return { commandId: envelope.commandId, kind: command.kind, parentProposalId: command.parentProposalId, operation: command.operation };
     case 'proposals.edit': case 'proposals.approve': case 'proposals.execute': case 'proposals.dismiss':
       return { commandId: envelope.commandId, kind: command.kind, objectId: command.proposalId, proposalId: command.proposalId };
     case 'dispatch.reconcile': return { commandId: envelope.commandId, kind: command.kind, objectId: command.recordId, recordId: command.recordId };

@@ -9,6 +9,8 @@ const missingBatchJob: WorkspaceCommandReceipt = { ...base, kind: 'assistant.bat
 const missingChatJob: WorkspaceCommandReceipt = { ...base, kind: 'chat.submit', turnId: commandId };
 // @ts-expect-error Chat refinement receipts also bind the exact parent turn.
 const missingRefinementParent: WorkspaceCommandReceipt = { ...base, kind: 'chat.refine', turnId: commandId, jobId: commandId };
+// @ts-expect-error Manual reply successor receipts bind their exact parent and reviewed operation.
+const missingReplySuccessorBinding: WorkspaceCommandReceipt = { ...base, kind: 'mail.reply.derive', proposalId: commandId, proposalRevision: 1 };
 
 function requiredByDiscriminant(receipt: WorkspaceCommandReceipt): string {
   switch (receipt.kind) {
@@ -28,4 +30,4 @@ function selectionIsImmutable(command: WorkspaceCommand): void {
   }
 }
 
-void [missingBatchJob, missingChatJob, missingRefinementParent, requiredByDiscriminant, selectionIsImmutable];
+void [missingBatchJob, missingChatJob, missingRefinementParent, missingReplySuccessorBinding, requiredByDiscriminant, selectionIsImmutable];

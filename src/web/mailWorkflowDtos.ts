@@ -51,7 +51,9 @@ export interface MailReplyTextReadDto extends WorkspaceReadEnvelope {
 }
 
 export interface WorkflowProposalReviewDto {
-  readonly editPolicy: 'email_fields' | 'source_reply_fields' | 'event_fields' | 'read_only';
+  readonly editPolicy: 'email_fields' | 'source_reply_fields' | 'manual_reply_fields' | 'event_fields' | 'read_only';
+  readonly canDeriveManualReply: boolean;
+  readonly supersededByProposalId?: string;
   readonly id: string;
   readonly kind: 'email' | 'event' | 'task' | 'memory' | 'reminder';
   readonly title: string;

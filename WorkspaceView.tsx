@@ -115,7 +115,15 @@ export function buildSpeechProviderSettingsPatch(provider: "azure" | "openrouter
 
 function reviewProposalDisplay(value: Proposal): ReviewProposalDisplay {
   const provenance = value.provenance && "kind" in value.provenance
-    ? { version: 2 as const, kind: "mail_reply" as const, sourceDigest: value.provenance.sourceDigest,
+    ? value.provenance.version === 3
+      ? { version: 3 as const, kind: "manual_mail_reply" as const, sourceDigest: value.provenance.sourceDigest,
+        source: { ...value.provenance.source, identity: { ...value.provenance.source.identity },
+          ...(value.provenance.source.replyTo ? { replyTo: [...value.provenance.source.replyTo] } : {}),
+          ...(value.provenance.source.to ? { to: [...value.provenance.source.to] } : {}),
+          ...(value.provenance.source.cc ? { cc: [...value.provenance.source.cc] } : {}) },
+        expiresAt: value.provenance.expiresAt, outputPolicyVersion: 2 as const, operation: value.provenance.operation,
+        lineage: { ...value.provenance.lineage } }
+      : { version: 2 as const, kind: "mail_reply" as const, sourceDigest: value.provenance.sourceDigest,
         source: { ...value.provenance.source, identity: { ...value.provenance.source.identity },
           ...(value.provenance.source.replyTo ? { replyTo: [...value.provenance.source.replyTo] } : {}),
           ...(value.provenance.source.to ? { to: [...value.provenance.source.to] } : {}),

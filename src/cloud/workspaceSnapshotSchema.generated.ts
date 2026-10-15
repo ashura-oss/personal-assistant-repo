@@ -1233,6 +1233,10 @@ export const workspaceSnapshotSchema = {
             {
               "kind": "ref",
               "name": "R0052"
+            },
+            {
+              "kind": "ref",
+              "name": "R0053"
             }
           ]
         },
@@ -1328,14 +1332,14 @@ export const workspaceSnapshotSchema = {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0053"
+            "name": "R0054"
           }
         },
         "chatHistory": {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0054"
+            "name": "R0055"
           }
         },
         "contentHash": {
@@ -1345,7 +1349,7 @@ export const workspaceSnapshotSchema = {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0055"
+            "name": "R0056"
           }
         },
         "exportedAt": {
@@ -1358,7 +1362,7 @@ export const workspaceSnapshotSchema = {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0056"
+            "name": "R0057"
           }
         },
         "id": {
@@ -1371,7 +1375,7 @@ export const workspaceSnapshotSchema = {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0057"
+            "name": "R0058"
           }
         },
         "sourceFormat": {
@@ -1391,6 +1395,10 @@ export const workspaceSnapshotSchema = {
             },
             {
               "kind": "literal",
+              "value": "still-backup-v5"
+            },
+            {
+              "kind": "literal",
               "value": "voice-assistant-export-v1"
             }
           ]
@@ -1399,7 +1407,7 @@ export const workspaceSnapshotSchema = {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0058"
+            "name": "R0059"
           }
         }
       },
@@ -1423,14 +1431,14 @@ export const workspaceSnapshotSchema = {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0059"
+            "name": "R0060"
           }
         },
         "projects": {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0060"
+            "name": "R0061"
           }
         },
         "schemaVersion": {
@@ -1441,7 +1449,7 @@ export const workspaceSnapshotSchema = {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0061"
+            "name": "R0062"
           }
         }
       },
@@ -1503,7 +1511,7 @@ export const workspaceSnapshotSchema = {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0062"
+            "name": "R0063"
           }
         },
         "id": {
@@ -1601,15 +1609,15 @@ export const workspaceSnapshotSchema = {
       "properties": {
         "analysis": {
           "kind": "ref",
-          "name": "R0063"
+          "name": "R0064"
         },
         "audio": {
           "kind": "ref",
-          "name": "R0064"
+          "name": "R0065"
         },
         "audioAttachment": {
           "kind": "ref",
-          "name": "R0065"
+          "name": "R0066"
         },
         "captureTimeZone": {
           "kind": "string"
@@ -1628,7 +1636,7 @@ export const workspaceSnapshotSchema = {
         },
         "importOrigin": {
           "kind": "ref",
-          "name": "R0066"
+          "name": "R0067"
         },
         "origin": {
           "kind": "literal",
@@ -1678,14 +1686,14 @@ export const workspaceSnapshotSchema = {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0067"
+            "name": "R0068"
           }
         },
         "dismissals": {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0068"
+            "name": "R0069"
           }
         },
         "integrityError": {
@@ -1693,13 +1701,13 @@ export const workspaceSnapshotSchema = {
         },
         "lastEvaluation": {
           "kind": "ref",
-          "name": "R0069"
+          "name": "R0070"
         },
         "rules": {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0070"
+            "name": "R0071"
           }
         },
         "schemaVersion": {
@@ -1710,7 +1718,7 @@ export const workspaceSnapshotSchema = {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0071"
+            "name": "R0072"
           }
         }
       },
@@ -1746,14 +1754,14 @@ export const workspaceSnapshotSchema = {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0072"
+            "name": "R0073"
           }
         },
         "receipts": {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0073"
+            "name": "R0074"
           }
         },
         "revision": {
@@ -1798,22 +1806,22 @@ export const workspaceSnapshotSchema = {
         },
         "email": {
           "kind": "ref",
-          "name": "R0074"
+          "name": "R0075"
         },
         "event": {
           "kind": "ref",
-          "name": "R0075"
+          "name": "R0076"
         },
         "eventDestination": {
           "kind": "union",
           "alternatives": [
             {
               "kind": "ref",
-              "name": "R0076"
+              "name": "R0077"
             },
             {
               "kind": "ref",
-              "name": "R0077"
+              "name": "R0078"
             }
           ]
         },
@@ -1821,7 +1829,7 @@ export const workspaceSnapshotSchema = {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0078"
+            "name": "R0079"
           }
         },
         "id": {
@@ -1874,6 +1882,10 @@ export const workspaceSnapshotSchema = {
             {
               "kind": "ref",
               "name": "R0052"
+            },
+            {
+              "kind": "ref",
+              "name": "R0053"
             }
           ]
         },
@@ -1962,6 +1974,9 @@ export const workspaceSnapshotSchema = {
             }
           ]
         },
+        "supersededByProposalId": {
+          "kind": "string"
+        },
         "title": {
           "kind": "string"
         }
@@ -2001,21 +2016,21 @@ export const workspaceSnapshotSchema = {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0079"
+            "name": "R0080"
           }
         },
         "legacyCancellations": {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0080"
+            "name": "R0081"
           }
         },
         "records": {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0081"
+            "name": "R0082"
           }
         },
         "schemaVersion": {
@@ -2271,7 +2286,7 @@ export const workspaceSnapshotSchema = {
       "kind": "dictionary",
       "value": {
         "kind": "ref",
-        "name": "R0082"
+        "name": "R0083"
       }
     },
     "R0034": {
@@ -2294,7 +2309,7 @@ export const workspaceSnapshotSchema = {
         },
         "importOrigin": {
           "kind": "ref",
-          "name": "R0083"
+          "name": "R0084"
         },
         "proposalId": {
           "kind": "never"
@@ -2396,12 +2411,12 @@ export const workspaceSnapshotSchema = {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0084"
+            "name": "R0085"
           }
         },
         "cleanup": {
           "kind": "ref",
-          "name": "R0085"
+          "name": "R0086"
         },
         "schemaVersion": {
           "kind": "literal",
@@ -2574,7 +2589,7 @@ export const workspaceSnapshotSchema = {
         },
         "reply": {
           "kind": "ref",
-          "name": "R0086"
+          "name": "R0087"
         },
         "userText": {
           "kind": "string"
@@ -2717,7 +2732,7 @@ export const workspaceSnapshotSchema = {
         },
         "payload": {
           "kind": "ref",
-          "name": "R0087"
+          "name": "R0088"
         },
         "proposalId": {
           "kind": "string"
@@ -2726,7 +2741,7 @@ export const workspaceSnapshotSchema = {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0088"
+            "name": "R0089"
           }
         },
         "revision": {
@@ -2843,7 +2858,7 @@ export const workspaceSnapshotSchema = {
         },
         "identity": {
           "kind": "ref",
-          "name": "R0089"
+          "name": "R0090"
         },
         "provider": {
           "kind": "union",
@@ -2890,7 +2905,7 @@ export const workspaceSnapshotSchema = {
       "properties": {
         "email": {
           "kind": "ref",
-          "name": "R0090"
+          "name": "R0091"
         },
         "kind": {
           "kind": "literal",
@@ -2907,7 +2922,7 @@ export const workspaceSnapshotSchema = {
       "properties": {
         "event": {
           "kind": "ref",
-          "name": "R0075"
+          "name": "R0076"
         },
         "kind": {
           "kind": "literal",
@@ -2980,6 +2995,19 @@ export const workspaceSnapshotSchema = {
         "expiresAt": {
           "kind": "string"
         },
+        "inputPolicyVersion": {
+          "kind": "union",
+          "alternatives": [
+            {
+              "kind": "literal",
+              "value": 1
+            },
+            {
+              "kind": "literal",
+              "value": 2
+            }
+          ]
+        },
         "intent": {
           "kind": "union",
           "alternatives": [
@@ -3005,7 +3033,7 @@ export const workspaceSnapshotSchema = {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0091"
+            "name": "R0092"
           }
         },
         "noteId": {
@@ -3014,11 +3042,24 @@ export const workspaceSnapshotSchema = {
         "noteRevision": {
           "kind": "number"
         },
+        "outputPolicyVersion": {
+          "kind": "union",
+          "alternatives": [
+            {
+              "kind": "literal",
+              "value": 1
+            },
+            {
+              "kind": "literal",
+              "value": 2
+            }
+          ]
+        },
         "policySources": {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0092"
+            "name": "R0093"
           }
         },
         "question": {
@@ -3031,7 +3072,7 @@ export const workspaceSnapshotSchema = {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0092"
+            "name": "R0093"
           }
         },
         "version": {
@@ -3066,9 +3107,22 @@ export const workspaceSnapshotSchema = {
           "kind": "literal",
           "value": "mail_reply"
         },
+        "outputPolicyVersion": {
+          "kind": "union",
+          "alternatives": [
+            {
+              "kind": "literal",
+              "value": 1
+            },
+            {
+              "kind": "literal",
+              "value": 2
+            }
+          ]
+        },
         "source": {
           "kind": "ref",
-          "name": "R0093"
+          "name": "R0094"
         },
         "sourceDigest": {
           "kind": "string"
@@ -3089,11 +3143,78 @@ export const workspaceSnapshotSchema = {
     "R0053": {
       "kind": "object",
       "properties": {
+        "expiresAt": {
+          "kind": "string"
+        },
+        "kind": {
+          "kind": "literal",
+          "value": "manual_mail_reply"
+        },
+        "lineage": {
+          "kind": "union",
+          "alternatives": [
+            {
+              "kind": "ref",
+              "name": "R0095"
+            },
+            {
+              "kind": "ref",
+              "name": "R0096"
+            },
+            {
+              "kind": "ref",
+              "name": "R0097"
+            }
+          ]
+        },
+        "operation": {
+          "kind": "union",
+          "alternatives": [
+            {
+              "kind": "literal",
+              "value": "draft"
+            },
+            {
+              "kind": "literal",
+              "value": "send"
+            }
+          ]
+        },
+        "outputPolicyVersion": {
+          "kind": "literal",
+          "value": 2
+        },
+        "source": {
+          "kind": "ref",
+          "name": "R0094"
+        },
+        "sourceDigest": {
+          "kind": "string"
+        },
+        "version": {
+          "kind": "literal",
+          "value": 3
+        }
+      },
+      "required": [
+        "expiresAt",
+        "kind",
+        "lineage",
+        "operation",
+        "outputPolicyVersion",
+        "source",
+        "sourceDigest",
+        "version"
+      ]
+    },
+    "R0054": {
+      "kind": "object",
+      "properties": {
         "activationLinks": {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0094"
+            "name": "R0098"
           }
         },
         "id": {
@@ -3101,7 +3222,7 @@ export const workspaceSnapshotSchema = {
         },
         "knowledge": {
           "kind": "ref",
-          "name": "R0095"
+          "name": "R0099"
         },
         "sourceId": {
           "kind": "string"
@@ -3113,7 +3234,7 @@ export const workspaceSnapshotSchema = {
         "sourceId"
       ]
     },
-    "R0054": {
+    "R0055": {
       "kind": "object",
       "properties": {
         "createdAt": {
@@ -3133,7 +3254,7 @@ export const workspaceSnapshotSchema = {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0096"
+            "name": "R0100"
           }
         },
         "updatedAt": {
@@ -3149,7 +3270,7 @@ export const workspaceSnapshotSchema = {
         "updatedAt"
       ]
     },
-    "R0055": {
+    "R0056": {
       "kind": "object",
       "properties": {
         "activatedAt": {
@@ -3182,7 +3303,7 @@ export const workspaceSnapshotSchema = {
         "updatedAt"
       ]
     },
-    "R0056": {
+    "R0057": {
       "kind": "object",
       "properties": {
         "content": {
@@ -3230,6 +3351,19 @@ export const workspaceSnapshotSchema = {
         "occurredAt": {
           "kind": "string"
         },
+        "outputPolicyVersion": {
+          "kind": "union",
+          "alternatives": [
+            {
+              "kind": "literal",
+              "value": 1
+            },
+            {
+              "kind": "literal",
+              "value": 2
+            }
+          ]
+        },
         "provider": {
           "kind": "string"
         },
@@ -3258,7 +3392,7 @@ export const workspaceSnapshotSchema = {
         "title"
       ]
     },
-    "R0057": {
+    "R0058": {
       "kind": "object",
       "properties": {
         "noteId": {
@@ -3273,7 +3407,7 @@ export const workspaceSnapshotSchema = {
         "sourceId"
       ]
     },
-    "R0058": {
+    "R0059": {
       "kind": "object",
       "properties": {
         "sourceId": {
@@ -3288,7 +3422,7 @@ export const workspaceSnapshotSchema = {
         "taskId"
       ]
     },
-    "R0059": {
+    "R0060": {
       "kind": "object",
       "properties": {
         "aliases": {
@@ -3304,7 +3438,7 @@ export const workspaceSnapshotSchema = {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0097"
+            "name": "R0101"
           }
         },
         "createdAt": {
@@ -3314,7 +3448,7 @@ export const workspaceSnapshotSchema = {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0098"
+            "name": "R0102"
           }
         },
         "id": {
@@ -3322,7 +3456,7 @@ export const workspaceSnapshotSchema = {
         },
         "importOrigin": {
           "kind": "ref",
-          "name": "R0099"
+          "name": "R0103"
         },
         "name": {
           "kind": "string"
@@ -3337,7 +3471,7 @@ export const workspaceSnapshotSchema = {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0100"
+            "name": "R0104"
           }
         },
         "updatedAt": {
@@ -3357,7 +3491,7 @@ export const workspaceSnapshotSchema = {
         "updatedAt"
       ]
     },
-    "R0060": {
+    "R0061": {
       "kind": "object",
       "properties": {
         "aliases": {
@@ -3379,7 +3513,7 @@ export const workspaceSnapshotSchema = {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0098"
+            "name": "R0102"
           }
         },
         "goal": {
@@ -3390,7 +3524,7 @@ export const workspaceSnapshotSchema = {
         },
         "importOrigin": {
           "kind": "ref",
-          "name": "R0099"
+          "name": "R0103"
         },
         "members": {
           "kind": "array",
@@ -3399,11 +3533,11 @@ export const workspaceSnapshotSchema = {
             "alternatives": [
               {
                 "kind": "ref",
-                "name": "R0101"
+                "name": "R0105"
               },
               {
                 "kind": "ref",
-                "name": "R0102"
+                "name": "R0106"
               }
             ]
           }
@@ -3421,7 +3555,7 @@ export const workspaceSnapshotSchema = {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0100"
+            "name": "R0104"
           }
         },
         "startsOn": {
@@ -3470,7 +3604,7 @@ export const workspaceSnapshotSchema = {
         "updatedAt"
       ]
     },
-    "R0061": {
+    "R0062": {
       "kind": "object",
       "properties": {
         "change": {
@@ -3478,19 +3612,19 @@ export const workspaceSnapshotSchema = {
           "alternatives": [
             {
               "kind": "ref",
-              "name": "R0103"
+              "name": "R0107"
             },
             {
               "kind": "ref",
-              "name": "R0104"
+              "name": "R0108"
             },
             {
               "kind": "ref",
-              "name": "R0105"
+              "name": "R0109"
             },
             {
               "kind": "ref",
-              "name": "R0106"
+              "name": "R0110"
             }
           ]
         },
@@ -3501,7 +3635,7 @@ export const workspaceSnapshotSchema = {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0107"
+            "name": "R0111"
           }
         },
         "id": {
@@ -3525,19 +3659,19 @@ export const workspaceSnapshotSchema = {
           "alternatives": [
             {
               "kind": "ref",
-              "name": "R0103"
+              "name": "R0107"
             },
             {
               "kind": "ref",
-              "name": "R0104"
+              "name": "R0108"
             },
             {
               "kind": "ref",
-              "name": "R0105"
+              "name": "R0109"
             },
             {
               "kind": "ref",
-              "name": "R0106"
+              "name": "R0110"
             }
           ]
         },
@@ -3545,8 +3679,21 @@ export const workspaceSnapshotSchema = {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0107"
+            "name": "R0111"
           }
+        },
+        "outputPolicyVersion": {
+          "kind": "union",
+          "alternatives": [
+            {
+              "kind": "literal",
+              "value": 1
+            },
+            {
+              "kind": "literal",
+              "value": 2
+            }
+          ]
         },
         "reviewedAt": {
           "kind": "string"
@@ -3602,7 +3749,7 @@ export const workspaceSnapshotSchema = {
         "updatedAt"
       ]
     },
-    "R0062": {
+    "R0063": {
       "kind": "object",
       "properties": {
         "name": {
@@ -3617,7 +3764,7 @@ export const workspaceSnapshotSchema = {
         "value"
       ]
     },
-    "R0063": {
+    "R0064": {
       "kind": "object",
       "properties": {
         "analyzedAt": {
@@ -3642,7 +3789,7 @@ export const workspaceSnapshotSchema = {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0108"
+            "name": "R0112"
           }
         },
         "clarifications": {
@@ -3655,7 +3802,7 @@ export const workspaceSnapshotSchema = {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0109"
+            "name": "R0113"
           }
         },
         "fingerprint": {
@@ -3671,7 +3818,7 @@ export const workspaceSnapshotSchema = {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0110"
+            "name": "R0114"
           }
         },
         "inputPolicyVersion": {
@@ -3712,7 +3859,7 @@ export const workspaceSnapshotSchema = {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0111"
+            "name": "R0115"
           }
         },
         "memorySuggestionIds": {
@@ -3732,6 +3879,19 @@ export const workspaceSnapshotSchema = {
           "element": {
             "kind": "string"
           }
+        },
+        "outputPolicyVersion": {
+          "kind": "union",
+          "alternatives": [
+            {
+              "kind": "literal",
+              "value": 1
+            },
+            {
+              "kind": "literal",
+              "value": 2
+            }
+          ]
         },
         "proposalIds": {
           "kind": "array",
@@ -3760,7 +3920,7 @@ export const workspaceSnapshotSchema = {
         },
         "sourceVersions": {
           "kind": "ref",
-          "name": "R0112"
+          "name": "R0116"
         },
         "stale": {
           "kind": "boolean"
@@ -3791,7 +3951,7 @@ export const workspaceSnapshotSchema = {
         "summary"
       ]
     },
-    "R0064": {
+    "R0065": {
       "kind": "object",
       "properties": {
         "available": {
@@ -3836,7 +3996,7 @@ export const workspaceSnapshotSchema = {
         "available"
       ]
     },
-    "R0065": {
+    "R0066": {
       "kind": "object",
       "properties": {
         "attachedAt": {
@@ -3916,7 +4076,7 @@ export const workspaceSnapshotSchema = {
         "sha256"
       ]
     },
-    "R0066": {
+    "R0067": {
       "kind": "object",
       "properties": {
         "archiveId": {
@@ -3951,12 +4111,12 @@ export const workspaceSnapshotSchema = {
         "sourceNoteId"
       ]
     },
-    "R0067": {
+    "R0068": {
       "kind": "object",
       "properties": {
         "candidate": {
           "kind": "ref",
-          "name": "R0113"
+          "name": "R0117"
         },
         "presentation": {
           "kind": "union",
@@ -3981,7 +4141,7 @@ export const workspaceSnapshotSchema = {
         "presentation"
       ]
     },
-    "R0068": {
+    "R0069": {
       "kind": "object",
       "properties": {
         "candidateId": {
@@ -4012,7 +4172,7 @@ export const workspaceSnapshotSchema = {
         "sourceVersion"
       ]
     },
-    "R0069": {
+    "R0070": {
       "kind": "object",
       "properties": {
         "asOf": {
@@ -4026,7 +4186,7 @@ export const workspaceSnapshotSchema = {
         },
         "truncation": {
           "kind": "ref",
-          "name": "R0114"
+          "name": "R0118"
         }
       },
       "required": [
@@ -4035,7 +4195,7 @@ export const workspaceSnapshotSchema = {
         "truncation"
       ]
     },
-    "R0070": {
+    "R0071": {
       "kind": "object",
       "properties": {
         "accountIds": {
@@ -4058,7 +4218,7 @@ export const workspaceSnapshotSchema = {
         },
         "quietHours": {
           "kind": "ref",
-          "name": "R0115"
+          "name": "R0119"
         },
         "revision": {
           "kind": "number"
@@ -4068,19 +4228,19 @@ export const workspaceSnapshotSchema = {
           "alternatives": [
             {
               "kind": "ref",
-              "name": "R0116"
+              "name": "R0120"
             },
             {
               "kind": "ref",
-              "name": "R0117"
+              "name": "R0121"
             },
             {
               "kind": "ref",
-              "name": "R0118"
+              "name": "R0122"
             },
             {
               "kind": "ref",
-              "name": "R0119"
+              "name": "R0123"
             }
           ]
         },
@@ -4103,7 +4263,7 @@ export const workspaceSnapshotSchema = {
         "version"
       ]
     },
-    "R0071": {
+    "R0072": {
       "kind": "object",
       "properties": {
         "ruleId": {
@@ -4130,7 +4290,7 @@ export const workspaceSnapshotSchema = {
         "until"
       ]
     },
-    "R0072": {
+    "R0073": {
       "kind": "object",
       "properties": {
         "accountIds": {
@@ -4210,7 +4370,7 @@ export const workspaceSnapshotSchema = {
         "timeZone"
       ]
     },
-    "R0073": {
+    "R0074": {
       "kind": "object",
       "properties": {
         "accountId": {
@@ -4221,7 +4381,7 @@ export const workspaceSnapshotSchema = {
         },
         "cancellation": {
           "kind": "ref",
-          "name": "R0120"
+          "name": "R0124"
         },
         "createdAt": {
           "kind": "string"
@@ -4304,14 +4464,14 @@ export const workspaceSnapshotSchema = {
         "updatedAt"
       ]
     },
-    "R0074": {
+    "R0075": {
       "kind": "object",
       "properties": {
         "attachments": {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0121"
+            "name": "R0125"
           }
         },
         "bcc": {
@@ -4341,7 +4501,7 @@ export const workspaceSnapshotSchema = {
         },
         "reply": {
           "kind": "ref",
-          "name": "R0122"
+          "name": "R0126"
         },
         "subject": {
           "kind": "string"
@@ -4365,7 +4525,7 @@ export const workspaceSnapshotSchema = {
         "to"
       ]
     },
-    "R0075": {
+    "R0076": {
       "kind": "object",
       "properties": {
         "attendees": {
@@ -4411,7 +4571,7 @@ export const workspaceSnapshotSchema = {
         "timeZone"
       ]
     },
-    "R0076": {
+    "R0077": {
       "kind": "object",
       "properties": {
         "calendarId": {
@@ -4427,7 +4587,7 @@ export const workspaceSnapshotSchema = {
         "kind"
       ]
     },
-    "R0077": {
+    "R0078": {
       "kind": "object",
       "properties": {
         "accountId": {
@@ -4447,7 +4607,7 @@ export const workspaceSnapshotSchema = {
         "kind"
       ]
     },
-    "R0078": {
+    "R0079": {
       "kind": "object",
       "properties": {
         "confidence": {
@@ -4470,7 +4630,7 @@ export const workspaceSnapshotSchema = {
         "quote"
       ]
     },
-    "R0079": {
+    "R0080": {
       "kind": "object",
       "properties": {
         "attemptedAt": {
@@ -4573,7 +4733,7 @@ export const workspaceSnapshotSchema = {
         },
         "payload": {
           "kind": "ref",
-          "name": "R0123"
+          "name": "R0127"
         },
         "payloadDigest": {
           "kind": "string"
@@ -4600,7 +4760,7 @@ export const workspaceSnapshotSchema = {
         "updatedAt"
       ]
     },
-    "R0080": {
+    "R0081": {
       "kind": "object",
       "properties": {
         "attemptedAt": {
@@ -4664,7 +4824,7 @@ export const workspaceSnapshotSchema = {
         "requestedAt"
       ]
     },
-    "R0081": {
+    "R0082": {
       "kind": "object",
       "properties": {
         "approvedRevision": {
@@ -4693,15 +4853,15 @@ export const workspaceSnapshotSchema = {
           "alternatives": [
             {
               "kind": "ref",
-              "name": "R0124"
+              "name": "R0128"
             },
             {
               "kind": "ref",
-              "name": "R0125"
+              "name": "R0129"
             },
             {
               "kind": "ref",
-              "name": "R0126"
+              "name": "R0130"
             }
           ]
         },
@@ -4767,7 +4927,7 @@ export const workspaceSnapshotSchema = {
         "updatedAt"
       ]
     },
-    "R0082": {
+    "R0083": {
       "kind": "object",
       "properties": {
         "accountId": {
@@ -4787,11 +4947,11 @@ export const workspaceSnapshotSchema = {
         },
         "mailBackfill": {
           "kind": "ref",
-          "name": "R0127"
+          "name": "R0131"
         },
         "mailHead": {
           "kind": "ref",
-          "name": "R0128"
+          "name": "R0132"
         },
         "messagesPartial": {
           "kind": "boolean"
@@ -4827,7 +4987,7 @@ export const workspaceSnapshotSchema = {
         "status"
       ]
     },
-    "R0083": {
+    "R0084": {
       "kind": "object",
       "properties": {
         "archiveId": {
@@ -4854,12 +5014,12 @@ export const workspaceSnapshotSchema = {
         "sourceTaskId"
       ]
     },
-    "R0084": {
+    "R0085": {
       "kind": "object",
       "properties": {
         "actualUsage": {
           "kind": "ref",
-          "name": "R0129"
+          "name": "R0133"
         },
         "code": {
           "kind": "union",
@@ -4939,7 +5099,7 @@ export const workspaceSnapshotSchema = {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0130"
+            "name": "R0134"
           }
         },
         "locale": {
@@ -5006,7 +5166,7 @@ export const workspaceSnapshotSchema = {
         },
         "source": {
           "kind": "ref",
-          "name": "R0131"
+          "name": "R0135"
         },
         "sourceRevision": {
           "kind": "number"
@@ -5033,7 +5193,7 @@ export const workspaceSnapshotSchema = {
         "sourceRevision"
       ]
     },
-    "R0085": {
+    "R0086": {
       "kind": "object",
       "properties": {
         "count": {
@@ -5055,7 +5215,7 @@ export const workspaceSnapshotSchema = {
         "pendingCount"
       ]
     },
-    "R0086": {
+    "R0087": {
       "kind": "object",
       "properties": {
         "answer": {
@@ -5081,7 +5241,7 @@ export const workspaceSnapshotSchema = {
         "summary"
       ]
     },
-    "R0087": {
+    "R0088": {
       "kind": "object",
       "properties": {
         "alarms": {
@@ -5132,7 +5292,7 @@ export const workspaceSnapshotSchema = {
         "title"
       ]
     },
-    "R0088": {
+    "R0089": {
       "kind": "object",
       "properties": {
         "at": {
@@ -5165,7 +5325,7 @@ export const workspaceSnapshotSchema = {
         "note"
       ]
     },
-    "R0089": {
+    "R0090": {
       "kind": "object",
       "properties": {
         "clientId": {
@@ -5203,14 +5363,14 @@ export const workspaceSnapshotSchema = {
         "subject"
       ]
     },
-    "R0090": {
+    "R0091": {
       "kind": "object",
       "properties": {
         "attachments": {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0121"
+            "name": "R0125"
           }
         },
         "bcc": {
@@ -5227,7 +5387,7 @@ export const workspaceSnapshotSchema = {
         },
         "reply": {
           "kind": "ref",
-          "name": "R0122"
+          "name": "R0126"
         },
         "subject": {
           "kind": "string"
@@ -5251,7 +5411,7 @@ export const workspaceSnapshotSchema = {
         "to"
       ]
     },
-    "R0091": {
+    "R0092": {
       "kind": "object",
       "properties": {
         "id": {
@@ -5276,7 +5436,7 @@ export const workspaceSnapshotSchema = {
         "kind"
       ]
     },
-    "R0092": {
+    "R0093": {
       "kind": "object",
       "properties": {
         "revision": {
@@ -5295,7 +5455,7 @@ export const workspaceSnapshotSchema = {
         "sourceVersion"
       ]
     },
-    "R0093": {
+    "R0094": {
       "kind": "object",
       "properties": {
         "accountEmail": {
@@ -5409,7 +5569,82 @@ export const workspaceSnapshotSchema = {
         "version"
       ]
     },
-    "R0094": {
+    "R0095": {
+      "kind": "object",
+      "properties": {
+        "draftDispatchRecordDigest": {
+          "kind": "string"
+        },
+        "draftDispatchRecordId": {
+          "kind": "string"
+        },
+        "kind": {
+          "kind": "literal",
+          "value": "accepted_draft"
+        },
+        "parentPayloadDigest": {
+          "kind": "string"
+        },
+        "parentProposalId": {
+          "kind": "string"
+        },
+        "parentRevision": {
+          "kind": "number"
+        },
+        "remoteDraftId": {
+          "kind": "string"
+        }
+      },
+      "required": [
+        "draftDispatchRecordDigest",
+        "draftDispatchRecordId",
+        "kind",
+        "parentPayloadDigest",
+        "parentProposalId",
+        "parentRevision",
+        "remoteDraftId"
+      ]
+    },
+    "R0096": {
+      "kind": "object",
+      "properties": {
+        "kind": {
+          "kind": "literal",
+          "value": "derived"
+        },
+        "parentBatchResultDigest": {
+          "kind": "string"
+        },
+        "parentPayloadDigest": {
+          "kind": "string"
+        },
+        "parentProposalId": {
+          "kind": "string"
+        },
+        "parentRevision": {
+          "kind": "number"
+        }
+      },
+      "required": [
+        "kind",
+        "parentPayloadDigest",
+        "parentProposalId",
+        "parentRevision"
+      ]
+    },
+    "R0097": {
+      "kind": "object",
+      "properties": {
+        "kind": {
+          "kind": "literal",
+          "value": "manual"
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    },
+    "R0098": {
       "kind": "object",
       "properties": {
         "activatedAt": {
@@ -5446,19 +5681,19 @@ export const workspaceSnapshotSchema = {
         "sourceEntityId"
       ]
     },
-    "R0095": {
+    "R0099": {
       "kind": "object",
       "properties": {
         "narratives": {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0132"
+            "name": "R0136"
           }
         },
         "state": {
           "kind": "ref",
-          "name": "R0133"
+          "name": "R0137"
         }
       },
       "required": [
@@ -5466,12 +5701,12 @@ export const workspaceSnapshotSchema = {
         "state"
       ]
     },
-    "R0096": {
+    "R0100": {
       "kind": "object",
       "properties": {
         "accounting": {
           "kind": "ref",
-          "name": "R0134"
+          "name": "R0138"
         },
         "captureTimeZone": {
           "kind": "string"
@@ -5516,7 +5751,7 @@ export const workspaceSnapshotSchema = {
         },
         "reply": {
           "kind": "ref",
-          "name": "R0135"
+          "name": "R0139"
         },
         "userText": {
           "kind": "string"
@@ -5531,7 +5766,7 @@ export const workspaceSnapshotSchema = {
         "userText"
       ]
     },
-    "R0097": {
+    "R0101": {
       "kind": "object",
       "properties": {
         "address": {
@@ -5544,7 +5779,7 @@ export const workspaceSnapshotSchema = {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0107"
+            "name": "R0111"
           }
         },
         "id": {
@@ -5552,6 +5787,19 @@ export const workspaceSnapshotSchema = {
         },
         "label": {
           "kind": "string"
+        },
+        "outputPolicyVersion": {
+          "kind": "union",
+          "alternatives": [
+            {
+              "kind": "literal",
+              "value": 1
+            },
+            {
+              "kind": "literal",
+              "value": 2
+            }
+          ]
         },
         "provenance": {
           "kind": "union",
@@ -5578,7 +5826,7 @@ export const workspaceSnapshotSchema = {
         "provenance"
       ]
     },
-    "R0098": {
+    "R0102": {
       "kind": "object",
       "properties": {
         "createdAt": {
@@ -5588,11 +5836,24 @@ export const workspaceSnapshotSchema = {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0107"
+            "name": "R0111"
           }
         },
         "id": {
           "kind": "string"
+        },
+        "outputPolicyVersion": {
+          "kind": "union",
+          "alternatives": [
+            {
+              "kind": "literal",
+              "value": 1
+            },
+            {
+              "kind": "literal",
+              "value": 2
+            }
+          ]
         },
         "provenance": {
           "kind": "union",
@@ -5621,7 +5882,7 @@ export const workspaceSnapshotSchema = {
         "statement"
       ]
     },
-    "R0099": {
+    "R0103": {
       "kind": "object",
       "properties": {
         "archiveId": {
@@ -5649,7 +5910,7 @@ export const workspaceSnapshotSchema = {
         "sourceEntityId"
       ]
     },
-    "R0100": {
+    "R0104": {
       "kind": "object",
       "properties": {
         "createdAt": {
@@ -5659,7 +5920,7 @@ export const workspaceSnapshotSchema = {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0107"
+            "name": "R0111"
           }
         },
         "id": {
@@ -5667,6 +5928,19 @@ export const workspaceSnapshotSchema = {
         },
         "label": {
           "kind": "string"
+        },
+        "outputPolicyVersion": {
+          "kind": "union",
+          "alternatives": [
+            {
+              "kind": "literal",
+              "value": 1
+            },
+            {
+              "kind": "literal",
+              "value": 2
+            }
+          ]
         },
         "provenance": {
           "kind": "union",
@@ -5686,27 +5960,27 @@ export const workspaceSnapshotSchema = {
           "alternatives": [
             {
               "kind": "ref",
-              "name": "R0136"
-            },
-            {
-              "kind": "ref",
-              "name": "R0137"
-            },
-            {
-              "kind": "ref",
-              "name": "R0138"
-            },
-            {
-              "kind": "ref",
-              "name": "R0139"
-            },
-            {
-              "kind": "ref",
               "name": "R0140"
             },
             {
               "kind": "ref",
               "name": "R0141"
+            },
+            {
+              "kind": "ref",
+              "name": "R0142"
+            },
+            {
+              "kind": "ref",
+              "name": "R0143"
+            },
+            {
+              "kind": "ref",
+              "name": "R0144"
+            },
+            {
+              "kind": "ref",
+              "name": "R0145"
             }
           ]
         },
@@ -5722,7 +5996,7 @@ export const workspaceSnapshotSchema = {
         "reference"
       ]
     },
-    "R0101": {
+    "R0105": {
       "kind": "object",
       "properties": {
         "createdAt": {
@@ -5732,7 +6006,7 @@ export const workspaceSnapshotSchema = {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0107"
+            "name": "R0111"
           }
         },
         "id": {
@@ -5740,6 +6014,19 @@ export const workspaceSnapshotSchema = {
         },
         "label": {
           "kind": "never"
+        },
+        "outputPolicyVersion": {
+          "kind": "union",
+          "alternatives": [
+            {
+              "kind": "literal",
+              "value": 1
+            },
+            {
+              "kind": "literal",
+              "value": 2
+            }
+          ]
         },
         "personId": {
           "kind": "string"
@@ -5775,7 +6062,7 @@ export const workspaceSnapshotSchema = {
         "role"
       ]
     },
-    "R0102": {
+    "R0106": {
       "kind": "object",
       "properties": {
         "createdAt": {
@@ -5785,7 +6072,7 @@ export const workspaceSnapshotSchema = {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0107"
+            "name": "R0111"
           }
         },
         "id": {
@@ -5793,6 +6080,19 @@ export const workspaceSnapshotSchema = {
         },
         "label": {
           "kind": "string"
+        },
+        "outputPolicyVersion": {
+          "kind": "union",
+          "alternatives": [
+            {
+              "kind": "literal",
+              "value": 1
+            },
+            {
+              "kind": "literal",
+              "value": 2
+            }
+          ]
         },
         "personId": {
           "kind": "never"
@@ -5829,7 +6129,7 @@ export const workspaceSnapshotSchema = {
         "sourcePersonId"
       ]
     },
-    "R0103": {
+    "R0107": {
       "kind": "object",
       "properties": {
         "address": {
@@ -5858,7 +6158,7 @@ export const workspaceSnapshotSchema = {
         "type"
       ]
     },
-    "R0104": {
+    "R0108": {
       "kind": "object",
       "properties": {
         "entityId": {
@@ -5892,7 +6192,7 @@ export const workspaceSnapshotSchema = {
         "type"
       ]
     },
-    "R0105": {
+    "R0109": {
       "kind": "object",
       "properties": {
         "entityId": {
@@ -5925,7 +6225,7 @@ export const workspaceSnapshotSchema = {
         "type"
       ]
     },
-    "R0106": {
+    "R0110": {
       "kind": "object",
       "properties": {
         "entityId": {
@@ -5952,27 +6252,27 @@ export const workspaceSnapshotSchema = {
           "alternatives": [
             {
               "kind": "ref",
-              "name": "R0136"
-            },
-            {
-              "kind": "ref",
-              "name": "R0137"
-            },
-            {
-              "kind": "ref",
-              "name": "R0138"
-            },
-            {
-              "kind": "ref",
-              "name": "R0139"
-            },
-            {
-              "kind": "ref",
               "name": "R0140"
             },
             {
               "kind": "ref",
               "name": "R0141"
+            },
+            {
+              "kind": "ref",
+              "name": "R0142"
+            },
+            {
+              "kind": "ref",
+              "name": "R0143"
+            },
+            {
+              "kind": "ref",
+              "name": "R0144"
+            },
+            {
+              "kind": "ref",
+              "name": "R0145"
             }
           ]
         },
@@ -5992,7 +6292,7 @@ export const workspaceSnapshotSchema = {
         "type"
       ]
     },
-    "R0107": {
+    "R0111": {
       "kind": "object",
       "properties": {
         "quote": {
@@ -6015,7 +6315,7 @@ export const workspaceSnapshotSchema = {
         "sourceVersion"
       ]
     },
-    "R0108": {
+    "R0112": {
       "kind": "object",
       "properties": {
         "quote": {
@@ -6042,7 +6342,7 @@ export const workspaceSnapshotSchema = {
         "sourceVersion"
       ]
     },
-    "R0109": {
+    "R0113": {
       "kind": "object",
       "properties": {
         "quote": {
@@ -6073,7 +6373,7 @@ export const workspaceSnapshotSchema = {
         "text"
       ]
     },
-    "R0110": {
+    "R0114": {
       "kind": "object",
       "properties": {
         "excerpt": {
@@ -6091,7 +6391,7 @@ export const workspaceSnapshotSchema = {
         "title"
       ]
     },
-    "R0111": {
+    "R0115": {
       "kind": "object",
       "properties": {
         "id": {
@@ -6116,13 +6416,13 @@ export const workspaceSnapshotSchema = {
         "kind"
       ]
     },
-    "R0112": {
+    "R0116": {
       "kind": "dictionary",
       "value": {
         "kind": "string"
       }
     },
-    "R0113": {
+    "R0117": {
       "kind": "object",
       "properties": {
         "accountId": {
@@ -6242,7 +6542,7 @@ export const workspaceSnapshotSchema = {
         "suppressionKey"
       ]
     },
-    "R0114": {
+    "R0118": {
       "kind": "object",
       "properties": {
         "candidates": {
@@ -6261,7 +6561,7 @@ export const workspaceSnapshotSchema = {
         "sources"
       ]
     },
-    "R0115": {
+    "R0119": {
       "kind": "object",
       "properties": {
         "end": {
@@ -6276,7 +6576,7 @@ export const workspaceSnapshotSchema = {
         "start"
       ]
     },
-    "R0116": {
+    "R0120": {
       "kind": "object",
       "properties": {
         "keywords": {
@@ -6298,7 +6598,7 @@ export const workspaceSnapshotSchema = {
         "type"
       ]
     },
-    "R0117": {
+    "R0121": {
       "kind": "object",
       "properties": {
         "minutes": {
@@ -6314,7 +6614,7 @@ export const workspaceSnapshotSchema = {
         "type"
       ]
     },
-    "R0118": {
+    "R0122": {
       "kind": "object",
       "properties": {
         "minutes": {
@@ -6330,7 +6630,7 @@ export const workspaceSnapshotSchema = {
         "type"
       ]
     },
-    "R0119": {
+    "R0123": {
       "kind": "object",
       "properties": {
         "addresses": {
@@ -6349,7 +6649,7 @@ export const workspaceSnapshotSchema = {
         "type"
       ]
     },
-    "R0120": {
+    "R0124": {
       "kind": "object",
       "properties": {
         "attemptedAt": {
@@ -6384,7 +6684,7 @@ export const workspaceSnapshotSchema = {
         "result"
       ]
     },
-    "R0121": {
+    "R0125": {
       "kind": "object",
       "properties": {
         "fileName": {
@@ -6411,7 +6711,7 @@ export const workspaceSnapshotSchema = {
         "sizeBytes"
       ]
     },
-    "R0122": {
+    "R0126": {
       "kind": "object",
       "properties": {
         "idFormat": {
@@ -6475,7 +6775,7 @@ export const workspaceSnapshotSchema = {
         "sourceSubject"
       ]
     },
-    "R0123": {
+    "R0127": {
       "kind": "object",
       "properties": {
         "body": {
@@ -6512,7 +6812,7 @@ export const workspaceSnapshotSchema = {
         "title"
       ]
     },
-    "R0124": {
+    "R0128": {
       "kind": "object",
       "properties": {
         "kind": {
@@ -6524,7 +6824,7 @@ export const workspaceSnapshotSchema = {
         "kind"
       ]
     },
-    "R0125": {
+    "R0129": {
       "kind": "object",
       "properties": {
         "kind": {
@@ -6560,12 +6860,12 @@ export const workspaceSnapshotSchema = {
         "sourceVersion"
       ]
     },
-    "R0126": {
+    "R0130": {
       "kind": "object",
       "properties": {
         "candidate": {
           "kind": "ref",
-          "name": "R0113"
+          "name": "R0117"
         },
         "capturedAt": {
           "kind": "string"
@@ -6579,22 +6879,22 @@ export const workspaceSnapshotSchema = {
         },
         "rule": {
           "kind": "ref",
-          "name": "R0142"
+          "name": "R0146"
         },
         "source": {
           "kind": "union",
           "alternatives": [
             {
               "kind": "ref",
-              "name": "R0143"
+              "name": "R0147"
             },
             {
               "kind": "ref",
-              "name": "R0144"
+              "name": "R0148"
             },
             {
               "kind": "ref",
-              "name": "R0145"
+              "name": "R0149"
             }
           ]
         }
@@ -6608,16 +6908,16 @@ export const workspaceSnapshotSchema = {
         "source"
       ]
     },
-    "R0127": {
+    "R0131": {
       "kind": "object",
       "properties": {
         "activeWindow": {
           "kind": "ref",
-          "name": "R0146"
+          "name": "R0150"
         },
         "coverage": {
           "kind": "ref",
-          "name": "R0147"
+          "name": "R0151"
         },
         "coverageNeededThrough": {
           "kind": "string"
@@ -6669,12 +6969,12 @@ export const workspaceSnapshotSchema = {
         "status"
       ]
     },
-    "R0128": {
+    "R0132": {
       "kind": "object",
       "properties": {
         "completeWindow": {
           "kind": "ref",
-          "name": "R0147"
+          "name": "R0151"
         },
         "lastAttemptAt": {
           "kind": "string"
@@ -6714,14 +7014,14 @@ export const workspaceSnapshotSchema = {
         },
         "window": {
           "kind": "ref",
-          "name": "R0146"
+          "name": "R0150"
         }
       },
       "required": [
         "status"
       ]
     },
-    "R0129": {
+    "R0133": {
       "kind": "object",
       "properties": {
         "costUsd": {
@@ -6742,7 +7042,7 @@ export const workspaceSnapshotSchema = {
       },
       "required": []
     },
-    "R0130": {
+    "R0134": {
       "kind": "object",
       "properties": {
         "at": {
@@ -6770,12 +7070,12 @@ export const workspaceSnapshotSchema = {
         "kind"
       ]
     },
-    "R0131": {
+    "R0135": {
       "kind": "object",
       "properties": {
         "audioAttachment": {
           "kind": "ref",
-          "name": "R0148"
+          "name": "R0152"
         },
         "captureTimeZone": {
           "kind": "string"
@@ -6814,7 +7114,7 @@ export const workspaceSnapshotSchema = {
         "speechEnabled"
       ]
     },
-    "R0132": {
+    "R0136": {
       "kind": "object",
       "properties": {
         "content": {
@@ -6851,21 +7151,21 @@ export const workspaceSnapshotSchema = {
         "updatedAt"
       ]
     },
-    "R0133": {
+    "R0137": {
       "kind": "object",
       "properties": {
         "people": {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0059"
+            "name": "R0060"
           }
         },
         "projects": {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0060"
+            "name": "R0061"
           }
         },
         "schemaVersion": {
@@ -6876,7 +7176,7 @@ export const workspaceSnapshotSchema = {
           "kind": "array",
           "element": {
             "kind": "ref",
-            "name": "R0061"
+            "name": "R0062"
           }
         }
       },
@@ -6887,7 +7187,7 @@ export const workspaceSnapshotSchema = {
         "suggestions"
       ]
     },
-    "R0134": {
+    "R0138": {
       "kind": "object",
       "properties": {
         "completionTokens": {
@@ -6908,7 +7208,7 @@ export const workspaceSnapshotSchema = {
       },
       "required": []
     },
-    "R0135": {
+    "R0139": {
       "kind": "object",
       "properties": {
         "answer": {
@@ -6923,6 +7223,19 @@ export const workspaceSnapshotSchema = {
         "completedAt": {
           "kind": "string"
         },
+        "outputPolicyVersion": {
+          "kind": "union",
+          "alternatives": [
+            {
+              "kind": "literal",
+              "value": 1
+            },
+            {
+              "kind": "literal",
+              "value": 2
+            }
+          ]
+        },
         "summary": {
           "kind": "string"
         }
@@ -6934,7 +7247,7 @@ export const workspaceSnapshotSchema = {
         "summary"
       ]
     },
-    "R0136": {
+    "R0140": {
       "kind": "object",
       "properties": {
         "calendarId": {
@@ -6962,7 +7275,7 @@ export const workspaceSnapshotSchema = {
         "kind"
       ]
     },
-    "R0137": {
+    "R0141": {
       "kind": "object",
       "properties": {
         "calendarId": {
@@ -6994,7 +7307,7 @@ export const workspaceSnapshotSchema = {
         "occurrenceStart"
       ]
     },
-    "R0138": {
+    "R0142": {
       "kind": "object",
       "properties": {
         "kind": {
@@ -7014,7 +7327,7 @@ export const workspaceSnapshotSchema = {
         "originalKind"
       ]
     },
-    "R0139": {
+    "R0143": {
       "kind": "object",
       "properties": {
         "connectionGeneration": {
@@ -7038,7 +7351,7 @@ export const workspaceSnapshotSchema = {
         "kind"
       ]
     },
-    "R0140": {
+    "R0144": {
       "kind": "object",
       "properties": {
         "id": {
@@ -7067,7 +7380,7 @@ export const workspaceSnapshotSchema = {
         "kind"
       ]
     },
-    "R0141": {
+    "R0145": {
       "kind": "object",
       "properties": {
         "id": {
@@ -7092,7 +7405,7 @@ export const workspaceSnapshotSchema = {
         "kind"
       ]
     },
-    "R0142": {
+    "R0146": {
       "kind": "object",
       "properties": {
         "id": {
@@ -7115,7 +7428,7 @@ export const workspaceSnapshotSchema = {
         "version"
       ]
     },
-    "R0143": {
+    "R0147": {
       "kind": "object",
       "properties": {
         "accountId": {
@@ -7196,7 +7509,7 @@ export const workspaceSnapshotSchema = {
         "sourceVersion"
       ]
     },
-    "R0144": {
+    "R0148": {
       "kind": "object",
       "properties": {
         "accountId": {
@@ -7217,7 +7530,7 @@ export const workspaceSnapshotSchema = {
         },
         "deviceBinding": {
           "kind": "ref",
-          "name": "R0149"
+          "name": "R0153"
         },
         "freshness": {
           "kind": "union",
@@ -7272,7 +7585,7 @@ export const workspaceSnapshotSchema = {
         "sourceVersion"
       ]
     },
-    "R0145": {
+    "R0149": {
       "kind": "object",
       "properties": {
         "accountId": {
@@ -7357,7 +7670,7 @@ export const workspaceSnapshotSchema = {
         "sourceVersion"
       ]
     },
-    "R0146": {
+    "R0150": {
       "kind": "object",
       "properties": {
         "cursor": {
@@ -7383,7 +7696,7 @@ export const workspaceSnapshotSchema = {
         "through"
       ]
     },
-    "R0147": {
+    "R0151": {
       "kind": "object",
       "properties": {
         "from": {
@@ -7398,7 +7711,7 @@ export const workspaceSnapshotSchema = {
         "through"
       ]
     },
-    "R0148": {
+    "R0152": {
       "kind": "object",
       "properties": {
         "byteLength": {
@@ -7464,7 +7777,7 @@ export const workspaceSnapshotSchema = {
         "sha256"
       ]
     },
-    "R0149": {
+    "R0153": {
       "kind": "object",
       "properties": {
         "calendarId": {

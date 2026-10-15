@@ -154,9 +154,10 @@ function parseAttachments(value: unknown): NonNullable<WorkflowProposalReviewDto
 
 function parseProposal(value: unknown): WorkflowProposalReviewDto {
   const proposal = row(value,
-    ['editPolicy', 'id', 'kind', 'title', 'body', 'status', 'revision', 'approvedRevision', 'lastError', 'accountId', 'recipients', 'calendarId', 'dueAt', 'email', 'event', 'remoteOperation', 'remoteId', 'remoteAcceptedAt', 'sourceDigest'],
-    ['editPolicy', 'id', 'kind', 'title', 'body', 'status', 'revision', 'recipients']);
-  if (typeof proposal.editPolicy !== 'string' || !['email_fields', 'source_reply_fields', 'event_fields', 'read_only'].includes(proposal.editPolicy) ||
+    ['editPolicy', 'canDeriveManualReply', 'supersededByProposalId', 'id', 'kind', 'title', 'body', 'status', 'revision', 'approvedRevision', 'lastError', 'accountId', 'recipients', 'calendarId', 'dueAt', 'email', 'event', 'remoteOperation', 'remoteId', 'remoteAcceptedAt', 'sourceDigest'],
+    ['editPolicy', 'canDeriveManualReply', 'id', 'kind', 'title', 'body', 'status', 'revision', 'recipients']);
+  if (typeof proposal.editPolicy !== 'string' || !['email_fields', 'source_reply_fields', 'manual_reply_fields', 'event_fields', 'read_only'].includes(proposal.editPolicy) ||
+      typeof proposal.canDeriveManualReply !== 'boolean' ||
       !boundedText(proposal.id, 1024, false) || typeof proposal.kind !== 'string' || !WORKFLOW_KINDS.has(proposal.kind) || !boundedText(proposal.title, 4096) ||
       !boundedText(proposal.body, 100_000) || typeof proposal.status !== 'string' || !PROPOSAL_STATUSES.has(proposal.status) || !integer(proposal.revision) ||
       (Object.hasOwn(proposal, 'approvedRevision') && !integer(proposal.approvedRevision)) || !strings(proposal.recipients, 200) ||
@@ -167,6 +168,7 @@ function parseProposal(value: unknown): WorkflowProposalReviewDto {
       (Object.hasOwn(proposal, 'remoteOperation') && (typeof proposal.remoteOperation !== 'string' || !['draft', 'send', 'event'].includes(proposal.remoteOperation))) ||
       (Object.hasOwn(proposal, 'remoteId') && !boundedText(proposal.remoteId, 1024, false)) ||
       (Object.hasOwn(proposal, 'remoteAcceptedAt') && !boundedText(proposal.remoteAcceptedAt, 128, false)) ||
+      (Object.hasOwn(proposal, 'supersededByProposalId') && !boundedText(proposal.supersededByProposalId, 1024, false)) ||
       (Object.hasOwn(proposal, 'sourceDigest') && (typeof proposal.sourceDigest !== 'string' || !/^[a-f0-9]{64}$/.test(proposal.sourceDigest)))) throw new Error('mail_workflow_response_invalid');
 
   let email: WorkflowProposalReviewDto['email'];
@@ -191,7 +193,9 @@ function parseProposal(value: unknown): WorkflowProposalReviewDto {
       start: item.start as string, end: item.end as string, timeZone: item.timeZone as string, attendees: stringArray(item.attendees, 'attendees', 100), invitePolicy: item.invitePolicy });
   }
   if ((proposal.kind === 'email' && !email) || (proposal.kind === 'event' && !event) || (email && event)) throw new Error('mail_workflow_response_invalid');
-  return Object.freeze({ editPolicy: proposal.editPolicy as WorkflowProposalReviewDto['editPolicy'], id: proposal.id as string, kind: proposal.kind as WorkflowProposalReviewDto['kind'], title: proposal.title as string, body: proposal.body as string,
+  return Object.freeze({ editPolicy: proposal.editPolicy as WorkflowProposalReviewDto['editPolicy'], canDeriveManualReply: proposal.canDeriveManualReply as boolean,
+    ...(Object.hasOwn(proposal, 'supersededByProposalId') ? { supersededByProposalId: proposal.supersededByProposalId as string } : {}),
+    id: proposal.id as string, kind: proposal.kind as WorkflowProposalReviewDto['kind'], title: proposal.title as string, body: proposal.body as string,
     status: proposal.status as WorkflowProposalReviewDto['status'], revision: proposal.revision as number,
     ...(Object.hasOwn(proposal, 'approvedRevision') ? { approvedRevision: proposal.approvedRevision as number } : {}),
     ...(Object.hasOwn(proposal, 'lastError') ? { lastError: proposal.lastError as string } : {}),

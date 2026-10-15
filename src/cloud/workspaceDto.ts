@@ -349,8 +349,14 @@ function projectMailSource(value: MailReplySourceSnapshot): MailReplySourceSnaps
 }
 function projectProvenance(value: Proposal['provenance']): Proposal['provenance'] {
   if (!value) return undefined;
-  if ('kind' in value) return { version: 2, kind: 'mail_reply', sourceDigest: value.sourceDigest,
-    source: projectMailSource(value.source), expiresAt: value.expiresAt, ...(value.batchJobId ? { batchJobId: value.batchJobId } : {}) };
+  if ('kind' in value) {
+    if (value.version === 3) return { version: 3, kind: 'manual_mail_reply', sourceDigest: value.sourceDigest,
+      source: projectMailSource(value.source), expiresAt: value.expiresAt, outputPolicyVersion: 2, operation: value.operation,
+      lineage: value.lineage.kind === 'manual' ? { kind: 'manual' } : { ...value.lineage } };
+    return { version: 2, kind: 'mail_reply', sourceDigest: value.sourceDigest,
+      source: projectMailSource(value.source), expiresAt: value.expiresAt, ...(value.batchJobId ? { batchJobId: value.batchJobId } : {}),
+      ...(value.outputPolicyVersion !== undefined ? { outputPolicyVersion: value.outputPolicyVersion } : {}) };
+  }
   return {
     version: 1, assistContractVersion: value.assistContractVersion, analysisFingerprint: value.analysisFingerprint,
     noteId: value.noteId, noteRevision: value.noteRevision, capturedAt: value.capturedAt, captureTimeZone: value.captureTimeZone,
@@ -383,6 +389,7 @@ function projectProposal(value: Proposal): WorkspaceProposalDTO {
     ...(value.requiresRebuild !== undefined ? { requiresRebuild: value.requiresRebuild } : {}),
     ...(value.dispatchHistoryIncomplete !== undefined ? { dispatchHistoryIncomplete: value.dispatchHistoryIncomplete } : {}),
     ...(value.dispatchRecoveryRetired ? { dispatchRecoveryRetired: true } : {}),
+    ...(value.supersededByProposalId ? { supersededByProposalId: value.supersededByProposalId } : {}),
     ...(value.accountId ? { accountId: value.accountId } : {}), recipients: [...value.recipients],
     ...(value.calendarId ? { calendarId: value.calendarId } : {}), ...(value.sourceRevision !== undefined ? { sourceRevision: value.sourceRevision } : {}),
     evidence: value.evidence.map(projectProposalEvidence), ...(value.dueAt ? { dueAt: value.dueAt } : {}),

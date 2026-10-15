@@ -1936,6 +1936,80 @@ test('mail reply approval does not send, edits clear approval, and reconnect fen
   } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
+test('manual reply successor command preserves reply title through edit, approval, and explicit send', async () => {
+  const accountId = randomUUID();
+  const identity = { providerNamespace: 'google', clientId: 'synthetic-client', subject: 'successor-subject' };
+  const identityKey = 'google:synthetic-client:successor-subject:';
+  const token = { accessToken: 'synthetic-access-token', expiresAt: Date.now() + 600_000, identity };
+  const message = { id: 'successor-message', accountId, providerMessageId: 'provider-successor-message', identityKey,
+    verifiedIdentityKey: identityKey, connectionGeneration: 1, idFormat: 'gmail', threadId: 'successor-thread', subject: 'Successor subject',
+    from: 'Alex <alex@example.test>', senderEmail: 'alex@example.test', internetMessageId: '<successor@example.test>', replyTo: ['alex@example.test'],
+    to: ['owner@example.test'], cc: [], replyMetadataComplete: true, observedAt: new Date().toISOString() };
+  const account = { id: accountId, provider: 'google', displayName: 'Synthetic Google', email: 'owner@example.test', connected: true,
+    authStatus: 'connected', identity, tokenRef: 'synthetic-token-ref', grantedScopes: ['openid', 'gmail.readonly', 'gmail.compose', 'gmail.send'],
+    capabilities: ['mail.read', 'mail.draft', 'mail.send'], capabilityLimits: ['mail.read', 'mail.draft', 'mail.send'], connectionGeneration: 1 };
+  const tokenValues = new Map([[account.tokenRef, token]]);
+  const sent = [];
+  const connector = { async verifyOAuthIdentity() { return true; }, async sendEmail(_account, request, verifier) {
+    assert.equal(await verifier.verify(request), true);
+    sent.push(structuredClone(request));
+    return { status: 'accepted', id: 'synthetic-send-receipt' };
+  } };
+  const f = fixture({ initialAccounts: [account], initialMailbox: [message],
+    integrationOverrides: { tokenStore: { async get(ref) { return tokenValues.get(ref) ? structuredClone(tokenValues.get(ref)) : null; },
+      async set(ref, value) { tokenValues.set(ref, structuredClone(value)); } }, verifyOAuthResult: async () => true, clientIds: { google: 'synthetic-client' },
+      connectorFactory: () => connector } });
+  try {
+    let current = await f.runtime.getSnapshot(f.admission);
+    current = (await dispatchWorkspaceCommand(f.runtime, f.admission, envelope({ kind: 'settings.update', patch: { mode: 'provider' } },
+      current.revision, current.privacyEpoch))).snapshot;
+    const source = await f.runtime.readMailReplySource(f.admission, { messageId: message.id, expectedRevision: current.revision,
+      expectedPrivacyEpoch: current.privacyEpoch });
+    assert.equal(source.value.source.status, 'current');
+    const parentResult = await dispatchWorkspaceCommand(f.runtime, f.admission, envelope({ kind: 'mail.reply.create', messageId: message.id, accountId,
+      expectedConnectionGeneration: 1, sourceDigest: source.value.source.source.sourceDigest, mode: 'reply', text: 'Generated response.',
+      to: ['alex@example.test'], cc: [] }, current.revision, current.privacyEpoch));
+    const parent = parentResult.snapshot.state.proposals.find((item) => item.id === parentResult.receipt.proposalId);
+    assert.equal(parent.title, 'Re: Successor subject');
+
+    const derived = await dispatchWorkspaceCommand(f.runtime, f.admission, envelope({ kind: 'mail.reply.derive', parentProposalId: parent.id,
+      expectedParentRevision: parent.revision, accountId, expectedConnectionGeneration: 1, operation: 'send' }, parentResult.snapshot.revision,
+      parentResult.snapshot.privacyEpoch));
+    current = derived.snapshot;
+    const successor = current.state.proposals.find((item) => item.id === derived.receipt.proposalId);
+    assert.equal(successor.title, 'Re: Successor subject');
+    assert.equal(successor.email.subject, 'Successor subject');
+    assert.equal(successor.provenance.operation, 'send');
+
+    const edited = await dispatchWorkspaceCommand(f.runtime, f.admission, envelope({ kind: 'proposals.edit', proposalId: successor.id,
+      expectedProposalRevision: successor.revision, accountId, expectedConnectionGeneration: 1,
+      edit: { kind: 'email', operation: 'send', to: ['alex@example.test', 'copy@example.test'], cc: ['cc@example.test'], bcc: [],
+        subject: successor.email.subject, text: 'Human-reviewed response.' } }, current.revision, current.privacyEpoch));
+    const editedSuccessor = edited.snapshot.state.proposals.find((item) => item.id === successor.id);
+    assert.equal(editedSuccessor.title, 'Re: Successor subject');
+    assert.equal(editedSuccessor.body, 'Human-reviewed response.');
+    assert.deepEqual(editedSuccessor.email.to, ['alex@example.test', 'copy@example.test']);
+    assert.deepEqual(editedSuccessor.email.cc, ['cc@example.test']);
+    assert.equal(editedSuccessor.approvedRevision, undefined);
+
+    const approved = await dispatchWorkspaceCommand(f.runtime, f.admission, envelope({ kind: 'proposals.approve', proposalId: successor.id,
+      expectedProposalRevision: edited.receipt.proposalRevision }, edited.snapshot.revision, edited.snapshot.privacyEpoch));
+    assert.equal(approved.snapshot.state.proposals.find((item) => item.id === successor.id).status, 'approved');
+    assert.equal(sent.length, 0, 'approval remains separate from sending');
+    const executed = await dispatchWorkspaceCommand(f.runtime, f.admission, envelope({ kind: 'proposals.execute', proposalId: successor.id,
+      expectedProposalRevision: approved.receipt.proposalRevision }, approved.snapshot.revision, approved.snapshot.privacyEpoch));
+    assert.equal(executed.receipt.execution, 'accepted');
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].operation, 'send');
+    assert.equal(sent[0].replySource.version, 3);
+    assert.equal(sent[0].replySource.kind, 'manual_mail_reply');
+    assert.equal(sent[0].replySource.operation, 'send');
+    assert.deepEqual(sent[0].payload, { operation: 'send', to: ['alex@example.test', 'copy@example.test'],
+      cc: ['cc@example.test'], bcc: [], subject: 'Successor subject', text: 'Human-reviewed response.', attachments: [],
+      reply: editedSuccessor.email.reply });
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
 test('disconnect command durably reports a disconnected account when credential cleanup is pending', async () => {
   const accountId = randomUUID();
   const identity = { providerNamespace: 'google', clientId: 'synthetic-client', subject: 'disconnect-subject' };

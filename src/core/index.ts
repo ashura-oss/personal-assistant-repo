@@ -171,9 +171,25 @@ export interface MailReplyProvenance {
   outputPolicyVersion?: 1 | 2;
 }
 
+/** Editable, human-reviewed reply provenance. Batch lineage is historical context only. */
+export interface ManualMailReplyProvenance {
+  version: 3;
+  kind: 'manual_mail_reply';
+  sourceDigest: string;
+  source: MailReplySourceSnapshot;
+  expiresAt: string;
+  outputPolicyVersion: 2;
+  operation: 'draft' | 'send';
+  lineage:
+    | { kind: 'manual' }
+    | { kind: 'derived'; parentProposalId: string; parentRevision: number; parentPayloadDigest: string; parentBatchResultDigest?: string }
+    | { kind: 'accepted_draft'; parentProposalId: string; parentRevision: number; parentPayloadDigest: string;
+        draftDispatchRecordId: string; draftDispatchRecordDigest: string; remoteDraftId: string };
+}
+
 /** Backward-compatible name for note-derived provenance; new proposals use the explicit union. */
 export type ProposalProvenance = NoteProposalProvenance;
-export type AnyProposalProvenance = NoteProposalProvenance | MailReplyProvenance;
+export type AnyProposalProvenance = NoteProposalProvenance | MailReplyProvenance | ManualMailReplyProvenance;
 
 export interface Proposal {
   id: string;
@@ -206,6 +222,8 @@ export interface Proposal {
   dispatchHistoryIncomplete?: boolean;
   /** This proposal predates dispatch recovery and is permanently read-only, even if its source is later edited. */
   dispatchRecoveryRetired?: true;
+  /** A historical source proposal that was explicitly superseded by a manual reply. */
+  supersededByProposalId?: string;
   accountId?: string;
   recipients: string[];
   calendarId?: string;

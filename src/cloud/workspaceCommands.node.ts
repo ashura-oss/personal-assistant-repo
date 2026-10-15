@@ -117,6 +117,13 @@ export async function dispatchWorkspaceCommand(runtime: OwnedWorkspaceRuntime, a
           text: command.text, to: command.to, cc: command.cc });
         return receipt(envelope, command, { objectId: proposal.id, proposalId: proposal.id, proposalRevision: proposal.revision });
       }
+      case 'mail.reply.derive': {
+        const proposal = await controller.deriveManualMailReplyForCommand({ parentProposalId: command.parentProposalId,
+          expectedParentRevision: command.expectedParentRevision,
+          accountId: command.accountId, expectedConnectionGeneration: command.expectedConnectionGeneration, operation: command.operation });
+        return receipt(envelope, command, { objectId: proposal.id, parentProposalId: command.parentProposalId,
+          proposalId: proposal.id, proposalRevision: proposal.revision, operation: command.operation });
+      }
       case 'proposals.edit': {
         const proposal = await controller.editProposalForCommand(command.proposalId, { expectedRevision: command.expectedProposalRevision,
           accountId: command.accountId, expectedConnectionGeneration: command.expectedConnectionGeneration, edit: command.edit });
@@ -348,7 +355,7 @@ function receipt(envelope: WorkspaceCommandEnvelope, command: WorkspaceCommand, 
   readonly suggestionId?: string; readonly suggestionRevision?: number; readonly status?: 'pending' | 'accepted' | 'dismissed';
   readonly accountId?: string; readonly connectionGeneration?: number; readonly syncStatus?: string; readonly calendarsPartial?: boolean;
   readonly lane?: string; readonly laneStatus?: string; readonly connected?: false; readonly cleanup?: 'complete' | 'pending';
-  readonly sourceDigest?: string; readonly textDigest?: string; readonly bytes?: number; readonly proposalId?: string; readonly proposalRevision?: number;
+  readonly sourceDigest?: string; readonly textDigest?: string; readonly bytes?: number; readonly proposalId?: string; readonly proposalRevision?: number; readonly parentProposalId?: string;
   readonly loadStatus?: import('../core').MailReplyTextLoadResult['status'];
   readonly proposalStatus?: import('../core').Proposal['status']; readonly execution?: 'accepted' | 'unknown' | 'rejected' | 'simulated' | 'executed' | 'failed' | 'invalidated';
   readonly dispatchRecordId?: string; readonly operation?: 'draft' | 'send' | 'event'; readonly outcomeAt?: string; readonly remoteId?: string;
@@ -384,6 +391,7 @@ function expectedReceipt(commandId: string, command: WorkspaceCommand) {
     case 'mail.source.loadText': return { commandId, kind: command.kind, objectId: command.messageId, accountId: command.accountId,
       connectionGeneration: command.expectedConnectionGeneration, sourceDigest: command.sourceDigest };
     case 'mail.reply.create': return { commandId, kind: command.kind };
+    case 'mail.reply.derive': return { commandId, kind: command.kind, parentProposalId: command.parentProposalId, operation: command.operation };
     case 'proposals.edit': case 'proposals.approve': case 'proposals.execute': case 'proposals.dismiss':
       return { commandId, kind: command.kind, objectId: command.proposalId, proposalId: command.proposalId };
     case 'dispatch.reconcile': return { commandId, kind: command.kind, objectId: command.recordId, recordId: command.recordId };

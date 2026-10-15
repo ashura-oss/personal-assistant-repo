@@ -3,7 +3,7 @@ import type {
   ForegroundMailRefreshResult, MailCoverageInterval, MailLaneResult, MailSyncWindow, AssistantBatchMoreComputePlan,
   BackupImportPreview, Calendar, CalendarConfig, ContextDocument, Note, NoteAssistResult, AssistIntent, LocalTask, Proposal, ProposalPatch,
   ProposalProvenance, SaveNoteInput, SettingsPatch, MailboxSnapshotMessage, CalendarEventSnapshot, OAuthInstallResult,
-  NoteProposalProvenance, MailReplyProvenance, MailReplySourceSnapshot, MailReplySourceResult,
+  NoteProposalProvenance, MailReplyProvenance, ManualMailReplyProvenance, MailReplySourceSnapshot, MailReplySourceResult,
   SelectedMailTextSnapshot, MailReplyTextLoadResult, MailReplyTextCacheResult, MailReplyTextGenerationInput, MailReplyTextGenerationResult, MailReplyBatchReviewPlan,
   MailReplyConversationContextDiscovery, MailReplyContextSelection, MailReplyBatchContextReviewItem, MailReplyBatchSourcesRefreshResult,
   ProactiveCandidateEntry, ProactiveCandidateSourceResult,
@@ -507,12 +507,14 @@ function assertNoDuplicateDispatch(state: AppState, candidate: DispatchRecord): 
     record.account.identity.subject === candidate.account.identity.subject &&
     (record.account.identity.resourceUserId ?? '') === (candidate.account.identity.resourceUserId ?? '');
   const candidateMail = candidate.operation === 'draft' || candidate.operation === 'send';
-  const candidateMailReply = candidateMail && candidate.sourceProvenance.version === 2 && candidate.sourceProvenance.kind === 'mail_reply';
+  const candidateMailReply = candidateMail && ((candidate.sourceProvenance.version === 2 && candidate.sourceProvenance.kind === 'mail_reply') ||
+    (candidate.sourceProvenance.version === 3 && candidate.sourceProvenance.kind === 'manual_mail_reply'));
   const recordDuplicate = state.dispatchRecords.some((record) => {
     if (!['pending', 'accepted', 'unknown'].includes(record.outcome)) return false;
     if (record.duplicateKey === candidate.duplicateKey) return true;
-    const recordMailReply = (record.operation === 'draft' || record.operation === 'send') && record.sourceProvenance.version === 2 &&
-      record.sourceProvenance.kind === 'mail_reply';
+    const recordMailReply = (record.operation === 'draft' || record.operation === 'send') &&
+      ((record.sourceProvenance.version === 2 && record.sourceProvenance.kind === 'mail_reply') ||
+        (record.sourceProvenance.version === 3 && record.sourceProvenance.kind === 'manual_mail_reply'));
     if (candidateMailReply && recordMailReply && sameSourceIdentity(record)) return true;
     return record.outcome === 'unknown' && candidateMail && (record.operation === 'draft' || record.operation === 'send') && sameSourceIdentity(record);
   });
@@ -529,7 +531,7 @@ function assertNoDuplicateDispatch(state: AppState, candidate: DispatchRecord): 
       ? proposal.sourceActionKey === candidate.sourceActionKey
       : candidate.sourceProvenance.version === 1
         ? proposal.noteId === candidate.sourceProvenance.noteId && proposal.sourceRevision === candidate.sourceRevision && proposal.kind === (candidate.operation === 'event' ? 'event' : 'email')
-        : proposal.kind === 'email' && proposal.provenance?.version === 2 && proposal.provenance.source.sourceDigest === candidate.sourceProvenance.sourceDigest;
+        : proposal.kind === 'email' && isMailReplyProvenance(proposal.provenance) && proposal.provenance.source.sourceDigest === candidate.sourceProvenance.sourceDigest;
     if (!sameAccount || !sameSource) return false;
     if (proposalMail && candidateMail && !operation) return true;
     if (proposal.status === 'unknown' && proposalMail && candidateMail) return true;
@@ -563,6 +565,10 @@ function identityKey(account: Account): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value));
+}
+
+function isMailReplyProvenance(value: Proposal['provenance']): value is MailReplyProvenance | ManualMailReplyProvenance {
+  return value?.version === 2 && value.kind === 'mail_reply' || value?.version === 3 && value.kind === 'manual_mail_reply';
 }
 
 function hasExactPlainDataKeys(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
@@ -1113,14 +1119,24 @@ function normalizeLoadedState(value: unknown, id: () => string): NormalizedLoade
       typeof candidateProvenance.expiresAt === 'string' && Number.isFinite(Date.parse(candidateProvenance.expiresAt)) &&
       candidateProvenance.expiresAt === new Date(Date.parse(candidateProvenance.source.observedAt) + 15 * 60_000).toISOString()
       ? candidateProvenance : undefined;
-    const provenance = noteProvenance ?? mailProvenance;
+    const manualMailProvenance = candidateProvenance && candidateProvenance.version === 3 && candidateProvenance.kind === 'manual_mail_reply' &&
+      candidateProvenance.outputPolicyVersion === 2 && ['draft', 'send'].includes(candidateProvenance.operation) &&
+      typeof candidateProvenance.sourceDigest === 'string' && /^[a-f\d]{64}$/i.test(candidateProvenance.sourceDigest) &&
+      candidateProvenance.source?.version === 1 && candidateProvenance.source.sourceDigest === candidateProvenance.sourceDigest &&
+      candidateProvenance.source.replyMetadataComplete === true && typeof candidateProvenance.source.observedAt === 'string' &&
+      Number.isFinite(Date.parse(candidateProvenance.source.observedAt)) && new Date(Date.parse(candidateProvenance.source.observedAt)).toISOString() === candidateProvenance.source.observedAt &&
+      typeof candidateProvenance.expiresAt === 'string' && Number.isFinite(Date.parse(candidateProvenance.expiresAt)) &&
+      candidateProvenance.expiresAt === new Date(Date.parse(candidateProvenance.source.observedAt) + 15 * 60_000).toISOString() &&
+      Boolean(candidateProvenance.lineage && ['manual', 'derived', 'accepted_draft'].includes(candidateProvenance.lineage.kind))
+      ? candidateProvenance : undefined;
+    const provenance = noteProvenance ?? mailProvenance ?? manualMailProvenance;
     const pending = ['draft', 'approved', 'failed'].includes(proposal.status);
     const requiresRebuild = Boolean(proposal.requiresRebuild || (pending && !provenance));
     return {
       ...proposal, recipients: Array.isArray(proposal.recipients) ? proposal.recipients : [],
       evidence: Array.isArray(proposal.evidence) ? proposal.evidence : [],
       revision: Number.isFinite(proposal.revision) ? proposal.revision : 1,
-      ...(provenance?.version === 2 ? {} : { sourceRevision: Number.isFinite(proposal.sourceRevision) ? proposal.sourceRevision : source?.revision ?? 1 }),
+      ...(provenance?.version === 2 || provenance?.version === 3 ? {} : { sourceRevision: Number.isFinite(proposal.sourceRevision) ? proposal.sourceRevision : source?.revision ?? 1 }),
       provenance, requiresRebuild,
       ...(requiresRebuild && proposal.status === 'approved' ? { status: 'draft' as const, approvedRevision: undefined, approvedPayloadDigest: undefined } : {}),
       sourceActionKey: proposal.sourceActionKey ?? (source && Array.isArray(proposal.evidence)
@@ -3346,7 +3362,9 @@ export class AppControllerImpl implements AppController {
   }
   private proposalDependencyProjection(state: AppState, proposal: Proposal): string | undefined {
     try {
+      if (proposal.supersededByProposalId) return undefined;
       if (proposal.provenance?.version === 2) return this.mailReplyDependencyProjection(state, proposal, proposal.provenance);
+      if (proposal.provenance?.version === 3) return this.manualMailReplyDependencyProjection(state, proposal, proposal.provenance);
       const { note, provenance, inputs, policyInputs, inputPolicyVersion } = this.proposalDependencyInputs(state, proposal);
       return JSON.stringify({
         contractVersion: ASSIST_CONTRACT_VERSION, analysisFingerprint: provenance.analysisFingerprint,
@@ -3360,6 +3378,45 @@ export class AppControllerImpl implements AppController {
     } catch { return undefined; }
   }
   private async validateProposalProvenance(state: AppState, proposal: Proposal): Promise<string> {
+    if (proposal.supersededByProposalId) throw new Error('This proposal was superseded by an explicitly reviewed successor and can no longer be approved or executed.');
+    if (proposal.provenance?.version === 3) {
+      const provenance = proposal.provenance;
+      const closed = (value: unknown, required: readonly string[], optional: readonly string[] = []) => {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+        const keys = Object.keys(value);
+        return required.every((key) => Object.hasOwn(value, key)) && keys.every((key) => required.includes(key) || optional.includes(key));
+      };
+      const sourceFields = ['version', 'accountId', 'accountEmail', 'identity', 'connectionGeneration', 'localMessageId', 'providerMessageId',
+        'idFormat', 'internetMessageId', 'subject', 'replyMetadataComplete', 'observedAt', 'sourceDigest'];
+      const sourceOptional = ['verifiedSelfEmail', 'providerVersion', 'threadId', 'references', 'inReplyTo', 'from', 'senderEmail', 'replyTo', 'to', 'cc', 'snippet'];
+      if (!closed(provenance, ['version', 'kind', 'sourceDigest', 'source', 'expiresAt', 'outputPolicyVersion', 'operation', 'lineage']) ||
+          !closed(provenance.source, sourceFields, sourceOptional) ||
+          !closed(provenance.source.identity, ['providerNamespace', 'clientId', 'subject'], ['issuer', 'tenantId', 'resourceUserId']) ||
+          provenance.outputPolicyVersion !== 2 || !['draft', 'send'].includes(provenance.operation)) {
+        throw new Error('Manual reply provenance contains unsupported or missing fields. Review a fresh reply.');
+      }
+      if (proposal.requiresRebuild || proposal.kind !== 'email' || !proposal.email?.reply || proposal.email.operation !== provenance.operation) throw new Error('This manual reply needs a fresh, explicitly reviewed source before approval.');
+      const account = state.accounts.find((item) => item.id === proposal.accountId);
+      const message = state.mailbox.find((item) => item.id === provenance.source.localMessageId && item.accountId === provenance.source.accountId);
+      if (!account || account.id !== provenance.source.accountId || account.provider !== provenance.source.identity.providerNamespace ||
+          !account.connected || account.authStatus !== 'connected' || !account.capabilities?.includes('mail.read') ||
+          (provenance.operation === 'draft' && !account.capabilities.includes('mail.draft')) ||
+          (provenance.operation === 'send' && !account.capabilities.includes('mail.send')) ||
+          (account.connectionGeneration ?? 0) !== provenance.source.connectionGeneration || !sameAccountIdentity(account.identity, provenance.source.identity) ||
+          !message || message.providerDeletedAt || !message.replyMetadataComplete || message.verifiedIdentityKey !== identityKey(account) || message.connectionGeneration !== account.connectionGeneration) {
+        throw new Error('The source message or verified mailbox connection is no longer available. Refresh the inbox and review a new reply.');
+      }
+      const age = Date.now() - Date.parse(provenance.source.observedAt);
+      const expiry = Date.parse(provenance.expiresAt);
+      if (!Number.isFinite(expiry) || new Date(expiry).toISOString() !== provenance.expiresAt || expiry !== Date.parse(provenance.source.observedAt) + 15 * 60_000 ||
+          !Number.isFinite(age) || age < 0 || age >= 15 * 60_000 || Date.now() >= expiry) throw new Error('This reply source is stale. Refresh the inbox and review a new reply.');
+      if (!await validateMailReplySource(provenance.source, async (canonical) => this.crypto.sha256(canonical))) throw new Error('This reply has an invalid frozen source digest. Review a new reply.');
+      const current = this.mailReplySourceFromRow(message, account, provenance.source.observedAt);
+      if (canonicalMailReplySource(current) !== canonicalMailReplySource(provenance.source)) throw new Error('The source message changed. Refresh it and review the reply again.');
+      validateReplyBinding(proposal.email, provenance, provenance.operation);
+      await this.validateManualMailReplyLineage(state, proposal, provenance);
+      return this.manualMailReplyDependencyProjection(state, proposal, provenance);
+    }
     if (proposal.provenance?.version === 2) {
       const provenance = proposal.provenance;
       const expectedOperation = this.mailReplyActivationOperationForProposal(proposal);
@@ -3420,6 +3477,77 @@ export class AppControllerImpl implements AppController {
     const projection = this.proposalDependencyProjection(state, proposal);
     if (!projection) throw new Error('The source context could not be verified. Run Assist again before approving this action.');
     return projection;
+  }
+
+  private async manualMailReplyPayloadDigest(proposal: Proposal): Promise<string> {
+    return this.crypto.sha256(stableJson({ id: proposal.id, revision: proposal.revision, accountId: proposal.accountId ?? null,
+      sourceActionKey: proposal.sourceActionKey ?? null, title: proposal.title, body: proposal.body, recipients: proposal.recipients,
+      email: proposal.email ?? null, provenance: proposal.provenance ?? null }));
+  }
+
+  private async validateManualMailReplyLineage(state: AppState, proposal: Proposal, provenance: ManualMailReplyProvenance): Promise<void> {
+    const lineage = provenance.lineage;
+    const hasExactKeys = (value: object, keys: readonly string[]) => {
+      const actual = Object.keys(value).sort();
+      return actual.length === keys.length && actual.every((key, index) => key === [...keys].sort()[index]);
+    };
+    if (lineage.kind === 'manual') {
+      if (!hasExactKeys(lineage, ['kind'])) throw new Error('Manual reply lineage contains unsupported fields.');
+      return;
+    }
+    if (lineage.kind === 'derived') {
+      if (!hasExactKeys(lineage, ['kind', 'parentProposalId', 'parentRevision', 'parentPayloadDigest', ...(lineage.parentBatchResultDigest !== undefined ? ['parentBatchResultDigest'] : [])]) ||
+          !Number.isSafeInteger(lineage.parentRevision) || lineage.parentRevision < 1 || !/^[a-f\d]{64}$/i.test(lineage.parentPayloadDigest) ||
+          lineage.parentBatchResultDigest !== undefined && !/^[a-f\d]{64}$/i.test(lineage.parentBatchResultDigest)) {
+        throw new Error('Derived reply lineage is invalid. Review a fresh reply successor.');
+      }
+    } else if (lineage.kind === 'accepted_draft') {
+      if (!hasExactKeys(lineage, ['kind', 'parentProposalId', 'parentRevision', 'parentPayloadDigest', 'draftDispatchRecordId', 'draftDispatchRecordDigest', 'remoteDraftId']) ||
+          !Number.isSafeInteger(lineage.parentRevision) || lineage.parentRevision < 1 || !/^[a-f\d]{64}$/i.test(lineage.parentPayloadDigest) ||
+          !/^[a-f\d]{64}$/i.test(lineage.draftDispatchRecordDigest) || !lineage.draftDispatchRecordId || !lineage.remoteDraftId) {
+        throw new Error('Accepted draft reply lineage is invalid. Review the saved draft history.');
+      }
+    }
+    const parent = state.proposals.find((item) => item.id === lineage.parentProposalId);
+    if (!parent || parent.revision !== lineage.parentRevision || parent.supersededByProposalId !== proposal.id || parent.accountId !== proposal.accountId ||
+        parent.sourceActionKey !== proposal.sourceActionKey || !isMailReplyProvenance(parent.provenance) ||
+        parent.provenance.sourceDigest !== provenance.sourceDigest || canonicalMailReplySource(parent.provenance.source) !== canonicalMailReplySource(provenance.source) ||
+        await this.manualMailReplyPayloadDigest(parent) !== lineage.parentPayloadDigest) throw new Error('The parent reply lineage changed. Review a fresh reply successor.');
+    if (lineage.kind === 'derived') {
+      const batchJobId = parent.provenance.version === 2 ? parent.provenance.batchJobId : undefined;
+      const batchResultDigest = batchJobId ? this.assistantBatchLedger.jobs.find((item) => item.id === batchJobId)?.resultSha256 : undefined;
+      // Batch lineage is a historical digest only; it never authorizes the successor operation.
+      if (lineage.parentBatchResultDigest !== undefined && batchResultDigest !== lineage.parentBatchResultDigest) {
+        throw new Error('The historical Batch result digest changed. Review a fresh reply successor.');
+      }
+      return;
+    }
+    const draftRecord = state.dispatchRecords.find((item) => item.id === lineage.draftDispatchRecordId);
+    if (!draftRecord || draftRecord.proposalId !== parent.id || draftRecord.operation !== 'draft' || draftRecord.outcome !== 'accepted' ||
+        draftRecord.remoteId !== lineage.remoteDraftId || await this.crypto.sha256(stableJson(draftRecord)) !== lineage.draftDispatchRecordDigest) {
+      throw new Error('The accepted remote draft receipt could not be verified. Review the saved draft history.');
+    }
+  }
+
+  private manualMailReplyDependencyProjection(state: AppState, proposal: Proposal, provenance: ManualMailReplyProvenance): string {
+    const account = state.accounts.find((item) => item.id === provenance.source.accountId);
+    const message = state.mailbox.find((item) => item.id === provenance.source.localMessageId && item.accountId === provenance.source.accountId);
+    if (!account || !message || !account.connected || account.authStatus !== 'connected' || !account.capabilities?.includes('mail.read') ||
+        (provenance.operation === 'draft' && !account.capabilities.includes('mail.draft')) ||
+        (provenance.operation === 'send' && !account.capabilities.includes('mail.send')) || account.connectionGeneration !== provenance.source.connectionGeneration ||
+        !sameAccountIdentity(account.identity, provenance.source.identity) || message.providerDeletedAt || !message.replyMetadataComplete ||
+        message.verifiedIdentityKey !== identityKey(account) || message.connectionGeneration !== account.connectionGeneration ||
+        canonicalMailReplySource(this.mailReplySourceFromRow(message, account, provenance.source.observedAt)) !== canonicalMailReplySource(provenance.source)) {
+      throw new Error('The source message or verified connection is no longer current.');
+    }
+    const expiry = Date.parse(provenance.expiresAt);
+    const age = Date.now() - Date.parse(provenance.source.observedAt);
+    if (!Number.isFinite(expiry) || new Date(expiry).toISOString() !== provenance.expiresAt || expiry !== Date.parse(provenance.source.observedAt) + 15 * 60_000 ||
+        !Number.isFinite(age) || age < 0 || age >= 15 * 60_000 || Date.now() >= expiry) throw new Error('The original message observation has expired.');
+    validateReplyBinding(proposal.email!, provenance, provenance.operation);
+    return stableJson({ source: canonicalMailReplySource(provenance.source), sourceDigest: provenance.sourceDigest, expiry: provenance.expiresAt,
+      accountGeneration: account.connectionGeneration ?? 0, operation: provenance.operation, payload: proposal.email?.reply ?? null,
+      recipients: { to: proposal.email?.to, cc: proposal.email?.cc }, body: proposal.email?.text });
   }
 
   private mailReplySourceFromRow(message: MailboxSnapshotMessage, account: Account, observedAt = message.observedAt ?? ''): MailReplySourceSnapshot {
@@ -3601,7 +3729,7 @@ export class AppControllerImpl implements AppController {
         contextDigests.some((item, index) => !item.sourceValid || item.bodyDigest !== binding.context?.[index]?.body.textDigest) ||
         settingsFingerprint !== binding.settingsFingerprint || requestSha256 !== job.requestSha256 || fingerprint !== job.sourceFingerprint ||
         prepared.body !== job.requestBody || prepared.requestBytes !== job.requestBytes || request.reasoning?.effort !== job.effort ||
-        (requireResult && (!job.resultText || !validReplyText(job.resultText) || resultSha256 !== job.resultSha256))) {
+        (requireResult && (!job.resultText || !validReplyText(job.resultText, job.outputPolicyVersion === 2 ? Number.MAX_SAFE_INTEGER : 100_000) || resultSha256 !== job.resultSha256))) {
       throw new Error('The saved Batch result or frozen request failed integrity validation.');
     }
   }
@@ -8943,7 +9071,8 @@ export class AppControllerImpl implements AppController {
       if (existing.kind !== 'email') throw new Error('This proposal is not an email.');
       const email: NonNullable<Proposal['email']> = { operation: edit.operation, to: [...edit.to], cc: [...edit.cc], bcc: [...edit.bcc],
         subject: edit.subject, text: edit.text, attachments: clone(attachments), ...(existing.email?.reply ? { reply: clone(existing.email.reply) } : {}) };
-      return this.editProposal(id, { title: email.subject, body: email.text, recipients: [...email.to], email },
+      return this.editProposal(id, { title: existing.provenance?.version === 3 ? existing.title : email.subject,
+        body: email.text, recipients: [...email.to], email },
         { expectedRevision: input.expectedRevision, accountId: input.accountId, expectedConnectionGeneration: input.expectedConnectionGeneration });
     }
     if (existing.kind !== 'event') throw new Error('This proposal is not a calendar event.');
@@ -8960,6 +9089,7 @@ export class AppControllerImpl implements AppController {
     const result = await this.mutate(async (state) => {
       const proposal = this.proposal(state, id);
       if (proposal.dispatchRecoveryRetired) throw new Error('This external action was retired during dispatch recovery and is permanently read-only.');
+      if (proposal.supersededByProposalId) throw new Error('This proposal was superseded by a reviewed successor and is permanently read-only.');
       this.assertDispatchRecoveryProposalAllowed(proposal);
       if (options && proposal.revision !== options.expectedRevision) throw new Error('This proposal changed. Reopen the current version before editing.');
       if (options?.accountId !== undefined) {
@@ -8993,6 +9123,36 @@ export class AppControllerImpl implements AppController {
           throw new Error('This Batch generated reply is immutable. Create a separate manual reply draft to change its title, body, account, or recipients.');
         }
         if (immutableBatchPayload) return proposal;
+        await this.validateProposalProvenance(state, proposal);
+      } else if (proposal.provenance?.version === 3) {
+        const locked = proposal.email?.reply;
+        const currentEmail = proposal.email;
+        const requestedEmail = patch.email;
+        if (!locked || proposal.kind !== 'email' || !currentEmail ||
+            (patch.title !== undefined && patch.title !== proposal.title) ||
+            (patch.accountId !== undefined && patch.accountId !== proposal.accountId) ||
+            (requestedEmail?.subject !== undefined && requestedEmail.subject !== proposal.provenance.source.subject) ||
+            (requestedEmail?.bcc !== undefined && requestedEmail.bcc.length > 0) ||
+            (requestedEmail?.attachments !== undefined && requestedEmail.attachments.length > 0) ||
+            (requestedEmail?.reply && stableJson(requestedEmail.reply) !== stableJson(locked)) ||
+            (patch.body !== undefined && requestedEmail?.text !== undefined && patch.body !== requestedEmail.text) ||
+            (patch.recipients !== undefined && requestedEmail?.to !== undefined && stableJson(patch.recipients) !== stableJson(requestedEmail.to))) {
+          throw new Error('Manual replies allow edits to the body, To and Cc only. Source, account, subject, Bcc, attachments, and reply binding are locked.');
+        }
+        const patchEmail = {
+          ...currentEmail,
+          ...requestedEmail,
+          operation: requestedEmail?.operation ?? currentEmail.operation,
+          to: requestedEmail?.to ?? patch.recipients ?? currentEmail.to,
+          text: requestedEmail?.text ?? patch.body ?? currentEmail.text,
+          cc: requestedEmail?.cc ?? currentEmail.cc,
+        };
+        if (!['draft', 'send'].includes(patchEmail.operation ?? '')) throw new Error('Choose Draft or Send as the explicitly reviewed reply operation.');
+        proposal.body = patchEmail.text;
+        proposal.recipients = [...patchEmail.to];
+        proposal.provenance = { ...proposal.provenance, operation: patchEmail.operation! };
+        proposal.email = { ...patchEmail, operation: patchEmail.operation, reply: clone(locked), subject: proposal.provenance.source.subject,
+          bcc: [], attachments: [] };
         await this.validateProposalProvenance(state, proposal);
       } else Object.assign(proposal, patch);
       if (patch.eventDestination) {
@@ -9036,6 +9196,7 @@ export class AppControllerImpl implements AppController {
     const result = await this.mutate(async (state) => {
       const proposal = this.proposal(state, id);
       if (proposal.dispatchRecoveryRetired) throw new Error('This external action was retired during dispatch recovery and is permanently read-only.');
+      if (proposal.supersededByProposalId) throw new Error('This proposal was superseded by a reviewed successor and can no longer be approved.');
       this.assertDispatchRecoveryProposalAllowed(proposal);
       if (options && proposal.revision !== options.expectedRevision) throw new Error('This proposal changed while approval was checked. Reopen the current version before approving.');
       if (proposal.status !== 'draft' && proposal.status !== 'failed') throw new Error('Only a draft or safely failed proposal can be approved.');
@@ -9043,9 +9204,9 @@ export class AppControllerImpl implements AppController {
         if (!proposal.noteId) throw new Error('The source note is missing. Run Assist again before approving.');
         const note = this.note(state, proposal.noteId);
         if (proposal.sourceRevision !== note.revision) throw new Error('The source transcript changed. Process the note again before approving.');
-      } else if (proposal.provenance?.version !== 2) throw new Error('This proposal has no verifiable source. Create it again before approving.');
+      } else if (proposal.provenance?.version !== 2 && proposal.provenance?.version !== 3) throw new Error('This proposal has no verifiable source. Create it again before approving.');
       await this.validateProposalProvenance(state, proposal);
-      if (!proposal.title.trim() || (!proposal.body.trim() && proposal.provenance.version !== 2)) throw new Error('A title and proposed content are required.');
+      if (!proposal.title.trim() || (!proposal.body.trim() && proposal.provenance.version !== 2 && proposal.provenance.version !== 3)) throw new Error('A title and proposed content are required.');
       if (proposal.kind === 'email') {
         if (!proposal.accountId || !(proposal.email?.to.length || proposal.recipients.length)) throw new Error('Choose an account and at least one recipient before approving this email.');
         if (!proposal.email?.operation) throw new Error('Choose Draft in mailbox or Send email before approving this email.');
@@ -9143,6 +9304,7 @@ export class AppControllerImpl implements AppController {
   private async executeProposalInternal(id: string, options: { expectedRevision: number } | undefined, commandMode: boolean): Promise<Proposal | import('../core').ProposalExecutionForCommandResult> {
     await this.load();
     const beforeExecute = this.snapshot.proposals.find((item) => item.id === id);
+    if (beforeExecute?.supersededByProposalId) throw new Error('This proposal was superseded by a reviewed successor and can no longer be executed.');
     if (options && beforeExecute?.revision !== options.expectedRevision) throw new Error('This proposal changed. Reopen the current version before continuing.');
     let deviceEventPreflight: { revision: number; generation: number; selectionRevision: number; row: DeviceCalendarRow } | undefined;
     if (beforeExecute?.kind === 'event' && beforeExecute.eventDestination?.kind === 'device_calendar') {
@@ -9157,6 +9319,7 @@ export class AppControllerImpl implements AppController {
     const claim = await this.mutate(async (state) => {
       const proposal = this.proposal(state, id);
       if (proposal.dispatchRecoveryRetired) throw new Error('This external action was retired during dispatch recovery and is permanently read-only.');
+      if (proposal.supersededByProposalId) throw new Error('This proposal was superseded by a reviewed successor and can no longer be executed.');
       this.assertDispatchRecoveryProposalAllowed(proposal);
       if (options && proposal.revision !== options.expectedRevision) throw new Error('This proposal changed while execution was checked. Reopen the current version before continuing.');
       if (proposal.status !== 'approved' || proposal.approvedRevision !== proposal.revision || !proposal.approvedPayloadDigest) throw new Error('Approve this exact version before continuing.');
@@ -9241,8 +9404,8 @@ export class AppControllerImpl implements AppController {
       let dispatchRecord: DispatchRecord | undefined;
       if (canDispatch && account) {
         if (this.dispatchRecordQuarantine.length) throw new Error('Dispatch history failed integrity validation. External writes are disabled until the receipt history is repaired.');
-        const mailReplyActivationOperation = proposal.provenance?.version === 2 && proposal.provenance.batchJobId
-          ? this.mailReplyActivationOperationForProposal(proposal) : undefined;
+        const mailReplyActivationOperation = proposal.provenance?.version === 3 ? proposal.provenance.operation
+          : proposal.provenance?.version === 2 && proposal.provenance.batchJobId ? this.mailReplyActivationOperationForProposal(proposal) : undefined;
         dispatchRecord = createDispatchRecord({ id: this.newId(), dispatchStartedAt: now(), proposal, account, calendar,
           ...(mailReplyActivationOperation ? { mailReplyActivationOperation } : {}) });
         assertNoDuplicateDispatch(state, dispatchRecord);
@@ -9362,7 +9525,7 @@ export class AppControllerImpl implements AppController {
           proposalId: record.proposalId, revision: record.approvedRevision, sourceRevision: record.sourceRevision, operation,
           accountId: record.accountId, identity: clone(record.account.identity), payloadDigest: record.payloadDigest,
           title: record.title, body: record.body, calendarId: record.calendar?.providerId,
-          ...(record.sourceProvenance.version === 2 ? { replySource: clone(record.sourceProvenance) } : {}),
+          ...(record.sourceProvenance.version === 2 || record.sourceProvenance.version === 3 ? { replySource: clone(record.sourceProvenance) } : {}),
           ...(record.mailReplyBatchBinding ? { mailReplyBatchBinding: clone(record.mailReplyBatchBinding) } : {}),
           payload: record.payload.kind === 'email'
             ? { ...clone(record.payload.email), operation: record.operation === 'draft' || record.operation === 'send' ? record.operation : undefined }
@@ -9400,6 +9563,7 @@ export class AppControllerImpl implements AppController {
               current.approvedPayloadDigest !== record.payloadDigest ||
               (current.provenance?.version === 1 && (current.sourceRevision !== currentNote?.revision || current.sourceRevision !== record.sourceRevision)) ||
               (record.sourceProvenance.version === 2 && (current.provenance?.version !== 2 || current.provenance.sourceDigest !== record.sourceProvenance.sourceDigest)) ||
+              (record.sourceProvenance.version === 3 && (current.provenance?.version !== 3 || current.provenance.sourceDigest !== record.sourceProvenance.sourceDigest || current.provenance.operation !== record.operation)) ||
               current.accountId !== record.accountId || currentAccount.authStatus !== 'connected' || !currentAccount.connected ||
               currentAccount.connectionGeneration !== account.connectionGeneration || !currentAccount.capabilities?.includes(expectedCapability) ||
               !sameAccountIdentity(currentAccount.identity, record.account.identity) || !matchesFrozenPayload(current) ||
@@ -9411,7 +9575,7 @@ export class AppControllerImpl implements AppController {
           }
           return true;
         }, inspectRefreshedReplySource: (candidate) => {
-          const linkedId = candidate.replySource?.batchJobId;
+          const linkedId = candidate.replySource?.version === 2 ? candidate.replySource.batchJobId : undefined;
           if (!linkedId) return 'not_required';
           const linked = this.assistantBatchLedger.jobs.find((item) => item.id === linkedId);
           if (!linked || !isOpenRouterMailReplyContentJob(linked) || linked.status !== 'completed' || linked.proposalId !== id ||
@@ -11557,6 +11721,59 @@ export class AppControllerImpl implements AppController {
     });
   }
 
+  async deriveManualMailReplyForCommand(input: { parentProposalId: string; expectedParentRevision: number;
+    accountId: string; expectedConnectionGeneration: number; operation: 'draft' | 'send' }): Promise<Proposal> {
+    return this.mutate(async (state) => {
+      const parent = this.proposal(state, input.parentProposalId);
+      if (parent.supersededByProposalId || parent.kind !== 'email' || !parent.sourceActionKey || !isMailReplyProvenance(parent.provenance) || !parent.email?.reply ||
+          !['draft', 'approved', 'failed'].includes(parent.status)) throw new Error('This reply cannot be derived because it is already consumed, superseded, or has no editable reply source.');
+      const parentProvenance = parent.provenance;
+      if (parent.revision !== input.expectedParentRevision || parent.accountId !== input.accountId) throw new Error('The parent reply changed. Reload it before creating a manual successor.');
+      const account = state.accounts.find((item) => item.id === input.accountId);
+      const historicalSource = parentProvenance.source;
+      if (!account || !account.connected || account.authStatus !== 'connected' || !account.capabilities?.includes('mail.read') ||
+          (input.operation === 'draft' && !account.capabilities.includes('mail.draft')) ||
+          (input.operation === 'send' && !account.capabilities.includes('mail.send')) || (account.connectionGeneration ?? 0) !== input.expectedConnectionGeneration ||
+          account.connectionGeneration !== historicalSource.connectionGeneration || !sameAccountIdentity(account.identity, historicalSource.identity)) {
+        throw new Error('The verified mailbox connection or requested operation changed. Refresh the account and review the reply again.');
+      }
+      const consumed = state.dispatchRecords.some((record) => record.proposalId === parent.id && ['pending', 'unknown', 'accepted'].includes(record.outcome));
+      if (consumed || parent.status === 'dispatching' || parent.status === 'unknown' || parent.status === 'accepted' || parent.status === 'executed') {
+        throw new Error('This reply has a pending, unknown, or accepted provider attempt. Inspect its receipt before creating another proposal.');
+      }
+      if (this.dispatchRecoveryFencesAction(parent.sourceActionKey)) throw new Error('This source action is retired during dispatch recovery and cannot be promoted to a new proposal.');
+      if (!await validateMailReplySource(historicalSource, async (canonical) => this.crypto.sha256(canonical))) throw new Error('The parent reply source digest is invalid. Refresh the message and review it again.');
+      const latest = await this.currentMailReplySource(state, historicalSource.localMessageId);
+      if (latest.status !== 'current' || !latest.source || latest.source.sourceDigest !== historicalSource.sourceDigest ||
+          canonicalMailReplySource(latest.source) !== canonicalMailReplySource(historicalSource) ||
+          latest.source.connectionGeneration !== account.connectionGeneration) {
+        throw new Error('Refresh required: the original message needs a current saved mailbox observation before it can be derived.');
+      }
+      if (parentProvenance.version === 2 && parentProvenance.batchJobId) {
+        const linked = this.assistantBatchLedger.jobs.find((item) => item.id === parentProvenance.batchJobId);
+        if (!linked || !isOpenRouterMailReplyContentJob(linked) || linked.status !== 'completed' || linked.proposalId !== parent.id ||
+            linked.resultText !== parent.email.text || !linked.resultSha256) throw new Error('The historical Batch result is no longer available for this reply.');
+        await this.assertMailReplyBatchJobIntegrity(linked, true);
+      }
+      const batchJobId = parentProvenance.version === 2 ? parentProvenance.batchJobId : undefined;
+      const batchResultDigest = batchJobId ? this.assistantBatchLedger.jobs.find((item) => item.id === batchJobId)?.resultSha256 : undefined;
+      const parentPayloadDigest = await this.manualMailReplyPayloadDigest(parent);
+      const child = this.buildMailReplyProposal(state, latest.source, { messageId: latest.source.localMessageId, mode: parent.email.reply.mode,
+        sourceDigest: latest.source.sourceDigest, text: parent.email.text, to: parent.email.to, cc: parent.email.cc }, undefined, input.operation);
+      child.provenance = { ...(child.provenance as ManualMailReplyProvenance),
+        lineage: { kind: 'derived', parentProposalId: parent.id, parentRevision: parent.revision, parentPayloadDigest,
+          ...(batchResultDigest ? { parentBatchResultDigest: batchResultDigest } : {}) } };
+      child.sourceActionKey = parent.sourceActionKey;
+      validateReplyBinding(child.email!, child.provenance, input.operation);
+      parent.supersededByProposalId = child.id;
+      parent.approvedRevision = undefined;
+      parent.approvedPayloadDigest = undefined;
+      state.proposals.unshift(child);
+      addActivity(state, 'proposal_created', 'Manual reply successor created from a reviewed source and operation.', { proposalId: child.id }, this.newId);
+      return child;
+    });
+  }
+
   private mailReplyContextSession(sessionId: string): MailReplyContextDiscoverySession {
     const session = this.mailReplyContextSessions.get(sessionId);
     const at = Date.now();
@@ -11723,7 +11940,9 @@ export class AppControllerImpl implements AppController {
     input: { messageId: string; mode: 'reply' | 'reply_all'; sourceDigest: string; text: string; to: readonly string[]; cc: readonly string[] }, batchJobId?: string,
     activationOperation: 'draft' | 'send' = 'draft'): Proposal {
     const linkedJob = batchJobId ? this.assistantBatchLedger.jobs.find((job) => job.id === batchJobId) : undefined;
-    const outputPolicyVersion = linkedJob && isOpenRouterMailReplyContentJob(linkedJob) ? linkedJob.outputPolicyVersion ?? 1 : 1;
+    const outputPolicyVersion = batchJobId
+      ? linkedJob && isOpenRouterMailReplyContentJob(linkedJob) ? linkedJob.outputPolicyVersion ?? 1 : 1
+      : 2;
     if (batchJobId && (!linkedJob || !isOpenRouterMailReplyContentJob(linkedJob) || linkedJob.status !== 'completed' || linkedJob.resultText !== input.text)) {
       throw new Error('The reply result is not linked to its trusted completed Batch job. Review the saved result again.');
     }
@@ -11737,12 +11956,12 @@ export class AppControllerImpl implements AppController {
     const to = [...input.to];
     const cc = [...input.cc];
     if (!to.length || to.length > 100 || cc.length > 100 || [...to, ...cc].some((address) => !validEmail(address))) throw new Error('Check the reply recipients.');
-    const provenance: MailReplyProvenance = {
-      version: 2, kind: 'mail_reply', sourceDigest: source.sourceDigest, source,
-      expiresAt: new Date(Date.parse(source.observedAt) + 15 * 60_000).toISOString(),
-      ...(batchJobId ? { batchJobId } : {}),
-      ...(linkedJob?.outputPolicyVersion !== undefined ? { outputPolicyVersion: linkedJob.outputPolicyVersion } : {}),
-    };
+    const expiresAt = new Date(Date.parse(source.observedAt) + 15 * 60_000).toISOString();
+    const provenance: MailReplyProvenance | ManualMailReplyProvenance = batchJobId
+      ? { version: 2, kind: 'mail_reply', sourceDigest: source.sourceDigest, source, expiresAt, batchJobId,
+          ...(linkedJob?.outputPolicyVersion !== undefined ? { outputPolicyVersion: linkedJob.outputPolicyVersion } : {}) }
+      : { version: 3, kind: 'manual_mail_reply', sourceDigest: source.sourceDigest, source, expiresAt,
+          outputPolicyVersion: 2, operation: activationOperation, lineage: { kind: 'manual' } };
     const reply = {
       mode: input.mode, sourceDigest: source.sourceDigest, localMessageId: source.localMessageId,
       providerMessageId: source.providerMessageId, idFormat: source.idFormat,
@@ -11953,7 +12172,8 @@ export class AppControllerImpl implements AppController {
       state.selectedMailTexts.unshift(bodySnapshot);
       state.selectedMailTexts = state.selectedMailTexts.slice(0, 20);
       if (updatedSource && updatedSource.sourceDigest !== input.sourceDigest) {
-        for (const proposal of state.proposals.filter((item) => item.provenance?.version === 2 && item.provenance.source.localMessageId === input.messageId && ['draft', 'approved', 'failed'].includes(item.status))) {
+        for (const proposal of state.proposals.filter((item) => isMailReplyProvenance(item.provenance) &&
+          item.provenance.source.localMessageId === input.messageId && ['draft', 'approved', 'failed'].includes(item.status))) {
           this.invalidate(proposal); proposal.requiresRebuild = true;
         }
       }

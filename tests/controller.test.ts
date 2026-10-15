@@ -129,7 +129,7 @@ describe('application state controller', () => {
     const account = {
       id: 'mail-account', provider: 'google' as const, displayName: 'Work', email: 'display@example.test', verifiedEmail: 'me@example.test',
       connected: true, authStatus: 'connected' as const, identity: { providerNamespace: 'google' as const, clientId: 'client-1', subject: 'subject-1' },
-      tokenRef: 'test-token-ref', capabilities: ['mail.read' as const], connectionGeneration: 3,
+      tokenRef: 'test-token-ref', capabilities: ['mail.read' as const, 'mail.draft' as const, 'mail.send' as const], connectionGeneration: 3,
     };
     state.accounts.push(account);
     state.mailbox.push({
@@ -151,15 +151,27 @@ describe('application state controller', () => {
     const proposal = await restored.createMailReplyProposal({
       messageId: 'local-message-1', mode: 'reply_all', sourceDigest: sourceResult.source!.sourceDigest, text: 'Thanks for the update.',
     });
-    expect(proposal).toMatchObject({ kind: 'email', status: 'draft', provenance: { version: 2, kind: 'mail_reply' } });
+    expect(proposal).toMatchObject({ kind: 'email', status: 'draft', provenance: { version: 3, kind: 'manual_mail_reply', operation: 'draft', lineage: { kind: 'manual' } } });
     expect(proposal).not.toHaveProperty('noteId');
     expect(proposal).not.toHaveProperty('sourceRevision');
     expect(restored.getSnapshot().notes).toEqual([]);
     expect(proposal.email).toMatchObject({ operation: 'draft', subject: 'Project update', bcc: [], attachments: [], to: ['sam@example.test', 'alex@example.test'], cc: ['casey@example.test'] });
-    await expect(restored.editProposal(proposal.id, { email: { ...proposal.email!, operation: 'send' } })).rejects.toThrow(/locked/i);
-    const approved = await restored.approveProposal(proposal.id);
+    const edited = await restored.editProposal(proposal.id, { title: proposal.title, body: 'Revised without another AI request.', recipients: ['new-recipient@example.test'],
+      email: { ...proposal.email!, operation: 'draft', to: ['new-recipient@example.test'], cc: ['copy@example.test'], text: 'Revised without another AI request.' } },
+    { expectedRevision: proposal.revision, accountId: account.id, expectedConnectionGeneration: 3 });
+    expect(edited).toMatchObject({ status: 'draft', revision: proposal.revision + 1, body: 'Revised without another AI request.', recipients: ['new-recipient@example.test'],
+      email: { operation: 'draft', to: ['new-recipient@example.test'], cc: ['copy@example.test'] }, provenance: { operation: 'draft' } });
+    expect(edited.provenance?.version === 3 && edited.provenance.source).toEqual(proposal.provenance?.version === 3 ? proposal.provenance.source : undefined);
+    const approved = await restored.approveProposal(proposal.id, { expectedRevision: edited.revision });
     expect(approved.status).toBe('approved');
     expect(approved.sourceRevision).toBeUndefined();
+    const switched = await restored.editProposal(proposal.id, { title: edited.title, body: 'Reviewed as a send.', recipients: ['new-recipient@example.test'],
+      email: { ...edited.email!, operation: 'send', text: 'Reviewed as a send.' } },
+    { expectedRevision: approved.revision, accountId: account.id, expectedConnectionGeneration: 3 });
+    expect(switched).toMatchObject({ status: 'draft', approvedRevision: undefined, approvedPayloadDigest: undefined,
+      email: { operation: 'send', text: 'Reviewed as a send.' }, provenance: { operation: 'send' } });
+    const sendApproved = await restored.approveProposal(proposal.id, { expectedRevision: switched.revision });
+    expect(sendApproved).toMatchObject({ status: 'approved', email: { operation: 'send' }, provenance: { version: 3, operation: 'send' } });
     const another = await restored.createMailReplyProposal({
       messageId: 'local-message-1', mode: 'reply', sourceDigest: sourceResult.source!.sourceDigest, text: 'A second draft for review.',
     });
@@ -237,6 +249,63 @@ describe('application state controller', () => {
     }
   });
 
+  it('derives one manual successor from a stale historical reply using the latest saved source observation', async () => {
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store);
+    await app.load();
+    const state = structuredClone(app.getSnapshot());
+    const observedAt = new Date().toISOString();
+    const account = {
+      id: 'derive-account', provider: 'google' as const, displayName: 'Work', email: 'display@example.test', verifiedEmail: 'me@example.test',
+      connected: true, authStatus: 'connected' as const, identity: { providerNamespace: 'google' as const, clientId: 'derive-client', subject: 'derive-subject' },
+      tokenRef: 'derive-token-ref', capabilities: ['mail.read' as const, 'mail.draft' as const], connectionGeneration: 5,
+    };
+    state.accounts.push(account);
+    state.mailbox.push({ id: 'derive-message', accountId: account.id, providerMessageId: 'derive-provider-message', identityKey: 'google:derive-client:derive-subject:',
+      verifiedIdentityKey: 'google:derive-client:derive-subject:', connectionGeneration: 5, idFormat: 'gmail', threadId: 'derive-thread',
+      subject: 'Delayed reply', from: 'Sam <sam@example.test>', senderEmail: 'sam@example.test', receivedAt: observedAt, replyTo: ['sam@example.test'],
+      to: ['me@example.test'], cc: [], internetMessageId: '<derive@example.test>', references: '<parent@example.test>', inReplyTo: '<derive@example.test>',
+      replyMetadataComplete: true, observedAt });
+    await store.save(state);
+    const token: StoredOAuthToken = { accessToken: 'derive-token', expiresAt: Date.now() + 600_000, identity: account.identity };
+    const tokenStore = { async get() { return structuredClone(token); }, async set() {} };
+    const connected = new AppControllerImpl(store, {}, { tokenStore });
+    await connected.load();
+    const source = await connected.getMailReplySource('derive-message');
+    const created = await connected.createMailReplyProposal({ messageId: 'derive-message', mode: 'reply', sourceDigest: source.source!.sourceDigest, text: 'The historical generated reply.' });
+
+    // Model a completed legacy reply whose source observation aged while the result was waiting for review.
+    const historical = store.value!.proposals.find((item) => item.id === created.id)!;
+    if (historical.provenance?.version !== 3) throw new Error('Expected the new manual reply provenance.');
+    const oldObservedAt = new Date(Date.parse(observedAt) - 30 * 60_000).toISOString();
+    historical.provenance = { version: 2, kind: 'mail_reply', sourceDigest: historical.provenance.sourceDigest,
+      source: { ...historical.provenance.source, observedAt: oldObservedAt }, expiresAt: new Date(Date.parse(oldObservedAt) + 15 * 60_000).toISOString(),
+      outputPolicyVersion: 2 };
+    await store.save(store.value!);
+    const restored = new AppControllerImpl(store, {}, { tokenStore });
+    await restored.load();
+
+    const input = { parentProposalId: created.id, expectedParentRevision: created.revision, accountId: account.id,
+      expectedConnectionGeneration: account.connectionGeneration, operation: 'draft' as const };
+    const results = await Promise.allSettled([restored.deriveManualMailReplyForCommand(input), restored.deriveManualMailReplyForCommand(input)]);
+    const children = results.filter((result): result is PromiseFulfilledResult<Proposal> => result.status === 'fulfilled').map((result) => result.value);
+    expect(children).toHaveLength(1);
+    expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1);
+    const child = children[0]!;
+    expect(child).toMatchObject({ status: 'draft', revision: 1, sourceActionKey: created.sourceActionKey,
+      provenance: { version: 3, kind: 'manual_mail_reply', operation: 'draft', source: { observedAt },
+        lineage: { kind: 'derived', parentProposalId: created.id, parentRevision: created.revision, parentPayloadDigest: expect.stringMatching(/^[a-f0-9]{64}$/) } } });
+    const parent = restored.getSnapshot().proposals.find((item) => item.id === created.id)!;
+    expect(parent).toMatchObject({ status: 'draft', revision: created.revision, supersededByProposalId: child.id,
+      provenance: { version: 2, source: { observedAt: oldObservedAt } } });
+    await expect(restored.editProposal(parent.id, { body: 'Cannot edit a superseded source.' }, { expectedRevision: parent.revision }))
+      .rejects.toThrow(/superseded/i);
+    const edited = await restored.editProposal(child.id, { title: child.title, body: 'Edited after the delayed result.', recipients: ['new@example.test'],
+      email: { ...child.email!, operation: 'draft', to: ['new@example.test'], text: 'Edited after the delayed result.' } },
+    { expectedRevision: child.revision, accountId: account.id, expectedConnectionGeneration: account.connectionGeneration });
+    await expect(restored.approveProposal(edited.id, { expectedRevision: edited.revision })).resolves.toMatchObject({ status: 'approved', revision: edited.revision });
+  });
+
   it('executes frozen mail replies without notes, preserves unknown receipts, and blocks a changed connection before the write', async () => {
     const store = new MemoryStore();
     const identity = { providerNamespace: 'google' as const, clientId: 'reply-client', subject: 'reply-subject' };
@@ -259,7 +328,7 @@ describe('application state controller', () => {
     const connector = {
       async verifyOAuthIdentity() { return true; },
       async createDraft(_account: unknown, envelope: Record<string, unknown>, verifier: { verify(value: never): Promise<boolean>; verifyBeforeDispatch(value: never): boolean }) {
-        expect(envelope.replySource).toMatchObject({ version: 2, kind: 'mail_reply' });
+        expect(envelope.replySource).toMatchObject({ version: 3, kind: 'manual_mail_reply', operation: 'draft' });
         expect(envelope.sourceRevision).toBeUndefined();
         expect(await verifier.verify(envelope as never)).toBe(true);
         attemptedDrafts += 1;
@@ -304,14 +373,14 @@ describe('application state controller', () => {
     expect(accepted).toMatchObject({ status: 'accepted', remoteOperation: 'draft', remoteId: 'provider-draft-1' });
     expect(app.getSnapshot().dispatchRecords[0]).toMatchObject({
       operation: 'draft', outcome: 'accepted', replyDraftCheck: 'matches_approved',
-      sourceProvenance: { version: 2, source: { localMessageId: message.id } },
+      sourceProvenance: { version: 3, source: { localMessageId: message.id } },
     });
     expect(app.getSnapshot().dispatchRecords[0]).not.toHaveProperty('sourceRevision');
     expect(app.getSnapshot().notes).toEqual([]);
 
     app = new AppControllerImpl(store, {}, integration);
     await app.load();
-    expect(app.getSnapshot().dispatchRecords[0].sourceProvenance.version).toBe(2);
+    expect(app.getSnapshot().dispatchRecords[0].sourceProvenance.version).toBe(3);
     const unknownDraft = await app.createMailReplyProposal({ messageId: message.id, mode: 'reply_all', sourceDigest: source.source!.sourceDigest, text: 'Another response.' });
     const unknownApproved = await app.approveProposal(unknownDraft.id);
     const unknownExecution = await app.executeProposalForCommand(unknownDraft.id, { expectedRevision: unknownApproved.revision });

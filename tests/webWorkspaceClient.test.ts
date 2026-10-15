@@ -62,6 +62,18 @@ describe('same-origin web workspace command client', () => {
     const prepareId = '20000000-0000-4000-8000-000000000001';
     const planId = '20000000-0000-4000-8000-000000000002';
     const conversation = '20000000-0000-4000-8000-000000000003';
+    const parentProposalId = '20000000-0000-4000-8000-000000000004';
+    const proposalId = '20000000-0000-4000-8000-000000000005';
+    const accountId = '20000000-0000-4000-8000-000000000006';
+    const deriveCommand = { kind: 'mail.reply.derive' as const, parentProposalId, expectedParentRevision: 3, accountId,
+      expectedConnectionGeneration: 7, operation: 'send' as const };
+    expect(parseWorkspaceCommandEnvelope({ schemaVersion: 1, commandId, expectedRevision: 9, expectedPrivacyEpoch: 3, command: deriveCommand }).command)
+      .toEqual(deriveCommand);
+    expect(() => parseWorkspaceCommandEnvelope({ schemaVersion: 1, commandId, expectedRevision: 9, expectedPrivacyEpoch: 3,
+      command: { ...deriveCommand, expectedParentRevision: 0 } })).toThrow('workspace_command_invalid');
+    expect(parseWorkspaceCommandReceipt({ schemaVersion: 1, commandId, kind: 'mail.reply.derive', objectId: proposalId,
+      parentProposalId, proposalId, proposalRevision: 1, operation: 'send' }, { commandId, kind: 'mail.reply.derive', objectId: proposalId,
+      parentProposalId, proposalId, operation: 'send' })).toMatchObject({ proposalId, parentProposalId, proposalRevision: 1, operation: 'send' });
     const zone = parseWorkspaceCommandEnvelope({ schemaVersion: 1, commandId, expectedRevision: 4, expectedPrivacyEpoch: 3,
       command: { kind: 'notes.confirmImportedTimeZone', noteId: legacyNoteId, expectedNoteRevision: 5, timeZone: 'Asia/Singapore' } });
     expect(zone.command.kind).toBe('notes.confirmImportedTimeZone');
@@ -110,7 +122,7 @@ describe('same-origin web workspace command client', () => {
       'chat.transcript.prepare', 'chat.transcript.cancel', 'chat.transcript.submit', 'settings.update', 'notes.save', 'notes.capture.adopt',
       'notes.updateTranscript', 'assistant.batch.submitNote', 'assistant.batch.check', 'chat.submit', 'chat.refine', 'notes.transcribe', 'accounts.installOAuth',
       'accounts.syncCalendars', 'accounts.refreshMail', 'accounts.continueMailBackfill', 'accounts.disconnect', 'mail.source.loadText', 'mail.reply.create',
-      'proposals.edit', 'proposals.approve', 'proposals.execute', 'proposals.dismiss', 'dispatch.reconcile', 'mail.replyBatch.submit', 'mail.replyBatch.check',
+      'mail.reply.derive', 'proposals.edit', 'proposals.approve', 'proposals.execute', 'proposals.dismiss', 'dispatch.reconcile', 'mail.replyBatch.submit', 'mail.replyBatch.check',
       'mail.replyBatch.review', 'mail.replyBatch.activate',
       'documents.save', 'knowledge.person.save', 'knowledge.project.save', 'knowledge.entity.archive', 'knowledge.fact.save', 'knowledge.fact.remove',
       'knowledge.contact.save', 'knowledge.contact.remove', 'knowledge.member.save', 'knowledge.member.remove',

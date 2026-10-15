@@ -116,19 +116,23 @@ function safeMailSource(value: import('../core').MailReplySourceSnapshot) {
     observedAt: value.observedAt, sourceDigest: value.sourceDigest };
 }
 function safeProposal(value: import('../core').Proposal) {
-  const editableStatus = value.status === 'draft' || value.status === 'failed' || value.status === 'approved';
+  const editableStatus = (value.status === 'draft' || value.status === 'failed' || value.status === 'approved') && !value.supersededByProposalId;
+  const mailReply = value.provenance?.version === 2 && value.provenance.kind === 'mail_reply' ||
+    value.provenance?.version === 3 && value.provenance.kind === 'manual_mail_reply';
   const editPolicy = !editableStatus ? 'read_only' : value.kind === 'event' ? 'event_fields' : value.kind !== 'email' ? 'read_only'
-    : value.provenance?.version === 2 && value.provenance.kind === 'mail_reply'
-      ? value.provenance.batchJobId ? 'read_only' : 'source_reply_fields'
-      : 'email_fields';
-  return { editPolicy, id: value.id, kind: value.kind, title: value.title, body: value.body, status: value.status, revision: value.revision,
+    : value.provenance?.version === 3 ? 'manual_reply_fields'
+      : mailReply ? value.provenance?.version === 2 && value.provenance.batchJobId ? 'read_only' : 'source_reply_fields'
+        : 'email_fields';
+  return { editPolicy, canDeriveManualReply: Boolean(mailReply && editableStatus && value.email?.reply && value.sourceActionKey),
+    ...(value.supersededByProposalId ? { supersededByProposalId: value.supersededByProposalId } : {}),
+    id: value.id, kind: value.kind, title: value.title, body: value.body, status: value.status, revision: value.revision,
     ...(value.approvedRevision !== undefined ? { approvedRevision: value.approvedRevision } : {}), ...(value.lastError ? { lastError: value.lastError } : {}),
     ...(value.accountId ? { accountId: value.accountId } : {}), recipients: value.recipients, ...(value.calendarId ? { calendarId: value.calendarId } : {}),
     ...(value.dueAt ? { dueAt: value.dueAt } : {}), ...(value.email ? { email: { operation: value.email.operation, to: value.email.to, cc: value.email.cc,
       bcc: value.email.bcc, subject: value.email.subject, text: value.email.text, attachments: value.email.attachments.map(({ fileName, mimeType, sizeBytes }) => ({ fileName, mimeType, sizeBytes })) } } : {}),
     ...(value.event ? { event: value.event } : {}), ...(value.remoteOperation ? { remoteOperation: value.remoteOperation } : {}),
     ...(value.remoteId ? { remoteId: value.remoteId } : {}), ...(value.remoteAcceptedAt ? { remoteAcceptedAt: value.remoteAcceptedAt } : {}),
-    ...(value.provenance?.version === 2 ? { sourceDigest: value.provenance.sourceDigest } : {}) };
+    ...(value.provenance && 'sourceDigest' in value.provenance ? { sourceDigest: value.provenance.sourceDigest } : {}) };
 }
 
 function serializeSnapshot(snapshot: WorkspaceSnapshotDTO): JsonValue {

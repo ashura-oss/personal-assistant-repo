@@ -1804,6 +1804,88 @@ describe('OpenRouter Batch controller lifecycle', () => {
     expect(requests).toHaveLength(2);
   });
 
+  it('derives and edits an oversized retained Batch reply after its original source observation expires', async () => {
+    const resultText = 'r'.repeat(100_001);
+    let batchSubmissions = 0;
+    const sent: Parameters<ConnectorClient['sendEmail']>[1][] = [];
+    const fakeClient = {
+      submit: async (input: { operationId: string; requestBody: string }, before: () => Promise<void>, assert: () => void) => {
+        batchSubmissions += 1;
+        return fakeSubmit('batch_oversized_manual_successor', input, before, assert);
+      },
+      inspect: async (batchId: string, customId: string) => ({ ...completedInspection(customId, JSON.stringify({ text: resultText })), batchId }),
+    } as unknown as OpenRouterBatchClient;
+    let targetReceivedAt = '';
+    const targetText = 'Selected message body for a controlled mail Batch controller fixture.';
+    const connector = { async readSelectedMessageText() { return { status: 'available' as const,
+      message: { id: 'mail-fixture-provider', idFormat: 'gmail' as const, threadId: 'mail-fixture-thread', subject: 'Fixture subject',
+        from: 'Sam <sam@example.test>', senderEmail: 'sam@example.test', receivedAt: targetReceivedAt, isDraft: false, replyMetadataComplete: true,
+        internetMessageId: '<mail-fixture@example.test>', replyTo: ['sam@example.test'], to: ['me@example.test'], cc: [] },
+      text: targetText, bytes: new TextEncoder().encode(targetText).length, representation: 'plain' as const, completeness: 'complete_text' as const,
+      reasons: [], checkedAt: new Date().toISOString(), extractionVersion: 'mail-text-v1' as const }; },
+      async sendEmail(_account: Parameters<ConnectorClient['sendEmail']>[0], envelope: Parameters<ConnectorClient['sendEmail']>[1],
+        verifier: Parameters<ConnectorClient['sendEmail']>[2]) {
+        expect(await verifier.verify(envelope)).toBe(true);
+        sent.push(structuredClone(envelope));
+        return { status: 'accepted' as const, id: 'oversized-retained-successor-send' };
+      } };
+    const fixture = await mailFixture(fakeClient, connector);
+    targetReceivedAt = fixture.message.receivedAt;
+    const queued = await fixture.app.submitMailReplyBatch({ messageId: fixture.message.id, sourceDigest: fixture.source.source!.sourceDigest,
+      textDigest: fixture.textDigest, mode: 'reply', to: ['sam@example.test'], cc: [], brief: 'Reply briefly.', composerRevision: 1 });
+    expect((await fixture.app.refreshAssistantBatch(queued.id)).status).toBe('completed');
+    const review = await fixture.app.reviewMailReplyBatch(queued.id);
+    const activated = await fixture.app.activateMailReplyBatch({ planId: review.planId });
+    const parent = fixture.store.value!.proposals.find((item) => item.id === activated.proposalId)!;
+    expect(parent).toMatchObject({ status: 'draft', body: resultText, provenance: { version: 2, outputPolicyVersion: 2, batchJobId: queued.id } });
+
+    // The retained Batch result can outlive its original observation. Refresh the saved source
+    // independently, then derive without submitting another model request.
+    const oldObservation = new Date(Date.parse(fixture.message.observedAt) - 30 * 60_000).toISOString();
+    const oldParent = fixture.store.value!.proposals.find((item) => item.id === parent.id)!;
+    if (oldParent.provenance?.version !== 2) throw new Error('Expected a legacy Batch reply parent.');
+    oldParent.provenance = { ...oldParent.provenance, source: { ...oldParent.provenance.source, observedAt: oldObservation },
+      expiresAt: new Date(Date.parse(oldObservation) + 15 * 60_000).toISOString() };
+    const savedAccount = fixture.store.value!.accounts.find((item) => item.id === fixture.account.id)!;
+    savedAccount.capabilities = [...new Set([...(savedAccount.capabilities ?? []), 'mail.draft' as const, 'mail.send' as const])];
+    savedAccount.grantedScopes = [...new Set([...(savedAccount.grantedScopes ?? []), 'https://www.googleapis.com/auth/gmail.compose', 'https://www.googleapis.com/auth/gmail.send'])];
+    await fixture.store.save(fixture.store.value!);
+    const restored = new AppControllerImpl(fixture.store, {}, fixture.integration);
+    await restored.load();
+    const refreshedSource = await restored.getMailReplySource(fixture.message.id);
+    expect(refreshedSource.status).toBe('current');
+    const currentObservation = refreshedSource.source!.observedAt;
+
+    const successor = await restored.deriveManualMailReplyForCommand({ parentProposalId: parent.id, expectedParentRevision: parent.revision,
+      accountId: fixture.account.id, expectedConnectionGeneration: fixture.account.connectionGeneration, operation: 'send' });
+    expect(successor).toMatchObject({ status: 'draft', body: resultText, provenance: { version: 3, outputPolicyVersion: 2, operation: 'send',
+      source: { observedAt: currentObservation }, lineage: { kind: 'derived', parentProposalId: parent.id, parentBatchResultDigest: expect.stringMatching(/^[a-f0-9]{64}$/) } } });
+    const historical = restored.getSnapshot().proposals.find((item) => item.id === parent.id)!;
+    expect(historical).toMatchObject({ status: 'draft', body: resultText, supersededByProposalId: successor.id,
+      provenance: { version: 2, source: { observedAt: oldObservation } } });
+
+    const edited = await restored.editProposal(successor.id, { title: successor.title, body: 'Edited retained reply.', recipients: ['new@example.test'],
+      email: { ...successor.email!, operation: 'send', to: ['new@example.test'], text: 'Edited retained reply.' } },
+    { expectedRevision: successor.revision, accountId: fixture.account.id, expectedConnectionGeneration: fixture.account.connectionGeneration });
+    expect(edited).toMatchObject({ revision: successor.revision + 1, status: 'draft', body: 'Edited retained reply.',
+      provenance: { version: 3, operation: 'send', outputPolicyVersion: 2, lineage: { parentBatchResultDigest: expect.stringMatching(/^[a-f0-9]{64}$/) } } });
+    const approved = await restored.approveProposal(edited.id, { expectedRevision: edited.revision });
+    expect(approved).toMatchObject({ status: 'approved', body: 'Edited retained reply.' });
+    expect(batchSubmissions).toBe(1);
+    const firstExecution = await restored.executeProposal(approved.id);
+    expect(firstExecution).toMatchObject({ status: 'accepted' });
+    expect(restored.getSnapshot().dispatchRecords.find((item) => item.proposalId === approved.id)).toMatchObject({ operation: 'send',
+      outcome: 'accepted', remoteId: 'oversized-retained-successor-send' });
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ operation: 'send', replySource: { version: 3, kind: 'manual_mail_reply', operation: 'send',
+      lineage: { kind: 'derived', parentProposalId: parent.id } }, payload: { operation: 'send', to: ['new@example.test'],
+      subject: 'Fixture subject', text: 'Edited retained reply.' } });
+    await expect(restored.executeProposal(approved.id)).rejects.toThrow(/approve this exact version|already|accepted/i);
+    expect(sent).toHaveLength(1);
+    expect(batchSubmissions).toBe(1);
+    expect(restored.getSnapshot().proposals.find((item) => item.id === parent.id)?.body).toBe(resultText);
+  });
+
   it.each([
     { context: false, operation: 'draft' as const },
     { context: false, operation: 'send' as const },

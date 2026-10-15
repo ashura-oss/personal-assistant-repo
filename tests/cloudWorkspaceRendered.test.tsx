@@ -275,7 +275,7 @@ describe('CloudWorkspace safe DTO presentation', () => {
       if (path.startsWith('/api/workspace/proposals/review?') && method === 'GET') {
         return { ok: true, status: 200, json: async () => ({ schemaVersion: 1, workspaceId, privacyEpoch: 3,
           revision: Number(new URL(path, 'http://test').searchParams.get('expectedRevision')),
-          proposal: { editPolicy: 'email_fields', id: proposal.id, kind: 'email', title: proposal.title, body: proposal.body, status: proposal.status,
+          proposal: { editPolicy: 'email_fields', canDeriveManualReply: false, id: proposal.id, kind: 'email', title: proposal.title, body: proposal.body, status: proposal.status,
             revision: proposal.revision, accountId, recipients: proposal.recipients, email: { operation: proposal.email!.operation, to: proposal.email!.to, cc: proposal.email!.cc,
               bcc: proposal.email!.bcc, subject: proposal.email!.subject, text: proposal.email!.text, attachments: [] } } }) };
       }
@@ -347,7 +347,7 @@ describe('CloudWorkspace safe DTO presentation', () => {
       const path = String(input); const method = init?.method ?? 'GET';
       if (path === '/api/workspace/snapshot' && method === 'GET') return { ok: true, status: 200, json: async () => snapshot };
       if (path.startsWith('/api/workspace/proposals/review?') && method === 'GET') return { ok: true, status: 200, json: async () => ({ schemaVersion: 1, workspaceId, privacyEpoch: 3,
-        revision: 7, proposal: { editPolicy: 'email_fields', id: proposal.id, kind: 'email', title: proposal.title, body: proposal.body, status: proposal.status,
+        revision: 7, proposal: { editPolicy: 'email_fields', canDeriveManualReply: false, id: proposal.id, kind: 'email', title: proposal.title, body: proposal.body, status: proposal.status,
           revision: proposal.revision, accountId, recipients: proposal.recipients, email: { operation: proposal.email!.operation, to: proposal.email!.to, cc: proposal.email!.cc,
             bcc: proposal.email!.bcc, subject: proposal.email!.subject, text: proposal.email!.text, attachments: [] } } }) };
       if (path === '/api/workspace/commands' && method === 'POST') {
@@ -1241,7 +1241,7 @@ describe('CloudWorkspace safe DTO presentation', () => {
         bodyCache: { status: 'current' as const, completeness: 'unavailable' as const, representation: 'none' as const } })),
       readMailReplyText: vi.fn(async () => ({ schemaVersion: 1 as const, workspaceId, privacyEpoch: 3, revision: 7, status: 'current' as const })),
       readProposalReview: vi.fn(async () => ({ schemaVersion: 1 as const, workspaceId, privacyEpoch: 3, revision: 7, proposal: {
-        editPolicy: 'email_fields' as const, id: proposalId, kind: 'email' as const, title: 'Editable proposal', body: 'Saved body', status: 'draft' as const, revision: 1,
+        editPolicy: 'email_fields' as const, canDeriveManualReply: false, id: proposalId, kind: 'email' as const, title: 'Editable proposal', body: 'Saved body', status: 'draft' as const, revision: 1,
         accountId: '22222222-2222-4222-8222-222222222222', recipients: ['person@example.test'],
         email: { operation: 'draft' as const, to: ['person@example.test'], cc: [], bcc: [], subject: 'Saved subject', text: 'Saved text', attachments: [] },
       } })),
@@ -1306,7 +1306,7 @@ describe('CloudWorkspace safe DTO presentation', () => {
       readSnapshot: () => snapshot, readOperation: () => ({ busy: false, pending: false, refreshRequired: false }),
       readMailReplySource: vi.fn(async () => { throw new Error('not used'); }), readMailReplyText: vi.fn(async () => { throw new Error('not used'); }),
       readProposalReview: vi.fn(async () => ({ schemaVersion: 1 as const, workspaceId, privacyEpoch: 3, revision: 7, proposal: {
-        editPolicy: 'read_only' as const, id: proposalId, kind: 'task' as const, title: proposal.title, body: proposal.body, status: reviewStatus,
+        editPolicy: 'read_only' as const, canDeriveManualReply: false, id: proposalId, kind: 'task' as const, title: proposal.title, body: proposal.body, status: reviewStatus,
         revision: proposal.revision, recipients: [], dueAt: proposal.dueAt,
       } })),
       readDispatchReview: vi.fn(async () => ({ schemaVersion: 1 as const, workspaceId, privacyEpoch: 3, revision: 7 })),
@@ -1403,7 +1403,7 @@ describe('CloudWorkspace safe DTO presentation', () => {
       readSnapshot: () => snapshot, readOperation: () => ({ busy: false, pending: false, refreshRequired: false }),
       readMailReplySource: vi.fn(async () => { throw new Error('not used'); }), readMailReplyText: vi.fn(async () => { throw new Error('not used'); }),
       readProposalReview: vi.fn(async () => ({ schemaVersion: 1 as const, workspaceId, privacyEpoch: 3, revision: 7, proposal: {
-        editPolicy: 'read_only' as const, id: proposalId, kind: 'email' as const, title: 'Batch reply for review', body: 'A fixed server-generated reply.',
+        editPolicy: 'read_only' as const, canDeriveManualReply: false, id: proposalId, kind: 'email' as const, title: 'Batch reply for review', body: 'A fixed server-generated reply.',
         status: 'draft' as const, revision: 3, accountId: state.accounts[0].id, recipients: ['sender@example.test'],
         email: { operation: 'draft' as const, to: ['sender@example.test'], cc: [], bcc: [], subject: 'Re: Planning', text: 'We can meet Tuesday.',
           attachments: [{ fileName: 'agenda.pdf', mimeType: 'application/pdf', sizeBytes: 128 }] },
@@ -1438,7 +1438,7 @@ describe('CloudWorkspace safe DTO presentation', () => {
       readSnapshot: () => snapshot, readOperation: () => ({ busy: false, pending: false, refreshRequired: false }),
       readMailReplySource: vi.fn(async () => { throw new Error('not used'); }), readMailReplyText: vi.fn(async () => { throw new Error('not used'); }),
       readProposalReview: vi.fn(async () => ({ schemaVersion: 1 as const, workspaceId, privacyEpoch: 3, revision: 7, proposal: {
-        editPolicy: 'event_fields' as const, id: proposalId, kind: 'event' as const, title: 'Planning session', body: 'Review schedule', status: 'draft' as const, revision: 1,
+        editPolicy: 'event_fields' as const, canDeriveManualReply: false, id: proposalId, kind: 'event' as const, title: 'Planning session', body: 'Review schedule', status: 'draft' as const, revision: 1,
         accountId: state.accounts[0].id, calendarId: 'calendar-a', recipients: [],
         event: { title: 'Planning session', description: 'Review schedule', start: '2026-10-20T10:00:00Z', end: '2026-10-20T11:00:00Z',
           timeZone: 'Asia/Singapore', attendees: [], invitePolicy: 'none' as const },

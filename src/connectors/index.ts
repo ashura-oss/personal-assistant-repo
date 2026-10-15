@@ -1,4 +1,4 @@
-import type { Account, AccountCapability, EmailProposalPayload, EventProposalPayload } from '../core';
+import type { Account, AccountCapability, EmailProposalPayload, EventProposalPayload, ManualMailReplyProvenance } from '../core';
 import { canonicalMailReplySource, replyReferences as frozenReplyReferences, validateReplyBinding, type MailReplyProvenance } from '../mailReply';
 import { boundGraphText, extractGmailMessageText, extractGraphHtmlText, type MailTextCompleteness, type MailTextRepresentation } from './mailText';
 import { scopeGrantsCapability } from './oauth';
@@ -79,7 +79,7 @@ export interface ApprovedDispatch {
   body: string;
   calendarId?: string;
   payload: EmailProposalPayload | EventProposalPayload;
-  replySource?: MailReplyProvenance;
+  replySource?: MailReplyProvenance | ManualMailReplyProvenance;
   mailReplyBatchBinding?: { jobId: string; provenanceCanonical: string; activationOperation?: 'send' };
 }
 
@@ -1415,10 +1415,12 @@ export class ConnectorClient {
       if (proofStatus === 'required_missing') throw new Error('Refresh the selected reply sources before dispatch.');
       if (envelope.operation === 'send') {
         const binding = envelope.mailReplyBatchBinding;
-        if (!envelope.replySource.batchJobId || !binding || binding.jobId !== envelope.replySource.batchJobId || binding.activationOperation !== 'send') {
+        if (envelope.replySource.version === 3) {
+          if (envelope.replySource.operation !== 'send' || binding !== undefined) throw new Error('The manual reply operation does not match its explicit review.');
+        } else if (!envelope.replySource.batchJobId || !binding || binding.jobId !== envelope.replySource.batchJobId || binding.activationOperation !== 'send') {
           throw new Error('Only an activated Batch reply can be sent; unlinked reply proposals can only create a draft.');
         }
-      } else if (envelope.replySource.batchJobId) {
+      } else if (envelope.replySource.version === 2 && envelope.replySource.batchJobId) {
         const binding = envelope.mailReplyBatchBinding;
         if (!binding || binding.jobId !== envelope.replySource.batchJobId || binding.activationOperation !== undefined) {
           throw new Error('The saved Batch reply operation does not match its approved dispatch. Review the result again.');
@@ -1463,10 +1465,11 @@ export class ConnectorClient {
     if (typeof p.text !== 'string' || p.subject.length > 998 || p.attachments.length > 10) throw new Error('Email payload exceeds limits.');
     if (p.reply) {
       if (operation !== 'draft' && operation !== 'send' || envelope.operation !== operation) throw new Error('Reply operation does not match its approved action.');
-      if (operation === 'send' && (!envelope.replySource?.batchJobId || envelope.mailReplyBatchBinding?.jobId !== envelope.replySource.batchJobId ||
+      if (operation === 'send' && envelope.replySource?.version === 2 && (!envelope.replySource.batchJobId || envelope.mailReplyBatchBinding?.jobId !== envelope.replySource.batchJobId ||
           envelope.mailReplyBatchBinding.activationOperation !== 'send')) {
         throw new Error('Only an activated Batch reply can be sent; unlinked reply proposals can only create a draft.');
       }
+      if (operation === 'send' && envelope.replySource?.version === 3 && envelope.replySource.operation !== 'send') throw new Error('The manual reply operation does not match its explicit review.');
       validateReplyPayload(account, p, envelope.replySource, operation);
     }
     return p;

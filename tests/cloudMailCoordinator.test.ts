@@ -48,7 +48,7 @@ function makeCoordinator(initialProposalStatus: NonNullable<ProposalReviewReadDt
     readMailReplySource: vi.fn(async () => { throw new Error('not used'); }),
     readMailReplyText: vi.fn(async () => { throw new Error('not used'); }),
     readProposalReview: vi.fn(async (): Promise<ProposalReviewReadDto> => ({ schemaVersion: 1, workspaceId, privacyEpoch: 3, revision: 7, proposal: {
-      editPolicy: 'email_fields', id: proposalId, kind: 'email', title: 'Reply', body: 'Saved reply', status: proposalStatus, revision: 2, accountId, recipients: ['to@example.test'],
+      editPolicy: 'email_fields', canDeriveManualReply: false, id: proposalId, kind: 'email', title: 'Reply', body: 'Saved reply', status: proposalStatus, revision: 2, accountId, recipients: ['to@example.test'],
       email: { operation: 'draft', to: ['to@example.test'], cc: [], bcc: [], subject: 'Reply subject', text: 'Saved reply', attachments: [] },
     } })),
     readDispatchReview: vi.fn(async () => ({ schemaVersion: 1 as const, workspaceId, privacyEpoch: 3, revision: 7 })),

@@ -145,6 +145,19 @@ describe('immutable dispatch records', () => {
     const accepted = recordDispatchOutcome(restored, { outcome: 'accepted', at: '2026-10-12T01:02:10.000Z', remoteId: 'draft-1', replyDraftCheck: 'matches_approved' });
     const acceptedRestored = validateDispatchRecord(JSON.parse(JSON.stringify(accepted)));
     expect(acceptedRestored).toMatchObject({ outcome: 'accepted', replyDraftCheck: 'matches_approved', remoteId: 'draft-1' });
+
+    const manualProvenance = { version: 3 as const, kind: 'manual_mail_reply' as const, sourceDigest: digest, source,
+      expiresAt: '2026-10-12T01:15:00.000Z', outputPolicyVersion: 2 as const, operation: 'send' as const, lineage: { kind: 'manual' as const } };
+    const editedManualReply: Proposal = { ...proposal, id: 'manual-mail-reply', revision: 4, approvedRevision: 4, sourceActionKey: 'mail-action',
+      provenance: manualProvenance, title: 'Re: Project update', body: 'Edited reply body.',
+      email: { ...proposal.email!, operation: 'send', to: ['new-person@example.test'], cc: ['another@example.test'], text: 'Edited reply body.' } };
+    const manualSend = createDispatchRecord({ id: 'manual-mail-send', dispatchStartedAt: startedAt, proposal: editedManualReply, account: googleAccount(), mailReplyActivationOperation: 'send' });
+    expect(manualSend).toMatchObject({ operation: 'send', sourceProvenance: { version: 3, operation: 'send', lineage: { kind: 'manual' } },
+      payload: { kind: 'email', email: { to: ['new-person@example.test'], cc: ['another@example.test'], text: 'Edited reply body.' } } });
+    expect(validateDispatchRecord(JSON.parse(JSON.stringify(manualSend)))).toMatchObject({ operation: 'send', sourceProvenance: { version: 3, operation: 'send' } });
+    expect(() => createDispatchRecord({ id: 'manual-mismatched-operation', dispatchStartedAt: startedAt,
+      proposal: { ...editedManualReply, email: { ...editedManualReply.email!, operation: 'draft' } }, account: googleAccount(), mailReplyActivationOperation: 'send' }))
+      .toThrow(/operation does not match/i);
   });
 
   it('binds Batch reply sends to an explicit Send activation while keeping Draft receipts unchanged', () => {
