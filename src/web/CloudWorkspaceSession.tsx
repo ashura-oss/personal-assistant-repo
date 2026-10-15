@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useSyncExternalStore } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { ActivityIndicator, Text, View } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import type { WorkspaceSnapshotDTO } from '../cloud/workspaceDto';
@@ -7,6 +7,9 @@ import { decodeWorkspaceSnapshotDTO } from '../cloud/workspaceSnapshotCodec';
 import { WorkspaceClientError, WorkspaceCommandNotStartedError, createWebWorkspaceClient, type WorkspaceClient, type WorkspaceCommandAdmission } from './workspaceClient';
 import type { AuthenticatedSession } from './authClient';
 import { CloudWorkspace } from './CloudWorkspace';
+import { createWebAudioUploadClient, type AudioUploadClient } from './audioClient';
+import { CloudVoiceCoordinator, type CloudVoiceCapturePort, type CloudVoiceCoordinatorState } from './cloudVoiceCoordinator';
+import { useCloudAudioCapture } from './useCloudAudioCapture';
 import { C, s } from '../ui/theme';
 
 export type CloudWorkspaceSessionState = Readonly<{
@@ -14,6 +17,7 @@ export type CloudWorkspaceSessionState = Readonly<{
   snapshot?: WorkspaceSnapshotDTO;
   busy: boolean;
   pendingCommand?: Readonly<{ commandId: string; kind: WorkspaceCommand['kind'] }>;
+  voice?: CloudVoiceCoordinatorState;
   refreshRequired: boolean;
   error?: string;
 }>;
@@ -25,12 +29,32 @@ export class CloudWorkspaceSessionStore {
   private value: CloudWorkspaceSessionState = INITIAL_STATE;
   private readonly listeners = new Set<() => void>();
   private client?: WorkspaceClient;
+  private audioClient?: AudioUploadClient;
+  private voiceCoordinator?: CloudVoiceCoordinator;
+  private unsubscribeVoice?: () => void;
   private ownerGeneration = 0;
   private active = false;
   private operationInFlight = false;
   private operationTicket = 0;
 
-  constructor(private readonly session: AuthenticatedSession) {}
+  readonly voiceActions: CloudWorkspaceVoiceActions;
+
+  constructor(private readonly session: AuthenticatedSession) {
+    this.voiceActions = Object.freeze({
+      start: () => this.currentVoiceCoordinator().start(),
+      pause: () => this.currentVoiceCoordinator().pause(),
+      resume: () => this.currentVoiceCoordinator().resume(),
+      stopAndSave: () => this.currentVoiceCoordinator().stopAndSave(),
+      uploadStoppedClip: () => this.currentVoiceCoordinator().uploadStoppedClip(),
+      saveReady: () => this.currentVoiceCoordinator().saveReady(),
+      inspectUpload: (uploadId: string) => this.currentVoiceCoordinator().inspectUpload(uploadId),
+      listHistory: (cursor?: string) => this.currentVoiceCoordinator().listHistory(cursor),
+      inspectAdoption: (commandId?: string) => this.currentVoiceCoordinator().inspectAdoption(commandId),
+      discardLocalClip: () => this.currentVoiceCoordinator().discardLocalClip(),
+      cancelCurrentRecording: () => this.currentVoiceCoordinator().cancelCurrentRecording(),
+      resetAfterSave: () => this.currentVoiceCoordinator().resetAfterSave(),
+    });
+  }
 
   readonly getSnapshot = (): CloudWorkspaceSessionState => this.value;
 
@@ -40,7 +64,11 @@ export class CloudWorkspaceSessionStore {
   };
 
   private publish(next: CloudWorkspaceSessionState): void {
-    this.value = Object.freeze(next);
+    const { voice: _callerVoice, ...withoutCallerVoice } = next;
+    void _callerVoice;
+    const coordinator = this.active ? this.voiceCoordinator : undefined;
+    const voice = coordinator?.getSnapshot();
+    this.value = Object.freeze({ ...withoutCallerVoice, ...(voice ? { voice } : {}) });
     for (const listener of this.listeners) listener();
   }
 
@@ -58,8 +86,9 @@ export class CloudWorkspaceSessionStore {
     if (this.isCurrent(owner)) this.publish({ ...this.value, busy: false });
   }
 
-  start(): () => void {
-    this.disposeClient();
+  start(getCapture?: () => CloudVoiceCapturePort): () => void {
+    this.invalidateGeneration();
+    this.disposeResources();
     this.operationInFlight = false;
     this.operationTicket += 1;
     this.active = true;
@@ -69,19 +98,51 @@ export class CloudWorkspaceSessionStore {
       decodeSnapshot: decodeWorkspaceSnapshotDTO,
       assertCurrent: () => { if (!this.isCurrent(owner)) throw new Error('Cloud workspace owner changed.'); },
     });
+    if (getCapture) {
+      this.audioClient = createWebAudioUploadClient(this.session, {
+        assertCurrent: () => { if (!this.isCurrent(owner)) throw new Error('Cloud workspace owner changed.'); },
+      });
+      const coordinator = new CloudVoiceCoordinator({
+        audio: this.audioClient,
+        workspace: {
+          execute: (command, onAdmitted) => this.execute(command, onAdmitted),
+          inspect: (commandId) => this.inspect(commandId),
+          refresh: () => this.refresh(),
+          readSnapshot: () => this.isCurrent(owner) ? this.value.snapshot : undefined,
+        },
+        getCapture,
+        disposeAudioOnDispose: false,
+      });
+      this.voiceCoordinator = coordinator;
+      this.unsubscribeVoice = coordinator.subscribe(() => {
+        if (this.isCurrent(owner) && this.voiceCoordinator === coordinator) {
+          this.publish({ ...this.value, voice: coordinator.getSnapshot() });
+        }
+      });
+    }
     this.publish({ status: 'loading', busy: false, refreshRequired: false });
     void this.loadInitial(owner, operation);
     return () => {
       if (!this.isCurrent(owner)) return;
-      this.active = false;
-      this.ownerGeneration += 1;
-      this.operationInFlight = false;
-      this.operationTicket += 1;
-      this.disposeClient();
+      this.invalidateGeneration();
+      this.disposeResources();
     };
   }
 
-  private disposeClient(): void {
+  private invalidateGeneration(): void {
+    this.active = false;
+    this.ownerGeneration += 1;
+    this.operationInFlight = false;
+    this.operationTicket += 1;
+  }
+
+  private disposeResources(): void {
+    this.unsubscribeVoice?.();
+    this.unsubscribeVoice = undefined;
+    this.voiceCoordinator?.dispose();
+    this.voiceCoordinator = undefined;
+    this.audioClient?.dispose();
+    this.audioClient = undefined;
     this.client?.dispose();
     this.client = undefined;
   }
@@ -89,6 +150,21 @@ export class CloudWorkspaceSessionStore {
   private currentClient(): WorkspaceClient {
     if (!this.active || !this.client) throw new WorkspaceClientError('disposed', 'This workspace session is no longer active.');
     return this.client;
+  }
+
+  private currentVoiceCoordinator(): CloudVoiceCoordinator {
+    if (!this.active || !this.voiceCoordinator) {
+      throw new WorkspaceClientError('disposed', 'This workspace voice session is no longer active.');
+    }
+    return this.voiceCoordinator;
+  }
+
+  async cancelTranscription(commandId: string): Promise<'cancellation_requested' | 'not_running'> {
+    const owner = this.ownerGeneration;
+    const client = this.currentClient();
+    const result = await client.cancelTranscription(commandId);
+    if (!this.isCurrent(owner)) throw new WorkspaceClientError('stale', 'The workspace session changed.');
+    return result;
   }
 
   private async loadInitial(owner: number, operation: number): Promise<void> {
@@ -140,8 +216,14 @@ export class CloudWorkspaceSessionStore {
       throw error;
     }
     this.publish({ ...this.value, busy: true, error: undefined });
+    let publishedCommandId: string | undefined;
     try {
-      const response = await client.execute(command, onAdmitted);
+      const response = await client.execute(command, (envelope) => {
+        if (!this.isCurrent(owner)) throw new WorkspaceClientError('stale', 'The workspace session changed.');
+        publishedCommandId = envelope.commandId;
+        this.publish({ ...this.value, pendingCommand: { commandId: envelope.commandId, kind: envelope.command.kind } });
+        onAdmitted?.(envelope);
+      });
       if (!this.isCurrent(owner)) throw new WorkspaceClientError('stale', 'The workspace session changed.');
       const snapshot = response.snapshot ?? this.value.snapshot;
       const refreshRequired = !response.snapshot;
@@ -153,7 +235,14 @@ export class CloudWorkspaceSessionStore {
     } catch (error) {
       if (this.isCurrent(owner)) {
         const pending = client.getPendingCommand();
-        this.publish({ ...this.value, busy: false, ...(pending ? { pendingCommand: { commandId: pending.commandId, kind: pending.command.kind } } : {}),
+        const currentPending = this.value.pendingCommand;
+        let base = this.value;
+        if (!pending && publishedCommandId && currentPending?.commandId === publishedCommandId) {
+          const { pendingCommand: _discarded, ...withoutPending } = this.value;
+          void _discarded;
+          base = withoutPending;
+        }
+        this.publish({ ...base, busy: false, ...(pending ? { pendingCommand: { commandId: pending.commandId, kind: pending.command.kind } } : {}),
           ...(error instanceof WorkspaceCommandNotStartedError ? { error: this.message(error) } : { refreshRequired: true, error: this.message(error) }) });
       }
       throw error;
@@ -187,19 +276,35 @@ export class CloudWorkspaceSessionStore {
 
   /** Invalidates every in-flight read and write before clearing the session-owned client. */
   invalidate(): void {
-    this.active = false;
-    this.ownerGeneration += 1;
-    this.operationInFlight = false;
-    this.operationTicket += 1;
-    this.disposeClient();
+    this.invalidateGeneration();
+    this.disposeResources();
     this.publish({ status: 'loading', busy: false, refreshRequired: true });
   }
 }
 
+export type CloudWorkspaceVoiceActions = Readonly<{
+  start(): Promise<void>;
+  pause(): Promise<void>;
+  resume(): Promise<void>;
+  stopAndSave(): Promise<void>;
+  uploadStoppedClip(): Promise<void>;
+  saveReady(): Promise<void>;
+  inspectUpload(uploadId: string): ReturnType<CloudVoiceCoordinator['inspectUpload']>;
+  listHistory(cursor?: string): ReturnType<CloudVoiceCoordinator['listHistory']>;
+  inspectAdoption(commandId?: string): Promise<void>;
+  discardLocalClip(): Promise<void>;
+  cancelCurrentRecording(): Promise<void>;
+  resetAfterSave(): void;
+}>;
+
 export function CloudWorkspaceSession({ session, onLogout }: { session: AuthenticatedSession; onLogout: () => void }) {
+  const capture = useCloudAudioCapture();
+  const captureRef = useRef(capture);
+  useLayoutEffect(() => { captureRef.current = capture; }, [capture]);
+  const getCapture = useCallback(() => captureRef.current, []);
   const [store] = useState(() => new CloudWorkspaceSessionStore(session));
   const state = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
-  useEffect(() => store.start(), [store]);
+  useEffect(() => store.start(getCapture), [store, getCapture]);
 
   if (!state.snapshot) {
     return (
