@@ -5,6 +5,13 @@ import type { DispatchReviewReadDto, MailReplyBatchReviewReadDto, MailReplySourc
 import type { ReplyBatchPlanRead } from './cloudMailClient';
 import { WorkspaceCommandNotStartedError, WorkspaceClientError, type WorkspaceCommandAdmission } from './workspaceClient';
 
+type MailIdentityFields = Readonly<{ providerNamespace?: string; clientId?: string; subject: string; issuer?: string; tenantId?: string; resourceUserId?: string }>;
+function sameMailAccountIdentity(a: MailIdentityFields | undefined, b: MailIdentityFields | undefined): boolean {
+  return Boolean(a && b && a.providerNamespace && b.providerNamespace && a.providerNamespace === b.providerNamespace && (a.clientId ?? '') === (b.clientId ?? '') &&
+    a.subject === b.subject && (a.issuer ?? '') === (b.issuer ?? '') && (a.tenantId ?? '') === (b.tenantId ?? '') &&
+    (a.resourceUserId ?? '') === (b.resourceUserId ?? ''));
+}
+
 export type CloudMailDraft = Readonly<{
   messageId: string;
   accountId: string;
@@ -29,6 +36,7 @@ export type CloudProposalDraft = Readonly<{
   bcc: string;
   subject: string;
   text: string;
+  operation: 'draft' | 'send';
   eventTitle: string;
   eventDescription: string;
   eventStart: string;
@@ -53,6 +61,10 @@ export type CloudMailCoordinatorState = Readonly<{
   proposalDrafts?: Readonly<Record<string, CloudProposalDraft>>;
   proposalSavingId?: string;
   proposalSavingGeneration?: number;
+  manualReplyDeriveOperations?: Readonly<Record<string, 'draft' | 'send'>>;
+  manualReplyDerivation?: Readonly<{ parentProposalId: string; parentRevision: number; accountId: string; connectionGeneration: number;
+    sourceDigest: string; operation: 'draft' | 'send'; commandId?: string }>;
+  manualReplySuccessor?: Readonly<{ parentProposalId: string; parentRevision: number; childProposalId: string; confirmedChildRevision: number }>;
   dispatchReview?: DispatchReviewReadDto;
   dispatchReviewId?: string;
   batchReview?: MailReplyBatchReviewReadDto;
@@ -134,7 +146,7 @@ export class CloudMailCoordinator {
   private proposalDraftFrom(proposal: NonNullable<ProposalReviewReadDto['proposal']>): CloudProposalDraft {
     return Object.freeze({ proposalId: proposal.id, baseRevision: proposal.revision, generation: ++this.proposalGeneration, dirty: false,
       to: proposal.email?.to.join(', ') ?? '', cc: proposal.email?.cc.join(', ') ?? '', bcc: proposal.email?.bcc.join(', ') ?? '',
-      subject: proposal.email?.subject ?? '', text: proposal.email?.text ?? '', eventTitle: proposal.event?.title ?? '',
+      subject: proposal.email?.subject ?? '', text: proposal.email?.text ?? '', operation: proposal.email?.operation ?? 'draft', eventTitle: proposal.event?.title ?? '',
       eventDescription: proposal.event?.description ?? '', eventStart: proposal.event?.start ?? '', eventEnd: proposal.event?.end ?? '',
       eventTimeZone: proposal.event?.timeZone ?? this.workspace.readSnapshot()?.state.settings.timezone ?? 'UTC',
       eventAttendees: proposal.event?.attendees.join(', ') ?? '', eventInvite: proposal.event?.invitePolicy ?? 'none', calendarId: proposal.calendarId ?? '' });
@@ -145,7 +157,21 @@ export class CloudMailCoordinator {
   updateProposalDraft(proposalId: string, patch: Partial<Omit<CloudProposalDraft, 'proposalId' | 'baseRevision' | 'generation' | 'dirty'>>): void {
     const proposal = this.value.proposalReview?.proposal;
     const draft = this.getProposalDraft(proposalId);
-    if (!proposal || proposal.id !== proposalId || !draft || proposal.editPolicy === 'read_only') return;
+    if (!proposal || proposal.id !== proposalId || !draft || proposal.supersededByProposalId || !['draft', 'failed', 'approved'].includes(proposal.status) ||
+        proposal.editPolicy === 'read_only') return;
+    const keys = Object.keys(patch);
+    if (proposal.editPolicy === 'manual_reply_fields' && keys.some((key) => !['to', 'cc', 'text', 'operation'].includes(key))) return;
+    if (proposal.editPolicy === 'source_reply_fields' && keys.some((key) => !['to', 'cc', 'text'].includes(key))) return;
+    if (patch.operation && patch.operation !== 'draft' && patch.operation !== 'send') return;
+    if (patch.operation === 'send' && (!proposal.accountId || !this.account(proposal.accountId)?.capabilities?.includes('mail.send'))) {
+      this.publish({ ...this.value, notice: 'Send permission is not available for this connected account.' });
+      return;
+    }
+    if (proposal.editPolicy === 'manual_reply_fields' && patch.operation === 'draft' &&
+        (!proposal.accountId || !this.account(proposal.accountId)?.capabilities?.includes('mail.draft'))) {
+      this.publish({ ...this.value, notice: 'Draft permission is not available for this connected account.' });
+      return;
+    }
     const generation = ++this.proposalGeneration;
     this.publish({ ...this.value, proposalDrafts: { ...this.value.proposalDrafts, [proposalId]: Object.freeze({ ...draft, ...patch, generation, dirty: true }) } });
   }
@@ -158,7 +184,178 @@ export class CloudMailCoordinator {
 
   private proposalMutationReady(proposal: NonNullable<ProposalReviewReadDto['proposal']>): boolean {
     const draft = this.getProposalDraft(proposal.id);
-    return Boolean(draft && !draft.dirty && draft.baseRevision === proposal.revision && !this.value.proposalSavingId);
+    return Boolean(!proposal.supersededByProposalId && draft && !draft.dirty && draft.baseRevision === proposal.revision && !this.value.proposalSavingId);
+  }
+
+  setManualReplyDeriveOperation(proposalId: string, operation: 'draft' | 'send'): void {
+    const proposal = this.value.proposalReview?.proposal;
+    if (!proposal || proposal.id !== proposalId || !proposal.canDeriveManualReply || proposal.supersededByProposalId) return;
+    if (operation === 'draft' && (!proposal.accountId || !this.account(proposal.accountId)?.capabilities?.includes('mail.draft'))) {
+      this.publish({ ...this.value, notice: 'Draft permission is not available for this connected account.' });
+      return;
+    }
+    if (operation === 'send' && (!proposal.accountId || !this.account(proposal.accountId)?.capabilities?.includes('mail.send'))) {
+      this.publish({ ...this.value, notice: 'Send permission is not available for this connected account.' });
+      return;
+    }
+    this.publish({ ...this.value, manualReplyDeriveOperations: { ...this.value.manualReplyDeriveOperations, [proposalId]: operation }, notice: undefined });
+  }
+
+  async deriveManualReply(proposalId: string): Promise<void> {
+    const proposal = this.value.proposalReview?.proposal;
+    if (!proposal || proposal.id !== proposalId || !proposal.canDeriveManualReply || proposal.supersededByProposalId ||
+        proposal.kind !== 'email' || !proposal.accountId || !proposal.email || this.value.manualReplyDerivation || this.heldCommandId) return;
+    const snapshot = this.workspace.readSnapshot();
+    const savedParent = snapshot?.state.proposals.find((item) => item.id === proposalId);
+    const savedParentProvenance = savedParent?.provenance;
+    const savedSourceDigest = savedParentProvenance && (savedParentProvenance.version === 2 || savedParentProvenance.version === 3)
+      ? savedParentProvenance.sourceDigest : undefined;
+    const account = this.account(proposal.accountId);
+    const operation = this.value.manualReplyDeriveOperations?.[proposalId] ?? 'draft';
+    const draft = this.getProposalDraft(proposalId);
+    if (!savedParent || savedParent.revision !== proposal.revision || savedParent.supersededByProposalId ||
+        !savedSourceDigest || savedSourceDigest !== proposal.sourceDigest || !account || !Number.isSafeInteger(account.connectionGeneration) ||
+        !draft || draft.dirty || draft.baseRevision !== proposal.revision || !account.capabilities?.includes(operation === 'draft' ? 'mail.draft' : 'mail.send')) {
+      this.publish({ ...this.value, notice: 'This reply or its account permission changed. Refresh and review the saved source before creating a copy.' });
+      return;
+    }
+    const context = Object.freeze({ parentProposalId: proposalId, parentRevision: proposal.revision, accountId: account.id,
+      connectionGeneration: account.connectionGeneration!, sourceDigest: savedSourceDigest, operation });
+    const owner = this.owner();
+    let admittedCommandId: string | undefined;
+    try {
+      const response = await this.runCommand({ kind: 'mail.reply.derive', parentProposalId: proposalId, expectedParentRevision: proposal.revision,
+        accountId: account.id, expectedConnectionGeneration: account.connectionGeneration!, operation }, 'mail.reply.derive', undefined,
+        { strictAdmissionIdentity: true, onAdmitted: (commandId) => {
+          admittedCommandId = commandId;
+          if (this.isOwner(owner)) this.publish({ ...this.value, manualReplyDerivation: { ...context, commandId }, notice: 'Creating an editable copy from the saved reply. No model request will be made.' });
+        } });
+      if (!response || !this.isOwner(owner)) return;
+      this.heldCommandId = admittedCommandId;
+      this.publish({ ...this.value, manualReplyDerivation: { ...context, ...(admittedCommandId ? { commandId: admittedCommandId } : {}) } });
+      const receipt = response.receipt;
+      if (response.commandId !== admittedCommandId || response.status !== 'finished' || !receipt || receipt.commandId !== admittedCommandId ||
+          receipt.kind !== 'mail.reply.derive' || receipt.parentProposalId !== proposalId ||
+          receipt.operation !== operation || !receipt.proposalId || receipt.objectId !== receipt.proposalId || !Number.isSafeInteger(receipt.proposalRevision)) {
+        this.holdManualReplyDerivation(context, admittedCommandId, 'The copy command did not return its exact parent, operation, and child receipt. Inspect it before continuing.');
+        return;
+      }
+      const confirmed = await this.confirmManualReplySuccessor(context, response, owner, false);
+      if (!confirmed && this.isOwner(owner)) this.holdManualReplyDerivation(context, admittedCommandId,
+        'The copy command was admitted, but its saved result could not be verified. Inspect the exact command before continuing.');
+    } catch (error) {
+      if (!this.isOwner(owner)) return;
+      if (error instanceof WorkspaceCommandNotStartedError && !admittedCommandId) {
+        this.publish({ ...this.value, manualReplyDerivation: undefined, notice: error.message });
+      } else {
+        this.holdManualReplyDerivation(context, admittedCommandId, error instanceof WorkspaceClientError ? error.message : 'The copy command could not be confirmed. Inspect its exact receipt; it will not be retried automatically.');
+      }
+    }
+  }
+
+  private holdManualReplyDerivation(context: NonNullable<CloudMailCoordinatorState['manualReplyDerivation']>, commandId: string | undefined, notice: string): void {
+    this.heldCommandId = commandId;
+    this.publish({ ...this.value, manualReplyDerivation: { ...context, ...(commandId ? { commandId } : {}) }, replyHeldCommand: commandId,
+      replyHeldKind: 'mail.reply.derive', notice });
+  }
+
+  private async confirmManualReplySuccessor(context: NonNullable<CloudMailCoordinatorState['manualReplyDerivation']>, response: WorkspaceCommandResponse,
+    owner: ReturnType<CloudMailCoordinator['owner']>, forceRefresh: boolean): Promise<boolean> {
+    const receipt = response.receipt;
+    if (response.status !== 'finished' || !receipt || receipt.kind !== 'mail.reply.derive' || receipt.commandId !== response.commandId ||
+        receipt.parentProposalId !== context.parentProposalId || receipt.operation !== context.operation || !receipt.proposalId ||
+        receipt.objectId !== receipt.proposalId || !Number.isSafeInteger(receipt.proposalRevision)) return false;
+    const refreshed = forceRefresh ? await this.workspace.refresh() : await this.refreshAfterReceipt(owner);
+    if (!refreshed || !this.isOwner(owner)) return false;
+    const parent = refreshed.state.proposals.find((item) => item.id === context.parentProposalId);
+    const child = refreshed.state.proposals.find((item) => item.id === receipt.proposalId);
+    const account = refreshed.state.accounts.find((item) => item.id === context.accountId);
+    const parentProvenance = parent?.provenance && (parent.provenance.version === 2 || parent.provenance.version === 3) ? parent.provenance : undefined;
+    const childProvenance = child?.provenance;
+    if (!parent || parent.revision !== context.parentRevision || parent.supersededByProposalId !== receipt.proposalId ||
+        !parentProvenance || parentProvenance.sourceDigest !== context.sourceDigest || !child || child.revision !== receipt.proposalRevision || child.accountId !== context.accountId ||
+        !parent.provenance || !childProvenance || childProvenance.version !== 3 || childProvenance.kind !== 'manual_mail_reply' ||
+        childProvenance.operation !== context.operation || childProvenance.sourceDigest !== parentProvenance.sourceDigest ||
+        childProvenance.source.accountId !== context.accountId || childProvenance.source.connectionGeneration !== context.connectionGeneration ||
+        !sameMailAccountIdentity(account?.identity, childProvenance.source.identity) ||
+        childProvenance.lineage.kind !== 'derived' || childProvenance.lineage.parentProposalId !== context.parentProposalId ||
+        childProvenance.lineage.parentRevision !== context.parentRevision || !account?.connected || account.authStatus !== 'connected' ||
+        account.connectionGeneration !== context.connectionGeneration) {
+      this.holdManualReplyDerivation(context, response.commandId, 'The copy receipt is saved, but its current source and account binding could not be verified. Refresh before opening or continuing.');
+      return false;
+    }
+    const review = await this.workspace.readProposalReview(child.id, refreshed.revision);
+    if (!this.isOwner(owner)) return false;
+    const latest = this.workspace.readSnapshot();
+    if (!latest || latest.workspaceId !== owner.workspaceId || latest.privacyEpoch !== owner.privacyEpoch || latest.revision !== refreshed.revision ||
+        review.revision !== refreshed.revision || review.proposal?.id !== child.id || review.proposal.revision !== child.revision ||
+        review.proposal.editPolicy !== 'manual_reply_fields' || review.proposal.accountId !== context.accountId ||
+        review.proposal.sourceDigest !== childProvenance.sourceDigest || review.proposal.email?.operation !== context.operation) {
+      this.holdManualReplyDerivation(context, response.commandId, 'The copy was saved, but its current review could not be confirmed. Refresh before opening or continuing.');
+      return false;
+    }
+    this.heldCommandId = undefined;
+    this.publish({ ...this.value, manualReplyDerivation: undefined, replyHeldCommand: undefined, replyHeldKind: undefined,
+      manualReplySuccessor: { parentProposalId: context.parentProposalId, parentRevision: context.parentRevision,
+        childProposalId: child.id, confirmedChildRevision: child.revision },
+      notice: 'Editable copy saved. Open it to review the recipients and message; no approval or send was performed.' });
+    return true;
+  }
+
+  async openManualReplySuccessor(): Promise<void> {
+    const successor = this.value.manualReplySuccessor;
+    if (!successor) return;
+    const owner = this.owner();
+    const snapshot = this.workspace.readSnapshot();
+    const parent = snapshot?.state.proposals.find((item) => item.id === successor.parentProposalId);
+    const child = snapshot?.state.proposals.find((item) => item.id === successor.childProposalId);
+    const parentProvenance = parent?.provenance && (parent.provenance.version === 2 || parent.provenance.version === 3) ? parent.provenance : undefined;
+    const childAccount = child?.accountId ? snapshot?.state.accounts.find((item) => item.id === child.accountId) : undefined;
+    if (!snapshot || !parent || parent.revision !== successor.parentRevision || parent.supersededByProposalId !== successor.childProposalId ||
+        !parentProvenance || !child || child.revision < successor.confirmedChildRevision || child.accountId !== parent.accountId ||
+        child.provenance?.version !== 3 || child.provenance.kind !== 'manual_mail_reply' || child.provenance.operation !== child.email?.operation ||
+        (child.provenance.operation !== 'draft' && child.provenance.operation !== 'send') || child.provenance.lineage.kind !== 'derived' ||
+        child.provenance.lineage.parentProposalId !== successor.parentProposalId || child.provenance.lineage.parentRevision !== successor.parentRevision ||
+        child.provenance.sourceDigest !== parentProvenance.sourceDigest || child.provenance.source.accountId !== parent.accountId ||
+        !childAccount?.connected || childAccount.authStatus !== 'connected' || childAccount.connectionGeneration !== child.provenance.source.connectionGeneration ||
+        !sameMailAccountIdentity(childAccount.identity, child.provenance.source.identity)) {
+      this.publish({ ...this.value, notice: 'The saved copy changed. Refresh the workspace before opening it.' });
+      return;
+    }
+    const sequence = ++this.reviewSequence;
+    try {
+      const currentChildRevision = child.revision;
+      const review = await this.workspace.readProposalReview(child.id, snapshot.revision);
+      if (sequence !== this.reviewSequence || !this.isOwner(owner)) return;
+      const latest = this.workspace.readSnapshot();
+      const latestParent = latest?.state.proposals.find((item) => item.id === parent.id);
+      const latestChild = latest?.state.proposals.find((item) => item.id === child.id);
+      const latestAccount = latest?.state.accounts.find((item) => item.id === child.accountId);
+      if (!latest || latest.revision !== snapshot.revision || review.revision !== snapshot.revision || review.proposal?.id !== child.id ||
+          review.proposal.revision !== currentChildRevision || review.proposal.editPolicy !== 'manual_reply_fields' ||
+          review.proposal.email?.operation !== latestChild?.email?.operation || review.proposal.sourceDigest !== child.provenance.sourceDigest ||
+          latestParent?.revision !== successor.parentRevision || latestParent.supersededByProposalId !== child.id ||
+          latestChild?.revision !== currentChildRevision || latestChild.accountId !== parent.accountId ||
+          latestChild.provenance?.version !== 3 || latestChild.provenance.kind !== 'manual_mail_reply' ||
+          latestChild.provenance.operation !== latestChild.email?.operation || latestChild.provenance.operation !== review.proposal.email?.operation ||
+          latestChild.provenance.lineage.kind !== 'derived' || latestChild.provenance.lineage.parentProposalId !== parent.id ||
+          latestChild.provenance.lineage.parentRevision !== successor.parentRevision || latestChild.provenance.sourceDigest !== parentProvenance.sourceDigest ||
+          latestChild.provenance.source.accountId !== parent.accountId ||
+          latestAccount?.connectionGeneration !== latestChild.provenance.source.connectionGeneration || !latestAccount.connected ||
+          !sameMailAccountIdentity(latestAccount.identity, latestChild.provenance.source.identity)) {
+        this.publish({ ...this.value, notice: 'The saved copy changed while opening it. Refresh and review the current workspace.' });
+        return;
+      }
+      const drafts = { ...this.value.proposalDrafts };
+      const existingDraft = drafts[child.id];
+      if (!existingDraft || (!existingDraft.dirty && existingDraft.baseRevision !== review.proposal.revision)) drafts[child.id] = this.proposalDraftFrom(review.proposal);
+      const hasDirtyRevisionConflict = Boolean(existingDraft?.dirty && existingDraft.baseRevision !== review.proposal.revision);
+      this.publish({ ...this.value, proposalReviewId: child.id, proposalReview: review, proposalDrafts: drafts,
+        notice: hasDirtyRevisionConflict ? 'The saved copy changed while you had unsaved edits. Your edits are preserved; review the current saved version before saving.' : undefined });
+    } catch (error) {
+      if (sequence === this.reviewSequence && this.isOwner(owner)) this.publish({ ...this.value,
+        notice: error instanceof WorkspaceClientError ? error.message : 'Could not open the saved editable copy.' });
+    }
   }
 
   selectAccount(accountId: string): void {
@@ -167,7 +364,8 @@ export class CloudMailCoordinator {
     this.publish({ ...this.value, selectedAccountId: accountId, notice: undefined });
   }
 
-  private async runCommand(command: WorkspaceCommand, expectedKind: WorkspaceCommand['kind'], expectedObjectId?: string): Promise<WorkspaceCommandResponse | undefined> {
+  private async runCommand(command: WorkspaceCommand, expectedKind: WorkspaceCommand['kind'], expectedObjectId?: string,
+    options: Readonly<{ strictAdmissionIdentity?: boolean; onAdmitted?: (commandId: string) => void }> = {}): Promise<WorkspaceCommandResponse | undefined> {
     const owner = this.owner();
     if (!this.mutationReady(owner)) { this.publish({ ...this.value, notice: 'Finish or inspect the pending workspace action, then refresh before making another change.' }); return undefined; }
     const token = this.tryLock();
@@ -175,13 +373,13 @@ export class CloudMailCoordinator {
     let admittedId: string | undefined;
     try {
       const response = await this.workspace.execute(command, (admission) => {
-        if (this.isOwner(owner)) admittedId = admission.commandId;
+        if (this.isOwner(owner)) { admittedId = admission.commandId; options.onAdmitted?.(admission.commandId); }
       });
       if (!this.isOwner(owner)) return undefined;
       const receipt = response.receipt;
       if (response.status !== 'finished' || !receipt || receipt.kind !== expectedKind || receipt.commandId !== response.commandId ||
           (expectedObjectId !== undefined && receipt.objectId !== expectedObjectId)) {
-        this.heldCommandId = admittedId ?? response.commandId;
+        this.heldCommandId = options.strictAdmissionIdentity ? admittedId : admittedId ?? response.commandId;
         this.publish({ ...this.value, replyHeldCommand: this.heldCommandId, replyHeldKind: expectedKind, notice: 'The action is awaiting its exact receipt. Inspect it before continuing; it will not be sent again.' });
         return response;
       }
@@ -356,8 +554,12 @@ export class CloudMailCoordinator {
     const proposal = this.value.proposalReview?.proposal;
     const draft = this.getProposalDraft(proposalId);
     if (!proposal || proposal.id !== proposalId || !['draft', 'failed', 'approved'].includes(proposal.status) ||
-        proposal.editPolicy === 'read_only' || !draft?.dirty || draft.baseRevision !== proposal.revision ||
+        proposal.supersededByProposalId || proposal.editPolicy === 'read_only' || !draft?.dirty || draft.baseRevision !== proposal.revision ||
         proposal.accountId !== accountId || !this.account(accountId, connectionGeneration) || this.value.proposalSavingId) return false;
+    if (proposal.editPolicy === 'manual_reply_fields' && (edit.kind !== 'email' || !proposal.email || edit.subject !== proposal.email.subject ||
+        edit.bcc.length !== 0 || (edit.operation === 'send' && !this.account(accountId, connectionGeneration)?.capabilities?.includes('mail.send')) ||
+        (edit.operation === 'draft' && !this.account(accountId, connectionGeneration)?.capabilities?.includes('mail.draft')))) return false;
+    if (proposal.editPolicy === 'source_reply_fields' && (edit.kind !== 'email' || edit.operation !== 'draft')) return false;
     const owner = this.owner();
     const generation = draft.generation;
     this.publish({ ...this.value, proposalSavingId: proposalId, proposalSavingGeneration: generation, notice: undefined });
@@ -390,7 +592,9 @@ export class CloudMailCoordinator {
 
   async approveProposal(proposalId: string): Promise<void> {
     const proposal = this.value.proposalReview?.proposal;
-    if (!proposal || proposal.id !== proposalId || !['draft', 'failed'].includes(proposal.status) || !this.proposalMutationReady(proposal)) return;
+    if (!proposal || proposal.id !== proposalId || proposal.supersededByProposalId || !['draft', 'failed'].includes(proposal.status) || !this.proposalMutationReady(proposal)) return;
+    if (proposal.editPolicy === 'manual_reply_fields' && (!proposal.accountId || !proposal.email?.operation ||
+        !this.account(proposal.accountId)?.capabilities?.includes(proposal.email.operation === 'send' ? 'mail.send' : 'mail.draft'))) return;
     const owner = this.owner();
     try {
       const response = await this.runCommand({ kind: 'proposals.approve', proposalId, expectedProposalRevision: proposal.revision }, 'proposals.approve', proposalId);
@@ -406,7 +610,9 @@ export class CloudMailCoordinator {
 
   async executeProposal(proposalId: string): Promise<void> {
     const proposal = this.value.proposalReview?.proposal;
-    if (!proposal || proposal.id !== proposalId || proposal.status !== 'approved' || !this.proposalMutationReady(proposal)) return;
+    if (!proposal || proposal.id !== proposalId || proposal.supersededByProposalId || proposal.status !== 'approved' || !this.proposalMutationReady(proposal)) return;
+    if (proposal.editPolicy === 'manual_reply_fields' && (!proposal.accountId || !proposal.email?.operation ||
+        !this.account(proposal.accountId)?.capabilities?.includes(proposal.email.operation === 'send' ? 'mail.send' : 'mail.draft'))) return;
     const owner = this.owner();
     try {
       const response = await this.runCommand({ kind: 'proposals.execute', proposalId, expectedProposalRevision: proposal.revision }, 'proposals.execute', proposalId);
@@ -435,7 +641,7 @@ export class CloudMailCoordinator {
 
   async dismissProposal(proposalId: string): Promise<void> {
     const proposal = this.value.proposalReview?.proposal;
-    if (!proposal || proposal.id !== proposalId || !['draft', 'failed', 'approved'].includes(proposal.status) || !this.proposalMutationReady(proposal)) return;
+    if (!proposal || proposal.id !== proposalId || proposal.supersededByProposalId || !['draft', 'failed', 'approved'].includes(proposal.status) || !this.proposalMutationReady(proposal)) return;
     const owner = this.owner();
     try {
       const response = await this.runCommand({ kind: 'proposals.dismiss', proposalId, expectedProposalRevision: proposal.revision }, 'proposals.dismiss', proposalId);
@@ -550,7 +756,7 @@ export class CloudMailCoordinator {
       }
       const drafts = { ...this.value.proposalDrafts };
       const existing = drafts[proposalId];
-      if (!existing || (!existing.dirty && existing.baseRevision !== review.proposal.revision)) drafts[proposalId] = this.proposalDraftFrom(review.proposal);
+      if (!existing || review.proposal.supersededByProposalId || (!existing.dirty && existing.baseRevision !== review.proposal.revision)) drafts[proposalId] = this.proposalDraftFrom(review.proposal);
       this.publish({ ...this.value, proposalReview: review, proposalDrafts: drafts });
     } catch (error) {
       if (sequence === this.reviewSequence && this.isOwner(owner)) this.publish({ ...this.value, notice: error instanceof WorkspaceClientError ? error.message : 'Could not open saved action details.' });
@@ -598,6 +804,18 @@ export class CloudMailCoordinator {
     try {
       const response = await this.workspace.inspect(commandId);
       if (!this.isOwner(owner)) return;
+      const derivation = this.value.manualReplyDerivation;
+      if (derivation && this.value.replyHeldKind === 'mail.reply.derive') {
+        const exactDeriveReceipt = response.commandId === commandId && response.status === 'finished' && response.receipt?.commandId === commandId &&
+          response.receipt.kind === 'mail.reply.derive' && response.receipt.parentProposalId === derivation.parentProposalId &&
+          response.receipt.operation === derivation.operation;
+        if (!exactDeriveReceipt) {
+          this.publish({ ...this.value, notice: 'The exact copy command is not confirmed yet. It remains inspect-only and will not be retried.' });
+          return;
+        }
+        await this.confirmManualReplySuccessor(derivation, response, owner, true);
+        return;
+      }
       const exactReceipt = response.commandId === commandId && response.status === 'finished' && response.receipt?.commandId === commandId &&
         response.receipt.kind === this.value.replyHeldKind;
       if (exactReceipt) {

@@ -26,8 +26,10 @@ export function CloudMailWorkspace({ coordinator, snapshot, busy, blocked }: Pro
   const messages = allMessages.slice(0, visibleMessageCount);
   const selectedProposal = state.proposalReview?.proposal;
   const snapshotProposal = selectedProposal ? dto.proposals.find((proposal) => proposal.id === selectedProposal.id && proposal.revision === selectedProposal.revision) : undefined;
+  const proposalSource = snapshotProposal?.provenance && (snapshotProposal.provenance.version === 2 || snapshotProposal.provenance.version === 3)
+    ? snapshotProposal.provenance.source : undefined;
   const proposalDraft = selectedProposal ? state.proposalDrafts?.[selectedProposal.id] : undefined;
-  const canEditProposal = Boolean(selectedProposal && ['draft', 'failed', 'approved'].includes(selectedProposal.status) && selectedProposal.editPolicy !== 'read_only');
+  const canEditProposal = Boolean(selectedProposal && !selectedProposal.supersededByProposalId && ['draft', 'failed', 'approved'].includes(selectedProposal.status) && selectedProposal.editPolicy !== 'read_only');
   const proposalConflict = Boolean(selectedProposal && proposalDraft && proposalDraft.baseRevision !== selectedProposal.revision);
   const proposalDirty = proposalDraft?.dirty === true;
   const proposalSaving = Boolean(selectedProposal && state.proposalSavingId === selectedProposal.id);
@@ -39,11 +41,12 @@ export function CloudMailWorkspace({ coordinator, snapshot, busy, blocked }: Pro
     if (!coordinator || !selectedProposal || !proposalDraft || !accountForProposal || mutationBlocked || proposalConflict || proposalSaving || !proposalDirty) return;
     const edit = selectedProposal.editPolicy === 'event_fields' && selectedProposal.event && proposalCalendar ? { kind: 'event' as const, calendarId: proposalCalendar.id, title: proposalDraft.eventTitle, description: proposalDraft.eventDescription,
       start: proposalDraft.eventStart, end: proposalDraft.eventEnd, timeZone: proposalDraft.eventTimeZone, attendees: splitAddresses(proposalDraft.eventAttendees), invitePolicy: proposalDraft.eventInvite }
-      : selectedProposal.email && ['email_fields', 'source_reply_fields'].includes(selectedProposal.editPolicy) ? { kind: 'email' as const,
-        operation: selectedProposal.editPolicy === 'source_reply_fields' ? 'draft' as const : (selectedProposal.email.operation ?? 'draft' as const),
+      : selectedProposal.email && ['email_fields', 'source_reply_fields', 'manual_reply_fields'].includes(selectedProposal.editPolicy) ? { kind: 'email' as const,
+        operation: selectedProposal.editPolicy === 'source_reply_fields' ? 'draft' as const :
+          selectedProposal.editPolicy === 'manual_reply_fields' ? proposalDraft.operation : (selectedProposal.email.operation ?? 'draft' as const),
         to: splitAddresses(proposalDraft.to), cc: splitAddresses(proposalDraft.cc),
-        bcc: selectedProposal.editPolicy === 'source_reply_fields' ? selectedProposal.email.bcc : splitAddresses(proposalDraft.bcc),
-        subject: selectedProposal.editPolicy === 'source_reply_fields' ? selectedProposal.email.subject : proposalDraft.subject, text: proposalDraft.text } : undefined;
+        bcc: ['source_reply_fields', 'manual_reply_fields'].includes(selectedProposal.editPolicy) ? selectedProposal.email.bcc : splitAddresses(proposalDraft.bcc),
+        subject: ['source_reply_fields', 'manual_reply_fields'].includes(selectedProposal.editPolicy) ? selectedProposal.email.subject : proposalDraft.subject, text: proposalDraft.text } : undefined;
     if (!edit) return;
     void coordinator.editProposal(selectedProposal.id, accountForProposal.id, accountForProposal.connectionGeneration!, edit);
   };
@@ -52,7 +55,7 @@ export function CloudMailWorkspace({ coordinator, snapshot, busy, blocked }: Pro
     <Text style={styles.heading}>Mail and calendar</Text>
     <Text style={styles.meta}>Saved mail is checked only when you ask. Sending, calendar changes, and proposal approval are separate steps.</Text>
     {state.notice ? <Text accessibilityRole="alert" style={styles.notice}>{state.notice}</Text> : null}
-    {state.replyHeldCommand ? <View style={styles.card}><Text style={styles.meta}>A mail command is awaiting its exact receipt. It will not be sent again.</Text>
+    {state.replyHeldCommand ? <View style={styles.card}><Text style={styles.meta}>A mail workflow command is awaiting its exact receipt. It will not be retried automatically.</Text>
       <Button label="Inspect exact mail command" tone="quiet" disabled={busy} onPress={() => { void coordinator?.inspectHeldCommand(); }} /></View> : null}
 
     <Text style={styles.section}>Choose a connected account</Text>
@@ -147,15 +150,48 @@ export function CloudMailWorkspace({ coordinator, snapshot, busy, blocked }: Pro
     {selectedProposal ? <View style={styles.card}>
       <View style={styles.row}><Text style={styles.title}>Review proposal</Text><Button label="Close review" tone="quiet" onPress={() => coordinator?.closeProposal()} /></View>
       <Text style={styles.meta}>Status · {selectedProposal.status} · revision {selectedProposal.revision}{selectedProposal.lastError ? ` · ${selectedProposal.lastError}` : ''}</Text>
+      {selectedProposal.supersededByProposalId ? <Text style={styles.notice}>This proposal has been superseded and is read-only. Its saved status and history are preserved.</Text> : null}
+      {selectedProposal.canDeriveManualReply && !selectedProposal.supersededByProposalId ? <View style={styles.card}>
+        <Text style={styles.title}>Create an editable copy</Text>
+        <Text style={styles.meta}>Edit the saved reply without another model request. The source account, message, subject, and thread stay bound. Choose whether the copy will be reviewed as a draft or a send.</Text>
+        <View style={styles.row}>
+          <Button label="Copy as draft" tone={(state.manualReplyDeriveOperations?.[selectedProposal.id] ?? 'draft') === 'draft' ? 'light' : 'quiet'}
+            disabled={!coordinator || mutationBlocked || !accountForProposal?.capabilities?.includes('mail.draft') || Boolean(state.manualReplyDerivation)}
+            onPress={() => coordinator?.setManualReplyDeriveOperation(selectedProposal.id, 'draft')} />
+          <Button label="Copy as send" tone={state.manualReplyDeriveOperations?.[selectedProposal.id] === 'send' ? 'light' : 'quiet'}
+            disabled={!coordinator || mutationBlocked || !accountForProposal?.capabilities?.includes('mail.send') || Boolean(state.manualReplyDerivation)}
+            onPress={() => coordinator?.setManualReplyDeriveOperation(selectedProposal.id, 'send')} />
+        </View>
+        <Button label="Edit a copy for review" disabled={!coordinator || mutationBlocked || !accountForProposal ||
+          !accountForProposal.capabilities?.includes((state.manualReplyDeriveOperations?.[selectedProposal.id] ?? 'draft') === 'send' ? 'mail.send' : 'mail.draft') ||
+          Boolean(state.manualReplyDerivation) || Boolean(state.replyHeldCommand)}
+          onPress={() => { void coordinator?.deriveManualReply(selectedProposal.id); }} />
+      </View> : null}
+      {state.manualReplyDerivation?.parentProposalId === selectedProposal.id ? <Text style={styles.notice}>The editable-copy command is being checked. Inspect its exact receipt before continuing; it will not be retried automatically.</Text> : null}
+      {state.manualReplySuccessor?.parentProposalId === selectedProposal.id ? <Button label="Open saved editable copy" tone="quiet" disabled={!coordinator || mutationBlocked}
+        onPress={() => { void coordinator?.openManualReplySuccessor(); }} /> : null}
       {proposalConflict ? <View style={styles.card}><Text accessibilityRole="alert" style={styles.notice}>The saved proposal changed while these fields were open. Your edits are preserved. Reload the current review before saving or approving.</Text>
         <Button label="Reload saved proposal" tone="quiet" disabled={!coordinator || busy} onPress={() => { void coordinator?.openProposal(selectedProposal.id).then(() => coordinator.reloadProposalDraft(selectedProposal.id)); }} /></View> : null}
       {selectedProposal.email ? <>
         {selectedProposal.editPolicy === 'source_reply_fields' ? <Text style={styles.meta}>This reply is bound to its saved source. Its subject, Bcc, attachments, and operation are fixed. You can revise recipients and message text.</Text> : null}
+        {selectedProposal.editPolicy === 'manual_reply_fields' ? <Text style={styles.meta}>Manual reply copy · Account · {accountForProposal?.displayName || 'connected account'} ({accountForProposal?.email || 'email unavailable'}) · Source · {proposalSource?.subject ?? selectedProposal.email.subject}{proposalSource?.threadId ? ` · thread ${proposalSource.threadId}` : ''} · account and source are locked. To, Cc, and message text are editable. Subject is fixed; Bcc and attachments are unavailable. Saving a changed operation requires fresh approval.</Text> : null}
         {selectedProposal.editPolicy === 'read_only' ? <Text style={styles.meta}>This saved reply cannot be edited. Review its contents and use the separate approval and execution steps when available.</Text> : null}
         {canEditProposal && proposalDraft ? <>
           <Field label="To" value={proposalDraft.to} onChangeText={(value) => coordinator?.updateProposalDraft(selectedProposal.id, { to: value })} /><Field label="Cc" value={proposalDraft.cc} onChangeText={(value) => coordinator?.updateProposalDraft(selectedProposal.id, { cc: value })} />
           {selectedProposal.editPolicy === 'source_reply_fields' ? <><Text style={styles.meta}>Subject · {selectedProposal.email.subject}</Text><Text style={styles.meta}>Bcc · {selectedProposal.email.bcc.join(', ') || 'none'}</Text>
-            <Text style={styles.meta}>Operation · {selectedProposal.email.operation ?? 'draft'}</Text></> : <><Field label="Bcc" value={proposalDraft.bcc} onChangeText={(value) => coordinator?.updateProposalDraft(selectedProposal.id, { bcc: value })} /><Field label="Subject" value={proposalDraft.subject} onChangeText={(value) => coordinator?.updateProposalDraft(selectedProposal.id, { subject: value })} /></>}
+            <Text style={styles.meta}>Operation · {selectedProposal.email.operation ?? 'draft'}</Text></> : selectedProposal.editPolicy === 'manual_reply_fields' ? <>
+              <Text style={styles.meta}>Subject · {selectedProposal.email.subject} · Bcc · none · attachments · none</Text>
+              <Text style={styles.meta}>Reviewed operation</Text>
+              <View style={styles.row}>
+                <Button label="Review as draft" tone={proposalDraft.operation === 'draft' ? 'light' : 'quiet'}
+                  disabled={!accountForProposal?.capabilities?.includes('mail.draft') || proposalDraft.operation === 'draft'}
+                  onPress={() => coordinator?.updateProposalDraft(selectedProposal.id, { operation: 'draft' })} />
+                <Button label="Review as send" tone={proposalDraft.operation === 'send' ? 'light' : 'quiet'}
+                  disabled={!accountForProposal?.capabilities?.includes('mail.send') || proposalDraft.operation === 'send'}
+                  onPress={() => coordinator?.updateProposalDraft(selectedProposal.id, { operation: 'send' })} />
+              </View>
+              <Text style={styles.meta}>Final To · {splitAddresses(proposalDraft.to).join(', ') || 'none'} · Cc · {splitAddresses(proposalDraft.cc).join(', ') || 'none'}</Text>
+            </> : <><Field label="Bcc" value={proposalDraft.bcc} onChangeText={(value) => coordinator?.updateProposalDraft(selectedProposal.id, { bcc: value })} /><Field label="Subject" value={proposalDraft.subject} onChangeText={(value) => coordinator?.updateProposalDraft(selectedProposal.id, { subject: value })} /></>}
           <Field label="Message" value={proposalDraft.text} onChangeText={(value) => coordinator?.updateProposalDraft(selectedProposal.id, { text: value })} multiline />
         </> : <><Text style={styles.meta}>To · {selectedProposal.email.to.join(', ') || 'none'} · Cc · {selectedProposal.email.cc.join(', ') || 'none'}</Text>
           <Text style={styles.meta}>Subject · {selectedProposal.email.subject}</Text><Text style={styles.body}>{selectedProposal.email.text}</Text></>}
@@ -189,9 +225,9 @@ export function CloudMailWorkspace({ coordinator, snapshot, busy, blocked }: Pro
       {proposalDirty ? <><Text style={styles.notice}>These fields have unsaved changes. Save them before approval or execution.</Text>
         <Button label="Discard edits and reload saved proposal" tone="quiet" disabled={!coordinator || proposalSaving} onPress={() => { coordinator?.reloadProposalDraft(selectedProposal.id); }} /></> : null}
       <Button label={proposalSaving ? 'Saving proposal…' : 'Save proposal changes'} tone="quiet" disabled={!coordinator || mutationBlocked || proposalConflict || proposalSaving || !proposalDirty || !accountForProposal || (selectedProposal.kind === 'event' && !proposalCalendar)} onPress={updateProposal} />
-      {selectedProposal.status === 'draft' || selectedProposal.status === 'failed' ? <Button label="Approve this revision" disabled={!coordinator || mutationBlocked || proposalConflict || proposalDirty || proposalSaving} onPress={() => { void coordinator?.approveProposal(selectedProposal.id); }} /> : null}
-      {selectedProposal.status === 'approved' ? <Button label="Execute approved action" tone="danger" disabled={!coordinator || mutationBlocked || proposalConflict || proposalDirty || proposalSaving || (selectedProposal.kind === 'event' && !proposalCalendar)} onPress={() => { void coordinator?.executeProposal(selectedProposal.id); }} /> : null}
-      {['draft', 'failed', 'approved'].includes(selectedProposal.status) ? <Button label="Dismiss proposal" tone="quiet" disabled={!coordinator || mutationBlocked || proposalConflict || proposalDirty || proposalSaving} onPress={() => { void coordinator?.dismissProposal(selectedProposal.id); }} /> : null}
+      {selectedProposal.status === 'draft' || selectedProposal.status === 'failed' ? <Button label="Approve this revision" disabled={!coordinator || mutationBlocked || proposalConflict || proposalDirty || proposalSaving || Boolean(selectedProposal.supersededByProposalId)} onPress={() => { void coordinator?.approveProposal(selectedProposal.id); }} /> : null}
+      {selectedProposal.status === 'approved' ? <Button label={selectedProposal.email?.operation === 'send' ? 'Execute approved send' : selectedProposal.email ? 'Create approved draft' : 'Execute approved action'} tone="danger" disabled={!coordinator || mutationBlocked || proposalConflict || proposalDirty || proposalSaving || Boolean(selectedProposal.supersededByProposalId) || (selectedProposal.kind === 'event' && !proposalCalendar)} onPress={() => { void coordinator?.executeProposal(selectedProposal.id); }} /> : null}
+      {['draft', 'failed', 'approved'].includes(selectedProposal.status) && !selectedProposal.supersededByProposalId ? <Button label="Dismiss proposal" tone="quiet" disabled={!coordinator || mutationBlocked || proposalConflict || proposalDirty || proposalSaving} onPress={() => { void coordinator?.dismissProposal(selectedProposal.id); }} /> : null}
     </View> : null}
 
     <Text style={styles.section}>Saved dispatch history</Text>
