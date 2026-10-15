@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useLayoutEffect, useRef, useState, useSy
 import { ActivityIndicator, Pressable, Text, View } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import type { WorkspaceSnapshotDTO } from '../cloud/workspaceDto';
+import type { KnowledgeSourceChoicesDTO, KnowledgeSuggestionReviewDTO } from '../cloud/knowledgeHttpContracts';
 import type { WorkspaceCommand, WorkspaceCommandResponse } from '../cloud/workspaceCommands';
 import { decodeWorkspaceSnapshotDTO } from '../cloud/workspaceSnapshotCodec';
 import { WorkspaceClientError, WorkspaceCommandNotStartedError, createWebWorkspaceClient, type WorkspaceClient, type WorkspaceCommandAdmission } from './workspaceClient';
@@ -12,6 +13,7 @@ import { CloudVoiceCoordinator, type CloudVoiceCapturePort, type CloudVoiceCoord
 import { useCloudAudioCapture } from './useCloudAudioCapture';
 import { C, s } from '../ui/theme';
 import { useCloudCredentials } from './useCloudCredentials';
+import { CloudOAuthCoordinator, type CloudOAuthState } from './cloudOAuthCoordinator';
 
 export type CloudWorkspaceSessionState = Readonly<{
   status: 'loading' | 'ready' | 'error';
@@ -19,6 +21,7 @@ export type CloudWorkspaceSessionState = Readonly<{
   busy: boolean;
   pendingCommand?: Readonly<{ commandId: string; kind: WorkspaceCommand['kind'] }>;
   voice?: CloudVoiceCoordinatorState;
+  oauth?: CloudOAuthState;
   refreshRequired: boolean;
   error?: string;
 }>;
@@ -33,6 +36,8 @@ export class CloudWorkspaceSessionStore {
   private audioClient?: AudioUploadClient;
   private voiceCoordinator?: CloudVoiceCoordinator;
   private unsubscribeVoice?: () => void;
+  private oauthCoordinator?: CloudOAuthCoordinator;
+  private unsubscribeOAuth?: () => void;
   private ownerGeneration = 0;
   private active = false;
   private operationInFlight = false;
@@ -65,11 +70,13 @@ export class CloudWorkspaceSessionStore {
   };
 
   private publish(next: CloudWorkspaceSessionState): void {
-    const { voice: _callerVoice, ...withoutCallerVoice } = next;
+    const { voice: _callerVoice, oauth: _callerOAuth, ...withoutCallerOwnedState } = next;
     void _callerVoice;
+    void _callerOAuth;
     const coordinator = this.active ? this.voiceCoordinator : undefined;
     const voice = coordinator?.getSnapshot();
-    this.value = Object.freeze({ ...withoutCallerVoice, ...(voice ? { voice } : {}) });
+    const oauth = this.active ? this.oauthCoordinator?.getSnapshot() : undefined;
+    this.value = Object.freeze({ ...withoutCallerOwnedState, ...(voice ? { voice } : {}), ...(oauth ? { oauth } : {}) });
     for (const listener of this.listeners) listener();
   }
 
@@ -98,6 +105,17 @@ export class CloudWorkspaceSessionStore {
     this.client = createWebWorkspaceClient(this.session, {
       decodeSnapshot: decodeWorkspaceSnapshotDTO,
       assertCurrent: () => { if (!this.isCurrent(owner)) throw new Error('Cloud workspace owner changed.'); },
+    });
+    const oauthCoordinator = new CloudOAuthCoordinator(this.session, { workspace: {
+      readSnapshot: () => this.isCurrent(owner) ? this.value.snapshot : undefined,
+      readWorkspaceOperation: () => ({ busy: this.value.busy, pending: Boolean(this.value.pendingCommand), refreshRequired: this.value.refreshRequired }),
+      execute: (command, onAdmitted) => this.execute(command, (envelope) => onAdmitted(envelope.commandId)),
+      inspect: (commandId) => this.inspect(commandId),
+      refresh: () => this.refresh(),
+    } });
+    this.oauthCoordinator = oauthCoordinator;
+    this.unsubscribeOAuth = oauthCoordinator.subscribe(() => {
+      if (this.isCurrent(owner) && this.oauthCoordinator === oauthCoordinator) this.publish({ ...this.value, oauth: oauthCoordinator.getSnapshot() });
     });
     if (getCapture) {
       this.audioClient = createWebAudioUploadClient(this.session, {
@@ -140,6 +158,10 @@ export class CloudWorkspaceSessionStore {
   private disposeResources(): void {
     this.unsubscribeVoice?.();
     this.unsubscribeVoice = undefined;
+    this.unsubscribeOAuth?.();
+    this.unsubscribeOAuth = undefined;
+    this.oauthCoordinator?.dispose();
+    this.oauthCoordinator = undefined;
     this.voiceCoordinator?.dispose();
     this.voiceCoordinator = undefined;
     this.audioClient?.dispose();
@@ -158,6 +180,11 @@ export class CloudWorkspaceSessionStore {
       throw new WorkspaceClientError('disposed', 'This workspace voice session is no longer active.');
     }
     return this.voiceCoordinator;
+  }
+
+  getOAuthCoordinator(): CloudOAuthCoordinator | undefined {
+    if (!this.active) return undefined;
+    return this.oauthCoordinator;
   }
 
   async cancelTranscription(commandId: string): Promise<'cancellation_requested' | 'not_running'> {
@@ -185,6 +212,48 @@ export class CloudWorkspaceSessionStore {
     return error instanceof WorkspaceClientError
       ? error.message
       : 'The workspace response could not be confirmed.';
+  }
+
+  async readKnowledgeSourceChoices(expectedRevision: number): Promise<KnowledgeSourceChoicesDTO> {
+    const owner = this.ownerGeneration;
+    const client = this.currentClient();
+    const current = this.value.snapshot;
+    if (!current || current.workspaceId !== this.session.workspaceId || current.privacyEpoch !== this.session.privacyEpoch || current.revision !== expectedRevision) {
+      throw new WorkspaceClientError('stale', 'The workspace changed. Reload it before loading source choices.');
+    }
+    const operation = this.beginOperation();
+    this.publish({ ...this.value, busy: true, error: undefined });
+    try {
+      const result = await client.readKnowledgeSourceChoices(expectedRevision);
+      const latest = this.value.snapshot;
+      if (!this.isCurrent(owner) || !latest || latest.workspaceId !== current.workspaceId || latest.privacyEpoch !== current.privacyEpoch || latest.revision !== expectedRevision) {
+        throw new WorkspaceClientError('stale', 'The workspace changed while source choices were loading. Reload before continuing.');
+      }
+      return result;
+    } finally {
+      this.finishOperation(operation, owner);
+    }
+  }
+
+  async readKnowledgeSuggestionReview(input: Readonly<{ suggestionId: string; expectedSuggestionRevision: number; expectedRevision: number }>): Promise<KnowledgeSuggestionReviewDTO> {
+    const owner = this.ownerGeneration;
+    const client = this.currentClient();
+    const current = this.value.snapshot;
+    if (!current || current.workspaceId !== this.session.workspaceId || current.privacyEpoch !== this.session.privacyEpoch || current.revision !== input.expectedRevision) {
+      throw new WorkspaceClientError('stale', 'The workspace changed. Reload it before preparing this suggestion.');
+    }
+    const operation = this.beginOperation();
+    this.publish({ ...this.value, busy: true, error: undefined });
+    try {
+      const result = await client.readKnowledgeSuggestionReview(input);
+      const latest = this.value.snapshot;
+      if (!this.isCurrent(owner) || !latest || latest.workspaceId !== current.workspaceId || latest.privacyEpoch !== current.privacyEpoch || latest.revision !== input.expectedRevision) {
+        throw new WorkspaceClientError('stale', 'The workspace changed while the suggestion was loading. Reload before continuing.');
+      }
+      return result;
+    } finally {
+      this.finishOperation(operation, owner);
+    }
   }
 
   async refresh(): Promise<WorkspaceSnapshotDTO | undefined> {
@@ -339,7 +408,7 @@ export function CloudWorkspaceSession({ session, onLogout }: { session: Authenti
     );
   }
 
-  return <CloudWorkspace store={store} state={state} onLogout={() => { store.invalidate(); onLogout(); }} credentials={credentials} voiceCapability={state.voice ? {
+  return <CloudWorkspace store={store} state={state} onLogout={() => { store.invalidate(); onLogout(); }} credentials={credentials} oauthCoordinator={store.getOAuthCoordinator()} voiceCapability={state.voice ? {
     available: true,
     capture: { status: capture.status, canResume: capture.canResume, durationSeconds: capture.durationSeconds,
       meter: capture.meter, hasPending: capture.hasPending, ...(capture.statusLabel ? { statusLabel: capture.statusLabel } : {}),

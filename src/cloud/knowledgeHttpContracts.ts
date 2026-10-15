@@ -1,5 +1,5 @@
 import { validateKnowledgeSuggestion, validateCanonicalKnowledgeReference } from '../knowledge';
-import type { KnowledgeReference, KnowledgeSuggestion } from '../knowledge/types';
+import type { KnowledgeChange, KnowledgeReference, KnowledgeSuggestion } from '../knowledge/types';
 import { projectKnowledgeSourceChoiceReference } from '../knowledge/sourceChoices';
 
 export type KnowledgeSourceChoiceDTO = Readonly<{ id: string; label: string; reference: Exclude<KnowledgeReference, { kind: 'device_calendar_event' }> }>;
@@ -8,9 +8,11 @@ export type KnowledgeSourceChoicesDTO = Readonly<{
 }>;
 export type KnowledgeSuggestionDisplayDTO = Readonly<{
   id: string; revision: number; targetRevision: number; evidence: readonly KnowledgeSuggestion['evidence'][number][]; status: KnowledgeSuggestion['status'];
-  createdAt: string; updatedAt: string; change: KnowledgeSuggestion['change']; reviewedAt?: string; originalChange?: KnowledgeSuggestion['change'];
+  createdAt: string; updatedAt: string; change: KnowledgeChangeDisplayDTO; reviewedAt?: string; originalChange?: KnowledgeChangeDisplayDTO;
   originalEvidence?: readonly KnowledgeSuggestion['evidence'][number][]; staleReason?: string;
 }>;
+export type KnowledgeChangeDisplayDTO = Exclude<KnowledgeChange, { type: 'add_source_link' }> |
+  (Omit<Extract<KnowledgeChange, { type: 'add_source_link' }>, 'reference'> & Readonly<{ reference: Exclude<KnowledgeReference, { kind: 'device_calendar_event' }> }>);
 export type KnowledgeSuggestionReviewDTO = Readonly<{
   schemaVersion: 1; workspaceId: string; privacyEpoch: number; revision: number;
   review: Readonly<{ suggestion: KnowledgeSuggestionDisplayDTO; canEdit: boolean; canAccept: boolean; reason?: string }>;
@@ -28,7 +30,6 @@ function record(value: unknown, keys: readonly string[], required: readonly stri
   }
   return value as Record<string, unknown>;
 }
-const positive = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) > 0;
 const nonNegative = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) >= 0;
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
@@ -68,7 +69,7 @@ export function parseKnowledgeSourceChoicesDTO(value: unknown, expected: Readonl
   return Object.freeze({ schemaVersion: 1, workspaceId: row.workspaceId as string, privacyEpoch: row.privacyEpoch as number, revision: row.revision as number, choices: Object.freeze(choices) });
 }
 
-function projectChange(change: KnowledgeSuggestion['change']): KnowledgeSuggestion['change'] {
+function projectChange(change: KnowledgeSuggestion['change']): KnowledgeChangeDisplayDTO {
   return change.type === 'add_source_link' ? Object.freeze({ ...change, reference: projectKnowledgeSourceChoiceReference(change.reference) }) : Object.freeze(structuredClone(change));
 }
 function projectSuggestion(item: KnowledgeSuggestion): KnowledgeSuggestionDisplayDTO {

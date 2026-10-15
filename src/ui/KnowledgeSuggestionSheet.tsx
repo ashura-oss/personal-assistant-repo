@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { Modal, Pressable, ScrollView, Text, View } from 'react-native';
-import type { KnowledgeChangeDisplay, KnowledgePersonDisplay, KnowledgeProjectDisplay, KnowledgeReferenceDisplay, KnowledgeSuggestionDisplay, KnowledgeSuggestionEditCommand, KnowledgeSuggestionReviewCommand, KnowledgeSuggestionReviewDisplay } from './knowledgeDisplayTypes';
+import type { KnowledgeChangeDisplay, KnowledgePersonDisplay, KnowledgeProjectDisplay, KnowledgeReferenceDisplay, KnowledgeSourceChoiceDisplay, KnowledgeSuggestionDisplay, KnowledgeSuggestionEditInput, KnowledgeSuggestionReviewInput, KnowledgeSuggestionReviewDisplay } from './knowledgeDisplayTypes';
 import { KnowledgeSuggestionReviewOwnership, type KnowledgeSuggestionReviewOwner } from './knowledgeSuggestionReviewOwnership';
 import { Button, Field, IconButton } from './primitives';
 import { s } from './theme';
@@ -14,9 +14,12 @@ type Props = {
   blocked?: boolean;
   openRequest?: Readonly<{ suggestionId: string; requestId: number }>;
   onRequestHandled?: (requestId: number) => void;
-  onPrepareReview: (id: string, input: { expectedRevision: number }) => Promise<KnowledgeSuggestionReviewDisplay>;
-  onReview: (id: string, input: KnowledgeSuggestionReviewCommand) => Promise<unknown>;
-  onEdit: (id: string, input: KnowledgeSuggestionEditCommand) => Promise<KnowledgeSuggestionDisplay | undefined>;
+  onPrepareReview: (id: string, input: { expectedRevision: number; expectedWorkspaceRevision?: number }) => Promise<KnowledgeSuggestionReviewDisplay>;
+  onReview: (id: string, input: KnowledgeSuggestionReviewInput) => Promise<unknown>;
+  onEdit: (id: string, input: KnowledgeSuggestionEditInput) => Promise<KnowledgeSuggestionDisplay | undefined>;
+  workspaceRevision?: number;
+  references?: readonly KnowledgeSourceChoiceDisplay[];
+  loadSourceChoices?: (expectedRevision: number) => Promise<readonly KnowledgeSourceChoiceDisplay[]>;
 };
 
 
@@ -32,9 +35,10 @@ type OpenSnapshot = {
   people: readonly KnowledgePersonDisplay[];
   projects: readonly KnowledgeProjectDisplay[];
   sourceLabels: Readonly<Record<string, string>>;
+  workspaceRevision?: number;
 };
 
-export function KnowledgeSuggestionSheet({ suggestions, people, projects, sourceLabels, busy, blocked = false, openRequest, onRequestHandled, onPrepareReview, onReview, onEdit }: Props) {
+export function KnowledgeSuggestionSheet({ suggestions, people, projects, sourceLabels, busy, blocked = false, openRequest, onRequestHandled, onPrepareReview, onReview, onEdit, workspaceRevision, references = [], loadSourceChoices }: Props) {
   const [filter, setFilter] = useState<Filter>('pending');
   const [opened, setOpened] = useState<OpenSnapshot | null>(null);
   const [editing, setEditing] = useState(false);
@@ -55,11 +59,15 @@ export function KnowledgeSuggestionSheet({ suggestions, people, projects, source
   const mounted = useRef(true);
   const pendingEditedPreflightRef = useRef<KnowledgeSuggestionReviewOwner | undefined>(undefined);
   const [waitingEditedRevision, setWaitingEditedRevision] = useState(false);
+  const [editSourceChoices, setEditSourceChoices] = useState<readonly KnowledgeSourceChoiceDisplay[]>([]);
+  const [loadingEditSourceChoices, setLoadingEditSourceChoices] = useState(false);
+  const [editSourceChoiceId, setEditSourceChoiceId] = useState<string>();
+  const sourceLoadSequence = useRef(0);
   const requestIdRef = useRef<number | undefined>(openRequest?.requestId);
   const requestRef = useRef(openRequest);
   const openSuggestionRef = useRef<(suggestion: KnowledgeSuggestionDisplay) => void>(() => undefined);
-  const contextRef = useRef({ suggestions, people, projects, blocked, busy, onPrepareReview, onRequestHandled });
-  useLayoutEffect(() => { contextRef.current = { suggestions, people, projects, blocked, busy, onPrepareReview, onRequestHandled }; }, [suggestions, people, projects, blocked, busy, onPrepareReview, onRequestHandled]);
+  const contextRef = useRef({ suggestions, people, projects, blocked, busy, onPrepareReview, onRequestHandled, workspaceRevision, references, loadSourceChoices });
+  useLayoutEffect(() => { contextRef.current = { suggestions, people, projects, blocked, busy, onPrepareReview, onRequestHandled, workspaceRevision, references, loadSourceChoices }; }, [suggestions, people, projects, blocked, busy, onPrepareReview, onRequestHandled, workspaceRevision, references, loadSourceChoices]);
   useLayoutEffect(() => {
     mounted.current = true;
     const ownership = ownerRef.current;
@@ -88,22 +96,23 @@ export function KnowledgeSuggestionSheet({ suggestions, people, projects, source
   const isOwnerCurrent = useCallback((owner: KnowledgeSuggestionReviewOwner) => {
     const context = contextRef.current;
     const current = context.suggestions.find((item) => item.id === owner.suggestionId);
-    return mounted.current && !context.blocked && ownerRef.current.owns(owner) &&
-      (!context.busy || actionLock.current) && current?.revision === owner.revision && current.status === 'pending';
+    return mounted.current && ownerRef.current.owns(owner) && current?.revision === owner.revision && current.status === 'pending';
   }, []);
 
   const closeSuggestion = () => {
+    sourceLoadSequence.current += 1;
+    setLoadingEditSourceChoices(false); setEditSourceChoices([]); setEditSourceChoiceId(undefined);
     ownerRef.current.publish(); selectedOwnerRef.current = undefined; setSelectedOwnerGeneration(undefined); pendingEditedPreflightRef.current = undefined; setWaitingEditedRevision(false); actionLock.current = false; activeActionTokenRef.current = undefined;
     setOpened(null); setEditing(false); setPreparedReview(undefined); setPreparingReview(false); setPreflightReason('');
   };
 
-  const prepareCurrent = useCallback(async (owner: KnowledgeSuggestionReviewOwner) => {
+  const prepareCurrent = useCallback(async (owner: KnowledgeSuggestionReviewOwner, expectedWorkspaceRevision = contextRef.current.workspaceRevision) => {
     setPreparingReview(true); setPreparedReview(undefined); setPreflightReason('');
     try {
       const result = await ownerRef.current.prepare({
         owner,
         isCurrent: () => isOwnerCurrent(owner),
-        prepare: () => contextRef.current.onPrepareReview(owner.suggestionId, { expectedRevision: owner.revision }),
+        prepare: () => contextRef.current.onPrepareReview(owner.suggestionId, { expectedRevision: owner.revision, expectedWorkspaceRevision }),
       });
       if (result.kind === 'prepared' && isOwnerCurrent(owner)) {
         setPreparedReview(result.review);
@@ -116,21 +125,42 @@ export function KnowledgeSuggestionSheet({ suggestions, people, projects, source
     }
   }, [isOwnerCurrent]);
 
+  const reloadEditSourceChoices = async (owner: KnowledgeSuggestionReviewOwner) => {
+    const loader = contextRef.current.loadSourceChoices;
+    const expectedRevision = contextRef.current.workspaceRevision;
+    if (!loader || expectedRevision === undefined || !isOwnerCurrent(owner)) return;
+    const sequence = ++sourceLoadSequence.current;
+    setLoadingEditSourceChoices(true); setEditSourceChoices([]); setEditSourceChoiceId(undefined); setMessage('');
+    try {
+      const choices = await loader(expectedRevision);
+      if (sourceLoadSequence.current !== sequence || !isOwnerCurrent(owner)) return;
+      setEditSourceChoices(choices);
+      const currentChange = selectedOwnerRef.current?.suggestionId === owner.suggestionId ? selected?.change : undefined;
+      const currentReference = currentChange?.type === 'add_source_link' ? currentChange.reference : undefined;
+      if (currentReference) setEditSourceChoiceId(choices.find((choice) => referenceKey(choice.reference) === referenceKey(currentReference))?.id);
+    } catch (error) {
+      if (sourceLoadSequence.current === sequence && isOwnerCurrent(owner)) setMessage(error instanceof Error ? error.message : 'Source choices could not be loaded. Reload and select a current source.');
+    } finally {
+      if (sourceLoadSequence.current === sequence && ownerRef.current.owns(owner)) setLoadingEditSourceChoices(false);
+    }
+  };
+
   const openSuggestion = (suggestion: KnowledgeSuggestionDisplay) => {
-    if (blocked || busy || actionLock.current) return;
+    if (busy || actionLock.current) return;
     pendingEditedPreflightRef.current = undefined;
     const entity = findTarget(suggestion, people, projects);
     const personId = suggestion.change.type === 'add_member' ? suggestion.change.personId : undefined;
     const person = personId ? people.find((item) => item.id === personId) : undefined;
     const reference = suggestion.change.type === 'add_source_link' ? suggestion.change.reference : undefined;
     const referencedEntity = reference ? findReferencedEntity(reference, people, projects) : undefined;
-    setOpened({ suggestion, entity, entityRevision: entity?.revision, memberPerson: person, memberRevision: person?.revision, referencedEntity, referenceRevision: referencedEntity?.revision, people, projects, sourceLabels });
+    sourceLoadSequence.current += 1; setEditSourceChoices([]); setEditSourceChoiceId(undefined); setLoadingEditSourceChoices(false);
+    setOpened({ suggestion, entity, entityRevision: entity?.revision, memberPerson: person, memberRevision: person?.revision, referencedEntity, referenceRevision: referencedEntity?.revision, people, projects, sourceLabels, workspaceRevision });
     setEditing(false); setMessage(''); setSuccessMessage('');
     setPreparedReview(undefined); setPreflightReason('');
     const owner = ownerRef.current.publish(suggestion.id, suggestion.revision)!;
     selectedOwnerRef.current = owner;
     setSelectedOwnerGeneration(owner.generation);
-    if (suggestion.status === 'pending') void prepareCurrent(owner);
+    if (suggestion.status === 'pending') void prepareCurrent(owner, workspaceRevision);
   };
   useLayoutEffect(() => { openSuggestionRef.current = openSuggestion; });
 
@@ -162,7 +192,11 @@ export function KnowledgeSuggestionSheet({ suggestions, people, projects, source
   }, [suggestions, blocked, busy, waitingEditedRevision, isOwnerCurrent, prepareCurrent]);
 
   useLayoutEffect(() => {
-    if (blocked && selectedOwnerRef.current) {
+    // The session marks a command pending as soon as it is admitted. Keep its
+    // editor and draft mounted until that exact request settles; otherwise a
+    // lost acknowledgement would erase the review context needed for receipt
+    // inspection and recovery.
+    if (blocked && selectedOwnerRef.current && !activeActionTokenRef.current) {
       ownerRef.current.publish();
       selectedOwnerRef.current = undefined;
       activeActionTokenRef.current = undefined;
@@ -211,7 +245,16 @@ export function KnowledgeSuggestionSheet({ suggestions, people, projects, source
     switch (selected.change.type) {
       case 'add_fact': setEditValue(selected.change.statement); break;
       case 'add_contact': setEditValue(selected.change.address); setEditLabel(selected.change.label); break;
-      case 'add_source_link': setEditValue(selected.change.label); break;
+      case 'add_source_link': {
+        setEditValue(selected.change.label);
+        if (loadSourceChoices) void reloadEditSourceChoices(owner);
+        else {
+          const selectedReference = selected.change.reference;
+          setEditSourceChoices(references);
+          setEditSourceChoiceId(references.find((choice) => referenceKey(choice.reference) === referenceKey(selectedReference))?.id);
+        }
+        break;
+      }
       case 'add_member': setEditValue(selected.change.role); setEditPersonId(selected.change.personId); break;
     }
     setEditing(true); setMessage(''); setSuccessMessage('');
@@ -221,13 +264,14 @@ export function KnowledgeSuggestionSheet({ suggestions, people, projects, source
     const owner = selectedOwnerRef.current;
     if (!selected || !opened || !owner || busy || blocked || actionLock.current || suggestionChanged || targetSnapshotChanged ||
       !preparedReviewCurrent || !preparedReview || ownerRef.current.current(owner)?.canEdit !== true || !isOwnerCurrent(owner)) return;
-    const change = editedChange(selected.change, editValue, editLabel, editPersonId, opened.people);
+    const change = editedChange(selected.change, editValue, editLabel, editPersonId, opened.people, editSourceChoiceId);
     if (!change) { setMessage('Choose a valid value for this suggestion.'); return; }
     actionLock.current = true;
     const actionToken = ++actionTokenSequence.current;
     activeActionTokenRef.current = actionToken;
     try {
-      const result = await onEdit(owner.suggestionId, { expectedRevision: owner.revision, change, evidence: selected.evidence });
+      if (opened.entityRevision === undefined) throw new Error('The target changed. Reload this suggestion before editing it.');
+      const result = await onEdit(owner.suggestionId, { expectedRevision: owner.revision, targetRevision: opened.entityRevision, change, evidence: selected.evidence });
       if (!ownerRef.current.owns(owner) || selectedOwnerRef.current?.generation !== owner.generation) return;
       if (!result) { setMessage('The edit was not saved. Check the app notice, then reopen this suggestion.'); return; }
       if (result.id !== owner.suggestionId || result.revision <= owner.revision) { setMessage('The edit result could not be matched to this suggestion. Reopen the latest Memory list.'); return; }
@@ -241,6 +285,7 @@ export function KnowledgeSuggestionSheet({ suggestions, people, projects, source
       selectedOwnerRef.current = nextOwner;
       setSelectedOwnerGeneration(nextOwner.generation);
       setPreparedReview(undefined); setPreparingReview(false); setPreflightReason('');
+      sourceLoadSequence.current += 1; setEditSourceChoices([]); setEditSourceChoiceId(undefined); setLoadingEditSourceChoices(false);
       pendingEditedPreflightRef.current = nextOwner;
       setWaitingEditedRevision(true);
       setEditing(false); setMessage(''); setSuccessMessage('The original remains in review history. This edit is a new suggestion revision.');
@@ -261,7 +306,7 @@ export function KnowledgeSuggestionSheet({ suggestions, people, projects, source
       </Pressable>;
     }) : <View style={s.knowledgeEmpty}><Text style={s.emptyTitle}>{filter === 'pending' ? 'Nothing to review' : `No ${filter} suggestions`}</Text><Text style={s.emptyText}>Suggestions stay separate from saved knowledge until you review them.</Text></View>}
 
-    <Modal visible={Boolean(opened && selectedOwnerGeneration !== undefined && !blocked)} animationType="slide" presentationStyle="pageSheet" onRequestClose={closeSuggestion}>
+    <Modal visible={Boolean(opened && selectedOwnerGeneration !== undefined)} animationType="slide" presentationStyle="pageSheet" onRequestClose={closeSuggestion}>
       <View style={s.safe}>
         {selected ? <>
           <View style={s.modalHeader}><IconButton name="chevron-back" label="Close suggestion review" onPress={closeSuggestion} /><Text style={s.modalTitle}>Memory suggestion</Text><View style={{ width: 46 }} /></View>
@@ -297,9 +342,14 @@ export function KnowledgeSuggestionSheet({ suggestions, people, projects, source
             {editing ? <>
               {selected.change.type === 'add_fact' ? <Field label="Proposed fact" value={editValue} onChangeText={setEditValue} multiline /> : null}
               {selected.change.type === 'add_contact' ? <><Field label="Contact address · not verified" value={editValue} onChangeText={setEditValue} keyboardType="email-address" /><Field label="Claim label" value={editLabel} onChangeText={setEditLabel} /></> : null}
-              {selected.change.type === 'add_source_link' ? <Field label="Link label" value={editValue} onChangeText={setEditValue} /> : null}
+              {selected.change.type === 'add_source_link' ? <>
+                <Field label="Link label" value={editValue} onChangeText={setEditValue} />
+                {loadSourceChoices ? <Button label={loadingEditSourceChoices ? 'Loading source choices…' : 'Reload source choices'} tone="quiet" disabled={blocked || busy || loadingEditSourceChoices} onPress={() => { const owner = selectedOwnerRef.current; if (owner) void reloadEditSourceChoices(owner); }} /> : null}
+                {editSourceChoices.map((choice) => <Pressable key={choice.id} accessibilityRole="radio" accessibilityState={{ selected: editSourceChoiceId === choice.id }} onPress={() => setEditSourceChoiceId(choice.id)} style={[s.knowledgeStatusChoice, editSourceChoiceId === choice.id && s.knowledgeStatusSelected]}><Text style={s.knowledgeMeta}>{choice.label}</Text></Pressable>)}
+                {!editSourceChoices.length && !loadingEditSourceChoices ? <Text style={s.knowledgeFootnote}>Load current source choices before saving this edit.</Text> : null}
+              </> : null}
               {selected.change.type === 'add_member' ? <><Text style={s.label}>Person</Text>{(opened?.people ?? []).filter((person) => !person.archivedAt).map((person) => <Pressable key={person.id} accessibilityRole="radio" accessibilityState={{ selected: editPersonId === person.id }} onPress={() => setEditPersonId(person.id)} style={[s.knowledgeStatusChoice, editPersonId === person.id && s.knowledgeStatusSelected]}><Text style={s.knowledgeMeta}>{person.name}{person.importOrigin?.kind === 'backup_knowledge' ? ' · Imported copy' : ''}</Text></Pressable>)}<Field label="Role" value={editValue} onChangeText={setEditValue} /></> : null}
-              <Button label="Save as a new suggestion revision" disabled={blocked || busy || selectedOwnerGeneration === undefined || !preparedReviewCurrent || !preparedReview?.canEdit || targetSnapshotChanged || suggestionChanged || !editValue.trim()} onPress={() => void saveEdit()} />
+              <Button label="Save as a new suggestion revision" disabled={blocked || busy || loadingEditSourceChoices || selectedOwnerGeneration === undefined || !preparedReviewCurrent || !preparedReview?.canEdit || targetSnapshotChanged || suggestionChanged || !editValue.trim() || (selected.change.type === 'add_source_link' && !editSourceChoiceId)} onPress={() => void saveEdit()} />
               <Button label="Cancel edit" tone="quiet" disabled={busy} onPress={() => setEditing(false)} />
             </> : null}
           </ScrollView>
@@ -339,11 +389,11 @@ function changeDescription(item: KnowledgeSuggestionDisplay, people: readonly Kn
   }
 }
 
-function editedChange(change: KnowledgeChangeDisplay, value: string, label: string, personId: string, people: readonly KnowledgePersonDisplay[]): KnowledgeChangeDisplay | undefined {
+function editedChange(change: KnowledgeChangeDisplay, value: string, label: string, personId: string, people: readonly KnowledgePersonDisplay[], referenceChoiceId?: string): KnowledgeSuggestionEditInput['change'] | undefined {
   switch (change.type) {
     case 'add_fact': return { ...change, statement: value.trim() };
     case 'add_contact': return { ...change, address: value.trim(), label: label.trim() || 'Contact' };
-    case 'add_source_link': return { ...change, label: value.trim() };
+    case 'add_source_link': return referenceChoiceId ? { type: change.type, entityKind: change.entityKind, entityId: change.entityId, label: value.trim(), referenceChoiceId } : undefined;
     case 'add_member': {
       const person = people.find((item) => item.id === personId);
       return person ? { ...change, personId: person.id, personRevision: person.revision, role: value.trim() } : undefined;
@@ -383,6 +433,13 @@ function referenceLabel(reference: KnowledgeReferenceDisplay, people: readonly K
     return sourceLabels[sourceId] ?? 'Mail · historical source unavailable';
   }
   return `${reference.kind} · ${reference.id}`;
+}
+
+function referenceKey(reference: KnowledgeReferenceDisplay) {
+  if (reference.kind === 'historical') return JSON.stringify([reference.kind, reference.originalKind, reference.label]);
+  if (reference.kind === 'mail') return JSON.stringify([reference.kind, reference.id, reference.identityKey, reference.connectionGeneration]);
+  if (reference.kind === 'calendar') return JSON.stringify([reference.kind, reference.id, reference.calendarId, reference.identityKey, reference.connectionGeneration]);
+  return JSON.stringify([reference.kind, reference.id]);
 }
 
 function entityLabel(kind: 'person' | 'project') { return kind === 'person' ? 'Person' : 'Project'; }

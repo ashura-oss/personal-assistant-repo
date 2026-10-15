@@ -31,6 +31,10 @@ export type KnowledgeSuggestionDisplay = Pick<WorkspaceKnowledgeSuggestion, 'id'
 export type KnowledgeSuggestionReviewDisplay = Readonly<{ suggestion: KnowledgeSuggestionDisplay; canEdit: boolean; canAccept: boolean; reason?: string }>;
 export type KnowledgeSuggestionReviewCommand = Readonly<{ expectedRevision: number; decision: 'accept' | 'dismiss'; targetRevision?: number; memberPersonRevision?: number }>;
 export type KnowledgeSuggestionEditCommand = Readonly<{ expectedRevision: number; change: KnowledgeChangeDisplay; evidence: readonly WorkspaceKnowledgeSuggestion['evidence'][number][] }>;
+export type KnowledgeSuggestionReviewInput = KnowledgeSuggestionReviewCommand;
+export type KnowledgeSuggestionEditChange = Exclude<KnowledgeChangeDisplay, { type: 'add_source_link' }> |
+  (Omit<Extract<KnowledgeChangeDisplay, { type: 'add_source_link' }>, 'reference'> & Readonly<{ referenceChoiceId: string }>);
+export type KnowledgeSuggestionEditInput = Readonly<{ expectedRevision: number; targetRevision: number; change: KnowledgeSuggestionEditChange; evidence: readonly WorkspaceKnowledgeSuggestion['evidence'][number][] }>;
 export type KnowledgeDisplay = Readonly<{
   people: readonly KnowledgePersonDisplay[];
   projects: readonly KnowledgeProjectDisplay[];

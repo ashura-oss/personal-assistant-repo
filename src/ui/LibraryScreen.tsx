@@ -1,14 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Pressable, ScrollView, Text, TextInput, View } from "react-native";
 import Ionicons from "@expo/vector-icons/Ionicons";
-import type { AppController, ContextDocument, LocalTask, SaveKnowledgeFactInput, SaveKnowledgeContactInput, SaveKnowledgeSourceLinkInput, SaveKnowledgeMemberInput, KnowledgeItemCommand, ReviewKnowledgeSuggestionInput } from "../core";
-import type { KnowledgeEntityKind, KnowledgeSuggestionReview } from "../knowledge/types";
+import type { AppController, ContextDocument, LocalTask, SaveKnowledgeFactInput, SaveKnowledgeContactInput, SaveKnowledgeSourceLinkInput, SaveKnowledgeMemberInput, KnowledgeItemCommand } from "../core";
+import type { KnowledgeEntityKind } from "../knowledge/types";
 import { BackupImportSheet } from "./BackupImportSheet";
 import { ImportedBackupsSection } from "./ImportedBackupsSection";
 import { KnowledgeSection } from "./KnowledgeSection";
 import { KnowledgeEntitySheet } from "./KnowledgeEntitySheet";
 import type { KnowledgeEntityEditCommand, KnowledgeProjectEditCommand } from "./KnowledgeEntitySheet";
-import type { ImportedKnowledgePreviewDisplay, ImportedKnowledgeSelection, KnowledgeDisplay, KnowledgeSourceChoiceDisplay, KnowledgeSuggestionDisplay, KnowledgeSuggestionEditCommand } from "./knowledgeDisplayTypes";
+import type { ImportedKnowledgePreviewDisplay, ImportedKnowledgeSelection, KnowledgeDisplay, KnowledgeSourceChoiceDisplay, KnowledgeSuggestionDisplay, KnowledgeSuggestionEditInput, KnowledgeSuggestionReviewDisplay, KnowledgeSuggestionReviewInput } from "./knowledgeDisplayTypes";
 import { KnowledgeSuggestionSheet } from "./KnowledgeSuggestionSheet";
 import { ImportedKnowledgeReview } from "./ImportedKnowledgeReview";
 import { ImportedKnowledgeActivationOwnership, attachImportedKnowledgePreviewForRuntime, importedKnowledgeOwnerMatchesRuntime, importedKnowledgeSelectionMatches, type ImportedKnowledgeActivationPort } from "./importedKnowledgeActivationOwnership";
@@ -18,7 +18,7 @@ import { IconButton, Button } from "./primitives";
 import { WorkspaceNoteCard, type WorkspaceNoteCardDisplay } from "./WorkspaceContent";
 import { C, s } from "./theme";
 import type { PickedBackupFile } from "../backupFiles";
-import { friendlyDocumentName, newDocumentPath, projectImportedKnowledgeArchives, projectKnowledgeSuggestionDisplay, projectImportedKnowledgePreview } from './libraryDisplay';
+import { friendlyDocumentName, newDocumentPath, projectImportedKnowledgeArchives, projectImportedKnowledgePreview } from './libraryDisplay';
 import type { ReminderAlertChannel, ReminderAlertDisplay, ReminderDisplayRecord } from './reminderDisplay';
 import type { WorkspaceSnapshotDTO, DeepReadonly } from '../cloud/workspaceDto';
 import type { WorkspaceActionCapability } from './workspaceCapabilities';
@@ -48,14 +48,15 @@ export type LibraryKnowledgeEntityActions = Readonly<{
   sourceLinks: WorkspaceActionCapability<Readonly<{
     save: (input: Omit<SaveKnowledgeSourceLinkInput, 'reference'> & { referenceChoiceId?: string }) => Promise<unknown>;
     remove: (input: KnowledgeItemCommand) => Promise<unknown>;
+    loadChoices?: (expectedRevision: number) => Promise<readonly KnowledgeSourceChoiceDisplay[]>;
   }>>;
   saveMember: (input: SaveKnowledgeMemberInput) => Promise<unknown>;
   removeMember: (input: KnowledgeItemCommand & { entityKind: 'project' }) => Promise<unknown>;
 }>;
 type LibraryKnowledgeSuggestionActions = Readonly<{
-  review: (id: string, input: ReviewKnowledgeSuggestionInput) => Promise<unknown>;
-  edit: (id: string, input: KnowledgeSuggestionEditCommand) => Promise<KnowledgeSuggestionDisplay | undefined>;
-  prepare: (id: string, input: { expectedRevision: number }) => Promise<KnowledgeSuggestionReview>;
+  review: (id: string, input: KnowledgeSuggestionReviewInput) => Promise<unknown>;
+  edit: (id: string, input: KnowledgeSuggestionEditInput) => Promise<KnowledgeSuggestionDisplay | undefined>;
+  prepare: (id: string, input: { expectedRevision: number; expectedWorkspaceRevision?: number }) => Promise<KnowledgeSuggestionReviewDisplay>;
 }>;
 export function LibraryScreen({
   notes,
@@ -70,6 +71,7 @@ export function LibraryScreen({
   knowledge,
   knowledgeRecoveryStatus,
   references,
+  workspaceRevision,
   evidenceLabels,
   chatEvidenceLabels,
   memoryReviewBlocked,
@@ -104,6 +106,7 @@ export function LibraryScreen({
   importedBackups: WorkspaceSnapshotDTO['state']['importedBackups'];
   archiveActionsBlocked: boolean;
   knowledge: KnowledgeDisplay;
+  workspaceRevision?: number;
   knowledgeRecoveryStatus?: Readonly<{ message: string }>;
   references: readonly KnowledgeSourceChoiceDisplay[];
   evidenceLabels: Record<string, string>;
@@ -429,10 +432,14 @@ export function LibraryScreen({
             onRequestHandled={onMemoryReviewRequestHandled}
             onPrepareReview={async (id, input) => {
               const review = await knowledgeSuggestionActions.action.prepare(id, input);
-              return { suggestion: projectKnowledgeSuggestionDisplay(review.suggestion), canEdit: review.canEdit, canAccept: review.canAccept, ...(review.reason ? { reason: review.reason } : {}) };
+              return review;
             }}
             onReview={knowledgeSuggestionActions.action.review}
             onEdit={knowledgeSuggestionActions.action.edit}
+            workspaceRevision={workspaceRevision}
+            references={references}
+            loadSourceChoices={knowledgeEntityActions.available && knowledgeEntityActions.action.sourceLinks.available
+              ? knowledgeEntityActions.action.sourceLinks.action.loadChoices : undefined}
           /> : <View style={{ gap: 9 }}>
             <Text style={s.sectionTitle}>Suggestions</Text>
             <Text style={s.noteSub}>{knowledgeSuggestionActions.reason}</Text>
@@ -472,6 +479,7 @@ export function LibraryScreen({
         people={knowledge.people}
         documents={docs}
         references={references}
+        workspaceRevision={workspaceRevision}
         busy={busy}
         onClose={() => { setEntitySheetOpen(false); setEditingEntityId(null); }}
         onSavePerson={knowledgeEntityActions.action.savePerson}

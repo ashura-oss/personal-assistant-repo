@@ -1,5 +1,7 @@
 /** Same-origin, receipt-aware transport for the authenticated browser workspace. */
 import type { WorkspaceSnapshotDTO } from '../cloud/workspaceDto';
+import { parseKnowledgeSourceChoicesDTO, parseKnowledgeSuggestionReviewDTO, type KnowledgeSourceChoicesDTO, type KnowledgeSuggestionReviewDTO } from '../cloud/knowledgeHttpContracts';
+import { isCanonicalKnowledgeId } from '../knowledge';
 import {
   parseWorkspaceCommandEnvelope,
   parseWorkspaceCommandId,
@@ -35,6 +37,8 @@ export type WorkspaceCommandAdmission = WorkspaceCommandEnvelope;
 export type WorkspaceClient = Readonly<{
   getSnapshot(): Promise<WorkspaceSnapshotDTO>;
   refresh(): Promise<WorkspaceSnapshotDTO>;
+  readKnowledgeSourceChoices(expectedRevision: number): Promise<KnowledgeSourceChoicesDTO>;
+  readKnowledgeSuggestionReview(input: Readonly<{ suggestionId: string; expectedSuggestionRevision: number; expectedRevision: number }>): Promise<KnowledgeSuggestionReviewDTO>;
   execute(command: WorkspaceCommand, onAdmitted?: (envelope: WorkspaceCommandAdmission) => void): Promise<WorkspaceCommandResponse>;
   inspectCommand(commandId?: string): Promise<WorkspaceCommandResponse>;
   inspectRecoveredCommand(entry: WorkspaceCommandHistoryEntry): Promise<WorkspaceCommandResponse>;
@@ -231,6 +235,38 @@ export function createWebWorkspaceClient(session: AuthenticatedSession, options:
     assertOperation(ticket);
     snapshot = next;
     return next;
+  }
+
+  async function readKnowledgeSourceChoices(expectedRevision: number): Promise<KnowledgeSourceChoicesDTO> {
+    assertUsable();
+    if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0 || !snapshot || snapshot.revision !== expectedRevision) {
+      throw new WorkspaceClientError('stale', 'The workspace changed. Reload it before loading source choices.');
+    }
+    const ticket = beginOperation();
+    const raw = await request(`/api/workspace/knowledge/source-choices?expectedRevision=${expectedRevision}&expectedPrivacyEpoch=${privacyEpoch}`, { method: 'GET' }, ticket);
+    assertOperation(ticket);
+    try { return parseKnowledgeSourceChoicesDTO(raw, { workspaceId, privacyEpoch, revision: expectedRevision }); }
+    catch (error) {
+      if (error instanceof Error && error.message === 'knowledge_http_response_stale') throw new WorkspaceClientError('stale', 'The workspace changed. Reload it before loading source choices.');
+      throw new WorkspaceClientError('malformed', 'The source choices could not be confirmed.');
+    }
+  }
+
+  async function readKnowledgeSuggestionReview(input: Readonly<{ suggestionId: string; expectedSuggestionRevision: number; expectedRevision: number }>): Promise<KnowledgeSuggestionReviewDTO> {
+    assertUsable();
+    if (!input || !isCanonicalKnowledgeId(input.suggestionId) || !Number.isSafeInteger(input.expectedSuggestionRevision) || input.expectedSuggestionRevision < 1 ||
+        !Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 0 || !snapshot || snapshot.revision !== input.expectedRevision) {
+      throw new WorkspaceClientError('stale', 'The workspace changed. Reload it before preparing this suggestion.');
+    }
+    const ticket = beginOperation();
+    const query = `suggestionId=${input.suggestionId}&expectedSuggestionRevision=${input.expectedSuggestionRevision}&expectedRevision=${input.expectedRevision}&expectedPrivacyEpoch=${privacyEpoch}`;
+    const raw = await request(`/api/workspace/knowledge/suggestion-review?${query}`, { method: 'GET' }, ticket);
+    assertOperation(ticket);
+    try { return parseKnowledgeSuggestionReviewDTO(raw, { workspaceId, privacyEpoch, revision: input.expectedRevision, suggestionId: input.suggestionId, suggestionRevision: input.expectedSuggestionRevision }); }
+    catch (error) {
+      if (error instanceof Error && error.message === 'knowledge_http_response_stale') throw new WorkspaceClientError('stale', 'The suggestion changed. Reload the latest revision before preparing it.');
+      throw new WorkspaceClientError('malformed', 'The suggestion review could not be confirmed.');
+    }
   }
 
   function parseResponse(value: unknown, expectedCommand?: WorkspaceCommandEnvelope, expectedHistoryKind?: WorkspaceCommandHistoryKind): WorkspaceCommandResponse {
@@ -453,6 +489,8 @@ export function createWebWorkspaceClient(session: AuthenticatedSession, options:
   return Object.freeze({
     getSnapshot: () => readSnapshot('/api/workspace/snapshot', 'GET'),
     refresh: () => readSnapshot('/api/workspace/refresh', 'POST'),
+    readKnowledgeSourceChoices,
+    readKnowledgeSuggestionReview,
     execute,
     inspectCommand,
     inspectRecoveredCommand,

@@ -27,6 +27,8 @@ import { useCloudAudioPlayback } from './useCloudAudioPlayback';
 import { createCloudKnowledgeActions } from './cloudKnowledgeActions';
 import type { CloudVoiceCoordinatorState } from './cloudVoiceCoordinator';
 import type { CloudCredentialController } from './useCloudCredentials';
+import { useCloudOAuth } from './useCloudOAuth';
+import type { CloudOAuthCoordinator } from './cloudOAuthCoordinator';
 
 export type CloudWorkspaceActions = Readonly<{
   tasks: Readonly<{ complete: (taskId: string) => Promise<WorkspaceCommandResponse>; reopen: (taskId: string) => Promise<WorkspaceCommandResponse> }>;
@@ -99,7 +101,8 @@ function equalSettingsBaseline(left: WorkspaceSettingsBaseline, right: Workspace
     left.maxAudioSeconds === right.maxAudioSeconds && left.retention === right.retention;
 }
 
-export function CloudWorkspace({ store, state, onLogout, voiceCapability, credentials }: { store: Pick<CloudWorkspaceSessionStore, 'getSnapshot' | 'execute' | 'inspect' | 'refresh'>; state: CloudWorkspaceSessionState; onLogout: () => void; voiceCapability?: CloudWorkspaceVoiceCapability; credentials?: CloudCredentialController }) {
+export function CloudWorkspace({ store, state, onLogout, voiceCapability, credentials, oauthCoordinator }: { store: Pick<CloudWorkspaceSessionStore, 'getSnapshot' | 'execute' | 'inspect' | 'refresh'> & Partial<Pick<CloudWorkspaceSessionStore, 'readKnowledgeSourceChoices' | 'readKnowledgeSuggestionReview'>>; state: CloudWorkspaceSessionState; onLogout: () => void; voiceCapability?: CloudWorkspaceVoiceCapability; credentials?: CloudCredentialController; oauthCoordinator?: CloudOAuthCoordinator }) {
+  const oauthState = useCloudOAuth(oauthCoordinator);
   const snapshot = state.snapshot!;
   const dto = snapshot.state;
   const libraryMutationActions = useMemo(() => createCloudKnowledgeActions(store, { workspaceId: snapshot.workspaceId, privacyEpoch: snapshot.privacyEpoch }),
@@ -316,6 +319,28 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
         : latestSettingsState.busy || latestSettingsState.refreshRequired || latestSettingsState.pendingCommand || settingsSaving
           ? 'Resolve the current workspace operation before saving settings.'
           : undefined;
+  const connectionCapability = oauthCoordinator ? {
+    available: true as const,
+    state: oauthState,
+    accounts: dto.accounts.filter((account) => account.provider === 'google' || account.provider === 'microsoft').map((account) => ({
+      id: account.id, provider: account.provider as 'google' | 'microsoft', displayName: account.displayName, email: account.email,
+      connected: account.connected, authStatus: account.authStatus, capabilities: account.capabilities, connectionGeneration: account.connectionGeneration,
+    })),
+    blockedReason: state.busy || state.pendingCommand || state.refreshRequired
+      ? 'Resolve the current workspace operation before starting or installing a connection.'
+      : oauthState.workspaceRefreshRequired ? 'Refresh the workspace before starting or installing a connection.' : undefined,
+    actions: {
+      open: () => oauthCoordinator.open(),
+      reload: () => oauthCoordinator.open(),
+      refreshWorkspace: () => oauthCoordinator.refreshWorkspace(),
+      start: (provider: 'google' | 'microsoft', capabilities: readonly import('./cloudOAuthClient').OAuthCapability[], reconnectAccountId?: string) => oauthCoordinator.start(provider, capabilities, reconnectAccountId),
+      restart: (provider: 'google' | 'microsoft', capabilities: readonly import('./cloudOAuthClient').OAuthCapability[], attemptId: string, reconnectAccountId?: string) => oauthCoordinator.start(provider, capabilities, reconnectAccountId, attemptId),
+      inspectStart: (provider: 'google' | 'microsoft', attemptId: string) => oauthCoordinator.inspectStart(provider, attemptId),
+      inspectStage: (stageId: string) => oauthCoordinator.inspectStage(stageId),
+      installStage: (stageId: string) => oauthCoordinator.installStage(stageId),
+      inspectInstall: () => oauthCoordinator.inspectInstall(),
+    },
+  } : undefined;
   const saveSettings = async () => {
     const draft = settingsDraft;
     const baseline = settingsBaseline;
@@ -581,11 +606,12 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
         }}
         preferencesDraft={settingsDraft ?? settingsDraftFrom(latestSettingsSnapshot.state.settings)}
         preferencesMessage={settingsFormMessage ?? (settingsConflict ? settingsUnavailableReason : settingsSaving ? 'Saving settings…' : undefined)}
+        connectionCapability={connectionCapability}
         credentials={credentials
           ? { available: true, controller: credentials }
           : { available: false, reason: 'Provider credentials are unavailable in this workspace view.' } satisfies WorkspaceSettingsCredentialCapability}
         onReloadPreferences={settingsConflict || settingsNeedsReload || state.refreshRequired ? reloadSettings : undefined}
-        busy={state.busy || state.refreshRequired || Boolean(state.pendingCommand) || settingsSaving} onClose={closeSettings}
+        busy={state.busy || settingsSaving} onClose={closeSettings}
       /> : tab === 'chat' ? (
         <ChatSection
           storageLocation="server"
@@ -634,7 +660,7 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
           <LibraryScreen key={`${snapshot.workspaceId}:${snapshot.privacyEpoch}`}
             notes={libraryNotes.map((note) => workspaceNoteCardDisplay({ ...note, recordingAvailable: note.audio?.available === true }))}
             query={libraryQuery} setQuery={setLibraryQuery} docs={dto.documents} tasks={dto.tasks}
-            busy={state.busy || state.refreshRequired}
+            busy={state.busy}
             archiveActions={{
               importedKnowledge: { available: false, reason: 'Imported knowledge activation is not connected to server commands yet.' },
               documents: { available: false, reason: 'Imported document activation is not connected to server commands yet.' },
@@ -642,9 +668,9 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
               importedChat: { available: false, reason: 'Imported conversation deletion is not connected to server commands yet.' },
             }}
             importedBackups={dto.importedBackups} archiveActionsBlocked={state.refreshRequired}
-            knowledge={projectKnowledgeDisplay(dto.knowledge)} references={[]}
+            knowledge={projectKnowledgeDisplay(dto.knowledge)} workspaceRevision={snapshot.revision} references={[]}
             evidenceLabels={{}} chatEvidenceLabels={safeChatMemoryEvidenceLabels(dto.assistantChatConversations)}
-            memoryReviewBlocked={true}
+            memoryReviewBlocked={state.refreshRequired || Boolean(state.pendingCommand)}
             previewMode={false} sampleBackupMode={false} knowledgeDemoMode={false}
             reminderRecords={dto.reminders.records} reminderAlerts={{}} reminderDemoMode={false}
             reminderAlertChannel="browser_unavailable"
@@ -666,7 +692,7 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
                 });
               },
             } } : libraryMutationActions.entities}
-            knowledgeSuggestionActions={{ available: false, reason: 'Knowledge suggestion review is not connected to server commands yet.' }}
+            knowledgeSuggestionActions={libraryMutationActions.suggestions}
             onExport={{ available: false, reason: 'Workspace export is not connected to the browser workspace yet.' }}
           />
           {selectedNote ? <WorkspaceModals

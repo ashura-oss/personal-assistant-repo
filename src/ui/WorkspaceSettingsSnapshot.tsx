@@ -6,6 +6,7 @@ import { C, s } from './theme';
 import { WorkspaceSettingsPreferences, type WorkspaceSettingsDraft, type WorkspaceSettingsPreferenceSave, type WorkspaceSettingsPreferenceUpdate } from './WorkspaceSettingsPreferences';
 import type { CloudCredentialController } from '../web/useCloudCredentials';
 import { CloudCredentialsPanel } from './CloudCredentialsPanel';
+import { CloudConnectionsPanel, type CloudConnectionsCapability } from './CloudConnectionsPanel';
 
 export type WorkspaceSettingsDisplay = WorkspaceSnapshotDTO['state'];
 export type WorkspaceSettingsAction = Readonly<{ available: true; action: () => void | Promise<void> }> | Readonly<{ available: false; reason: string }>;
@@ -17,6 +18,7 @@ export type WorkspaceSettingsActions = Readonly<{
   recovery: WorkspaceSettingsAction;
 }>;
 export type WorkspaceSettingsCredentialCapability = Readonly<{ available: true; controller: CloudCredentialController }> | Readonly<{ available: false; reason: string }>;
+export type WorkspaceSettingsConnectionCapability = CloudConnectionsCapability;
 
 function Unavailable({ capability }: { capability: WorkspaceSettingsAction }) {
   return capability.available ? null : <Text style={styles.meta}>{capability.reason}</Text>;
@@ -28,7 +30,7 @@ function CapabilityButton({ label, capability, busy }: { label: string; capabili
     : <Unavailable capability={capability} />;
 }
 
-export function WorkspaceSettingsScreen({ display, actions, busy, onClose, preferencesDraft, preferencesMessage, onReloadPreferences, credentials }: { display: WorkspaceSettingsDisplay; actions: WorkspaceSettingsActions; busy: boolean; onClose: () => void; preferencesDraft?: WorkspaceSettingsDraft; preferencesMessage?: string; onReloadPreferences?: () => void; credentials?: WorkspaceSettingsCredentialCapability }) {
+export function WorkspaceSettingsScreen({ display, actions, busy, onClose, preferencesDraft, preferencesMessage, onReloadPreferences, credentials, connectionCapability }: { display: WorkspaceSettingsDisplay; actions: WorkspaceSettingsActions; busy: boolean; onClose: () => void; preferencesDraft?: WorkspaceSettingsDraft; preferencesMessage?: string; onReloadPreferences?: () => void; credentials?: WorkspaceSettingsCredentialCapability; connectionCapability?: WorkspaceSettingsConnectionCapability }) {
   const settings = display.settings;
   const activeRules = display.proactive.rules.filter((rule) => rule.enabled).length;
   const pendingSuggestions = display.knowledge.suggestions.filter((suggestion) => suggestion.status === 'pending').length;
@@ -70,6 +72,7 @@ export function WorkspaceSettingsScreen({ display, actions, busy, onClose, prefe
       <Text style={styles.meta}>{display.usage.requests} requests · {display.usage.attemptsToday} attempts today · {display.usage.attempts} recorded attempts</Text>
     </View>
     <Text style={s.sectionTitle}>Connections</Text>
+    {connectionCapability ? <CloudConnectionsPanel capability={connectionCapability} busy={busy} /> : <>
     {display.accounts.map((account) => <View key={account.id} style={styles.card}>
       <Text style={styles.title}>{account.displayName}</Text>
       <Text style={styles.meta}>{account.provider} · {account.email}</Text>
@@ -79,6 +82,7 @@ export function WorkspaceSettingsScreen({ display, actions, busy, onClose, prefe
     </View>)}
     {display.accounts.length === 0 ? <Text style={styles.meta}>No accounts are saved.</Text> : null}
     <CapabilityButton label="Manage connections" capability={actions.connections} busy={busy} />
+    </>}
     <Text style={s.sectionTitle}>Calendars</Text>
     {display.calendars.map((calendar) => <View key={calendar.id} style={styles.card}>
       <Text style={styles.title}>{calendar.name}</Text>

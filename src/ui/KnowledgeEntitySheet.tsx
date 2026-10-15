@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView, Text, View } from 'react-native';
 import type { WorkspaceSnapshotDTO } from '../cloud/workspaceDto';
 import type { KnowledgeEntityDisplay, KnowledgePersonDisplay, KnowledgeProjectDisplay, KnowledgeReferenceDisplay, KnowledgeSourceChoiceDisplay } from './knowledgeDisplayTypes';
@@ -34,6 +34,7 @@ type Props = {
   people: readonly PersonDisplay[];
   documents: WorkspaceSnapshotDTO['state']['documents'];
   references: readonly KnowledgeSourceChoiceDisplay[];
+  workspaceRevision?: number;
   busy: boolean;
   onClose: () => void;
   onSavePerson: (input: KnowledgeEntityEditCommand) => Promise<unknown>;
@@ -45,18 +46,29 @@ type Props = {
   sourceLinks: WorkspaceActionCapability<Readonly<{
     save: (input: { entityKind: 'person' | 'project'; entityId: string; expectedEntityRevision: number; itemId?: string; referenceChoiceId?: string; label: string }) => Promise<unknown>;
     remove: (input: RemoveKnowledgeItemCommand) => Promise<unknown>;
+    loadChoices?: (expectedRevision: number) => Promise<readonly KnowledgeSourceChoiceDisplay[]>;
   }>>;
   onSaveMember: (input: { entityKind: 'project'; entityId: string; expectedEntityRevision: number; itemId?: string; personId: string; personRevision: number; role: string }) => Promise<unknown>;
   onRemoveMember: (input: Omit<RemoveKnowledgeItemCommand, 'entityKind'> & Readonly<{ entityKind: 'project' }>) => Promise<unknown>;
 };
 
 export function KnowledgeEntitySheet(props: Props) {
-  const { visible, kind, entity, people, documents, references, busy, onClose } = props;
+  const { visible, kind, entity, people, documents, references, workspaceRevision, busy, onClose } = props;
   const operation = useRef<object | undefined>(undefined);
+  const sourceLoadGeneration = useRef(0);
+  const sourceLoadLock = useRef(false);
+  const sourceLinkActions = props.sourceLinks.available ? props.sourceLinks.action : undefined;
+  const [loadedReferences, setLoadedReferences] = useState<readonly KnowledgeSourceChoiceDisplay[]>();
+  const [sourceChoicesLoading, setSourceChoicesLoading] = useState(() => Boolean(visible && entity && sourceLinkActions?.loadChoices && workspaceRevision !== undefined));
+  const [sourceChoicesError, setSourceChoicesError] = useState('');
   useEffect(() => () => { operation.current = undefined; }, []);
   const project = entity && 'members' in entity ? entity : undefined;
   const person = entity && 'contacts' in entity ? entity : undefined;
-  const referenceOptions = references.filter(({ reference }) => !(entity && reference.kind === kind && reference.id === entity.id));
+  const entityId = entity?.id;
+  const openingSourceChoiceRead = useRef({ entityId, workspaceRevision, loadChoices: sourceLinkActions?.loadChoices });
+  useLayoutEffect(() => { openingSourceChoiceRead.current = { entityId, workspaceRevision, loadChoices: sourceLinkActions?.loadChoices }; }, [entityId, workspaceRevision, sourceLinkActions?.loadChoices]);
+  const availableReferences = loadedReferences ?? references;
+  const referenceOptions = availableReferences.filter(({ reference }) => !(entity && reference.kind === kind && reference.id === entity.id));
   const narrativeDoc = entity ? documents.find((doc) => doc.path === entity.narrativePath) : undefined;
   const [openingSnapshot] = useState({
     documentRevision: narrativeDoc?.revision,
@@ -91,8 +103,41 @@ export function KnowledgeEntitySheet(props: Props) {
   const itemDisabled = busy || formDirty || sourceChanged;
   const selectedReference = referenceOptions.find((option) => option.id === selectedReferenceId);
   const selectedReferenceAvailable = Boolean(selectedReference);
-  const sourceLinkActions = props.sourceLinks.available ? props.sourceLinks.action : undefined;
   const close = () => { operation.current = undefined; onClose(); };
+  const loadSourceChoices = async (expectedRevision = workspaceRevision) => {
+    if (!sourceLinkActions?.loadChoices || expectedRevision === undefined || sourceLoadLock.current) return;
+    sourceLoadLock.current = true;
+    const generation = ++sourceLoadGeneration.current;
+    setSourceChoicesLoading(true); setSourceChoicesError('');
+    try {
+      const choices = await sourceLinkActions.loadChoices(expectedRevision);
+      if (sourceLoadGeneration.current !== generation) return;
+      setLoadedReferences(choices);
+      setSelectedReferenceId((selected) => selected && choices.some((choice) => choice.id === selected) ? selected : null);
+    } catch (error) {
+      if (sourceLoadGeneration.current === generation) setSourceChoicesError(error instanceof Error ? error.message : 'Source choices could not be loaded. Reload and choose again.');
+    } finally {
+      if (sourceLoadGeneration.current === generation) { sourceLoadLock.current = false; setSourceChoicesLoading(false); }
+    }
+  };
+  useEffect(() => {
+    const opening = openingSourceChoiceRead.current;
+    if (visible && opening.entityId && opening.loadChoices && opening.workspaceRevision !== undefined) {
+      const generation = ++sourceLoadGeneration.current;
+      sourceLoadLock.current = true;
+      void opening.loadChoices(opening.workspaceRevision).then((choices) => {
+        if (sourceLoadGeneration.current !== generation) return;
+        setLoadedReferences(choices);
+        setSelectedReferenceId((selected) => selected && choices.some((choice) => choice.id === selected) ? selected : null);
+      }).catch((error) => {
+        if (sourceLoadGeneration.current === generation) setSourceChoicesError(error instanceof Error ? error.message : 'Source choices could not be loaded. Reload and choose again.');
+      }).finally(() => {
+        if (sourceLoadGeneration.current === generation) { sourceLoadLock.current = false; setSourceChoicesLoading(false); }
+      });
+    }
+    return () => { sourceLoadGeneration.current += 1; sourceLoadLock.current = false; };
+    // Load once when this keyed editor opens; changed props do not silently rebase the draft.
+  }, [visible]);
 
   const submit = async () => {
     if (operation.current || busy || sourceChanged) return;
@@ -172,10 +217,14 @@ export function KnowledgeEntitySheet(props: Props) {
             {entity.sourceLinks.map((item) => editingLinkId === item.id && sourceLinkActions ? <View key={item.id} style={s.knowledgeInlineForm}><Text style={s.knowledgeFootnote}>{referenceSummary(item.reference, references)}</Text><Field label="Link label" value={sourceLabel} onChangeText={setSourceLabel} /><Button label="Save link" tone="quiet" disabled={itemDisabled || !sourceLabel.trim()} onPress={() => void itemAction(async () => { const saved = await sourceLinkActions.save({ entityKind: kind, entityId: entity.id, expectedEntityRevision: baseRevision ?? entity.revision, itemId: item.id, label: sourceLabel.trim() }); if (saved) setEditingLinkId(null); return saved; })} /><Button label="Cancel edit" tone="quiet" disabled={busy} onPress={() => setEditingLinkId(null)} /></View> : sourceLinkActions ? <ClaimRow key={item.id} title={`${item.label} · ${referenceSummary(item.reference, references)}`} provenance={item.provenance} busy={itemDisabled} onEdit={() => { setEditingLinkId(item.id); setSourceLabel(item.label); }} onRemove={() => void itemAction(() => sourceLinkActions.remove({ entityKind: kind, entityId: entity.id, expectedEntityRevision: baseRevision ?? entity.revision, itemId: item.id }))} /> : <View key={item.id} style={s.knowledgeClaim}><View style={{ flex: 1, gap: 3 }}><Text style={s.knowledgeMeta}>{item.provenance === 'user_authored' ? 'Entered by you' : 'Kept inference'}</Text><Text style={s.analysisText}>{item.label} · {referenceSummary(item.reference, references)}</Text></View></View>)}
             {sourceLinkActions ? <>
               <Text style={s.label}>Add a source link</Text>
-              {referenceOptions.length ? referenceOptions.map((option) => <Pressable key={option.id} accessibilityRole="radio" accessibilityState={{ selected: selectedReferenceId === option.id }} onPress={() => setSelectedReferenceId(option.id)} style={[s.knowledgeStatusChoice, selectedReferenceId === option.id && s.knowledgeStatusSelected]}><Text style={s.knowledgeMeta}>{option.label}</Text></Pressable>) : <Text style={s.knowledgeFootnote}>No saved sources are available to link yet.</Text>}
+              {sourceLinkActions.loadChoices ? <>
+                <Button label={sourceChoicesLoading ? 'Loading source choices…' : 'Reload source choices'} tone="quiet" disabled={sourceChoicesLoading || busy} onPress={() => void loadSourceChoices()} />
+                {sourceChoicesError ? <Text accessibilityRole="alert" style={s.knowledgeError}>{sourceChoicesError}</Text> : null}
+              </> : null}
+              {sourceChoicesLoading ? <Text style={s.knowledgeFootnote}>Checking current saved sources…</Text> : referenceOptions.length ? referenceOptions.map((option) => <Pressable key={option.id} accessibilityRole="radio" accessibilityState={{ selected: selectedReferenceId === option.id }} onPress={() => setSelectedReferenceId(option.id)} style={[s.knowledgeStatusChoice, selectedReferenceId === option.id && s.knowledgeStatusSelected]}><Text style={s.knowledgeMeta}>{option.label}</Text></Pressable>) : <Text style={s.knowledgeFootnote}>{sourceLinkActions.loadChoices && !loadedReferences ? 'Load the current source choices before creating a link.' : 'No saved sources are available to link yet.'}</Text>}
               {selectedReference && !selectedReferenceAvailable ? <Text style={s.knowledgeError}>That source changed or is no longer available. Choose a current source.</Text> : null}
               <Field label="Why is this relevant?" value={sourceLabel} onChangeText={setSourceLabel} />
-              <Button label="Save source link" tone="quiet" disabled={itemDisabled || !selectedReferenceAvailable || !sourceLabel.trim()} onPress={() => {
+              <Button label="Save source link" tone="quiet" disabled={itemDisabled || sourceChoicesLoading || !selectedReferenceAvailable || !sourceLabel.trim()} onPress={() => {
                 const referenceChoiceId = selectedReference && selectedReferenceAvailable ? selectedReference.id : undefined;
                 if (!referenceChoiceId) return;
                 void itemAction(async () => { const saved = await sourceLinkActions.save({ entityKind: kind, entityId: entity.id, expectedEntityRevision: baseRevision ?? entity.revision, referenceChoiceId, label: sourceLabel.trim() }); if (saved) { setSelectedReferenceId(null); setSourceLabel(''); } return saved; });

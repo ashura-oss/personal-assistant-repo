@@ -6,7 +6,7 @@ import type { Note, Proposal, AppState, AppSettings, AppController, AccountCapab
 import type { ProactiveRecoveryPlan, ProactiveRecoveryStatus } from "./src/proactive/recovery";
 import type { DispatchRecoveryPlan, DispatchRecoveryStatus } from "./src/dispatch/recovery";
 import type { StartupRecoveryPlan } from "./src/storage/startupRecovery";
-import type { KnowledgeChange, KnowledgeReference, KnowledgeSuggestionReview } from "./src/knowledge/types";
+import type { KnowledgeChange, KnowledgeSuggestionReview } from "./src/knowledge/types";
 import { SpeechTranscriptionError } from "./src/transcription/types";
 import { RecordingAutoStopGate } from "./src/audio/autoStop";
 import type { AudioCapture } from "./src/audio/types";
@@ -32,7 +32,7 @@ import { InboxWorkspaceContent, inboxAccountDisplay, inboxDeviceCalendarDisplay 
 import { LibraryScreen } from "./src/ui/LibraryScreen";
 import { findCurrentNativeDetailNote } from "./src/ui/nativeDetailSelection";
 import { RecordingAttachmentSheet } from "./src/ui/RecordingAttachmentSheet";
-import type { KnowledgeReferenceDisplay, KnowledgeSourceChoiceDisplay } from "./src/ui/knowledgeDisplayTypes";
+import type { KnowledgeSourceChoiceDisplay } from "./src/ui/knowledgeDisplayTypes";
 import { projectKnowledgeDisplay, projectKnowledgeSuggestionDisplay } from "./src/ui/libraryDisplay";
 import { buildKnowledgeReferenceOptions, projectKnowledgeSourceChoiceReference } from "./src/knowledge/sourceChoices";
 import { KnowledgeReferenceChoiceOwnership, resolveKnowledgeSourceLinkReference } from "./src/ui/knowledgeReferenceChoiceOwnership";
@@ -3765,7 +3765,11 @@ export function WorkspaceView({ controller, credentials, platform, workspaceGene
                   let change: KnowledgeChange;
                   if (input.change.type === 'add_source_link') {
                     if (current.change.type !== 'add_source_link') return undefined;
-                    change = { ...input.change, reference: current.change.reference };
+                    const selectedReference = resolveKnowledgeSourceLinkReference(knowledgeReferenceChoiceOwnership, input.change.referenceChoiceId,
+                      buildKnowledgeReferenceOptions(state));
+                    if (!selectedReference) return undefined;
+                    change = { type: 'add_source_link', entityKind: input.change.entityKind, entityId: input.change.entityId,
+                      reference: selectedReference, label: input.change.label };
                   } else if (input.change.type === 'add_member') {
                     const memberChange = input.change;
                     if (!('personId' in memberChange) || !('personRevision' in memberChange)) return undefined;
@@ -3777,7 +3781,11 @@ export function WorkspaceView({ controller, credentials, platform, workspaceGene
                   const result = await run(() => controller.editKnowledgeSuggestion(id, { expectedRevision: input.expectedRevision, change, evidence: input.evidence.map((item) => ({ ...item })) }));
                   return result ? projectKnowledgeSuggestionDisplay(result) : undefined;
                   },
-                  prepare: prepareKnowledgeSuggestionReview,
+                  prepare: async (id, input) => {
+                    const review = await prepareKnowledgeSuggestionReview(id, { expectedRevision: input.expectedRevision });
+                    return { suggestion: projectKnowledgeSuggestionDisplay(review.suggestion), canEdit: review.canEdit, canAccept: review.canAccept,
+                      ...(review.reason ? { reason: review.reason } : {}) };
+                  },
                 }}}
                 onRun={(action) => run(action)}
                 documentActions={{ available: true, action: async (input) => {

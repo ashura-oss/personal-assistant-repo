@@ -1297,6 +1297,10 @@ describe('CloudWorkspace safe DTO presentation', () => {
       const path = String(input); const method = init?.method ?? 'GET';
       if (path === '/api/credentials' && method === 'GET') return { ok: true, status: 200, json: async () => credentialMetadata() };
       if (path === '/api/workspace/snapshot' || path === '/api/workspace/refresh') return { ok: true, status: 200, json: async () => makeSnapshot() };
+      if (path.startsWith('/api/workspace/knowledge/source-choices?') && method === 'GET') {
+        const expectedRevision = Number(new URL(path, 'http://test').searchParams.get('expectedRevision'));
+        return { ok: true, status: 200, json: async () => ({ schemaVersion: 1, workspaceId, privacyEpoch: 3, revision: expectedRevision, choices: [] }) };
+      }
       if (path === '/api/workspace/commands' && method === 'POST') {
         const envelope = JSON.parse(String(init?.body)) as { commandId: string; command: WorkspaceCommand };
         const command = envelope.command;
@@ -1429,7 +1433,9 @@ describe('CloudWorkspace safe DTO presentation', () => {
       await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
       expect(commands[2]).toEqual({ kind: 'knowledge.person.save', operation: 'create', input: { name: 'Maya', aliases: ['May'], narrative: 'A new colleague.' } });
       click('Open person Maya');
-      expect(host.textContent).toContain('Source links are viewable here; editing them is not connected to workspace commands yet.');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(host.textContent).toContain('Add a source link');
+      expect(host.textContent).toContain('No saved sources are available to link yet.');
       setTextField('Add a fact', 'Prefers concise updates');
       clickTwice('Add fact');
       await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
@@ -1462,6 +1468,7 @@ describe('CloudWorkspace safe DTO presentation', () => {
       expect(commands.find((command) => command.kind === 'knowledge.project.save')).toMatchObject({ kind: 'knowledge.project.save', operation: 'create', input: { name: 'Still launch', goal: 'Ship the first version.' } });
 
       click('Open project Still launch');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
       click('Maya Lee');
       setTextField('Role', 'Owner');
       click('Add project member');
@@ -1477,6 +1484,7 @@ describe('CloudWorkspace safe DTO presentation', () => {
 
       click('People library section');
       click('Open person Existing Jordan');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
       setTextField('Name', 'Jordan Updated');
       clickTwice('Save changes');
       await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
