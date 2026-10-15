@@ -25,6 +25,23 @@ export type WorkspaceCommand =
   | { readonly kind: 'notes.save'; readonly transcript: string }
   | { readonly kind: 'notes.capture.adopt'; readonly captureId: string; readonly captureRevision: string }
   | { readonly kind: 'accounts.installOAuth'; readonly stageId: string }
+  | { readonly kind: 'accounts.syncCalendars'; readonly accountId: string; readonly expectedConnectionGeneration: number; readonly continue?: boolean }
+  | { readonly kind: 'accounts.refreshMail' | 'accounts.continueMailBackfill' | 'accounts.disconnect'; readonly accountId: string; readonly expectedConnectionGeneration: number }
+  | { readonly kind: 'mail.source.loadText'; readonly messageId: string; readonly accountId: string; readonly expectedConnectionGeneration: number; readonly sourceDigest: string }
+  | { readonly kind: 'mail.reply.create'; readonly messageId: string; readonly accountId: string; readonly expectedConnectionGeneration: number;
+      readonly sourceDigest: string; readonly mode: 'reply' | 'reply_all'; readonly text: string; readonly to: readonly string[]; readonly cc: readonly string[] }
+  | { readonly kind: 'proposals.edit'; readonly proposalId: string; readonly expectedProposalRevision: number; readonly accountId: string;
+      readonly expectedConnectionGeneration: number; readonly edit: CloudProposalEdit }
+  | { readonly kind: 'proposals.approve' | 'proposals.execute' | 'proposals.dismiss'; readonly proposalId: string; readonly expectedProposalRevision: number }
+  | { readonly kind: 'dispatch.reconcile'; readonly recordId: string; readonly expectedRecordVersion: string;
+      readonly disposition: import('../dispatch').DispatchReconciliation; readonly note: string; readonly remoteId?: string }
+  | { readonly kind: 'mail.replyBatch.submit'; readonly messageId: string; readonly accountId: string; readonly expectedConnectionGeneration: number;
+      readonly sourceDigest: string; readonly textDigest: string; readonly mode: 'reply' | 'reply_all'; readonly to: readonly string[]; readonly cc: readonly string[];
+      readonly brief: string; readonly composerRevision: number; readonly noteId?: string; readonly noteRevision?: number;
+      readonly contextSelectionIds?: readonly string[]; readonly contextExcerptSelectionIds?: readonly string[] }
+  | { readonly kind: 'mail.replyBatch.check'; readonly jobId: string; readonly accountId: string; readonly expectedConnectionGeneration: number }
+  | { readonly kind: 'mail.replyBatch.review'; readonly jobId: string; readonly accountId: string; readonly expectedConnectionGeneration: number; readonly operation: 'draft' | 'send' }
+  | { readonly kind: 'mail.replyBatch.activate'; readonly planId: string; readonly jobId: string; readonly accountId: string; readonly expectedConnectionGeneration: number }
   | { readonly kind: 'documents.save'; readonly path: string; readonly content: string; readonly expectedRevision: number | null; readonly expectedEntityRevision?: number }
   | { readonly kind: 'knowledge.person.save'; readonly operation: 'create'; readonly input: Readonly<PersonCreateInput> }
   | { readonly kind: 'knowledge.person.save'; readonly operation: 'update'; readonly input: Readonly<PersonUpdateInput> }
@@ -47,6 +64,14 @@ export type WorkspaceCommand =
   | { readonly kind: 'assistant.batch.check'; readonly jobId: string }
   | { readonly kind: 'chat.submit'; readonly conversationId: string; readonly text: string; readonly knowledgeSelection?: PublicKnowledgeSelection }
   | { readonly kind: 'chat.refine'; readonly conversationId: string; readonly parentTurnId: string; readonly effort: 'medium' | 'high' | 'max' };
+
+export type CloudProposalEdit =
+  | Readonly<{ kind: 'email'; operation: 'draft' | 'send'; to: readonly string[]; cc: readonly string[]; bcc: readonly string[]; subject: string; text: string }>
+  | Readonly<{ kind: 'event'; calendarId: string; title: string; description: string; start: string; end: string; timeZone: string;
+      attendees: readonly string[]; invitePolicy: 'send' | 'none' }>;
+
+export type CloudDispatchOutcome = 'accepted' | 'unknown' | 'rejected';
+export type CloudProposalExecutionResult = import('../core').ProposalExecutionForCommandResult;
 
 export type PublicKnowledgeSelection = readonly Readonly<{ kind: 'person' | 'project'; id: string }>[];
 export type PublicKnowledgeChange = Exclude<KnowledgeChange, { type: 'add_source_link' }> |
@@ -87,6 +112,21 @@ export type WorkspaceCommandReceipt =
   | WorkspaceCommandReceiptBase<'notes.save'>
   | (WorkspaceCommandReceiptBase<'notes.capture.adopt'> & Readonly<{ captureId: string; captureRevision: string }>)
   | (WorkspaceCommandReceiptBase<'accounts.installOAuth'> & Readonly<{ stageId: string; accountGeneration: number }>)
+  | (WorkspaceCommandReceiptBase<'accounts.syncCalendars'> & Readonly<{ accountId: string; connectionGeneration: number; syncStatus: import('../core').AccountSyncState['status']; calendarsPartial: boolean }> )
+  | (WorkspaceCommandReceiptBase<'accounts.refreshMail' | 'accounts.continueMailBackfill'> & Readonly<{ accountId: string; connectionGeneration: number; lane: 'head' | 'backfill'; laneStatus: import('../core').MailLaneResult['status']; syncStatus: import('../core').AccountSyncState['status'] }> )
+  | (WorkspaceCommandReceiptBase<'accounts.disconnect'> & Readonly<{ accountId: string; connectionGeneration: number; connected: false; cleanup: 'complete' | 'pending' }> )
+  | (WorkspaceCommandReceiptBase<'mail.source.loadText'> & Readonly<{ accountId: string; connectionGeneration: number; sourceDigest: string; loadStatus: import('../core').MailReplyTextLoadResult['status']; textDigest?: string; bytes?: number }> )
+  | (WorkspaceCommandReceiptBase<'mail.reply.create'> & Readonly<{ proposalId: string; proposalRevision: number }> )
+  | (WorkspaceCommandReceiptBase<'proposals.edit' | 'proposals.approve' | 'proposals.dismiss'> & Readonly<{ proposalId: string; proposalRevision: number; proposalStatus: import('../core').Proposal['status'] }> )
+  | (WorkspaceCommandReceiptBase<'proposals.execute'> & Readonly<{ proposalId: string; proposalRevision: number; proposalStatus: import('../core').Proposal['status'];
+      execution: 'accepted' | 'unknown' | 'rejected' | 'simulated' | 'executed' | 'failed' | 'invalidated'; dispatchRecordId?: string;
+      operation?: 'draft' | 'send' | 'event'; outcomeAt?: string; remoteId?: string }> )
+  | (WorkspaceCommandReceiptBase<'dispatch.reconcile'> & Readonly<{ recordId: string; recordVersion: string; disposition: import('../dispatch').DispatchReconciliation;
+      providerOutcome: import('../dispatch').DispatchOutcome; providerOutcomeAt?: string }> )
+  | (WorkspaceCommandReceiptBase<'mail.replyBatch.submit'> & Readonly<{ jobId: string; jobStatus: import('../services/openRouterBatchJobs').AssistantBatchJobDTO['status'] }> )
+  | (WorkspaceCommandReceiptBase<'mail.replyBatch.check'> & Readonly<{ jobId: string; jobStatus: import('../services/openRouterBatchJobs').AssistantBatchJobDTO['status'] }> )
+  | (WorkspaceCommandReceiptBase<'mail.replyBatch.review'> & Readonly<{ jobId: string; planId: string; expiresAt: string }> )
+  | (WorkspaceCommandReceiptBase<'mail.replyBatch.activate'> & Readonly<{ jobId: string; proposalId: string }> )
   | (WorkspaceCommandReceiptBase<'documents.save'> & Readonly<{ documentRevision: number; entityKind?: KnowledgeEntityKind; entityId?: string; entityRevision?: number }>)
   | ((WorkspaceCommandReceiptBase<'knowledge.person.save'> | WorkspaceCommandReceiptBase<'knowledge.project.save'> |
       WorkspaceCommandReceiptBase<'knowledge.entity.archive'>) & Readonly<{ entityKind: KnowledgeEntityKind; entityRevision: number }>)
@@ -121,6 +161,21 @@ const COMMAND_KEYS: Record<WorkspaceCommand['kind'], readonly string[]> = {
   'notes.save': ['kind', 'transcript'], 'notes.updateTranscript': ['kind', 'noteId', 'text', 'expectedNoteRevision'],
   'notes.capture.adopt': ['kind', 'captureId', 'captureRevision'],
   'accounts.installOAuth': ['kind', 'stageId'],
+  'accounts.syncCalendars': ['kind', 'accountId', 'expectedConnectionGeneration', 'continue'],
+  'accounts.refreshMail': ['kind', 'accountId', 'expectedConnectionGeneration'],
+  'accounts.continueMailBackfill': ['kind', 'accountId', 'expectedConnectionGeneration'],
+  'accounts.disconnect': ['kind', 'accountId', 'expectedConnectionGeneration'],
+  'mail.source.loadText': ['kind', 'messageId', 'accountId', 'expectedConnectionGeneration', 'sourceDigest'],
+  'mail.reply.create': ['kind', 'messageId', 'accountId', 'expectedConnectionGeneration', 'sourceDigest', 'mode', 'text', 'to', 'cc'],
+  'proposals.edit': ['kind', 'proposalId', 'expectedProposalRevision', 'accountId', 'expectedConnectionGeneration', 'edit'],
+  'proposals.approve': ['kind', 'proposalId', 'expectedProposalRevision'],
+  'proposals.execute': ['kind', 'proposalId', 'expectedProposalRevision'],
+  'proposals.dismiss': ['kind', 'proposalId', 'expectedProposalRevision'],
+  'dispatch.reconcile': ['kind', 'recordId', 'expectedRecordVersion', 'disposition', 'note', 'remoteId'],
+  'mail.replyBatch.submit': ['kind', 'messageId', 'accountId', 'expectedConnectionGeneration', 'sourceDigest', 'textDigest', 'mode', 'to', 'cc', 'brief', 'composerRevision', 'noteId', 'noteRevision', 'contextSelectionIds', 'contextExcerptSelectionIds'],
+  'mail.replyBatch.check': ['kind', 'jobId', 'accountId', 'expectedConnectionGeneration'],
+  'mail.replyBatch.review': ['kind', 'jobId', 'accountId', 'expectedConnectionGeneration', 'operation'],
+  'mail.replyBatch.activate': ['kind', 'planId', 'jobId', 'accountId', 'expectedConnectionGeneration'],
   'documents.save': ['kind', 'path', 'content', 'expectedRevision', 'expectedEntityRevision'],
   'knowledge.person.save': ['kind', 'operation', 'input'], 'knowledge.project.save': ['kind', 'operation', 'input'],
   'knowledge.entity.archive': ['kind', 'entityKind', 'id', 'expectedRevision', 'archived'],
@@ -251,6 +306,21 @@ function preflightJsonBytes(value: unknown, maxBytes: number): number {
 function boundedString(value: unknown, maxBytes: number, options: { allowEmpty?: boolean; identifier?: boolean } = {}): value is string {
   return typeof value === 'string' && (options.allowEmpty || value.length > 0) &&
     (!options.identifier || !CONTROL.test(value)) && new TextEncoder().encode(value).byteLength <= maxBytes;
+}
+
+function parseBoundedStringList(value: unknown, maxItems = 100, maxItemBytes = 4096): readonly string[] {
+  if (!Array.isArray(value) || value.length > maxItems) throw new Error('workspace_command_invalid');
+  const result = value.map((item) => {
+    if (!boundedString(item, maxItemBytes) || CONTROL.test(item)) throw new Error('workspace_command_invalid');
+    return item;
+  });
+  return Object.freeze(result);
+}
+
+function accountFence(raw: Record<string, unknown>): { accountId: string; expectedConnectionGeneration: number } {
+  if (!boundedString(raw.accountId, MAX_ID_BYTES, { identifier: true }) || !Number.isSafeInteger(raw.expectedConnectionGeneration) ||
+      (raw.expectedConnectionGeneration as number) < 0) throw new Error('workspace_command_invalid');
+  return { accountId: raw.accountId, expectedConnectionGeneration: raw.expectedConnectionGeneration as number };
 }
 
 function parseKnowledgeSelection(value: unknown): PublicKnowledgeSelection {
@@ -483,6 +553,100 @@ function freezeCommand(raw: Record<string, unknown>): WorkspaceCommand {
     if (typeof raw.stageId !== 'string' || !UUID_V4.test(raw.stageId)) throw new Error('workspace_command_invalid');
     return Object.freeze({ kind, stageId: raw.stageId });
   }
+  if (kind === 'accounts.syncCalendars' || kind === 'accounts.refreshMail' || kind === 'accounts.continueMailBackfill' || kind === 'accounts.disconnect') {
+    assertExactKeys(raw, COMMAND_KEYS[kind], kind === 'accounts.syncCalendars' ? ['kind', 'accountId', 'expectedConnectionGeneration'] : COMMAND_KEYS[kind]);
+    const fence = accountFence(raw);
+    if (kind === 'accounts.syncCalendars') {
+      if (Object.hasOwn(raw, 'continue') && typeof raw.continue !== 'boolean') throw new Error('workspace_command_invalid');
+      return Object.freeze({ kind, ...fence, ...(Object.hasOwn(raw, 'continue') ? { continue: raw.continue as boolean } : {}) });
+    }
+    return Object.freeze({ kind, ...fence });
+  }
+  if (kind === 'mail.source.loadText') {
+    assertExactKeys(raw, COMMAND_KEYS[kind], COMMAND_KEYS[kind]);
+    const fence = accountFence(raw);
+    if (!boundedString(raw.messageId, MAX_ID_BYTES, { identifier: true }) || typeof raw.sourceDigest !== 'string' || !/^[a-f\d]{64}$/i.test(raw.sourceDigest)) {
+      throw new Error('workspace_command_invalid');
+    }
+    return Object.freeze({ kind, ...fence, messageId: raw.messageId, sourceDigest: raw.sourceDigest.toLowerCase() });
+  }
+  if (kind === 'mail.reply.create') {
+    assertExactKeys(raw, COMMAND_KEYS[kind], COMMAND_KEYS[kind]);
+    const fence = accountFence(raw);
+    if (!boundedString(raw.messageId, MAX_ID_BYTES, { identifier: true }) || typeof raw.sourceDigest !== 'string' || !/^[a-f\d]{64}$/i.test(raw.sourceDigest) ||
+        (raw.mode !== 'reply' && raw.mode !== 'reply_all') || !boundedString(raw.text, WORKSPACE_TEXT_COMMAND_MAX_BYTES, { allowEmpty: true })) {
+      throw new Error('workspace_command_invalid');
+    }
+    return Object.freeze({ kind, ...fence, messageId: raw.messageId, sourceDigest: raw.sourceDigest.toLowerCase(), mode: raw.mode,
+      text: raw.text, to: parseBoundedStringList(raw.to), cc: parseBoundedStringList(raw.cc) });
+  }
+  if (kind === 'proposals.edit') {
+    assertExactKeys(raw, COMMAND_KEYS[kind], COMMAND_KEYS[kind]);
+    const fence = accountFence(raw);
+    if (!boundedString(raw.proposalId, MAX_ID_BYTES, { identifier: true }) || !positiveRevision(raw.expectedProposalRevision) || !isRecord(raw.edit)) {
+      throw new Error('workspace_command_invalid');
+    }
+    const edit = raw.edit;
+    let parsed: CloudProposalEdit;
+    if (edit.kind === 'email') {
+      assertExactKeys(edit, ['kind', 'operation', 'to', 'cc', 'bcc', 'subject', 'text'], ['kind', 'operation', 'to', 'cc', 'bcc', 'subject', 'text']);
+      if (edit.operation !== 'draft' && edit.operation !== 'send' || !boundedString(edit.subject, 4096, { allowEmpty: true }) || CONTROL.test(edit.subject) ||
+          !boundedString(edit.text, WORKSPACE_TEXT_COMMAND_MAX_BYTES, { allowEmpty: true })) throw new Error('workspace_command_invalid');
+      parsed = Object.freeze({ kind: 'email', operation: edit.operation, to: parseBoundedStringList(edit.to), cc: parseBoundedStringList(edit.cc),
+        bcc: parseBoundedStringList(edit.bcc), subject: edit.subject, text: edit.text });
+    } else if (edit.kind === 'event') {
+      assertExactKeys(edit, ['kind', 'calendarId', 'title', 'description', 'start', 'end', 'timeZone', 'attendees', 'invitePolicy'],
+        ['kind', 'calendarId', 'title', 'description', 'start', 'end', 'timeZone', 'attendees', 'invitePolicy']);
+      if (!boundedString(edit.calendarId, MAX_ID_BYTES, { identifier: true }) || !boundedString(edit.title, 4096, { allowEmpty: true }) || CONTROL.test(edit.title) ||
+          !boundedString(edit.description, WORKSPACE_TEXT_COMMAND_MAX_BYTES, { allowEmpty: true }) || !boundedString(edit.start, 128) || !boundedString(edit.end, 128) ||
+          !boundedString(edit.timeZone, 256) || CONTROL.test(edit.timeZone) || (edit.invitePolicy !== 'send' && edit.invitePolicy !== 'none')) throw new Error('workspace_command_invalid');
+      try { new Intl.DateTimeFormat('en', { timeZone: edit.timeZone }); } catch { throw new Error('workspace_command_invalid'); }
+      parsed = Object.freeze({ kind: 'event', calendarId: edit.calendarId, title: edit.title, description: edit.description, start: edit.start,
+        end: edit.end, timeZone: edit.timeZone, attendees: parseBoundedStringList(edit.attendees), invitePolicy: edit.invitePolicy });
+    } else throw new Error('workspace_command_invalid');
+    return Object.freeze({ kind, proposalId: raw.proposalId, expectedProposalRevision: raw.expectedProposalRevision as number, ...fence, edit: parsed });
+  }
+  if (kind === 'proposals.approve' || kind === 'proposals.execute' || kind === 'proposals.dismiss') {
+    assertExactKeys(raw, COMMAND_KEYS[kind], COMMAND_KEYS[kind]);
+    if (!boundedString(raw.proposalId, MAX_ID_BYTES, { identifier: true }) || !positiveRevision(raw.expectedProposalRevision)) throw new Error('workspace_command_invalid');
+    return Object.freeze({ kind, proposalId: raw.proposalId, expectedProposalRevision: raw.expectedProposalRevision as number });
+  }
+  if (kind === 'dispatch.reconcile') {
+    assertExactKeys(raw, COMMAND_KEYS[kind], ['kind', 'recordId', 'expectedRecordVersion', 'disposition', 'note']);
+    if (!boundedString(raw.recordId, MAX_ID_BYTES, { identifier: true }) || typeof raw.expectedRecordVersion !== 'string' || !/^[a-f\d]{64}$/i.test(raw.expectedRecordVersion) ||
+        !['confirmed_present', 'not_found', 'abandoned'].includes(raw.disposition as string) || !boundedString(raw.note, 4096, { allowEmpty: true }) || CONTROL.test(raw.note) ||
+        (Object.hasOwn(raw, 'remoteId') && (!boundedString(raw.remoteId, MAX_ID_BYTES, { identifier: true }) || CONTROL.test(raw.remoteId)))) throw new Error('workspace_command_invalid');
+    return Object.freeze({ kind, recordId: raw.recordId, expectedRecordVersion: raw.expectedRecordVersion.toLowerCase(),
+      disposition: raw.disposition as import('../dispatch').DispatchReconciliation, note: raw.note,
+      ...(Object.hasOwn(raw, 'remoteId') ? { remoteId: raw.remoteId as string } : {}) });
+  }
+  if (kind === 'mail.replyBatch.submit') {
+    assertExactKeys(raw, COMMAND_KEYS[kind], ['kind', 'messageId', 'accountId', 'expectedConnectionGeneration', 'sourceDigest', 'textDigest', 'mode', 'to', 'cc', 'brief', 'composerRevision']);
+    const fence = accountFence(raw);
+    if (!boundedString(raw.messageId, MAX_ID_BYTES, { identifier: true }) || typeof raw.sourceDigest !== 'string' || !/^[a-f\d]{64}$/i.test(raw.sourceDigest) ||
+        typeof raw.textDigest !== 'string' || !/^[a-f\d]{64}$/i.test(raw.textDigest) || (raw.mode !== 'reply' && raw.mode !== 'reply_all') ||
+        !boundedString(raw.brief, WORKSPACE_TEXT_COMMAND_MAX_BYTES, { allowEmpty: true }) || !Number.isSafeInteger(raw.composerRevision) || (raw.composerRevision as number) < 0 ||
+        (Object.hasOwn(raw, 'noteId') !== Object.hasOwn(raw, 'noteRevision')) || (Object.hasOwn(raw, 'noteId') && (!boundedString(raw.noteId, MAX_ID_BYTES, { identifier: true }) || !positiveRevision(raw.noteRevision)))) {
+      throw new Error('workspace_command_invalid');
+    }
+    const contextSelectionIds = Object.hasOwn(raw, 'contextSelectionIds') ? parseBoundedStringList(raw.contextSelectionIds, 64, MAX_ID_BYTES) : undefined;
+    const contextExcerptSelectionIds = Object.hasOwn(raw, 'contextExcerptSelectionIds') ? parseBoundedStringList(raw.contextExcerptSelectionIds, 64, MAX_ID_BYTES) : undefined;
+    if (contextExcerptSelectionIds && (!contextSelectionIds || contextExcerptSelectionIds.some((id) => !contextSelectionIds.includes(id)))) throw new Error('workspace_command_invalid');
+    return Object.freeze({ kind, ...fence, messageId: raw.messageId, sourceDigest: raw.sourceDigest.toLowerCase(), textDigest: raw.textDigest.toLowerCase(), mode: raw.mode,
+      to: parseBoundedStringList(raw.to), cc: parseBoundedStringList(raw.cc), brief: raw.brief, composerRevision: raw.composerRevision as number,
+      ...(Object.hasOwn(raw, 'noteId') ? { noteId: raw.noteId as string, noteRevision: raw.noteRevision as number } : {}),
+      ...(contextSelectionIds ? { contextSelectionIds } : {}), ...(contextExcerptSelectionIds ? { contextExcerptSelectionIds } : {}) });
+  }
+  if (kind === 'mail.replyBatch.check' || kind === 'mail.replyBatch.review' || kind === 'mail.replyBatch.activate') {
+    assertExactKeys(raw, COMMAND_KEYS[kind], kind === 'mail.replyBatch.review' ? ['kind', 'jobId', 'accountId', 'expectedConnectionGeneration', 'operation'] : COMMAND_KEYS[kind]);
+    const fence = accountFence(raw);
+    if (!boundedString(raw.jobId, MAX_ID_BYTES, { identifier: true }) ||
+        (kind === 'mail.replyBatch.review' && raw.operation !== 'draft' && raw.operation !== 'send') ||
+        (kind === 'mail.replyBatch.activate' && !boundedString(raw.planId, MAX_ID_BYTES, { identifier: true }))) throw new Error('workspace_command_invalid');
+    if (kind === 'mail.replyBatch.review') return Object.freeze({ kind, ...fence, jobId: raw.jobId, operation: raw.operation as 'draft' | 'send' });
+    if (kind === 'mail.replyBatch.activate') return Object.freeze({ kind, ...fence, jobId: raw.jobId, planId: raw.planId as string });
+    return Object.freeze({ kind, ...fence, jobId: raw.jobId });
+  }
   if (kind === 'documents.save') {
     assertExactKeys(raw, COMMAND_KEYS[kind], ['kind', 'path', 'content', 'expectedRevision']);
     if (typeof raw.path !== 'string' || !safeRelativeMarkdownPath(raw.path) ||
@@ -624,7 +788,7 @@ export function parseWorkspaceCommandEnvelope(value: unknown): WorkspaceCommandE
   const kind = rawCommand.kind;
   if (typeof kind !== 'string' || !COMMAND_KINDS.includes(kind as WorkspaceCommand['kind'])) throw new Error('workspace_command_invalid');
   const limit = ['notes.save', 'notes.updateTranscript', 'assistant.batch.submitNote', 'chat.submit', 'documents.save',
-    'knowledge.person.save', 'knowledge.project.save'].includes(kind)
+    'knowledge.person.save', 'knowledge.project.save', 'mail.reply.create', 'proposals.edit', 'mail.replyBatch.submit'].includes(kind)
     ? WORKSPACE_TEXT_COMMAND_MAX_BYTES : WORKSPACE_COMMAND_MAX_BYTES;
   preflightJsonBytes(value, limit);
   if (value.schemaVersion !== WORKSPACE_COMMAND_SCHEMA_VERSION || !UUID_V4.test(typeof value.commandId === 'string' ? value.commandId : '') ||
@@ -663,6 +827,12 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
   readonly suggestionId?: string;
   readonly suggestionRevision?: number;
   readonly status?: 'pending' | 'accepted' | 'dismissed';
+  readonly accountId?: string;
+  readonly connectionGeneration?: number;
+  readonly sourceDigest?: string;
+  readonly proposalId?: string;
+  readonly recordId?: string;
+  readonly jobStatus?: import('../services/openRouterBatchJobs').AssistantBatchJobDTO['status'];
 }): WorkspaceCommandReceipt {
   if (!isRecord(value)) throw new Error('workspace_command_receipt_invalid');
   assertPlainDataProperties(value);
@@ -676,6 +846,21 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
     'notes.save': ['commandId', 'kind', 'objectId', 'schemaVersion'],
     'notes.capture.adopt': ['captureId', 'captureRevision', 'commandId', 'kind', 'objectId', 'schemaVersion'],
     'accounts.installOAuth': ['accountGeneration', 'commandId', 'kind', 'objectId', 'schemaVersion', 'stageId'],
+    'accounts.syncCalendars': ['accountId', 'calendarsPartial', 'commandId', 'connectionGeneration', 'kind', 'objectId', 'schemaVersion', 'syncStatus'],
+    'accounts.refreshMail': ['accountId', 'commandId', 'connectionGeneration', 'kind', 'lane', 'laneStatus', 'objectId', 'schemaVersion', 'syncStatus'],
+    'accounts.continueMailBackfill': ['accountId', 'commandId', 'connectionGeneration', 'kind', 'lane', 'laneStatus', 'objectId', 'schemaVersion', 'syncStatus'],
+    'accounts.disconnect': ['accountId', 'cleanup', 'commandId', 'connected', 'connectionGeneration', 'kind', 'objectId', 'schemaVersion'],
+    'mail.source.loadText': ['accountId', 'commandId', 'connectionGeneration', 'kind', 'loadStatus', 'objectId', 'schemaVersion', 'sourceDigest', 'textDigest', 'bytes'],
+    'mail.reply.create': ['commandId', 'kind', 'objectId', 'proposalId', 'proposalRevision', 'schemaVersion'],
+    'proposals.edit': ['commandId', 'kind', 'objectId', 'proposalId', 'proposalRevision', 'proposalStatus', 'schemaVersion'],
+    'proposals.approve': ['commandId', 'kind', 'objectId', 'proposalId', 'proposalRevision', 'proposalStatus', 'schemaVersion'],
+    'proposals.dismiss': ['commandId', 'kind', 'objectId', 'proposalId', 'proposalRevision', 'proposalStatus', 'schemaVersion'],
+    'proposals.execute': ['commandId', 'dispatchRecordId', 'execution', 'kind', 'objectId', 'operation', 'outcomeAt', 'proposalId', 'proposalRevision', 'proposalStatus', 'remoteId', 'schemaVersion'],
+    'dispatch.reconcile': ['commandId', 'disposition', 'kind', 'objectId', 'providerOutcome', 'providerOutcomeAt', 'recordId', 'recordVersion', 'schemaVersion'],
+    'mail.replyBatch.submit': ['commandId', 'jobId', 'jobStatus', 'kind', 'objectId', 'schemaVersion'],
+    'mail.replyBatch.check': ['commandId', 'jobId', 'jobStatus', 'kind', 'objectId', 'schemaVersion'],
+    'mail.replyBatch.review': ['commandId', 'expiresAt', 'jobId', 'kind', 'objectId', 'planId', 'schemaVersion'],
+    'mail.replyBatch.activate': ['commandId', 'jobId', 'kind', 'objectId', 'proposalId', 'schemaVersion'],
     'documents.save': ['commandId', 'documentRevision', 'entityId', 'entityKind', 'entityRevision', 'kind', 'objectId', 'schemaVersion'],
     'knowledge.person.save': ['commandId', 'entityKind', 'entityRevision', 'kind', 'objectId', 'schemaVersion'],
     'knowledge.project.save': ['commandId', 'entityKind', 'entityRevision', 'kind', 'objectId', 'schemaVersion'],
@@ -698,7 +883,12 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
     'chat.refine': ['commandId', 'jobId', 'kind', 'objectId', 'parentTurnId', 'schemaVersion', 'turnId'],
   };
   const allowedReceiptKeys = keysByKind[kind as WorkspaceCommand['kind']];
-  const requiredReceiptKeys = kind === 'documents.save' ? ['commandId', 'documentRevision', 'kind', 'objectId', 'schemaVersion'] : allowedReceiptKeys;
+  const optionalReceiptKeys: Partial<Record<WorkspaceCommand['kind'], readonly string[]>> = {
+    'mail.source.loadText': ['textDigest', 'bytes'], 'proposals.execute': ['dispatchRecordId', 'operation', 'outcomeAt', 'remoteId'],
+    'dispatch.reconcile': ['providerOutcomeAt'],
+  };
+  const requiredReceiptKeys = kind === 'documents.save' ? ['commandId', 'documentRevision', 'kind', 'objectId', 'schemaVersion'] :
+    allowedReceiptKeys.filter((key) => !optionalReceiptKeys[kind as WorkspaceCommand['kind']]?.includes(key));
   assertExactKeys(value, allowedReceiptKeys, requiredReceiptKeys);
   const textId = (candidate: unknown): candidate is string => boundedString(candidate, MAX_ID_BYTES, { identifier: true });
   const uuidId = (candidate: unknown): candidate is string => typeof candidate === 'string' && UUID_V4.test(candidate);
@@ -715,6 +905,34 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
       (Object.hasOwn(value, 'captureRevision') && !uuidId(value.captureRevision)) ||
       (Object.hasOwn(value, 'stageId') && !uuidId(value.stageId)) ||
       (kind === 'accounts.installOAuth' && (!Number.isSafeInteger(value.accountGeneration) || (value.accountGeneration as number) < 1)) ||
+      (['accounts.syncCalendars', 'accounts.refreshMail', 'accounts.continueMailBackfill', 'accounts.disconnect', 'mail.source.loadText'].includes(kind) &&
+        (!textId(value.accountId) || !Number.isSafeInteger(value.connectionGeneration) || (value.connectionGeneration as number) < 0)) ||
+      (kind === 'accounts.syncCalendars' && (!['idle', 'syncing', 'partial', 'error'].includes(value.syncStatus as string) || typeof value.calendarsPartial !== 'boolean')) ||
+      ((kind === 'accounts.refreshMail' || kind === 'accounts.continueMailBackfill') && (!['head', 'backfill'].includes(value.lane as string) ||
+        !['complete', 'partial', 'error', 'idle'].includes(value.laneStatus as string) || !['idle', 'syncing', 'partial', 'error'].includes(value.syncStatus as string))) ||
+      (kind === 'accounts.disconnect' && (value.connected !== false || (value.cleanup !== 'complete' && value.cleanup !== 'pending'))) ||
+      (kind === 'mail.source.loadText' && (!/^[a-f\d]{64}$/.test(String(value.sourceDigest)) ||
+        !['current', 'source_changed', 'stale', 'unavailable'].includes(value.loadStatus as string) ||
+        (Object.hasOwn(value, 'textDigest') && !/^[a-f\d]{64}$/.test(String(value.textDigest))) ||
+        (Object.hasOwn(value, 'bytes') && (!Number.isSafeInteger(value.bytes) || (value.bytes as number) < 0)))) ||
+      (kind === 'mail.reply.create' && (!textId(value.proposalId) || !positiveRevision(value.proposalRevision) || value.objectId !== value.proposalId)) ||
+      (['proposals.edit', 'proposals.approve', 'proposals.dismiss', 'proposals.execute'].includes(kind) &&
+        (!textId(value.proposalId) || !positiveRevision(value.proposalRevision) || value.objectId !== value.proposalId ||
+          !['draft', 'approved', 'dispatching', 'unknown', 'failed', 'accepted', 'simulated', 'executed', 'dismissed'].includes(value.proposalStatus as string))) ||
+      (kind === 'proposals.execute' && (!['accepted', 'unknown', 'rejected', 'simulated', 'executed', 'failed', 'invalidated'].includes(value.execution as string) ||
+        (Object.hasOwn(value, 'dispatchRecordId') && !textId(value.dispatchRecordId)) ||
+        (Object.hasOwn(value, 'operation') && !['draft', 'send', 'event'].includes(value.operation as string)) ||
+        (Object.hasOwn(value, 'outcomeAt') && (typeof value.outcomeAt !== 'string' || !Number.isFinite(Date.parse(value.outcomeAt)))) ||
+        (Object.hasOwn(value, 'remoteId') && !textId(value.remoteId)))) ||
+      (kind === 'dispatch.reconcile' && (!textId(value.recordId) || !/^[a-f\d]{64}$/.test(String(value.recordVersion)) ||
+        !['confirmed_present', 'not_found', 'abandoned'].includes(value.disposition as string) ||
+        !['pending', 'accepted', 'unknown', 'rejected'].includes(value.providerOutcome as string) ||
+        (Object.hasOwn(value, 'providerOutcomeAt') && (typeof value.providerOutcomeAt !== 'string' || !Number.isFinite(Date.parse(value.providerOutcomeAt)))))) ||
+      ((kind === 'mail.replyBatch.submit' || kind === 'mail.replyBatch.check') &&
+        (!uuidId(value.jobId) || !['preparing', 'submitting', 'submission_unknown', 'queued', 'processing', 'completed', 'failed', 'expired', 'cancelled',
+          'result_stale', 'result_invalid', 'result_truncated', 'result_not_retained', 'cleanup_pending', 'source_removed'].includes(value.jobStatus as string))) ||
+      (kind === 'mail.replyBatch.review' && (!uuidId(value.jobId) || !textId(value.planId) || typeof value.expiresAt !== 'string' || !Number.isFinite(Date.parse(value.expiresAt)))) ||
+      (kind === 'mail.replyBatch.activate' && (!uuidId(value.jobId) || !textId(value.proposalId))) ||
       (kind === 'documents.save' && (() => {
         const parent = canonicalKnowledgeDocumentParent(value.objectId);
         const hasParent = Object.hasOwn(value, 'entityKind') || Object.hasOwn(value, 'entityId') || Object.hasOwn(value, 'entityRevision');
@@ -751,6 +969,12 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
         (expected.suggestionId !== undefined && value.suggestionId !== expected.suggestionId) ||
         (expected.suggestionRevision !== undefined && value.suggestionRevision !== expected.suggestionRevision) ||
         (expected.status !== undefined && value.status !== expected.status) ||
+        (expected.accountId !== undefined && value.accountId !== expected.accountId) ||
+        (expected.connectionGeneration !== undefined && value.connectionGeneration !== expected.connectionGeneration) ||
+        (expected.sourceDigest !== undefined && value.sourceDigest !== expected.sourceDigest) ||
+        (expected.proposalId !== undefined && value.proposalId !== expected.proposalId) ||
+        (expected.recordId !== undefined && value.recordId !== expected.recordId) ||
+        (expected.jobStatus !== undefined && value.jobStatus !== expected.jobStatus) ||
         (expected.attemptId !== undefined && value.attemptId !== expected.attemptId) || (expected.sourceRevision !== undefined && value.sourceRevision !== expected.sourceRevision) ||
         (expected.outcome !== undefined && value.outcome !== expected.outcome)))) {
     throw new Error('workspace_command_receipt_invalid');
@@ -776,6 +1000,47 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
     case 'accounts.installOAuth':
       return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId,
         stageId: jobId(value.stageId), accountGeneration: value.accountGeneration as number });
+    case 'accounts.syncCalendars':
+      return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId, accountId: value.accountId as string,
+        connectionGeneration: value.connectionGeneration as number, syncStatus: value.syncStatus as import('../core').AccountSyncState['status'], calendarsPartial: value.calendarsPartial as boolean });
+    case 'accounts.refreshMail': case 'accounts.continueMailBackfill':
+      return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId, accountId: value.accountId as string,
+        connectionGeneration: value.connectionGeneration as number, lane: value.lane as 'head' | 'backfill', laneStatus: value.laneStatus as import('../core').MailLaneResult['status'],
+        syncStatus: value.syncStatus as import('../core').AccountSyncState['status'] });
+    case 'accounts.disconnect':
+      return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId, accountId: value.accountId as string,
+        connectionGeneration: value.connectionGeneration as number, connected: false, cleanup: value.cleanup as 'complete' | 'pending' });
+    case 'mail.source.loadText':
+      return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId, accountId: value.accountId as string,
+        connectionGeneration: value.connectionGeneration as number, sourceDigest: value.sourceDigest as string,
+        loadStatus: value.loadStatus as import('../core').MailReplyTextLoadResult['status'], ...(Object.hasOwn(value, 'textDigest') ? { textDigest: value.textDigest as string } : {}),
+        ...(Object.hasOwn(value, 'bytes') ? { bytes: value.bytes as number } : {}) });
+    case 'mail.reply.create':
+      return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId, proposalId: value.proposalId as string,
+        proposalRevision: value.proposalRevision as number });
+    case 'proposals.edit': case 'proposals.approve': case 'proposals.dismiss':
+      return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId, proposalId: value.proposalId as string,
+        proposalRevision: value.proposalRevision as number, proposalStatus: value.proposalStatus as import('../core').Proposal['status'] });
+    case 'proposals.execute':
+      return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId, proposalId: value.proposalId as string,
+        proposalRevision: value.proposalRevision as number, proposalStatus: value.proposalStatus as import('../core').Proposal['status'], execution: value.execution as
+          'accepted' | 'unknown' | 'rejected' | 'simulated' | 'executed' | 'failed' | 'invalidated',
+        ...(Object.hasOwn(value, 'dispatchRecordId') ? { dispatchRecordId: value.dispatchRecordId as string } : {}),
+        ...(Object.hasOwn(value, 'operation') ? { operation: value.operation as 'draft' | 'send' | 'event' } : {}),
+        ...(Object.hasOwn(value, 'outcomeAt') ? { outcomeAt: value.outcomeAt as string } : {}), ...(Object.hasOwn(value, 'remoteId') ? { remoteId: value.remoteId as string } : {}) });
+    case 'dispatch.reconcile':
+      return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId, recordId: value.recordId as string,
+        recordVersion: value.recordVersion as string, disposition: value.disposition as import('../dispatch').DispatchReconciliation,
+        providerOutcome: value.providerOutcome as import('../dispatch').DispatchOutcome,
+        ...(Object.hasOwn(value, 'providerOutcomeAt') ? { providerOutcomeAt: value.providerOutcomeAt as string } : {}) });
+    case 'mail.replyBatch.submit': case 'mail.replyBatch.check':
+      return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId, jobId: jobId(value.jobId),
+        jobStatus: value.jobStatus as import('../services/openRouterBatchJobs').AssistantBatchJobDTO['status'] });
+    case 'mail.replyBatch.review':
+      return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId, jobId: jobId(value.jobId),
+        planId: textId(value.planId) ? value.planId : (() => { throw new Error('workspace_command_receipt_invalid'); })(), expiresAt: value.expiresAt as string });
+    case 'mail.replyBatch.activate':
+      return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId, jobId: jobId(value.jobId), proposalId: value.proposalId as string });
     case 'documents.save': {
       const parent = canonicalKnowledgeDocumentParent(objectId);
       return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId,

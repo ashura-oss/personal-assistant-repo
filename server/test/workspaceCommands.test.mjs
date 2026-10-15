@@ -21,7 +21,8 @@ import {
 } from '../dist/workspaceCommands.node.mjs';
 
 function fixture({ providerBatchClient, withAudio = false, speechClient, speechEnabled = false, withSpeechCleanup = false,
-  initialNoteId, initialKnowledge, initialDocuments = [], writeDocument, captureController } = {}) {
+  initialNoteId, initialKnowledge, initialDocuments = [], initialAccounts = [], initialCalendars = [], initialProposals = [], initialMailbox = [], integrationOverrides = {},
+  writeDocument, captureController } = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'still-workspace-commands-'));
   const kernel = createDurableKernel({ databasePath: join(directory, 'workspace.sqlite'),
     validateSnapshot: (value) => assert.ok(value && typeof value === 'object' && !Array.isArray(value)) });
@@ -36,6 +37,10 @@ function fixture({ providerBatchClient, withAudio = false, speechClient, speechE
     status: 'recorded', revision: 1 });
   if (initialKnowledge) state.knowledge = structuredClone(initialKnowledge);
   state.documents.push(...structuredClone(initialDocuments));
+  state.accounts.push(...structuredClone(initialAccounts));
+  state.calendars.push(...structuredClone(initialCalendars));
+  state.proposals.push(...structuredClone(initialProposals));
+  state.mailbox.push(...structuredClone(initialMailbox));
   if (providerBatchClient) {
     state.settings.mode = 'provider';
     state.settings.llmProvider = 'openrouter';
@@ -104,6 +109,7 @@ function fixture({ providerBatchClient, withAudio = false, speechClient, speechE
       async loadRecordingRecovery() { return { async pickAndStage() { return null; }, async inspect() { throw new Error('unsupported'); }, async remove() {} }; },
       bindRecordingRecovery(service) { return service; },
       ...(providerBatchClient ? { openRouterBatchClient: providerBatchClient } : {}),
+      ...integrationOverrides,
     }, ...(pendingCapture ? { pendingCapture } : {}) });
   if (captureController) {
     const executeCommand = runtime.executeCommand.bind(runtime);
@@ -1309,6 +1315,423 @@ test('explicit dispatcher calls only the task/chat allowlist and returns safe du
     assert.ok(chat.snapshot.state.assistantChatConversations.some((item) => item.id === chat.receipt.objectId));
     const changed = { ...command, command: { kind: 'tasks.reopen', taskId: 'legacy task: 1' } };
     await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission, changed), /already bound to different/);
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test('proposal execution receipt reflects the final persisted proposal state through the actual command runtime', async () => {
+  const f = fixture();
+  try {
+    await f.runtime.getSnapshot(f.admission);
+    const identity = f.kernel.getOwnedIdentity(f.admission.sessionToken);
+    const seeded = await f.runtime.executeCommand({ sessionToken: f.admission.sessionToken,
+      assertCurrent() { f.kernel.getOwnedIdentity(f.admission.sessionToken); }, expectedRevision: identity.revision,
+      expectedPrivacyEpoch: identity.privacyEpoch, idempotencyKey: randomUUID(), kind: 'proposals.approve',
+      canonicalBody: JSON.stringify({ seed: 'local proposal execution receipt' }) }, async (controller) => {
+      const note = await controller.saveNote({ transcript: 'Please remember to call Alex tomorrow.' });
+      const [proposal] = await controller.processNote(note.id);
+      assert.ok(proposal, 'preview processing creates a local proposal without a provider call');
+      const approved = await controller.approveProposal(proposal.id);
+      return { proposalId: approved.id, expectedProposalRevision: approved.revision };
+    }, (result) => result);
+    assert.equal(seeded.result?.proposalId, seeded.snapshot?.state.proposals[0]?.id);
+    const before = await f.runtime.getSnapshot(f.admission);
+    const command = envelope({ kind: 'proposals.execute', proposalId: seeded.result.proposalId,
+      expectedProposalRevision: seeded.result.expectedProposalRevision }, before.revision, before.privacyEpoch);
+    const execution = await dispatchWorkspaceCommand(f.runtime, f.admission, command);
+    const proposal = execution.snapshot.state.proposals.find((item) => item.id === seeded.result.proposalId);
+    assert.ok(proposal);
+    assert.equal(execution.receipt.proposalStatus, proposal.status);
+    assert.ok(['simulated', 'executed', 'failed'].includes(execution.receipt.execution));
+    assert.equal(inspectWorkspaceCommand(f.runtime, f.admission, command.commandId).receipt.proposalStatus, proposal.status);
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test('saved mail and review readers are current-owner metadata envelopes and do not admit provider or command work', async () => {
+  const f = fixture();
+  try {
+    const head = await f.runtime.getSnapshot(f.admission);
+    const fence = { expectedRevision: head.revision, expectedPrivacyEpoch: head.privacyEpoch };
+    const source = await f.runtime.readMailReplySource(f.admission, { ...fence, messageId: 'message:Ω/opaque' });
+    assert.deepEqual({ workspaceId: source.workspaceId, privacyEpoch: source.privacyEpoch, revision: source.revision },
+      { workspaceId: head.workspaceId, privacyEpoch: head.privacyEpoch, revision: head.revision });
+    assert.equal(source.value.source.status, 'missing');
+    assert.equal(source.value.bodyCache.status, 'missing');
+    const body = await f.runtime.readMailReplyText(f.admission, { ...fence, messageId: 'message:Ω/opaque' });
+    assert.equal(body.value.status, 'missing');
+    const proposal = await f.runtime.readProposalForReview(f.admission, { ...fence, proposalId: 'proposal:missing' });
+    assert.equal(proposal.value, undefined);
+    await assert.rejects(f.runtime.readDispatchForReview(f.admission, { ...fence, recordId: 'dispatch:missing' }), /not found/i);
+    const batch = await f.runtime.readMailReplyBatchReview(f.admission, { ...fence, planId: 'plan:missing', jobId: 'job:missing',
+      accountId: 'account:missing', expectedConnectionGeneration: 1 });
+    assert.equal(batch.value, undefined);
+    const after = await f.runtime.getSnapshot(f.admission);
+    assert.equal(after.revision, head.revision, 'saved-only reads do not mutate the workspace revision');
+    assert.equal(after.state.activity.length, head.state.activity.length);
+    await assert.rejects(f.runtime.readProposalForReview(f.admission, { ...fence, expectedPrivacyEpoch: head.privacyEpoch + 1,
+      proposalId: 'proposal:missing' }), /stale/i);
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test('mail text load keeps its exact parsed receipt through duplicate and inspection, and lost body-save ACK stays inspect-only', async () => {
+  const accountId = randomUUID();
+  const identity = { providerNamespace: 'google', clientId: 'synthetic-client', subject: 'text-load-subject' };
+  const identityKey = 'google:synthetic-client:text-load-subject:';
+  const tokenRef = 'synthetic-mail-text-token';
+  const token = { accessToken: 'synthetic-access-token', expiresAt: Date.now() + 600_000, identity };
+  const messages = ['mail-text-current', 'mail-text-lost-ack'].map((id, index) => ({ id, accountId, providerMessageId: `provider-${id}`,
+    identityKey: `${identityKey}:provider-${id}`, verifiedIdentityKey: identityKey, connectionGeneration: 1, idFormat: 'gmail', threadId: `thread-${index}`,
+    subject: `Text ${index}`, from: 'Alex <alex@example.test>', senderEmail: 'alex@example.test', internetMessageId: `<${id}@example.test>`,
+    replyTo: ['alex@example.test'], to: ['owner@example.test'], cc: [], replyMetadataComplete: true, observedAt: new Date().toISOString() }));
+  const account = { id: accountId, provider: 'google', displayName: 'Synthetic Google', email: 'owner@example.test', connected: true,
+    authStatus: 'connected', identity, tokenRef, grantedScopes: ['openid', 'https://www.googleapis.com/auth/gmail.readonly'], capabilities: ['mail.read'], capabilityLimits: ['mail.read'],
+    connectionGeneration: 1 };
+  let selectedTextReads = 0;
+  let loseAckOnNextRead = false;
+  let f;
+  const connector = { async verifyOAuthIdentity() { return true; }, async readSelectedMessageText(_account, providerMessageId) {
+    selectedTextReads += 1;
+    if (loseAckOnNextRead) { loseAckOnNextRead = false; f.loseNextWorkspaceCommitAck(); }
+    const row = messages.find((item) => item.providerMessageId === providerMessageId);
+    const text = `Selected body for ${providerMessageId}.`;
+    return { status: 'available', message: { id: providerMessageId, idFormat: 'gmail', threadId: row.threadId, subject: row.subject,
+      from: row.from, senderEmail: row.senderEmail, internetMessageId: row.internetMessageId, replyTo: row.replyTo, to: row.to, cc: row.cc,
+      replyMetadataComplete: true, observedAt: new Date().toISOString() }, text, bytes: Buffer.byteLength(text), representation: 'plain',
+      completeness: 'complete_text', reasons: [], checkedAt: new Date().toISOString(), extractionVersion: 'mail-text-v2' };
+  } };
+  f = fixture({ initialAccounts: [account], initialMailbox: messages, integrationOverrides: {
+    tokenStore: { async get(ref) { return ref === tokenRef ? structuredClone(token) : null; }, async set() {} }, connectorFactory: () => connector,
+  } });
+  try {
+    let current = await f.runtime.getSnapshot(f.admission);
+    const setup = await dispatchWorkspaceCommand(f.runtime, f.admission, envelope({ kind: 'settings.update', patch: { mode: 'preview' } }, current.revision, current.privacyEpoch));
+    current = setup.snapshot;
+    const source = await f.runtime.readMailReplySource(f.admission, { messageId: messages[0].id, expectedRevision: current.revision,
+      expectedPrivacyEpoch: current.privacyEpoch });
+    const command = envelope({ kind: 'mail.source.loadText', messageId: messages[0].id, accountId, expectedConnectionGeneration: 1,
+      sourceDigest: source.value.source.source.sourceDigest }, current.revision, current.privacyEpoch);
+    const loaded = await dispatchWorkspaceCommand(f.runtime, f.admission, command);
+    assert.equal(loaded.receipt.loadStatus, 'current');
+    assert.deepEqual((await dispatchWorkspaceCommand(f.runtime, f.admission, command)).receipt, loaded.receipt);
+    assert.deepEqual(inspectWorkspaceCommand(f.runtime, f.admission, command.commandId).receipt, loaded.receipt);
+    assert.equal(selectedTextReads, 1, 'duplicate and inspect return the original result without another provider read');
+
+    current = await f.runtime.refreshSnapshot(f.admission);
+    const secondSource = await f.runtime.readMailReplySource(f.admission, { messageId: messages[1].id, expectedRevision: current.revision,
+      expectedPrivacyEpoch: current.privacyEpoch });
+    const uncertain = envelope({ kind: 'mail.source.loadText', messageId: messages[1].id, accountId, expectedConnectionGeneration: 1,
+      sourceDigest: secondSource.value.source.source.sourceDigest }, current.revision, current.privacyEpoch);
+    loseAckOnNextRead = true;
+    await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission, uncertain), /acknowledgement|commit/i);
+    assert.equal(inspectWorkspaceCommand(f.runtime, f.admission, uncertain.commandId).status, 'inspect_required');
+    await f.runtime.refreshSnapshot(f.admission);
+    assert.equal((await dispatchWorkspaceCommand(f.runtime, f.admission, uncertain)).status, 'inspect_required');
+    assert.equal(selectedTextReads, 2, 'an uncertain text-load command is never replayed');
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test('journaled mail Batch submit, check, review, and activation consume one plan exactly once', async () => {
+  const accountId = randomUUID();
+  const identity = { providerNamespace: 'google', clientId: 'synthetic-client', subject: 'batch-reply-subject' };
+  const identityKey = 'google:synthetic-client:batch-reply-subject:';
+  const tokenRef = 'synthetic-batch-mail-token';
+  const token = { accessToken: 'synthetic-access-token', expiresAt: Date.now() + 600_000, identity };
+  const message = { id: 'batch-mail-message', accountId, providerMessageId: 'provider-batch-message', identityKey: `${identityKey}:provider-batch-message`,
+    verifiedIdentityKey: identityKey, connectionGeneration: 1, idFormat: 'gmail', threadId: 'batch-thread', subject: 'Batch reply',
+    from: 'Alex <alex@example.test>', senderEmail: 'alex@example.test', internetMessageId: '<batch-reply@example.test>', replyTo: ['alex@example.test'],
+    to: ['owner@example.test'], cc: [], replyMetadataComplete: true, observedAt: new Date().toISOString() };
+  const account = { id: accountId, provider: 'google', displayName: 'Synthetic Google', email: 'owner@example.test', connected: true,
+    authStatus: 'connected', identity, tokenRef, grantedScopes: ['openid', 'https://www.googleapis.com/auth/gmail.readonly'], capabilities: ['mail.read'], capabilityLimits: ['mail.read'],
+    connectionGeneration: 1 };
+  let selectedTextReads = 0;
+  let batchSubmissions = 0;
+  const text = 'The selected message body for review.';
+  const resultContent = JSON.stringify({ text: 'A carefully reviewed reply.' });
+  const providerBatchClient = {
+    async submit(_input, onBeforeDispatch, assertCurrent) { batchSubmissions += 1; await onBeforeDispatch(); assertCurrent(); return { batchId: 'synthetic-mail-batch' }; },
+    async inspect(batchId, customId) { return { batchId, status: 'completed', endpoint: '/v1/chat/completions', model: 'openai/gpt-6-luna',
+      completionWindow: '24h', total: 1, completed: 1, failed: 0, metadataValidation: 'valid', resultValidation: 'valid',
+      usage: { cost: 0.001, promptTokens: 10, completionTokens: 5, totalTokens: 15 }, result: { customId, statusCode: 200, finishReason: 'stop',
+        responseBody: { model: 'openai/gpt-6-luna', choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: resultContent } }] } } };
+    },
+  };
+  const connector = { async verifyOAuthIdentity() { return true; }, async readSelectedMessageText(_account, providerMessageId) {
+    selectedTextReads += 1;
+    return { status: 'available', message: { id: providerMessageId, idFormat: 'gmail', threadId: message.threadId, subject: message.subject,
+      from: message.from, senderEmail: message.senderEmail, internetMessageId: message.internetMessageId, replyTo: message.replyTo, to: message.to,
+      cc: message.cc, replyMetadataComplete: true, observedAt: new Date().toISOString() }, text, bytes: Buffer.byteLength(text), representation: 'plain',
+      completeness: 'complete_text', reasons: [], checkedAt: new Date().toISOString(), extractionVersion: 'mail-text-v2' };
+  } };
+  const f = fixture({ providerBatchClient, initialAccounts: [account], initialMailbox: [message], integrationOverrides: {
+    tokenStore: { async get(ref) { return ref === tokenRef ? structuredClone(token) : null; }, async set() {} }, connectorFactory: () => connector,
+  } });
+  try {
+    let current = await f.runtime.getSnapshot(f.admission);
+    const source = await f.runtime.readMailReplySource(f.admission, { messageId: message.id, expectedRevision: current.revision,
+      expectedPrivacyEpoch: current.privacyEpoch });
+    const load = await dispatchWorkspaceCommand(f.runtime, f.admission, envelope({ kind: 'mail.source.loadText', messageId: message.id, accountId,
+      expectedConnectionGeneration: 1, sourceDigest: source.value.source.source.sourceDigest }, current.revision, current.privacyEpoch));
+    assert.equal(load.receipt.loadStatus, 'current');
+    current = load.snapshot;
+    const refreshedSource = await f.runtime.readMailReplySource(f.admission, { messageId: message.id, expectedRevision: current.revision,
+      expectedPrivacyEpoch: current.privacyEpoch });
+    const body = await f.runtime.readMailReplyText(f.admission, { messageId: message.id, expectedRevision: current.revision,
+      expectedPrivacyEpoch: current.privacyEpoch });
+    assert.equal(body.value.snapshot.text, text);
+    const submitted = await dispatchWorkspaceCommand(f.runtime, f.admission, envelope({ kind: 'mail.replyBatch.submit', messageId: message.id, accountId,
+      expectedConnectionGeneration: 1, sourceDigest: refreshedSource.value.source.source.sourceDigest, textDigest: body.value.snapshot.textDigest,
+      mode: 'reply', to: ['alex@example.test'], cc: [], brief: 'Write a concise reply.', composerRevision: 1 }, current.revision, current.privacyEpoch));
+    assert.equal(submitted.receipt.jobStatus, 'queued');
+    assert.equal(batchSubmissions, 1);
+
+    current = submitted.snapshot;
+    const checked = await dispatchWorkspaceCommand(f.runtime, f.admission, envelope({ kind: 'mail.replyBatch.check', jobId: submitted.receipt.jobId, accountId,
+      expectedConnectionGeneration: 1 }, current.revision, current.privacyEpoch));
+    assert.equal(checked.receipt.jobStatus, 'completed');
+    current = checked.snapshot;
+    const reviewed = await dispatchWorkspaceCommand(f.runtime, f.admission, envelope({ kind: 'mail.replyBatch.review', jobId: submitted.receipt.jobId, accountId,
+      expectedConnectionGeneration: 1, operation: 'draft' }, current.revision, current.privacyEpoch));
+    assert.ok(reviewed.receipt.planId);
+    current = reviewed.snapshot;
+    const activationCommand = envelope({ kind: 'mail.replyBatch.activate', planId: reviewed.receipt.planId, jobId: submitted.receipt.jobId, accountId,
+      expectedConnectionGeneration: 1 }, current.revision, current.privacyEpoch);
+    const activated = await dispatchWorkspaceCommand(f.runtime, f.admission, activationCommand);
+    assert.ok(activated.receipt.proposalId);
+    const proposalsAfterActivation = activated.snapshot.state.proposals.filter((item) => item.provenance?.batchJobId === submitted.receipt.jobId);
+    assert.equal(proposalsAfterActivation.length, 1);
+    assert.equal(batchSubmissions, 1, 'review and activation never resubmit the Batch provider request');
+    assert.deepEqual((await dispatchWorkspaceCommand(f.runtime, f.admission, activationCommand)).receipt, activated.receipt);
+    assert.deepEqual(inspectWorkspaceCommand(f.runtime, f.admission, activationCommand.commandId).receipt, activated.receipt);
+    const newAttempt = envelope({ kind: 'mail.replyBatch.activate', planId: reviewed.receipt.planId, jobId: submitted.receipt.jobId, accountId,
+      expectedConnectionGeneration: 1 }, activated.snapshot.revision, activated.snapshot.privacyEpoch);
+    await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission, newAttempt), /unavailable|expired|already|review/i);
+    await f.runtime.refreshSnapshot(f.admission);
+    const final = await f.runtime.getSnapshot(f.admission);
+    assert.equal(final.state.proposals.filter((item) => item.provenance?.batchJobId === submitted.receipt.jobId).length, 1,
+      'a fresh command cannot activate a consumed review plan a second time');
+    assert.equal(batchSubmissions, 1);
+    assert.equal(selectedTextReads, 2, 'one explicit load plus the review freshness check are the only selected-message reads');
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test('mail reply commands freeze the source, preserve exact accepted/unknown outcomes, and never replay on duplicate or lost ACK', async () => {
+  const accountId = randomUUID();
+  const identity = { providerNamespace: 'google', clientId: 'synthetic-client', subject: 'synthetic-subject' };
+  const identityKey = 'google:synthetic-client:synthetic-subject:';
+  const token = { accessToken: 'synthetic-access-token', expiresAt: Date.now() + 600_000, identity };
+  const messages = ['accepted', 'unknown', 'lost-ack'].map((subject, index) => ({
+    id: `local-message-${index + 1}`, accountId, providerMessageId: `provider-message-${index + 1}`, identityKey,
+    verifiedIdentityKey: identityKey, connectionGeneration: 1, idFormat: 'gmail', threadId: `thread-${index + 1}`,
+    subject: `Reply ${subject}`, from: 'Alex <alex@example.test>', senderEmail: 'alex@example.test',
+    internetMessageId: `<reply-${index + 1}@example.test>`, replyTo: ['alex@example.test'], to: ['owner@example.test'], cc: [],
+    replyMetadataComplete: true, observedAt: new Date().toISOString(),
+  }));
+  const account = { id: accountId, provider: 'google', displayName: 'Synthetic Google', email: 'owner@example.test',
+    connected: true, authStatus: 'connected', identity, tokenRef: 'synthetic-token-ref', grantedScopes: ['openid', 'gmail.readonly', 'gmail.compose'],
+    capabilities: ['mail.read', 'mail.draft'], capabilityLimits: ['mail.read', 'mail.draft'], connectionGeneration: 1 };
+  let providerWrites = 0;
+  let loseAckAfterThirdProviderWrite = false;
+  let f;
+  const connector = { async verifyOAuthIdentity() { return true; }, async createDraft(_account, request, verifier) {
+    assert.equal(await verifier.verify(request), true);
+    providerWrites += 1;
+    if (providerWrites === 3 && loseAckAfterThirdProviderWrite) {
+      loseAckAfterThirdProviderWrite = false;
+      f.loseNextWorkspaceCommitAck();
+    }
+    if (providerWrites > 1) return { status: 'unknown' };
+    return { status: 'accepted', id: 'provider-accepted-id' };
+  } };
+  f = fixture({ initialAccounts: [account], initialMailbox: messages,
+    integrationOverrides: { tokenStore: { async get(ref) { return ref === account.tokenRef ? structuredClone(token) : null; }, async set() {} },
+      connectorFactory: () => connector } });
+  try {
+    const seed = await f.runtime.getSnapshot(f.admission);
+    await f.runtime.executeCommand({ sessionToken: f.admission.sessionToken, assertCurrent() { f.kernel.getOwnedIdentity(f.admission.sessionToken); },
+      expectedRevision: seed.revision, expectedPrivacyEpoch: seed.privacyEpoch, idempotencyKey: randomUUID(), kind: 'mail.reply.create',
+      canonicalBody: JSON.stringify({ seed: 'mail replies' }) }, async (controller) => { await controller.saveSettings({ mode: 'provider' }); return true; }, () => true);
+
+    const createAndApprove = async (message) => {
+      const current = await f.runtime.getSnapshot(f.admission);
+      const source = await f.runtime.readMailReplySource(f.admission, { messageId: message.id, expectedRevision: current.revision, expectedPrivacyEpoch: current.privacyEpoch });
+      assert.equal(source.value.source.status, 'current');
+      const created = await dispatchWorkspaceCommand(f.runtime, f.admission, envelope({ kind: 'mail.reply.create', messageId: message.id, accountId,
+        expectedConnectionGeneration: 1, sourceDigest: source.value.source.source.sourceDigest, mode: 'reply', text: `Approved ${message.subject}`,
+        to: ['alex@example.test'], cc: [] }, current.revision, current.privacyEpoch));
+      const afterCreate = await f.runtime.getSnapshot(f.admission);
+      const approved = await dispatchWorkspaceCommand(f.runtime, f.admission, envelope({ kind: 'proposals.approve', proposalId: created.receipt.proposalId,
+        expectedProposalRevision: created.receipt.proposalRevision }, afterCreate.revision, afterCreate.privacyEpoch));
+      return { proposalId: approved.receipt.proposalId, proposalRevision: approved.receipt.proposalRevision };
+    };
+
+    const acceptedDraft = await createAndApprove(messages[0]);
+    const beforeAccepted = await f.runtime.getSnapshot(f.admission);
+    const acceptedCommand = envelope({ kind: 'proposals.execute', proposalId: acceptedDraft.proposalId,
+      expectedProposalRevision: acceptedDraft.proposalRevision }, beforeAccepted.revision, beforeAccepted.privacyEpoch);
+    const accepted = await dispatchWorkspaceCommand(f.runtime, f.admission, acceptedCommand);
+    assert.equal(accepted.receipt.execution, 'accepted', JSON.stringify({ record: accepted.snapshot.state.dispatchRecords[0],
+      proposal: accepted.snapshot.state.proposals.find((item) => item.id === acceptedDraft.proposalId), providerWrites }));
+    assert.equal(accepted.receipt.proposalStatus, accepted.snapshot.state.proposals.find((item) => item.id === acceptedDraft.proposalId).status);
+    assert.equal(providerWrites, 1);
+    assert.deepEqual((await dispatchWorkspaceCommand(f.runtime, f.admission, acceptedCommand)).receipt, accepted.receipt);
+    assert.equal(providerWrites, 1, 'exact duplicate returns the durable receipt without a second provider write');
+
+    const unknownDraft = await createAndApprove(messages[1]);
+    let current = await f.runtime.getSnapshot(f.admission);
+    const unknown = await dispatchWorkspaceCommand(f.runtime, f.admission, envelope({ kind: 'proposals.execute', proposalId: unknownDraft.proposalId,
+      expectedProposalRevision: unknownDraft.proposalRevision }, current.revision, current.privacyEpoch));
+    assert.equal(unknown.receipt.execution, 'unknown');
+    assert.equal(unknown.snapshot.state.proposals.find((item) => item.id === unknownDraft.proposalId).status, 'unknown');
+
+    const uncertainDraft = await createAndApprove(messages[2]);
+    current = await f.runtime.getSnapshot(f.admission);
+    const uncertainCommand = envelope({ kind: 'proposals.execute', proposalId: uncertainDraft.proposalId,
+      expectedProposalRevision: uncertainDraft.proposalRevision }, current.revision, current.privacyEpoch);
+    loseAckAfterThirdProviderWrite = true;
+    await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission, uncertainCommand), /acknowledgement|commit/i);
+    assert.equal(inspectWorkspaceCommand(f.runtime, f.admission, uncertainCommand.commandId).status, 'inspect_required');
+    await f.runtime.refreshSnapshot(f.admission);
+    assert.equal((await dispatchWorkspaceCommand(f.runtime, f.admission, uncertainCommand)).status, 'inspect_required');
+    assert.equal(providerWrites, 3, 'lost terminal acknowledgement never replays the provider request');
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test('mail reply approval does not send, edits clear approval, and reconnect fences the prior source action', async () => {
+  const accountId = randomUUID();
+  const identity = { providerNamespace: 'google', clientId: 'synthetic-client', subject: 'approval-subject' };
+  const identityKey = 'google:synthetic-client:approval-subject:';
+  const token = { accessToken: 'synthetic-access-token', expiresAt: Date.now() + 600_000, identity };
+  const message = { id: 'approval-mail-message', accountId, providerMessageId: 'provider-approval-message', identityKey,
+    verifiedIdentityKey: identityKey, connectionGeneration: 1, idFormat: 'gmail', threadId: 'approval-thread', subject: 'Approval only',
+    from: 'Alex <alex@example.test>', senderEmail: 'alex@example.test', internetMessageId: '<approval@example.test>', replyTo: ['alex@example.test'],
+    to: ['owner@example.test'], cc: [], replyMetadataComplete: true, observedAt: new Date().toISOString() };
+  const account = { id: accountId, provider: 'google', displayName: 'Synthetic Google', email: 'owner@example.test', connected: true,
+    authStatus: 'connected', identity, tokenRef: 'synthetic-token-ref', grantedScopes: ['openid', 'gmail.readonly', 'gmail.compose'],
+    capabilities: ['mail.read', 'mail.draft'], capabilityLimits: ['mail.read', 'mail.draft'], connectionGeneration: 1 };
+  const tokenValues = new Map([[account.tokenRef, token]]);
+  let providerWrites = 0;
+  let controller;
+  const connector = { async verifyOAuthIdentity() { return true; }, async createDraft() { providerWrites += 1; return { status: 'accepted', id: 'should-not-send' }; } };
+  const f = fixture({ initialAccounts: [account], initialMailbox: [message], captureController(value) { controller = value; },
+    integrationOverrides: { tokenStore: { async get(ref) { return tokenValues.get(ref) ? structuredClone(tokenValues.get(ref)) : null; },
+      async set(ref, value) { tokenValues.set(ref, structuredClone(value)); } }, verifyOAuthResult: async () => true, clientIds: { google: 'synthetic-client' },
+      connectorFactory: () => connector } });
+  try {
+    let current = await f.runtime.getSnapshot(f.admission);
+    const seeded = await dispatchWorkspaceCommand(f.runtime, f.admission, envelope({ kind: 'settings.update', patch: { mode: 'provider' } }, current.revision, current.privacyEpoch));
+    current = seeded.snapshot;
+    const source = await f.runtime.readMailReplySource(f.admission, { messageId: message.id, expectedRevision: current.revision, expectedPrivacyEpoch: current.privacyEpoch });
+    const created = await dispatchWorkspaceCommand(f.runtime, f.admission, envelope({ kind: 'mail.reply.create', messageId: message.id, accountId,
+      expectedConnectionGeneration: 1, sourceDigest: source.value.source.source.sourceDigest, mode: 'reply', text: 'Draft text.', to: ['alex@example.test'], cc: [] },
+      current.revision, current.privacyEpoch));
+    current = created.snapshot;
+    const approved = await dispatchWorkspaceCommand(f.runtime, f.admission, envelope({ kind: 'proposals.approve', proposalId: created.receipt.proposalId,
+      expectedProposalRevision: created.receipt.proposalRevision }, current.revision, current.privacyEpoch));
+    assert.equal(approved.snapshot.state.proposals.find((item) => item.id === created.receipt.proposalId).status, 'approved');
+    assert.equal(providerWrites, 0, 'approval records consent but does not execute the provider action');
+
+    const createdProposal = created.snapshot.state.proposals.find((item) => item.id === created.receipt.proposalId);
+    const edited = await dispatchWorkspaceCommand(f.runtime, f.admission, envelope({ kind: 'proposals.edit', proposalId: created.receipt.proposalId,
+      expectedProposalRevision: approved.receipt.proposalRevision, accountId, expectedConnectionGeneration: 1,
+      edit: { kind: 'email', operation: createdProposal.email.operation, to: createdProposal.email.to, cc: createdProposal.email.cc,
+        bcc: createdProposal.email.bcc, subject: createdProposal.email.subject, text: 'Changed text.' } },
+      approved.snapshot.revision, approved.snapshot.privacyEpoch));
+    assert.equal(edited.snapshot.state.proposals.find((item) => item.id === created.receipt.proposalId).status, 'draft');
+    assert.equal(edited.snapshot.state.proposals.find((item) => item.id === created.receipt.proposalId).approvedRevision, undefined);
+    await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission, envelope({ kind: 'proposals.execute', proposalId: created.receipt.proposalId,
+      expectedProposalRevision: approved.receipt.proposalRevision }, edited.snapshot.revision, edited.snapshot.privacyEpoch)), /revision|approved|changed/i);
+    assert.equal(providerWrites, 0, 'editing invalidates the old approval before any send');
+
+    current = await f.runtime.refreshSnapshot(f.admission);
+    const reapproved = await dispatchWorkspaceCommand(f.runtime, f.admission, envelope({ kind: 'proposals.approve', proposalId: created.receipt.proposalId,
+      expectedProposalRevision: edited.receipt.proposalRevision }, current.revision, current.privacyEpoch));
+    const disconnected = await dispatchWorkspaceCommand(f.runtime, f.admission, envelope({ kind: 'accounts.disconnect', accountId,
+      expectedConnectionGeneration: 1 }, reapproved.snapshot.revision, reapproved.snapshot.privacyEpoch));
+    assert.equal(disconnected.receipt.connected, false);
+    const reconnected = await controller.installVerifiedAccount({ id: accountId, provider: 'google', displayName: '', email: '' }, {
+      provider: 'google', accessToken: 'synthetic-access-token-2', refreshToken: 'synthetic-refresh-token-2', expiresAt: Date.now() + 600_000,
+      grantedScopes: ['openid', 'gmail.readonly', 'gmail.compose'], requestedCapabilities: ['mail.read', 'mail.draft'],
+      capabilities: ['mail.read', 'mail.draft'], identity, displayName: 'Synthetic Google', email: 'owner@example.test' });
+    assert.equal(reconnected.connectionGeneration, 3);
+    const afterReconnect = await f.runtime.refreshSnapshot(f.admission);
+    await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission, envelope({ kind: 'proposals.execute', proposalId: created.receipt.proposalId,
+      expectedProposalRevision: reapproved.receipt.proposalRevision }, afterReconnect.revision, afterReconnect.privacyEpoch)), /revision|approved|changed/i);
+    assert.equal(providerWrites, 0, 'a reconnect cannot dispatch an approval captured under the prior account generation');
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test('disconnect command durably reports a disconnected account when credential cleanup is pending', async () => {
+  const accountId = randomUUID();
+  const identity = { providerNamespace: 'google', clientId: 'synthetic-client', subject: 'disconnect-subject' };
+  const account = { id: accountId, provider: 'google', displayName: 'Synthetic Google', email: 'owner@example.test', connected: true,
+    authStatus: 'connected', identity, tokenRef: 'credential-to-delete', grantedScopes: ['openid'], capabilities: ['mail.read'],
+    capabilityLimits: ['mail.read'], connectionGeneration: 4 };
+  const tokenStore = { async get(ref) { return ref === account.tokenRef ? { accessToken: 'synthetic-access-token', expiresAt: Date.now() + 600_000, identity } : null; },
+    async set() {} };
+  let controller;
+  const f = fixture({ initialAccounts: [account], captureController(value) { controller = value; },
+    integrationOverrides: { tokenStore, async deleteToken() { throw new Error('synthetic cleanup failure'); } } });
+  try {
+    const current = await f.runtime.getSnapshot(f.admission);
+    const disconnected = await dispatchWorkspaceCommand(f.runtime, f.admission, envelope({ kind: 'accounts.disconnect', accountId,
+      expectedConnectionGeneration: 4 }, current.revision, current.privacyEpoch));
+    assert.equal(disconnected.status, 'finished');
+    assert.equal(disconnected.receipt.connected, false);
+    assert.equal(disconnected.receipt.cleanup, 'pending');
+    assert.equal(disconnected.snapshot.state.accounts.find((item) => item.id === accountId).connected, false);
+    assert.equal(disconnected.snapshot.state.accounts.find((item) => item.id === accountId).connectionGeneration, 5);
+    assert.ok(controller.getSnapshot().pendingCredentialCleanup.some((item) => item.tokenRef === account.tokenRef));
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test('event proposal edits require a discovered writable calendar from the selected connected account', async () => {
+  const accountId = randomUUID();
+  const identity = { providerNamespace: 'google', clientId: 'synthetic-client', subject: 'calendar-owner' };
+  const account = { id: accountId, provider: 'google', displayName: 'Calendar account', email: 'calendar@example.test', connected: false, authStatus: 'configured',
+    capabilities: [], capabilityLimits: [], connectionGeneration: 0 };
+  const proposalId = 'event-proposal-for-account';
+  const initialProposal = { id: proposalId, kind: 'event', title: 'Original event', body: '', status: 'draft', revision: 1, recipients: [],
+    accountId, calendarId: 'placeholder-calendar', eventDestination: { kind: 'remote_calendar', accountId, calendarId: 'placeholder-calendar' },
+    evidence: [], event: { title: 'Original event', description: '', start: '2026-11-01T10:00:00.000Z', end: '2026-11-01T11:00:00.000Z',
+      timeZone: 'UTC', attendees: [], invitePolicy: 'none' } };
+  const tokens = new Map();
+  const tokenStore = { async get(ref) { return tokens.get(ref) ? structuredClone(tokens.get(ref)) : null; }, async set(ref, value) { tokens.set(ref, structuredClone(value)); } };
+  const connector = { async verifyOAuthIdentity() { return true; }, async listCalendars(_account, options) {
+    const items = [{ id: 'provider-calendar-1', name: 'Primary', writable: true }];
+    await options.onPage?.(items, undefined, 1);
+    return { items, pagesRead: 1, partial: false };
+  }, async readCalendarEvents() { return { items: [], pagesRead: 1, partial: false }; } };
+  let controller;
+  const f = fixture({ initialAccounts: [account],
+    initialCalendars: [
+      { id: 'placeholder-calendar', accountId, name: 'Not discovered', writable: false, connected: false },
+    ], initialProposals: [initialProposal], captureController(value) { controller = value; },
+    integrationOverrides: { tokenStore, clientIds: { google: 'synthetic-client' }, verifyOAuthResult: async () => true, connectorFactory: () => connector } });
+  try {
+    let current = await f.runtime.getSnapshot(f.admission);
+    const initialized = await dispatchWorkspaceCommand(f.runtime, f.admission, envelope({ kind: 'settings.update', patch: { mode: 'preview' } }, current.revision, current.privacyEpoch));
+    const installed = await controller.installVerifiedAccount({ id: accountId, provider: 'google', displayName: '', email: 'calendar@example.test' }, {
+      provider: 'google', accessToken: 'calendar-access', refreshToken: 'calendar-refresh', expiresAt: Date.now() + 600_000,
+      grantedScopes: ['openid', 'https://www.googleapis.com/auth/calendar.events'], requestedCapabilities: ['calendar.read', 'calendar.write'], capabilities: ['calendar.read', 'calendar.write'],
+      identity, displayName: 'Calendar account', email: 'calendar@example.test' });
+    current = await f.runtime.refreshSnapshot(f.admission);
+    const synced = await dispatchWorkspaceCommand(f.runtime, f.admission, envelope({ kind: 'accounts.syncCalendars', accountId,
+      expectedConnectionGeneration: installed.connectionGeneration, continue: false }, current.revision, current.privacyEpoch));
+    current = synced.snapshot;
+    assert.ok(current.state.calendars.some((item) => item.connected && item.writable && item.providerId === 'provider-calendar-1'), JSON.stringify(current.state.calendars));
+    const expectedProposalRevision = current.state.proposals.find((item) => item.id === proposalId).revision;
+    const body = (calendarId) => ({ kind: 'proposals.edit', proposalId, expectedProposalRevision, accountId,
+      expectedConnectionGeneration: installed.connectionGeneration, edit: { kind: 'event', calendarId, title: 'Reviewed event', description: 'Details',
+        start: '2026-11-02T10:00:00.000Z', end: '2026-11-02T11:00:00.000Z', timeZone: 'UTC', attendees: [], invitePolicy: 'none' } });
+    await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission, envelope(body('placeholder-calendar'), current.revision, current.privacyEpoch)), /connected, writable calendar/i);
+    await f.runtime.refreshSnapshot(f.admission);
+    current = await f.runtime.getSnapshot(f.admission);
+    const rediscovered = await dispatchWorkspaceCommand(f.runtime, f.admission, envelope({ kind: 'accounts.syncCalendars', accountId,
+      expectedConnectionGeneration: installed.connectionGeneration, continue: false }, current.revision, current.privacyEpoch));
+    current = rediscovered.snapshot;
+    const calendarId = current.state.calendars.find((item) => item.providerId === 'provider-calendar-1').id;
+    const edited = await dispatchWorkspaceCommand(f.runtime, f.admission, envelope(body(calendarId), current.revision, current.privacyEpoch));
+    assert.equal(edited.snapshot.state.proposals.find((item) => item.id === proposalId).eventDestination.accountId, accountId);
+    assert.equal(edited.snapshot.state.proposals.find((item) => item.id === proposalId).eventDestination.calendarId, calendarId);
   } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 

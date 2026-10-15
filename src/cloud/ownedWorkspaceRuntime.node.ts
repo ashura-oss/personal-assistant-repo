@@ -313,6 +313,31 @@ export class OwnedWorkspaceRuntime {
     });
   }
 
+  readMailReplySource(admission: OwnedWorkspaceAdmission, input: { messageId: string; expectedRevision: number; expectedPrivacyEpoch: number }) {
+    return this.readController(admission, input, async (controller) => ({
+      source: await controller.getMailReplySource(input.messageId), bodyCache: await controller.getMailReplyText(input.messageId),
+    }));
+  }
+
+  readMailReplyText(admission: OwnedWorkspaceAdmission, input: { messageId: string; expectedRevision: number; expectedPrivacyEpoch: number }) {
+    return this.readController(admission, input, async (controller) => await controller.getMailReplyText(input.messageId));
+  }
+
+  readProposalForReview(admission: OwnedWorkspaceAdmission, input: { proposalId: string; expectedRevision: number; expectedPrivacyEpoch: number }) {
+    return this.readController(admission, input, (controller) => {
+      const proposal = controller.getSnapshot().proposals.find((item) => item.id === input.proposalId);
+      return proposal ? JSON.parse(JSON.stringify(proposal)) as typeof proposal : undefined;
+    });
+  }
+
+  readDispatchForReview(admission: OwnedWorkspaceAdmission, input: { recordId: string; expectedRevision: number; expectedPrivacyEpoch: number }) {
+    return this.readController(admission, input, (controller) => controller.getDispatchRecordForCommand(input.recordId));
+  }
+
+  readMailReplyBatchReview(admission: OwnedWorkspaceAdmission, input: { planId: string; jobId: string; accountId: string; expectedConnectionGeneration: number; expectedRevision: number; expectedPrivacyEpoch: number }) {
+    return this.readController(admission, input, (controller) => controller.getMailReplyBatchReviewForCommand(input));
+  }
+
   /** Reads only safe source-choice projections and never publishes or caches a workspace snapshot. */
   readKnowledgeSourceChoices(admission: OwnedWorkspaceAdmission, input: Readonly<{ expectedRevision: number; expectedPrivacyEpoch: number }>): Promise<KnowledgeSourceChoicesDTO> {
     this.assertAdmission(admission);
@@ -660,6 +685,24 @@ export class OwnedWorkspaceRuntime {
     });
     this.inFlight.add(pending);
     return pending;
+  }
+
+  private readController<T>(admission: OwnedWorkspaceAdmission, fence: { expectedRevision: number; expectedPrivacyEpoch: number },
+    operation: (controller: AppControllerImpl) => T | Promise<T>): Promise<{ workspaceId: string; privacyEpoch: number; revision: number; value: T }> {
+    this.assertAdmission(admission);
+    const identity = this.options.kernel.getOwnedIdentity(admission.sessionToken);
+    if (!Number.isSafeInteger(fence.expectedRevision) || fence.expectedRevision !== identity.revision ||
+        !Number.isSafeInteger(fence.expectedPrivacyEpoch) || fence.expectedPrivacyEpoch !== identity.privacyEpoch) return Promise.reject(new Error('workspace_read_stale'));
+    if (this.refreshRequired.has(identity.workspaceId)) return Promise.reject(new Error('workspace_refresh_required'));
+    return this.track(identity.workspaceId, () => undefined, async () => {
+      const runtime = await this.registry.get(admission.sessionToken);
+      admission.assertCurrent();
+      this.assertStillCurrent(admission, identity, runtime.store.getLoadedIdentity(), this.options.kernel.getOwnedIdentity(admission.sessionToken));
+      const value = await operation(runtime.controller);
+      admission.assertCurrent();
+      this.assertStillCurrent(admission, identity, runtime.store.getLoadedIdentity(), this.options.kernel.getOwnedIdentity(admission.sessionToken));
+      return Object.freeze({ workspaceId: identity.workspaceId, privacyEpoch: identity.privacyEpoch, revision: identity.revision, value });
+    });
   }
 
   private attachController(controller: AppControllerImpl, adapter: NodeSpeechCleanupAdapter | undefined,

@@ -60,6 +60,87 @@ export async function dispatchWorkspaceCommand(runtime: OwnedWorkspaceRuntime, a
         return receipt(envelope, command, { objectId: account.id, stageId: command.stageId,
           accountGeneration: account.connectionGeneration ?? 0 });
       }
+      case 'accounts.syncCalendars': {
+        const result = await controller.syncCalendarsForCommand(command.accountId, { expectedConnectionGeneration: command.expectedConnectionGeneration, continue: command.continue });
+        return receipt(envelope, command, { objectId: command.accountId, accountId: command.accountId, connectionGeneration: result.connectionGeneration,
+          syncStatus: result.state.status, calendarsPartial: result.state.calendarsPartial });
+      }
+      case 'accounts.refreshMail': case 'accounts.continueMailBackfill': {
+        const result = command.kind === 'accounts.refreshMail'
+          ? await controller.refreshMailHeadForCommand(command.accountId, { expectedConnectionGeneration: command.expectedConnectionGeneration })
+          : await controller.continueMailBackfillForCommand(command.accountId, { expectedConnectionGeneration: command.expectedConnectionGeneration });
+        return receipt(envelope, command, { objectId: command.accountId, accountId: command.accountId, connectionGeneration: result.connectionGeneration,
+          lane: result.result.lane, laneStatus: result.result.status, syncStatus: result.result.state.status });
+      }
+      case 'accounts.disconnect': {
+        const result = await controller.disconnectAccountForCommand(command.accountId, { expectedConnectionGeneration: command.expectedConnectionGeneration });
+        return receipt(envelope, command, { objectId: result.account.id, accountId: result.account.id,
+          connectionGeneration: result.account.connectionGeneration ?? command.expectedConnectionGeneration + 1, connected: false, cleanup: result.cleanup });
+      }
+      case 'mail.source.loadText': {
+        const result = await controller.loadMailReplyTextForCommand({ messageId: command.messageId, accountId: command.accountId,
+          expectedConnectionGeneration: command.expectedConnectionGeneration, sourceDigest: command.sourceDigest });
+        return receipt(envelope, command, { objectId: command.messageId, accountId: command.accountId,
+          connectionGeneration: command.expectedConnectionGeneration, sourceDigest: command.sourceDigest, loadStatus: result.status,
+          ...(result.snapshot?.textDigest ? { textDigest: result.snapshot.textDigest } : {}), ...(result.snapshot ? { bytes: result.snapshot.bytes } : {}) });
+      }
+      case 'mail.reply.create': {
+        const proposal = await controller.createMailReplyProposalForCommand({ messageId: command.messageId, accountId: command.accountId,
+          expectedConnectionGeneration: command.expectedConnectionGeneration, sourceDigest: command.sourceDigest, mode: command.mode,
+          text: command.text, to: command.to, cc: command.cc });
+        return receipt(envelope, command, { objectId: proposal.id, proposalId: proposal.id, proposalRevision: proposal.revision });
+      }
+      case 'proposals.edit': {
+        const proposal = await controller.editProposalForCommand(command.proposalId, { expectedRevision: command.expectedProposalRevision,
+          accountId: command.accountId, expectedConnectionGeneration: command.expectedConnectionGeneration, edit: command.edit });
+        return receipt(envelope, command, { objectId: proposal.id, proposalId: proposal.id, proposalRevision: proposal.revision, proposalStatus: proposal.status });
+      }
+      case 'proposals.approve': {
+        const proposal = await controller.approveProposal(command.proposalId, { expectedRevision: command.expectedProposalRevision });
+        return receipt(envelope, command, { objectId: proposal.id, proposalId: proposal.id, proposalRevision: proposal.revision, proposalStatus: proposal.status });
+      }
+      case 'proposals.dismiss': {
+        const proposal = await controller.dismissProposal(command.proposalId, { expectedRevision: command.expectedProposalRevision });
+        return receipt(envelope, command, { objectId: proposal.id, proposalId: proposal.id, proposalRevision: proposal.revision, proposalStatus: proposal.status });
+      }
+      case 'proposals.execute': {
+        const result = await controller.executeProposalForCommand(command.proposalId, { expectedRevision: command.expectedProposalRevision });
+        const proposal = result.proposal;
+        const execution = result.kind === 'invalidated' ? 'invalidated' : result.dispatch?.outcome ?? (result.simulated ? 'simulated' : result.localOutcome ?? 'failed');
+        return receipt(envelope, command, { objectId: proposal.id, proposalId: proposal.id, proposalRevision: proposal.revision, proposalStatus: proposal.status,
+          execution, ...(result.kind === 'settled' && result.dispatch ? { dispatchRecordId: result.dispatch.id, operation: result.dispatch.operation,
+            ...(result.dispatch.outcomeAt ? { outcomeAt: result.dispatch.outcomeAt } : {}), ...(result.dispatch.remoteId ? { remoteId: result.dispatch.remoteId } : {}) } : {}) });
+      }
+      case 'dispatch.reconcile': {
+        const { record, recordVersion } = await controller.reconcileDispatchForCommand(command.recordId, { expectedRecordVersion: command.expectedRecordVersion,
+          disposition: command.disposition, note: command.note, ...(command.remoteId ? { remoteId: command.remoteId } : {}) });
+        return receipt(envelope, command, { objectId: record.id, recordId: record.id, recordVersion, disposition: command.disposition,
+          providerOutcome: record.outcome, ...(record.outcomeAt ? { providerOutcomeAt: record.outcomeAt } : {}) });
+      }
+      case 'mail.replyBatch.submit': {
+        const job = await controller.submitMailReplyBatchForCommand({ accountId: command.accountId, expectedConnectionGeneration: command.expectedConnectionGeneration,
+          messageId: command.messageId, sourceDigest: command.sourceDigest, textDigest: command.textDigest, mode: command.mode,
+          to: [...command.to], cc: [...command.cc], brief: command.brief, composerRevision: command.composerRevision,
+          ...(command.noteId ? { noteId: command.noteId, noteRevision: command.noteRevision } : {}),
+          ...(command.contextSelectionIds ? { contextSelectionIds: command.contextSelectionIds } : {}),
+          ...(command.contextExcerptSelectionIds ? { contextExcerptSelectionIds: command.contextExcerptSelectionIds } : {}) });
+        return receipt(envelope, command, { objectId: job.id, jobId: job.id, jobStatus: job.status });
+      }
+      case 'mail.replyBatch.check': {
+        const job = await controller.checkMailReplyBatchForCommand({ jobId: command.jobId, accountId: command.accountId,
+          expectedConnectionGeneration: command.expectedConnectionGeneration });
+        return receipt(envelope, command, { objectId: job.id, jobId: job.id, jobStatus: job.status });
+      }
+      case 'mail.replyBatch.review': {
+        const plan = await controller.reviewMailReplyBatchForCommand({ jobId: command.jobId, accountId: command.accountId,
+          expectedConnectionGeneration: command.expectedConnectionGeneration, operation: command.operation });
+        return receipt(envelope, command, { objectId: command.jobId, jobId: command.jobId, planId: plan.planId, expiresAt: plan.expiresAt });
+      }
+      case 'mail.replyBatch.activate': {
+        const result = await controller.activateMailReplyBatchForCommand({ planId: command.planId, jobId: command.jobId,
+          accountId: command.accountId, expectedConnectionGeneration: command.expectedConnectionGeneration });
+        return receipt(envelope, command, { objectId: result.proposalId, jobId: result.jobId, proposalId: result.proposalId });
+      }
       case 'documents.save': {
         const document = await controller.saveDocument(command.path, command.content, {
           expectedRevision: command.expectedRevision ?? undefined, expectedEntityRevision: command.expectedEntityRevision,
@@ -195,17 +276,10 @@ export async function dispatchWorkspaceCommand(runtime: OwnedWorkspaceRuntime, a
       }
       default: return assertNever(command);
     }
-  }, (value): JsonValue => ({ schemaVersion: value.schemaVersion, commandId: value.commandId, kind: value.kind,
-    objectId: value.objectId, ...('jobId' in value ? { jobId: value.jobId } : {}), ...('turnId' in value ? { turnId: value.turnId } : {}),
-    ...('parentTurnId' in value ? { parentTurnId: value.parentTurnId } : {}),
-    ...('captureId' in value ? { captureId: value.captureId } : {}), ...('captureRevision' in value ? { captureRevision: value.captureRevision } : {}),
-    ...('stageId' in value ? { stageId: value.stageId } : {}), ...('accountGeneration' in value ? { accountGeneration: value.accountGeneration } : {}),
-    ...('documentRevision' in value ? { documentRevision: value.documentRevision } : {}),
-    ...('entityKind' in value ? { entityKind: value.entityKind } : {}), ...('entityId' in value ? { entityId: value.entityId } : {}),
-    ...('entityRevision' in value ? { entityRevision: value.entityRevision } : {}), ...('itemId' in value ? { itemId: value.itemId } : {}),
-    ...('suggestionId' in value ? { suggestionId: value.suggestionId } : {}),
-    ...('suggestionRevision' in value ? { suggestionRevision: value.suggestionRevision } : {}),
-    ...('status' in value ? { status: value.status } : {}) }));
+  }, (value): JsonValue => {
+    const closed = parseWorkspaceCommandReceipt(value, expectedReceipt(envelope.commandId, command));
+    return JSON.parse(JSON.stringify(closed)) as JsonValue;
+  });
 
   const expectation = expectedReceipt(envelope.commandId, command);
   if (result.admission.fresh) {
@@ -245,6 +319,15 @@ function receipt(envelope: WorkspaceCommandEnvelope, command: WorkspaceCommand, 
   readonly documentRevision?: number; readonly entityKind?: 'person' | 'project'; readonly entityId?: string;
   readonly entityRevision?: number; readonly itemId?: string;
   readonly suggestionId?: string; readonly suggestionRevision?: number; readonly status?: 'pending' | 'accepted' | 'dismissed';
+  readonly accountId?: string; readonly connectionGeneration?: number; readonly syncStatus?: string; readonly calendarsPartial?: boolean;
+  readonly lane?: string; readonly laneStatus?: string; readonly connected?: false; readonly cleanup?: 'complete' | 'pending';
+  readonly sourceDigest?: string; readonly textDigest?: string; readonly bytes?: number; readonly proposalId?: string; readonly proposalRevision?: number;
+  readonly loadStatus?: import('../core').MailReplyTextLoadResult['status'];
+  readonly proposalStatus?: import('../core').Proposal['status']; readonly execution?: 'accepted' | 'unknown' | 'rejected' | 'simulated' | 'executed' | 'failed' | 'invalidated';
+  readonly dispatchRecordId?: string; readonly operation?: 'draft' | 'send' | 'event'; readonly outcomeAt?: string; readonly remoteId?: string;
+  readonly recordId?: string; readonly recordVersion?: string; readonly disposition?: import('../dispatch').DispatchReconciliation;
+  readonly providerOutcome?: import('../dispatch').DispatchOutcome; readonly providerOutcomeAt?: string;
+  readonly jobStatus?: import('../services/openRouterBatchJobs').AssistantBatchJobDTO['status']; readonly planId?: string; readonly expiresAt?: string;
 }) {
   return parseWorkspaceCommandReceipt({ schemaVersion: 1, commandId: envelope.commandId, kind: command.kind, ...fields },
     expectedReceipt(envelope.commandId, command));
@@ -258,6 +341,17 @@ function expectedReceipt(commandId: string, command: WorkspaceCommand) {
     case 'notes.capture.adopt': return { commandId, kind: command.kind, objectId: command.captureId,
       captureId: command.captureId, captureRevision: command.captureRevision };
     case 'accounts.installOAuth': return { commandId, kind: command.kind, stageId: command.stageId };
+    case 'accounts.syncCalendars': case 'accounts.refreshMail': case 'accounts.continueMailBackfill': case 'accounts.disconnect':
+      return { commandId, kind: command.kind, objectId: command.accountId, accountId: command.accountId };
+    case 'mail.source.loadText': return { commandId, kind: command.kind, objectId: command.messageId, accountId: command.accountId,
+      connectionGeneration: command.expectedConnectionGeneration, sourceDigest: command.sourceDigest };
+    case 'mail.reply.create': return { commandId, kind: command.kind };
+    case 'proposals.edit': case 'proposals.approve': case 'proposals.execute': case 'proposals.dismiss':
+      return { commandId, kind: command.kind, objectId: command.proposalId, proposalId: command.proposalId };
+    case 'dispatch.reconcile': return { commandId, kind: command.kind, objectId: command.recordId, recordId: command.recordId };
+    case 'mail.replyBatch.submit': return { commandId, kind: command.kind };
+    case 'mail.replyBatch.check': case 'mail.replyBatch.review': return { commandId, kind: command.kind, objectId: command.jobId, jobId: command.jobId };
+    case 'mail.replyBatch.activate': return { commandId, kind: command.kind, jobId: command.jobId };
     case 'documents.save': {
       const parent = canonicalKnowledgeDocumentParent(command.path);
       return { commandId, kind: command.kind, objectId: command.path,

@@ -212,6 +212,18 @@ export interface Proposal {
   remoteAcceptedAt?: string;
 }
 
+/** Explicit persisted result returned only to journaled cloud proposal execution. */
+export type ProposalExecutionForCommandResult =
+  | Readonly<{ kind: 'invalidated'; proposal: Proposal; reason: 'source_changed' | 'reply_context_expired' }>
+  | Readonly<{ kind: 'settled'; proposal: Proposal;
+      dispatch?: Readonly<{ id: string; operation: 'draft' | 'send' | 'event'; outcome: 'accepted' | 'unknown' | 'rejected'; outcomeAt?: string; remoteId?: string }>;
+      simulated?: true; localOutcome?: 'executed' | 'failed' }>;
+
+export interface DisconnectAccountForCommandResult { readonly account: Account; readonly cleanup: 'complete' | 'pending' }
+export interface SyncCalendarsForCommandResult { readonly state: AccountSyncState; readonly connectionGeneration: number }
+export interface MailLaneForCommandResult { readonly result: MailLaneResult; readonly connectionGeneration: number }
+export interface DispatchReconciliationForCommandResult { readonly record: import('../dispatch').DispatchRecord; readonly recordVersion: string }
+
 export interface EmailProposalPayload {
   /** Required at approval time; omitted on legacy proposals until the user selects an action. */
   operation?: 'draft' | 'send';
@@ -703,6 +715,12 @@ export interface MailReplyBatchReviewPlan {
   readonly expiresAt: string;
 }
 
+export interface MailReplyBatchReviewBoundPlan {
+  readonly plan: MailReplyBatchReviewPlan;
+  readonly accountId: string;
+  readonly connectionGeneration: number;
+}
+
 export interface AssistantBatchMoreComputePlan {
   readonly planId: string;
   readonly jobId: string;
@@ -983,20 +1001,31 @@ export interface AppController {
   cancelMoreCompute(planId: string): void;
   submitMoreCompute(input: { planId: string }): Promise<import('../services/openRouterBatchJobs').AssistantBatchJobDTO & { recoveredConversationId?: string; recoveredTurnId?: string }>;
   submitMailReplyBatch(input: Omit<MailReplyTextGenerationInput, 'forceRefresh'>): Promise<import('../services/openRouterBatchJobs').AssistantBatchJobDTO>;
+  submitMailReplyBatchForCommand(input: Omit<MailReplyTextGenerationInput, 'forceRefresh'> & { accountId: string; expectedConnectionGeneration: number }): Promise<import('../services/openRouterBatchJobs').AssistantBatchJobDTO>;
   reviewMailReplyBatch(jobId: string, options?: { operation?: 'draft' | 'send' }): Promise<MailReplyBatchReviewPlan>;
+  reviewMailReplyBatchForCommand(input: { jobId: string; accountId: string; expectedConnectionGeneration: number; operation: 'draft' | 'send' }): Promise<MailReplyBatchReviewPlan>;
   activateMailReplyBatch(input: { planId: string }): Promise<{ kind: 'created'; jobId: string; proposalId: string }>;
+  activateMailReplyBatchForCommand(input: { planId: string; jobId: string; accountId: string; expectedConnectionGeneration: number }): Promise<{ kind: 'created'; jobId: string; proposalId: string }>;
+  checkMailReplyBatchForCommand(input: { jobId: string; accountId: string; expectedConnectionGeneration: number }): Promise<import('../services/openRouterBatchJobs').AssistantBatchJobDTO>;
+  getMailReplyBatchReviewForCommand(input: { planId: string; jobId: string; accountId: string; expectedConnectionGeneration: number }): MailReplyBatchReviewBoundPlan | undefined;
   cancelMailReplyBatchReview(planId: string): Promise<void>;
   deleteMailReplyBatch(jobId: string): Promise<void>;
   retryAssistantBatchCleanup(jobId: string): Promise<import('../services/openRouterBatchJobs').AssistantBatchJobDTO>;
   refreshAnalysisStatus(noteId: string): Promise<NoteAssistResult | undefined>;
   checkProposalFreshness(id: string): Promise<{ current: boolean; reason?: string }>;
   reconcileDispatch(recordId: string, input: { disposition: import('../dispatch').DispatchReconciliation; note: string; remoteId?: string }): Promise<import('../dispatch').DispatchRecord>;
+  reconcileDispatchForCommand(recordId: string, input: { expectedRecordVersion: string; disposition: import('../dispatch').DispatchReconciliation; note: string; remoteId?: string }): Promise<DispatchReconciliationForCommandResult>;
+  getDispatchRecordForCommand(recordId: string): Promise<DispatchReconciliationForCommandResult>;
   transcribeNote(id: string, options?: { expectedRevision: number }): Promise<Note>;
   cancelTranscription(noteId: string, input?: { attemptId?: string }): Promise<{ status: 'cancelled' | 'already_terminal' | 'not_running' }>;
   retryTranscriptionRequestCleanup(attemptId: string): Promise<void>;
   editProposal(id: string, patch: ProposalPatch, options?: { expectedRevision: number }): Promise<Proposal>;
+  editProposalForCommand(id: string, input: { expectedRevision: number; accountId: string; expectedConnectionGeneration: number; edit:
+    | { kind: 'email'; operation: 'draft' | 'send'; to: readonly string[]; cc: readonly string[]; bcc: readonly string[]; subject: string; text: string }
+    | { kind: 'event'; calendarId: string; title: string; description: string; start: string; end: string; timeZone: string; attendees: readonly string[]; invitePolicy: 'send' | 'none' } }): Promise<Proposal>;
   approveProposal(id: string, options?: { expectedRevision: number }): Promise<Proposal>;
   executeProposal(id: string, options?: { expectedRevision: number }): Promise<Proposal>;
+  executeProposalForCommand(id: string, options: { expectedRevision: number }): Promise<ProposalExecutionForCommandResult>;
   connectDeviceCalendars(input: { expectedGeneration: number }): Promise<DeviceCalendarAccessState>;
   disconnectDeviceCalendars(input: { expectedGeneration: number }): Promise<import('../deviceCalendars/types').DeviceCalendarState>;
   checkDeviceCalendarAccess(): Promise<DeviceCalendarAccessState>;
@@ -1004,7 +1033,7 @@ export interface AppController {
   refreshDeviceCalendars(input: { expectedGeneration: number; expectedSelectionRevision: number; continueRunId?: string }): Promise<import('../deviceCalendars/types').DeviceCalendarState>;
   inspectDeviceEventDispatch(recordId: string): Promise<{ record: import('../deviceCalendars/types').DeviceEventDispatchRecord; lookup: import('../deviceCalendars/types').DeviceEventLookupResult }>;
   reconcileDeviceEventDispatch(recordId: string, input: { disposition: import('../deviceCalendars/types').DeviceEventReconciliation; note: string; nativeEventId?: string }): Promise<import('../deviceCalendars/types').DeviceEventDispatchRecord>;
-  dismissProposal(id: string): Promise<Proposal>;
+  dismissProposal(id: string, options?: { expectedRevision: number }): Promise<Proposal>;
   completeTask(id: string): Promise<LocalTask>;
   reopenTask(id: string): Promise<LocalTask>;
   savePerson(input: SavePersonInput): Promise<import('../knowledge/types').Person>;
@@ -1031,11 +1060,15 @@ export interface AppController {
   installVerifiedAccount(config: AccountConfig, result: OAuthInstallResult, options?: { assertCurrent?: () => void }): Promise<Account>;
   installOAuthStage(stageId: string): Promise<Account>;
   retryCredentialCleanup(): Promise<void>;
-  disconnectAccount(id: string): Promise<Account>;
+  disconnectAccount(id: string, options?: { expectedConnectionGeneration?: number }): Promise<Account>;
+  disconnectAccountForCommand(id: string, options: { expectedConnectionGeneration: number }): Promise<DisconnectAccountForCommandResult>;
   saveCalendar(config: CalendarConfig): Promise<Calendar>;
-  syncAccount(id: string, options?: { continue?: boolean }): Promise<AccountSyncState>;
-  refreshMailHead(accountId: string, options?: { reason?: 'manual' | 'foreground' }): Promise<MailLaneResult>;
-  continueMailBackfill(accountId: string): Promise<MailLaneResult>;
+  syncAccount(id: string, options?: { continue?: boolean; expectedConnectionGeneration?: number }): Promise<AccountSyncState>;
+  refreshMailHead(accountId: string, options?: { reason?: 'manual' | 'foreground'; expectedConnectionGeneration?: number }): Promise<MailLaneResult>;
+  continueMailBackfill(accountId: string, options?: { expectedConnectionGeneration?: number }): Promise<MailLaneResult>;
+  syncCalendarsForCommand(accountId: string, options: { expectedConnectionGeneration: number; continue?: boolean }): Promise<SyncCalendarsForCommandResult>;
+  refreshMailHeadForCommand(accountId: string, options: { expectedConnectionGeneration: number }): Promise<MailLaneForCommandResult>;
+  continueMailBackfillForCommand(accountId: string, options: { expectedConnectionGeneration: number }): Promise<MailLaneForCommandResult>;
   refreshForegroundMail(): Promise<ForegroundMailRefreshResult>;
   enableProactiveMailAlerts(input: { ruleId: string; expectedRuleVersion: number; expectedRuleRevision: number; timeZone: string; accountIds: string[] }): Promise<void>;
   revokeProactiveMailAlerts(ruleId: string): Promise<void>;
@@ -1087,7 +1120,9 @@ export interface AppController {
   refreshMailReplyBatchSources(jobId: string): Promise<MailReplyBatchSourcesRefreshResult>;
   getMailReplyBatchSourcesStatus(jobId: string): { readonly status: 'missing' | 'refresh_required' | 'current' | 'invalid'; readonly expiresAt?: string };
   createMailReplyProposal(input: { messageId: string; mode: 'reply' | 'reply_all'; sourceDigest: string; text: string; to?: string[]; cc?: string[] }): Promise<Proposal>;
+  createMailReplyProposalForCommand(input: { messageId: string; accountId: string; expectedConnectionGeneration: number; mode: 'reply' | 'reply_all'; sourceDigest: string; text: string; to: readonly string[]; cc: readonly string[] }): Promise<Proposal>;
   loadMailReplyText(input: { messageId: string; sourceDigest: string }): Promise<MailReplyTextLoadResult>;
+  loadMailReplyTextForCommand(input: { messageId: string; accountId: string; expectedConnectionGeneration: number; sourceDigest: string }): Promise<MailReplyTextLoadResult>;
   getMailReplyText(messageId: string): Promise<MailReplyTextCacheResult>;
   generateMailReplyText(input: MailReplyTextGenerationInput): Promise<MailReplyTextGenerationResult>;
 }

@@ -14,4 +14,9 @@ export interface WorkspaceHttpApi extends Partial<KnowledgeHttpApi> {
   inspectCommand(admission: WorkspaceHttpAdmission, commandId: string): JsonValue;
   listCommandHistory(admission: WorkspaceHttpAdmission, cursor?: string): JsonValue;
   cancelTranscription(admission: WorkspaceHttpAdmission, commandId: string): JsonValue;
+  readMailReplySource?(admission: WorkspaceHttpAdmission, input: Readonly<{ messageId: string; expectedRevision: number; expectedPrivacyEpoch: number }>): Promise<JsonValue>;
+  readMailReplyText?(admission: WorkspaceHttpAdmission, input: Readonly<{ messageId: string; expectedRevision: number; expectedPrivacyEpoch: number }>): Promise<JsonValue>;
+  readProposalReview?(admission: WorkspaceHttpAdmission, input: Readonly<{ proposalId: string; expectedRevision: number; expectedPrivacyEpoch: number }>): Promise<JsonValue>;
+  readDispatchReview?(admission: WorkspaceHttpAdmission, input: Readonly<{ recordId: string; expectedRevision: number; expectedPrivacyEpoch: number }>): Promise<JsonValue>;
+  readMailReplyBatchReview?(admission: WorkspaceHttpAdmission, input: Readonly<{ planId: string; jobId: string; accountId: string; expectedConnectionGeneration: number; expectedRevision: number; expectedPrivacyEpoch: number }>): Promise<JsonValue>;
 }

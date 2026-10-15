@@ -5,6 +5,7 @@ import { extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { AuthError, type AuthService } from './auth.js';
 import { KernelError } from './kernel.js';
 import { VaultError } from './vault.js';
+import { isValidAccountId } from './accountIds.js';
 import type { SafeCredentialMetadataSnapshot, ServerCredentialCommandService } from './credentialCommands.js';
 import type { WorkspaceHttpAdmission, WorkspaceHttpApi } from './workspaceHttp.js';
 import { KNOWLEDGE_SOURCE_CHOICES_PATH, KNOWLEDGE_SUGGESTION_REVIEW_PATH, parseKnowledgeHttpRead } from './knowledgeHttp.js';
@@ -860,6 +861,49 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
     return;
   }
+  const workflowReads = new Map<string, { readonly method: keyof Pick<WorkspaceHttpApi, 'readMailReplySource' | 'readMailReplyText' | 'readProposalReview' | 'readDispatchReview' | 'readMailReplyBatchReview'>; readonly keys: readonly string[] }>([
+    ['/api/workspace/mail/source', { method: 'readMailReplySource', keys: ['messageId', 'expectedRevision', 'expectedPrivacyEpoch'] }],
+    ['/api/workspace/mail/source-text', { method: 'readMailReplyText', keys: ['messageId', 'expectedRevision', 'expectedPrivacyEpoch'] }],
+    ['/api/workspace/proposals/review', { method: 'readProposalReview', keys: ['proposalId', 'expectedRevision', 'expectedPrivacyEpoch'] }],
+    ['/api/workspace/dispatch/review', { method: 'readDispatchReview', keys: ['recordId', 'expectedRevision', 'expectedPrivacyEpoch'] }],
+    ['/api/workspace/mail/reply-batch/review', { method: 'readMailReplyBatchReview', keys: ['planId', 'jobId', 'accountId', 'expectedConnectionGeneration', 'expectedRevision', 'expectedPrivacyEpoch'] }],
+  ]);
+  const workflowRead = workflowReads.get(pathname);
+  if (workflowRead) {
+    if (request.method !== 'GET') { response.setHeader('Allow', 'GET'); throw problem(405, 'method_not_allowed'); }
+    const values = strictQuery(rawQuery, workflowRead.keys);
+    if (values.size !== workflowRead.keys.length) throw problem(400, 'bad_request');
+    const decimalValue = (key: string, minimum = 0) => {
+      const raw = values.get(key);
+      if (raw === undefined || !/^(0|[1-9][0-9]{0,15})$/.test(raw)) throw problem(400, 'bad_request');
+      const number = Number(raw);
+      if (!Number.isSafeInteger(number) || number < minimum) throw problem(400, 'bad_request');
+      return number;
+    };
+    const opaqueId = (key: string) => {
+      const value = values.get(key);
+      if (!isValidAccountId(value)) throw problem(400, 'bad_request');
+      return value;
+    };
+    const base = { expectedRevision: decimalValue('expectedRevision'), expectedPrivacyEpoch: decimalValue('expectedPrivacyEpoch') };
+    let input: Readonly<Record<string, string | number>>;
+    switch (workflowRead.method) {
+      case 'readMailReplySource': case 'readMailReplyText': input = { ...base, messageId: opaqueId('messageId') }; break;
+      case 'readProposalReview': input = { ...base, proposalId: opaqueId('proposalId') }; break;
+      case 'readDispatchReview': input = { ...base, recordId: opaqueId('recordId') }; break;
+      case 'readMailReplyBatchReview': input = { ...base, planId: opaqueId('planId'), jobId: opaqueId('jobId'), accountId: opaqueId('accountId'),
+        expectedConnectionGeneration: decimalValue('expectedConnectionGeneration') }; break;
+    }
+    if (!workspaceApi || typeof workspaceApi[workflowRead.method] !== 'function') throw problem(503, 'service_unavailable');
+    const admission = workspaceReadAdmission(request, auth, canonicalOrigin);
+    try {
+      admission.assertCurrent();
+      const result = await workspaceApi[workflowRead.method]!(admission, input as never);
+      admission.assertCurrent();
+      if (!response.destroyed) sendJson(response, 200, result);
+    } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
+    return;
+  }
   if (pathname === KNOWLEDGE_SOURCE_CHOICES_PATH || pathname === KNOWLEDGE_SUGGESTION_REVIEW_PATH) {
     if (request.method !== 'GET') { response.setHeader('Allow', 'GET'); throw problem(405, 'method_not_allowed'); }
     let read;
@@ -906,7 +950,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
         const command = value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>).command : undefined;
         const kind = command && typeof command === 'object' && !Array.isArray(command) ? (command as Record<string, unknown>).kind : undefined;
         return typeof kind === 'string' && ['notes.save', 'notes.updateTranscript', 'assistant.batch.submitNote', 'chat.submit',
-          'documents.save', 'knowledge.person.save', 'knowledge.project.save'].includes(kind)
+          'documents.save', 'knowledge.person.save', 'knowledge.project.save', 'mail.reply.create', 'proposals.edit', 'mail.replyBatch.submit'].includes(kind)
           ? WORKSPACE_COMMAND_TEXT_BODY_LIMIT : BODY_LIMIT;
       });
       admission.assertCurrent();

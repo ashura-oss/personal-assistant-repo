@@ -30,6 +30,59 @@ export function createWorkspaceHttpApi(runtime: OwnedWorkspaceRuntime): Workspac
       admission.assertCurrent();
       return serializeKnowledgeRead(result);
     },
+    async readMailReplySource(admission: WorkspaceHttpAdmission, input: { messageId: string; expectedRevision: number; expectedPrivacyEpoch: number }) {
+      admission.assertCurrent();
+      const result = await runtime.readMailReplySource(admission, input);
+      admission.assertCurrent();
+      return serializeWorkflowRead({ ...readEnvelope(result), status: result.value.source.status, ...(result.value.source.source ? { source: safeMailSource(result.value.source.source) } : {}),
+        ...(result.value.source.defaults ? { defaults: result.value.source.defaults } : {}), bodyCache: { status: result.value.bodyCache.status,
+          ...(result.value.bodyCache.snapshot?.textDigest ? { textDigest: result.value.bodyCache.snapshot.textDigest } : {}),
+          ...(result.value.bodyCache.snapshot ? { bytes: result.value.bodyCache.snapshot.bytes, completeness: result.value.bodyCache.snapshot.completeness,
+            representation: result.value.bodyCache.snapshot.representation, checkedAt: result.value.bodyCache.snapshot.checkedAt } : {}) } });
+    },
+    async readMailReplyText(admission: WorkspaceHttpAdmission, input: { messageId: string; expectedRevision: number; expectedPrivacyEpoch: number }) {
+      admission.assertCurrent();
+      const result = await runtime.readMailReplyText(admission, input);
+      admission.assertCurrent();
+      const value = result.value.snapshot;
+      return serializeWorkflowRead({ ...readEnvelope(result), status: result.value.status, ...(value ? { snapshot: {
+        messageId: value.messageId, accountId: value.accountId, connectionGeneration: value.connectionGeneration, sourceDigest: value.sourceDigest,
+        checkedAt: value.checkedAt, ...(value.text === undefined ? {} : { text: value.text }), ...(value.textDigest ? { textDigest: value.textDigest } : {}),
+        bytes: value.bytes, extractionVersion: value.extractionVersion, representation: value.representation, completeness: value.completeness,
+        omissionReasons: value.omissionReasons,
+      } } : {}) });
+    },
+    async readProposalReview(admission: WorkspaceHttpAdmission, input: { proposalId: string; expectedRevision: number; expectedPrivacyEpoch: number }) {
+      admission.assertCurrent();
+      const value = await runtime.readProposalForReview(admission, input);
+      admission.assertCurrent();
+      return serializeWorkflowRead({ ...readEnvelope(value), ...(value.value ? { proposal: safeProposal(value.value) } : {}) });
+    },
+    async readDispatchReview(admission: WorkspaceHttpAdmission, input: { recordId: string; expectedRevision: number; expectedPrivacyEpoch: number }) {
+      admission.assertCurrent();
+      const value = await runtime.readDispatchForReview(admission, input);
+      admission.assertCurrent();
+      const { record, recordVersion } = value.value;
+      return serializeWorkflowRead({ ...readEnvelope(value), record: { id: record.id, proposalId: record.proposalId, accountId: record.accountId,
+        account: { provider: record.account.provider, displayName: record.account.displayName, email: record.account.email },
+        ...(record.calendar ? { calendar: { localId: record.calendar.localId, providerId: record.calendar.providerId, name: record.calendar.name } } : {}),
+        operation: record.operation, title: record.title, body: record.body,
+        payload: record.payload.kind === 'email' ? { kind: 'email', to: record.payload.email.to, cc: record.payload.email.cc, bcc: record.payload.email.bcc,
+          subject: record.payload.email.subject, text: record.payload.email.text, attachments: record.payload.email.attachments.map(({ fileName, mimeType, sizeBytes }) => ({ fileName, mimeType, sizeBytes })) }
+          : { kind: 'event', title: record.payload.event.title, description: record.payload.event.description, start: record.payload.event.start,
+            end: record.payload.event.end, timeZone: record.payload.event.timeZone, attendees: record.payload.event.attendees, invitePolicy: record.payload.event.invitePolicy },
+        outcome: record.outcome, dispatchStartedAt: record.dispatchStartedAt, ...(record.outcomeAt ? { outcomeAt: record.outcomeAt } : {}),
+        ...(record.remoteId ? { remoteId: record.remoteId } : {}), ...(record.rejectionCode ? { rejectionCode: record.rejectionCode } : {}),
+        reconciliations: record.reconciliations.map((item) => ({ disposition: item.disposition, at: item.at, note: item.note, ...(item.remoteId ? { remoteId: item.remoteId } : {}) })) },
+        recordVersion });
+    },
+    async readMailReplyBatchReview(admission: WorkspaceHttpAdmission, input: { planId: string; jobId: string; accountId: string; expectedConnectionGeneration: number; expectedRevision: number; expectedPrivacyEpoch: number }) {
+      admission.assertCurrent();
+      const value = await runtime.readMailReplyBatchReview(admission, input);
+      admission.assertCurrent();
+      return serializeWorkflowRead({ ...readEnvelope(value), ...(value.value ? { plan: { ...value.value.plan, accountId: value.value.accountId,
+        connectionGeneration: value.value.connectionGeneration } } : {}) });
+    },
     inspectCommand(admission: WorkspaceHttpAdmission, commandId: string): JsonValue {
       return serializeCommandResponse(inspectWorkspaceCommand(runtime, admission, commandId));
     },
@@ -48,6 +101,29 @@ export function createWorkspaceHttpApi(runtime: OwnedWorkspaceRuntime): Workspac
 
 function serializeKnowledgeRead(value: Awaited<ReturnType<KnowledgeHttpApi['readKnowledgeSourceChoices']>> | Awaited<ReturnType<KnowledgeHttpApi['readKnowledgeSuggestionReview']>>): JsonValue {
   return JSON.parse(JSON.stringify(value)) as JsonValue;
+}
+
+function serializeWorkflowRead(value: unknown): JsonValue { return JSON.parse(JSON.stringify(value)) as JsonValue; }
+function readEnvelope(value: { workspaceId: string; privacyEpoch: number; revision: number }) {
+  return { schemaVersion: 1 as const, workspaceId: value.workspaceId, privacyEpoch: value.privacyEpoch, revision: value.revision };
+}
+function safeMailSource(value: import('../core').MailReplySourceSnapshot) {
+  return { accountId: value.accountId, connectionGeneration: value.connectionGeneration, localMessageId: value.localMessageId,
+    providerMessageId: value.providerMessageId, idFormat: value.idFormat, ...(value.threadId ? { threadId: value.threadId } : {}),
+    internetMessageId: value.internetMessageId, subject: value.subject, ...(value.from ? { from: value.from } : {}),
+    ...(value.senderEmail ? { senderEmail: value.senderEmail } : {}), ...(value.replyTo ? { replyTo: value.replyTo } : {}),
+    ...(value.to ? { to: value.to } : {}), ...(value.cc ? { cc: value.cc } : {}), ...(value.snippet ? { snippet: value.snippet } : {}),
+    observedAt: value.observedAt, sourceDigest: value.sourceDigest };
+}
+function safeProposal(value: import('../core').Proposal) {
+  return { id: value.id, kind: value.kind, title: value.title, body: value.body, status: value.status, revision: value.revision,
+    ...(value.approvedRevision !== undefined ? { approvedRevision: value.approvedRevision } : {}), ...(value.lastError ? { lastError: value.lastError } : {}),
+    ...(value.accountId ? { accountId: value.accountId } : {}), recipients: value.recipients, ...(value.calendarId ? { calendarId: value.calendarId } : {}),
+    ...(value.dueAt ? { dueAt: value.dueAt } : {}), ...(value.email ? { email: { operation: value.email.operation, to: value.email.to, cc: value.email.cc,
+      bcc: value.email.bcc, subject: value.email.subject, text: value.email.text, attachments: value.email.attachments.map(({ fileName, mimeType, sizeBytes }) => ({ fileName, mimeType, sizeBytes })) } } : {}),
+    ...(value.event ? { event: value.event } : {}), ...(value.remoteOperation ? { remoteOperation: value.remoteOperation } : {}),
+    ...(value.remoteId ? { remoteId: value.remoteId } : {}), ...(value.remoteAcceptedAt ? { remoteAcceptedAt: value.remoteAcceptedAt } : {}),
+    ...(value.provenance?.version === 2 ? { sourceDigest: value.provenance.sourceDigest } : {}) };
 }
 
 function serializeSnapshot(snapshot: WorkspaceSnapshotDTO): JsonValue {

@@ -1637,6 +1637,8 @@ export class AppControllerImpl implements AppController {
   }>();
   private readonly mailReplyBatchReviewPlans = new Map<string, {
     readonly planId: string; readonly jobId: string; readonly messageId: string; readonly mode: 'reply' | 'reply_all';
+    readonly accountId: string; readonly connectionGeneration: number;
+    readonly publicPlan: MailReplyBatchReviewPlan;
     readonly operation: 'draft' | 'send';
     readonly sourceDigest: string; readonly bodyDigest: string; readonly bindingDigest: string; readonly resultSha256: string;
     readonly settingsFingerprint: string; readonly expiresAt: string;
@@ -5613,7 +5615,7 @@ export class AppControllerImpl implements AppController {
     finally { this.activeBatchNoteOperations.delete(noteId); }
   }
 
-  async submitMailReplyBatch(input: Omit<MailReplyTextGenerationInput, 'forceRefresh'>): Promise<AssistantBatchJobDTO> {
+  async submitMailReplyBatch(input: Omit<MailReplyTextGenerationInput, 'forceRefresh'>, commandFence?: { accountId: string; expectedConnectionGeneration: number }): Promise<AssistantBatchJobDTO> {
     if (!input || !['reply', 'reply_all'].includes(input.mode) || !Number.isSafeInteger(input.composerRevision) || input.composerRevision < 0 ||
         typeof input.messageId !== 'string' || !input.messageId || input.messageId.length > 256 || typeof input.sourceDigest !== 'string' ||
         typeof input.textDigest !== 'string' || !Array.isArray(input.to) || !Array.isArray(input.cc) || typeof input.brief !== 'string' ||
@@ -5629,11 +5631,17 @@ export class AppControllerImpl implements AppController {
       ...(input.contextSelectionIds ? { contextSelectionIds: Object.freeze([...input.contextSelectionIds]) } : {}),
       ...(input.contextExcerptSelectionIds ? { contextExcerptSelectionIds: Object.freeze([...input.contextExcerptSelectionIds]) } : {}) });
     this.activeMailReplyBatchSubmissions.set(capturedInput.messageId, undefined);
-    try { return await this.submitMailReplyBatchCaptured(capturedInput); }
+    try { return await this.submitMailReplyBatchCaptured(capturedInput, commandFence); }
     finally { this.activeMailReplyBatchSubmissions.delete(capturedInput.messageId); }
   }
 
-  private async submitMailReplyBatchCaptured(input: Omit<MailReplyTextGenerationInput, 'forceRefresh' | 'to' | 'cc'> & { to: readonly string[]; cc: readonly string[] }): Promise<AssistantBatchJobDTO> {
+  async submitMailReplyBatchForCommand(input: Omit<MailReplyTextGenerationInput, 'forceRefresh'> & { accountId: string; expectedConnectionGeneration: number }): Promise<AssistantBatchJobDTO> {
+    const { accountId, expectedConnectionGeneration, ...request } = input;
+    return this.submitMailReplyBatch(request, { accountId, expectedConnectionGeneration });
+  }
+
+  private async submitMailReplyBatchCaptured(input: Omit<MailReplyTextGenerationInput, 'forceRefresh' | 'to' | 'cc'> & { to: readonly string[]; cc: readonly string[] },
+    commandFence?: { accountId: string; expectedConnectionGeneration: number }): Promise<AssistantBatchJobDTO> {
     await this.load();
     if (this.assistantBatchLedgerMalformed || !this.loaded || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired) {
       throw new Error('Refresh local data before submitting a mail reply Batch request.');
@@ -5656,6 +5664,9 @@ export class AppControllerImpl implements AppController {
       const body = draft.selectedMailTexts.find((item) => item.messageId === input.messageId);
       const message = draft.mailbox.find((item) => item.id === input.messageId);
       const account = message && draft.accounts.find((item) => item.id === message.accountId);
+      if (commandFence && (!account || account.id !== commandFence.accountId || (account.connectionGeneration ?? 0) !== commandFence.expectedConnectionGeneration)) {
+        throw new Error('Account connection changed. Refresh the mailbox before submitting this Batch request.');
+      }
       if (!body || !message || !account || body.textDigest !== input.textDigest || body.sourceDigest !== input.sourceDigest ||
           body.accountId !== account.id || body.identityKey !== identityKey(account) || !sameAccountIdentity(body.identity, account.identity) ||
           body.connectionGeneration !== (account.connectionGeneration ?? 0) || body.providerMessageId !== message.providerMessageId ||
@@ -6211,10 +6222,32 @@ export class AppControllerImpl implements AppController {
       this.pruneMailReplyBatchReviewPlans();
       for (const [id, plan] of this.mailReplyBatchReviewPlans) if (plan.jobId === jobId) this.mailReplyBatchReviewPlans.delete(id);
       this.mailReplyBatchReviewPlans.set(publicPlan.planId, Object.freeze({ planId: publicPlan.planId, jobId, messageId: binding.messageId,
+        accountId: binding.source.accountId, connectionGeneration: binding.source.connectionGeneration,
+        publicPlan,
         mode: binding.mode, operation, sourceDigest: binding.source.sourceDigest, bodyDigest, bindingDigest, resultSha256: job.resultSha256,
         settingsFingerprint: binding.settingsFingerprint, expiresAt, bootstrapGeneration: generation, ...(epoch ? { privacyEpoch: epoch } : {}), preparedAtMs }));
       return publicPlan;
     } finally { this.activeMailReplyBatchReviews.delete(jobId); }
+  }
+
+  async reviewMailReplyBatchForCommand(input: { jobId: string; accountId: string; expectedConnectionGeneration: number; operation: 'draft' | 'send' }): Promise<MailReplyBatchReviewPlan> {
+    await this.load();
+    const job = this.assistantBatchLedger.jobs.find((item) => item.id === input.jobId);
+    const account = this.snapshot.accounts.find((item) => item.id === input.accountId);
+    if (!job || !isOpenRouterMailReplyContentJob(job) || job.mailReplyBinding.source.accountId !== input.accountId ||
+        job.mailReplyBinding.source.connectionGeneration !== input.expectedConnectionGeneration || !account || !account.connected || account.authStatus !== 'connected' ||
+        (account.connectionGeneration ?? 0) !== input.expectedConnectionGeneration) throw new Error('Account connection changed. Refresh the mailbox before reviewing this Batch result.');
+    return this.reviewMailReplyBatch(input.jobId, { operation: input.operation });
+  }
+
+  getMailReplyBatchReviewForCommand(input: { planId: string; jobId: string; accountId: string; expectedConnectionGeneration: number }): import('../core').MailReplyBatchReviewBoundPlan | undefined {
+    this.pruneMailReplyBatchReviewPlans();
+    const plan = this.mailReplyBatchReviewPlans.get(input.planId);
+    const account = this.snapshot.accounts.find((item) => item.id === input.accountId);
+    if (!plan || !account || !account.connected || account.authStatus !== 'connected' || plan.jobId !== input.jobId || plan.accountId !== input.accountId ||
+        plan.connectionGeneration !== input.expectedConnectionGeneration || (account.connectionGeneration ?? 0) !== input.expectedConnectionGeneration ||
+        plan.bootstrapGeneration !== this.bootstrapGeneration || plan.privacyEpoch !== this.integration.privacySession?.epoch) return undefined;
+    return Object.freeze({ plan: plan.publicPlan, accountId: plan.accountId, connectionGeneration: plan.connectionGeneration });
   }
 
   private async assertMailReplyBatchInputsCurrent(state: AppState, binding: OpenRouterMailReplyBinding,
@@ -6265,11 +6298,14 @@ export class AppControllerImpl implements AppController {
     if (typeof planId === 'string') this.mailReplyBatchReviewPlans.delete(planId);
   }
 
-  async activateMailReplyBatch(input: { planId: string }): Promise<{ kind: 'created'; jobId: string; proposalId: string }> {
+  async activateMailReplyBatch(input: { planId: string }, commandFence?: { jobId: string; accountId: string; expectedConnectionGeneration: number }): Promise<{ kind: 'created'; jobId: string; proposalId: string }> {
     this.pruneMailReplyBatchReviewPlans();
     const planId = input?.planId;
     const plan = typeof planId === 'string' ? this.mailReplyBatchReviewPlans.get(planId) : undefined;
     if (!plan) throw new Error('This reply review expired or was already used. Review the saved result again.');
+    if (commandFence && (plan.jobId !== commandFence.jobId || plan.accountId !== commandFence.accountId || plan.connectionGeneration !== commandFence.expectedConnectionGeneration)) {
+      throw new Error('This reply review belongs to a different mailbox connection. Review the saved result again.');
+    }
     this.mailReplyBatchReviewPlans.delete(planId);
     const at = Date.now();
     if (at < plan.preparedAtMs || at >= Date.parse(plan.expiresAt) ||
@@ -6312,6 +6348,14 @@ export class AppControllerImpl implements AppController {
         if (!currentJob || !isOpenRouterMailReplyContentJob(currentJob) || currentJob.status !== 'completed' || currentJob.proposalId ||
             currentJob.mailReplyActivationOperation !== undefined || currentJob.resultSha256 !== plan.resultSha256 || currentJob.mailReplyBinding !== job.mailReplyBinding) throw new Error('This Batch result was already consumed or changed.');
         await this.assertMailReplyBatchJobIntegrity(currentJob, true);
+        if (commandFence) {
+          const currentAccount = state.accounts.find((item) => item.id === commandFence.accountId);
+          if (!currentAccount || !currentAccount.connected || currentAccount.authStatus !== 'connected' ||
+              (currentAccount.connectionGeneration ?? 0) !== commandFence.expectedConnectionGeneration || currentJob.mailReplyBinding.source.accountId !== commandFence.accountId ||
+              currentJob.mailReplyBinding.source.connectionGeneration !== commandFence.expectedConnectionGeneration) {
+            throw new Error('Account connection changed before Batch activation. Review the mailbox again.');
+          }
+        }
         if (currentJob.mailReplyBinding.version === 2) this.requireCurrentMailReplyContextProof(state, currentJob);
         await this.assertMailReplyBatchInputsCurrent(state, job.mailReplyBinding, latestSource.source!, reviewedBody, job);
         const queuedProof = currentJob.mailReplyBinding.version === 2 ? this.requireCurrentMailReplyContextProof(state, currentJob) : undefined;
@@ -6337,6 +6381,25 @@ export class AppControllerImpl implements AppController {
           this.integration.privacySession?.epoch !== plan.privacyEpoch) throw new Error('This reply review expired while activation was saving. Review the saved result again.');
       return result;
     } finally { this.activeMailReplyBatchReviews.delete(plan.jobId); }
+  }
+
+  async activateMailReplyBatchForCommand(input: { planId: string; jobId: string; accountId: string; expectedConnectionGeneration: number }): Promise<{ kind: 'created'; jobId: string; proposalId: string }> {
+    return this.activateMailReplyBatch({ planId: input.planId }, input);
+  }
+
+  async checkMailReplyBatchForCommand(input: { jobId: string; accountId: string; expectedConnectionGeneration: number }): Promise<AssistantBatchJobDTO> {
+    await this.load();
+    const job = this.assistantBatchLedger.jobs.find((item) => item.id === input.jobId);
+    const account = this.snapshot.accounts.find((item) => item.id === input.accountId);
+    if (!job || !isOpenRouterMailReplyContentJob(job) || job.mailReplyBinding.source.accountId !== input.accountId ||
+        job.mailReplyBinding.source.connectionGeneration !== input.expectedConnectionGeneration || !account || !account.connected || account.authStatus !== 'connected' ||
+        (account.connectionGeneration ?? 0) !== input.expectedConnectionGeneration) throw new Error('Account connection changed. Refresh the mailbox before checking this Batch result.');
+    const result = await this.refreshAssistantBatch(input.jobId);
+    const currentAccount = this.snapshot.accounts.find((item) => item.id === input.accountId);
+    if (!currentAccount || !currentAccount.connected || currentAccount.authStatus !== 'connected' || (currentAccount.connectionGeneration ?? 0) !== input.expectedConnectionGeneration) {
+      throw new Error('Account connection changed while checking this Batch result.');
+    }
+    return result;
   }
 
   async deleteMailReplyBatch(jobId: string): Promise<void> {
@@ -8730,12 +8793,44 @@ export class AppControllerImpl implements AppController {
     });
   }
 
-  async editProposal(id: string, patch: ProposalPatch, options?: { expectedRevision: number }): Promise<Proposal> {
+  async editProposalForCommand(id: string, input: { expectedRevision: number; accountId: string; expectedConnectionGeneration: number; edit:
+    | { kind: 'email'; operation: 'draft' | 'send'; to: readonly string[]; cc: readonly string[]; bcc: readonly string[]; subject: string; text: string }
+    | { kind: 'event'; calendarId: string; title: string; description: string; start: string; end: string; timeZone: string; attendees: readonly string[]; invitePolicy: 'send' | 'none' } }): Promise<Proposal> {
+    await this.load();
+    const edit = input.edit;
+    const existing = this.snapshot.proposals.find((item) => item.id === id);
+    if (!existing || existing.revision !== input.expectedRevision || existing.accountId !== input.accountId) throw new Error('This proposal or account changed. Reload the current proposal before editing.');
+    const attachments = existing.email?.attachments ?? [];
+    if (edit.kind === 'email') {
+      if (existing.kind !== 'email') throw new Error('This proposal is not an email.');
+      const email: NonNullable<Proposal['email']> = { operation: edit.operation, to: [...edit.to], cc: [...edit.cc], bcc: [...edit.bcc],
+        subject: edit.subject, text: edit.text, attachments: clone(attachments), ...(existing.email?.reply ? { reply: clone(existing.email.reply) } : {}) };
+      return this.editProposal(id, { title: email.subject, body: email.text, recipients: [...email.to], email },
+        { expectedRevision: input.expectedRevision, accountId: input.accountId, expectedConnectionGeneration: input.expectedConnectionGeneration });
+    }
+    if (existing.kind !== 'event') throw new Error('This proposal is not a calendar event.');
+    const calendar = this.snapshot.calendars.find((item) => item.id === edit.calendarId && item.accountId === input.accountId && item.connected && item.writable && item.providerId);
+    if (!calendar) throw new Error('Choose a connected, writable calendar discovered for this account.');
+    const event: NonNullable<Proposal['event']> = { title: edit.title, description: edit.description, start: edit.start, end: edit.end,
+      timeZone: edit.timeZone, attendees: [...edit.attendees], invitePolicy: edit.invitePolicy };
+    return this.editProposal(id, { title: edit.title, body: edit.description, accountId: input.accountId, calendarId: calendar.id, event,
+      eventDestination: { kind: 'remote_calendar', accountId: input.accountId, calendarId: calendar.id } },
+      { expectedRevision: input.expectedRevision, accountId: input.accountId, expectedConnectionGeneration: input.expectedConnectionGeneration });
+  }
+
+  async editProposal(id: string, patch: ProposalPatch, options?: { expectedRevision: number; accountId?: string; expectedConnectionGeneration?: number }): Promise<Proposal> {
     const result = await this.mutate(async (state) => {
       const proposal = this.proposal(state, id);
       if (proposal.dispatchRecoveryRetired) throw new Error('This external action was retired during dispatch recovery and is permanently read-only.');
       this.assertDispatchRecoveryProposalAllowed(proposal);
       if (options && proposal.revision !== options.expectedRevision) throw new Error('This proposal changed. Reopen the current version before editing.');
+      if (options?.accountId !== undefined) {
+        const account = state.accounts.find((item) => item.id === options.accountId);
+        if (!account || !account.connected || account.authStatus !== 'connected' || (account.connectionGeneration ?? 0) !== options.expectedConnectionGeneration) {
+          throw new Error('Account connection changed. Refresh the account before editing this proposal.');
+        }
+        if (proposal.accountId !== account.id) throw new Error('This proposal is bound to a different account. Create a new proposal to change its source account.');
+      }
       if (['executed', 'accepted', 'simulated', 'dispatching', 'unknown', 'dismissed'].includes(proposal.status)) throw new Error('This proposal can no longer be edited.');
       if (proposal.kind === 'reminder') {
         const revision = proposal.notificationRevision ?? proposal.revision;
@@ -8892,6 +8987,22 @@ export class AppControllerImpl implements AppController {
   }
 
   async executeProposal(id: string, options?: { expectedRevision: number }): Promise<Proposal> {
+    const result = await this.executeProposalInternal(id, options, false);
+    if (result.kind === 'invalidated' || result.kind === 'settled') throw new Error('This proposal changed and must be reviewed again before execution.');
+    return result;
+  }
+
+  async executeProposalForCommand(id: string, options: { expectedRevision: number }): Promise<import('../core').ProposalExecutionForCommandResult> {
+    await this.load();
+    const before = this.snapshot.proposals.find((item) => item.id === id);
+    if (!before) throw new Error('Proposal was not found.');
+    if (before.kind === 'event' && before.eventDestination?.kind === 'device_calendar') throw new Error('Device calendar actions are unavailable in cloud workspaces.');
+    const result = await this.executeProposalInternal(id, options, true);
+    if (result.kind === 'invalidated' || result.kind === 'settled') return result;
+    throw new Error('The explicit execution result was not durably checkpointed. Inspect the command before continuing.');
+  }
+
+  private async executeProposalInternal(id: string, options: { expectedRevision: number } | undefined, commandMode: boolean): Promise<Proposal | import('../core').ProposalExecutionForCommandResult> {
     await this.load();
     const beforeExecute = this.snapshot.proposals.find((item) => item.id === id);
     if (options && beforeExecute?.revision !== options.expectedRevision) throw new Error('This proposal changed. Reopen the current version before continuing.');
@@ -8919,11 +9030,11 @@ export class AppControllerImpl implements AppController {
         if (error instanceof MailReplyContextRefreshRequiredError) {
           proposal.requiresRebuild = false;
           addActivity(state, 'error', 'The selected conversation-source review expired before execution. Refresh those sources and approve this saved reply again.', { proposalId: proposal.id, noteId: proposal.noteId }, this.newId);
-          return { proposal, dependencyProjection: '', invalidated: 'The selected conversation-source review expired. Refresh the sources and approve this saved reply again.' };
+          return { proposal, dependencyProjection: '', invalidated: 'The selected conversation-source review expired. Refresh the sources and approve this saved reply again.', invalidatedReason: 'reply_context_expired' as const };
         }
         proposal.requiresRebuild = true;
         addActivity(state, 'error', 'An approved suggestion was invalidated because its source context changed. Run Assist again before reviewing it.', { proposalId: proposal.id, noteId: proposal.noteId }, this.newId);
-        return { proposal, dependencyProjection: '', invalidated: error instanceof Error ? error.message : 'The source context changed.' };
+        return { proposal, dependencyProjection: '', invalidated: error instanceof Error ? error.message : 'The source context changed.', invalidatedReason: 'source_changed' as const };
       }
       if (proposal.kind === 'reminder') {
         if (!proposal.dueAt) throw new Error('Add a date and time before saving this reminder.');
@@ -9002,7 +9113,10 @@ export class AppControllerImpl implements AppController {
       }
       return { proposal, dependencyProjection, dispatchRecord, capturedAccount: canDispatch && account ? account : undefined };
     });
-    if ('invalidated' in claim) throw new Error(claim.invalidated);
+    if ('invalidated' in claim) {
+      if (commandMode) return Object.freeze({ kind: 'invalidated', proposal: clone(claim.proposal), reason: claim.invalidatedReason ?? 'source_changed' });
+      throw new Error(claim.invalidated);
+    }
     const claimed = claim.proposal;
     const approvedDependencyProjection = claim.dependencyProjection;
     const frozenRecord = claim.dispatchRecord;
@@ -9206,6 +9320,7 @@ export class AppControllerImpl implements AppController {
     }
 
     let committed: Proposal | undefined;
+    let commandExecution: import('../core').ProposalExecutionForCommandResult | undefined;
     try {
       committed = await this.mutate((state) => {
         let persistedRecord: DispatchRecord | undefined;
@@ -9235,14 +9350,27 @@ export class AppControllerImpl implements AppController {
           if (persistedRecord.outcome === 'rejected' && persistedRecord.rejectionCode === 'provider_rejected') result.message = `The provider rejected the ${persistedRecord.operation} request. Review the destination and approve a fresh attempt if needed.`;
         }
         const proposal = state.proposals.find((item) => item.id === id);
+        const captureCommandExecution = (projectedProposal: Proposal): void => {
+          if (!commandMode) return;
+          commandExecution = Object.freeze({ kind: 'settled', proposal: clone(projectedProposal),
+            ...(persistedRecord && persistedRecord.outcome !== 'pending' ? { dispatch: Object.freeze({ id: persistedRecord.id,
+              operation: persistedRecord.operation, outcome: persistedRecord.outcome,
+              ...(persistedRecord.outcomeAt ? { outcomeAt: persistedRecord.outcomeAt } : {}), ...(persistedRecord.remoteId ? { remoteId: persistedRecord.remoteId } : {}) }) } : {}),
+            ...(result.status === 'simulated' ? { simulated: true as const } : {}),
+            ...(!persistedRecord && result.status !== 'simulated' ? { localOutcome: result.status === 'executed' ? 'executed' as const : 'failed' as const } : {}) });
+        };
         if (!proposal) {
           if (!persistedRecord) throw new Error('The action was removed before completion.');
+          captureCommandExecution({ ...claimed, status: result.status, dispatchRecordId: persistedRecord.id, remoteOperation: persistedRecord.operation,
+            remoteId: persistedRecord.remoteId, remoteAcceptedAt: persistedRecord.outcome === 'accepted' ? persistedRecord.outcomeAt : undefined,
+            lastError: result.status === 'failed' || result.status === 'unknown' ? result.message : undefined });
           addActivity(state, result.status === 'failed' || result.status === 'unknown' ? 'error' : 'local_action',
             `Dispatch receipt saved after the proposal was removed: ${result.message}`, { proposalId: frozenRecord!.proposalId }, this.newId);
           return undefined;
         }
         if (proposal.status !== 'dispatching') {
           if (!persistedRecord) throw new Error('Action state changed while execution was in progress.');
+          captureCommandExecution(proposal);
           addActivity(state, 'error', `Dispatch receipt saved while preserving the proposal’s newer state: ${result.message}`, { proposalId: frozenRecord!.proposalId, noteId: proposal.noteId }, this.newId);
           return proposal;
         }
@@ -9265,11 +9393,17 @@ export class AppControllerImpl implements AppController {
           markTaskAnalysesStale(state, proposal.id);
         }
         addActivity(state, result.status === 'simulated' ? 'simulation' : result.status === 'failed' || result.status === 'unknown' ? 'error' : 'local_action', result.message, { proposalId: id, noteId: proposal.noteId }, this.newId);
+        captureCommandExecution(proposal);
         return proposal;
       });
     } catch (error) {
       if (frozenRecord) this.activeRemoteDispatchOperations.delete(frozenRecord.id);
       throw error;
+    }
+    if (commandMode) {
+      if (!commandExecution) throw new Error('The explicit execution result was not durably checkpointed. Inspect the command before continuing.');
+      if (frozenRecord) this.activeRemoteDispatchOperations.delete(frozenRecord.id);
+      return commandExecution;
     }
     if (!committed && frozenRecord) {
       this.activeRemoteDispatchOperations.delete(frozenRecord.id);
@@ -9325,9 +9459,10 @@ export class AppControllerImpl implements AppController {
       duplicateKey: record.duplicateKey, payloadDigest: record.payloadDigest, target: record.target, payload: record.payload, claimAt: record.claimAt });
   }
 
-  async dismissProposal(id: string): Promise<Proposal> {
+  async dismissProposal(id: string, options?: { expectedRevision: number }): Promise<Proposal> {
     return this.mutate((state) => {
       const proposal = this.proposal(state, id);
+      if (options && proposal.revision !== options.expectedRevision) throw new Error('This proposal changed. Reopen the current version before dismissing it.');
       if (proposal.dispatchRecoveryRetired) throw new Error('This external action was retired during dispatch recovery and is permanently read-only.');
       if (['dispatching', 'unknown', 'executed', 'accepted', 'simulated'].includes(proposal.status)) throw new Error('This proposal cannot be dismissed while or after execution.');
       proposal.status = 'dismissed';
@@ -9351,6 +9486,37 @@ export class AppControllerImpl implements AppController {
       state.dispatchRecords[index] = updated;
       addActivity(state, 'local_action', 'Added a local reconciliation note. Provider outcome remains unchanged.', { proposalId: current.proposalId }, this.newId);
       return updated;
+    });
+  }
+
+  private async dispatchObservationVersion(record: DispatchRecord): Promise<string> {
+    const projection = { id: record.id, outcome: record.outcome, outcomeAt: record.outcomeAt ?? null,
+      reconciliations: record.reconciliations.map((item) => ({ id: item.id, disposition: item.disposition, at: item.at, note: item.note, remoteId: item.remoteId ?? null })) };
+    return this.crypto.sha256(stableJson(projection));
+  }
+
+  async getDispatchRecordForCommand(recordId: string): Promise<{ record: DispatchRecord; recordVersion: string }> {
+    await this.load();
+    const record = this.snapshot.dispatchRecords.find((item) => item.id === recordId);
+    if (!record) throw new Error('Dispatch history record was not found.');
+    return Object.freeze({ record: clone(record), recordVersion: await this.dispatchObservationVersion(record) });
+  }
+
+  async reconcileDispatchForCommand(recordId: string, input: { expectedRecordVersion: string; disposition: DispatchReconciliation; note: string; remoteId?: string }): Promise<{ record: DispatchRecord; recordVersion: string }> {
+    return this.mutate(async (state) => {
+      const index = state.dispatchRecords.findIndex((record) => record.id === recordId);
+      if (index < 0) throw new Error('Dispatch history record was not found.');
+      const current = state.dispatchRecords[index];
+      const currentVersion = await this.dispatchObservationVersion(current);
+      if (currentVersion !== input.expectedRecordVersion) throw new Error('Dispatch history changed. Reload the observed record before reconciling it.');
+      const updated = appendDispatchReconciliation(current, {
+        id: this.newId(), disposition: input.disposition,
+        at: new Date(Math.max(Date.now(), current.outcomeAt ? Date.parse(current.outcomeAt) : 0)).toISOString(),
+        note: input.note, ...(input.remoteId ? { remoteId: input.remoteId } : {}),
+      });
+      state.dispatchRecords[index] = updated;
+      addActivity(state, 'local_action', 'Added a local reconciliation note. Provider outcome remains unchanged.', { proposalId: current.proposalId }, this.newId);
+      return { record: clone(updated), recordVersion: await this.dispatchObservationVersion(updated) };
     });
   }
 
@@ -11136,12 +11302,24 @@ export class AppControllerImpl implements AppController {
     }
   }
 
-  async disconnectAccount(id: string): Promise<Account> {
-    this.syncGeneration.set(id, (this.syncGeneration.get(id) ?? 0) + 1);
-    this.syncAbortControllers.get(id)?.abort();
-    const account = await this.mutate((state) => {
+  async disconnectAccount(id: string, options?: { expectedConnectionGeneration?: number }): Promise<Account> {
+    const result = await this.disconnectAccountInternal(id, options?.expectedConnectionGeneration);
+    if (result.retryFailed) throw new Error('Account was disconnected, but saved credential cleanup is pending.');
+    return result.account;
+  }
+
+  async disconnectAccountForCommand(id: string, options: { expectedConnectionGeneration: number }): Promise<{ account: Account; cleanup: 'complete' | 'pending' }> {
+    const result = await this.disconnectAccountInternal(id, options.expectedConnectionGeneration);
+    return Object.freeze({ account: result.account, cleanup: result.cleanup });
+  }
+
+  private async disconnectAccountInternal(id: string, expectedConnectionGeneration?: number): Promise<{ account: Account; cleanup: 'complete' | 'pending'; retryFailed: boolean }> {
+    const disconnected = await this.mutate((state) => {
       const current = state.accounts.find((item) => item.id === id);
       if (!current) throw new Error('Account was not found.');
+      if (expectedConnectionGeneration !== undefined && (current.connectionGeneration ?? 0) !== expectedConnectionGeneration) {
+        throw new Error('Account connection changed. Refresh the account before continuing.');
+      }
       if (current.identity) {
         const priorIdentity = encodeURIComponent(identityKey(current));
         markAnalysesStale(state, [], [`mail:${priorIdentity}:`, `calendar:${priorIdentity}:`, `calendar-event:${priorIdentity}:`]);
@@ -11163,18 +11341,26 @@ export class AppControllerImpl implements AppController {
       interruptMailLanes(sync, 'Account was disconnected during mail sync. Reconnect and continue explicitly.');
       state.syncStates[id] = sync;
       addActivity(state, 'local_action', `${current.displayName || current.email} was disconnected. Pending approvals were cleared.`, this.newId);
-      return current;
+      return { account: current, oldTokenRef };
     });
+    this.syncGeneration.set(id, (this.syncGeneration.get(id) ?? 0) + 1);
+    this.syncAbortControllers.get(id)?.abort();
     this.clearMailReplyBatchReviewPlansForAccount(id);
-    await this.retryCredentialCleanup();
-    return account;
+    let retryFailed = false;
+    try { await this.retryCredentialCleanup(); } catch { retryFailed = true; }
+    const cleanup = disconnected.oldTokenRef && this.snapshot.pendingCredentialCleanup.some((item) => item.tokenRef === disconnected.oldTokenRef)
+      ? 'pending' : 'complete';
+    return Object.freeze({ account: clone(disconnected.account), cleanup, retryFailed });
   }
 
-  async syncAccount(id: string, options: { continue?: boolean } = {}): Promise<AccountSyncState> {
-    const active = this.syncJobs.get(id);
-    if (active) return active;
+  async syncAccount(id: string, options: { continue?: boolean; expectedConnectionGeneration?: number } = {}): Promise<AccountSyncState> {
     await this.load();
     const configured = this.snapshot.accounts.find((item) => item.id === id);
+    if (!configured || options.expectedConnectionGeneration !== undefined && (configured.connectionGeneration ?? 0) !== options.expectedConnectionGeneration) {
+      throw new Error('Account connection changed. Refresh the account before continuing.');
+    }
+    const active = this.syncJobs.get(id);
+    if (active) return active;
     if (configured?.capabilities?.includes('mail.read') && !configured.capabilities.includes('calendar.read')) {
       throw new Error('This account has mailbox access. Use Refresh inbox or Continue backfill; this control only syncs calendars.');
     }
@@ -11183,6 +11369,11 @@ export class AppControllerImpl implements AppController {
     const job = this.runSyncAccount(id, options).finally(() => { this.syncJobs.delete(id); this.busySyncAccounts.delete(id); });
     this.syncJobs.set(id, job);
     return job;
+  }
+
+  async syncCalendarsForCommand(accountId: string, options: { expectedConnectionGeneration: number; continue?: boolean }): Promise<{ state: AccountSyncState; connectionGeneration: number }> {
+    const state = await this.syncAccount(accountId, options);
+    return Object.freeze({ state: clone(state), connectionGeneration: options.expectedConnectionGeneration });
   }
 
   private requireConfirmedCaptureTimeZone(note: Note): void {
@@ -11199,11 +11390,21 @@ export class AppControllerImpl implements AppController {
     return clone(result);
   }
 
-  async createMailReplyProposal(input: { messageId: string; mode: 'reply' | 'reply_all'; sourceDigest: string; text: string; to?: string[]; cc?: string[] }): Promise<Proposal> {
+  async createMailReplyProposalForCommand(input: { messageId: string; accountId: string; expectedConnectionGeneration: number; mode: 'reply' | 'reply_all'; sourceDigest: string; text: string; to: readonly string[]; cc: readonly string[] }): Promise<Proposal> {
+    return this.createMailReplyProposal({ ...input, to: [...input.to], cc: [...input.cc] });
+  }
+
+  async createMailReplyProposal(input: { messageId: string; mode: 'reply' | 'reply_all'; sourceDigest: string; text: string; to?: string[]; cc?: string[];
+    accountId?: string; expectedConnectionGeneration?: number }): Promise<Proposal> {
     return this.mutate(async (state) => {
       if (!input || !['reply', 'reply_all'].includes(input.mode) || typeof input.sourceDigest !== 'string' || !/^[a-f\d]{64}$/i.test(input.sourceDigest)) throw new Error('Reply mode or source digest is invalid. Reopen the message and try again.');
       const result = await this.currentMailReplySource(state, input.messageId);
       if (result.status !== 'current' || !result.source || !result.defaults) throw new Error('Refresh this message before creating a reply draft.');
+      if (input.accountId !== undefined) {
+        const sourceAccount = state.accounts.find((item) => item.id === input.accountId);
+        if (!sourceAccount || result.source.accountId !== input.accountId || !sourceAccount.connected || sourceAccount.authStatus !== 'connected' ||
+            (sourceAccount.connectionGeneration ?? 0) !== input.expectedConnectionGeneration) throw new Error('The source mailbox connection changed. Refresh the message before creating a reply.');
+      }
       if (result.source.sourceDigest.toLowerCase() !== input.sourceDigest.toLowerCase()) throw new Error('The source message changed. Reopen the reply composer and review its current recipients.');
       const proposal = this.buildMailReplyProposal(state, result.source, { ...input,
         to: input.to ?? result.defaults[input.mode].to, cc: input.cc ?? result.defaults[input.mode].cc });
@@ -11478,13 +11679,26 @@ export class AppControllerImpl implements AppController {
     return this.loadMailReplyTextInternal(input);
   }
 
-  private async loadMailReplyTextInternal(input: { messageId: string; sourceDigest: string }, ownActiveMailReviewJobId?: string): Promise<MailReplyTextLoadResult> {
+  async loadMailReplyTextForCommand(input: { messageId: string; accountId: string; expectedConnectionGeneration: number; sourceDigest: string }): Promise<MailReplyTextLoadResult> {
+    await this.load();
+    const message = this.snapshot.mailbox.find((item) => item.id === input.messageId);
+    const account = this.snapshot.accounts.find((item) => item.id === input.accountId);
+    if (!message || message.accountId !== input.accountId || !account || !account.connected || account.authStatus !== 'connected' ||
+        (account.connectionGeneration ?? 0) !== input.expectedConnectionGeneration || message.connectionGeneration !== account.connectionGeneration) {
+      throw new Error('The source mailbox connection changed. Refresh the message before loading its text.');
+    }
+    return this.loadMailReplyTextInternal(input);
+  }
+
+  private async loadMailReplyTextInternal(input: { messageId: string; sourceDigest: string; accountId?: string; expectedConnectionGeneration?: number }, ownActiveMailReviewJobId?: string): Promise<MailReplyTextLoadResult> {
     await this.load();
     if (!input || typeof input.messageId !== 'string' || !/^[a-f\d]{64}$/i.test(input.sourceDigest)) return { status: 'unavailable' };
     const captured = this.snapshot;
     const original = captured.mailbox.find((item) => item.id === input.messageId);
     const account = original && captured.accounts.find((item) => item.id === original.accountId);
     if (!original || !account) return { status: 'unavailable' };
+    if (input.accountId !== undefined && (original.accountId !== input.accountId || account.id !== input.accountId ||
+        (account.connectionGeneration ?? 0) !== input.expectedConnectionGeneration)) throw new Error('The source mailbox connection changed. Refresh the message before loading its text.');
     if (!account.connected || account.authStatus !== 'connected' || account.provider === 'local' || !account.identity ||
         !account.capabilities?.includes('mail.read') || !account.grantedScopes || !scopeGrantsCapability(account.provider, account.grantedScopes, 'mail.read') ||
         !original.idFormat || original.providerDeletedAt || original.verifiedIdentityKey !== identityKey(account) || original.connectionGeneration !== account.connectionGeneration) return { status: 'unavailable' };
@@ -11780,17 +11994,33 @@ export class AppControllerImpl implements AppController {
     };
   }
 
-  async refreshMailHead(accountId: string, options: { reason?: 'manual' | 'foreground' } = {}): Promise<MailLaneResult> {
+  async refreshMailHead(accountId: string, options: { reason?: 'manual' | 'foreground'; expectedConnectionGeneration?: number } = {}): Promise<MailLaneResult> {
     const pages = new Map<string, CommittedMailAlertPage>();
-    const result = await this.startMailLane(accountId, 'head', options.reason ?? 'manual', false, pages);
+    const result = await this.startMailLane(accountId, 'head', options.reason ?? 'manual', false, pages, options.expectedConnectionGeneration);
     if (result.status === 'complete' || result.status === 'partial') {
       await this.withMailAlertTransactionSlot(() => this.commitMailAlertPlan([...pages.values()]));
     }
     return result;
   }
 
-  async continueMailBackfill(accountId: string): Promise<MailLaneResult> {
-    return this.startMailLane(accountId, 'backfill', 'manual');
+  async continueMailBackfill(accountId: string, options: { expectedConnectionGeneration?: number } = {}): Promise<MailLaneResult> {
+    return this.startMailLane(accountId, 'backfill', 'manual', false, undefined, options.expectedConnectionGeneration);
+  }
+
+  async refreshMailHeadForCommand(accountId: string, options: { expectedConnectionGeneration: number }): Promise<{ result: MailLaneResult; connectionGeneration: number }> {
+    await this.load();
+    const account = this.snapshot.accounts.find((item) => item.id === accountId);
+    if (!account || (account.connectionGeneration ?? 0) !== options.expectedConnectionGeneration) throw new Error('Account connection changed. Refresh the account before continuing.');
+    const result = await this.refreshMailHead(accountId, { expectedConnectionGeneration: options.expectedConnectionGeneration });
+    return Object.freeze({ result: clone(result), connectionGeneration: options.expectedConnectionGeneration });
+  }
+
+  async continueMailBackfillForCommand(accountId: string, options: { expectedConnectionGeneration: number }): Promise<{ result: MailLaneResult; connectionGeneration: number }> {
+    await this.load();
+    const account = this.snapshot.accounts.find((item) => item.id === accountId);
+    if (!account || (account.connectionGeneration ?? 0) !== options.expectedConnectionGeneration) throw new Error('Account connection changed. Refresh the account before continuing.');
+    const result = await this.continueMailBackfill(accountId, { expectedConnectionGeneration: options.expectedConnectionGeneration });
+    return Object.freeze({ result: clone(result), connectionGeneration: options.expectedConnectionGeneration });
   }
 
   refreshForegroundMail(): Promise<ForegroundMailRefreshResult> {
@@ -11833,19 +12063,21 @@ export class AppControllerImpl implements AppController {
     return { attempted, skipped, results };
   }
 
-  private startMailLane(accountId: string, lane: 'head' | 'backfill', reason: 'manual' | 'foreground', doNotQueue = false, committedPages?: Map<string, CommittedMailAlertPage>): Promise<MailLaneResult> {
+  private startMailLane(accountId: string, lane: 'head' | 'backfill', reason: 'manual' | 'foreground', doNotQueue = false,
+    committedPages?: Map<string, CommittedMailAlertPage>, expectedConnectionGeneration?: number): Promise<MailLaneResult> {
     const key = `${accountId}:${lane}`;
     const sameLane = this.mailLaneJobs.get(key);
     if (sameLane) return sameLane;
     if (this.busySyncAccounts.has(accountId)) return Promise.reject(new Error('Another sync lane is already active for this account.'));
     this.busySyncAccounts.add(accountId);
-    const job = this.runMailLane(accountId, lane, reason, doNotQueue, committedPages)
+    const job = this.runMailLane(accountId, lane, reason, doNotQueue, committedPages, expectedConnectionGeneration)
       .finally(() => { this.mailLaneJobs.delete(key); this.busySyncAccounts.delete(accountId); });
     this.mailLaneJobs.set(key, job);
     return job;
   }
 
-  private async runMailLane(accountId: string, lane: 'head' | 'backfill', reason: 'manual' | 'foreground', doNotQueue: boolean, committedPages?: Map<string, CommittedMailAlertPage>): Promise<MailLaneResult> {
+  private async runMailLane(accountId: string, lane: 'head' | 'backfill', reason: 'manual' | 'foreground', doNotQueue: boolean,
+    committedPages?: Map<string, CommittedMailAlertPage>, expectedConnectionGeneration?: number): Promise<MailLaneResult> {
     if (!this.connector) throw new Error('Provider mail sync is not configured.');
     const release = doNotQueue ? this.tryAcquireSyncSlot() : await this.acquireSyncSlot();
     if (!release) throw new Error('Both sync slots are busy.');
@@ -11868,6 +12100,9 @@ export class AppControllerImpl implements AppController {
         const currentAccount = state.accounts.find((item) => item.id === accountId);
         if (!currentAccount || currentAccount.authStatus !== 'connected' || !currentAccount.connected || !currentAccount.capabilities?.includes('mail.read')) {
           throw new Error('Reconnect this account with mailbox read access before syncing.');
+        }
+        if (expectedConnectionGeneration !== undefined && (currentAccount.connectionGeneration ?? 0) !== expectedConnectionGeneration) {
+          throw new Error('Account connection changed. Refresh the account before continuing.');
         }
         const currentSync = state.syncStates[accountId] ?? emptySyncState(accountId);
         startedAt = now();
@@ -12146,7 +12381,7 @@ export class AppControllerImpl implements AppController {
     return left;
   }
 
-  private async runSyncAccount(id: string, options: { continue?: boolean }): Promise<AccountSyncState> {
+  private async runSyncAccount(id: string, options: { continue?: boolean; expectedConnectionGeneration?: number }): Promise<AccountSyncState> {
     if (!this.connector) throw new Error('Provider sync is not configured.');
     const release = await this.acquireSyncSlot();
     const abortController = new AbortController();
@@ -12163,6 +12398,9 @@ export class AppControllerImpl implements AppController {
       const { account, sync } = await this.mutate((state) => {
         const account = state.accounts.find((item) => item.id === id);
         if (!account || account.authStatus !== 'connected' || !account.connected) throw new Error('Reconnect this account before syncing.');
+        if (options.expectedConnectionGeneration !== undefined && (account.connectionGeneration ?? 0) !== options.expectedConnectionGeneration) {
+          throw new Error('Account connection changed. Refresh the account before continuing.');
+        }
         const sync = state.syncStates[id] ?? emptySyncState(id);
         if (sync.status === 'partial' && !options.continue) throw new Error('This sync is partial. Choose Continue to resume saved cursors.');
         if (options.continue && sync.status !== 'partial') throw new Error('There is no partial sync to continue. Start a fresh sync instead.');

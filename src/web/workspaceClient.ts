@@ -522,6 +522,17 @@ function expectedReceiptFor(envelope: WorkspaceCommandEnvelope) {
         captureId: command.captureId, captureRevision: command.captureRevision };
     case 'accounts.installOAuth':
       return { commandId: envelope.commandId, kind: command.kind, stageId: command.stageId };
+    case 'accounts.syncCalendars': case 'accounts.refreshMail': case 'accounts.continueMailBackfill': case 'accounts.disconnect':
+      return { commandId: envelope.commandId, kind: command.kind, objectId: command.accountId, accountId: command.accountId };
+    case 'mail.source.loadText': return { commandId: envelope.commandId, kind: command.kind, objectId: command.messageId, accountId: command.accountId,
+      connectionGeneration: command.expectedConnectionGeneration, sourceDigest: command.sourceDigest };
+    case 'mail.reply.create': return { commandId: envelope.commandId, kind: command.kind };
+    case 'proposals.edit': case 'proposals.approve': case 'proposals.execute': case 'proposals.dismiss':
+      return { commandId: envelope.commandId, kind: command.kind, objectId: command.proposalId, proposalId: command.proposalId };
+    case 'dispatch.reconcile': return { commandId: envelope.commandId, kind: command.kind, objectId: command.recordId, recordId: command.recordId };
+    case 'mail.replyBatch.submit': return { commandId: envelope.commandId, kind: command.kind };
+    case 'mail.replyBatch.check': case 'mail.replyBatch.review': return { commandId: envelope.commandId, kind: command.kind, objectId: command.jobId, jobId: command.jobId };
+    case 'mail.replyBatch.activate': return { commandId: envelope.commandId, kind: command.kind, jobId: command.jobId };
     case 'documents.save': {
       const parent = canonicalKnowledgeDocumentParent(command.path);
       return { commandId: envelope.commandId, kind: command.kind, objectId: command.path,

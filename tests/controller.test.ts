@@ -313,8 +313,13 @@ describe('application state controller', () => {
     await app.load();
     expect(app.getSnapshot().dispatchRecords[0].sourceProvenance.version).toBe(2);
     const unknownDraft = await app.createMailReplyProposal({ messageId: message.id, mode: 'reply_all', sourceDigest: source.source!.sourceDigest, text: 'Another response.' });
-    await app.approveProposal(unknownDraft.id);
-    expect((await app.executeProposal(unknownDraft.id)).status).toBe('unknown');
+    const unknownApproved = await app.approveProposal(unknownDraft.id);
+    const unknownExecution = await app.executeProposalForCommand(unknownDraft.id, { expectedRevision: unknownApproved.revision });
+    expect(unknownExecution.kind).toBe('settled');
+    if (unknownExecution.kind !== 'settled') throw new Error('Expected a settled execution result.');
+    expect(unknownExecution.proposal.status).toBe('unknown');
+    expect(unknownExecution.dispatch?.outcome).toBe('unknown');
+    expect(unknownExecution.proposal.status).toBe(app.getSnapshot().proposals.find((item) => item.id === unknownDraft.id)?.status);
     const afterUnknown = new AppControllerImpl(store, {}, integration);
     await afterUnknown.load();
     expect(afterUnknown.getSnapshot().dispatchRecords[0]).toMatchObject({ outcome: 'unknown', operation: 'draft' });
@@ -1189,11 +1194,16 @@ describe('application state controller', () => {
     await app.editProposal(draft.id, { accountId: account.id, email: {
       operation: 'send', to: ['alex@example.com'], cc: [], bcc: [], subject: 'Meeting', text: 'Let us meet tomorrow.', attachments: [],
     } });
-    await app.approveProposal(draft.id);
-    const executed = await app.executeProposal(draft.id);
+    const approved = await app.approveProposal(draft.id);
+    const commandExecution = await app.executeProposalForCommand(draft.id, { expectedRevision: approved.revision });
+    expect(commandExecution.kind).toBe('settled');
+    if (commandExecution.kind !== 'settled') throw new Error('Expected a settled execution result.');
+    const executed = commandExecution.proposal;
     expect(verifiedEnvelope).toBe(true);
     expect(externalWrites).toBe(1);
     expect(executed).toMatchObject({ status: 'accepted', remoteOperation: 'send', remoteId: 'provider-reference', simulated: false });
+    expect(executed.status).toBe(app.getSnapshot().proposals.find((item) => item.id === draft.id)?.status);
+    expect(commandExecution.dispatch).toMatchObject({ outcome: 'accepted' });
     expect(executed.dispatchRecordId).toBeTruthy();
     expect(app.getSnapshot().dispatchRecords[0]).toMatchObject({
       proposalId: draft.id, operation: 'send', outcome: 'accepted', remoteId: 'provider-reference',
@@ -1398,10 +1408,12 @@ describe('application state controller', () => {
     const account = await app.saveAccount({ provider: 'google', displayName: 'Work', email: 'me@example.com' });
     expect(account.connected).toBe(false);
     await app.editProposal(draft.id, { accountId: account.id, recipients: ['alex@example.com'], email: { operation: 'draft', to: ['alex@example.com'], cc: [], bcc: [], subject: draft.title, text: draft.body, attachments: [] } });
-    await app.approveProposal(draft.id);
-    const outcomes = await Promise.allSettled([app.executeProposal(draft.id), app.executeProposal(draft.id)]);
-    expect(outcomes.filter((item) => item.status === 'fulfilled')).toHaveLength(1);
-    expect(app.getSnapshot().proposals.find((item) => item.id === draft.id)).toMatchObject({ status: 'simulated', simulated: true });
+    const approved = await app.approveProposal(draft.id);
+    const commandResult = await app.executeProposalForCommand(draft.id, { expectedRevision: approved.revision });
+    expect(commandResult.kind).toBe('settled');
+    if (commandResult.kind !== 'settled') throw new Error('Expected a settled execution result.');
+    expect(commandResult.proposal).toMatchObject({ status: 'simulated', simulated: true });
+    expect(commandResult.proposal.status).toBe(app.getSnapshot().proposals.find((item) => item.id === draft.id)?.status);
     expect(app.getSnapshot().activity.some((item) => /not sent/.test(item.message))).toBe(true);
   });
 
@@ -1443,9 +1455,14 @@ describe('application state controller', () => {
     const b = await app.saveNote({ transcript: 'Remember that Lee prefers email.' });
     const [pa] = await app.processNote(a.id);
     const [pb] = await app.processNote(b.id);
-    await app.approveProposal(pa.id);
+    const approvedA = await app.approveProposal(pa.id);
     await app.approveProposal(pb.id);
-    await Promise.all([app.executeProposal(pa.id), app.executeProposal(pb.id)]);
+    const resultA = await app.executeProposalForCommand(pa.id, { expectedRevision: approvedA.revision });
+    expect(resultA.kind).toBe('settled');
+    if (resultA.kind !== 'settled') throw new Error('Expected a settled execution result.');
+    expect(resultA.localOutcome).toBe('executed');
+    expect(resultA.proposal.status).toBe(app.getSnapshot().proposals.find((item) => item.id === pa.id)?.status);
+    await app.executeProposal(pb.id);
     const profile = app.getSnapshot().documents.find((doc) => doc.path === 'memory/PROFILE.md')?.content ?? '';
     expect(profile).toContain('Sam prefers calls');
     expect(profile).toContain('Lee prefers email');
