@@ -1541,6 +1541,69 @@ describe('CloudWorkspace safe DTO presentation', () => {
     coordinator.dispose();
   });
 
+  it('renders provider-specific accepted draft copies with fixed send operation and locked fields', async () => {
+    for (const provider of ['google', 'microsoft'] as const) {
+      const { state } = fixture();
+      const account = state.accounts[0]!;
+      const identity = provider === 'google' ? { providerNamespace: 'google' as const, clientId: 'client', subject: 'subject' }
+        : { providerNamespace: 'microsoft' as const, clientId: 'client', subject: 'subject', resourceUserId: 'resource-user' };
+      account.provider = provider;
+      account.identity = identity;
+      account.connectionGeneration = 4;
+      account.capabilities = ['mail.read', 'mail.send'];
+      const parentId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaac';
+      const childId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbc';
+      const sourceDigest = 'd'.repeat(64);
+      const source = { version: 1 as const, accountId: account.id, accountEmail: account.email, identity, connectionGeneration: 4,
+        localMessageId: 'saved-message', providerMessageId: 'provider-message', idFormat: provider === 'google' ? 'gmail' as const : 'graph-immutable' as const,
+        threadId: 'saved-thread', internetMessageId: '<saved@example.test>', subject: 'Source subject', replyMetadataComplete: true as const,
+        observedAt: '2026-10-15T00:00:00.000Z', sourceDigest };
+      const parent: Proposal = { id: parentId, kind: 'email', title: 'Re: Source subject', body: 'Accepted contents', status: 'accepted', revision: 3,
+        accountId: account.id, recipients: ['sender@example.test'], evidence: [], supersededByProposalId: childId, remoteOperation: 'draft', remoteId: 'remote-draft',
+        email: { operation: 'draft', to: ['sender@example.test'], cc: [], bcc: [], subject: 'Source subject', text: 'Accepted contents', attachments: [],
+          reply: { mode: 'reply', sourceDigest, localMessageId: source.localMessageId, providerMessageId: source.providerMessageId, idFormat: source.idFormat,
+            internetMessageId: source.internetMessageId, sourceSubject: source.subject, threadId: source.threadId } },
+        provenance: { version: 2, kind: 'mail_reply', sourceDigest, source, expiresAt: '2026-10-16T00:00:00.000Z', outputPolicyVersion: 2 } };
+      const child: Proposal = { ...structuredClone(parent), id: childId, title: 'Re: Source subject', status: 'draft', revision: 1,
+        email: { ...parent.email!, operation: 'send', text: 'Accepted contents' }, provenance: { version: 3, kind: 'manual_mail_reply', sourceDigest,
+          source, expiresAt: '2026-10-16T00:00:00.000Z', outputPolicyVersion: 2, operation: 'send',
+          lineage: { kind: 'accepted_draft', parentProposalId: parentId, parentRevision: 3, parentPayloadDigest: 'e'.repeat(64),
+            draftDispatchRecordId: 'dispatch-1', draftDispatchRecordDigest: 'f'.repeat(64), remoteDraftId: 'remote-draft' } } };
+      delete child.supersededByProposalId;
+      state.proposals.push(parent, child);
+      const snapshot = createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: 9 });
+      const review = { schemaVersion: 1 as const, workspaceId, privacyEpoch: 3, revision: 9, proposal: {
+        editPolicy: 'manual_reply_send_fields' as const, canDeriveManualReply: false,
+        acceptedDraftCopy: { parentProposalId: parentId, draftDispatchRecordId: 'dispatch-1', provider },
+        id: childId, kind: 'email' as const, title: child.title, body: child.body, status: 'draft' as const, revision: 1,
+        accountId: account.id, recipients: child.recipients, sourceDigest,
+        email: { operation: 'send' as const, to: ['sender@example.test'], cc: [], bcc: [], subject: 'Source subject', text: 'Accepted contents', attachments: [] },
+      } };
+      const coordinator = new CloudMailCoordinator({
+        readSnapshot: () => snapshot, readOperation: () => ({ busy: false, pending: false, refreshRequired: false }),
+        readMailReplySource: vi.fn(async () => { throw new Error('not used'); }), readMailReplyText: vi.fn(async () => { throw new Error('not used'); }),
+        readProposalReview: vi.fn(async () => review), readDispatchReview: vi.fn(async () => ({ schemaVersion: 1 as const, workspaceId, privacyEpoch: 3, revision: 9 })),
+        readReplyBatchReview: vi.fn(async () => ({ schemaVersion: 1 as const, workspaceId, privacyEpoch: 3, revision: 9 })),
+        execute: vi.fn(async () => { throw new Error('render-only review must not dispatch'); }), inspect: vi.fn(async () => { throw new Error('not used'); }),
+        refresh: vi.fn(async () => snapshot),
+      });
+      await act(async () => { await coordinator.openProposal(childId); });
+      act(() => root.render(<CloudMailWorkspace coordinator={coordinator} snapshot={snapshot} busy={false} blocked={false} />));
+      expect(host.textContent).toContain(provider === 'google' ? 'Send saved draft with reviewed contents' : 'Send reviewed copy; keep original draft');
+      expect(host.textContent).toContain('Provider draft contents have not been rechecked.');
+      expect(host.querySelector('[aria-label="Subject"]')).toBeNull();
+      expect(host.querySelector('[aria-label="Bcc"]')).toBeNull();
+      expect(host.querySelector('[aria-label="Attachments"]')).toBeNull();
+      expect(host.textContent).not.toContain('Review as draft');
+      expect(host.textContent).not.toContain('Review as send');
+      setTextField('To', 'reviewed@example.test');
+      setTextField('Message', 'Edited from the saved contents');
+      expect(coordinator.getProposalDraft(childId)).toMatchObject({ to: 'reviewed@example.test', text: 'Edited from the saved contents', dirty: true, operation: 'send' });
+      coordinator.dispose();
+      act(() => root.render(null));
+    }
+  });
+
   it('offers explicit writable calendar choices for the proposal account', async () => {
     const { state } = fixture();
     state.accounts[0].connectionGeneration = 4;

@@ -41,12 +41,12 @@ export function CloudMailWorkspace({ coordinator, snapshot, busy, blocked }: Pro
     if (!coordinator || !selectedProposal || !proposalDraft || !accountForProposal || mutationBlocked || proposalConflict || proposalSaving || !proposalDirty) return;
     const edit = selectedProposal.editPolicy === 'event_fields' && selectedProposal.event && proposalCalendar ? { kind: 'event' as const, calendarId: proposalCalendar.id, title: proposalDraft.eventTitle, description: proposalDraft.eventDescription,
       start: proposalDraft.eventStart, end: proposalDraft.eventEnd, timeZone: proposalDraft.eventTimeZone, attendees: splitAddresses(proposalDraft.eventAttendees), invitePolicy: proposalDraft.eventInvite }
-      : selectedProposal.email && ['email_fields', 'source_reply_fields', 'manual_reply_fields'].includes(selectedProposal.editPolicy) ? { kind: 'email' as const,
+      : selectedProposal.email && ['email_fields', 'source_reply_fields', 'manual_reply_fields', 'manual_reply_send_fields'].includes(selectedProposal.editPolicy) ? { kind: 'email' as const,
         operation: selectedProposal.editPolicy === 'source_reply_fields' ? 'draft' as const :
-          selectedProposal.editPolicy === 'manual_reply_fields' ? proposalDraft.operation : (selectedProposal.email.operation ?? 'draft' as const),
+          selectedProposal.editPolicy === 'manual_reply_fields' ? proposalDraft.operation : selectedProposal.editPolicy === 'manual_reply_send_fields' ? 'send' as const : (selectedProposal.email.operation ?? 'draft' as const),
         to: splitAddresses(proposalDraft.to), cc: splitAddresses(proposalDraft.cc),
-        bcc: ['source_reply_fields', 'manual_reply_fields'].includes(selectedProposal.editPolicy) ? selectedProposal.email.bcc : splitAddresses(proposalDraft.bcc),
-        subject: ['source_reply_fields', 'manual_reply_fields'].includes(selectedProposal.editPolicy) ? selectedProposal.email.subject : proposalDraft.subject, text: proposalDraft.text } : undefined;
+        bcc: ['source_reply_fields', 'manual_reply_fields', 'manual_reply_send_fields'].includes(selectedProposal.editPolicy) ? selectedProposal.email.bcc : splitAddresses(proposalDraft.bcc),
+        subject: ['source_reply_fields', 'manual_reply_fields', 'manual_reply_send_fields'].includes(selectedProposal.editPolicy) ? selectedProposal.email.subject : proposalDraft.subject, text: proposalDraft.text } : undefined;
     if (!edit) return;
     void coordinator.editProposal(selectedProposal.id, accountForProposal.id, accountForProposal.connectionGeneration!, edit);
   };
@@ -170,11 +170,23 @@ export function CloudMailWorkspace({ coordinator, snapshot, busy, blocked }: Pro
       {state.manualReplyDerivation?.parentProposalId === selectedProposal.id ? <Text style={styles.notice}>The editable-copy command is being checked. Inspect its exact receipt before continuing; it will not be retried automatically.</Text> : null}
       {state.manualReplySuccessor?.parentProposalId === selectedProposal.id ? <Button label="Open saved editable copy" tone="quiet" disabled={!coordinator || mutationBlocked}
         onPress={() => { void coordinator?.openManualReplySuccessor(); }} /> : null}
+      {selectedProposal.draftPromotion && !selectedProposal.supersededByProposalId ? <View style={styles.card}>
+        <Text style={styles.title}>Review accepted draft for sending</Text>
+        <Text style={styles.meta}>Create a separate send proposal from the contents saved in Still. The current provider draft contents have not been rechecked. The original draft stays in place.</Text>
+        <Button label="Review draft for sending" disabled={!coordinator || mutationBlocked || !accountForProposal?.capabilities?.includes('mail.send') ||
+          Boolean(state.acceptedDraftPromotion) || Boolean(state.replyHeldCommand) || proposalDirty || proposalConflict || proposalSaving}
+          onPress={() => { void coordinator?.promoteAcceptedDraft(selectedProposal.id); }} />
+      </View> : null}
+      {state.acceptedDraftPromotion?.parentProposalId === selectedProposal.id ? <Text style={styles.notice}>Promotion status is being checked. Inspect its exact receipt before continuing; it will not be retried automatically.</Text> : null}
+      {state.acceptedDraftSuccessor?.parentProposalId === selectedProposal.id ? <Button label="Open reviewed send copy" tone="quiet" disabled={!coordinator || mutationBlocked}
+        onPress={() => { void coordinator?.openAcceptedDraftSuccessor(); }} /> : null}
       {proposalConflict ? <View style={styles.card}><Text accessibilityRole="alert" style={styles.notice}>The saved proposal changed while these fields were open. Your edits are preserved. Reload the current review before saving or approving.</Text>
         <Button label="Reload saved proposal" tone="quiet" disabled={!coordinator || busy} onPress={() => { void coordinator?.openProposal(selectedProposal.id).then(() => coordinator.reloadProposalDraft(selectedProposal.id)); }} /></View> : null}
       {selectedProposal.email ? <>
         {selectedProposal.editPolicy === 'source_reply_fields' ? <Text style={styles.meta}>This reply is bound to its saved source. Its subject, Bcc, attachments, and operation are fixed. You can revise recipients and message text.</Text> : null}
         {selectedProposal.editPolicy === 'manual_reply_fields' ? <Text style={styles.meta}>Manual reply copy · Account · {accountForProposal?.displayName || 'connected account'} ({accountForProposal?.email || 'email unavailable'}) · Source · {proposalSource?.subject ?? selectedProposal.email.subject}{proposalSource?.threadId ? ` · thread ${proposalSource.threadId}` : ''} · account and source are locked. To, Cc, and message text are editable. Subject is fixed; Bcc and attachments are unavailable. Saving a changed operation requires fresh approval.</Text> : null}
+        {selectedProposal.acceptedDraftCopy ? <><Text style={styles.title}>{selectedProposal.acceptedDraftCopy.provider === 'google' ? 'Send saved draft with reviewed contents' : 'Send reviewed copy; keep original draft'}</Text>
+          <Text style={styles.meta}>The proposal uses contents saved in Still after draft creation. Provider draft contents have not been rechecked. To, Cc, and message text are editable; subject, Bcc, attachments, account, and send operation are fixed.</Text></> : null}
         {selectedProposal.editPolicy === 'read_only' ? <Text style={styles.meta}>This saved reply cannot be edited. Review its contents and use the separate approval and execution steps when available.</Text> : null}
         {canEditProposal && proposalDraft ? <>
           <Field label="To" value={proposalDraft.to} onChangeText={(value) => coordinator?.updateProposalDraft(selectedProposal.id, { to: value })} /><Field label="Cc" value={proposalDraft.cc} onChangeText={(value) => coordinator?.updateProposalDraft(selectedProposal.id, { cc: value })} />
@@ -191,7 +203,8 @@ export function CloudMailWorkspace({ coordinator, snapshot, busy, blocked }: Pro
                   onPress={() => coordinator?.updateProposalDraft(selectedProposal.id, { operation: 'send' })} />
               </View>
               <Text style={styles.meta}>Final To · {splitAddresses(proposalDraft.to).join(', ') || 'none'} · Cc · {splitAddresses(proposalDraft.cc).join(', ') || 'none'}</Text>
-            </> : <><Field label="Bcc" value={proposalDraft.bcc} onChangeText={(value) => coordinator?.updateProposalDraft(selectedProposal.id, { bcc: value })} /><Field label="Subject" value={proposalDraft.subject} onChangeText={(value) => coordinator?.updateProposalDraft(selectedProposal.id, { subject: value })} /></>}
+            </> : selectedProposal.editPolicy === 'manual_reply_send_fields' ? <Text style={styles.meta}>Subject · {selectedProposal.email.subject} · Operation · send · Bcc · none · attachments · none</Text>
+              : <><Field label="Bcc" value={proposalDraft.bcc} onChangeText={(value) => coordinator?.updateProposalDraft(selectedProposal.id, { bcc: value })} /><Field label="Subject" value={proposalDraft.subject} onChangeText={(value) => coordinator?.updateProposalDraft(selectedProposal.id, { subject: value })} /></>}
           <Field label="Message" value={proposalDraft.text} onChangeText={(value) => coordinator?.updateProposalDraft(selectedProposal.id, { text: value })} multiline />
         </> : <><Text style={styles.meta}>To · {selectedProposal.email.to.join(', ') || 'none'} · Cc · {selectedProposal.email.cc.join(', ') || 'none'}</Text>
           <Text style={styles.meta}>Subject · {selectedProposal.email.subject}</Text><Text style={styles.body}>{selectedProposal.email.text}</Text></>}

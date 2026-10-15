@@ -74,6 +74,42 @@ describe('same-origin web workspace command client', () => {
     expect(parseWorkspaceCommandReceipt({ schemaVersion: 1, commandId, kind: 'mail.reply.derive', objectId: proposalId,
       parentProposalId, proposalId, proposalRevision: 1, operation: 'send' }, { commandId, kind: 'mail.reply.derive', objectId: proposalId,
       parentProposalId, proposalId, operation: 'send' })).toMatchObject({ proposalId, parentProposalId, proposalRevision: 1, operation: 'send' });
+    const dispatchRecordId = '20000000-0000-4000-8000-000000000007';
+    const promoteCommand = { kind: 'mail.reply.promoteDraft' as const, parentProposalId, expectedParentRevision: 3,
+      draftDispatchRecordId: dispatchRecordId, accountId, expectedConnectionGeneration: 7 };
+    expect(parseWorkspaceCommandEnvelope({ schemaVersion: 1, commandId, expectedRevision: 9, expectedPrivacyEpoch: 3,
+      command: promoteCommand }).command).toEqual(promoteCommand);
+    for (const extra of [{ operation: 'send' }, { payload: 'caller data' }, { digest: 'a'.repeat(64) }, { remoteId: 'provider-id' }]) {
+      expect(() => parseWorkspaceCommandEnvelope({ schemaVersion: 1, commandId, expectedRevision: 9, expectedPrivacyEpoch: 3,
+        command: { ...promoteCommand, ...extra } })).toThrow('workspace_command_invalid');
+    }
+    for (const invalid of [
+      { ...promoteCommand, parentProposalId: '' }, { ...promoteCommand, expectedParentRevision: 0 },
+      { ...promoteCommand, draftDispatchRecordId: '' }, { ...promoteCommand, accountId: '' },
+      { ...promoteCommand, expectedConnectionGeneration: -1 }, { ...promoteCommand, expectedConnectionGeneration: 1.5 },
+    ]) {
+      expect(() => parseWorkspaceCommandEnvelope({ schemaVersion: 1, commandId, expectedRevision: 9, expectedPrivacyEpoch: 3,
+        command: invalid })).toThrow('workspace_command_invalid');
+    }
+    const promotionReceipt = { schemaVersion: 1, commandId, kind: 'mail.reply.promoteDraft', objectId: proposalId,
+      parentProposalId, parentProposalRevision: 3, draftDispatchRecordId: dispatchRecordId,
+      childProposalId: proposalId, childProposalRevision: 1,
+      accountId, connectionGeneration: 7, operation: 'send' };
+    const promoteExpected = { commandId, kind: 'mail.reply.promoteDraft' as const, objectId: proposalId, parentProposalId, parentProposalRevision: 3,
+      draftDispatchRecordId: dispatchRecordId, accountId, connectionGeneration: 7, operation: 'send' as const };
+    expect(parseWorkspaceCommandReceipt(promotionReceipt, promoteExpected)).toMatchObject({
+      parentProposalId, parentProposalRevision: 3, draftDispatchRecordId: dispatchRecordId,
+      childProposalId: proposalId, childProposalRevision: 1,
+      accountId, connectionGeneration: 7, operation: 'send',
+    });
+    for (const wrong of [
+      { parentProposalId: 'other-parent' }, { draftDispatchRecordId: 'other-record' }, { accountId: 'other-account' },
+      { parentProposalRevision: 2 }, { parentProposalRevision: 0 }, { parentProposalRevision: '3' },
+      { connectionGeneration: 8 }, { operation: 'draft' }, { childProposalId: parentProposalId },
+      { childProposalRevision: 0 }, { objectId: 'other-child' }, { payload: 'extra' },
+    ]) {
+      expect(() => parseWorkspaceCommandReceipt({ ...promotionReceipt, ...wrong }, promoteExpected)).toThrow(/invalid/);
+    }
     const zone = parseWorkspaceCommandEnvelope({ schemaVersion: 1, commandId, expectedRevision: 4, expectedPrivacyEpoch: 3,
       command: { kind: 'notes.confirmImportedTimeZone', noteId: legacyNoteId, expectedNoteRevision: 5, timeZone: 'Asia/Singapore' } });
     expect(zone.command.kind).toBe('notes.confirmImportedTimeZone');
@@ -122,7 +158,7 @@ describe('same-origin web workspace command client', () => {
       'chat.transcript.prepare', 'chat.transcript.cancel', 'chat.transcript.submit', 'settings.update', 'notes.save', 'notes.capture.adopt',
       'notes.updateTranscript', 'assistant.batch.submitNote', 'assistant.batch.check', 'chat.submit', 'chat.refine', 'notes.transcribe', 'accounts.installOAuth',
       'accounts.syncCalendars', 'accounts.refreshMail', 'accounts.continueMailBackfill', 'accounts.disconnect', 'mail.source.loadText', 'mail.reply.create',
-      'mail.reply.derive', 'proposals.edit', 'proposals.approve', 'proposals.execute', 'proposals.dismiss', 'dispatch.reconcile', 'mail.replyBatch.submit', 'mail.replyBatch.check',
+      'mail.reply.derive', 'mail.reply.promoteDraft', 'proposals.edit', 'proposals.approve', 'proposals.execute', 'proposals.dismiss', 'dispatch.reconcile', 'mail.replyBatch.submit', 'mail.replyBatch.check',
       'mail.replyBatch.review', 'mail.replyBatch.activate',
       'documents.save', 'knowledge.person.save', 'knowledge.project.save', 'knowledge.entity.archive', 'knowledge.fact.save', 'knowledge.fact.remove',
       'knowledge.contact.save', 'knowledge.contact.remove', 'knowledge.member.save', 'knowledge.member.remove',
@@ -440,6 +476,32 @@ describe('same-origin web workspace command client', () => {
       command: { kind: 'tasks.complete', taskId: 'task-safe-id' },
     });
     expect(JSON.stringify(result)).not.toContain('private-csrf');
+    client.dispose();
+  });
+
+  it.each([
+    ['parent proposal', { parentProposalId: 'other-parent' }],
+    ['parent revision', { parentProposalRevision: 2 }],
+    ['draft dispatch record', { draftDispatchRecordId: 'other-record' }],
+  ])('keeps a promotion command uncertain when its acknowledgement changes the %s binding', async (_label, mismatch) => {
+    const parentProposalId = '20000000-0000-4000-8000-000000000004';
+    const childProposalId = '20000000-0000-4000-8000-000000000005';
+    const accountId = '20000000-0000-4000-8000-000000000006';
+    const draftDispatchRecordId = '20000000-0000-4000-8000-000000000007';
+    const command = { kind: 'mail.reply.promoteDraft' as const, parentProposalId, expectedParentRevision: 3,
+      draftDispatchRecordId, accountId, expectedConnectionGeneration: 7 };
+    const badReceipt = { schemaVersion: 1, commandId, kind: command.kind, objectId: childProposalId,
+      parentProposalId, parentProposalRevision: 3, draftDispatchRecordId, childProposalId, childProposalRevision: 1,
+      accountId, connectionGeneration: 7, operation: 'send', ...mismatch };
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(body(snapshot(1)))
+      .mockResolvedValueOnce(body({ schemaVersion: 1, commandId, status: 'finished', receipt: badReceipt }));
+    const client = makeClient(fetcher, () => true, [commandId]);
+
+    await client.getSnapshot();
+    await expect(client.execute(command)).rejects.toBeInstanceOf(WorkspaceCommandUnknownError);
+    expect(client.getPendingCommand()?.command).toEqual(command);
+    expect(fetcher).toHaveBeenCalledTimes(2);
     client.dispose();
   });
 

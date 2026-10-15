@@ -37,6 +37,8 @@ export type WorkspaceCommand =
       readonly sourceDigest: string; readonly mode: 'reply' | 'reply_all'; readonly text: string; readonly to: readonly string[]; readonly cc: readonly string[] }
   | { readonly kind: 'mail.reply.derive'; readonly parentProposalId: string; readonly expectedParentRevision: number;
       readonly accountId: string; readonly expectedConnectionGeneration: number; readonly operation: 'draft' | 'send' }
+  | { readonly kind: 'mail.reply.promoteDraft'; readonly parentProposalId: string; readonly expectedParentRevision: number;
+      readonly draftDispatchRecordId: string; readonly accountId: string; readonly expectedConnectionGeneration: number }
   | { readonly kind: 'proposals.edit'; readonly proposalId: string; readonly expectedProposalRevision: number; readonly accountId: string;
       readonly expectedConnectionGeneration: number; readonly edit: CloudProposalEdit }
   | { readonly kind: 'proposals.approve' | 'proposals.execute' | 'proposals.dismiss'; readonly proposalId: string; readonly expectedProposalRevision: number }
@@ -134,6 +136,8 @@ export type WorkspaceCommandReceipt =
   | (WorkspaceCommandReceiptBase<'mail.source.loadText'> & Readonly<{ accountId: string; connectionGeneration: number; sourceDigest: string; loadStatus: import('../core').MailReplyTextLoadResult['status']; textDigest?: string; bytes?: number }> )
   | (WorkspaceCommandReceiptBase<'mail.reply.create'> & Readonly<{ proposalId: string; proposalRevision: number }> )
   | (WorkspaceCommandReceiptBase<'mail.reply.derive'> & Readonly<{ parentProposalId: string; proposalId: string; proposalRevision: number; operation: 'draft' | 'send' }> )
+  | (WorkspaceCommandReceiptBase<'mail.reply.promoteDraft'> & Readonly<{ parentProposalId: string; draftDispatchRecordId: string;
+      parentProposalRevision: number; childProposalId: string; childProposalRevision: number; accountId: string; connectionGeneration: number; operation: 'send' }> )
   | (WorkspaceCommandReceiptBase<'proposals.edit' | 'proposals.approve' | 'proposals.dismiss'> & Readonly<{ proposalId: string; proposalRevision: number; proposalStatus: import('../core').Proposal['status'] }> )
   | (WorkspaceCommandReceiptBase<'proposals.execute'> & Readonly<{ proposalId: string; proposalRevision: number; proposalStatus: import('../core').Proposal['status'];
       execution: 'accepted' | 'unknown' | 'rejected' | 'simulated' | 'executed' | 'failed' | 'invalidated'; dispatchRecordId?: string;
@@ -190,6 +194,7 @@ const COMMAND_KEYS: Record<WorkspaceCommand['kind'], readonly string[]> = {
   'mail.source.loadText': ['kind', 'messageId', 'accountId', 'expectedConnectionGeneration', 'sourceDigest'],
   'mail.reply.create': ['kind', 'messageId', 'accountId', 'expectedConnectionGeneration', 'sourceDigest', 'mode', 'text', 'to', 'cc'],
   'mail.reply.derive': ['kind', 'parentProposalId', 'expectedParentRevision', 'accountId', 'expectedConnectionGeneration', 'operation'],
+  'mail.reply.promoteDraft': ['kind', 'parentProposalId', 'expectedParentRevision', 'draftDispatchRecordId', 'accountId', 'expectedConnectionGeneration'],
   'proposals.edit': ['kind', 'proposalId', 'expectedProposalRevision', 'accountId', 'expectedConnectionGeneration', 'edit'],
   'proposals.approve': ['kind', 'proposalId', 'expectedProposalRevision'],
   'proposals.execute': ['kind', 'proposalId', 'expectedProposalRevision'],
@@ -648,6 +653,14 @@ function freezeCommand(raw: Record<string, unknown>): WorkspaceCommand {
     return Object.freeze({ kind, ...fence, parentProposalId: raw.parentProposalId,
       expectedParentRevision: raw.expectedParentRevision as number, operation: raw.operation });
   }
+  if (kind === 'mail.reply.promoteDraft') {
+    assertExactKeys(raw, COMMAND_KEYS[kind], COMMAND_KEYS[kind]);
+    const fence = accountFence(raw);
+    if (!boundedString(raw.parentProposalId, MAX_ID_BYTES, { identifier: true }) || !positiveRevision(raw.expectedParentRevision) ||
+        !boundedString(raw.draftDispatchRecordId, MAX_ID_BYTES, { identifier: true })) throw new Error('workspace_command_invalid');
+    return Object.freeze({ kind, ...fence, parentProposalId: raw.parentProposalId,
+      expectedParentRevision: raw.expectedParentRevision as number, draftDispatchRecordId: raw.draftDispatchRecordId });
+  }
   if (kind === 'proposals.edit') {
     assertExactKeys(raw, COMMAND_KEYS[kind], COMMAND_KEYS[kind]);
     const fence = accountFence(raw);
@@ -899,6 +912,8 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
   readonly sourceDigest?: string;
   readonly proposalId?: string;
   readonly parentProposalId?: string;
+  readonly parentProposalRevision?: number;
+  readonly draftDispatchRecordId?: string;
   readonly operation?: 'draft' | 'send' | 'event';
   readonly recordId?: string;
   readonly jobStatus?: import('../services/openRouterBatchJobs').AssistantBatchJobDTO['status'];
@@ -935,6 +950,9 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
     'mail.source.loadText': ['accountId', 'commandId', 'connectionGeneration', 'kind', 'loadStatus', 'objectId', 'schemaVersion', 'sourceDigest', 'textDigest', 'bytes'],
     'mail.reply.create': ['commandId', 'kind', 'objectId', 'proposalId', 'proposalRevision', 'schemaVersion'],
     'mail.reply.derive': ['commandId', 'kind', 'objectId', 'parentProposalId', 'proposalId', 'proposalRevision', 'operation', 'schemaVersion'],
+    'mail.reply.promoteDraft': ['accountId', 'childProposalId', 'childProposalRevision', 'commandId', 'connectionGeneration', 'draftDispatchRecordId',
+      'parentProposalId', 'parentProposalRevision',
+      'kind', 'objectId', 'operation', 'schemaVersion'],
     'proposals.edit': ['commandId', 'kind', 'objectId', 'proposalId', 'proposalRevision', 'proposalStatus', 'schemaVersion'],
     'proposals.approve': ['commandId', 'kind', 'objectId', 'proposalId', 'proposalRevision', 'proposalStatus', 'schemaVersion'],
     'proposals.dismiss': ['commandId', 'kind', 'objectId', 'proposalId', 'proposalRevision', 'proposalStatus', 'schemaVersion'],
@@ -1017,6 +1035,10 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
       (kind === 'mail.reply.create' && (!textId(value.proposalId) || !positiveRevision(value.proposalRevision) || value.objectId !== value.proposalId)) ||
       (kind === 'mail.reply.derive' && (!textId(value.parentProposalId) || !textId(value.proposalId) || !positiveRevision(value.proposalRevision) ||
         value.objectId !== value.proposalId || value.parentProposalId === value.proposalId || !['draft', 'send'].includes(value.operation as string))) ||
+      (kind === 'mail.reply.promoteDraft' && (!textId(value.parentProposalId) || !positiveRevision(value.parentProposalRevision) || !textId(value.draftDispatchRecordId) ||
+        !textId(value.childProposalId) || value.childProposalId === value.parentProposalId || !positiveRevision(value.childProposalRevision) ||
+        !textId(value.accountId) || !Number.isSafeInteger(value.connectionGeneration) || (value.connectionGeneration as number) < 0 ||
+        value.operation !== 'send' || value.objectId !== value.childProposalId)) ||
       (['proposals.edit', 'proposals.approve', 'proposals.dismiss', 'proposals.execute'].includes(kind) &&
         (!textId(value.proposalId) || !positiveRevision(value.proposalRevision) || value.objectId !== value.proposalId ||
           !['draft', 'approved', 'dispatching', 'unknown', 'failed', 'accepted', 'simulated', 'executed', 'dismissed'].includes(value.proposalStatus as string))) ||
@@ -1074,6 +1096,9 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
         (expected.connectionGeneration !== undefined && value.connectionGeneration !== expected.connectionGeneration) ||
         (expected.sourceDigest !== undefined && value.sourceDigest !== expected.sourceDigest) ||
         (expected.proposalId !== undefined && value.proposalId !== expected.proposalId) ||
+        (expected.parentProposalId !== undefined && value.parentProposalId !== expected.parentProposalId) ||
+        (expected.parentProposalRevision !== undefined && value.parentProposalRevision !== expected.parentProposalRevision) ||
+        (expected.draftDispatchRecordId !== undefined && value.draftDispatchRecordId !== expected.draftDispatchRecordId) ||
         (expected.recordId !== undefined && value.recordId !== expected.recordId) ||
         (expected.jobStatus !== undefined && value.jobStatus !== expected.jobStatus) ||
         (expected.noteId !== undefined && value.noteId !== expected.noteId) ||
@@ -1148,6 +1173,12 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
     case 'mail.reply.derive':
       return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId, parentProposalId: value.parentProposalId as string,
         proposalId: value.proposalId as string, proposalRevision: value.proposalRevision as number, operation: value.operation as 'draft' | 'send' });
+    case 'mail.reply.promoteDraft':
+      return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId,
+        parentProposalId: value.parentProposalId as string, draftDispatchRecordId: value.draftDispatchRecordId as string,
+        parentProposalRevision: value.parentProposalRevision as number,
+        childProposalId: value.childProposalId as string, childProposalRevision: value.childProposalRevision as number,
+        accountId: value.accountId as string, connectionGeneration: value.connectionGeneration as number, operation: 'send' });
     case 'proposals.edit': case 'proposals.approve': case 'proposals.dismiss':
       return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId, proposalId: value.proposalId as string,
         proposalRevision: value.proposalRevision as number, proposalStatus: value.proposalStatus as import('../core').Proposal['status'] });

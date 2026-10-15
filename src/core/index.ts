@@ -201,6 +201,8 @@ export interface Proposal {
   revision: number;
   approvedRevision?: number;
   approvedPayloadDigest?: string;
+  /** Internal canonical approval hash format. Missing means the legacy JSON.stringify format. */
+  approvedPayloadDigestVersion?: 2;
   lastError?: string;
   notificationId?: string;
   notificationRevision?: number;

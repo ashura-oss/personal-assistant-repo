@@ -11,6 +11,14 @@ const missingChatJob: WorkspaceCommandReceipt = { ...base, kind: 'chat.submit', 
 const missingRefinementParent: WorkspaceCommandReceipt = { ...base, kind: 'chat.refine', turnId: commandId, jobId: commandId };
 // @ts-expect-error Manual reply successor receipts bind their exact parent and reviewed operation.
 const missingReplySuccessorBinding: WorkspaceCommandReceipt = { ...base, kind: 'mail.reply.derive', proposalId: commandId, proposalRevision: 1 };
+// @ts-expect-error Draft promotion receipts bind the source, immutable dispatch record, child revision, and account fence.
+const missingDraftPromotionBinding: WorkspaceCommandReceipt = { ...base, kind: 'mail.reply.promoteDraft',
+  parentProposalId: commandId, childProposalId: commandId, childProposalRevision: 1,
+  accountId: 'account', connectionGeneration: 0, operation: 'send' };
+const draftPromotionCannotChooseOperation: WorkspaceCommand = { kind: 'mail.reply.promoteDraft', parentProposalId: commandId,
+  expectedParentRevision: 1, draftDispatchRecordId: commandId, accountId: 'account', expectedConnectionGeneration: 0,
+  // @ts-expect-error Caller cannot supply an operation; promotion is fixed to send.
+  operation: 'draft' };
 
 function requiredByDiscriminant(receipt: WorkspaceCommandReceipt): string {
   switch (receipt.kind) {
@@ -30,4 +38,5 @@ function selectionIsImmutable(command: WorkspaceCommand): void {
   }
 }
 
-void [missingBatchJob, missingChatJob, missingRefinementParent, missingReplySuccessorBinding, requiredByDiscriminant, selectionIsImmutable];
+void [missingBatchJob, missingChatJob, missingRefinementParent, missingReplySuccessorBinding, missingDraftPromotionBinding,
+  draftPromotionCannotChooseOperation, requiredByDiscriminant, selectionIsImmutable];

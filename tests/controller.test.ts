@@ -5,7 +5,7 @@ import { extractPreviewProposals as extractSharedPreviewProposals } from '../src
 import type { StateStore } from '../src/storage/contracts';
 import { AzureOpenAIClient } from '../src/services/azure';
 import { cancelReminderNotification, reminderNotificationId, requestReminderNotification } from '../src/services/notifications';
-import { describeMessageWindowQuery, withCredentialLock, type OAuthBridgeResult, type StoredOAuthToken } from '../src/connectors';
+import { ConnectorClient, describeMessageWindowQuery, withCredentialLock, type OAuthBridgeResult, type StoredOAuthToken } from '../src/connectors';
 import * as Crypto from 'expo-crypto';
 import { completeNoteBatch, createCompletedAssistantBatchClient } from './helpers/assistantBatchFixture';
 
@@ -22,12 +22,109 @@ class MemoryStore implements StateStore {
   async clear() { this.value = undefined; }
 }
 
+function canonicalTestValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalTestValue);
+  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).filter(([, child]) => child !== undefined)
+    .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0).map(([key, child]) => [key, canonicalTestValue(child)]));
+  return value;
+}
+
+class CanonicalizingMemoryStore extends MemoryStore {
+  override async save(state: AppState) {
+    this.saves += 1;
+    if (this.failNext) { this.failNext = false; throw new Error('disk full'); }
+    this.value = canonicalTestValue(JSON.parse(JSON.stringify(state))) as AppState;
+  }
+}
+
+async function legacyProposalApprovalDigest(proposal: Proposal, state: AppState): Promise<string> {
+  const account = state.accounts.find((item) => item.id === proposal.accountId);
+  const calendar = proposal.eventDestination?.kind === 'remote_calendar' ? state.calendars.find((item) => item.id === proposal.eventDestination?.calendarId) : undefined;
+  const payload = JSON.stringify({ id: proposal.id, revision: proposal.revision, noteId: proposal.noteId, sourceRevision: proposal.sourceRevision,
+    provenance: proposal.provenance ?? null, requiresRebuild: proposal.requiresRebuild ?? false, kind: proposal.kind, title: proposal.title, body: proposal.body,
+    accountId: proposal.accountId ?? null, accountIdentity: account ? { provider: account.provider, email: account.email, authStatus: account.authStatus,
+      identity: account.identity ? { providerNamespace: account.identity.providerNamespace ?? null, clientId: account.identity.clientId ?? null,
+        subject: account.identity.subject, issuer: account.identity.issuer ?? null, tenantId: account.identity.tenantId ?? null,
+        resourceUserId: account.identity.resourceUserId ?? null } : null, scopes: account.grantedScopes ?? [], capabilities: account.capabilities ?? [],
+      capabilityLimits: account.capabilityLimits ?? [] } : null, recipients: [...proposal.recipients], calendarId: proposal.calendarId ?? null,
+    eventDestination: proposal.eventDestination ?? null, deviceCalendarApproval: proposal.deviceCalendarApproval ?? null,
+    calendarDestination: calendar ? { accountId: calendar.accountId, providerId: calendar.providerId ?? null, name: calendar.name,
+      writable: calendar.writable, connected: calendar.connected } : null, dueAt: proposal.dueAt ?? null,
+    email: proposal.email ?? null, event: proposal.event ?? null, evidence: proposal.evidence });
+  return Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, payload);
+}
+
 async function saveDocumentCurrent(app: AppControllerImpl, path: string, content: string) {
   const revision = app.getSnapshot().documents.find((item) => item.path === path)?.revision;
   return app.saveDocument(path, content, { expectedRevision: revision });
 }
 
 describe('application state controller', () => {
+  it('keeps v2 approval hashes stable across canonical key ordering and undefined-field removal', async () => {
+    const store = new CanonicalizingMemoryStore();
+    const app = new AppControllerImpl(store);
+    await app.load();
+    const note = await app.saveNote({ transcript: 'Email Alex the agenda.' });
+    const [proposal] = await app.processNote(note.id);
+    const account = await app.saveAccount({ provider: 'google', displayName: 'Work', email: 'me@example.com' });
+    await app.editProposal(proposal.id, { accountId: account.id, recipients: ['alex@example.com'], email: {
+      operation: 'draft', to: ['alex@example.com'], cc: [], bcc: [], subject: 'Agenda', text: 'Here is the agenda.', attachments: [],
+    } });
+    const approved = await app.approveProposal(proposal.id);
+    expect(approved.approvedPayloadDigestVersion).toBe(2);
+    const digest = approved.approvedPayloadDigest;
+    const reloaded = new AppControllerImpl(store);
+    await reloaded.load();
+    expect(reloaded.getSnapshot().proposals.find((item) => item.id === proposal.id)).toMatchObject({
+      status: 'approved', approvedPayloadDigestVersion: 2, approvedPayloadDigest: digest,
+    });
+  });
+
+  it('preserves reproducible legacy approvals, demotes only unverifiable pending approvals, and rejects unknown digest versions', async () => {
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store);
+    await app.load();
+    const note = await app.saveNote({ transcript: 'Email Alex the agenda.' });
+    const [proposal] = await app.processNote(note.id);
+    const account = await app.saveAccount({ provider: 'google', displayName: 'Work', email: 'me@example.com' });
+    await app.editProposal(proposal.id, { accountId: account.id, recipients: ['alex@example.com'], email: {
+      operation: 'draft', to: ['alex@example.com'], cc: [], bcc: [], subject: 'Agenda', text: 'Here is the agenda.', attachments: [],
+    } });
+    await app.approveProposal(proposal.id);
+    const saved = store.value!;
+    const legacy = saved.proposals.find((item) => item.id === proposal.id)!;
+    delete legacy.approvedPayloadDigestVersion;
+    legacy.approvedPayloadDigest = await legacyProposalApprovalDigest(legacy, saved);
+    const legacyDigest = legacy.approvedPayloadDigest;
+    saved.proposals.push({ ...structuredClone(legacy), id: 'accepted-legacy-history', status: 'accepted' });
+    saved.proposals.push({ ...structuredClone(legacy), id: 'unknown-legacy-history', status: 'unknown' });
+    const legacyReload = new AppControllerImpl(store);
+    await legacyReload.load();
+    expect(legacyReload.getSnapshot().proposals.find((item) => item.id === proposal.id)).toMatchObject({
+      status: 'approved', approvedPayloadDigest: legacyDigest,
+    });
+    expect(legacyReload.getSnapshot().proposals.find((item) => item.id === 'accepted-legacy-history')?.status).toBe('accepted');
+    expect(legacyReload.getSnapshot().proposals.find((item) => item.id === 'unknown-legacy-history')?.status).toBe('unknown');
+
+    const changedStore = new MemoryStore();
+    changedStore.value = structuredClone(saved);
+    const changed = changedStore.value!.proposals.find((item) => item.id === proposal.id)!;
+    changed.title += ' tampered after approval';
+    const reloaded = new AppControllerImpl(changedStore);
+    await reloaded.load();
+    expect(reloaded.getSnapshot().proposals.find((item) => item.id === proposal.id)).toMatchObject({ status: 'draft' });
+    expect(reloaded.getSnapshot().proposals.find((item) => item.id === proposal.id)?.approvedPayloadDigest).toBeUndefined();
+
+    const unknownStore = new MemoryStore();
+    unknownStore.value = structuredClone(saved);
+    const unknown = unknownStore.value!.proposals.find((item) => item.id === proposal.id)!;
+    (unknown as unknown as Record<string, unknown>).approvedPayloadDigestVersion = 99;
+    const unknownReload = new AppControllerImpl(unknownStore);
+    await unknownReload.load();
+    expect(unknownReload.getSnapshot().proposals.find((item) => item.id === proposal.id)).toMatchObject({ status: 'draft' });
+    await expect(unknownReload.executeProposal(proposal.id)).rejects.toThrow(/approve this exact version/i);
+  });
+
   it('uses the injected UUID port for shared preview proposal IDs', () => {
     const note = { id: 'note-1', transcript: 'Please send the update.', revision: 3 } as Note;
     const ids = ['node-uuid-1', 'node-uuid-2'];
@@ -41,7 +138,7 @@ describe('application state controller', () => {
   it('uses native defaults without mutating a frozen integration object', async () => {
     const store = new MemoryStore();
     const integration = Object.freeze({ writeDocument: vi.fn(async () => {}), privacySession: { epoch: 'frozen-port', assertCurrent: vi.fn(async () => {}) } });
-    const app = new AppControllerImpl(store, {}, integration);
+    let app = new AppControllerImpl(store, {}, integration);
 
     await app.load();
     const note = await app.saveNote({ transcript: 'Frozen integration stays caller-owned.' });
@@ -304,6 +401,184 @@ describe('application state controller', () => {
       email: { ...child.email!, operation: 'draft', to: ['new@example.test'], text: 'Edited after the delayed result.' } },
     { expectedRevision: child.revision, accountId: account.id, expectedConnectionGeneration: account.connectionGeneration });
     await expect(restored.approveProposal(edited.id, { expectedRevision: edited.revision })).resolves.toMatchObject({ status: 'approved', revision: edited.revision });
+  });
+
+  it.each(['google', 'microsoft'] as const)('promotes and sends an accepted %s provider draft through ConnectorClient', async (provider) => {
+    const store = new MemoryStore();
+    const identity = provider === 'google'
+      ? { providerNamespace: 'google' as const, clientId: 'connector-promote-client', subject: 'connector-promote-subject' }
+      : { providerNamespace: 'microsoft' as const, clientId: 'connector-promote-client', subject: 'connector-promote-subject', resourceUserId: 'connector-promote-resource' };
+    const tokenValues = new Map<string, StoredOAuthToken>();
+    const requests: { url: string; method: string; body?: string }[] = [];
+    let expectedGraphDraft: { subject: string; text: string; to: string[]; cc: string[] } | undefined;
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = String(init?.method ?? 'GET').toUpperCase();
+      requests.push({ url, method, ...(typeof init?.body === 'string' ? { body: init.body } : {}) });
+      if (url.endsWith('/v1/userinfo') || url.endsWith('/oidc/userinfo')) return new Response(JSON.stringify({ sub: identity.subject, email: 'me@example.test' }), { status: 200 });
+      if (provider === 'microsoft' && url.includes('/v1.0/me?$select=id')) return new Response(JSON.stringify({ id: identity.resourceUserId }), { status: 200 });
+      if (provider === 'google' && url.endsWith('/gmail/v1/users/me/drafts')) {
+        return new Response(JSON.stringify({ id: 'gmail-accepted-draft-id', message: { threadId: 'connector-promote-thread' } }), { status: 200 });
+      }
+      if (provider === 'microsoft' && url.endsWith('/createReply')) return new Response(JSON.stringify({ id: 'graph-accepted-draft-id', isDraft: true,
+        subject: expectedGraphDraft!.subject, body: { contentType: 'text', content: expectedGraphDraft!.text },
+        toRecipients: expectedGraphDraft!.to.map((address) => ({ emailAddress: { address } })),
+        ccRecipients: expectedGraphDraft!.cc.map((address) => ({ emailAddress: { address } })), bccRecipients: [] }), { status: 201 });
+      if (provider === 'google' && url.endsWith('/gmail/v1/users/me/drafts/send')) {
+        return new Response(JSON.stringify({ id: 'gmail-new-sent-message-id', threadId: 'connector-promote-thread' }), { status: 200 });
+      }
+      if (provider === 'microsoft' && url.endsWith('/me/sendMail')) return new Response(null, { status: 202 });
+      throw new Error(`Unexpected fake provider request: ${method} ${url}`);
+    }) as typeof fetch;
+    const tokenStore = { async get(ref: string) { const value = tokenValues.get(ref); return value ? structuredClone(value) : null; },
+      async set(ref: string, value: StoredOAuthToken) { tokenValues.set(ref, structuredClone(value)); } };
+    const client = new ConnectorClient({ tokenStore, fetcher, googleClientId: identity.clientId, microsoftClientId: identity.clientId });
+    const integration = { tokenStore, deleteToken: async () => undefined, clientIds: { google: identity.clientId, microsoft: identity.clientId },
+      verifyOAuthResult: async () => true, connectorFactory: () => client as never };
+    const app = new AppControllerImpl(store, {}, integration);
+    await app.load();
+    const grantedScopes = provider === 'google'
+      ? ['openid', 'https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/gmail.compose', 'https://www.googleapis.com/auth/gmail.send']
+      : ['openid', 'Mail.ReadWrite', 'Mail.Send'];
+    const oauth: OAuthBridgeResult = { provider, accessToken: `${provider}-connector-token`, expiresAt: Date.now() + 600_000, grantedScopes,
+      requestedCapabilities: ['mail.read', 'mail.draft', 'mail.send'], capabilities: ['mail.read', 'mail.draft', 'mail.send'], identity,
+      displayName: 'Connector promotion account', email: 'me@example.test' };
+    tokenValues.set(oauth.accessToken, { accessToken: oauth.accessToken, expiresAt: oauth.expiresAt, identity });
+    const account = await app.installVerifiedAccount({ provider, displayName: '', email: '' }, oauth);
+    const observedAt = new Date().toISOString();
+    const message = { id: `${provider}-connector-message`, accountId: account.id, providerMessageId: `${provider}-connector-provider-message`,
+      identityKey: provider === 'google' ? 'google:connector-promote-client:connector-promote-subject:'
+        : 'microsoft:connector-promote-client:connector-promote-subject:connector-promote-resource',
+      verifiedIdentityKey: provider === 'google' ? 'google:connector-promote-client:connector-promote-subject:'
+        : 'microsoft:connector-promote-client:connector-promote-subject:connector-promote-resource',
+      connectionGeneration: account.connectionGeneration, idFormat: provider === 'google' ? 'gmail' as const : 'graph-immutable' as const,
+      threadId: 'connector-promote-thread', subject: 'Connector promotion', from: 'Sam <sam@example.test>', senderEmail: 'sam@example.test',
+      internetMessageId: '<connector-promote@example.test>', replyTo: ['sam@example.test'], to: ['me@example.test'], cc: [],
+      replyMetadataComplete: true, observedAt };
+    store.value!.mailbox.push(message);
+    await store.save(store.value!);
+    const refreshed = new AppControllerImpl(store, {}, integration);
+    await refreshed.load();
+    await refreshed.saveSettings({ mode: 'provider' });
+    const source = await refreshed.getMailReplySource(message.id);
+    expect(source.status).toBe('current');
+    const parentDraft = await refreshed.createMailReplyProposal({ messageId: message.id, mode: 'reply', sourceDigest: source.source!.sourceDigest,
+      text: 'Approved provider draft text.' });
+    expectedGraphDraft = { subject: parentDraft.email!.reply!.sourceSubject, text: parentDraft.email!.text,
+      to: parentDraft.email!.to, cc: parentDraft.email!.cc };
+    await refreshed.approveProposal(parentDraft.id);
+    const acceptedParent = await refreshed.executeProposal(parentDraft.id);
+    expect(acceptedParent).toMatchObject({ status: 'accepted', remoteOperation: 'draft',
+      remoteId: provider === 'google' ? 'gmail-accepted-draft-id' : 'graph-accepted-draft-id' });
+    const parentBeforePromotion = structuredClone(refreshed.getSnapshot().proposals.find((item) => item.id === parentDraft.id)!);
+    const parentReceipt = refreshed.getSnapshot().dispatchRecords.find((item) => item.id === parentBeforePromotion.dispatchRecordId)!;
+    expect(parentReceipt.replyDraftCheck).toBe(provider === 'google' ? 'unverified' : 'matches_approved');
+    const originalLimits = [...refreshed.getSnapshot().accounts.find((item) => item.id === account.id)!.capabilityLimits!];
+    await (refreshed as unknown as { mutate(operation: (draft: AppState) => void): Promise<void> }).mutate((draft) => {
+      draft.accounts.find((item) => item.id === account.id)!.capabilityLimits = originalLimits.filter((capability) => capability !== (provider === 'google' ? 'mail.draft' : 'mail.send'));
+    });
+    await expect(refreshed.promoteAcceptedMailReplyDraftForCommand({ parentProposalId: parentDraft.id,
+      expectedParentRevision: parentBeforePromotion.revision, draftDispatchRecordId: parentReceipt.id, accountId: account.id,
+      expectedConnectionGeneration: account.connectionGeneration! })).rejects.toThrow(/permission|capability|scope/i);
+    await (refreshed as unknown as { mutate(operation: (draft: AppState) => void): Promise<void> }).mutate((draft) => {
+      draft.accounts.find((item) => item.id === account.id)!.capabilityLimits = originalLimits;
+    });
+    const child = await refreshed.promoteAcceptedMailReplyDraftForCommand({ parentProposalId: parentDraft.id,
+      expectedParentRevision: parentBeforePromotion.revision, draftDispatchRecordId: parentReceipt.id, accountId: account.id,
+      expectedConnectionGeneration: account.connectionGeneration! });
+    expect(child.provenance).toMatchObject({ version: 3, operation: 'send', lineage: { kind: 'accepted_draft',
+      parentProposalId: parentDraft.id, remoteDraftId: parentReceipt.remoteId } });
+    await refreshed.approveProposal(child.id, { expectedRevision: child.revision });
+    const sent = await refreshed.executeProposal(child.id);
+    expect(sent).toMatchObject({ status: 'accepted', remoteOperation: 'send' });
+    expect(refreshed.getSnapshot().proposals.find((item) => item.id === parentDraft.id)).toEqual({ ...parentBeforePromotion,
+      supersededByProposalId: child.id });
+    expect(refreshed.getSnapshot().dispatchRecords.find((item) => item.id === parentReceipt.id)).toEqual(parentReceipt);
+    expect(requests.filter((request) => request.method === 'POST').map((request) => request.url)).toEqual(provider === 'google'
+      ? ['https://gmail.googleapis.com/gmail/v1/users/me/drafts', 'https://gmail.googleapis.com/gmail/v1/users/me/drafts/send']
+      : ['https://graph.microsoft.com/v1.0/me/messages/microsoft-connector-provider-message/createReply', 'https://graph.microsoft.com/v1.0/me/sendMail']);
+    if (provider === 'google') expect(sent.remoteId).toBe('gmail-new-sent-message-id');
+    else expect(sent.remoteId).toBeUndefined();
+  });
+
+  it('promotes an accepted v2 mail reply through its exact historical draft receipt into a fresh send copy', async () => {
+    const store = new MemoryStore();
+    const identity = { providerNamespace: 'google' as const, clientId: 'promote-client', subject: 'promote-subject' };
+    const tokenValues = new Map<string, StoredOAuthToken>();
+    let providerWrites = 0;
+    const connector = {
+      async verifyOAuthIdentity() { return true; },
+      async createDraft(_account: unknown, envelope: Record<string, unknown>, verifier: { verify(value: never): Promise<boolean>; verifyBeforeDispatch(value: never): boolean }) {
+        expect(await verifier.verify(envelope as never)).toBe(true);
+        expect(verifier.verifyBeforeDispatch(envelope as never)).toBe(true);
+        providerWrites += 1;
+        return { status: 'accepted' as const, id: 'opaque-provider-draft:α-1', replyDraftCheck: 'matches_approved' as const };
+      },
+    };
+    const integration = { tokenStore: { async get(ref: string) { const value = tokenValues.get(ref); return value ? structuredClone(value) : null; },
+      async set(ref: string, value: StoredOAuthToken) { tokenValues.set(ref, structuredClone(value)); } }, deleteToken: async () => undefined,
+      clientIds: { google: 'promote-client' }, verifyOAuthResult: async () => true, connectorFactory: () => connector as never };
+    let app = new AppControllerImpl(store, {}, integration);
+    await app.load();
+    const oauth: OAuthBridgeResult = { provider: 'google', accessToken: 'promote-token', expiresAt: Date.now() + 600_000,
+      grantedScopes: ['openid', 'https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/gmail.compose', 'https://www.googleapis.com/auth/gmail.send'],
+      requestedCapabilities: ['mail.read', 'mail.draft', 'mail.send'], capabilities: ['mail.read', 'mail.draft', 'mail.send'], identity,
+      displayName: 'Promotion account', email: 'me@example.test' };
+    tokenValues.set('promote-token', { accessToken: oauth.accessToken, expiresAt: oauth.expiresAt, identity });
+    const account = await app.installVerifiedAccount({ provider: 'google', displayName: '', email: '' }, oauth);
+    const observedAt = new Date().toISOString();
+    const message = { id: 'promote-message', accountId: account.id, providerMessageId: 'promote-provider-message',
+      identityKey: 'google:promote-client:promote-subject:', verifiedIdentityKey: 'google:promote-client:promote-subject:',
+      connectionGeneration: account.connectionGeneration, idFormat: 'gmail' as const, threadId: 'promote-thread', subject: 'Review this reply',
+      from: 'Sam <sam@example.test>', senderEmail: 'sam@example.test', internetMessageId: '<promote@example.test>', replyTo: ['sam@example.test'],
+      to: ['me@example.test'], cc: [], replyMetadataComplete: true, observedAt };
+    store.value!.mailbox.push(message);
+    await store.save(store.value!);
+    app = new AppControllerImpl(store, {}, integration);
+    await app.load();
+    await app.saveSettings({ mode: 'provider' });
+    const source = await app.getMailReplySource(message.id);
+    expect(source).toMatchObject({ status: 'current' });
+    const parentDraft = await app.createMailReplyProposal({ messageId: message.id, mode: 'reply', sourceDigest: source.source!.sourceDigest, text: 'Reviewed batch reply.' });
+    const historical = store.value!.proposals.find((item) => item.id === parentDraft.id)!;
+    const v3 = historical.provenance!;
+    if (v3.version !== 3) throw new Error('Expected a current manual mail reply before the legacy fixture conversion.');
+    historical.provenance = { version: 2, kind: 'mail_reply', sourceDigest: v3.sourceDigest, source: v3.source,
+      expiresAt: v3.expiresAt, outputPolicyVersion: 2 };
+    await store.save(store.value!);
+    let restored = new AppControllerImpl(store, {}, integration);
+    await restored.load();
+    await restored.approveProposal(parentDraft.id);
+    const accepted = await restored.executeProposal(parentDraft.id);
+    expect(accepted).toMatchObject({ status: 'accepted', remoteOperation: 'draft', remoteId: 'opaque-provider-draft:α-1' });
+    const acceptedParentBefore = structuredClone(restored.getSnapshot().proposals.find((item) => item.id === parentDraft.id)!);
+    const draftRecord = restored.getSnapshot().dispatchRecords.find((record) => record.id === acceptedParentBefore.dispatchRecordId)!;
+    const promotion = { parentProposalId: parentDraft.id,
+      expectedParentRevision: acceptedParentBefore.revision, draftDispatchRecordId: draftRecord.id, accountId: account.id,
+      expectedConnectionGeneration: account.connectionGeneration! };
+    const firstPromotions = await Promise.allSettled([restored.promoteAcceptedMailReplyDraftForCommand(promotion),
+      restored.promoteAcceptedMailReplyDraftForCommand(promotion)]);
+    const children = firstPromotions.filter((result): result is PromiseFulfilledResult<Proposal> => result.status === 'fulfilled').map((result) => result.value);
+    expect(children).toHaveLength(1);
+    expect(firstPromotions.filter((result) => result.status === 'rejected')).toHaveLength(1);
+    const child = children[0]!;
+    expect(child).toMatchObject({ status: 'draft', revision: 1, accountId: account.id, sourceActionKey: acceptedParentBefore.sourceActionKey,
+      email: { operation: 'send' }, provenance: { version: 3, kind: 'manual_mail_reply', operation: 'send',
+        lineage: { kind: 'accepted_draft', parentProposalId: parentDraft.id, parentRevision: acceptedParentBefore.revision,
+          draftDispatchRecordId: draftRecord.id, remoteDraftId: 'opaque-provider-draft:α-1' } } });
+    expect(providerWrites).toBe(1);
+    const acceptedParentAfter = restored.getSnapshot().proposals.find((item) => item.id === parentDraft.id)!;
+    expect(acceptedParentAfter).toEqual({ ...acceptedParentBefore, supersededByProposalId: child.id });
+    expect(acceptedParentAfter).toMatchObject({ status: 'accepted', approvedRevision: acceptedParentBefore.approvedRevision,
+      approvedPayloadDigest: acceptedParentBefore.approvedPayloadDigest, remoteId: 'opaque-provider-draft:α-1' });
+    await expect(restored.editProposal(child.id, { email: { ...child.email!, operation: 'draft' } }, { expectedRevision: child.revision,
+      accountId: account.id, expectedConnectionGeneration: account.connectionGeneration! })).rejects.toThrow(/send/i);
+    await expect(restored.deriveManualMailReplyForCommand({ parentProposalId: child.id, expectedParentRevision: child.revision,
+      accountId: account.id, expectedConnectionGeneration: account.connectionGeneration!, operation: 'draft' })).rejects.toThrow(/accepted provider draft/i);
+    restored = new AppControllerImpl(store, {}, integration);
+    await restored.load();
+    expect(restored.getSnapshot().proposals.find((item) => item.id === child.id)?.provenance).toMatchObject({ version: 3, operation: 'send',
+      lineage: { kind: 'accepted_draft', parentProposalId: parentDraft.id, draftDispatchRecordId: draftRecord.id } });
   });
 
   it('executes frozen mail replies without notes, preserves unknown receipts, and blocks a changed connection before the write', async () => {
@@ -1886,7 +2161,7 @@ describe('application state controller', () => {
     const reloaded = new AppControllerImpl(store);
     await reloaded.load();
     expect(reloaded.getSnapshot().accounts[0]).toMatchObject({ connected: false, authStatus: 'reauth_required' });
-    await expect(reloaded.executeProposal(edited.id)).rejects.toThrow(/content or destination changed/i);
+    await expect(reloaded.executeProposal(edited.id)).rejects.toThrow(/approve this exact version/i);
   });
 
   it('rejects malformed structured event times and zones before approval', async () => {

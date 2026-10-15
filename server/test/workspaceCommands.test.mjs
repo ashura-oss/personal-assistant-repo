@@ -143,6 +143,58 @@ function envelope(command, expectedRevision = 0, expectedPrivacyEpoch = 0, comma
   return { schemaVersion: 1, commandId, expectedRevision, expectedPrivacyEpoch, command };
 }
 
+async function promotableCommandFixture() {
+  const identity = { providerNamespace: 'google', clientId: 'promote-command-client', subject: 'promote-command-subject' };
+  const identityKey = 'google:promote-command-client:promote-command-subject:';
+  const account = { id: 'promote-command-account', provider: 'google', displayName: 'Promotion account', email: 'me@example.test', verifiedEmail: 'me@example.test',
+    connected: true, authStatus: 'connected', identity, tokenRef: 'promote-command-token', capabilities: ['mail.read', 'mail.draft', 'mail.send'],
+    capabilityLimits: ['mail.read', 'mail.draft', 'mail.send'],
+    grantedScopes: ['openid', 'https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/gmail.compose',
+      'https://www.googleapis.com/auth/gmail.send'], connectionGeneration: 7 };
+  const observedAt = new Date().toISOString();
+  const message = { id: 'promote-command-message', accountId: account.id, providerMessageId: 'promote-command-provider-message',
+    identityKey: `${identityKey}:promote-command-provider-message`, verifiedIdentityKey: identityKey, connectionGeneration: account.connectionGeneration,
+    idFormat: 'gmail', threadId: 'promote-command-thread', subject: 'Gateway promotion', from: 'Sam <sam@example.test>', senderEmail: 'sam@example.test',
+    internetMessageId: '<promote-command@example.test>', replyTo: ['sam@example.test'], to: ['me@example.test'], cc: [], replyMetadataComplete: true, observedAt };
+  let controller;
+  let providerDraftWrites = 0;
+  let providerSendWrites = 0;
+  const token = { accessToken: 'promote-command-access', expiresAt: Date.now() + 600_000, identity };
+  const integrationOverrides = { tokenStore: { async get() { return structuredClone(token); }, async set() {} }, connectorFactory() {
+    return { async verifyOAuthIdentity() { return true; }, async createDraft(_account, envelope, verifier) {
+      assert.equal(await verifier.verify(envelope), true);
+      assert.equal(verifier.verifyBeforeDispatch(envelope), true);
+      providerDraftWrites += 1;
+      return { status: 'accepted', id: 'gateway-provider-draft', replyDraftCheck: 'matches_approved' };
+    }, async sendEmail(_account, envelope, verifier) {
+      assert.equal(await verifier.verify(envelope), true);
+      assert.equal(verifier.verifyBeforeDispatch(envelope), true);
+      providerSendWrites += 1;
+      return { status: 'accepted', id: 'gateway-provider-sent' };
+    } };
+  } };
+  const f = fixture({ initialAccounts: [account], initialMailbox: [message], captureController(value) { controller = value; }, integrationOverrides });
+  const head = await f.runtime.getSnapshot(f.admission);
+  const configured = await dispatchWorkspaceCommand(f.runtime, f.admission,
+    envelope({ kind: 'settings.update', patch: { mode: 'provider' } }, head.revision, head.privacyEpoch));
+  const source = await controller.getMailReplySource(message.id);
+  assert.equal(source.status, 'current');
+  const created = await dispatchWorkspaceCommand(f.runtime, f.admission, envelope({ kind: 'mail.reply.create', messageId: message.id,
+    accountId: account.id, expectedConnectionGeneration: account.connectionGeneration, sourceDigest: source.source.sourceDigest,
+    mode: 'reply', text: 'Reviewed gateway reply.', to: ['sam@example.test'], cc: [] }, configured.snapshot.revision, configured.snapshot.privacyEpoch));
+  const parentId = created.receipt.proposalId;
+  await controller.approveProposal(parentId);
+  const accepted = await controller.executeProposal(parentId);
+  assert.equal(accepted.status, 'accepted');
+  assert.equal(providerDraftWrites, 1);
+  const parent = controller.getSnapshot().proposals.find((item) => item.id === parentId);
+  return { f, controller, account, parent, get providerSendWrites() { return providerSendWrites; }, async command() {
+    const current = await f.runtime.refreshSnapshot(f.admission);
+    return envelope({ kind: 'mail.reply.promoteDraft', parentProposalId: parent.id, expectedParentRevision: parent.revision,
+      draftDispatchRecordId: parent.dispatchRecordId, accountId: account.id, expectedConnectionGeneration: account.connectionGeneration }, current.revision, current.privacyEpoch);
+  } };
+}
+
 function wavFixture() {
   const sampleRate = 8000;
   const data = Buffer.alloc(1600, 128);
@@ -230,6 +282,57 @@ test('settings.update parser exposes only a nonempty closed settings patch and n
   const receipt = { schemaVersion: 1, commandId, kind: 'settings.update', objectId: 'workspace-settings' };
   assert.deepEqual(parseWorkspaceCommandReceipt(receipt, { commandId, kind: 'settings.update', objectId: 'workspace-settings' }), receipt);
   assert.throws(() => parseWorkspaceCommandReceipt({ ...receipt, objectId: 'settings' }), /workspace_command_receipt_invalid/);
+});
+
+test('promotion gateway receipt binds the exact parent revision and draft record and replays without another child', async () => {
+  const setup = await promotableCommandFixture();
+  try {
+    const command = await setup.command();
+    const result = await dispatchWorkspaceCommand(setup.f.runtime, setup.f.admission, command);
+    assert.equal(result.status, 'finished');
+    assert.deepEqual(result.receipt, { schemaVersion: 1, commandId: command.commandId, kind: 'mail.reply.promoteDraft',
+      objectId: result.receipt.childProposalId, parentProposalId: setup.parent.id, parentProposalRevision: setup.parent.revision,
+      draftDispatchRecordId: setup.parent.dispatchRecordId, childProposalId: result.receipt.objectId, childProposalRevision: 1,
+      accountId: setup.account.id, connectionGeneration: setup.account.connectionGeneration, operation: 'send' });
+    const countChildren = (state) => state.proposals.filter((item) => item.provenance?.version === 3 && item.provenance.lineage.kind === 'accepted_draft' &&
+      item.provenance.lineage.parentProposalId === setup.parent.id).length;
+    assert.equal(countChildren(result.snapshot.state), 1);
+    const replay = await dispatchWorkspaceCommand(setup.f.runtime, setup.f.admission, command);
+    assert.deepEqual(replay.receipt, result.receipt);
+    assert.equal(countChildren((await setup.f.runtime.refreshSnapshot(setup.f.admission)).state), 1);
+    const childId = result.receipt.childProposalId;
+    let head = await setup.f.runtime.getSnapshot(setup.f.admission);
+    const approved = await dispatchWorkspaceCommand(setup.f.runtime, setup.f.admission,
+      envelope({ kind: 'proposals.approve', proposalId: childId, expectedProposalRevision: 1 }, head.revision, head.privacyEpoch));
+    assert.equal(approved.status, 'finished');
+    await setup.f.runtime.refreshSnapshot(setup.f.admission);
+    head = await setup.f.runtime.getSnapshot(setup.f.admission);
+    const sent = await dispatchWorkspaceCommand(setup.f.runtime, setup.f.admission,
+      envelope({ kind: 'proposals.execute', proposalId: childId, expectedProposalRevision: 1 }, head.revision, head.privacyEpoch));
+    assert.equal(sent.status, 'finished');
+    assert.equal(setup.providerSendWrites, 1, 'the v2 approval digest survives the canonical server refresh before dispatch');
+  } finally { await setup.f.runtime.closeAfterDrain(); setup.f.kernel.close(); rmSync(setup.f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test('lost promotion gateway acknowledgement remains inspect-only and exact retry cannot create a second child', async () => {
+  const setup = await promotableCommandFixture();
+  try {
+    const command = await setup.command();
+    setup.f.loseNextWorkspaceCommitAck();
+    await assert.rejects(dispatchWorkspaceCommand(setup.f.runtime, setup.f.admission, command), /acknowledgement|simulated|commit/i);
+    assert.equal(inspectWorkspaceCommand(setup.f.runtime, setup.f.admission, command.commandId).status, 'inspect_required');
+    await assert.rejects(dispatchWorkspaceCommand(setup.f.runtime, setup.f.admission, command), /workspace_refresh_required/i,
+      'a lost acknowledgement holds command admission until an explicit workspace refresh');
+    let state = (await setup.f.runtime.refreshSnapshot(setup.f.admission)).state;
+    assert.equal(state.proposals.filter((item) => item.provenance?.version === 3 && item.provenance.lineage.kind === 'accepted_draft' &&
+      item.provenance.lineage.parentProposalId === setup.parent.id).length, 1);
+    const retry = await dispatchWorkspaceCommand(setup.f.runtime, setup.f.admission, command);
+    assert.equal(retry.status, 'inspect_required');
+    assert.equal(Object.hasOwn(retry, 'receipt'), false);
+    state = (await setup.f.runtime.refreshSnapshot(setup.f.admission)).state;
+    assert.equal(state.proposals.filter((item) => item.provenance?.version === 3 && item.provenance.lineage.kind === 'accepted_draft' &&
+      item.provenance.lineage.parentProposalId === setup.parent.id).length, 1);
+  } finally { await setup.f.runtime.closeAfterDrain(); setup.f.kernel.close(); rmSync(setup.f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test('real command dispatch creates and edits documents, people, projects, facts, contacts, members, and archives with exact metadata receipts', async () => {

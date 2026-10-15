@@ -509,7 +509,17 @@ function assertNoDuplicateDispatch(state: AppState, candidate: DispatchRecord): 
   const candidateMail = candidate.operation === 'draft' || candidate.operation === 'send';
   const candidateMailReply = candidateMail && ((candidate.sourceProvenance.version === 2 && candidate.sourceProvenance.kind === 'mail_reply') ||
     (candidate.sourceProvenance.version === 3 && candidate.sourceProvenance.kind === 'manual_mail_reply'));
+  const acceptedDraftLineage = candidate.operation === 'send' && candidate.sourceProvenance.version === 3 &&
+    candidate.sourceProvenance.lineage.kind === 'accepted_draft' ? candidate.sourceProvenance.lineage : undefined;
   const recordDuplicate = state.dispatchRecords.some((record) => {
+    if (acceptedDraftLineage && record.id === acceptedDraftLineage.draftDispatchRecordId &&
+        record.proposalId === acceptedDraftLineage.parentProposalId && record.operation === 'draft' && record.outcome === 'accepted' &&
+        record.remoteId === acceptedDraftLineage.remoteDraftId && record.sourceActionKey === candidate.sourceActionKey &&
+        sameSourceIdentity(record)) {
+      const parent = state.proposals.find((item) => item.id === acceptedDraftLineage.parentProposalId);
+      if (parent?.status === 'accepted' && parent.dispatchRecordId === record.id && parent.supersededByProposalId === candidate.proposalId &&
+          stableJson(parent.provenance) === stableJson(record.sourceProvenance)) return false;
+    }
     if (!['pending', 'accepted', 'unknown'].includes(record.outcome)) return false;
     if (record.duplicateKey === candidate.duplicateKey) return true;
     const recordMailReply = (record.operation === 'draft' || record.operation === 'send') &&
@@ -569,6 +579,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isMailReplyProvenance(value: Proposal['provenance']): value is MailReplyProvenance | ManualMailReplyProvenance {
   return value?.version === 2 && value.kind === 'mail_reply' || value?.version === 3 && value.kind === 'manual_mail_reply';
+}
+
+function isManualMailReplyProvenance(value: Proposal['provenance']): value is ManualMailReplyProvenance {
+  return value?.version === 3 && value.kind === 'manual_mail_reply';
 }
 
 function hasExactPlainDataKeys(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
@@ -916,7 +930,7 @@ function intersectCapabilities(...groups: AccountCapability[][]): AccountCapabil
 async function approvedDigest(proposal: Proposal, state: AppState, digest: (value: string) => Promise<string>): Promise<string> {
   const account = state.accounts.find((item) => item.id === proposal.accountId);
   const calendar = proposal.eventDestination?.kind === 'remote_calendar' ? state.calendars.find((item) => item.id === proposal.eventDestination?.calendarId) : undefined;
-  const payload = JSON.stringify({
+  const payload = {
     id: proposal.id, revision: proposal.revision, noteId: proposal.noteId, sourceRevision: proposal.sourceRevision,
     provenance: proposal.provenance ?? null, requiresRebuild: proposal.requiresRebuild ?? false,
     kind: proposal.kind, title: proposal.title, body: proposal.body,
@@ -933,8 +947,10 @@ async function approvedDigest(proposal: Proposal, state: AppState, digest: (valu
     eventDestination: proposal.eventDestination ?? null, deviceCalendarApproval: proposal.deviceCalendarApproval ?? null,
     calendarDestination: calendar ? { accountId: calendar.accountId, providerId: calendar.providerId ?? null, name: calendar.name, writable: calendar.writable, connected: calendar.connected } : null,
     dueAt: proposal.dueAt ?? null, email: proposal.email ?? null, event: proposal.event ?? null, evidence: proposal.evidence,
-  });
-  return digest(payload);
+  };
+  if (proposal.approvedPayloadDigestVersion === undefined) return digest(JSON.stringify(payload));
+  if (proposal.approvedPayloadDigestVersion !== 2) throw new Error('The approval digest version is not supported. Review and approve this proposal again.');
+  return digest(canonicalPersistedJson(payload));
 }
 
 export function extractPreviewProposals(note: Note, newId: () => string): Proposal[] {
@@ -1138,7 +1154,7 @@ function normalizeLoadedState(value: unknown, id: () => string): NormalizedLoade
       revision: Number.isFinite(proposal.revision) ? proposal.revision : 1,
       ...(provenance?.version === 2 || provenance?.version === 3 ? {} : { sourceRevision: Number.isFinite(proposal.sourceRevision) ? proposal.sourceRevision : source?.revision ?? 1 }),
       provenance, requiresRebuild,
-      ...(requiresRebuild && proposal.status === 'approved' ? { status: 'draft' as const, approvedRevision: undefined, approvedPayloadDigest: undefined } : {}),
+      ...(requiresRebuild && proposal.status === 'approved' ? { status: 'draft' as const, approvedRevision: undefined, approvedPayloadDigest: undefined, approvedPayloadDigestVersion: undefined } : {}),
       sourceActionKey: proposal.sourceActionKey ?? (source && Array.isArray(proposal.evidence)
         ? sourceActionKey({ ...source, revision: Number.isFinite(proposal.sourceRevision) ? proposal.sourceRevision! : source.revision }, proposal.kind, proposal.evidence)
         : undefined),
@@ -3494,6 +3510,46 @@ export class AppControllerImpl implements AppController {
       email: proposal.email ?? null, provenance: proposal.provenance ?? null }));
   }
 
+  private async acceptedDraftParentPayloadDigest(proposal: Proposal): Promise<string> {
+    return this.crypto.sha256(canonicalPersistedJson({ id: proposal.id, revision: proposal.revision, accountId: proposal.accountId ?? null,
+      sourceActionKey: proposal.sourceActionKey ?? null, title: proposal.title, body: proposal.body, recipients: proposal.recipients,
+      email: proposal.email ?? null, provenance: proposal.provenance ?? null }));
+  }
+
+  private async acceptedDraftRecordDigestForParent(state: AppState, parent: Proposal, draftRecord: DispatchRecord): Promise<string> {
+    try { validateDispatchRecord(draftRecord); } catch { throw new Error('The accepted provider draft receipt is malformed. Review the saved draft history.'); }
+    const provenance = parent.provenance;
+    if (this.dispatchRecordQuarantine.length || parent.status !== 'accepted' || parent.simulated || parent.kind !== 'email' ||
+        !parent.email?.reply || parent.email.operation !== 'draft' || !parent.sourceActionKey || parent.remoteOperation !== 'draft' ||
+        !parent.remoteId || !parent.dispatchRecordId || parent.dispatchRecordId !== draftRecord.id ||
+        parent.approvedRevision !== parent.revision || !parent.approvedPayloadDigest || !isMailReplyProvenance(provenance) ||
+        (provenance.version === 3 && provenance.operation !== 'draft') ||
+        draftRecord.proposalId !== parent.id || draftRecord.operation !== 'draft' || draftRecord.outcome !== 'accepted' ||
+        draftRecord.reconciliations.length !== 0 || !['matches_approved', 'unverified'].includes(draftRecord.replyDraftCheck ?? '') ||
+        draftRecord.remoteId !== parent.remoteId || draftRecord.accountId !== parent.accountId ||
+        draftRecord.sourceActionKey !== parent.sourceActionKey || draftRecord.approvedRevision !== parent.revision ||
+        draftRecord.payloadDigest !== parent.approvedPayloadDigest ||
+        (parent.approvedPayloadDigestVersion !== undefined && parent.approvedPayloadDigestVersion !== 2) ||
+        draftRecord.account.provider !== provenance.source.identity.providerNamespace ||
+        !sameAccountIdentity(draftRecord.account.identity, provenance.source.identity) ||
+        draftRecord.account.email.trim().toLowerCase() !== provenance.source.accountEmail.trim().toLowerCase() ||
+        stableJson(draftRecord.sourceProvenance) !== stableJson(provenance) || draftRecord.payload.kind !== 'email' ||
+        draftRecord.title !== parent.title || draftRecord.body !== parent.body || parent.body !== parent.email.text ||
+        stableJson(parent.recipients) !== stableJson(parent.email.to) || !Array.isArray(parent.evidence) || parent.evidence.length !== 0 || parent.noteId !== undefined ||
+        parent.sourceRevision !== undefined || (parent.requiresRebuild !== undefined && parent.requiresRebuild !== false) || parent.dueAt !== undefined || parent.event !== undefined ||
+        parent.calendarId !== undefined || parent.eventDestination !== undefined || parent.deviceCalendarApproval !== undefined ||
+        parent.eventTransactionId !== undefined || stableJson(draftRecord.payload.email) !== stableJson((({ operation: _operation, ...email }) => email)(parent.email))) {
+      throw new Error('The accepted provider draft no longer matches its exact approved proposal and receipt. Review the saved draft history.');
+    }
+    if (provenance.version === 2 && provenance.batchJobId) {
+      const linked = this.assistantBatchLedger.jobs.find((item) => item.id === provenance.batchJobId);
+      if (!linked || !isOpenRouterMailReplyContentJob(linked) || linked.status !== 'completed' || linked.proposalId !== parent.id ||
+          linked.resultText !== parent.email.text || !linked.resultSha256) throw new Error('The historical Batch result is no longer available for this reply.');
+      await this.assertMailReplyBatchJobIntegrity(linked, true);
+    }
+    return this.crypto.sha256(canonicalPersistedJson(draftRecord));
+  }
+
   private async validateManualMailReplyLineage(state: AppState, proposal: Proposal, provenance: ManualMailReplyProvenance): Promise<void> {
     const lineage = provenance.lineage;
     const hasExactKeys = (value: object, keys: readonly string[]) => {
@@ -3512,8 +3568,10 @@ export class AppControllerImpl implements AppController {
       }
     } else if (lineage.kind === 'accepted_draft') {
       if (!hasExactKeys(lineage, ['kind', 'parentProposalId', 'parentRevision', 'parentPayloadDigest', 'draftDispatchRecordId', 'draftDispatchRecordDigest', 'remoteDraftId']) ||
-          !Number.isSafeInteger(lineage.parentRevision) || lineage.parentRevision < 1 || !/^[a-f\d]{64}$/i.test(lineage.parentPayloadDigest) ||
-          !/^[a-f\d]{64}$/i.test(lineage.draftDispatchRecordDigest) || !lineage.draftDispatchRecordId || !lineage.remoteDraftId) {
+          typeof lineage.parentProposalId !== 'string' || !validBoundedOpaqueText(lineage.parentProposalId, 160) ||
+          !Number.isSafeInteger(lineage.parentRevision) || lineage.parentRevision < 1 || typeof lineage.parentPayloadDigest !== 'string' || !/^[a-f\d]{64}$/i.test(lineage.parentPayloadDigest) ||
+          typeof lineage.draftDispatchRecordDigest !== 'string' || !/^[a-f\d]{64}$/i.test(lineage.draftDispatchRecordDigest) ||
+          !validBoundedOpaqueText(lineage.draftDispatchRecordId, 160) || !validBoundedOpaqueText(lineage.remoteDraftId, 1024) || provenance.operation !== 'send') {
         throw new Error('Accepted draft reply lineage is invalid. Review the saved draft history.');
       }
     }
@@ -3521,7 +3579,9 @@ export class AppControllerImpl implements AppController {
     if (!parent || parent.revision !== lineage.parentRevision || parent.supersededByProposalId !== proposal.id || parent.accountId !== proposal.accountId ||
         parent.sourceActionKey !== proposal.sourceActionKey || !isMailReplyProvenance(parent.provenance) ||
         parent.provenance.sourceDigest !== provenance.sourceDigest || canonicalMailReplySource(parent.provenance.source) !== canonicalMailReplySource(provenance.source) ||
-        await this.manualMailReplyPayloadDigest(parent) !== lineage.parentPayloadDigest) throw new Error('The parent reply lineage changed. Review a fresh reply successor.');
+        (lineage.kind === 'accepted_draft' ? await this.acceptedDraftParentPayloadDigest(parent) : await this.manualMailReplyPayloadDigest(parent)) !== lineage.parentPayloadDigest) {
+      throw new Error('The parent reply lineage changed. Review a fresh reply successor.');
+    }
     if (lineage.kind === 'derived') {
       const batchJobId = parent.provenance.version === 2 ? parent.provenance.batchJobId : undefined;
       const batchResultDigest = batchJobId ? this.assistantBatchLedger.jobs.find((item) => item.id === batchJobId)?.resultSha256 : undefined;
@@ -3532,8 +3592,8 @@ export class AppControllerImpl implements AppController {
       return;
     }
     const draftRecord = state.dispatchRecords.find((item) => item.id === lineage.draftDispatchRecordId);
-    if (!draftRecord || draftRecord.proposalId !== parent.id || draftRecord.operation !== 'draft' || draftRecord.outcome !== 'accepted' ||
-        draftRecord.remoteId !== lineage.remoteDraftId || await this.crypto.sha256(stableJson(draftRecord)) !== lineage.draftDispatchRecordDigest) {
+    if (!draftRecord || draftRecord.remoteId !== lineage.remoteDraftId ||
+        await this.acceptedDraftRecordDigestForParent(state, parent, draftRecord) !== lineage.draftDispatchRecordDigest) {
       throw new Error('The accepted remote draft receipt could not be verified. Review the saved draft history.');
     }
   }
@@ -3541,9 +3601,16 @@ export class AppControllerImpl implements AppController {
   private manualMailReplyDependencyProjection(state: AppState, proposal: Proposal, provenance: ManualMailReplyProvenance): string {
     const account = state.accounts.find((item) => item.id === provenance.source.accountId);
     const message = state.mailbox.find((item) => item.id === provenance.source.localMessageId && item.accountId === provenance.source.accountId);
+    const acceptedDraftLineage = provenance.lineage.kind === 'accepted_draft' ? provenance.lineage : undefined;
+    const acceptedDraftPermissionsInvalid = acceptedDraftLineage && (!account || account.provider === 'local' || !account.grantedScopes || !account.capabilityLimits?.includes('mail.read') ||
+      !account.capabilityLimits.includes('mail.send') || !scopeGrantsCapability(account.provider, account.grantedScopes, 'mail.read') ||
+      !scopeGrantsCapability(account.provider, account.grantedScopes, 'mail.send') ||
+      (account.provider === 'google' && (!account.capabilityLimits.includes('mail.draft') || !account.capabilities?.includes('mail.draft') ||
+        !scopeGrantsCapability('google', account.grantedScopes, 'mail.draft'))));
     if (!account || !message || !account.connected || account.authStatus !== 'connected' || !account.capabilities?.includes('mail.read') ||
         (provenance.operation === 'draft' && !account.capabilities.includes('mail.draft')) ||
-        (provenance.operation === 'send' && !account.capabilities.includes('mail.send')) || account.connectionGeneration !== provenance.source.connectionGeneration ||
+        (provenance.operation === 'send' && !account.capabilities.includes('mail.send')) || acceptedDraftPermissionsInvalid ||
+        account.connectionGeneration !== provenance.source.connectionGeneration ||
         !sameAccountIdentity(account.identity, provenance.source.identity) || message.providerDeletedAt || !message.replyMetadataComplete ||
         message.verifiedIdentityKey !== identityKey(account) || message.connectionGeneration !== account.connectionGeneration ||
         canonicalMailReplySource(this.mailReplySourceFromRow(message, account, provenance.source.observedAt)) !== canonicalMailReplySource(provenance.source)) {
@@ -3554,9 +3621,19 @@ export class AppControllerImpl implements AppController {
     if (!Number.isFinite(expiry) || new Date(expiry).toISOString() !== provenance.expiresAt || expiry !== Date.parse(provenance.source.observedAt) + 15 * 60_000 ||
         !Number.isFinite(age) || age < 0 || age >= 15 * 60_000 || Date.now() >= expiry) throw new Error('The original message observation has expired.');
     validateReplyBinding(proposal.email!, provenance, provenance.operation);
+    let acceptedDraftContext: unknown;
+    if (acceptedDraftLineage) {
+      const parent = state.proposals.find((item) => item.id === acceptedDraftLineage.parentProposalId);
+      const draftRecord = state.dispatchRecords.find((item) => item.id === acceptedDraftLineage.draftDispatchRecordId);
+      acceptedDraftContext = { lineage: acceptedDraftLineage, permissions: {
+        provider: account.provider, identity: account.identity, capabilities: account.capabilities ?? [],
+        capabilityLimits: account.capabilityLimits ?? [], grantedScopes: account.grantedScopes ?? [],
+      }, parent: parent ?? null, draftRecord: draftRecord ?? null };
+    }
     return stableJson({ source: canonicalMailReplySource(provenance.source), sourceDigest: provenance.sourceDigest, expiry: provenance.expiresAt,
       accountGeneration: account.connectionGeneration ?? 0, operation: provenance.operation, payload: proposal.email?.reply ?? null,
-      recipients: { to: proposal.email?.to, cc: proposal.email?.cc }, body: proposal.email?.text });
+      recipients: { to: proposal.email?.to, cc: proposal.email?.cc }, body: proposal.email?.text,
+      ...(acceptedDraftContext !== undefined ? { acceptedDraftContext } : {}) });
   }
 
   private mailReplySourceFromRow(message: MailboxSnapshotMessage, account: Account, observedAt = message.observedAt ?? ''): MailReplySourceSnapshot {
@@ -3768,6 +3845,7 @@ export class AppControllerImpl implements AppController {
     proposal.revision += 1;
     proposal.approvedRevision = undefined;
     proposal.approvedPayloadDigest = undefined;
+    proposal.approvedPayloadDigestVersion = undefined;
     proposal.deviceCalendarApproval = undefined;
     proposal.lastError = undefined;
     if (proposal.status === 'approved' || proposal.status === 'failed') proposal.status = 'draft';
@@ -3798,6 +3876,7 @@ export class AppControllerImpl implements AppController {
         proposal.requiresRebuild = true;
         proposal.approvedRevision = undefined;
         proposal.approvedPayloadDigest = undefined;
+        proposal.approvedPayloadDigestVersion = undefined;
         proposal.dispatchDependencyProjection = undefined;
         proposal.lastError = issue;
         return { changed: true, result: { current: false, reason: issue } };
@@ -4990,6 +5069,21 @@ export class AppControllerImpl implements AppController {
         addActivity(this.state, 'error', `${account.displayName || account.email} needs to reconnect before account actions can continue.`, this.newId);
       }
     }
+    for (const proposal of this.state.proposals) {
+      if (proposal.status !== 'approved' || proposal.dispatchRecordId || proposal.simulated) continue;
+      let approvalStillMatches = false;
+      if (proposal.approvedPayloadDigest && proposal.approvedRevision === proposal.revision &&
+          (proposal.approvedPayloadDigestVersion === undefined || proposal.approvedPayloadDigestVersion === 2)) {
+        try { approvalStillMatches = await approvedDigest(proposal, this.state, this.crypto.sha256) === proposal.approvedPayloadDigest; }
+        catch { approvalStillMatches = false; }
+        await this.assertPrivacySessionCurrent(allowMailAlertRefresh);
+        if (capturedBootstrapGeneration !== this.bootstrapGeneration) throw new Error('The app workspace changed while startup was loading. Reopen the app before continuing.');
+      }
+      if (!approvalStillMatches) {
+        this.invalidate(proposal);
+        proposal.lastError = 'This saved approval could not be verified after loading. Review and approve this proposal again before continuing.';
+      }
+    }
     for (const record of this.state.dispatchRecords) {
       if (record.outcome === 'pending') {
         try {
@@ -5043,6 +5137,7 @@ export class AppControllerImpl implements AppController {
         proposal.status = remote ? 'unknown' : 'failed';
         proposal.dispatchHistoryIncomplete = remote;
         proposal.approvedPayloadDigest = undefined;
+        proposal.approvedPayloadDigestVersion = undefined;
         proposal.lastError = remote
           ? 'App closed while this legacy external action was in progress. Its exact provider payload was not captured; do not retry automatically.'
           : 'App closed before this local action was confirmed. Review before trying again.';
@@ -8338,7 +8433,7 @@ export class AppControllerImpl implements AppController {
           selected.push(existing);
         } else {
           selected.push({ ...proposal, id: existing.id, revision: existing.revision + 1,
-            approvedRevision: undefined, approvedPayloadDigest: undefined, lastError: undefined });
+            approvedRevision: undefined, approvedPayloadDigest: undefined, approvedPayloadDigestVersion: undefined, lastError: undefined });
         }
       }
       const selectedIds = new Set(selected.map((proposal) => proposal.id));
@@ -9157,6 +9252,9 @@ export class AppControllerImpl implements AppController {
           cc: requestedEmail?.cc ?? currentEmail.cc,
         };
         if (!['draft', 'send'].includes(patchEmail.operation ?? '')) throw new Error('Choose Draft or Send as the explicitly reviewed reply operation.');
+        if (proposal.provenance.lineage.kind === 'accepted_draft' && patchEmail.operation !== 'send') {
+          throw new Error('An accepted provider draft can only be reviewed for send.');
+        }
         proposal.body = patchEmail.text;
         proposal.recipients = [...patchEmail.to];
         proposal.provenance = { ...proposal.provenance, operation: patchEmail.operation! };
@@ -9285,6 +9383,7 @@ export class AppControllerImpl implements AppController {
       }
       proposal.status = 'approved';
       proposal.approvedRevision = proposal.revision;
+      proposal.approvedPayloadDigestVersion = 2;
       proposal.approvedPayloadDigest = await approvedDigest(proposal, state, this.crypto.sha256);
       const decision = proposal.provenance.version === 1 ? appendDecision(state, proposal) : undefined;
       addActivity(state, 'proposal_approved', 'Suggestion approved with its current source, content, account, and destination details.', { proposalId: id, noteId: proposal.noteId }, this.newId);
@@ -9430,6 +9529,7 @@ export class AppControllerImpl implements AppController {
     const claimed = claim.proposal;
     const approvedDependencyProjection = claim.dependencyProjection;
     const frozenRecord = claim.dispatchRecord;
+    const capturedApprovedPayloadDigestVersion = claimed.approvedPayloadDigestVersion;
     const frozenDeviceRecord = 'deviceEventRecord' in claim ? claim.deviceEventRecord : undefined;
 
     let result: ProposalStatusOutcome;
@@ -9570,6 +9670,8 @@ export class AppControllerImpl implements AppController {
           if (this.mailAlertRefreshRequired || !current || (current.provenance?.version === 1 && !currentNote) || !currentAccount || currentState.settings.mode !== 'provider' || !recordIsCurrent(currentState, current) ||
               current.status !== 'dispatching' || current.approvedRevision !== record.approvedRevision || current.revision !== record.approvedRevision ||
               current.approvedPayloadDigest !== record.payloadDigest ||
+              current.approvedPayloadDigestVersion !== capturedApprovedPayloadDigestVersion ||
+              (current.approvedPayloadDigestVersion !== undefined && current.approvedPayloadDigestVersion !== 2) ||
               (current.provenance?.version === 1 && (current.sourceRevision !== currentNote?.revision || current.sourceRevision !== record.sourceRevision)) ||
               (record.sourceProvenance.version === 2 && (current.provenance?.version !== 2 || current.provenance.sourceDigest !== record.sourceProvenance.sourceDigest)) ||
               (record.sourceProvenance.version === 3 && (current.provenance?.version !== 3 || current.provenance.sourceDigest !== record.sourceProvenance.sourceDigest || current.provenance.operation !== record.operation)) ||
@@ -9779,6 +9881,7 @@ export class AppControllerImpl implements AppController {
       proposal.status = 'dismissed';
       proposal.approvedRevision = undefined;
       proposal.approvedPayloadDigest = undefined;
+      proposal.approvedPayloadDigestVersion = undefined;
       addActivity(state, 'proposal_created', 'Suggestion dismissed.', { proposalId: id, noteId: proposal.noteId }, this.newId);
       return proposal;
     });
@@ -11734,6 +11837,9 @@ export class AppControllerImpl implements AppController {
     accountId: string; expectedConnectionGeneration: number; operation: 'draft' | 'send' }): Promise<Proposal> {
     return this.mutate(async (state) => {
       const parent = this.proposal(state, input.parentProposalId);
+      if (parent.provenance?.version === 3 && parent.provenance.lineage.kind === 'accepted_draft') {
+        throw new Error('An accepted provider draft cannot be converted into a new reply lineage. Edit its reviewed send copy instead.');
+      }
       if (parent.supersededByProposalId || parent.kind !== 'email' || !parent.sourceActionKey || !isMailReplyProvenance(parent.provenance) || !parent.email?.reply ||
           !['draft', 'approved', 'failed'].includes(parent.status)) throw new Error('This reply cannot be derived because it is already consumed, superseded, or has no editable reply source.');
       const parentProvenance = parent.provenance;
@@ -11779,6 +11885,72 @@ export class AppControllerImpl implements AppController {
       parent.approvedPayloadDigest = undefined;
       state.proposals.unshift(child);
       addActivity(state, 'proposal_created', 'Manual reply successor created from a reviewed source and operation.', { proposalId: child.id }, this.newId);
+      return child;
+    });
+  }
+
+  async promoteAcceptedMailReplyDraftForCommand(input: { parentProposalId: string; expectedParentRevision: number;
+    draftDispatchRecordId: string; accountId: string; expectedConnectionGeneration: number }): Promise<Proposal> {
+    return this.mutate(async (state) => {
+      const parent = this.proposal(state, input.parentProposalId);
+      if (parent.supersededByProposalId || parent.kind !== 'email' || parent.status !== 'accepted' || parent.simulated ||
+          parent.revision !== input.expectedParentRevision || parent.accountId !== input.accountId || !parent.sourceActionKey ||
+          !parent.email?.reply || !isMailReplyProvenance(parent.provenance) ||
+          (parent.provenance.version === 3 && parent.provenance.operation !== 'draft')) {
+        throw new Error('Only the exact, accepted, unsuperseded reviewed reply draft can be promoted. Reload its saved history.');
+      }
+      this.assertDispatchRecoveryProposalAllowed(parent);
+      const parentProvenance = parent.provenance;
+      const historicalSource = parentProvenance.source;
+      const account = state.accounts.find((item) => item.id === input.accountId);
+      if (!account || !account.connected || account.authStatus !== 'connected' || !account.identity || !account.grantedScopes ||
+          !account.capabilities?.includes('mail.read') || !account.capabilities.includes('mail.send') ||
+          !account.capabilityLimits?.includes('mail.read') || !account.capabilityLimits.includes('mail.send') ||
+          account.provider === 'local' || !scopeGrantsCapability(account.provider, account.grantedScopes, 'mail.read') ||
+          !scopeGrantsCapability(account.provider, account.grantedScopes, 'mail.send') ||
+          (account.provider === 'google' && (!account.capabilities.includes('mail.draft') || !account.capabilityLimits.includes('mail.draft') ||
+            !scopeGrantsCapability(account.provider, account.grantedScopes, 'mail.draft'))) ||
+          (account.connectionGeneration ?? 0) !== input.expectedConnectionGeneration ||
+          input.expectedConnectionGeneration !== historicalSource.connectionGeneration ||
+          !sameAccountIdentity(account.identity, historicalSource.identity) || account.provider !== historicalSource.identity.providerNamespace) {
+        throw new Error('The verified mailbox connection or required send permission changed. Refresh the account and review the reply again.');
+      }
+      const draftRecord = state.dispatchRecords.find((record) => record.id === input.draftDispatchRecordId);
+      if (!draftRecord || draftRecord.proposalId !== parent.id) throw new Error('The selected provider draft receipt does not belong to this reply. Review the saved draft history.');
+      const draftDispatchRecordDigest = await this.acceptedDraftRecordDigestForParent(state, parent, draftRecord);
+      if (this.dispatchRecoveryFencesAction(parent.sourceActionKey)) {
+        throw new Error('This source action is retired during dispatch recovery and cannot be promoted to a new proposal.');
+      }
+      if (state.proposals.some((proposal) => isManualMailReplyProvenance(proposal.provenance) &&
+          proposal.provenance.lineage.kind === 'accepted_draft' && proposal.provenance.lineage.parentProposalId === parent.id)) {
+        throw new Error('This accepted provider draft already has a reviewed send copy. Inspect its history before continuing.');
+      }
+      if (!await validateMailReplySource(historicalSource, async (canonical) => this.crypto.sha256(canonical))) {
+        throw new Error('The parent reply source digest is invalid. Refresh the message and review it again.');
+      }
+      const latest = await this.currentMailReplySource(state, historicalSource.localMessageId);
+      if (latest.status !== 'current' || !latest.source || latest.source.accountId !== account.id ||
+          latest.source.connectionGeneration !== input.expectedConnectionGeneration ||
+          !sameAccountIdentity(latest.source.identity, account.identity) || latest.source.sourceDigest !== historicalSource.sourceDigest ||
+          canonicalMailReplySource(latest.source) !== canonicalMailReplySource(historicalSource)) {
+        throw new Error('Refresh required: the original message needs a current unchanged mailbox observation before the draft can be promoted.');
+      }
+      const parentPayloadDigest = await this.acceptedDraftParentPayloadDigest(parent);
+      const child = this.buildMailReplyProposal(state, latest.source, { messageId: latest.source.localMessageId,
+        mode: parent.email.reply.mode, sourceDigest: latest.source.sourceDigest, text: parent.email.text,
+        to: parent.email.to, cc: parent.email.cc }, undefined, 'send', {
+        parentProposalId: parent.id, draftDispatchRecordId: draftRecord.id,
+      });
+      child.provenance = { ...(child.provenance as ManualMailReplyProvenance), lineage: {
+        kind: 'accepted_draft', parentProposalId: parent.id, parentRevision: parent.revision, parentPayloadDigest,
+        draftDispatchRecordId: draftRecord.id, draftDispatchRecordDigest, remoteDraftId: draftRecord.remoteId!,
+      } };
+      child.sourceActionKey = parent.sourceActionKey;
+      validateReplyBinding(child.email!, child.provenance, 'send');
+      parent.supersededByProposalId = child.id;
+      await this.validateProposalProvenance(state, child);
+      state.proposals.unshift(child);
+      addActivity(state, 'proposal_created', 'Accepted provider draft promoted to a reviewed send copy.', { proposalId: child.id }, this.newId);
       return child;
     });
   }
@@ -11947,7 +12119,7 @@ export class AppControllerImpl implements AppController {
 
   private buildMailReplyProposal(state: AppState, source: MailReplySourceSnapshot,
     input: { messageId: string; mode: 'reply' | 'reply_all'; sourceDigest: string; text: string; to: readonly string[]; cc: readonly string[] }, batchJobId?: string,
-    activationOperation: 'draft' | 'send' = 'draft'): Proposal {
+    activationOperation: 'draft' | 'send' = 'draft', acceptedDraftPromotion?: { parentProposalId: string; draftDispatchRecordId: string }): Proposal {
     const linkedJob = batchJobId ? this.assistantBatchLedger.jobs.find((job) => job.id === batchJobId) : undefined;
     const outputPolicyVersion = batchJobId
       ? linkedJob && isOpenRouterMailReplyContentJob(linkedJob) ? linkedJob.outputPolicyVersion ?? 1 : 1
@@ -11983,8 +12155,11 @@ export class AppControllerImpl implements AppController {
     validateReplyBinding(email, provenance, activationOperation);
     const sourceActionKey = JSON.stringify(['mail-reply-v1', identityKey(account), source.providerMessageId, input.mode]);
     if (this.dispatchRecoveryFencesAction(sourceActionKey)) throw new Error('This mail source action was retired during dispatch recovery. Create a new independent reply from a different message.');
-    const duplicate = state.proposals.some((proposal) => proposal.sourceActionKey === sourceActionKey && ['accepted', 'unknown', 'dispatching'].includes(proposal.status) && !proposal.simulated) ||
-      state.dispatchRecords.some((record) => record.sourceActionKey === sourceActionKey && ['pending', 'accepted', 'unknown'].includes(record.outcome));
+    const duplicate = state.proposals.some((proposal) => proposal.sourceActionKey === sourceActionKey && ['accepted', 'unknown', 'dispatching'].includes(proposal.status) && !proposal.simulated &&
+        !(acceptedDraftPromotion && proposal.id === acceptedDraftPromotion.parentProposalId && proposal.status === 'accepted')) ||
+      state.dispatchRecords.some((record) => record.sourceActionKey === sourceActionKey && ['pending', 'accepted', 'unknown'].includes(record.outcome) &&
+        !(acceptedDraftPromotion && record.id === acceptedDraftPromotion.draftDispatchRecordId && record.proposalId === acceptedDraftPromotion.parentProposalId &&
+          record.operation === 'draft' && record.outcome === 'accepted'));
     if (duplicate) throw new Error('A reply draft attempt for this message and mode already exists. Review its history before creating another.');
     return { id: this.newId(), kind: 'email', title: source.subject ? `Re: ${source.subject}` : 'Reply draft', body: input.text,
       status: 'draft', revision: 1, accountId: account.id, recipients: [...to], evidence: [], sourceActionKey, provenance, email };

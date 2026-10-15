@@ -6,7 +6,7 @@ import { validateDispatchRecord } from '../src/dispatch';
 import { ConnectorClient, ProviderHttpError, describeMessageWindowQuery, type MessageSummary, type MessageWindowPageMetadata } from '../src/connectors';
 import { OpenRouterBatchClient, OpenRouterBatchDispatchError, OpenRouterBatchRequestBuilder, OPENROUTER_BATCH_BODY_MODEL, OPENROUTER_CHAT_COMPLETIONS_PATH, type OpenRouterBatchInspection } from '../src/services/openRouter';
 import { parseOpenRouterMailReplyResult, validOpenRouterMailReplyBinding } from '../src/services/openRouterMailReply';
-import type { AppState, SelectedMailTextSnapshot } from '../src/core';
+import type { AppState, Proposal, SelectedMailTextSnapshot } from '../src/core';
 import type { StateStore } from '../src/storage/contracts';
 import { STATE_SNAPSHOT_READ_MAX_BYTES } from '../src/storage/contracts';
 
@@ -410,6 +410,128 @@ describe('OpenRouter Batch controller lifecycle', () => {
     expect(restarted.getMailReplyBatchSourcesStatus(queued.id).status).toBe('refresh_required');
     await expect(restarted.refreshMailReplyBatchSources(queued.id)).resolves.toMatchObject({ status: 'current', jobId: queued.id });
   });
+
+  it.each(['parent body', 'parent account', 'draft receipt', 'Google draft capability', 'Google draft capability limit', 'Google compose scope',
+    'approval digest version removed', 'unknown approval digest version'] as const)(
+    'promotes a real accepted Batch reply draft into a fresh manual send copy and fences %s changes after verification', async (tamperCase) => {
+    const sourceConnector = conversationContextConnector();
+    let liveApp: AppControllerImpl | undefined;
+    let providerSendWrites = 0;
+    const acceptedDraftConnector = {
+      async createDraft(_account: unknown, envelope: Record<string, unknown>, verifier: { verify(value: never): Promise<boolean>; verifyBeforeDispatch(value: never): boolean }) {
+        expect(await verifier.verify(envelope as never)).toBe(true);
+        expect(verifier.verifyBeforeDispatch(envelope as never)).toBe(true);
+        return { status: 'accepted' as const, id: 'batch-provider-draft-1', replyDraftCheck: 'matches_approved' as const };
+      },
+      async sendEmail(_account: unknown, envelope: Record<string, unknown>, verifier: { verify(value: never): Promise<boolean>; verifyBeforeDispatch(value: never): boolean }) {
+        expect(await verifier.verify(envelope as never)).toBe(true);
+        const runtime = liveApp as unknown as { snapshot: AppState };
+        runtime.snapshot = structuredClone(runtime.snapshot);
+        const proposal = runtime.snapshot.proposals.find((item) => item.id === envelope.proposalId)!;
+        const lineage = proposal.provenance?.version === 3 && proposal.provenance.lineage.kind === 'accepted_draft'
+          ? proposal.provenance.lineage : undefined;
+        const parentReceipt = lineage && runtime.snapshot.dispatchRecords.find((item) => item.id === lineage.draftDispatchRecordId);
+        if (!parentReceipt) throw new Error('Accepted provider draft receipt disappeared.');
+        const parent = runtime.snapshot.proposals.find((item) => item.id === lineage.parentProposalId)!;
+        const account = runtime.snapshot.accounts.find((item) => item.id === proposal.accountId)!;
+        if (tamperCase === 'parent body') parent.body = 'Tampered after credential verification.';
+        else if (tamperCase === 'parent account') parent.accountId = 'tampered-account-id';
+        else if (tamperCase === 'draft receipt') parentReceipt.remoteId = 'tampered-provider-draft-id';
+        else if (tamperCase === 'Google draft capability') account.capabilities = account.capabilities?.filter((capability) => capability !== 'mail.draft');
+        else if (tamperCase === 'Google draft capability limit') account.capabilityLimits = account.capabilityLimits?.filter((capability) => capability !== 'mail.draft');
+        else if (tamperCase === 'Google compose scope') account.grantedScopes = account.grantedScopes?.filter((scope) => scope !== 'https://www.googleapis.com/auth/gmail.compose');
+        else if (tamperCase === 'approval digest version removed') proposal.approvedPayloadDigestVersion = undefined;
+        else (proposal as unknown as Record<string, unknown>).approvedPayloadDigestVersion = 99;
+        if (!verifier.verifyBeforeDispatch(envelope as never)) throw new Error('Accepted draft dependency changed before provider dispatch.');
+        providerSendWrites += 1;
+        return { status: 'accepted' as const, id: 'batch-provider-sent-1' };
+      },
+    };
+    const fakeClient = {
+      submit: async (_input: unknown, before: () => Promise<void>, assert: () => void) => {
+        await before(); assert();
+        return { batchId: 'batch_promotion_fixture', status: 'validating' as const, endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH,
+          model: OPENROUTER_BATCH_BODY_MODEL, completionWindow: '24h' as const, total: 1, completed: 0, failed: 0 };
+      },
+      inspect: async (batchId: string, customId: string) => ({ ...completedInspection(customId, JSON.stringify({ text: 'A careful reviewed Batch reply.' })), batchId }),
+    } as unknown as OpenRouterBatchClient;
+    const fixture = await mailFixture(fakeClient, { ...sourceConnector.connector, ...acceptedDraftConnector });
+    liveApp = fixture.app;
+    await (fixture.app as unknown as { mutate(operation: (draft: AppState) => void): Promise<void> }).mutate((draft) => {
+      const account = draft.accounts.find((item) => item.id === fixture.account.id)!;
+      account.capabilities = ['mail.read', 'mail.draft', 'mail.send'];
+      account.capabilityLimits = ['mail.read', 'mail.draft', 'mail.send'];
+      account.grantedScopes = ['openid', 'https://www.googleapis.com/auth/gmail.readonly',
+        'https://www.googleapis.com/auth/gmail.compose', 'https://www.googleapis.com/auth/gmail.send'];
+    });
+    const queued = await fixture.app.submitMailReplyBatch({ messageId: fixture.message.id, sourceDigest: fixture.source.source!.sourceDigest,
+      textDigest: fixture.textDigest, mode: 'reply', to: ['sam@example.test'], cc: [], brief: 'Reply briefly.', composerRevision: 1 });
+    await fixture.app.refreshAssistantBatch(queued.id);
+    const plan = await fixture.app.reviewMailReplyBatch(queued.id, { operation: 'draft' });
+    const activation = await fixture.app.activateMailReplyBatch({ planId: plan.planId });
+    const parentDraft = fixture.app.getSnapshot().proposals.find((item) => item.id === activation.proposalId)!;
+    expect(parentDraft.provenance).toMatchObject({ version: 2, kind: 'mail_reply', batchJobId: queued.id });
+    await fixture.app.approveProposal(parentDraft.id, { expectedRevision: parentDraft.revision });
+    const acceptedParent = await fixture.app.executeProposal(parentDraft.id);
+    expect(acceptedParent).toMatchObject({ status: 'accepted', remoteOperation: 'draft', remoteId: 'batch-provider-draft-1' });
+    const acceptedParentBefore = structuredClone(fixture.app.getSnapshot().proposals.find((item) => item.id === parentDraft.id)!);
+    const record = fixture.app.getSnapshot().dispatchRecords.find((item) => item.id === acceptedParentBefore.dispatchRecordId)!;
+    const promotion = { parentProposalId: parentDraft.id, expectedParentRevision: acceptedParentBefore.revision,
+      draftDispatchRecordId: record.id, accountId: fixture.account.id, expectedConnectionGeneration: fixture.account.connectionGeneration! };
+    if (tamperCase === 'parent body') {
+      const parentMutations: ((proposal: Proposal) => void)[] = [
+        (proposal) => { proposal.title += ' tampered'; },
+        (proposal) => { proposal.body += ' tampered'; },
+        (proposal) => { proposal.email!.text += ' tampered'; },
+        (proposal) => { proposal.recipients = ['other@example.test']; },
+        (proposal) => { proposal.evidence = [{ quote: 'unexpected evidence', source: 'transcript' }]; },
+        (proposal) => { proposal.noteId = 'unexpected-note'; },
+        (proposal) => { proposal.sourceRevision = 2; },
+        (proposal) => { proposal.requiresRebuild = true; },
+        (proposal) => { proposal.dueAt = new Date().toISOString(); },
+        (proposal) => { proposal.event = { start: new Date().toISOString(), end: new Date(Date.now() + 60_000).toISOString(), timeZone: 'UTC', attendees: [], invitePolicy: 'none' }; },
+        (proposal) => { proposal.calendarId = 'unexpected-calendar'; },
+        (proposal) => { proposal.eventDestination = { kind: 'remote_calendar', accountId: fixture.account.id, calendarId: 'unexpected-calendar' }; },
+        (proposal) => { proposal.deviceCalendarApproval = {} as NonNullable<Proposal['deviceCalendarApproval']>; },
+        (proposal) => { proposal.eventTransactionId = 'unexpected-event-transaction'; },
+      ];
+      for (const mutateParent of parentMutations) {
+        await (fixture.app as unknown as { mutate(operation: (draft: AppState) => void): Promise<void> }).mutate((draft) => {
+          mutateParent(draft.proposals.find((item) => item.id === parentDraft.id)!);
+        });
+        await expect(fixture.app.promoteAcceptedMailReplyDraftForCommand(promotion)).rejects.toThrow();
+        await (fixture.app as unknown as { mutate(operation: (draft: AppState) => void): Promise<void> }).mutate((draft) => {
+          const index = draft.proposals.findIndex((item) => item.id === parentDraft.id);
+          draft.proposals[index] = structuredClone(acceptedParentBefore);
+        });
+      }
+    }
+    await expect(fixture.app.promoteAcceptedMailReplyDraftForCommand({ ...promotion, expectedParentRevision: promotion.expectedParentRevision + 1 }))
+      .rejects.toThrow(/exact, accepted/i);
+    await expect(fixture.app.promoteAcceptedMailReplyDraftForCommand({ ...promotion, draftDispatchRecordId: 'different-receipt' }))
+      .rejects.toThrow(/does not belong/i);
+    await (fixture.app as unknown as { mutate(operation: (draft: AppState) => void): Promise<void> }).mutate((draft) => {
+      draft.mailbox.find((item) => item.id === fixture.message.id)!.observedAt = new Date(Date.now() - 20 * 60_000).toISOString();
+    });
+    await expect(fixture.app.promoteAcceptedMailReplyDraftForCommand(promotion)).rejects.toThrow(/current unchanged mailbox observation/i);
+    await (fixture.app as unknown as { mutate(operation: (draft: AppState) => void): Promise<void> }).mutate((draft) => {
+      draft.mailbox.find((item) => item.id === fixture.message.id)!.observedAt = fixture.message.observedAt;
+    });
+    const promoted = await fixture.app.promoteAcceptedMailReplyDraftForCommand({ parentProposalId: parentDraft.id,
+      expectedParentRevision: acceptedParentBefore.revision, draftDispatchRecordId: record.id, accountId: fixture.account.id,
+      expectedConnectionGeneration: fixture.account.connectionGeneration! });
+    expect(promoted).toMatchObject({ status: 'draft', email: { operation: 'send' },
+      provenance: { version: 3, kind: 'manual_mail_reply', operation: 'send', lineage: { kind: 'accepted_draft',
+        parentProposalId: parentDraft.id, draftDispatchRecordId: record.id, remoteDraftId: 'batch-provider-draft-1' } } });
+    expect(fixture.app.getSnapshot().proposals.find((item) => item.id === parentDraft.id)).toEqual({ ...acceptedParentBefore, supersededByProposalId: promoted.id });
+    expect(fixture.app.getSnapshot().assistantBatchJobs?.find((item) => item.id === queued.id)).toMatchObject({
+      proposalId: parentDraft.id, mailReplyActivationOperation: 'draft', status: 'completed' });
+    await fixture.app.approveProposal(promoted.id, { expectedRevision: promoted.revision });
+    const sendResult = await fixture.app.executeProposal(promoted.id);
+    expect(sendResult.status).toBe('failed');
+    expect(providerSendWrites).toBe(0);
+    },
+  );
 
   it('freezes an explicit Send choice into one immutable Batch activation and its permanent job link', async () => {
     const base = conversationContextConnector();

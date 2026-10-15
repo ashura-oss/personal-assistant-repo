@@ -159,6 +159,20 @@ describe('cloud saved-mail read paths', () => {
     expect(dispatch.record?.payload.kind === 'email' ? dispatch.record.payload.text : '').toHaveLength(100_000);
   });
 
+  it('parses accepted draft promotion metadata and accepted-copy lineage as closed frozen values', () => {
+    const raw = { schemaVersion: 1, ...expected, proposal: { editPolicy: 'manual_reply_send_fields', canDeriveManualReply: false,
+      acceptedDraftCopy: { parentProposalId: 'parent-1', draftDispatchRecordId: 'dispatch-1', provider: 'microsoft' },
+      id: 'child-1', kind: 'email', title: 'Reply', body: 'Saved contents', status: 'draft', revision: 3, recipients: [], accountId: 'acct-1',
+      email: { operation: 'send', to: [], cc: [], bcc: [], subject: 'Reply', text: 'Saved contents', attachments: [] } } };
+    const parsed = parseCloudProposalReview(raw, expected, 'child-1').proposal!;
+    expect(parsed.acceptedDraftCopy).toEqual({ parentProposalId: 'parent-1', draftDispatchRecordId: 'dispatch-1', provider: 'microsoft' });
+    expect(Object.isFrozen(parsed.acceptedDraftCopy)).toBe(true);
+    expect(() => parseCloudProposalReview({ ...raw, proposal: { ...raw.proposal,
+      draftPromotion: { draftDispatchRecordId: 'dispatch-1', provider: ['google'] } } }, expected, 'child-1')).toThrow();
+    expect(() => parseCloudProposalReview({ ...raw, proposal: { ...raw.proposal,
+      acceptedDraftCopy: { ...raw.proposal.acceptedDraftCopy, credential: 'secret' } } }, expected, 'child-1')).toThrow();
+  });
+
   it('accepts a bound reply Batch review with real omission codes and full producer result text', () => {
     const requested = { planId: 'plan-1', jobId: 'job-1', messageId: source.localMessageId, accountId: source.accountId, expectedConnectionGeneration: source.connectionGeneration };
     const parsed = parseCloudReplyBatchReview({ schemaVersion: 1, ...expected, plan: {

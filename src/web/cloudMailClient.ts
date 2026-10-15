@@ -154,9 +154,9 @@ function parseAttachments(value: unknown): NonNullable<WorkflowProposalReviewDto
 
 function parseProposal(value: unknown): WorkflowProposalReviewDto {
   const proposal = row(value,
-    ['editPolicy', 'canDeriveManualReply', 'supersededByProposalId', 'id', 'kind', 'title', 'body', 'status', 'revision', 'approvedRevision', 'lastError', 'accountId', 'recipients', 'calendarId', 'dueAt', 'email', 'event', 'remoteOperation', 'remoteId', 'remoteAcceptedAt', 'sourceDigest'],
+    ['editPolicy', 'canDeriveManualReply', 'draftPromotion', 'acceptedDraftCopy', 'supersededByProposalId', 'id', 'kind', 'title', 'body', 'status', 'revision', 'approvedRevision', 'lastError', 'accountId', 'recipients', 'calendarId', 'dueAt', 'email', 'event', 'remoteOperation', 'remoteId', 'remoteAcceptedAt', 'sourceDigest'],
     ['editPolicy', 'canDeriveManualReply', 'id', 'kind', 'title', 'body', 'status', 'revision', 'recipients']);
-  if (typeof proposal.editPolicy !== 'string' || !['email_fields', 'source_reply_fields', 'manual_reply_fields', 'event_fields', 'read_only'].includes(proposal.editPolicy) ||
+  if (typeof proposal.editPolicy !== 'string' || !['email_fields', 'source_reply_fields', 'manual_reply_fields', 'manual_reply_send_fields', 'event_fields', 'read_only'].includes(proposal.editPolicy) ||
       typeof proposal.canDeriveManualReply !== 'boolean' ||
       !boundedText(proposal.id, 1024, false) || typeof proposal.kind !== 'string' || !WORKFLOW_KINDS.has(proposal.kind) || !boundedText(proposal.title, 4096) ||
       !boundedText(proposal.body, 100_000) || typeof proposal.status !== 'string' || !PROPOSAL_STATUSES.has(proposal.status) || !integer(proposal.revision) ||
@@ -183,6 +183,20 @@ function parseProposal(value: unknown): WorkflowProposalReviewDto {
       subject: item.subject as string, text: item.text as string, attachments: parseAttachments(item.attachments) });
   }
 
+  let draftPromotion: WorkflowProposalReviewDto['draftPromotion'];
+  if (proposal.draftPromotion !== undefined) {
+    const item = row(proposal.draftPromotion, ['draftDispatchRecordId', 'provider'], ['draftDispatchRecordId', 'provider']);
+    if (!boundedText(item.draftDispatchRecordId, 1024, false) || (item.provider !== 'google' && item.provider !== 'microsoft')) throw new Error('mail_workflow_response_invalid');
+    draftPromotion = Object.freeze({ draftDispatchRecordId: item.draftDispatchRecordId as string, provider: item.provider });
+  }
+  let acceptedDraftCopy: WorkflowProposalReviewDto['acceptedDraftCopy'];
+  if (proposal.acceptedDraftCopy !== undefined) {
+    const item = row(proposal.acceptedDraftCopy, ['parentProposalId', 'draftDispatchRecordId', 'provider'], ['parentProposalId', 'draftDispatchRecordId', 'provider']);
+    if (!boundedText(item.parentProposalId, 1024, false) || !boundedText(item.draftDispatchRecordId, 1024, false) ||
+        (item.provider !== 'google' && item.provider !== 'microsoft')) throw new Error('mail_workflow_response_invalid');
+    acceptedDraftCopy = Object.freeze({ parentProposalId: item.parentProposalId as string, draftDispatchRecordId: item.draftDispatchRecordId as string, provider: item.provider });
+  }
+
   let event: WorkflowProposalReviewDto['event'];
   if (proposal.event !== undefined) {
     const item = row(proposal.event, ['title', 'description', 'start', 'end', 'timeZone', 'attendees', 'invitePolicy'], ['start', 'end', 'timeZone', 'attendees', 'invitePolicy']);
@@ -194,6 +208,7 @@ function parseProposal(value: unknown): WorkflowProposalReviewDto {
   }
   if ((proposal.kind === 'email' && !email) || (proposal.kind === 'event' && !event) || (email && event)) throw new Error('mail_workflow_response_invalid');
   return Object.freeze({ editPolicy: proposal.editPolicy as WorkflowProposalReviewDto['editPolicy'], canDeriveManualReply: proposal.canDeriveManualReply as boolean,
+    ...(draftPromotion ? { draftPromotion } : {}), ...(acceptedDraftCopy ? { acceptedDraftCopy } : {}),
     ...(Object.hasOwn(proposal, 'supersededByProposalId') ? { supersededByProposalId: proposal.supersededByProposalId as string } : {}),
     id: proposal.id as string, kind: proposal.kind as WorkflowProposalReviewDto['kind'], title: proposal.title as string, body: proposal.body as string,
     status: proposal.status as WorkflowProposalReviewDto['status'], revision: proposal.revision as number,

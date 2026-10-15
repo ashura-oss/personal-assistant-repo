@@ -180,7 +180,203 @@ function makeManualReplyCoordinator(options: { loseDeriveAck?: boolean; changeAc
     refreshSnapshot: () => { snapshot = createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision }); }, childProposalId };
 }
 
+function makeAcceptedDraftCoordinator(options: { loseAck?: boolean; receiptMismatch?: 'parentRevision' | 'record' | 'child' | 'generation' | 'responseId';
+  changeGenerationDuringChildReview?: boolean } = {}) {
+  const state = createInitialWorkspaceState(() => '66666666-6666-4666-8666-666666666666');
+  const identity = { providerNamespace: 'google' as const, clientId: 'client', subject: 'provider-subject' };
+  state.accounts.push({ id: accountId, provider: 'google', displayName: 'Work', email: 'me@example.test', connected: true, authStatus: 'connected',
+    identity, capabilities: ['mail.read', 'mail.draft', 'mail.send'], connectionGeneration: 4 });
+  const sourceDigest = 'a'.repeat(64);
+  const source = { version: 1 as const, accountId, accountEmail: 'me@example.test', identity, connectionGeneration: 4, localMessageId: 'message-1',
+    providerMessageId: 'provider-message-1', idFormat: 'gmail' as const, threadId: 'thread-1', internetMessageId: '<message-1@example.test>',
+    subject: 'Source subject', replyMetadataComplete: true as const, observedAt: '2026-10-15T00:00:00.000Z', sourceDigest };
+  const parent: Proposal = { id: proposalId, kind: 'email', title: 'Re: Source subject', body: 'Accepted provider draft contents', status: 'accepted', revision: 2,
+    accountId, recipients: ['to@example.test'], evidence: [], sourceActionKey: 'source-action', dispatchRecordId: 'dispatch-1', remoteOperation: 'draft',
+    remoteId: 'remote-draft-1', remoteAcceptedAt: '2026-10-15T00:00:00.000Z', simulated: false,
+    email: { operation: 'draft', to: ['to@example.test'], cc: [], bcc: [], subject: 'Source subject', text: 'Accepted provider draft contents', attachments: [],
+      reply: { mode: 'reply', sourceDigest, localMessageId: 'message-1', providerMessageId: 'provider-message-1', idFormat: 'gmail',
+        internetMessageId: '<message-1@example.test>', sourceSubject: 'Source subject', threadId: 'thread-1' } },
+    provenance: { version: 2, kind: 'mail_reply', sourceDigest, source, expiresAt: '2026-10-16T00:00:00.000Z', outputPolicyVersion: 2 } };
+  state.proposals.push(parent);
+  state.dispatchRecords.push({ version: 1, id: 'dispatch-1', proposalId, approvedRevision: 2, payloadDigest: 'b'.repeat(64),
+    sourceActionKey: 'source-action', duplicateKey: 'duplicate-key', sourceProvenance: parent.provenance!, operation: 'draft', accountId,
+    account: { provider: 'google', identity: { providerNamespace: 'google', clientId: 'client', subject: 'provider-subject' },
+      displayName: 'Work', email: 'me@example.test' }, title: parent.title, body: parent.body,
+    payload: { kind: 'email', email: { to: parent.email!.to, cc: parent.email!.cc, bcc: parent.email!.bcc, subject: parent.email!.subject,
+      text: parent.email!.text, attachments: [] } }, dispatchStartedAt: '2026-10-15T00:00:00.000Z', outcome: 'accepted',
+    outcomeAt: '2026-10-15T00:00:00.000Z', remoteId: 'remote-draft-1', reconciliations: [] });
+  let revision = 7;
+  let snapshot = createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision });
+  const childProposalId = '99999999-9999-4999-8999-999999999999';
+  let commandCount = 0;
+  let lastResponse: WorkspaceCommandResponse | undefined;
+  let refreshRequired = false;
+  const commands: WorkspaceCommand[] = [];
+  const readProposal = vi.fn(async (id: string, expectedRevision: number): Promise<ProposalReviewReadDto> => {
+    if (options.changeGenerationDuringChildReview && id === childProposalId) {
+      options.changeGenerationDuringChildReview = false;
+      state.accounts.find((item) => item.id === accountId)!.connectionGeneration = 5;
+      revision += 1;
+      snapshot = createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision });
+    }
+    const item = state.proposals.find((candidate) => candidate.id === id);
+    return { schemaVersion: 1, workspaceId, privacyEpoch: 3, revision: expectedRevision, proposal: item ? {
+      editPolicy: item.id !== proposalId && ['draft', 'failed', 'approved'].includes(item.status) ? 'manual_reply_send_fields' : 'read_only', canDeriveManualReply: false,
+      ...(item.id === proposalId && !item.supersededByProposalId ? { draftPromotion: { draftDispatchRecordId: 'dispatch-1', provider: 'google' } } : {}),
+      ...(item.id !== proposalId ? { acceptedDraftCopy: { parentProposalId: proposalId, draftDispatchRecordId: 'dispatch-1', provider: 'google' } } : {}),
+      ...(item.supersededByProposalId ? { supersededByProposalId: item.supersededByProposalId } : {}), id: item.id, kind: 'email', title: item.title,
+      body: item.body, status: item.status, revision: item.revision, accountId: item.accountId, recipients: item.recipients, sourceDigest,
+      ...(item.remoteOperation ? { remoteOperation: item.remoteOperation } : {}), ...(item.remoteId ? { remoteId: item.remoteId } : {}),
+      email: item.email ? { operation: item.email.operation, to: item.email.to, cc: item.email.cc, bcc: item.email.bcc, subject: item.email.subject,
+        text: item.email.text, attachments: [] } : undefined,
+    } : undefined };
+  });
+  const workspace: CloudMailWorkspacePort = {
+    readSnapshot: () => snapshot, readOperation: () => ({ busy: false, pending: false, refreshRequired,
+      ...(refreshRequired && lastResponse ? { pendingCommandId: lastResponse.commandId } : {}) }),
+    readMailReplySource: vi.fn(async () => { throw new Error('not used'); }), readMailReplyText: vi.fn(async () => { throw new Error('not used'); }),
+    readProposalReview: readProposal, readDispatchReview: vi.fn(async () => ({ schemaVersion: 1 as const, workspaceId, privacyEpoch: 3, revision })),
+    readReplyBatchReview: vi.fn(async () => ({ schemaVersion: 1 as const, workspaceId, privacyEpoch: 3, revision })),
+    execute: vi.fn(async (command, onAdmitted) => {
+      commands.push(command);
+      const commandId = `promote-command-${++commandCount}`;
+      onAdmitted?.({ schemaVersion: 1, commandId, expectedRevision: revision, expectedPrivacyEpoch: 3, idempotencyKey: commandId, kind: command.kind, canonicalBody: '{}' } as never);
+      if (command.kind === 'mail.reply.promoteDraft') {
+        parent.supersededByProposalId = childProposalId;
+        const child: Proposal = { ...structuredClone(parent), id: childProposalId, revision: 1, status: 'draft', approvedRevision: undefined,
+          email: { ...parent.email!, operation: 'send' }, provenance: { version: 3, kind: 'manual_mail_reply', sourceDigest, source: { ...source },
+            expiresAt: '2026-10-16T00:00:00.000Z', outputPolicyVersion: 2, operation: 'send', lineage: { kind: 'accepted_draft',
+              parentProposalId: proposalId, parentRevision: 2, parentPayloadDigest: 'b'.repeat(64), draftDispatchRecordId: 'dispatch-1',
+              draftDispatchRecordDigest: 'c'.repeat(64), remoteDraftId: 'remote-draft-1' } } };
+        delete child.supersededByProposalId;
+        state.proposals.unshift(child);
+      } else if (command.kind === 'proposals.approve') {
+        const child = state.proposals.find((item) => item.id === command.proposalId)!;
+        child.status = 'approved';
+        child.approvedRevision = child.revision;
+      } else throw new Error(`unexpected command ${command.kind}`);
+      revision += 1;
+      snapshot = createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision });
+      refreshRequired = true;
+      const receipt: Record<string, unknown> = command.kind === 'mail.reply.promoteDraft' ? { schemaVersion: 1, commandId, kind: command.kind,
+        objectId: childProposalId, parentProposalId: proposalId, parentProposalRevision: 2, draftDispatchRecordId: 'dispatch-1',
+        childProposalId, childProposalRevision: 1, accountId, connectionGeneration: 4, operation: 'send' } : { schemaVersion: 1, commandId,
+        kind: command.kind, objectId: command.proposalId, proposalId: command.proposalId,
+        proposalRevision: state.proposals.find((item) => item.id === command.proposalId)!.revision, proposalStatus: 'approved' };
+      if (options.receiptMismatch === 'parentRevision') receipt.parentProposalRevision = 3;
+      if (options.receiptMismatch === 'record') receipt.draftDispatchRecordId = 'other-dispatch';
+      if (options.receiptMismatch === 'child') receipt.childProposalId = 'other-child';
+      if (options.receiptMismatch === 'generation') receipt.connectionGeneration = 5;
+      const responseId = options.receiptMismatch === 'responseId' ? 'untrusted-response-id' : commandId;
+      lastResponse = { schemaVersion: 1, commandId: responseId, status: 'finished', receipt: { ...receipt, commandId: responseId } } as WorkspaceCommandResponse;
+      if (options.loseAck && command.kind === 'mail.reply.promoteDraft') throw new TypeError('connection lost after admitted promotion');
+      return lastResponse;
+    }),
+    inspect: vi.fn(async (commandId) => lastResponse?.commandId === commandId ? lastResponse! : ({ schemaVersion: 1, commandId, status: 'inspect_required' } as WorkspaceCommandResponse)),
+    refresh: vi.fn(async () => { refreshRequired = false; return snapshot; }),
+  };
+  return { coordinator: new CloudMailCoordinator(workspace), commands, workspace, readProposal, childProposalId,
+    getSnapshot: () => snapshot, advanceChildRevision: () => {
+      const child = state.proposals.find((item) => item.id === childProposalId)!;
+      child.revision += 1;
+      revision += 1;
+      snapshot = createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision });
+    }, setChildStatus: (status: Proposal['status']) => {
+      const child = state.proposals.find((item) => item.id === childProposalId)!;
+      child.status = status;
+      revision += 1;
+      snapshot = createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision });
+    } };
+}
+
 describe('CloudMailCoordinator command receipts', () => {
+  it('promotes an accepted draft to a separate fixed-send review and waits for explicit navigation', async () => {
+    const { coordinator, commands, childProposalId, advanceChildRevision } = makeAcceptedDraftCoordinator();
+    await coordinator.openProposal(proposalId);
+    await Promise.all([coordinator.promoteAcceptedDraft(proposalId), coordinator.promoteAcceptedDraft(proposalId)]);
+    expect(commands).toEqual([{ kind: 'mail.reply.promoteDraft', parentProposalId: proposalId, expectedParentRevision: 2,
+      draftDispatchRecordId: 'dispatch-1', accountId, expectedConnectionGeneration: 4 }]);
+    expect(coordinator.getSnapshot().proposalReviewId).toBe(proposalId);
+    expect(coordinator.getSnapshot().acceptedDraftSuccessor).toMatchObject({ childProposalId, parentProposalId: proposalId, provider: 'google' });
+    expect(coordinator.getSnapshot().proposalReview?.proposal).toMatchObject({ status: 'accepted', editPolicy: 'read_only' });
+    await coordinator.openAcceptedDraftSuccessor();
+    expect(coordinator.getSnapshot().proposalReviewId).toBe(childProposalId);
+    expect(coordinator.getSnapshot().proposalReview?.proposal).toMatchObject({ status: 'draft', editPolicy: 'manual_reply_send_fields',
+      acceptedDraftCopy: { parentProposalId: proposalId, draftDispatchRecordId: 'dispatch-1', provider: 'google' }, canDeriveManualReply: false,
+      email: { operation: 'send' } });
+    coordinator.updateProposalDraft(childProposalId, { operation: 'draft' });
+    expect(coordinator.getProposalDraft(childProposalId)?.operation).toBe('send');
+    coordinator.updateProposalDraft(childProposalId, { text: 'Newer unsaved review text' });
+    advanceChildRevision();
+    await coordinator.openAcceptedDraftSuccessor();
+    expect(coordinator.getProposalDraft(childProposalId)).toMatchObject({ text: 'Newer unsaved review text', dirty: true, baseRevision: 1 });
+  });
+
+  it('inspects a lost promotion acknowledgement without replaying the command', async () => {
+    const { coordinator, commands, workspace, childProposalId } = makeAcceptedDraftCoordinator({ loseAck: true });
+    await coordinator.openProposal(proposalId);
+    await coordinator.promoteAcceptedDraft(proposalId);
+    expect(coordinator.getSnapshot().acceptedDraftPromotion?.parentProposalId).toBe(proposalId);
+    await coordinator.inspectHeldCommand();
+    expect(commands).toHaveLength(1);
+    expect(workspace.inspect).toHaveBeenCalledTimes(1);
+    expect(coordinator.getSnapshot().acceptedDraftSuccessor?.childProposalId).toBe(childProposalId);
+    expect(coordinator.getSnapshot().acceptedDraftPromotion).toBeUndefined();
+  });
+
+  it('keeps a replacement coordinator inspect-only when it finds the admitted promotion command', async () => {
+    const { coordinator, commands, workspace } = makeAcceptedDraftCoordinator({ loseAck: true });
+    await coordinator.openProposal(proposalId);
+    await coordinator.promoteAcceptedDraft(proposalId);
+    const replacement = new CloudMailCoordinator(workspace);
+    await replacement.inspectHeldCommand();
+    expect(commands).toHaveLength(1);
+    expect(workspace.inspect).toHaveBeenCalledTimes(1);
+    expect(workspace.execute).toHaveBeenCalledTimes(1);
+    replacement.dispose();
+    coordinator.dispose();
+  });
+
+  it('reopens the reviewed copy after approval and shows later accepted copies read-only', async () => {
+    const { coordinator, childProposalId, setChildStatus } = makeAcceptedDraftCoordinator();
+    await coordinator.openProposal(proposalId);
+    await coordinator.promoteAcceptedDraft(proposalId);
+    await coordinator.openAcceptedDraftSuccessor();
+    await coordinator.approveProposal(childProposalId);
+    expect(coordinator.getSnapshot().proposalReview?.proposal).toMatchObject({ status: 'approved', editPolicy: 'manual_reply_send_fields' });
+    await coordinator.openProposal(proposalId);
+    await coordinator.openAcceptedDraftSuccessor();
+    expect(coordinator.getSnapshot().proposalReviewId).toBe(childProposalId);
+    expect(coordinator.getSnapshot().proposalReview?.proposal).toMatchObject({ status: 'approved', editPolicy: 'manual_reply_send_fields', email: { operation: 'send' } });
+
+    setChildStatus('accepted');
+    await coordinator.openProposal(proposalId);
+    await coordinator.openAcceptedDraftSuccessor();
+    expect(coordinator.getSnapshot().proposalReview?.proposal).toMatchObject({ status: 'accepted', editPolicy: 'read_only', email: { operation: 'send' } });
+    coordinator.dispose();
+  });
+
+  it('holds mismatched promotion bindings and generation changes for inspection without replay', async () => {
+    for (const receiptMismatch of ['parentRevision', 'record', 'child', 'generation', 'responseId'] as const) {
+      const { coordinator, commands, workspace } = makeAcceptedDraftCoordinator({ receiptMismatch });
+      await coordinator.openProposal(proposalId);
+      await coordinator.promoteAcceptedDraft(proposalId);
+      expect(commands).toHaveLength(1);
+      expect(coordinator.getSnapshot().acceptedDraftSuccessor).toBeUndefined();
+      await coordinator.inspectHeldCommand();
+      expect(commands).toHaveLength(1);
+      expect(workspace.inspect).toHaveBeenCalledTimes(1);
+      coordinator.dispose();
+    }
+    const { coordinator, commands } = makeAcceptedDraftCoordinator({ changeGenerationDuringChildReview: true });
+    await coordinator.openProposal(proposalId);
+    await coordinator.promoteAcceptedDraft(proposalId);
+    expect(commands).toHaveLength(1);
+    expect(coordinator.getSnapshot().acceptedDraftSuccessor).toBeUndefined();
+    expect(coordinator.getSnapshot().acceptedDraftPromotion?.parentProposalId).toBe(proposalId);
+    coordinator.dispose();
+  });
+
   it('derives an explicit draft or send copy, verifies it, and waits for user navigation', async () => {
     const { coordinator, commands, workspace, childProposalId } = makeManualReplyCoordinator();
     await coordinator.openProposal(proposalId);

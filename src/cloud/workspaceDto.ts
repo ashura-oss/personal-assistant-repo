@@ -45,7 +45,7 @@ export type WorkspaceNoteDTO = Omit<Note, 'audioUri' | 'analysis' | 'audioAttach
 export type WorkspaceAccountDTO = Omit<Account, 'tokenRef'> & { readonly credentialConfigured: boolean };
 
 export type WorkspaceProposalDTO = Omit<Proposal,
-  'approvedPayloadDigest' | 'eventTransactionId' | 'deviceCalendarApproval' | 'deviceEventDispatchRecordId' |
+  'approvedPayloadDigest' | 'approvedPayloadDigestVersion' | 'eventTransactionId' | 'deviceCalendarApproval' | 'deviceEventDispatchRecordId' |
   'sourceActionKey' | 'dispatchDependencyProjection' | 'dispatchRecordId'>;
 
 export type WorkspaceDispatchRecordDTO = Omit<DispatchRecord,

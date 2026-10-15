@@ -152,11 +152,21 @@ function safeProposal(value: import('../core').Proposal) {
   const editableStatus = (value.status === 'draft' || value.status === 'failed' || value.status === 'approved') && !value.supersededByProposalId;
   const mailReply = value.provenance?.version === 2 && value.provenance.kind === 'mail_reply' ||
     value.provenance?.version === 3 && value.provenance.kind === 'manual_mail_reply';
-  const editPolicy = !editableStatus ? 'read_only' : value.kind === 'event' ? 'event_fields' : value.kind !== 'email' ? 'read_only'
+  const acceptedDraftLineage = value.provenance?.version === 3 && value.provenance.kind === 'manual_mail_reply' &&
+    value.provenance.lineage.kind === 'accepted_draft' ? value.provenance.lineage : undefined;
+  const providerNamespace = value.provenance && 'source' in value.provenance ? value.provenance.source.identity.providerNamespace : undefined;
+  const provider = providerNamespace === 'google' || providerNamespace === 'microsoft' ? providerNamespace : undefined;
+  const canPromoteDraft = value.kind === 'email' && value.status === 'accepted' && !value.simulated && !value.supersededByProposalId &&
+    (value.provenance?.version === 2 && value.provenance.kind === 'mail_reply' || value.provenance?.version === 3 && value.provenance.kind === 'manual_mail_reply') &&
+    value.email?.operation === 'draft' && value.remoteOperation === 'draft' && Boolean(value.dispatchRecordId && value.remoteId && provider);
+  const editPolicy = !editableStatus ? 'read_only' : acceptedDraftLineage ? 'manual_reply_send_fields' : value.kind === 'event' ? 'event_fields' : value.kind !== 'email' ? 'read_only'
     : value.provenance?.version === 3 ? 'manual_reply_fields'
       : mailReply ? value.provenance?.version === 2 && value.provenance.batchJobId ? 'read_only' : 'source_reply_fields'
         : 'email_fields';
-  return { editPolicy, canDeriveManualReply: Boolean(mailReply && editableStatus && value.email?.reply && value.sourceActionKey),
+  return { editPolicy, canDeriveManualReply: Boolean(mailReply && !acceptedDraftLineage && editableStatus && value.email?.reply && value.sourceActionKey),
+    ...(canPromoteDraft ? { draftPromotion: { draftDispatchRecordId: value.dispatchRecordId!, provider: provider! } } : {}),
+    ...(acceptedDraftLineage && provider ? { acceptedDraftCopy: { parentProposalId: acceptedDraftLineage.parentProposalId,
+      draftDispatchRecordId: acceptedDraftLineage.draftDispatchRecordId, provider } } : {}),
     ...(value.supersededByProposalId ? { supersededByProposalId: value.supersededByProposalId } : {}),
     id: value.id, kind: value.kind, title: value.title, body: value.body, status: value.status, revision: value.revision,
     ...(value.approvedRevision !== undefined ? { approvedRevision: value.approvedRevision } : {}), ...(value.lastError ? { lastError: value.lastError } : {}),
