@@ -1,15 +1,21 @@
 /** @vitest-environment jsdom */
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import React, { act } from 'react';
+import { createRoot, type Root } from 'react-dom/client';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createInitialWorkspaceState } from '../src/services/controller.shared';
 import { createWorkspaceSnapshotDTO } from '../src/cloud/workspaceDto';
-import { CloudWorkspaceSessionStore } from '../src/web/CloudWorkspaceSession';
+import { CloudWorkspaceSession, CloudWorkspaceSessionStore } from '../src/web/CloudWorkspaceSession';
 import type { CloudVoiceCapturePort } from '../src/web/cloudVoiceCoordinator';
 import type { AuthenticatedSession } from '../src/web/authClient';
 
+const mockSessionStoreRef = vi.hoisted(() => ({ current: null as unknown }));
 vi.mock('react-native', () => ({ ActivityIndicator: () => null, Text: () => null, View: () => null }));
 vi.mock('react-native-safe-area-context', () => ({ SafeAreaProvider: ({ children }: { children: unknown }) => children,
   SafeAreaView: ({ children }: { children: unknown }) => children }));
-vi.mock('../src/web/CloudWorkspace', () => ({ CloudWorkspace: () => null }));
+vi.mock('../src/web/CloudWorkspace', () => ({ CloudWorkspace: ({ store }: { store: unknown }) => {
+  mockSessionStoreRef.current = store;
+  return null;
+} }));
 vi.mock('../src/ui/theme', () => ({ C: { text: '#fff', muted: '#aaa', sage: '#9a9' }, s: new Proxy({}, { get: () => ({}) }) }));
 
 const workspaceId = '7b906fca-65c1-4bd2-b18e-1b56cc6f48a8';
@@ -49,9 +55,128 @@ function installFetch(fetcher: (...args: [string, RequestInit]) => Promise<Retur
   return mock;
 }
 
+type FakeTrack = { stopped: number; stop(): void };
+class StrictModeFakeRecorder {
+  static instances: StrictModeFakeRecorder[] = [];
+  static isTypeSupported = () => true;
+  state: RecordingState = 'inactive';
+  mimeType = 'audio/webm';
+  ondataavailable: ((event: BlobEvent) => void) | null = null;
+  onstop: ((event: Event) => void) | null = null;
+  onerror: ((event: Event) => void) | null = null;
+  constructor(readonly stream: MediaStream) { StrictModeFakeRecorder.instances.push(this); }
+  start() { this.state = 'recording'; }
+  pause() { this.state = 'paused'; }
+  resume() { this.state = 'recording'; }
+  stop() { this.state = 'inactive'; queueMicrotask(() => this.onstop?.(new Event('stop'))); }
+}
+
+beforeEach(() => { (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true; });
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers(); });
 
 describe('CloudWorkspaceSession voice lifecycle', () => {
+  it('mounts the real capture hook through StrictMode replay with RAM-only ownership and hardware cleanup', async () => {
+    const host = document.createElement('div');
+    document.body.append(host);
+    const root: Root = createRoot(host);
+    let unmounted = false;
+    const tracks: FakeTrack[] = [];
+    const getUserMedia = vi.fn(async () => {
+      const track: FakeTrack = { stopped: 0, stop() { this.stopped += 1; } };
+      tracks.push(track);
+      return { getTracks: () => [track] } as unknown as MediaStream;
+    });
+    const mediaDescriptor = Object.getOwnPropertyDescriptor(navigator, 'mediaDevices');
+    const indexedDbDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'indexedDB');
+    Object.defineProperty(navigator, 'mediaDevices', { configurable: true, value: { getUserMedia } });
+    vi.stubGlobal('MediaRecorder', StrictModeFakeRecorder);
+    const indexedDbRead = vi.fn(() => { throw new Error('Cloud capture must not read IndexedDB.'); });
+    Object.defineProperty(globalThis, 'indexedDB', { configurable: true, get: indexedDbRead });
+    StrictModeFakeRecorder.instances = [];
+    const fetcher = installFetch(async (path) => {
+      if (path === '/api/workspace/snapshot' || path === '/api/workspace/refresh') return body(snapshot());
+      throw new Error(`Unexpected request ${path}`);
+    });
+    const onLogout = vi.fn();
+    try {
+      await act(async () => {
+        root.render(<React.StrictMode><CloudWorkspaceSession session={session} onLogout={onLogout} /></React.StrictMode>);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+      await vi.waitFor(() => expect(mockSessionStoreRef.current).toBeTruthy());
+      const store = mockSessionStoreRef.current as CloudWorkspaceSessionStore;
+      expect(store.getSnapshot().voice?.phase).toBe('idle');
+      expect(getUserMedia).not.toHaveBeenCalled();
+      expect(fetcher.mock.calls.some(([path]) => path === '/api/audio/upload-history')).toBe(false);
+
+      await act(async () => { await store.voiceActions.start(); });
+      expect(getUserMedia).toHaveBeenCalledOnce();
+      expect(StrictModeFakeRecorder.instances).toHaveLength(1);
+      expect(tracks[0]?.stopped).toBe(0);
+
+      await act(async () => { await store.refresh(); });
+      expect(store.getSnapshot().voice?.phase).toBe('recording');
+      expect(mockSessionStoreRef.current).toBe(store);
+      expect(StrictModeFakeRecorder.instances).toHaveLength(1);
+      expect(getUserMedia).toHaveBeenCalledOnce();
+
+      await act(async () => { root.unmount(); unmounted = true; });
+      expect(tracks[0]?.stopped).toBe(1);
+      expect(StrictModeFakeRecorder.instances[0]?.state).toBe('inactive');
+      expect(fetcher.mock.calls.some(([path]) => String(path).startsWith('/api/audio/uploads'))).toBe(false);
+      expect(indexedDbRead).not.toHaveBeenCalled();
+      expect(onLogout).not.toHaveBeenCalled();
+    } finally {
+      if (!unmounted) await act(async () => { root.unmount(); await Promise.resolve(); await Promise.resolve(); });
+      host.remove();
+      mockSessionStoreRef.current = null;
+      if (mediaDescriptor) Object.defineProperty(navigator, 'mediaDevices', mediaDescriptor);
+      else Reflect.deleteProperty(navigator, 'mediaDevices');
+      if (indexedDbDescriptor) Object.defineProperty(globalThis, 'indexedDB', indexedDbDescriptor);
+      else Reflect.deleteProperty(globalThis, 'indexedDB');
+    }
+  });
+
+  it('releases tracks returned by a permission prompt after StrictMode composition unmounts', async () => {
+    const host = document.createElement('div');
+    document.body.append(host);
+    const root: Root = createRoot(host);
+    const permission = deferred<MediaStream>();
+    const getUserMedia = vi.fn(() => permission.promise);
+    let unmounted = false;
+    const mediaDescriptor = Object.getOwnPropertyDescriptor(navigator, 'mediaDevices');
+    Object.defineProperty(navigator, 'mediaDevices', { configurable: true, value: { getUserMedia } });
+    vi.stubGlobal('MediaRecorder', StrictModeFakeRecorder);
+    StrictModeFakeRecorder.instances = [];
+    installFetch(async (path) => {
+      if (path === '/api/workspace/snapshot') return body(snapshot());
+      throw new Error(`Unexpected request ${path}`);
+    });
+    try {
+      await act(async () => {
+        root.render(<React.StrictMode><CloudWorkspaceSession session={session} onLogout={() => undefined} /></React.StrictMode>);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+      await vi.waitFor(() => expect(mockSessionStoreRef.current).toBeTruthy());
+      const store = mockSessionStoreRef.current as CloudWorkspaceSessionStore;
+      let starting!: Promise<void>;
+      act(() => { starting = store.voiceActions.start(); });
+      expect(getUserMedia).toHaveBeenCalledOnce();
+      await act(async () => { root.unmount(); unmounted = true; await Promise.resolve(); });
+      const track: FakeTrack = { stopped: 0, stop() { this.stopped += 1; } };
+      permission.resolve({ getTracks: () => [track] } as unknown as MediaStream);
+      await expect(starting).rejects.toThrow('cancelled');
+      expect(track.stopped).toBe(1);
+      expect(StrictModeFakeRecorder.instances).toHaveLength(0);
+    } finally {
+      if (!unmounted) act(() => { root.unmount(); });
+      host.remove();
+      mockSessionStoreRef.current = null;
+      if (mediaDescriptor) Object.defineProperty(navigator, 'mediaDevices', mediaDescriptor);
+      else Reflect.deleteProperty(navigator, 'mediaDevices');
+    }
+  });
+
   it('creates fresh voice owners per setup, ignores stale cleanup, and does no implicit upload-history read', async () => {
     let failRefresh = false;
     let commandId: string | undefined;
