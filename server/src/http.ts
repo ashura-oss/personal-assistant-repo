@@ -260,6 +260,7 @@ function workspaceFailure(error: unknown): { readonly status: number; readonly c
     switch (error.code) {
       case 'oauth_invalid_input': case 'oauth_callback_invalid': return { status: 400, code: 'invalid_oauth_request' };
       case 'oauth_not_found': return { status: 404, code: 'oauth_not_found' };
+      case 'oauth_start_not_admitted': return { status: 409, code: 'oauth_start_not_admitted' };
       case 'oauth_conflict': case 'oauth_stale_workspace': case 'oauth_start_in_progress': return { status: 409, code: 'oauth_conflict' };
       case 'oauth_original_session_inactive': return { status: 401, code: 'unauthenticated' };
       case 'oauth_unavailable': return { status: 503, code: 'oauth_unavailable' };

@@ -1,4 +1,4 @@
-import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import type { ServerConfig } from './config.js';
 import type { AuthService } from './auth.js';
 import type { DurableKernel, OwnedWorkspaceIdentity } from './kernel.js';
@@ -33,7 +33,7 @@ interface StartRow {
 
 export class OAuthConnectionServiceError extends Error {
   constructor(readonly code: 'oauth_unavailable' | 'oauth_invalid_input' | 'oauth_conflict' | 'oauth_stale_workspace' |
-    'oauth_start_in_progress' | 'oauth_original_session_inactive' | 'oauth_not_found' | 'oauth_provider_failed' |
+    'oauth_start_in_progress' | 'oauth_start_not_admitted' | 'oauth_original_session_inactive' | 'oauth_not_found' | 'oauth_provider_failed' |
     'oauth_callback_invalid' | 'oauth_exchange_unknown' | 'oauth_service_closing') {
     super(code);
     this.name = 'OAuthConnectionServiceError';
@@ -162,7 +162,7 @@ export class OAuthConnectionService implements OAuthHttpApi {
         created_at INTEGER NOT NULL CHECK(created_at>=0), expires_at INTEGER NOT NULL CHECK(expires_at>created_at)
       ) STRICT;`);
       if (!hasSchema) db.prepare('INSERT INTO oauth_connection_schema(singleton,version) VALUES(1,1)').run();
-      const columns = new Set((db.prepare('PRAGMA table_info(oauth_connection_starts)').all() as Array<{ name: string }>).map((column) => column.name));
+      const columns = new Set((db.prepare('PRAGMA table_info(oauth_connection_starts)').all() as { name: string }[]).map((column) => column.name));
       if (['start_attempt_id', 'stage_id', 'owner_id', 'workspace_id', 'privacy_epoch', 'session_binding', 'provider', 'request_digest',
         'builder_state', 'disposition', 'created_at', 'expires_at'].some((column) => !columns.has(column))) throw new Error('oauth_connection_schema_incomplete');
       db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS oauth_connection_starts_one_active ON oauth_connection_starts(session_binding,provider)
@@ -209,61 +209,96 @@ export class OAuthConnectionService implements OAuthHttpApi {
     return this.track(provider, () => this.startOwned(admission, provider, inputValue));
   }
 
-  private async startOwned(admission: { sessionToken: string; assertCurrent: () => void }, provider: OAuthStageProvider, inputValue: unknown): Promise<OAuthStartResult> {
-    if (!providerFrom(provider)) fail('oauth_invalid_input');
-    const input = normalizeStart(inputValue);
-    const registration = this.registration(provider);
-    const identity = this.current(admission);
-    if (identity.revision !== input.expectedRevision || identity.privacyEpoch !== input.expectedPrivacyEpoch) fail('oauth_stale_workspace');
-    const sessionBinding = sha256(admission.sessionToken);
-    const requestDigest = digestRequest(input);
-    const prepared = this.options.kernel.withOwnedTransaction(admission.sessionToken, input.expectedPrivacyEpoch, (context) => {
-      if (context.revision !== input.expectedRevision) fail('oauth_stale_workspace');
-      const prior = context.db.prepare('SELECT * FROM oauth_connection_starts WHERE start_attempt_id=?')
-        .get(input.startAttemptId) as StartRow | undefined;
-      if (prior) {
-        if (prior.provider !== provider || prior.owner_id !== context.ownerId || prior.workspace_id !== context.workspaceId ||
-            prior.privacy_epoch !== context.privacyEpoch || !sameHash(prior.request_digest, requestDigest) ||
-            !sameHash(prior.session_binding, sessionBinding)) fail('oauth_conflict');
-        return { existing: true as const, row: prior, status: this.options.stages.readStatus(context, prior.stage_id, sessionBinding), clearCookieNames: [] as string[] };
+  /** All synchronous admission work happens in one transaction before a stage is committed. */
+  private prepareStart(admission: { sessionToken: string; assertCurrent: () => void }, provider: OAuthStageProvider,
+    inputValue: unknown) {
+    let existingStartAttemptId = false;
+    let startAttemptId: string | undefined;
+    try {
+      if (typeof inputValue === 'object' && inputValue !== null && !Array.isArray(inputValue)) {
+        const descriptor = Object.getOwnPropertyDescriptor(inputValue, 'startAttemptId');
+        if (descriptor && Object.hasOwn(descriptor, 'value') && typeof descriptor.value === 'string' && UUID_V4.test(descriptor.value)) {
+          startAttemptId = descriptor.value;
+        }
       }
-      const previous = context.db.prepare(`SELECT * FROM oauth_connection_starts WHERE session_binding=? AND provider=? AND disposition='active'`)
-        .get(sessionBinding, provider) as StartRow | undefined;
-      const clearCookieNames: string[] = [];
-      if (previous) {
-        if (input.restartOfStartAttemptId !== undefined && input.restartOfStartAttemptId !== previous.start_attempt_id) fail('oauth_conflict');
-        const priorStatus = this.options.stages.readStatus(context, previous.stage_id, sessionBinding);
-        if (previous.builder_state === 'building' && (this.activeBuilders.has(previous.start_attempt_id) || priorStatus.status === 'authorization_pending')) {
-          fail('oauth_start_in_progress');
+    } catch { /* Invalid objects are rejected by normalizeStart below. */ }
+    try {
+      if (!providerFrom(provider)) fail('oauth_invalid_input');
+      const input = normalizeStart(inputValue);
+      startAttemptId = input.startAttemptId;
+      const registration = this.registration(provider);
+      const identity = this.current(admission);
+      const sessionBinding = sha256(admission.sessionToken);
+      const requestDigest = digestRequest(input);
+      const prepared = this.options.kernel.withOwnedTransaction(admission.sessionToken, input.expectedPrivacyEpoch, (context) => {
+        const prior = context.db.prepare('SELECT * FROM oauth_connection_starts WHERE start_attempt_id=?')
+          .get(input.startAttemptId) as StartRow | undefined;
+        if (prior) {
+          existingStartAttemptId = true;
+          if (prior.provider !== provider || prior.owner_id !== context.ownerId || prior.workspace_id !== context.workspaceId ||
+              prior.privacy_epoch !== context.privacyEpoch || !sameHash(prior.request_digest, requestDigest) ||
+              !sameHash(prior.session_binding, sessionBinding)) fail('oauth_conflict');
+          return { existing: true as const, row: prior, status: this.options.stages.readStatus(context, prior.stage_id, sessionBinding), clearCookieNames: [] as string[] };
         }
-        if (priorStatus.status === 'exchange_claimed') fail('oauth_start_in_progress');
-        if (priorStatus.status === 'authorization_pending') {
-          if (input.restartOfStartAttemptId !== previous.start_attempt_id) fail('oauth_conflict');
-          const replaced = this.options.stages.supersedeAuthorizationWithinTransaction(context, previous.stage_id, sessionBinding);
-          if (replaced.status === 'exchange_claimed') fail('oauth_start_in_progress');
-        } else if (priorStatus.status === 'inspect_required' && input.restartOfStartAttemptId !== previous.start_attempt_id) {
-          fail('oauth_conflict');
-        }
-        context.db.prepare(`UPDATE oauth_connection_starts SET disposition='superseded' WHERE start_attempt_id=? AND disposition='active'`)
-          .run(previous.start_attempt_id);
-        clearCookieNames.push(cookieName(provider, previous.start_attempt_id));
-      } else if (input.restartOfStartAttemptId !== undefined) fail('oauth_conflict');
-      const lifecycle = input.reconnectAccountId
-        ? reconnectFromSnapshot((context.db.prepare('SELECT snapshot_json FROM workspaces WHERE id=?').get(context.workspaceId) as { snapshot_json: string }).snapshot_json,
-          input.reconnectAccountId, provider)
-        : undefined;
-      const created = this.options.stages.createAuthorization(context, { initiatingSessionToken: admission.sessionToken,
-        registrationId: registration.id, provider, requestedCapabilities: input.requestedCapabilities,
-        ...(lifecycle ? { reconnectLifecycle: lifecycle } : {}) });
-      const row: StartRow = { start_attempt_id: input.startAttemptId, stage_id: created.status.attemptId, owner_id: context.ownerId,
-        workspace_id: context.workspaceId, privacy_epoch: context.privacyEpoch, session_binding: sessionBinding, provider, request_digest: requestDigest,
-        builder_state: 'building', disposition: 'active', created_at: created.status.createdAt, expires_at: created.status.expiresAt };
-      context.db.prepare(`INSERT INTO oauth_connection_starts(start_attempt_id,stage_id,owner_id,workspace_id,privacy_epoch,session_binding,
-        provider,request_digest,builder_state,disposition,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`)
-        .run(row.start_attempt_id, row.stage_id, row.owner_id, row.workspace_id, row.privacy_epoch, row.session_binding, row.provider,
-          row.request_digest, row.builder_state, row.disposition, row.created_at, row.expires_at);
-      return { existing: false as const, row, status: created.status, authorization: created.authorization, clearCookieNames };
-    });
+        if (context.revision !== input.expectedRevision || context.privacyEpoch !== input.expectedPrivacyEpoch) fail('oauth_stale_workspace');
+        const previous = context.db.prepare(`SELECT * FROM oauth_connection_starts WHERE session_binding=? AND provider=? AND disposition='active'`)
+          .get(sessionBinding, provider) as StartRow | undefined;
+        const clearCookieNames: string[] = [];
+        if (previous) {
+          if (input.restartOfStartAttemptId !== undefined && input.restartOfStartAttemptId !== previous.start_attempt_id) fail('oauth_conflict');
+          const priorStatus = this.options.stages.readStatus(context, previous.stage_id, sessionBinding);
+          if (previous.builder_state === 'building' && (this.activeBuilders.has(previous.start_attempt_id) || priorStatus.status === 'authorization_pending')) {
+            fail('oauth_start_in_progress');
+          }
+          if (priorStatus.status === 'exchange_claimed') fail('oauth_start_in_progress');
+          if (priorStatus.status === 'authorization_pending') {
+            if (input.restartOfStartAttemptId !== previous.start_attempt_id) fail('oauth_conflict');
+            const replaced = this.options.stages.supersedeAuthorizationWithinTransaction(context, previous.stage_id, sessionBinding);
+            if (replaced.status === 'exchange_claimed') fail('oauth_start_in_progress');
+          } else if (priorStatus.status === 'inspect_required' && input.restartOfStartAttemptId !== previous.start_attempt_id) {
+            fail('oauth_conflict');
+          }
+          context.db.prepare(`UPDATE oauth_connection_starts SET disposition='superseded' WHERE start_attempt_id=? AND disposition='active'`)
+            .run(previous.start_attempt_id);
+          clearCookieNames.push(cookieName(provider, previous.start_attempt_id));
+        } else if (input.restartOfStartAttemptId !== undefined) fail('oauth_conflict');
+        const lifecycle = input.reconnectAccountId
+          ? reconnectFromSnapshot((context.db.prepare('SELECT snapshot_json FROM workspaces WHERE id=?').get(context.workspaceId) as { snapshot_json: string }).snapshot_json,
+            input.reconnectAccountId, provider)
+          : undefined;
+        const created = this.options.stages.createAuthorization(context, { initiatingSessionToken: admission.sessionToken,
+          registrationId: registration.id, provider, requestedCapabilities: input.requestedCapabilities,
+          ...(lifecycle ? { reconnectLifecycle: lifecycle } : {}) });
+        const row: StartRow = { start_attempt_id: input.startAttemptId, stage_id: created.status.attemptId, owner_id: context.ownerId,
+          workspace_id: context.workspaceId, privacy_epoch: context.privacyEpoch, session_binding: sessionBinding, provider, request_digest: requestDigest,
+          builder_state: 'building', disposition: 'active', created_at: created.status.createdAt, expires_at: created.status.expiresAt };
+        context.db.prepare(`INSERT INTO oauth_connection_starts(start_attempt_id,stage_id,owner_id,workspace_id,privacy_epoch,session_binding,
+          provider,request_digest,builder_state,disposition,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`)
+          .run(row.start_attempt_id, row.stage_id, row.owner_id, row.workspace_id, row.privacy_epoch, row.session_binding, row.provider,
+            row.request_digest, row.builder_state, row.disposition, row.created_at, row.expires_at);
+        return { existing: false as const, row, status: created.status, authorization: created.authorization, clearCookieNames };
+      });
+      return Object.freeze({ input, registration, identity, sessionBinding, requestDigest, prepared });
+    } catch (error) {
+      if (existingStartAttemptId) fail('oauth_conflict');
+      // A successful exact readback proves whether a synchronous transaction failed
+      // before commit or whether its acknowledgement was lost after the row committed.
+      if (startAttemptId) {
+        let existingRow: unknown;
+        try {
+          existingRow = this.options.kernel.withTrustedDatabaseTransaction((db) =>
+            db.prepare('SELECT 1 FROM oauth_connection_starts WHERE start_attempt_id=?').get(startAttemptId));
+        } catch { throw error; }
+        if (existingRow) throw error;
+      }
+      // No exact CID row exists, so this call neither committed nor adopted a stage,
+      // and provider work has not begun.
+      fail('oauth_start_not_admitted');
+    }
+  }
+
+  private async startOwned(admission: { sessionToken: string; assertCurrent: () => void }, provider: OAuthStageProvider, inputValue: unknown): Promise<OAuthStartResult> {
+    const { input, registration, identity, sessionBinding, prepared } = this.prepareStart(admission, provider, inputValue);
     admission.assertCurrent();
     if (prepared.existing) return Object.freeze({ kind: 'existing', status: prepared.status });
     this.activeBuilders.add(input.startAttemptId);

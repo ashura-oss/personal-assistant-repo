@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { Buffer } from 'node:buffer';
 import { exportJWK, generateKeyPair, SignJWT } from 'jose';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -97,11 +98,13 @@ async function oidcHarness() {
   let tokenCalls = 0;
   let gateNextGoogleToken;
   let gateNextDiscovery;
+  let failNextDiscovery = false;
   let failNextToken = false;
   const fetcher = async (input, init = {}) => {
     const url = new URL(input.toString());
     calls.push({ provider: active.get('provider'), url: url.href, method: init.method ?? 'GET', body: init.body });
     if (url.pathname.endsWith('/.well-known/openid-configuration')) {
+      if (failNextDiscovery) { failNextDiscovery = false; throw new Error('synthetic discovery transport failure'); }
       if (gateNextDiscovery && gateNextDiscovery.provider === active.get('provider')) {
         const gate = gateNextDiscovery; gateNextDiscovery = undefined; gate.entered.resolve(); await gate.release.promise;
       }
@@ -151,6 +154,7 @@ async function oidcHarness() {
   };
   function json(value, status = 200) { return new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } }); }
   return { fetcher, active, calls, tokenCount: () => tokenCalls,
+    failNextDiscovery() { failNextDiscovery = true; },
     failNextTokenExchange() { failNextToken = true; },
     gateGoogleToken() { const gate = { entered: deferred(), release: deferred() }; gateNextGoogleToken = gate; return gate; },
     gateDiscovery(provider) { const gate = { provider, entered: deferred(), release: deferred() }; gateNextDiscovery = gate; return gate; } };
@@ -743,6 +747,117 @@ test('corrupt verified payload inspection terminalizes safely and returns no pro
       .get(startBody.status.attemptId));
     assert.equal(persisted.status, 'inspect_required');
     assert.equal(persisted.ciphertext, null);
+  } finally {
+    await host?.close();
+    rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+test('OAuth start distinguishes pre-stage rejection from uncertain provider setup after a stage exists', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'still-oauth-start-admission-'));
+  const staticRoot = staticFixture(root);
+  const port = await freePort();
+  const origin = `${ORIGIN}:${port}`;
+  const config = loadServerConfig({ STILL_ORIGIN: origin, STILL_DATA_DIR: join(root, 'private', 'data'),
+    STILL_VAULT_KEY_FILE: join(root, 'private', 'keys', 'root.key'), STILL_GOOGLE_CLIENT_ID: 'google-client',
+    STILL_GOOGLE_CLIENT_SECRET: 'synthetic-google-secret' }, { staticRoot, allowLocalHttp: true });
+  let host; let testKernel;
+  let loseOwnedTransactionAcknowledgementForStartId;
+  let ownedTransactionAcknowledgementsLost = 0;
+  try {
+    const foundation = openServerFoundation(config, { initialWorkspaceSnapshot: state });
+    try { await foundation.auth.enrollOwner(PASSWORD, state()); } finally { foundation.close(); }
+    const oidc = await oidcHarness();
+    oidc.active.set('provider', 'google');
+    const responseOwner = createNodeProviderResponseLifetimeOwner({ fetcher: oidc.fetcher, createId: randomUUID });
+    const adapter = createServerOAuthProviderAdapter({ canonicalOrigin: origin, registrations: [{ registrationId: 'google', provider: 'google',
+      clientId: 'google-client', clientSecret: 'synthetic-google-secret' }], responseLifetime: responseOwner.withResponseLifetimeFor('oauth') });
+    host = await startApplicationHost({ config, port, foundation: { initialWorkspaceSnapshot: state },
+      createRuntime: createCloudApplicationRuntimeFactory({ workspacePortsFor: (_context, _vault, kernel) => {
+        testKernel = kernel;
+        const withOwnedTransaction = kernel.withOwnedTransaction.bind(kernel);
+        kernel.withOwnedTransaction = (sessionToken, expectedEpoch, callback) => {
+          const result = withOwnedTransaction(sessionToken, expectedEpoch, callback);
+          const committedStart = loseOwnedTransactionAcknowledgementForStartId
+            ? kernel.withTrustedDatabaseTransaction((db) => db.prepare('SELECT 1 FROM oauth_connection_starts WHERE start_attempt_id=?')
+              .get(loseOwnedTransactionAcknowledgementForStartId)) : undefined;
+          if (committedStart) {
+            loseOwnedTransactionAcknowledgementForStartId = undefined;
+            ownedTransactionAcknowledgementsLost += 1;
+            throw new Error('synthetic transaction acknowledgement loss');
+          }
+          return result;
+        };
+        return closedPorts();
+      },
+        oauth: { provider: adapter, responseLifetimeOwner: responseOwner, config } }) });
+    const auth = await login(origin);
+    const headers = { Cookie: auth.session };
+    const snapshot = await (await fetch(`${origin}/api/workspace/snapshot`, { headers })).json();
+    const rowsBefore = testKernel.withTrustedDatabaseTransaction((db) => ({
+      starts: db.prepare('SELECT COUNT(*) AS count FROM oauth_connection_starts').get().count,
+      stages: db.prepare('SELECT COUNT(*) AS count FROM oauth_install_stages').get().count,
+    }));
+    const freshId = randomUUID();
+    const rejected = await fetch(`${origin}/api/oauth/google/start`, { method: 'POST', headers: { ...headers, Origin: origin,
+      'X-Still-CSRF': auth.csrf, 'Content-Type': 'application/json' }, body: JSON.stringify({ startAttemptId: freshId,
+      requestedCapabilities: ['mail.read'], expectedRevision: snapshot.revision + 1, expectedPrivacyEpoch: 0 }) });
+    assert.equal(rejected.status, 409);
+    assert.deepEqual(await rejected.json(), { error: 'oauth_start_not_admitted' });
+    assert.equal(oidc.calls.length, 0, 'stale workspace rejection happens before provider discovery');
+    assert.deepEqual(testKernel.withTrustedDatabaseTransaction((db) => ({
+      starts: db.prepare('SELECT COUNT(*) AS count FROM oauth_connection_starts').get().count,
+      stages: db.prepare('SELECT COUNT(*) AS count FROM oauth_install_stages').get().count,
+    })), rowsBefore, 'pre-admission rejection creates neither a start row nor an OAuth stage');
+    assert.equal(testKernel.withTrustedDatabaseTransaction((db) => db.prepare('SELECT revision FROM workspaces').get().revision), snapshot.revision);
+
+    const lostAckId = randomUUID();
+    loseOwnedTransactionAcknowledgementForStartId = lostAckId;
+    const lostAck = await fetch(`${origin}/api/oauth/google/start`, { method: 'POST', headers: { ...headers, Origin: origin,
+      'X-Still-CSRF': auth.csrf, 'Content-Type': 'application/json' }, body: JSON.stringify({ startAttemptId: lostAckId,
+      requestedCapabilities: ['mail.read'], expectedRevision: snapshot.revision, expectedPrivacyEpoch: 0 }) });
+    assert.equal(lostAck.status, 503);
+    const lostAckBody = await lostAck.json();
+    assert.deepEqual(lostAckBody, { error: 'service_unavailable' }, `a lost commit acknowledgement is not classified as not-admitted: ${JSON.stringify(lostAckBody)}`);
+    assert.equal(ownedTransactionAcknowledgementsLost, 1, 'fault injection must hit the owned transaction after it returns');
+    assert.equal(oidc.calls.length, 0, 'the lost acknowledgement prevents provider work while preserving the committed stage');
+    let starts = await fetch(`${origin}/api/oauth/starts?provider=google`, { headers });
+    let rows = await starts.json();
+    const lostAckRow = rows.find((row) => row.startAttemptId === lostAckId);
+    assert.ok(lostAckRow?.stageId, `the committed attempt remains inspectable after acknowledgement loss: ${JSON.stringify({ lostAckBody, rows, calls: oidc.calls.length, lost: ownedTransactionAcknowledgementsLost })}`);
+
+    testKernel.withTrustedDatabaseTransaction((db) => db.prepare('UPDATE workspaces SET revision=revision+1').run());
+    const duplicateAfterWorkspaceChange = await fetch(`${origin}/api/oauth/google/start`, { method: 'POST', headers: { ...headers, Origin: origin,
+      'X-Still-CSRF': auth.csrf, 'Content-Type': 'application/json' }, body: JSON.stringify({ startAttemptId: lostAckId,
+      requestedCapabilities: ['mail.read'], expectedRevision: snapshot.revision, expectedPrivacyEpoch: 0 }) });
+    assert.equal(duplicateAfterWorkspaceChange.status, 200, 'an exact existing CID is resolved before stale-revision rejection');
+    assert.equal((await duplicateAfterWorkspaceChange.json()).kind, 'existing');
+    const expiredAt = Date.now() - 1;
+    testKernel.withTrustedDatabaseTransaction((db) => {
+      db.prepare('UPDATE oauth_install_stages SET created_at=?,expires_at=? WHERE stage_id=?').run(expiredAt - 1000, expiredAt, lostAckRow.stageId);
+      db.prepare('UPDATE oauth_connection_starts SET created_at=?,expires_at=? WHERE start_attempt_id=?').run(expiredAt - 1000, expiredAt, lostAckId);
+    });
+
+    oidc.failNextDiscovery();
+    const uncertainId = randomUUID();
+    const uncertain = await fetch(`${origin}/api/oauth/google/start`, { method: 'POST', headers: { ...headers, Origin: origin,
+      'X-Still-CSRF': auth.csrf, 'Content-Type': 'application/json' }, body: JSON.stringify({ startAttemptId: uncertainId,
+      requestedCapabilities: ['mail.read'], expectedRevision: snapshot.revision + 1, expectedPrivacyEpoch: 0 }) });
+    assert.equal(uncertain.status, 503);
+    assert.deepEqual(await uncertain.json(), { error: 'service_unavailable' });
+    starts = await fetch(`${origin}/api/oauth/starts?provider=google`, { headers });
+    assert.equal(starts.status, 200);
+    rows = await starts.json();
+    const created = rows.find((row) => row.startAttemptId === uncertainId);
+    assert.ok(created, 'the uncertain CID remains inspectable after the stage committed');
+    assert.equal(created.status, 'restart_required');
+    assert.ok(created.stageId);
+    const duplicateConflict = await fetch(`${origin}/api/oauth/google/start`, { method: 'POST', headers: { ...headers, Origin: origin,
+      'X-Still-CSRF': auth.csrf, 'Content-Type': 'application/json' }, body: JSON.stringify({ startAttemptId: uncertainId,
+      requestedCapabilities: ['calendar.read'], expectedRevision: snapshot.revision + 1, expectedPrivacyEpoch: 0 }) });
+    assert.equal(duplicateConflict.status, 409);
+    assert.deepEqual(await duplicateConflict.json(), { error: 'oauth_conflict' }, 'an existing CID conflict does not claim the original attempt vanished');
+    assert.equal(oidc.tokenCount(), 0, 'discovery failure does not perform a token exchange');
   } finally {
     await host?.close();
     rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
