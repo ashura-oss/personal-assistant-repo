@@ -24,6 +24,7 @@ import { ChatSubmissionNotStartedError, type ChatSendAttempt, type ChatSendInspe
 import { Button } from '../ui/primitives';
 import { C, s } from '../ui/theme';
 import { useCloudAudioPlayback } from './useCloudAudioPlayback';
+import { createCloudKnowledgeActions } from './cloudKnowledgeActions';
 import type { CloudVoiceCoordinatorState } from './cloudVoiceCoordinator';
 import type { CloudCredentialController } from './useCloudCredentials';
 
@@ -101,6 +102,9 @@ function equalSettingsBaseline(left: WorkspaceSettingsBaseline, right: Workspace
 export function CloudWorkspace({ store, state, onLogout, voiceCapability, credentials }: { store: Pick<CloudWorkspaceSessionStore, 'getSnapshot' | 'execute' | 'inspect' | 'refresh'>; state: CloudWorkspaceSessionState; onLogout: () => void; voiceCapability?: CloudWorkspaceVoiceCapability; credentials?: CloudCredentialController }) {
   const snapshot = state.snapshot!;
   const dto = snapshot.state;
+  const libraryMutationActions = useMemo(() => createCloudKnowledgeActions(store, { workspaceId: snapshot.workspaceId, privacyEpoch: snapshot.privacyEpoch }),
+    [snapshot.privacyEpoch, snapshot.workspaceId, store]);
+  const cloudKnowledgeEntityActions = libraryMutationActions.entities.available ? libraryMutationActions.entities.action : undefined;
   const [tab, setTab] = useState<WorkspaceTab>('inbox');
   const [, setDraft] = useState('');
   const [selectedNoteId, setSelectedNoteId] = useState<string>();
@@ -626,7 +630,7 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
           />
       ) : tab === 'library' ? (
         <>
-          <LibraryScreen
+          <LibraryScreen key={`${snapshot.workspaceId}:${snapshot.privacyEpoch}`}
             notes={libraryNotes.map((note) => workspaceNoteCardDisplay({ ...note, recordingAvailable: note.audio?.available === true }))}
             query={libraryQuery} setQuery={setLibraryQuery} docs={dto.documents} tasks={dto.tasks}
             busy={state.busy || state.refreshRequired}
@@ -651,8 +655,16 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
               if (!note) return;
               setSelectedNoteId(id); setDraft('');
             }}
-            documentActions={{ available: false, reason: 'Document editing is not connected to server commands yet.' }}
-            knowledgeEntityActions={{ available: false, reason: 'People and project editing are not connected to server commands yet.' }}
+            documentActions={libraryMutationActions.documents}
+            knowledgeEntityActions={cloudKnowledgeEntityActions ? { available: true, action: {
+              ...cloudKnowledgeEntityActions,
+              archive: (kind, id, expectedRevision, archived) => {
+                void cloudKnowledgeEntityActions.archive(kind, id, expectedRevision, archived).catch((error) => {
+                  const latest = store.getSnapshot().snapshot;
+                  if (latest?.workspaceId === snapshot.workspaceId && latest.privacyEpoch === snapshot.privacyEpoch) setNotice(errText(error));
+                });
+              },
+            } } : libraryMutationActions.entities}
             knowledgeSuggestionActions={{ available: false, reason: 'Knowledge suggestion review is not connected to server commands yet.' }}
             onExport={{ available: false, reason: 'Workspace export is not connected to the browser workspace yet.' }}
           />

@@ -22,6 +22,7 @@ import { friendlyDocumentName, newDocumentPath, projectImportedKnowledgeArchives
 import type { ReminderAlertChannel, ReminderAlertDisplay, ReminderDisplayRecord } from './reminderDisplay';
 import type { WorkspaceSnapshotDTO, DeepReadonly } from '../cloud/workspaceDto';
 import type { WorkspaceActionCapability } from './workspaceCapabilities';
+import { WorkspaceDocumentEditor, type EditableWorkspaceDocument, type WorkspaceDocumentSaveAction } from './WorkspaceDocumentEditor';
 
 export type LibraryArchiveActionPorts = Readonly<{
   importedKnowledge: WorkspaceActionCapability<ImportedKnowledgeActivationPort>;
@@ -36,7 +37,7 @@ type LibraryReminderActions = Readonly<{
   cancel: (id: string, expectedRevision: number) => Promise<unknown>;
   delete: (id: string, expectedRevision: number) => Promise<unknown>;
 }>;
-type LibraryKnowledgeEntityActions = Readonly<{
+export type LibraryKnowledgeEntityActions = Readonly<{
   archive: (kind: KnowledgeEntityKind, id: string, revision: number, archived: boolean) => void;
   savePerson: (input: KnowledgeEntityEditCommand) => Promise<unknown>;
   saveProject: (input: KnowledgeProjectEditCommand) => Promise<unknown>;
@@ -44,8 +45,10 @@ type LibraryKnowledgeEntityActions = Readonly<{
   removeFact: (input: KnowledgeItemCommand) => Promise<unknown>;
   saveContact: (input: SaveKnowledgeContactInput) => Promise<unknown>;
   removeContact: (input: KnowledgeItemCommand & { entityKind: 'person' }) => Promise<unknown>;
-  saveSourceLink: (input: Omit<SaveKnowledgeSourceLinkInput, 'reference'> & { referenceChoiceId?: string }) => Promise<unknown>;
-  removeSourceLink: (input: KnowledgeItemCommand) => Promise<unknown>;
+  sourceLinks: WorkspaceActionCapability<Readonly<{
+    save: (input: Omit<SaveKnowledgeSourceLinkInput, 'reference'> & { referenceChoiceId?: string }) => Promise<unknown>;
+    remove: (input: KnowledgeItemCommand) => Promise<unknown>;
+  }>>;
   saveMember: (input: SaveKnowledgeMemberInput) => Promise<unknown>;
   removeMember: (input: KnowledgeItemCommand & { entityKind: 'project' }) => Promise<unknown>;
 }>;
@@ -84,6 +87,7 @@ export function LibraryScreen({
   onComplete,
   onReopen,
   onOpenNote,
+  onDocumentEditorChange,
   documentActions,
   knowledgeEntityActions,
   knowledgeSuggestionActions,
@@ -119,13 +123,17 @@ export function LibraryScreen({
   onComplete: WorkspaceActionCapability<(id: string) => void>;
   onReopen: WorkspaceActionCapability<(id: string) => void>;
   onOpenNote: (id: string, expectedRevision: number) => void;
-  documentActions: WorkspaceActionCapability<(d: { path: string; content: string }) => void>;
+  onDocumentEditorChange?: (document: EditableWorkspaceDocument | undefined) => void;
+  documentActions: WorkspaceActionCapability<WorkspaceDocumentSaveAction>;
   knowledgeEntityActions: WorkspaceActionCapability<LibraryKnowledgeEntityActions>;
   knowledgeSuggestionActions: WorkspaceActionCapability<LibraryKnowledgeSuggestionActions>;
   onExport: WorkspaceActionCapability<() => void>;
   onRun?: <T>(action: () => Promise<T>) => Promise<T | undefined>;
 }) {
   const [importOpen, setImportOpen] = useState(false);
+  const documentEditorChangeRef = useRef(onDocumentEditorChange);
+  documentEditorChangeRef.current = onDocumentEditorChange;
+  useEffect(() => () => documentEditorChangeRef.current?.(undefined), []);
   const importedOwnershipRef = useRef(new ImportedKnowledgeActivationOwnership());
   const importedSelectionRef = useRef<ImportedKnowledgeSelection | null>(null);
   const importedKnowledgePort = archiveActions.importedKnowledge.available ? archiveActions.importedKnowledge.action : undefined;
@@ -223,6 +231,15 @@ export function LibraryScreen({
   const [editingEntityId, setEditingEntityId] = useState<string | null>(null);
   const [editorInstance, setEditorInstance] = useState(0);
   const [entitySheetOpen, setEntitySheetOpen] = useState(false);
+  const [selectedDocument, setSelectedDocument] = useState<EditableWorkspaceDocument>();
+  const openDocumentEditor = (document: EditableWorkspaceDocument) => {
+    setSelectedDocument(document);
+    onDocumentEditorChange?.(document);
+  };
+  const closeDocumentEditor = () => {
+    setSelectedDocument(undefined);
+    onDocumentEditorChange?.(undefined);
+  };
   const structuredNarrativePaths = new Set([
     ...knowledge.people.map((entity) => entity.narrativePath),
     ...knowledge.projects.map((entity) => entity.narrativePath),
@@ -295,7 +312,7 @@ export function LibraryScreen({
           name="add"
           label="Create personal document"
             onPress={() => {
-              if (documentActions.available) documentActions.action({ path: newDocumentPath(docs), content: "" });
+              if (documentActions.available) openDocumentEditor({ path: newDocumentPath(docs), content: "" });
             }}
             disabled={!documentActions.available}
         />
@@ -308,7 +325,7 @@ export function LibraryScreen({
               key={d.path}
               accessibilityRole="button"
               accessibilityLabel={`Open document ${title}`}
-              onPress={() => { if (documentActions.available) documentActions.action(d); }}
+              onPress={() => { if (documentActions.available) openDocumentEditor(d); }}
               disabled={!documentActions.available}
               style={s.documentRow}
             >
@@ -447,7 +464,7 @@ export function LibraryScreen({
         chooseBackup={backupImportPort.chooseBackup}
         onClose={() => setImportOpen(false)}
       /> : null}
-      {knowledgeEntityActions.available ? <KnowledgeEntitySheet
+      {entitySheetOpen && knowledgeEntityActions.available ? <KnowledgeEntitySheet
         key={editorInstance}
         visible={entitySheetOpen}
         kind={entityKind}
@@ -463,10 +480,18 @@ export function LibraryScreen({
         onRemoveFact={knowledgeEntityActions.action.removeFact}
         onSaveContact={knowledgeEntityActions.action.saveContact}
         onRemoveContact={knowledgeEntityActions.action.removeContact}
-        onSaveSourceLink={knowledgeEntityActions.action.saveSourceLink}
-        onRemoveSourceLink={knowledgeEntityActions.action.removeSourceLink}
+        sourceLinks={knowledgeEntityActions.action.sourceLinks}
         onSaveMember={knowledgeEntityActions.action.saveMember}
         onRemoveMember={knowledgeEntityActions.action.removeMember}
+      /> : null}
+      {selectedDocument ? <WorkspaceDocumentEditor
+        key={selectedDocument.path}
+        visible={Boolean(selectedDocument)}
+        document={selectedDocument}
+        currentDocuments={docs}
+        busy={busy}
+        saveAction={documentActions}
+        onClose={closeDocumentEditor}
       /> : null}
     </ScrollView>
   );

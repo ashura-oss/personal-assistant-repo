@@ -9,6 +9,7 @@ import type { CloudWorkspaceSessionState, CloudWorkspaceVoiceActions } from '../
 import { CloudWorkspace } from '../src/web/CloudWorkspace';
 import { CloudWorkspaceSession } from '../src/web/CloudWorkspaceSession';
 import { ServerRecordingPanel } from '../src/ui/ServerRecordingPanel';
+import { WorkspaceDocumentEditor } from '../src/ui/WorkspaceDocumentEditor';
 import type { CloudVoiceCoordinatorState, CloudVoicePhase } from '../src/web/cloudVoiceCoordinator';
 import type { WorkspaceCommand, WorkspaceCommandResponse } from '../src/cloud/workspaceCommands';
 import { WorkspaceClientError } from '../src/web/workspaceClient';
@@ -723,7 +724,7 @@ describe('CloudWorkspace safe DTO presentation', () => {
     expect(snapshot.state.tasks[0]?.status).toBe('open');
   });
 
-  it('keeps unimplemented shared library actions disabled and explains their current capability', () => {
+  it('keeps unavailable reminders disabled while enabling the server-backed People editor', () => {
     const { snapshot, store } = fixture();
     act(() => root.render(<CloudWorkspace store={store} state={{ status: 'ready', snapshot, busy: false, refreshRequired: false }} onLogout={vi.fn()} />));
     click('Library');
@@ -731,8 +732,7 @@ describe('CloudWorkspace safe DTO presentation', () => {
     expect(host.textContent).toContain('Reminder creation and management are not connected to server commands yet.');
     expect([...host.querySelectorAll('button')].find((button) => button.textContent?.includes('Add reminder'))?.disabled).toBe(true);
     click('People');
-    expect(host.textContent).toContain('People and project editing are not connected to server commands yet.');
-    expect([...host.querySelectorAll('button')].find((button) => button.textContent?.includes('Add person'))?.disabled).toBe(true);
+    expect([...host.querySelectorAll('button')].find((button) => button.textContent?.includes('Add person'))?.disabled).toBe(false);
     expect(store.execute).not.toHaveBeenCalled();
   });
 
@@ -1202,5 +1202,297 @@ describe('CloudWorkspace safe DTO presentation', () => {
     expect(uploadStoppedClip).not.toHaveBeenCalled();
     expect(saveReady).not.toHaveBeenCalled();
     expect(inspectAdoption).not.toHaveBeenCalled();
+  });
+
+  it('saves shared documents and People/Projects through exact cloud commands and confirmed receipts', async () => {
+    const { state } = fixture();
+    const commands: WorkspaceCommand[] = [];
+    const personId = 'abababab-abab-4bab-8bab-abababababab';
+    const existingPersonId = '01234567-89ab-7def-8abc-0123456789ab';
+    const projectId = 'bcbcbcbc-bcbc-4cbc-8cbc-bcbcbcbcbcbc';
+    const factId = 'cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd';
+    const contactId = 'dededede-dede-4ede-8ede-dededededede';
+    const memberId = 'efefefef-efef-4fef-8fef-efefefefefef';
+    let snapshotRevision = 7;
+    state.knowledge.people.push({ id: existingPersonId, revision: 6, name: 'Existing Jordan', aliases: [], narrativePath: `people/${existingPersonId}.md`, createdAt: '2026-10-01T00:00:00.000Z', updatedAt: '2026-10-14T00:00:00.000Z', facts: [], contacts: [], sourceLinks: [] } satisfies import('../src/knowledge/types').Person);
+    state.documents.push({ path: `people/${existingPersonId}.md`, content: 'Existing saved narrative.', revision: 4, updatedAt: '2026-10-14T00:00:00.000Z' });
+    const makeSnapshot = () => createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: ++snapshotRevision });
+    const getEntity = (kind: 'person' | 'project', id: string) => kind === 'person'
+      ? state.knowledge.people.find((item) => item.id === id)
+      : state.knowledge.projects.find((item) => item.id === id);
+    const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const path = String(input); const method = init?.method ?? 'GET';
+      if (path === '/api/credentials' && method === 'GET') return { ok: true, status: 200, json: async () => credentialMetadata() };
+      if (path === '/api/workspace/snapshot' || path === '/api/workspace/refresh') return { ok: true, status: 200, json: async () => makeSnapshot() };
+      if (path === '/api/workspace/commands' && method === 'POST') {
+        const envelope = JSON.parse(String(init?.body)) as { commandId: string; command: WorkspaceCommand };
+        const command = envelope.command;
+        commands.push(command);
+        const timestamp = new Date().toISOString();
+        let objectId = '';
+        let receiptExtra: Record<string, unknown> = {};
+        switch (command.kind) {
+          case 'documents.save': {
+            const current = state.documents.find((item) => item.path === command.path);
+            const revision = (current?.revision ?? 0) + 1;
+            if (current) { current.content = command.content; current.revision = revision; current.updatedAt = timestamp; }
+            else state.documents.push({ path: command.path, content: command.content, revision, updatedAt: timestamp });
+            objectId = command.path; receiptExtra = { documentRevision: revision }; break;
+          }
+          case 'knowledge.person.save': {
+            const narrative = command.input.narrative;
+            let person: (typeof state.knowledge.people)[number];
+            if (command.operation === 'create') {
+              const input = command.input;
+              person = {
+                id: personId, revision: 1, name: input.name, aliases: [...input.aliases], narrativePath: `people/${personId}.md`, createdAt: timestamp, updatedAt: timestamp,
+                facts: [], contacts: [], sourceLinks: [],
+              };
+              state.knowledge.people.push(person);
+            } else {
+              const input = command.input;
+              person = state.knowledge.people.find((item) => item.id === input.id)!;
+              person.revision += 1; person.name = input.name; person.aliases = [...input.aliases]; person.updatedAt = timestamp;
+            }
+            const doc = state.documents.find((item) => item.path === person.narrativePath);
+            if (doc) { doc.content = narrative; doc.revision += 1; doc.updatedAt = timestamp; }
+            else state.documents.push({ path: person.narrativePath, content: narrative, revision: 1, updatedAt: timestamp });
+            objectId = person.id; receiptExtra = { entityKind: 'person', entityRevision: person.revision }; break;
+          }
+          case 'knowledge.project.save': {
+            const narrative = command.input.narrative;
+            let project: (typeof state.knowledge.projects)[number];
+            if (command.operation === 'create') {
+              const input = command.input;
+              project = {
+                id: projectId, revision: 1, name: input.name, aliases: [...input.aliases], narrativePath: `projects/${projectId}.md`, createdAt: timestamp, updatedAt: timestamp,
+                facts: [], sourceLinks: [], members: [], status: input.status, goal: input.goal,
+                ...(input.startsOn ? { startsOn: input.startsOn } : {}), ...(input.targetOn ? { targetOn: input.targetOn } : {}), ...(input.dateTimeZone ? { dateTimeZone: input.dateTimeZone } : {}),
+              };
+              state.knowledge.projects.push(project);
+            } else {
+              const input = command.input;
+              project = state.knowledge.projects.find((item) => item.id === input.id)!;
+              project.revision += 1; project.name = input.name; project.aliases = [...input.aliases]; project.status = input.status; project.goal = input.goal; project.updatedAt = timestamp;
+            }
+            const doc = state.documents.find((item) => item.path === project.narrativePath);
+            if (doc) { doc.content = narrative; doc.revision += 1; doc.updatedAt = timestamp; }
+            else state.documents.push({ path: project.narrativePath, content: narrative, revision: 1, updatedAt: timestamp });
+            objectId = project.id; receiptExtra = { entityKind: 'project', entityRevision: project.revision }; break;
+          }
+          case 'knowledge.entity.archive': {
+            const entity = getEntity(command.entityKind, command.id)!;
+            entity.revision += 1; entity.updatedAt = timestamp;
+            if (command.archived) entity.archivedAt = timestamp; else delete entity.archivedAt;
+            objectId = entity.id; receiptExtra = { entityKind: command.entityKind, entityRevision: entity.revision }; break;
+          }
+          case 'knowledge.fact.save': case 'knowledge.fact.remove': {
+            const entity = getEntity(command.entityKind, command.entityId)!;
+            const id = command.kind === 'knowledge.fact.remove' ? command.itemId : command.itemId ?? factId;
+            if (command.kind === 'knowledge.fact.remove') entity.facts = entity.facts.filter((item) => item.id !== id);
+            else {
+              const existing = entity.facts.find((item) => item.id === id);
+              if (existing) existing.statement = command.statement;
+              else entity.facts.push({ id, provenance: 'user_authored', createdAt: timestamp, statement: command.statement });
+            }
+            entity.revision += 1; entity.updatedAt = timestamp; objectId = entity.id; receiptExtra = { entityKind: command.entityKind, entityRevision: entity.revision, itemId: id }; break;
+          }
+          case 'knowledge.contact.save': case 'knowledge.contact.remove': {
+            const entity = state.knowledge.people.find((item) => item.id === command.entityId)!;
+            const id = command.kind === 'knowledge.contact.remove' ? command.itemId : command.itemId ?? contactId;
+            if (command.kind === 'knowledge.contact.remove') entity.contacts = entity.contacts.filter((item) => item.id !== id);
+            else {
+              const existing = entity.contacts.find((item) => item.id === id);
+              if (existing) { existing.address = command.address; existing.label = command.label; }
+              else entity.contacts.push({ id, provenance: 'user_authored', createdAt: timestamp, address: command.address, label: command.label });
+            }
+            entity.revision += 1; entity.updatedAt = timestamp; objectId = entity.id; receiptExtra = { entityKind: 'person', entityRevision: entity.revision, itemId: id }; break;
+          }
+          case 'knowledge.member.save': case 'knowledge.member.remove': {
+            const entity = state.knowledge.projects.find((item) => item.id === command.entityId)!;
+            const id = command.kind === 'knowledge.member.remove' ? command.itemId : command.itemId ?? memberId;
+            if (command.kind === 'knowledge.member.remove') entity.members = entity.members.filter((item) => item.id !== id);
+            else {
+              const existing = entity.members.find((item) => item.id === id);
+              if (existing && 'personId' in existing) { existing.personId = command.personId; existing.role = command.role; }
+              else entity.members.push({ id, provenance: 'user_authored', createdAt: timestamp, personId: command.personId, role: command.role });
+            }
+            entity.revision += 1; entity.updatedAt = timestamp; objectId = entity.id; receiptExtra = { entityKind: 'project', entityRevision: entity.revision, itemId: id }; break;
+          }
+          default: throw new Error(`Unexpected Library command: ${command.kind}`);
+        }
+        const responseSnapshot = makeSnapshot();
+        return { ok: true, status: 200, json: async () => ({ schemaVersion: 1, commandId: envelope.commandId, status: 'finished',
+          receipt: { schemaVersion: 1, commandId: envelope.commandId, kind: command.kind, objectId, ...receiptExtra }, snapshot: responseSnapshot }) };
+      }
+      throw new Error(`Unexpected Library request: ${method} ${path}`);
+    });
+    vi.stubGlobal('fetch', fetcher);
+    try {
+      await act(async () => { root.render(<CloudWorkspaceSession session={{ authenticated: true, workspaceId, privacyEpoch: 3, csrfToken: 'csrf' }} onLogout={vi.fn()} />); await new Promise((resolve) => setTimeout(resolve, 0)); });
+      click('Library');
+      click('Create personal document');
+      setTextField('Document content', 'Keep project decisions here.');
+      clickTwice('Save');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(commands[0]).toMatchObject({ kind: 'documents.save', content: 'Keep project decisions here.', expectedRevision: null });
+      expect(host.textContent).toContain('Document saved.');
+      click('Back to library');
+      const savedDocumentRow = [...host.querySelectorAll('button')].find((button) => button.getAttribute('aria-label')?.startsWith('Open document '));
+      expect(savedDocumentRow).toBeDefined();
+      act(() => savedDocumentRow!.click());
+      setTextField('Document content', 'Updated project decisions.');
+      clickTwice('Save');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(commands[1]).toMatchObject({ kind: 'documents.save', content: 'Updated project decisions.', expectedRevision: 1 });
+      click('Back to library');
+
+      click('People library section');
+      click('Add person');
+      setTextField('Name', 'Maya');
+      setTextField('Aliases · separate with commas', 'May');
+      setTextField('Notes', 'A new colleague.');
+      click('Create person');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(commands[2]).toEqual({ kind: 'knowledge.person.save', operation: 'create', input: { name: 'Maya', aliases: ['May'], narrative: 'A new colleague.' } });
+      click('Open person Maya');
+      expect(host.textContent).toContain('Source links are viewable here; editing them is not connected to workspace commands yet.');
+      setTextField('Add a fact', 'Prefers concise updates');
+      clickTwice('Add fact');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(commands.filter((command) => command.kind === 'knowledge.fact.save')).toHaveLength(1);
+      click('Remove claim Prefers concise updates');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(commands.filter((command) => command.kind === 'knowledge.fact.remove')).toHaveLength(1);
+
+      setTextField('Contact address · not verified', 'maya@example.test');
+      setTextField('Label', 'Work');
+      click('Add contact claim');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(commands.filter((command) => command.kind === 'knowledge.contact.save')).toHaveLength(1);
+      click('Remove claim Work: maya@example.test');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(commands.filter((command) => command.kind === 'knowledge.contact.remove')).toHaveLength(1);
+
+      setTextField('Name', 'Maya Lee');
+      click('Save changes');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(commands.find((command) => command.kind === 'knowledge.person.save' && command.operation === 'update')).toMatchObject({ operation: 'update', input: { id: personId, expectedRevision: 5, expectedDocumentRevision: 1, name: 'Maya Lee' } });
+
+      click('Projects library section');
+      click('Add project');
+      setTextField('Name', 'Still launch');
+      setTextField('Notes', 'Project narrative.');
+      setTextField('Goal', 'Ship the first version.');
+      click('Create project');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(commands.find((command) => command.kind === 'knowledge.project.save')).toMatchObject({ kind: 'knowledge.project.save', operation: 'create', input: { name: 'Still launch', goal: 'Ship the first version.' } });
+
+      click('Open project Still launch');
+      click('Maya Lee');
+      setTextField('Role', 'Owner');
+      click('Add project member');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(commands.filter((command) => command.kind === 'knowledge.member.save')).toHaveLength(1);
+      click('Remove claim Maya Lee · Owner');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(commands.filter((command) => command.kind === 'knowledge.member.remove')).toHaveLength(1);
+      click('Close knowledge editor');
+      click('Archive project Still launch');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(commands.filter((command) => command.kind === 'knowledge.entity.archive')).toHaveLength(1);
+
+      click('People library section');
+      click('Open person Existing Jordan');
+      setTextField('Name', 'Jordan Updated');
+      clickTwice('Save changes');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(commands.find((command) => command.kind === 'knowledge.person.save' && command.operation === 'update' && command.input.id === existingPersonId)).toMatchObject({
+        operation: 'update', input: { id: existingPersonId, expectedRevision: 6, expectedDocumentRevision: 4, name: 'Jordan Updated' },
+      });
+      expect(host.textContent).toContain('Jordan Updated');
+      expect(fetcher.mock.calls.filter(([path, init]) => String(path) === '/api/workspace/commands' && init?.method === 'POST')).toHaveLength(commands.length);
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it.each(['rejected request', 'late receipt'] as const)('does not publish an archive result from an old workspace after a %s', async (outcome) => {
+    const oldOwner = fixture().state;
+    const personId = '01234567-89ab-7def-8abc-0123456789ab';
+    oldOwner.knowledge.people.push({ id: personId, revision: 1, name: 'Jordan', aliases: [], narrativePath: `people/${personId}.md`, createdAt: '2026-10-01T00:00:00.000Z', updatedAt: '2026-10-14T00:00:00.000Z', facts: [], contacts: [], sourceLinks: [] } satisfies import('../src/knowledge/types').Person);
+    const newOwner = createInitialWorkspaceState(() => '44444444-4444-4444-8444-444444444444');
+    const firstSnapshot = createWorkspaceSnapshotDTO({ getSnapshot: () => oldOwner }, { workspaceId, privacyEpoch: 3, revision: 7 });
+    const secondSnapshot = createWorkspaceSnapshotDTO({ getSnapshot: () => newOwner }, { workspaceId: '99999999-9999-4999-8999-999999999999', privacyEpoch: 4, revision: 1 });
+    let liveState: CloudWorkspaceSessionState = { status: 'ready', snapshot: firstSnapshot, busy: false, refreshRequired: false };
+    const pending = deferred<WorkspaceCommandResponse>();
+    const store = {
+      getSnapshot: () => liveState,
+      execute: vi.fn(() => pending.promise),
+      inspect: vi.fn(async () => { throw new Error('Not used'); }),
+      refresh: vi.fn(async () => secondSnapshot),
+    };
+    act(() => root.render(<CloudWorkspace store={store} state={liveState} onLogout={vi.fn()} />));
+    click('Library');
+    click('People library section');
+    click('Archive person Jordan');
+    expect(store.execute).toHaveBeenCalledOnce();
+
+    liveState = { status: 'ready', snapshot: secondSnapshot, busy: false, refreshRequired: false };
+    act(() => root.render(<CloudWorkspace store={store} state={liveState} onLogout={vi.fn()} />));
+    await act(async () => {
+      if (outcome === 'rejected request') pending.reject(new Error('Old workspace request failed'));
+      else {
+        const commandId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+        pending.resolve({ schemaVersion: 1, commandId, status: 'finished', receipt: { schemaVersion: 1, commandId, kind: 'knowledge.entity.archive', objectId: personId, entityKind: 'person', entityRevision: 2 } });
+      }
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(host.textContent).not.toContain('could not be confirmed');
+    expect(host.textContent).not.toContain('Jordan');
+  });
+
+  it('keeps an open document draft on conflict, reloads only on request, and fences duplicate saves', async () => {
+    const first = { path: 'notes/decisions.md', content: 'Saved version', revision: 1 };
+    let latest = [first];
+    const response = deferred<{ revision: number; snapshotUpdated: boolean }>();
+    const save = vi.fn(() => response.promise);
+    const renderEditor = () => <WorkspaceDocumentEditor visible document={first} currentDocuments={latest} busy={false}
+      saveAction={{ available: true, action: save }} onClose={vi.fn()} />;
+    act(() => root.render(renderEditor()));
+    setTextField('Document content', 'Draft I want to keep');
+    latest = [{ path: first.path, content: 'Changed elsewhere', revision: 2 }];
+    act(() => root.render(renderEditor()));
+    expect((host.querySelector('textarea[aria-label="Document content"]') as HTMLTextAreaElement).value).toBe('Draft I want to keep');
+    expect(host.textContent).toContain('The saved version changed while this document was open. Your draft is still here.');
+    expect([...host.querySelectorAll('button')].find((button) => button.textContent?.includes('Save'))?.disabled).toBe(true);
+    click('Reload saved document');
+    expect((host.querySelector('textarea[aria-label="Document content"]') as HTMLTextAreaElement).value).toBe('Changed elsewhere');
+    setTextField('Document content', 'Reviewed new version');
+    clickTwice('Save');
+    expect(save).toHaveBeenCalledOnce();
+    expect(save).toHaveBeenCalledWith({ path: first.path, content: 'Reviewed new version', expectedRevision: 2 });
+    response.resolve({ revision: 3, snapshotUpdated: true });
+    await act(async () => { await response.promise; });
+    expect(host.textContent).toContain('Document saved.');
+  });
+
+  it('ignores a late document save result after closing and opening a different document', async () => {
+    const pending = deferred<{ revision: number; snapshotUpdated: boolean }>();
+    const save = vi.fn(() => pending.promise);
+    const first = { path: 'notes/one.md', content: 'First', revision: 1 };
+    const second = { path: 'notes/two.md', content: 'Second', revision: 4 };
+    const currentDocuments = [first, second];
+    const renderEditor = (visible: boolean, document: typeof first) => <WorkspaceDocumentEditor key={`${visible}:${document.path}`} visible={visible} document={document}
+      currentDocuments={currentDocuments} busy={false} saveAction={{ available: true, action: save }} onClose={vi.fn()} />;
+    act(() => root.render(renderEditor(true, first)));
+    setTextField('Document content', 'First edited');
+    click('Save');
+    expect(save).toHaveBeenCalledOnce();
+    act(() => root.render(renderEditor(true, second)));
+    expect((host.querySelector('textarea[aria-label="Document content"]') as HTMLTextAreaElement).value).toBe('Second');
+    pending.resolve({ revision: 2, snapshotUpdated: true });
+    await act(async () => { await pending.promise; });
+    expect((host.querySelector('textarea[aria-label="Document content"]') as HTMLTextAreaElement).value).toBe('Second');
+    expect(host.textContent).not.toContain('Document saved.');
   });
 });

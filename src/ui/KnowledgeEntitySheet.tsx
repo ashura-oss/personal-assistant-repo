@@ -1,9 +1,10 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView, Text, View } from 'react-native';
 import type { WorkspaceSnapshotDTO } from '../cloud/workspaceDto';
 import type { KnowledgeEntityDisplay, KnowledgePersonDisplay, KnowledgeProjectDisplay, KnowledgeReferenceDisplay, KnowledgeSourceChoiceDisplay } from './knowledgeDisplayTypes';
 import { Button, Field, IconButton } from './primitives';
 import { s } from './theme';
+import type { WorkspaceActionCapability } from './workspaceCapabilities';
 
 type PersonDisplay = KnowledgePersonDisplay;
 type ProjectDisplay = KnowledgeProjectDisplay;
@@ -41,14 +42,18 @@ type Props = {
   onRemoveFact: (input: RemoveKnowledgeItemCommand) => Promise<unknown>;
   onSaveContact: (input: { entityKind: 'person'; entityId: string; expectedEntityRevision: number; itemId?: string; address: string; label: string }) => Promise<unknown>;
   onRemoveContact: (input: Omit<RemoveKnowledgeItemCommand, 'entityKind'> & Readonly<{ entityKind: 'person' }>) => Promise<unknown>;
-  onSaveSourceLink: (input: { entityKind: 'person' | 'project'; entityId: string; expectedEntityRevision: number; itemId?: string; referenceChoiceId?: string; label: string }) => Promise<unknown>;
-  onRemoveSourceLink: (input: RemoveKnowledgeItemCommand) => Promise<unknown>;
+  sourceLinks: WorkspaceActionCapability<Readonly<{
+    save: (input: { entityKind: 'person' | 'project'; entityId: string; expectedEntityRevision: number; itemId?: string; referenceChoiceId?: string; label: string }) => Promise<unknown>;
+    remove: (input: RemoveKnowledgeItemCommand) => Promise<unknown>;
+  }>>;
   onSaveMember: (input: { entityKind: 'project'; entityId: string; expectedEntityRevision: number; itemId?: string; personId: string; personRevision: number; role: string }) => Promise<unknown>;
   onRemoveMember: (input: Omit<RemoveKnowledgeItemCommand, 'entityKind'> & Readonly<{ entityKind: 'project' }>) => Promise<unknown>;
 };
 
 export function KnowledgeEntitySheet(props: Props) {
   const { visible, kind, entity, people, documents, references, busy, onClose } = props;
+  const operation = useRef<object | undefined>(undefined);
+  useEffect(() => () => { operation.current = undefined; }, []);
   const project = entity && 'members' in entity ? entity : undefined;
   const person = entity && 'contacts' in entity ? entity : undefined;
   const referenceOptions = references.filter(({ reference }) => !(entity && reference.kind === kind && reference.id === entity.id));
@@ -86,8 +91,13 @@ export function KnowledgeEntitySheet(props: Props) {
   const itemDisabled = busy || formDirty || sourceChanged;
   const selectedReference = referenceOptions.find((option) => option.id === selectedReferenceId);
   const selectedReferenceAvailable = Boolean(selectedReference);
+  const sourceLinkActions = props.sourceLinks.available ? props.sourceLinks.action : undefined;
+  const close = () => { operation.current = undefined; onClose(); };
 
   const submit = async () => {
+    if (operation.current || busy || sourceChanged) return;
+    const token = {};
+    operation.current = token;
     setMessage('');
     try {
       const common = {
@@ -99,28 +109,36 @@ export function KnowledgeEntitySheet(props: Props) {
       const saved = kind === 'person'
         ? await props.onSavePerson(common)
         : await props.onSaveProject({ ...common, status, goal, ...(startsOn ? { startsOn } : {}), ...(targetOn ? { targetOn } : {}), ...(startsOn || targetOn ? { dateTimeZone: timeZone.trim() } : {}) });
-      if (saved) onClose();
+      if (operation.current !== token) return;
+      if (saved) close();
       else setMessage('Changes were not saved. Check the app notice, then try again.');
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'This item changed elsewhere. Close and reopen it to review the latest version.');
+      if (operation.current === token) setMessage(error instanceof Error ? error.message : 'This item changed elsewhere. Close and reopen it to review the latest version.');
+    } finally {
+      if (operation.current === token) operation.current = undefined;
     }
   };
   const itemAction = async (action: () => Promise<unknown>) => {
+    if (operation.current || busy) return;
+    const token = {};
+    operation.current = token;
     setMessage('');
     try {
       const saved = await action();
-      if (!saved) return;
+      if (operation.current !== token || !saved) return;
       setBaseRevision((revision) => revision === undefined ? undefined : revision + 1);
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'The saved context changed. Reopen this item to review the latest version.');
+      if (operation.current === token) setMessage(error instanceof Error ? error.message : 'The saved context changed. Reopen this item to review the latest version.');
+    } finally {
+      if (operation.current === token) operation.current = undefined;
     }
   };
 
   return (
-    <Modal visible={visible} animationType="slide" presentationStyle="pageSheet" onRequestClose={onClose}>
+    <Modal visible={visible} animationType="slide" presentationStyle="pageSheet" onRequestClose={close}>
       <KeyboardAvoidingView style={s.safe} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
         <View style={s.modalHeader}>
-          <IconButton name="close" label="Close knowledge editor" onPress={onClose} />
+          <IconButton name="close" label="Close knowledge editor" onPress={close} />
           <Text style={s.modalTitle}>{entity ? `Edit ${kind}` : `New ${kind}`}</Text>
           <View style={{ width: 46 }} />
         </View>
@@ -151,16 +169,18 @@ export function KnowledgeEntitySheet(props: Props) {
               {person.contacts.map((item) => editingContactId === item.id ? <View key={item.id} style={s.knowledgeInlineForm}><Field label="Contact address · unverified" value={contactAddress} onChangeText={setContactAddress} keyboardType="email-address" /><Field label="Claim label" value={contactLabel} onChangeText={setContactLabel} /><Button label="Save contact claim" tone="quiet" disabled={itemDisabled || !contactAddress.trim()} onPress={() => void itemAction(async () => { const saved = await props.onSaveContact({ entityKind: 'person', entityId: entity.id, expectedEntityRevision: baseRevision ?? entity.revision, itemId: item.id, address: contactAddress.trim(), label: contactLabel.trim() || 'Contact' }); if (saved) setEditingContactId(null); return saved; })} /><Button label="Cancel edit" tone="quiet" disabled={busy} onPress={() => setEditingContactId(null)} /></View> : <ClaimRow key={item.id} title={`${item.label}: ${item.address}`} provenance={item.provenance} busy={itemDisabled} onEdit={() => { setEditingContactId(item.id); setContactAddress(item.address); setContactLabel(item.label); }} onRemove={() => void itemAction(() => props.onRemoveContact({ entityKind: 'person', entityId: person.id, expectedEntityRevision: baseRevision ?? entity.revision, itemId: item.id }))} />)}
               {!editingContactId ? <View style={s.knowledgeInlineForm}><Field label="Contact address · not verified" value={contactAddress} onChangeText={setContactAddress} placeholder="name@example.com" keyboardType="email-address" /><Field label="Label" value={contactLabel} onChangeText={setContactLabel} /><Button label="Add contact claim" tone="quiet" disabled={itemDisabled || !contactAddress.trim()} onPress={() => void itemAction(async () => { const saved = await props.onSaveContact({ entityKind: 'person', entityId: person.id, expectedEntityRevision: baseRevision ?? entity.revision, address: contactAddress.trim(), label: contactLabel.trim() || 'Contact' }); if (saved) setContactAddress(''); return saved; })} /></View> : null}
             </> : null}
-            {entity.sourceLinks.map((item) => editingLinkId === item.id ? <View key={item.id} style={s.knowledgeInlineForm}><Text style={s.knowledgeFootnote}>{referenceSummary(item.reference, references)}</Text><Field label="Link label" value={sourceLabel} onChangeText={setSourceLabel} /><Button label="Save link" tone="quiet" disabled={itemDisabled || !sourceLabel.trim()} onPress={() => void itemAction(async () => { const saved = await props.onSaveSourceLink({ entityKind: kind, entityId: entity.id, expectedEntityRevision: baseRevision ?? entity.revision, itemId: item.id, label: sourceLabel.trim() }); if (saved) setEditingLinkId(null); return saved; })} /><Button label="Cancel edit" tone="quiet" disabled={busy} onPress={() => setEditingLinkId(null)} /></View> : <ClaimRow key={item.id} title={`${item.label} · ${referenceSummary(item.reference, references)}`} provenance={item.provenance} busy={itemDisabled} onEdit={() => { setEditingLinkId(item.id); setSourceLabel(item.label); }} onRemove={() => void itemAction(() => props.onRemoveSourceLink({ entityKind: kind, entityId: entity.id, expectedEntityRevision: baseRevision ?? entity.revision, itemId: item.id }))} />)}
-            <Text style={s.label}>Add a source link</Text>
-            {referenceOptions.length ? referenceOptions.map((option) => <Pressable key={option.id} accessibilityRole="radio" accessibilityState={{ selected: selectedReferenceId === option.id }} onPress={() => setSelectedReferenceId(option.id)} style={[s.knowledgeStatusChoice, selectedReferenceId === option.id && s.knowledgeStatusSelected]}><Text style={s.knowledgeMeta}>{option.label}</Text></Pressable>) : <Text style={s.knowledgeFootnote}>No saved sources are available to link yet.</Text>}
-            {selectedReference && !selectedReferenceAvailable ? <Text style={s.knowledgeError}>That source changed or is no longer available. Choose a current source.</Text> : null}
-            <Field label="Why is this relevant?" value={sourceLabel} onChangeText={setSourceLabel} />
-            <Button label="Save source link" tone="quiet" disabled={itemDisabled || !selectedReferenceAvailable || !sourceLabel.trim()} onPress={() => {
-              const referenceChoiceId = selectedReference && selectedReferenceAvailable ? selectedReference.id : undefined;
-              if (!referenceChoiceId) return;
-              void itemAction(async () => { const saved = await props.onSaveSourceLink({ entityKind: kind, entityId: entity.id, expectedEntityRevision: baseRevision ?? entity.revision, referenceChoiceId, label: sourceLabel.trim() }); if (saved) { setSelectedReferenceId(null); setSourceLabel(''); } return saved; });
-            }} />
+            {entity.sourceLinks.map((item) => editingLinkId === item.id && sourceLinkActions ? <View key={item.id} style={s.knowledgeInlineForm}><Text style={s.knowledgeFootnote}>{referenceSummary(item.reference, references)}</Text><Field label="Link label" value={sourceLabel} onChangeText={setSourceLabel} /><Button label="Save link" tone="quiet" disabled={itemDisabled || !sourceLabel.trim()} onPress={() => void itemAction(async () => { const saved = await sourceLinkActions.save({ entityKind: kind, entityId: entity.id, expectedEntityRevision: baseRevision ?? entity.revision, itemId: item.id, label: sourceLabel.trim() }); if (saved) setEditingLinkId(null); return saved; })} /><Button label="Cancel edit" tone="quiet" disabled={busy} onPress={() => setEditingLinkId(null)} /></View> : sourceLinkActions ? <ClaimRow key={item.id} title={`${item.label} · ${referenceSummary(item.reference, references)}`} provenance={item.provenance} busy={itemDisabled} onEdit={() => { setEditingLinkId(item.id); setSourceLabel(item.label); }} onRemove={() => void itemAction(() => sourceLinkActions.remove({ entityKind: kind, entityId: entity.id, expectedEntityRevision: baseRevision ?? entity.revision, itemId: item.id }))} /> : <View key={item.id} style={s.knowledgeClaim}><View style={{ flex: 1, gap: 3 }}><Text style={s.knowledgeMeta}>{item.provenance === 'user_authored' ? 'Entered by you' : 'Kept inference'}</Text><Text style={s.analysisText}>{item.label} · {referenceSummary(item.reference, references)}</Text></View></View>)}
+            {sourceLinkActions ? <>
+              <Text style={s.label}>Add a source link</Text>
+              {referenceOptions.length ? referenceOptions.map((option) => <Pressable key={option.id} accessibilityRole="radio" accessibilityState={{ selected: selectedReferenceId === option.id }} onPress={() => setSelectedReferenceId(option.id)} style={[s.knowledgeStatusChoice, selectedReferenceId === option.id && s.knowledgeStatusSelected]}><Text style={s.knowledgeMeta}>{option.label}</Text></Pressable>) : <Text style={s.knowledgeFootnote}>No saved sources are available to link yet.</Text>}
+              {selectedReference && !selectedReferenceAvailable ? <Text style={s.knowledgeError}>That source changed or is no longer available. Choose a current source.</Text> : null}
+              <Field label="Why is this relevant?" value={sourceLabel} onChangeText={setSourceLabel} />
+              <Button label="Save source link" tone="quiet" disabled={itemDisabled || !selectedReferenceAvailable || !sourceLabel.trim()} onPress={() => {
+                const referenceChoiceId = selectedReference && selectedReferenceAvailable ? selectedReference.id : undefined;
+                if (!referenceChoiceId) return;
+                void itemAction(async () => { const saved = await sourceLinkActions.save({ entityKind: kind, entityId: entity.id, expectedEntityRevision: baseRevision ?? entity.revision, referenceChoiceId, label: sourceLabel.trim() }); if (saved) { setSelectedReferenceId(null); setSourceLabel(''); } return saved; });
+              }} />
+            </> : <Text style={s.knowledgeFootnote}>{props.sourceLinks.available ? '' : props.sourceLinks.reason}</Text>}
             {project ? <>
               <Text style={s.sectionTitle}>Members</Text>
               {project.members.map((member) => editingMemberId === member.id && 'personId' in member ? <View key={member.id} style={s.knowledgeInlineForm}><Text style={s.knowledgeFootnote}>{people.find((candidate) => candidate.id === member.personId)?.name ?? 'Person unavailable'}</Text><Field label="Role" value={memberRole} onChangeText={setMemberRole} /><Button label="Save member" tone="quiet" disabled={itemDisabled} onPress={() => { const selected = people.find((candidate) => candidate.id === member.personId); if (!selected) return; void itemAction(async () => { const saved = await props.onSaveMember({ entityKind: 'project', entityId: entity.id, expectedEntityRevision: baseRevision ?? entity.revision, itemId: member.id, personId: selected.id, personRevision: selected.revision, role: memberRole.trim() }); if (saved) setEditingMemberId(null); return saved; }); }} /><Button label="Cancel edit" tone="quiet" disabled={busy} onPress={() => setEditingMemberId(null)} /></View> : <MemberRow key={member.id} member={member} people={people} busy={itemDisabled} onEdit={() => { if ('personId' in member) { setEditingMemberId(member.id); setMemberRole(member.role); } }} onRemove={() => void itemAction(() => props.onRemoveMember({ entityKind: 'project', entityId: project.id, expectedEntityRevision: baseRevision ?? entity.revision, itemId: member.id }))} />)}

@@ -101,7 +101,7 @@ describe('knowledge source choice ownership', () => {
       visible kind="person" entity={entity} people={people} documents={dto.state.documents} references={references} busy={false}
       onClose={() => undefined} onSavePerson={async () => true} onSaveProject={async () => true}
       onSaveFact={async () => true} onRemoveFact={async () => true} onSaveContact={async () => true} onRemoveContact={async () => true}
-      onSaveSourceLink={onSaveSourceLink} onRemoveSourceLink={async () => true} onSaveMember={async () => true} onRemoveMember={async () => true}
+      sourceLinks={{ available: true, action: { save: onSaveSourceLink, remove: async () => true } }} onSaveMember={async () => true} onRemoveMember={async () => true}
     />));
     render();
     act(() => [...host.querySelectorAll('button')].find((item) => item.textContent === noteOption.label)!.click());

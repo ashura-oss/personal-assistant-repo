@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
-import { ActivityIndicator, Alert, Modal, Platform, Pressable, ScrollView, Text, TextInput, View } from "react-native";
+import { ActivityIndicator, Alert, Modal, Platform, Pressable, ScrollView, Text, View } from "react-native";
 import Ionicons from "@expo/vector-icons/Ionicons";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import type { Note, Proposal, AppState, AppSettings, AppController, AccountCapability, SavedProactiveRule, StartupRecoveryStatus, MailReplyBatchReviewPlan, MailReplyBatchSourcesRefreshResult, MailReplyContextSelection, MailReplyConversationContextDiscovery } from "./src/core";
@@ -638,10 +638,7 @@ export function WorkspaceView({ controller, credentials, platform, workspaceGene
     isDispatchHistoryDemo ? "done" : "pending",
   );
   const [query, setQuery] = useState("");
-  const [doc, setDoc] = useState<{ path: string; content: string } | null>(
-    null,
-  );
-  const [docDraft, setDocDraft] = useState("");
+  const [doc, setDoc] = useState<{ path: string; content: string } | null>(null);
   const [manualOpen, setManualOpen] = useState(false);
   const [analysisStatusError, setAnalysisStatusError] = useState<{
     key: string;
@@ -3797,6 +3794,7 @@ export function WorkspaceView({ controller, credentials, platform, workspaceGene
                   const current = state.notes.find((note) => note.id === id && note.revision === expectedRevision);
                   if (current) openNote(current);
                 }}
+                onDocumentEditorChange={(document) => setDoc(document ? { path: document.path, content: document.content } : null)}
                 knowledgeEntityActions={{ available: true, action: {
                   archive: (kind, id, expectedRevision, archived) => {
                     void run(() => controller.setKnowledgeEntityArchived({ kind, id, expectedRevision, archived }));
@@ -3807,7 +3805,8 @@ export function WorkspaceView({ controller, credentials, platform, workspaceGene
                   removeFact: (input) => run(async () => { await controller.removeKnowledgeFact(input); return true; }),
                   saveContact: (input) => run(() => controller.saveKnowledgeContact(input)),
                   removeContact: (input) => run(async () => { await controller.removeKnowledgeContact(input); return true; }),
-                  saveSourceLink: (input) => {
+                  sourceLinks: { available: true, action: {
+                  save: (input) => {
                   const entity = input.entityKind === 'person'
                     ? state.knowledge.people.find((item) => item.id === input.entityId && item.revision === input.expectedEntityRevision)
                     : state.knowledge.projects.find((item) => item.id === input.entityId && item.revision === input.expectedEntityRevision);
@@ -3817,7 +3816,8 @@ export function WorkspaceView({ controller, credentials, platform, workspaceGene
                   if (!entity || (input.itemId && !existing) || !selectedReference) return Promise.resolve(undefined);
                   return run(() => controller.saveKnowledgeSourceLink({ ...command, reference: selectedReference }));
                   },
-                  removeSourceLink: (input) => run(async () => { await controller.removeKnowledgeSourceLink(input); return true; }),
+                  remove: (input) => run(async () => { await controller.removeKnowledgeSourceLink(input); return true; }),
+                  } },
                   saveMember: (input) => run(() => controller.saveKnowledgeMember(input)),
                   removeMember: (input) => run(async () => { await controller.removeKnowledgeMember(input); return true; }),
                 }}}
@@ -3844,12 +3844,16 @@ export function WorkspaceView({ controller, credentials, platform, workspaceGene
                   prepare: prepareKnowledgeSuggestionReview,
                 }}}
                 onRun={(action) => run(action)}
-                documentActions={{ available: true, action: (d) => {
-                  const existing = state.documents.find(
-                    (x) => x.path === d.path,
-                  );
-                  setDoc(existing ?? d);
-                  setDocDraft(existing?.content ?? d.content);
+                documentActions={{ available: true, action: async (input) => {
+                  const existing = state.documents.find((item) => item.path === input.path);
+                  if (input.expectedRevision === null ? Boolean(existing) : existing?.revision !== input.expectedRevision) {
+                    throw new Error("This document changed. Reload the library and reopen it before saving.");
+                  }
+                  const saved = await run(() => controller.saveDocument(input.path, input.content,
+                    input.expectedRevision === null ? {} : { expectedRevision: input.expectedRevision }));
+                  if (!saved) throw new Error("The document save could not be confirmed.");
+                  setNotice("Document saved on this device.");
+                  return { revision: saved.revision, snapshotUpdated: true };
                 }}}
                 onExport={isIsolatedDemo && !isBackupImportDemo
                   ? { available: false, reason: "Export is disabled in this sample preview." }
@@ -4278,44 +4282,6 @@ export function WorkspaceView({ controller, credentials, platform, workspaceGene
             return updated ? toReminderDisplayRecord(updated) : undefined;
           })}
         /> : null}
-        <Modal
-          visible={!!doc}
-          animationType="slide"
-          onRequestClose={() => setDoc(null)}
-        >
-          <SafeAreaView style={s.modalSafe}>
-            <View style={s.modalHeader}>
-              <IconButton
-                name="chevron-back"
-                label="Back to library"
-                onPress={() => setDoc(null)}
-              />
-              <Text style={s.modalTitle}>{doc?.path ?? "Document"}</Text>
-              <Button
-                label="Save"
-                onPress={() =>
-                  run(async () => {
-                    if (!doc) return;
-                    const saved = await controller.saveDocument(
-                      doc.path,
-                      docDraft,
-                    );
-                    setDoc({ path: saved.path, content: saved.content });
-                    setNotice("Document saved on this device.");
-                  })
-                }
-              />
-            </View>
-            <TextInput
-              multiline
-              value={docDraft}
-              onChangeText={setDocDraft}
-              style={[s.input, s.docEditor]}
-              placeholder="Write a note or personal rule…"
-              placeholderTextColor={C.muted}
-            />
-          </SafeAreaView>
-        </Modal>
     </WorkspaceScreen>
   );
 }
