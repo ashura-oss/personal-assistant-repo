@@ -692,6 +692,17 @@ export class DurableKernel {
     return this.loadWorkspaceSnapshot(row);
   }
 
+  /** Validates a trusted replacement snapshot through this kernel's configured strict validator and canonical serializer. */
+  validateOwnedSnapshotReplacement(context: OwnedTransactionContext, candidate: unknown): Readonly<{
+    readonly canonicalJson: string; readonly schemaVersion: number;
+  }> {
+    const current = this.readOwnedSnapshotWithinTransaction(context);
+    context.assertActive();
+    const serialized = this.validateSnapshot(candidate);
+    context.assertActive();
+    return Object.freeze({ canonicalJson: serialized.text, schemaVersion: current.schemaVersion });
+  }
+
   /** TRUSTED INTERNAL ONLY. Used for module-owned schema setup, never for request authority. */
   withTrustedDatabaseTransaction<T>(callback: (db: Database.Database) => T): T {
     if (typeof callback !== 'function') fail('invalid_input', 'A trusted synchronous database callback is required.');

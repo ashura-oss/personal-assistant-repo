@@ -74,7 +74,13 @@ function fixture(options = {}) {
       ...(options.integration ?? {}),
     },
   };
-  const runtime = new OwnedWorkspaceRuntime({ ...ports, ...(options.afterSpeechCleanupCommitForTesting
+  const runtimeOptions = options.workspacePortsFor ? { kernel, runtimeSessionFor: ports.runtimeSessionFor, crypto: ports.crypto,
+    workspacePortsFor: (context) => options.workspacePortsFor(context, ports),
+    ...(options.isWorkspaceEraseComplete ? { isWorkspaceEraseComplete: options.isWorkspaceEraseComplete } : {}),
+    ...(options.isWorkspaceEraseCancellationComplete ? { isWorkspaceEraseCancellationComplete: options.isWorkspaceEraseCancellationComplete } : {})
+  } : { ...ports, ...(options.isWorkspaceEraseComplete ? { isWorkspaceEraseComplete: options.isWorkspaceEraseComplete } : {}),
+    ...(options.isWorkspaceEraseCancellationComplete ? { isWorkspaceEraseCancellationComplete: options.isWorkspaceEraseCancellationComplete } : {}) };
+  const runtime = new OwnedWorkspaceRuntime({ ...runtimeOptions, ...(options.afterSpeechCleanupCommitForTesting
     ? { afterSpeechCleanupCommitForTesting: options.afterSpeechCleanupCommitForTesting } : {}) });
   const admission = { sessionToken: admissionSession, assertCurrent: () => kernel.getOwnedIdentity(admissionSession) };
   return { directory, databasePath, applicationOwnership, validateSnapshot, kernel, ownerId, workspace, admissionSession,
@@ -113,6 +119,37 @@ test('scheduled account sync observes active foreground busy before sticky refre
     await foreground;
   } finally {
     release.resolve();
+    await f.runtime.closeAfterDrain();
+    removeFixture(f);
+  }
+});
+
+test('erase hold survives a failed drain and the same command explicitly retries before cancellation can release it', async () => {
+  let drainCalls = 0;
+  let cancellationDurable = false;
+  const lifecycle = { stopAdmission() {}, async drain() {
+    drainCalls += 1;
+    if (drainCalls === 1) throw new Error('synthetic attached cleanup failure');
+  }, async dispose() {} };
+  const f = fixture({ isWorkspaceEraseCancellationComplete: () => cancellationDurable,
+    workspacePortsFor: (_context, ports) => ({ providers: ports.providers, integration: ports.integration,
+      responseLifetimeOwner: ports.responseLifetimeOwner, disposeUnattached() {}, attachedLifecycle: lifecycle }) });
+  const commandId = randomUUID();
+  try {
+    await f.runtime.getSnapshot(f.admission);
+    await assert.rejects(f.runtime.reserveWorkspaceForErase(f.admission, commandId), /synthetic attached cleanup failure/);
+    assert.deepEqual(f.runtime.getWorkspaceEraseHoldStatus(f.admission), { commandId, status: 'drain_failed', expectedRevision: f.kernel.getOwnedIdentity(f.admissionSession).revision, expectedPrivacyEpoch: 0 });
+    assert.throws(() => f.runtime.getSnapshot(f.admission), /workspace_erase_in_progress/);
+
+    const hold = await f.runtime.reserveWorkspaceForErase(f.admission, commandId);
+    assert.deepEqual(f.runtime.getWorkspaceEraseHoldStatus(f.admission), { commandId, status: 'drained', expectedRevision: f.kernel.getOwnedIdentity(f.admissionSession).revision, expectedPrivacyEpoch: 0 });
+    assert.equal(drainCalls, 2, 'same-command retry reruns the retained exact lifecycle drain');
+    assert.throws(() => f.runtime.assertWorkspaceEraseHold({}, commandId), /workspace_erase_hold_rejected/);
+    assert.throws(() => hold.releaseAfterCancellation(), /workspace_erase_cancellation_rejected/);
+    cancellationDurable = true;
+    hold.releaseAfterCancellation();
+    assert.equal(f.runtime.getWorkspaceEraseHoldStatus(f.admission), undefined);
+  } finally {
     await f.runtime.closeAfterDrain();
     removeFixture(f);
   }
@@ -975,4 +1012,20 @@ test('failed unattached-port cleanup fences epoch replacement until the caller e
     assert.equal(factoryCalls, 2, 'replacement construction happens only after explicit cleanup and refresh');
     await runtime.closeAfterDrain();
   } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); removeFixture(f); }
+});
+
+test('completed erase receipt never unfences ordinary reads until the exact drained hold is explicitly released', async () => {
+  const commandId = randomUUID();
+  const f = fixture({ isWorkspaceEraseComplete: (_workspaceId, _ownerId, completedCommandId) => completedCommandId === commandId });
+  try {
+    await f.runtime.getSnapshot(f.admission);
+    const hold = await f.runtime.reserveWorkspaceForErase(f.admission, commandId);
+    assert.throws(() => f.runtime.getSnapshot(f.admission), /workspace_erase_in_progress/);
+    assert.throws(() => f.runtime.inspectCommandReceipt(f.admission, randomUUID()), /workspace_erase_in_progress/);
+    hold.releaseAfterCleanup();
+    assert.equal((await f.runtime.getSnapshot(f.admission)).privacyEpoch, 0);
+  } finally {
+    await f.runtime.closeAfterDrain();
+    removeFixture(f);
+  }
 });

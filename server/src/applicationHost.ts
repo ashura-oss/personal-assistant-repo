@@ -36,6 +36,8 @@ export interface ApplicationRuntimeFactoryContext {
   readonly listWorkspaceMetadataPage: (afterWorkspaceId?: string, limit?: number) => readonly WorkspaceActorMetadata[];
   /** One UUID shared by every private media runtime in this host process. */
   readonly processInstanceId: string;
+  /** Trusted host factory for a fresh empty canonical application state, never request data. */
+  readonly createEmptyWorkspaceSnapshot: () => unknown;
 }
 
 export type ApplicationRuntimeFactory =
@@ -250,6 +252,7 @@ export async function startApplicationHost(options: ApplicationHostOptions): Pro
       runtimeSessionFor: (identity: OwnedWorkspaceIdentity) => actors.sessionForRegistry(identity),
       listWorkspaceMetadataPage: (afterWorkspaceId?: string, limit?: number) => actors.listWorkspaceMetadataPage(afterWorkspaceId, limit),
       processInstanceId: opened.privateContext.processInstanceId,
+      createEmptyWorkspaceSnapshot: opened.foundation.initialWorkspaceSnapshot,
     }));
     if (runtime && typeof runtime === 'object' && typeof runtime.stopAdmission === 'function' &&
         typeof runtime.drainAndDispose === 'function') owner.attachRuntime(runtime);

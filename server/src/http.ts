@@ -258,12 +258,21 @@ function workspaceMutationAdmission(request: IncomingMessage, auth: AuthService,
 }
 
 function workspaceFailure(error: unknown): { readonly status: number; readonly code: string } {
+  if (error instanceof Error && /^workspace_erase_/.test(error.message)) {
+    const code = error.message;
+    if (['workspace_erase_stale', 'workspace_erase_plan_unavailable', 'workspace_erase_command_conflict',
+      'workspace_erase_cleanup_pending', 'workspace_erase_already_executed', 'workspace_erase_hold_conflict',
+      'workspace_erase_in_progress', 'workspace_erase_hold_lost', 'workspace_erase_plan_exists'].includes(code)) return { status: 409, code };
+    if (['workspace_erase_command_id_invalid', 'workspace_erase_input_invalid', 'workspace_erase_document_path_invalid',
+      'workspace_erase_audio_path_invalid'].includes(code)) return { status: 400, code };
+    return { status: 503, code: 'workspace_erase_unavailable' };
+  }
   if (error instanceof OAuthConnectionServiceError) {
     switch (error.code) {
       case 'oauth_invalid_input': case 'oauth_callback_invalid': return { status: 400, code: 'invalid_oauth_request' };
       case 'oauth_not_found': return { status: 404, code: 'oauth_not_found' };
       case 'oauth_start_not_admitted': return { status: 409, code: 'oauth_start_not_admitted' };
-      case 'oauth_conflict': case 'oauth_stale_workspace': case 'oauth_start_in_progress': return { status: 409, code: 'oauth_conflict' };
+      case 'oauth_conflict': case 'oauth_stale_workspace': case 'oauth_start_in_progress': case 'oauth_workspace_erasing': return { status: 409, code: 'oauth_conflict' };
       case 'oauth_original_session_inactive': return { status: 401, code: 'unauthenticated' };
       case 'oauth_unavailable': return { status: 503, code: 'oauth_unavailable' };
       case 'oauth_exchange_unknown': return { status: 503, code: 'oauth_inspect_required' };
@@ -659,6 +668,19 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
   }
   const originHeader = uniqueHeader(request, 'origin');
   if (originHeader !== undefined && originHeader !== canonicalOrigin.origin) throw problem(403, 'origin_rejected');
+  const eraseControlPath = pathname === '/api/workspace/erase/prepare' || pathname === '/api/workspace/erase/confirm' ||
+    pathname === '/api/workspace/erase/execute' || pathname === '/api/workspace/erase/cancel' ||
+    pathname === '/api/workspace/erase/retry-cleanup' ||
+    pathname === '/api/workspace/erase/status' ||
+    /^\/api\/workspace\/erase\/receipts\/[0-9a-f-]{36}$/i.test(pathname);
+  const oauthCallbackPath = /^\/api\/oauth\/(?:google|microsoft)\/callback$/.test(pathname);
+  if (pathname.startsWith('/api/') && !eraseControlPath && !oauthCallbackPath && workspaceApi?.assertWorkspaceAdmission) {
+    const sessionToken = readCookies(request).session;
+    if (sessionToken && auth.getSession(sessionToken).authenticated) {
+      try { workspaceApi.assertWorkspaceAdmission(workspaceReadAdmission(request, auth, canonicalOrigin)); }
+      catch (error) { sendWorkspaceFailure(response, error); return; }
+    }
+  }
   if (pathname === '/healthz') {
     if (request.method !== 'GET') { response.setHeader('Allow', 'GET'); throw problem(405, 'method_not_allowed'); }
     sendJson(response, 200, { status: 'ok' }); return;
@@ -833,6 +855,74 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
       const result = oauthApi.inspectStart(admission, oauthStartInspectMatch[1] as 'google' | 'microsoft', oauthStartInspectMatch[2]!);
       admission.assertCurrent();
       sendJson(response, 200, result);
+    } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
+    return;
+  }
+  const workspaceEraseActionMatch = /^\/api\/workspace\/erase\/(prepare|confirm|execute|cancel)$/.exec(pathname);
+  if (workspaceEraseActionMatch) {
+    if (request.method !== 'POST') { response.setHeader('Allow', 'POST'); throw problem(405, 'method_not_allowed'); }
+    if (hasQuery) throw problem(400, 'bad_request');
+    if (!workspaceApi) throw problem(503, 'service_unavailable');
+    const methodName = ({ prepare: 'prepareWorkspaceErase', confirm: 'confirmWorkspaceErase', execute: 'executeWorkspaceErase',
+      cancel: 'cancelWorkspaceErase' } as const)[workspaceEraseActionMatch[1] as 'prepare' | 'confirm' | 'execute' | 'cancel'];
+    const action = workspaceApi[methodName];
+    if (typeof action !== 'function') throw problem(503, 'service_unavailable');
+    const admission = workspaceMutationAdmission(request, auth, canonicalOrigin);
+    try {
+      const input = exactObject(await readJsonBody(request, response), ['commandId', 'expectedRevision', 'expectedPrivacyEpoch']);
+      if (typeof input.commandId !== 'string' || !Number.isSafeInteger(input.expectedRevision) || !Number.isSafeInteger(input.expectedPrivacyEpoch)) {
+        throw problem(400, 'bad_request');
+      }
+      admission.assertCurrent();
+      if (admissionOpen && !admissionOpen()) throw problem(503, 'service_unavailable');
+      const result = await action.call(workspaceApi, admission, input as never);
+      // Successful execution deliberately revokes this session in the same transaction.
+      if (workspaceEraseActionMatch[1] !== 'execute') admission.assertCurrent();
+      if (!response.destroyed) sendJson(response, 200, result);
+    } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
+    return;
+  }
+  if (pathname === '/api/workspace/erase/retry-cleanup') {
+    if (request.method !== 'POST') { response.setHeader('Allow', 'POST'); throw problem(405, 'method_not_allowed'); }
+    if (hasQuery) throw problem(400, 'bad_request');
+    if (!workspaceApi || typeof workspaceApi.retryWorkspaceEraseCleanup !== 'function') throw problem(503, 'service_unavailable');
+    const admission = workspaceMutationAdmission(request, auth, canonicalOrigin);
+    try {
+      const input = exactObject(await readJsonBody(request, response), ['commandId', 'expectedPrivacyEpoch']);
+      if (typeof input.commandId !== 'string' || !Number.isSafeInteger(input.expectedPrivacyEpoch)) throw problem(400, 'bad_request');
+      admission.assertCurrent();
+      if (admissionOpen && !admissionOpen()) throw problem(503, 'service_unavailable');
+      const result = await workspaceApi.retryWorkspaceEraseCleanup(admission, input as never);
+      admission.assertCurrent();
+      if (!response.destroyed) sendJson(response, 200, result);
+    } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
+    return;
+  }
+  const workspaceEraseReceiptMatch = /^\/api\/workspace\/erase\/receipts\/([0-9a-f-]{36})$/i.exec(pathname);
+  if (pathname === '/api/workspace/erase/status') {
+    if (request.method !== 'GET') { response.setHeader('Allow', 'GET'); throw problem(405, 'method_not_allowed'); }
+    if (hasQuery) throw problem(400, 'bad_request');
+    if (!workspaceApi || typeof workspaceApi.inspectWorkspaceEraseStatus !== 'function') throw problem(503, 'service_unavailable');
+    const admission = workspaceReadAdmission(request, auth, canonicalOrigin);
+    try {
+      admission.assertCurrent();
+      const result = await workspaceApi.inspectWorkspaceEraseStatus(admission);
+      admission.assertCurrent();
+      sendJson(response, 200, result);
+    } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
+    return;
+  }
+  if (workspaceEraseReceiptMatch) {
+    if (request.method !== 'GET') { response.setHeader('Allow', 'GET'); throw problem(405, 'method_not_allowed'); }
+    if (hasQuery || !COMMAND_ID_RE.test(workspaceEraseReceiptMatch[1]!)) throw problem(400, 'bad_request');
+    if (!workspaceApi || typeof workspaceApi.inspectWorkspaceErase !== 'function') throw problem(503, 'service_unavailable');
+    const admission = workspaceReadAdmission(request, auth, canonicalOrigin);
+    try {
+      admission.assertCurrent();
+      const receipt = await workspaceApi.inspectWorkspaceErase(admission, workspaceEraseReceiptMatch[1]!);
+      admission.assertCurrent();
+      if (!receipt) throw problem(404, 'not_found');
+      sendJson(response, 200, receipt);
     } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
     return;
   }

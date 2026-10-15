@@ -47,10 +47,10 @@ test('idle scheduler rescans use the backfilled Batch metadata index without rer
     const factory = createProductionApplicationRuntimeFactory(config, { fetcher: async () => {
       throw new Error('idle empty index must not perform provider work');
     } });
-    runtime = factory({ kernel, vault, auth: opened.foundation.auth,
+    runtime = await factory({ kernel, vault, auth: opened.foundation.auth,
       runtimeSessionFor: (identity) => actors.sessionForRegistry(identity),
       listWorkspaceMetadataPage: (afterWorkspaceId, limit) => { pageReads += 1; return actors.listWorkspaceMetadataPage(afterWorkspaceId, limit); },
-      processInstanceId: opened.privateContext.processInstanceId });
+      processInstanceId: opened.privateContext.processInstanceId, createEmptyWorkspaceSnapshot: () => createInitialWorkspaceState(randomUUID) });
     assert.equal(snapshotReads, 1, 'startup performs the one content backfill');
 
     const waitForNextScan = async (before) => {

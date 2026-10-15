@@ -61,14 +61,14 @@ test('stop during cold controller construction holds the claimed Batch before jo
       providerCalls += 1;
       throw new Error('stop-before-dispatch fixture must not reach a provider');
     } });
-    runtime = createCloudApplicationRuntimeFactory({ workspacePortsFor: async (context, factoryVault, factoryKernel) => {
+    runtime = await createCloudApplicationRuntimeFactory({ workspacePortsFor: async (context, factoryVault, factoryKernel) => {
       portsStarted = true;
       await portsGate;
       return makePorts(context, factoryVault, factoryKernel);
     } })({ kernel, vault, auth: opened.foundation.auth,
       runtimeSessionFor: (identity) => actors.sessionForRegistry(identity),
       listWorkspaceMetadataPage: (afterWorkspaceId, limit) => actors.listWorkspaceMetadataPage(afterWorkspaceId, limit),
-      processInstanceId: opened.privateContext.processInstanceId });
+      processInstanceId: opened.privateContext.processInstanceId, createEmptyWorkspaceSnapshot: () => createInitialWorkspaceState(randomUUID) });
     await waitUntil(() => portsStarted, Boolean, 'cold controller construction did not begin');
     const claimed = await waitUntil(() => kernel.withTrustedDatabaseTransaction((db) => db.prepare(`SELECT status FROM batch_observation_attempts
       WHERE job_id=? ORDER BY created_at DESC LIMIT 1`).get(jobId)), (row) => row?.status === 'claimed', 'Batch claim was not durable before cold load');

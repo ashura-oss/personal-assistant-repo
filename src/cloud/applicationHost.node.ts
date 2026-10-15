@@ -15,6 +15,8 @@ import { OAuthConnectionService } from '../../server/src/oauthConnectionService.
 import type { NodeProviderResponseLifetimeOwner } from './providerResponseLifetime.node';
 import type { ServerOAuthProviderAdapter } from '../../server/src/oauthProviderAdapter.js';
 import { BackgroundRuntimeOwner } from './backgroundRuntime.node';
+import { WorkspaceEraseService } from '../../server/src/workspaceErase.js';
+import { join } from 'node:path';
 
 // Private Node gateway seam: callers must already hold an immutable occurrence claim.
 // This export shares the exact AsyncLocalStorage instance used by the production participant.
@@ -32,6 +34,8 @@ export interface CloudApplicationRuntimeOptions {
   readonly oauth?: Readonly<{ provider: ServerOAuthProviderAdapter; responseLifetimeOwner: NodeProviderResponseLifetimeOwner;
     config: Pick<ServerConfig, 'googleClientId' | 'googleClientSecret' | 'microsoftClientId' | 'microsoftClientSecret' |
       'googleRedirectUri' | 'microsoftRedirectUri'> }>;
+  readonly privateAudioRoot?: string;
+  readonly privateDocumentsRoot?: string;
 }
 
 /** Creates the Node host adapter. Missing provider composition is a startup error, never a stub. */
@@ -39,10 +43,20 @@ export function createCloudApplicationRuntimeFactory(options: CloudApplicationRu
   if (!options || typeof options !== 'object' || typeof options.workspacePortsFor !== 'function') {
     throw new TypeError('application_workspace_ports_factory_required');
   }
-  const factory: ApplicationRuntimeFactory = ({ kernel, vault, auth, runtimeSessionFor, listWorkspaceMetadataPage, processInstanceId }) => {
+  const factory: ApplicationRuntimeFactory = async ({ kernel, vault, auth, runtimeSessionFor, listWorkspaceMetadataPage, processInstanceId,
+    createEmptyWorkspaceSnapshot }) => {
     const oauthStages = new OAuthInstallStages(kernel, vault, auth);
     const oauthBindings = new ServerOAuthTokenBindings(kernel);
-    const runtime = new OwnedWorkspaceRuntime({ kernel, runtimeSessionFor, processInstanceId, oauthInstall: { auth, vault, stages: oauthStages, bindings: oauthBindings },
+    const workspaceErase = new WorkspaceEraseService({ kernel, auth, vault, createEmptySnapshot: createEmptyWorkspaceSnapshot,
+      ...(options.privateAudioRoot ? { privateAudioRoot: options.privateAudioRoot } : {}),
+      ...(options.privateDocumentsRoot ? { privateDocumentsRoot: options.privateDocumentsRoot } : {}) });
+    await workspaceErase.resumePendingPhysicalCleanup();
+    const runtime = new OwnedWorkspaceRuntime({ kernel, runtimeSessionFor, processInstanceId,
+      isWorkspaceErasePending: (workspaceId, ownerId) => workspaceErase.isWorkspaceErasePending(workspaceId, ownerId),
+      isWorkspaceEraseCommandPending: (workspaceId, ownerId, commandId) => workspaceErase.isWorkspaceEraseCommandPending(workspaceId, ownerId, commandId),
+      isWorkspaceEraseComplete: (workspaceId, ownerId, commandId) => workspaceErase.isWorkspaceEraseComplete(workspaceId, ownerId, commandId),
+      isWorkspaceEraseCancellationComplete: (workspaceId, ownerId, commandId) => workspaceErase.isWorkspaceEraseCancellationComplete(workspaceId, ownerId, commandId),
+      oauthInstall: { auth, vault, stages: oauthStages, bindings: oauthBindings },
       crypto: {
         randomUUID,
         async sha256(value) { return createHash('sha256').update(value).digest('hex'); },
@@ -50,9 +64,10 @@ export function createCloudApplicationRuntimeFactory(options: CloudApplicationRu
       workspacePortsFor: (context) => options.workspacePortsFor(context, vault, kernel),
     });
     const oauthService = options.oauth ? new OAuthConnectionService({ kernel, auth, stages: oauthStages,
-      provider: options.oauth.provider, config: options.oauth.config, runtimeSessionFor }) : undefined;
+      provider: options.oauth.provider, config: options.oauth.config, runtimeSessionFor,
+      isWorkspaceEraseHeldOrPending: (workspaceId, ownerId) => runtime.isWorkspaceEraseHeldOrPending(workspaceId, ownerId) }) : undefined;
     const background = new BackgroundRuntimeOwner({ kernel, auth, runtime, runtimeSessionFor, listWorkspaceMetadataPage });
-    return Object.freeze({ workspaceApi: createWorkspaceHttpApi(runtime, background?.policies), audioHttpApi: runtime.createAudioHttpApi(),
+    return Object.freeze({ workspaceApi: createWorkspaceHttpApi(runtime, background?.policies, workspaceErase), audioHttpApi: runtime.createAudioHttpApi(),
       ...(oauthService ? { oauthHttpApi: oauthService } : {}),
       stopAdmission: () => { background.stopAdmission(); oauthService?.stopAdmission(); options.oauth?.responseLifetimeOwner.stopAdmission(); runtime.stopAdmission(); },
       drainAndDispose: async () => {
@@ -83,7 +98,7 @@ export function createProductionApplicationRuntimeFactory(config: ServerConfig,
         ...(adapters.fetcher ? { fetcher: adapters.fetcher } : {}),
       ...(adapters.documentFileOperations ? { documentFileOperations: adapters.documentFileOperations } : {}),
       });
-  return ({ kernel, vault, auth, runtimeSessionFor, listWorkspaceMetadataPage, processInstanceId }) => {
+  return ({ kernel, vault, auth, runtimeSessionFor, listWorkspaceMetadataPage, processInstanceId, createEmptyWorkspaceSnapshot }) => {
     const fetcher = adapters.fetcher ?? globalThis.fetch;
     const responseLifetimeOwner = createNodeProviderResponseLifetimeOwner({ fetcher, createId: randomUUID });
     const registrations = [
@@ -97,6 +112,8 @@ export function createProductionApplicationRuntimeFactory(config: ServerConfig,
     return createCloudApplicationRuntimeFactory({
       workspacePortsFor: (context) => makeWorkspacePorts(context, vault, kernel),
       oauth: { provider, responseLifetimeOwner, config },
-    })({ kernel, vault, auth, runtimeSessionFor, listWorkspaceMetadataPage, processInstanceId });
+      privateAudioRoot: join(config.dataDirectory, 'private-audio'),
+      privateDocumentsRoot: join(config.dataDirectory, 'private-documents'),
+    })({ kernel, vault, auth, runtimeSessionFor, listWorkspaceMetadataPage, processInstanceId, createEmptyWorkspaceSnapshot });
   };
 }

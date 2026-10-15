@@ -67,8 +67,8 @@ test('production runtime observes a cold known Batch without browser sessions or
         model: OPENROUTER_BATCH_MODEL, completion_window: '24h', request_counts: { total: 1, completed: 0, failed: 0 } }),
       { status: 200, headers: { 'content-type': 'application/json', 'retry-after': '7200' } });
     } });
-    runtime = factory({ kernel, vault, auth: opened.foundation.auth, runtimeSessionFor,
-      listWorkspaceMetadataPage: (afterWorkspaceId, limit) => actors.listWorkspaceMetadataPage(afterWorkspaceId, limit), processInstanceId: opened.privateContext.processInstanceId });
+    runtime = await factory({ kernel, vault, auth: opened.foundation.auth, runtimeSessionFor,
+      listWorkspaceMetadataPage: (afterWorkspaceId, limit) => actors.listWorkspaceMetadataPage(afterWorkspaceId, limit), processInstanceId: opened.privateContext.processInstanceId, createEmptyWorkspaceSnapshot: () => createInitialWorkspaceState(randomUUID) });
     const readJournal = () => kernel.withTrustedDatabaseTransaction((db) => {
       const entries = db.prepare(`SELECT workspace_id,owner_id,privacy_epoch,command_kind,status,idempotency_key FROM async_command_journal
         WHERE command_kind='assistant.batch.check' ORDER BY created_at,idempotency_key`).all();

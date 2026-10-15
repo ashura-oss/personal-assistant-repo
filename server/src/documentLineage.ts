@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { DurableKernel, OwnedTransactionContext } from './kernel.js';
 import type { SnapshotCommitParticipant, SnapshotCommitParticipantInput } from './workspaceStore.js';
+import { registerWorkspaceEraseDeleteGuard } from './workspaceErase.js';
 
-export const DOCUMENT_LINEAGE_SCHEMA_VERSION = 2;
+export const DOCUMENT_LINEAGE_SCHEMA_VERSION = 3;
 
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const DOCUMENT_PATH_MAX_BYTES = 1024;
@@ -307,6 +308,7 @@ export class DocumentLineage {
 }
 
 function initializeSchema(db: import('better-sqlite3').Database): void {
+  registerWorkspaceEraseDeleteGuard(db);
   const names = new Set(['document_lineage_schema', 'document_lineage_scopes', 'document_lineage_heads']);
   const existing = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name GLOB 'document_lineage_*'`).all() as { name: string }[];
   const existingNames = new Set(existing.map((row) => row.name));
@@ -321,15 +323,18 @@ function initializeSchema(db: import('better-sqlite3').Database): void {
         CHECK((document_id IS NULL AND document_revision IS NULL AND content_sha256 IS NULL) OR
           (document_id IS NOT NULL AND document_revision IS NOT NULL AND document_revision>0 AND content_sha256 IS NOT NULL AND length(content_sha256)=64))) STRICT;
       CREATE TRIGGER document_lineage_heads_no_delete BEFORE DELETE ON document_lineage_heads
+        WHEN still_workspace_erase_authorized(OLD.workspace_id,OLD.owner_id,OLD.privacy_epoch) IS NOT 1
         BEGIN SELECT RAISE(ABORT,'document_lineage_tombstones_are_durable'); END;
       CREATE TRIGGER document_lineage_scopes_no_delete BEFORE DELETE ON document_lineage_scopes
+        WHEN still_workspace_erase_authorized(OLD.workspace_id,OLD.owner_id,OLD.privacy_epoch) IS NOT 1
         BEGIN SELECT RAISE(ABORT,'document_lineage_scopes_are_durable'); END;`);
   }
   if (existingNames.size !== 0 && existingNames.size !== names.size) throw new Error('document_lineage_schema_invalid');
+  if (existingNames.size !== 0) migrateEraseGuardV2ToV3(db);
   assertSchema(db);
 }
 
-function assertSchema(db: import('better-sqlite3').Database): void {
+function assertSchema(db: import('better-sqlite3').Database, expectedVersion = DOCUMENT_LINEAGE_SCHEMA_VERSION): void {
   const expected: Readonly<Record<string, readonly (readonly [string, string, number, number])[]>> = {
     document_lineage_schema: [['singleton', 'INTEGER', 0, 1], ['version', 'INTEGER', 1, 0]],
     document_lineage_scopes: [['workspace_id', 'TEXT', 1, 1], ['owner_id', 'TEXT', 1, 2], ['privacy_epoch', 'INTEGER', 1, 3], ['snapshot_revision', 'INTEGER', 1, 0]],
@@ -346,7 +351,7 @@ function assertSchema(db: import('better-sqlite3').Database): void {
     }) || strict?.strict !== 1) throw new Error(`document_lineage_schema_invalid:${table}`);
   }
   const schemaRows = db.prepare('SELECT singleton,version FROM document_lineage_schema').all() as { singleton: number; version: number }[];
-  if (schemaRows.length !== 1 || schemaRows[0]?.singleton !== 1 || schemaRows[0]?.version !== DOCUMENT_LINEAGE_SCHEMA_VERSION) {
+  if (schemaRows.length !== 1 || schemaRows[0]?.singleton !== 1 || schemaRows[0]?.version !== expectedVersion) {
     throw new Error('document_lineage_schema_unsupported');
   }
   for (const table of ['document_lineage_scopes', 'document_lineage_heads']) {
@@ -356,9 +361,51 @@ function assertSchema(db: import('better-sqlite3').Database): void {
   for (const [trigger, table] of [['document_lineage_heads_no_delete', 'document_lineage_heads'],
     ['document_lineage_scopes_no_delete', 'document_lineage_scopes']] as const) {
     const row = db.prepare(`SELECT sql FROM sqlite_master WHERE type='trigger' AND name=? AND tbl_name=?`).get(trigger, table) as { sql: string } | undefined;
-    if (!row || !/BEFORE\s+DELETE/i.test(row.sql) || !/RAISE\s*\(\s*ABORT/i.test(row.sql)) throw new Error(`document_lineage_schema_invalid:${trigger}`);
+    if (!row || !/BEFORE\s+DELETE/i.test(row.sql) || !/RAISE\s*\(\s*ABORT/i.test(row.sql) ||
+        expectedVersion >= 3 && normalizeTriggerSql(row.sql) !== normalizeTriggerSql(expectedEraseTriggerSql(trigger, table))) {
+      throw new Error(`document_lineage_schema_invalid:${trigger}`);
+    }
   }
 }
+
+function migrateEraseGuardV2ToV3(db: import('better-sqlite3').Database): void {
+  const version = db.prepare('SELECT version FROM document_lineage_schema WHERE singleton=1').get() as { version: number } | undefined;
+  if (version?.version === DOCUMENT_LINEAGE_SCHEMA_VERSION) return;
+  if (version?.version !== 2) throw new Error('document_lineage_schema_unsupported');
+  // Verify the full known v2 structure and immutable legacy trigger bodies before changing schema.
+  assertSchema(db, 2);
+  for (const [trigger, table, marker] of [
+    ['document_lineage_heads_no_delete', 'document_lineage_heads', 'document_lineage_tombstones_are_durable'],
+    ['document_lineage_scopes_no_delete', 'document_lineage_scopes', 'document_lineage_scopes_are_durable'],
+  ] as const) {
+    const row = db.prepare('SELECT sql FROM sqlite_master WHERE type=\'trigger\' AND name=? AND tbl_name=?').get(trigger, table) as { sql: string } | undefined;
+    const legacySql = trigger === 'document_lineage_heads_no_delete'
+      ? "CREATE TRIGGER document_lineage_heads_no_delete BEFORE DELETE ON document_lineage_heads BEGIN SELECT RAISE(ABORT,'document_lineage_tombstones_are_durable'); END"
+      : "CREATE TRIGGER document_lineage_scopes_no_delete BEFORE DELETE ON document_lineage_scopes BEGIN SELECT RAISE(ABORT,'document_lineage_scopes_are_durable'); END";
+    if (!row?.sql || !row.sql.includes(marker) || normalizeTriggerSql(row.sql) !== normalizeTriggerSql(legacySql)) {
+      throw new Error(`document_lineage_schema_invalid:${trigger}`);
+    }
+  }
+  const migrate = db.transaction(() => {
+    db.exec(`DROP TRIGGER document_lineage_heads_no_delete;
+      DROP TRIGGER document_lineage_scopes_no_delete;
+      CREATE TRIGGER document_lineage_heads_no_delete BEFORE DELETE ON document_lineage_heads
+        WHEN still_workspace_erase_authorized(OLD.workspace_id,OLD.owner_id,OLD.privacy_epoch) IS NOT 1
+        BEGIN SELECT RAISE(ABORT,'document_lineage_tombstones_are_durable'); END;
+      CREATE TRIGGER document_lineage_scopes_no_delete BEFORE DELETE ON document_lineage_scopes
+        WHEN still_workspace_erase_authorized(OLD.workspace_id,OLD.owner_id,OLD.privacy_epoch) IS NOT 1
+        BEGIN SELECT RAISE(ABORT,'document_lineage_scopes_are_durable'); END;
+      UPDATE document_lineage_schema SET version=${DOCUMENT_LINEAGE_SCHEMA_VERSION} WHERE singleton=1 AND version=2;`);
+  });
+  migrate.immediate();
+}
+
+function expectedEraseTriggerSql(trigger: 'document_lineage_heads_no_delete' | 'document_lineage_scopes_no_delete', table: string): string {
+  const message = table === 'document_lineage_heads' ? 'document_lineage_tombstones_are_durable' : 'document_lineage_scopes_are_durable';
+  return `CREATE TRIGGER ${trigger} BEFORE DELETE ON ${table} WHEN still_workspace_erase_authorized(OLD.workspace_id,OLD.owner_id,OLD.privacy_epoch) IS NOT 1 BEGIN SELECT RAISE(ABORT,'${message}'); END`;
+}
+
+function normalizeTriggerSql(sql: string): string { return sql.trim().toLowerCase().replace(/\s+/g, ' '); }
 
 function projectDocuments(snapshot: unknown): readonly DocumentView[] {
   if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) throw new Error('document_lineage_snapshot_invalid');

@@ -218,6 +218,34 @@ test('privacy epoch advancement atomically revokes old sessions and preserves st
   } finally { closeAndRemove(f); }
 });
 
+test('trusted snapshot replacement validation requires this kernel active transaction and its strict validator', () => {
+  const f = setup();
+  const second = createDurableKernel({ databasePath: f.databasePath, validateSnapshot: f.validateSnapshot, now: f.now,
+    applicationOwnership: f.applicationOwnership });
+  try {
+    let expiredContext;
+    const result = f.kernel.withOwnedTransaction(f.session, 0, (context) => {
+      expiredContext = context;
+      return f.kernel.validateOwnedSnapshotReplacement(context, { count: 0, label: 'replacement' });
+    });
+    assert.deepEqual(JSON.parse(result.canonicalJson), { count: 0, label: 'replacement' });
+    assert.equal(result.schemaVersion, 1);
+    assert.equal(f.kernel.getOwnedSnapshot(f.session).revision, 0, 'validation does not write a snapshot or revision');
+    assert.throws(() => f.kernel.validateOwnedSnapshotReplacement(expiredContext, { count: 0, label: 'replacement' }),
+      (error) => error instanceof KernelError && error.code === 'transaction_context_expired');
+    second.withOwnedTransaction(f.session, 0, (foreignContext) => {
+      assert.throws(() => f.kernel.validateOwnedSnapshotReplacement(foreignContext, { count: 0, label: 'replacement' }),
+        (error) => error instanceof KernelError && error.code === 'transaction_context_expired');
+    });
+    f.kernel.withOwnedTransaction(f.session, 0, (context) => {
+      assert.throws(() => f.kernel.validateOwnedSnapshotReplacement(context, { count: 'invalid', label: 'replacement' }));
+    });
+    assert.throws(() => f.kernel.validateOwnedSnapshotReplacement({ workspaceId: f.workspace.workspaceId }, { count: 0, label: 'replacement' }),
+      (error) => error instanceof KernelError && error.code === 'transaction_context_expired');
+    assert.equal(f.kernel.getOwnedSnapshot(f.session).revision, 0);
+  } finally { closeAndRemove(f, second); }
+});
+
 test('newer schemas and corrupt database files fail closed rather than being rewritten', () => {
   const f = setup();
   try {

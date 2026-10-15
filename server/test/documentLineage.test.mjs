@@ -263,3 +263,31 @@ test('unsupported lineage schema fails before it can be used', () => {
     rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
+
+test('v2 lineage trigger migration preserves heads and keeps deletes denied without a live erase grant', () => {
+  const f = setup({ documents: [document(PATH, 'preserve this lineage', 7)] });
+  try {
+    const before = capture(f);
+    f.kernel.withTrustedDatabaseTransaction((db) => {
+      // Recreate the exact v2 trigger shape to exercise the on-disk upgrade path.
+      db.exec(`DROP TRIGGER document_lineage_heads_no_delete;
+        DROP TRIGGER document_lineage_scopes_no_delete;
+        CREATE TRIGGER document_lineage_heads_no_delete BEFORE DELETE ON document_lineage_heads
+          BEGIN SELECT RAISE(ABORT,'document_lineage_tombstones_are_durable'); END;
+        CREATE TRIGGER document_lineage_scopes_no_delete BEFORE DELETE ON document_lineage_scopes
+          BEGIN SELECT RAISE(ABORT,'document_lineage_scopes_are_durable'); END;
+        UPDATE document_lineage_schema SET version=2 WHERE singleton=1;`);
+    });
+
+    const upgraded = new DocumentLineage(f.kernel, f.sessionToken);
+    const after = f.kernel.withOwnedTransaction(f.sessionToken, 0, (context) => upgraded.captureDestination(context, PATH));
+    assert.equal(after.documentId, before.documentId);
+    assert.equal(after.expectedRevision, before.expectedRevision);
+    f.kernel.withOwnedTransaction(f.sessionToken, 0, (context) => {
+      assert.throws(() => context.db.prepare('DELETE FROM document_lineage_heads WHERE workspace_id=? AND owner_id=? AND privacy_epoch=?')
+        .run(context.workspaceId, context.ownerId, context.privacyEpoch), /document_lineage_tombstones_are_durable/);
+    });
+    const marker = f.kernel.withTrustedDatabaseTransaction((db) => db.prepare('SELECT version FROM document_lineage_schema WHERE singleton=1').get());
+    assert.equal(marker.version, 3);
+  } finally { close(f); }
+});

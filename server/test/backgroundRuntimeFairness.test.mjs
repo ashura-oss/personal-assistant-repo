@@ -119,8 +119,8 @@ test('production background runtime suspends stale authority and continues healt
       }
       throw new Error(`unexpected fairness fixture request to ${new URL(url).origin}`);
     } });
-    runtime = factory({ kernel, vault, auth: enrollment.foundation.auth, runtimeSessionFor,
-      listWorkspaceMetadataPage: (afterWorkspaceId, limit) => actors.listWorkspaceMetadataPage(afterWorkspaceId, limit), processInstanceId: randomUUID() });
+    runtime = await factory({ kernel, vault, auth: enrollment.foundation.auth, runtimeSessionFor,
+      listWorkspaceMetadataPage: (afterWorkspaceId, limit) => actors.listWorkspaceMetadataPage(afterWorkspaceId, limit), processInstanceId: randomUUID(), createEmptyWorkspaceSnapshot: () => createInitialWorkspaceState(randomUUID) });
 
     const readStatus = () => kernel.withTrustedDatabaseTransaction((db) => ({
       stalePolicies: staleCases.map((item) => db.prepare('SELECT h.status,h.suspension FROM background_policy_heads h JOIN workspaces w ON w.id=h.workspace_id WHERE w.id=?').get(item.workspaceId)),

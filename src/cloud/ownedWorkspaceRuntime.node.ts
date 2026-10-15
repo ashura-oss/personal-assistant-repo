@@ -77,6 +77,12 @@ interface OwnedWorkspaceRuntimeCommonOptions {
   /** Test-only fault injection after an atomic workspace checkpoint has committed. */
   readonly afterWorkspaceCommitForTesting?: () => void | Promise<void>;
   readonly oauthInstall?: Readonly<{ auth: AuthService; vault: SecretVault; stages: OAuthInstallStages; bindings: ServerOAuthTokenBindings }>;
+  /** Private startup composition fence for a durable erase receipt awaiting physical file cleanup. */
+  readonly isWorkspaceErasePending?: (workspaceId: string, ownerId: string) => boolean;
+  /** Allows only the exact durable prepared command through erase-control reservation after restart. */
+  readonly isWorkspaceEraseCommandPending?: (workspaceId: string, ownerId: string, commandId: string) => boolean;
+  readonly isWorkspaceEraseComplete?: (workspaceId: string, ownerId: string, commandId: string) => boolean;
+  readonly isWorkspaceEraseCancellationComplete?: (workspaceId: string, ownerId: string, commandId: string) => boolean;
 }
 
 export type OwnedWorkspaceRuntimeOptions = OwnedWorkspaceRuntimeCommonOptions & (
@@ -98,6 +104,17 @@ export interface OwnedWorkspaceCommandResult<T> {
   readonly result?: T;
   /** Present only after the durable command receipt is known and the loaded state matches the DB head. */
   readonly snapshot?: WorkspaceSnapshotDTO;
+}
+
+export interface OwnedWorkspaceEraseHold {
+  readonly identity: OwnedWorkspaceIdentity;
+  readonly commandId: string;
+  /** Rechecks the private in-memory hold and original owner binding. */
+  readonly assertHeld: () => void;
+  /** Releases admission only after the durable erase cleanup receipt is complete. */
+  readonly releaseAfterCleanup: () => void;
+  /** Releases a drained hold only after the authenticated service deletes its exact unexecuted plan. */
+  readonly releaseAfterCancellation: () => void;
 }
 
 interface CachedWorkspaceSnapshot {
@@ -133,6 +150,7 @@ export class OwnedWorkspaceRuntime {
   private readonly allSpeechAdapters = new Set<NodeSpeechCleanupAdapter>();
   private readonly responseOwners = new Set<NodeProviderResponseLifetimeOwner>();
   private readonly responseOwnerByWorkspace = new Map<string, NodeProviderResponseLifetimeOwner>();
+  private readonly controllerByWorkspace = new Map<string, AppControllerImpl>();
   private readonly responseOwnerByController = new WeakMap<AppControllerImpl, NodeProviderResponseLifetimeOwner>();
   private readonly storeByController = new WeakMap<AppControllerImpl, ServerWorkspaceStore<AppState>>();
   private readonly activeTranscriptionCommands = new Map<string, ActiveTranscriptionCommand>();
@@ -141,6 +159,9 @@ export class OwnedWorkspaceRuntime {
   /** Exact scheduler attempt that introduced a refresh fence while holding the workspace reservation. */
   private readonly batchRefreshFence = new Map<string, Readonly<{ attemptId: string; token: object }>>();
   private readonly busy = new Set<string>();
+  private readonly eraseHolds = new Map<string, { readonly ownerId: string; readonly privacyEpoch: number; readonly commandId: string;
+    failedDisposal: boolean; drained: boolean; readonly handle: OwnedWorkspaceEraseHold }>();
+  private readonly issuedEraseHolds = new WeakSet<object>();
   private readonly idleWaiters = new Map<string, Set<() => void>>();
   private readonly continuationQueues = new Map<string, Promise<void>>();
   private readonly inFlight = new Set<Promise<unknown>>();
@@ -801,6 +822,122 @@ export class OwnedWorkspaceRuntime {
     return binding.requestCancellation();
   }
 
+  /**
+   * Holds one exact workspace closed, waits for its current tracked operation, and drains/disposes
+   * that entry. A failed drain keeps the hold and the registry's exact closing entry for retry.
+   */
+  async reserveWorkspaceForErase(admission: OwnedWorkspaceAdmission, commandId: string): Promise<OwnedWorkspaceEraseHold> {
+    this.assertEraseAdmission(admission, commandId);
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(commandId)) {
+      throw new TypeError('workspace_erase_command_id_invalid');
+    }
+    const identity = this.options.kernel.getOwnedIdentity(admission.sessionToken);
+    let held = this.eraseHolds.get(identity.workspaceId);
+    if (held) {
+      if (held.ownerId !== identity.ownerId || held.privacyEpoch !== identity.privacyEpoch || held.commandId !== commandId) {
+        throw new Error('workspace_erase_hold_conflict');
+      }
+    } else {
+      const record = { ownerId: identity.ownerId, privacyEpoch: identity.privacyEpoch, commandId,
+        failedDisposal: false, drained: false, handle: undefined as unknown as OwnedWorkspaceEraseHold };
+      const handle: OwnedWorkspaceEraseHold = Object.freeze({ identity: Object.freeze({ ...identity }), commandId,
+        assertHeld: () => {
+          const current = this.eraseHolds.get(identity.workspaceId);
+          if (!current || current !== record || current.ownerId !== identity.ownerId || current.privacyEpoch !== identity.privacyEpoch ||
+              current.commandId !== commandId) throw new Error('workspace_erase_hold_lost');
+        },
+        releaseAfterCleanup: () => {
+          handle.assertHeld();
+          if (!record.drained) throw new Error('workspace_erase_hold_not_drained');
+          if (!this.options.isWorkspaceEraseComplete?.(identity.workspaceId, identity.ownerId, commandId)) {
+            throw new Error('workspace_erase_cleanup_incomplete');
+          }
+          this.eraseHolds.delete(identity.workspaceId);
+        },
+        releaseAfterCancellation: () => {
+          handle.assertHeld();
+          if (!record.drained || !this.options.isWorkspaceEraseCancellationComplete?.(identity.workspaceId, identity.ownerId, commandId)) {
+            throw new Error('workspace_erase_cancellation_rejected');
+          }
+          this.eraseHolds.delete(identity.workspaceId);
+        },
+      });
+      this.issuedEraseHolds.add(handle);
+      record.handle = handle;
+      held = record;
+      this.eraseHolds.set(identity.workspaceId, held);
+      this.stopWorkspaceAdmission(identity.workspaceId);
+    }
+    while (this.busy.has(identity.workspaceId)) await new Promise<void>((resolve) => {
+      const waiters = this.idleWaiters.get(identity.workspaceId) ?? new Set<() => void>();
+      waiters.add(resolve);
+      this.idleWaiters.set(identity.workspaceId, waiters);
+    });
+    held.handle.assertHeld();
+    try {
+      if (held.failedDisposal) {
+        await this.registry.retryFailedDisposal({ admissionSessionToken: admission.sessionToken,
+          expectedHeldPrivacyEpoch: identity.privacyEpoch });
+      } else {
+        await this.registry.disposeWorkspace(admission.sessionToken);
+      }
+      held.failedDisposal = false;
+      held.drained = true;
+    } catch (error) {
+      held.failedDisposal = true;
+      throw error;
+    }
+    admission.assertCurrent();
+    held.handle.assertHeld();
+    return held.handle;
+  }
+
+  /** Confirms the exact opaque handle issued by this runtime and its completed disposal state. */
+  assertWorkspaceEraseHold(hold: OwnedWorkspaceEraseHold, commandId: string): void {
+    if (!hold || typeof hold !== 'object' || !this.issuedEraseHolds.has(hold) || hold.commandId !== commandId) {
+      throw new Error('workspace_erase_hold_rejected');
+    }
+    hold.assertHeld();
+    const current = this.eraseHolds.get(hold.identity.workspaceId);
+    if (!current || current.handle !== hold || current.ownerId !== hold.identity.ownerId || current.privacyEpoch !== hold.identity.privacyEpoch ||
+        current.commandId !== commandId || !current.drained) throw new Error('workspace_erase_hold_rejected');
+  }
+
+
+
+  /** Used by the host HTTP fence for APIs that bypass the controller runtime (credentials/OAuth). */
+  assertWorkspaceAdmission(admission: OwnedWorkspaceAdmission): void { this.assertAdmission(admission); }
+
+  /** Metadata-only recovery view for the authenticated owner after an app refresh. */
+  getWorkspaceEraseHoldStatus(admission: OwnedWorkspaceAdmission): Readonly<{ commandId: string; status: 'draining' | 'drain_failed' | 'drained';
+    expectedRevision: number; expectedPrivacyEpoch: number }> | undefined {
+    if (!admission || typeof admission !== 'object' || typeof admission.sessionToken !== 'string' || !admission.sessionToken ||
+        typeof admission.assertCurrent !== 'function') throw new TypeError('owned_workspace_admission_required');
+    if (this.closing) throw new Error('The owned workspace runtime is closing.');
+    admission.assertCurrent();
+    const identity = this.options.kernel.getOwnedIdentity(admission.sessionToken);
+    const held = this.eraseHolds.get(identity.workspaceId);
+    if (!held) return undefined;
+    if (held.ownerId !== identity.ownerId || held.privacyEpoch !== identity.privacyEpoch) throw new Error('workspace_erase_hold_conflict');
+    const currentIdentity = this.options.kernel.getOwnedIdentity(admission.sessionToken);
+    return Object.freeze({ commandId: held.commandId,
+      status: held.drained ? 'drained' as const : held.failedDisposal ? 'drain_failed' as const : 'draining' as const,
+      expectedRevision: currentIdentity.revision, expectedPrivacyEpoch: currentIdentity.privacyEpoch });
+  }
+
+  /** Callback-only identity fence for OAuth redirects that intentionally have no live browser session. */
+  isWorkspaceEraseHeldOrPending(workspaceId: string, ownerId: string): boolean {
+    const held = this.eraseHolds.get(workspaceId);
+    return Boolean(held?.ownerId === ownerId || this.options.isWorkspaceErasePending?.(workspaceId, ownerId));
+  }
+
+  private stopWorkspaceAdmission(workspaceId: string): void {
+    const controller = this.controllerByWorkspace.get(workspaceId);
+    controller?.stopActiveTranscriptions();
+    this.responseOwnerByWorkspace.get(workspaceId)?.stopAdmission();
+    if (controller) this.attachedLifecycles.get(controller)?.stopAdmission();
+  }
+
   /** Read-only receipt lookup. It deliberately bypasses busy/refresh-required state and never touches the controller. */
   inspectCommandReceipt(admission: OwnedWorkspaceAdmission, idempotencyKey: string): CommandAdmission | undefined {
     this.assertAdmission(admission);
@@ -860,6 +997,7 @@ export class OwnedWorkspaceRuntime {
 
   private track<T>(workspaceId: string, beforeWork: () => void, work: () => Promise<T>): Promise<T> {
     if (this.closing) return Promise.reject(new Error('The owned workspace runtime is closing.'));
+    if (this.eraseHolds.has(workspaceId)) return Promise.reject(new Error('workspace_erase_in_progress'));
     if (this.busy.has(workspaceId)) return Promise.reject(new Error('The workspace runtime is busy.'));
     this.busy.add(workspaceId);
     beforeWork();
@@ -892,6 +1030,7 @@ export class OwnedWorkspaceRuntime {
   private attachController(controller: AppControllerImpl, adapter: NodeSpeechCleanupAdapter | undefined,
     workspaceId: string, responseOwner?: NodeProviderResponseLifetimeOwner): void {
     this.controllers.add(controller);
+    this.controllerByWorkspace.set(workspaceId, controller);
     if (adapter) {
       this.speechAdapters.set(controller, adapter);
       this.allSpeechAdapters.add(adapter);
@@ -947,6 +1086,7 @@ export class OwnedWorkspaceRuntime {
     this.audioApis.delete(controller);
     this.attachedLifecycles.delete(controller);
     this.cache.delete(input.identity.workspaceId);
+    if (this.controllerByWorkspace.get(input.identity.workspaceId) === controller) this.controllerByWorkspace.delete(input.identity.workspaceId);
   }
 
   private invalidateWorkspaceSnapshot(workspaceId: string): void {
@@ -1013,6 +1153,27 @@ export class OwnedWorkspaceRuntime {
     if (!admission || typeof admission !== 'object' || typeof admission.sessionToken !== 'string' ||
         !admission.sessionToken || typeof admission.assertCurrent !== 'function') throw new TypeError('owned_workspace_admission_required');
     if (this.closing) throw new Error('The owned workspace runtime is closing.');
+    admission.assertCurrent();
+    const identity = this.options.kernel.getOwnedIdentity(admission.sessionToken);
+    const held = this.eraseHolds.get(identity.workspaceId);
+    if (held || this.options.isWorkspaceErasePending?.(identity.workspaceId, identity.ownerId)) {
+      throw new Error('workspace_erase_in_progress');
+    }
+  }
+
+  /** Same real admission checks as normal work, except the exact existing erase hold may retry. */
+  private assertEraseAdmission(admission: OwnedWorkspaceAdmission, commandId: string): void {
+    if (!admission || typeof admission !== 'object' || typeof admission.sessionToken !== 'string' ||
+        !admission.sessionToken || typeof admission.assertCurrent !== 'function') throw new TypeError('owned_workspace_admission_required');
+    if (this.closing) throw new Error('The owned workspace runtime is closing.');
+    admission.assertCurrent();
+    const identity = this.options.kernel.getOwnedIdentity(admission.sessionToken);
+    const held = this.eraseHolds.get(identity.workspaceId);
+    if (held && (held.ownerId !== identity.ownerId || held.privacyEpoch !== identity.privacyEpoch)) throw new Error('workspace_erase_hold_conflict');
+      if (!held && this.options.isWorkspaceErasePending?.(identity.workspaceId, identity.ownerId) &&
+          !this.options.isWorkspaceEraseCommandPending?.(identity.workspaceId, identity.ownerId, commandId)) {
+        throw new Error('workspace_erase_in_progress');
+      }
     admission.assertCurrent();
   }
 }

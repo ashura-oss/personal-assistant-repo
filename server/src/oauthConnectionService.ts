@@ -34,7 +34,7 @@ interface StartRow {
 export class OAuthConnectionServiceError extends Error {
   constructor(readonly code: 'oauth_unavailable' | 'oauth_invalid_input' | 'oauth_conflict' | 'oauth_stale_workspace' |
     'oauth_start_in_progress' | 'oauth_start_not_admitted' | 'oauth_original_session_inactive' | 'oauth_not_found' | 'oauth_provider_failed' |
-    'oauth_callback_invalid' | 'oauth_exchange_unknown' | 'oauth_service_closing') {
+    'oauth_callback_invalid' | 'oauth_exchange_unknown' | 'oauth_service_closing' | 'oauth_workspace_erasing') {
     super(code);
     this.name = 'OAuthConnectionServiceError';
   }
@@ -129,6 +129,8 @@ export interface OAuthConnectionServiceOptions {
   readonly runtimeSessionFor: RuntimeSessionResolver;
   readonly now?: () => number;
   readonly withOperationOwnership?: <T>(provider: OAuthStageProvider, operation: () => Promise<T>) => Promise<T>;
+  /** Host-private per-workspace erase hold/intent fence, including cold-start prepared plans. */
+  readonly isWorkspaceEraseHeldOrPending?: (workspaceId: string, ownerId: string) => boolean;
 }
 
 /** Durable, session-bound OAuth start identity plus one-use callback exchange orchestration. */
@@ -195,7 +197,12 @@ export class OAuthConnectionService implements OAuthHttpApi {
     admission.assertCurrent();
     const after = this.options.kernel.getOwnedIdentity(admission.sessionToken);
     if (before.workspaceId !== after.workspaceId || before.ownerId !== after.ownerId || before.privacyEpoch !== after.privacyEpoch) fail('oauth_stale_workspace');
+    this.assertWorkspaceAvailable(after);
     return after;
+  }
+
+  private assertWorkspaceAvailable(identity: Pick<OwnedWorkspaceIdentity, 'workspaceId' | 'ownerId'>): void {
+    if (this.options.isWorkspaceEraseHeldOrPending?.(identity.workspaceId, identity.ownerId)) fail('oauth_workspace_erasing');
   }
 
   private track<T>(provider: OAuthStageProvider, operation: () => Promise<T>): Promise<T> {
@@ -429,6 +436,7 @@ export class OAuthConnectionService implements OAuthHttpApi {
       attemptId = resolved.attemptId;
     } catch { fail('oauth_callback_invalid'); }
     const actor = this.options.runtimeSessionFor(identity);
+    this.assertWorkspaceAvailable(identity);
     let claimResult;
     try {
       claimResult = this.options.kernel.withOwnedTransaction(actor, identity.privacyEpoch, (context) => {
@@ -459,6 +467,9 @@ export class OAuthConnectionService implements OAuthHttpApi {
             (context) => this.options.stages.assertExchangeClaimCurrent(context, claim));
         },
       }));
+      // Provider work may outlive prepare/drain. Recheck the exact resolved stage identity
+      // immediately before the verified private payload can be committed.
+      this.assertWorkspaceAvailable(identity);
       const status = this.options.kernel.withOwnedTransaction(actor, identity.privacyEpoch,
         (context) => this.options.stages.completeVerified(context, claim, payload));
       return Object.freeze({ attemptId, status: status.status, ...(clearCookieName ? { clearCookieName } : {}) });

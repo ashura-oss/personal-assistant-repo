@@ -9,12 +9,20 @@ export interface WorkspaceHttpAdmission {
 }
 
 export interface WorkspaceHttpApi extends Partial<KnowledgeHttpApi>, Partial<BackgroundHttpApi> {
+  assertWorkspaceAdmission?(admission: WorkspaceHttpAdmission): void;
   getSnapshot(admission: WorkspaceHttpAdmission): Promise<JsonValue>;
   refreshSnapshot(admission: WorkspaceHttpAdmission): Promise<JsonValue>;
   dispatchCommand(admission: WorkspaceHttpAdmission, envelope: unknown): Promise<JsonValue>;
   inspectCommand(admission: WorkspaceHttpAdmission, commandId: string): JsonValue;
   listCommandHistory(admission: WorkspaceHttpAdmission, cursor?: string): JsonValue;
   cancelTranscription(admission: WorkspaceHttpAdmission, commandId: string): JsonValue;
+  prepareWorkspaceErase?(admission: WorkspaceHttpAdmission, input: Readonly<{ commandId: string; expectedRevision: number; expectedPrivacyEpoch: number }>): Promise<JsonValue>;
+  confirmWorkspaceErase?(admission: WorkspaceHttpAdmission, input: Readonly<{ commandId: string; expectedRevision: number; expectedPrivacyEpoch: number }>): Promise<JsonValue>;
+  executeWorkspaceErase?(admission: WorkspaceHttpAdmission, input: Readonly<{ commandId: string; expectedRevision: number; expectedPrivacyEpoch: number }>): Promise<JsonValue>;
+  cancelWorkspaceErase?(admission: WorkspaceHttpAdmission, input: Readonly<{ commandId: string; expectedRevision: number; expectedPrivacyEpoch: number }>): Promise<JsonValue>;
+  retryWorkspaceEraseCleanup?(admission: WorkspaceHttpAdmission, input: Readonly<{ commandId: string; expectedPrivacyEpoch: number }>): Promise<JsonValue>;
+  inspectWorkspaceErase?(admission: WorkspaceHttpAdmission, commandId: string): Promise<JsonValue | undefined>;
+  inspectWorkspaceEraseStatus?(admission: WorkspaceHttpAdmission): Promise<JsonValue>;
   readMailReplySource?(admission: WorkspaceHttpAdmission, input: Readonly<{ messageId: string; expectedRevision: number; expectedPrivacyEpoch: number }>): Promise<JsonValue>;
   readMailReplyText?(admission: WorkspaceHttpAdmission, input: Readonly<{ messageId: string; expectedRevision: number; expectedPrivacyEpoch: number }>): Promise<JsonValue>;
   readProposalReview?(admission: WorkspaceHttpAdmission, input: Readonly<{ proposalId: string; expectedRevision: number; expectedPrivacyEpoch: number }>): Promise<JsonValue>;

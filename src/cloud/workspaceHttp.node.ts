@@ -6,10 +6,17 @@ import { dispatchWorkspaceCommand, inspectWorkspaceCommand } from './workspaceCo
 import type { WorkspaceCommandResponse } from './workspaceCommands';
 import type { WorkspaceSnapshotDTO } from './workspaceDto';
 import type { BackgroundPolicyStore } from '../../server/src/backgroundPolicies.js';
+import type { WorkspaceEraseService, WorkspaceEraseRuntimeHold } from '../../server/src/workspaceErase.js';
+import type { OwnedWorkspaceEraseHold } from './ownedWorkspaceRuntime.node';
 
 /** Binds the HTTP port only to the safe snapshot and explicit command APIs. */
-export function createWorkspaceHttpApi(runtime: OwnedWorkspaceRuntime, backgroundPolicies?: BackgroundPolicyStore): WorkspaceHttpApi {
+export function createWorkspaceHttpApi(runtime: OwnedWorkspaceRuntime, backgroundPolicies?: BackgroundPolicyStore,
+  workspaceErase?: WorkspaceEraseService): WorkspaceHttpApi {
+  const reserveEraseRuntime = (admission: WorkspaceHttpAdmission, commandId: string) => runtime.reserveWorkspaceForErase(admission, commandId);
+  const verifyEraseRuntimeHold = (hold: WorkspaceEraseRuntimeHold, commandId: string) =>
+    runtime.assertWorkspaceEraseHold(hold as OwnedWorkspaceEraseHold, commandId);
   return Object.freeze({
+    assertWorkspaceAdmission(admission: WorkspaceHttpAdmission): void { runtime.assertWorkspaceAdmission(admission); },
     async getSnapshot(admission: WorkspaceHttpAdmission): Promise<JsonValue> {
       return serializeSnapshot(await runtime.getSnapshot(admission));
     },
@@ -135,6 +142,33 @@ export function createWorkspaceHttpApi(runtime: OwnedWorkspaceRuntime, backgroun
       const status = runtime.requestTranscriptionCancellation(admission, commandId);
       return { schemaVersion: 1, commandId, status };
     },
+    ...(workspaceErase ? {
+      async prepareWorkspaceErase(admission: WorkspaceHttpAdmission, input: { commandId: string; expectedRevision: number; expectedPrivacyEpoch: number }) {
+        return serializeEraseResult(await workspaceErase.prepare(admission, input, reserveEraseRuntime, verifyEraseRuntimeHold));
+      },
+      async confirmWorkspaceErase(admission: WorkspaceHttpAdmission, input: { commandId: string; expectedRevision: number; expectedPrivacyEpoch: number }) {
+        return serializeEraseResult(await workspaceErase.confirm(admission, input, reserveEraseRuntime, verifyEraseRuntimeHold));
+      },
+      async executeWorkspaceErase(admission: WorkspaceHttpAdmission, input: { commandId: string; expectedRevision: number; expectedPrivacyEpoch: number }) {
+        return serializeEraseResult(await workspaceErase.execute(admission, input, reserveEraseRuntime, verifyEraseRuntimeHold));
+      },
+      async cancelWorkspaceErase(admission: WorkspaceHttpAdmission, input: { commandId: string; expectedRevision: number; expectedPrivacyEpoch: number }) {
+        return serializeEraseResult(await workspaceErase.cancel(admission, input, reserveEraseRuntime, verifyEraseRuntimeHold));
+      },
+      async retryWorkspaceEraseCleanup(admission: WorkspaceHttpAdmission, input: { commandId: string; expectedPrivacyEpoch: number }) {
+        return serializeEraseResult(await workspaceErase.retryPhysicalCleanup(admission, input));
+      },
+      async inspectWorkspaceErase(admission: WorkspaceHttpAdmission, commandId: string) {
+        const receipt = await workspaceErase.inspect(admission, commandId);
+        return receipt ? serializeEraseResult(receipt) : undefined;
+      },
+      async inspectWorkspaceEraseStatus(admission: WorkspaceHttpAdmission) {
+        const status = await workspaceErase.inspectStatus(admission);
+        if (status.status === 'cleanup_pending' || status.status === 'complete') return serializeEraseResult(status);
+        const hold = runtime.getWorkspaceEraseHoldStatus(admission);
+        return serializeEraseResult({ ...status, ...(hold ? { hold } : {}) });
+      },
+    } : {}),
   });
 }
 
@@ -143,6 +177,7 @@ function serializeKnowledgeRead(value: Awaited<ReturnType<KnowledgeHttpApi['read
 }
 
 function serializeWorkflowRead(value: unknown): JsonValue { return JSON.parse(JSON.stringify(value)) as JsonValue; }
+function serializeEraseResult(value: unknown): JsonValue { return JSON.parse(JSON.stringify(value)) as JsonValue; }
 function readEnvelope(value: { workspaceId: string; privacyEpoch: number; revision: number }) {
   return { schemaVersion: 1 as const, workspaceId: value.workspaceId, privacyEpoch: value.privacyEpoch, revision: value.revision };
 }

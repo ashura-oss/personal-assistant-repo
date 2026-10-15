@@ -59,7 +59,7 @@ test('runtime drain retains an owned Batch response until its body cleanup compl
     let release;
     const cleanupGate = new Promise((resolve) => { release = resolve; });
     releaseCleanup = release;
-    runtime = createProductionApplicationRuntimeFactory(config, { fetcher: async (input, init = {}) => {
+    runtime = await createProductionApplicationRuntimeFactory(config, { fetcher: async (input, init = {}) => {
       providerGets += 1;
       assert.equal(init.method ?? 'GET', 'GET');
       assert.equal(String(input), `https://openrouter.ai/api/v1/batches/${batchId}`);
@@ -71,7 +71,7 @@ test('runtime drain retains an owned Batch response until its body cleanup compl
     } })({ kernel, vault, auth: opened.foundation.auth,
       runtimeSessionFor: (identity) => actors.sessionForRegistry(identity),
       listWorkspaceMetadataPage: (afterWorkspaceId, limit) => actors.listWorkspaceMetadataPage(afterWorkspaceId, limit),
-      processInstanceId: opened.privateContext.processInstanceId });
+      processInstanceId: opened.privateContext.processInstanceId, createEmptyWorkspaceSnapshot: () => createInitialWorkspaceState(randomUUID) });
     await waitUntil(() => providerGets, (count) => count === 1, 'the held Batch response did not start');
     runtime.stopAdmission();
     const drain = runtime.drainAndDispose().then(() => { drainFinished = true; });

@@ -85,7 +85,7 @@ test('a process crash preserves an unknown GET command and restart admits only a
     });
     actors = new ProcessWorkspaceActors(restartedKernel);
     let providerGets = 0;
-    runtime = createProductionApplicationRuntimeFactory(config, { fetcher: async (input, init = {}) => {
+    runtime = await createProductionApplicationRuntimeFactory(config, { fetcher: async (input, init = {}) => {
       providerGets += 1;
       assert.equal(init.method ?? 'GET', 'GET');
       assert.equal(String(input), `https://openrouter.ai/api/v1/batches/${batchId}`);
@@ -95,7 +95,7 @@ test('a process crash preserves an unknown GET command and restart admits only a
     } })({ kernel: restartedKernel, vault: restartedVault, auth: opened.foundation.auth,
       runtimeSessionFor: (identity) => actors.sessionForRegistry(identity),
       listWorkspaceMetadataPage: (afterWorkspaceId, limit) => actors.listWorkspaceMetadataPage(afterWorkspaceId, limit),
-      processInstanceId: opened.privateContext.processInstanceId });
+      processInstanceId: opened.privateContext.processInstanceId, createEmptyWorkspaceSnapshot: () => createInitialWorkspaceState(randomUUID) });
     const state = await waitUntil(() => restartedKernel.withTrustedDatabaseTransaction((db) => {
       const commands = db.prepare(`SELECT idempotency_key,status FROM async_command_journal WHERE command_kind='assistant.batch.check'`).all();
       const attempts = db.prepare(`SELECT command_id,status,result_code,next_due_at FROM batch_observation_attempts WHERE job_id=?`).all(jobId);

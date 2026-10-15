@@ -162,9 +162,9 @@ export async function runPaidReplyFixture({ missingOpenRouterCredential = false,
       workspaceStore = context.store;
       return productionPortsFor(context, activeVault, activeKernel);
     } });
-    runtime = factory({ kernel, vault, auth: opened.foundation.auth,
+    runtime = await factory({ kernel, vault, auth: opened.foundation.auth,
       runtimeSessionFor, listWorkspaceMetadataPage: (afterWorkspaceId, limit) => actors.listWorkspaceMetadataPage(afterWorkspaceId, limit),
-      processInstanceId: randomUUID() });
+      processInstanceId: randomUUID(), createEmptyWorkspaceSnapshot: () => createInitialWorkspaceState(randomUUID) });
     const admission = Object.freeze({ sessionToken: browserLogin.sessionToken, assertCurrent() { kernel.getOwnedIdentity(browserLogin.sessionToken); } });
     const snapshot = await runtime.workspaceApi.getSnapshot(admission);
     if (snapshotMutation) {

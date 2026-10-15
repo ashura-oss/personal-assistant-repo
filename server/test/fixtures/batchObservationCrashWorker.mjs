@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+import { createInitialWorkspaceState } from '../../dist/sharedControllerNode.mjs';
 import { join } from 'node:path';
 import { loadServerConfig } from '../../dist/config.js';
 import { openServerFoundationInternal } from '../../dist/bootstrap.js';
@@ -16,7 +18,7 @@ startup.beginRecovery();
 recoverInterruptedBatchObservations(kernel, startup.capability);
 startup.seal();
 const actors = new ProcessWorkspaceActors(kernel);
-const runtime = createProductionApplicationRuntimeFactory(config, { fetcher: async (_input, init = {}) => {
+const runtime = await createProductionApplicationRuntimeFactory(config, { fetcher: async (_input, init = {}) => {
   if ((init.method ?? 'GET') !== 'GET') process.exit(71);
   if (mode === 'dispatched') {
     const admitted = kernel.withTrustedDatabaseTransaction((db) => {
@@ -31,7 +33,7 @@ const runtime = createProductionApplicationRuntimeFactory(config, { fetcher: asy
 } })({ kernel, vault, auth: opened.foundation.auth,
   runtimeSessionFor: (identity) => actors.sessionForRegistry(identity),
   listWorkspaceMetadataPage: (afterWorkspaceId, limit) => actors.listWorkspaceMetadataPage(afterWorkspaceId, limit),
-  processInstanceId: opened.privateContext.processInstanceId });
+  processInstanceId: opened.privateContext.processInstanceId, createEmptyWorkspaceSnapshot: () => createInitialWorkspaceState(randomUUID) });
 
 const deadline = Date.now() + 12_000;
 while (Date.now() < deadline) {

@@ -77,8 +77,8 @@ test('foreground account sync causes one durable scheduled deferral and leaves t
       }
       throw new Error(`unexpected foreground fixture request to ${new URL(url).origin}`);
     } });
-    runtime = factory({ kernel, vault, auth: enrollment.foundation.auth, runtimeSessionFor,
-      listWorkspaceMetadataPage: (afterWorkspaceId, limit) => actors.listWorkspaceMetadataPage(afterWorkspaceId, limit), processInstanceId: randomUUID() });
+    runtime = await factory({ kernel, vault, auth: enrollment.foundation.auth, runtimeSessionFor,
+      listWorkspaceMetadataPage: (afterWorkspaceId, limit) => actors.listWorkspaceMetadataPage(afterWorkspaceId, limit), processInstanceId: randomUUID(), createEmptyWorkspaceSnapshot: () => createInitialWorkspaceState(randomUUID) });
     const admission = Object.freeze({ sessionToken: login.sessionToken, assertCurrent: () => kernel.getOwnedIdentity(login.sessionToken) });
     const before = await runtime.workspaceApi.getSnapshot(admission);
     const foreground = runtime.workspaceApi.dispatchCommand(admission, { schemaVersion: 1, commandId: randomUUID(),
