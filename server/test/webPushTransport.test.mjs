@@ -109,6 +109,7 @@ function makeFixture(options = {}) {
     },
   });
   const input = {
+    kind: options.kind ?? 'reminder',
     subscription: {
       endpoint,
       expirationTime: null,
@@ -144,6 +145,19 @@ test('builds a fixed encrypted aes128gcm request and reports service acceptance'
   assert.deepEqual(JSON.parse(decryptPayload().toString('utf8')), {
     schemaVersion: 1, type: 'reminder', title: 'Reminder', body: 'You have a reminder.',
   });
+});
+
+test('encrypts only the fixed copy selected by a closed notification kind', async () => {
+  const expected = [
+    ['reminder', { schemaVersion: 1, type: 'reminder', title: 'Reminder', body: 'You have a reminder.' }],
+    ['mail_alert', { schemaVersion: 1, type: 'mail_alert', title: 'Mail alert', body: 'A saved mail rule matched a message.' }],
+    ['draft_ready', { schemaVersion: 1, type: 'draft_ready', title: 'Draft ready', body: 'A draft is ready to review.' }],
+  ];
+  for (const [kind, copy] of expected) {
+    const fixture = makeFixture({ kind });
+    assert.deepEqual(await fixture.transport.send(fixture.input), { kind: 'accepted' });
+    assert.deepEqual(JSON.parse(fixture.decryptPayload().toString('utf8')), copy);
+  }
 });
 
 test('rejects malformed endpoints before DNS or TLS', async () => {
@@ -237,6 +251,14 @@ test('rejects accessors and symbol properties without invoking them or doing net
   const withSymbol = { ...input, [Symbol('extra')]: true };
   assert.deepEqual(await transport.send(withSymbol), { kind: 'not_started', reason: 'invalid_request' });
   assert.equal(calls.resolve, 0);
+});
+
+test('rejects unknown notification kinds before DNS', async () => {
+  const { transport, input, calls } = makeFixture({ kind: 'arbitrary_user_text' });
+  assert.deepEqual(await transport.send(input), { kind: 'not_started', reason: 'invalid_request' });
+  assert.equal(calls.resolve, 0);
+  assert.equal(calls.dial, 0);
+  assert.equal(calls.request, 0);
 });
 
 test('waits for late dial sockets, closes them, and drains stopped admission', async () => {

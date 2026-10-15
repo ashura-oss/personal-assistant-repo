@@ -165,6 +165,54 @@ test('explicit provisioning and key rotation are idempotent, inspectable, and bi
   } finally { f.close(); }
 });
 
+test('delivery material opens only the exact active generation and retains its VAPID pair across rotation', async () => {
+  const f = await setup();
+  const admission = f.admission();
+  try {
+    const provision = f.service.provision(admission, { commandId: randomUUID(), expectedPrivacyEpoch: 0 });
+    const saved = subscription();
+    const registered = f.service.register(admission, { commandId: randomUUID(), expectedPrivacyEpoch: 0,
+      deviceId: randomUUID(), keyId: provision.result.keyId, expectedPreviousGeneration: 0, subscription: saved });
+    f.service.rotate(admission, { commandId: randomUUID(), expectedPrivacyEpoch: 0, expectedActiveKeyId: provision.result.keyId });
+    const material = f.kernel.withOwnedTransaction(f.login.sessionToken, 0, (context) =>
+      f.service.readDeliveryMaterialWithinTransaction(context, { deviceId: registered.result.deviceId, generation: 1 }));
+    assert.equal(material.deviceId, registered.result.deviceId);
+    assert.equal(material.keyId, provision.result.keyId);
+    assert.equal(material.subscription.endpoint.toString('utf8'), saved.endpoint);
+    assert.equal(material.subscription.keys.p256dh.toString('base64url'), saved.keys.p256dh);
+    assert.equal(material.subscription.keys.auth.toString('base64url'), saved.keys.auth);
+    const derived = createECDH('prime256v1');
+    try {
+      derived.setPrivateKey(material.vapid.privateKey);
+      assert.equal(derived.getPublicKey(undefined, 'uncompressed').toString('base64url'), provision.result.publicKey);
+    } finally {
+      material.subscription.endpoint.fill(0); material.subscription.keys.p256dh.fill(0); material.subscription.keys.auth.fill(0);
+      material.vapid.privateKey.fill(0);
+    }
+  } finally { f.close(); }
+});
+
+test('delivery expiry is an exact generation and key compare-and-set', async () => {
+  const f = await setup();
+  const admission = f.admission();
+  try {
+    const provision = f.service.provision(admission, { commandId: randomUUID(), expectedPrivacyEpoch: 0 });
+    const first = f.service.register(admission, { commandId: randomUUID(), expectedPrivacyEpoch: 0,
+      deviceId: randomUUID(), keyId: provision.result.keyId, expectedPreviousGeneration: 0, subscription: subscription() });
+    const expires = (generation, keyId) => f.kernel.withOwnedTransaction(f.login.sessionToken, 0, (context) =>
+      f.service.expireDeliveryGenerationWithinTransaction(context, { deviceId: first.result.deviceId, generation, keyId }));
+    assert.equal(expires(2, provision.result.keyId), false);
+    assert.equal(expires(1, randomUUID()), false);
+    assert.equal(expires(1, provision.result.keyId), true);
+    const second = f.service.register(admission, { commandId: randomUUID(), expectedPrivacyEpoch: 0,
+      deviceId: first.result.deviceId, keyId: provision.result.keyId, expectedPreviousGeneration: 1, subscription: subscription() });
+    assert.equal(second.result.generation, 2);
+    assert.equal(expires(1, provision.result.keyId), false);
+    assert.equal(f.service.listSubscriptions(admission).subscriptions[0].status, 'active');
+    assert.throws(() => f.service.readDeliveryMaterialWithinTransaction({}, { deviceId: first.result.deviceId, generation: 2 }));
+  } finally { f.close(); }
+});
+
 test('registration rejects fragments, malformed P-256 points, accessors, and symbols before any row write', async () => {
   const f = await setup();
   const admission = f.admission();

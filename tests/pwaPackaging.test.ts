@@ -167,10 +167,25 @@ describe('PWA export packaging', () => {
       addEventListener: (type: string, listener: (event: any) => void) => listeners.set(type, listener),
     };
     runInNewContext(createServiceWorker('still-shell-0123456789abcdef', ['/']), { self: serviceWorkerScope, URL, Promise });
-    let pushWork: Promise<unknown> | undefined;
-    listeners.get('push')?.({ data: { json: () => { throw new Error('payload must not be read'); } }, waitUntil: (work: Promise<unknown>) => { pushWork = work; } });
-    await pushWork;
-    expect(shown).toEqual([['Reminder', { body: 'You have a reminder.', icon: '/assets/still-icon.png', data: { schemaVersion: 1, type: 'reminder' } }]]);
+    const push = listeners.get('push')!;
+    for (const payload of [
+      { schemaVersion: 1, type: 'reminder', title: 'attacker title', body: 'private body', url: 'https://attacker.invalid/' },
+      { schemaVersion: 1, type: 'mail_alert', title: 'attacker title', body: 'private body' },
+      { schemaVersion: 1, type: 'draft_ready', body: 'private body' },
+    ]) {
+      let pushWork: Promise<unknown> | undefined;
+      push({ data: { json: () => payload }, waitUntil: (work: Promise<unknown>) => { pushWork = work; } });
+      await pushWork;
+    }
+    let unknownPushWork: Promise<unknown> | undefined;
+    push({ data: { json: () => ({ schemaVersion: 1, type: 'toString', title: 'private' }) },
+      waitUntil: (work: Promise<unknown>) => { unknownPushWork = work; } });
+    expect(unknownPushWork).toBeUndefined();
+    expect(shown).toEqual([
+      ['Reminder', { body: 'You have a reminder.', icon: '/assets/still-icon.png', data: { schemaVersion: 1, type: 'reminder' } }],
+      ['Mail alert', { body: 'A saved mail rule matched a message.', icon: '/assets/still-icon.png', data: { schemaVersion: 1, type: 'mail_alert' } }],
+      ['Draft ready', { body: 'A draft is ready to review.', icon: '/assets/still-icon.png', data: { schemaVersion: 1, type: 'draft_ready' } }],
+    ]);
 
     let clickWork: Promise<unknown> | undefined;
     let closed = false;

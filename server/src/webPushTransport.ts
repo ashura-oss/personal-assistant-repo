@@ -8,7 +8,12 @@ import webPush, { type PushSubscription, type RequestDetails, type VapidKeys } f
 
 const REQUEST_TIMEOUT_MS = 12_000;
 const MAX_RESPONSE_BYTES = 16 * 1024;
-const FIXED_PAYLOAD = Buffer.from(JSON.stringify({ schemaVersion: 1, type: 'reminder', title: 'Reminder', body: 'You have a reminder.' }), 'utf8');
+const FIXED_PAYLOADS = Object.freeze({
+  reminder: Buffer.from(JSON.stringify({ schemaVersion: 1, type: 'reminder', title: 'Reminder', body: 'You have a reminder.' }), 'utf8'),
+  mail_alert: Buffer.from(JSON.stringify({ schemaVersion: 1, type: 'mail_alert', title: 'Mail alert', body: 'A saved mail rule matched a message.' }), 'utf8'),
+  draft_ready: Buffer.from(JSON.stringify({ schemaVersion: 1, type: 'draft_ready', title: 'Draft ready', body: 'A draft is ready to review.' }), 'utf8'),
+});
+export type WebPushNotificationKind = keyof typeof FIXED_PAYLOADS;
 const IPV4_SPECIAL = ['0.0.0.0/8', '100.64.0.0/10', '192.0.0.0/24', '192.0.2.0/24', '192.88.99.0/24',
   '198.18.0.0/15', '198.51.100.0/24', '203.0.113.0/24', '224.0.0.0/4', '240.0.0.0/4'].map((range) => ipaddr.parseCIDR(range));
 const IPV6_SPECIAL = ['2001::/23', '2001:db8::/32', '2002::/16', '3fff::/20'].map((range) => ipaddr.parseCIDR(range));
@@ -41,6 +46,7 @@ export type WebPushTransportResult =
   | Readonly<{ kind: 'ambiguous'; reason: 'cancelled' | 'timeout' | 'transport_failure' }>;
 
 export type WebPushTransportInput = Readonly<{
+  kind: WebPushNotificationKind;
   subscription: PushSubscription;
   vapidDetails: Readonly<{ subject: string; publicKey: string; privateKey: string }>;
   assertBeforeDispatch(): void;
@@ -69,9 +75,9 @@ function closedRecord(value: unknown, allowed: readonly string[], required: read
   return result;
 }
 
-function captureInput(value: unknown): Readonly<{ subscription: PushSubscription; vapidDetails: VapidKeys & { subject: string };
+function captureInput(value: unknown): Readonly<{ kind: WebPushNotificationKind; subscription: PushSubscription; vapidDetails: VapidKeys & { subject: string };
   assertBeforeDispatch: () => void; signal?: AbortSignal }> {
-  const input = closedRecord(value, ['subscription', 'vapidDetails', 'assertBeforeDispatch', 'signal'], ['subscription', 'vapidDetails', 'assertBeforeDispatch']);
+  const input = closedRecord(value, ['kind', 'subscription', 'vapidDetails', 'assertBeforeDispatch', 'signal'], ['kind', 'subscription', 'vapidDetails', 'assertBeforeDispatch']);
   const subscription = closedRecord(input.subscription, ['endpoint', 'expirationTime', 'keys'], ['endpoint', 'keys']);
   const keys = closedRecord(subscription.keys, ['p256dh', 'auth'], ['p256dh', 'auth']);
   const vapid = closedRecord(input.vapidDetails, ['subject', 'publicKey', 'privateKey'], ['subject', 'publicKey', 'privateKey']);
@@ -79,14 +85,16 @@ function captureInput(value: unknown): Readonly<{ subscription: PushSubscription
       (subscription.expirationTime !== undefined && subscription.expirationTime !== null &&
         (typeof subscription.expirationTime !== 'number' || !Number.isSafeInteger(subscription.expirationTime) || subscription.expirationTime < 0)) ||
       typeof keys.p256dh !== 'string' || keys.p256dh.length > 256 || typeof keys.auth !== 'string' || keys.auth.length > 256 ||
+      typeof input.kind !== 'string' || !Object.hasOwn(FIXED_PAYLOADS, input.kind) ||
       typeof vapid.subject !== 'string' || vapid.subject.length > 512 || typeof vapid.publicKey !== 'string' || vapid.publicKey.length > 256 ||
       typeof vapid.privateKey !== 'string' || vapid.privateKey.length > 256 || typeof input.assertBeforeDispatch !== 'function' ||
       (input.signal !== undefined && !(input.signal instanceof AbortSignal))) throw new Error('invalid');
   const copiedSubscription = Object.freeze({ endpoint: subscription.endpoint,
     ...(subscription.expirationTime === undefined ? {} : { expirationTime: subscription.expirationTime as number | null }),
     keys: Object.freeze({ p256dh: keys.p256dh, auth: keys.auth }) });
-  const captured: { subscription: PushSubscription; vapidDetails: VapidKeys & { subject: string };
+  const captured: { kind: WebPushNotificationKind; subscription: PushSubscription; vapidDetails: VapidKeys & { subject: string };
     assertBeforeDispatch: () => void; signal?: AbortSignal } = {
+    kind: input.kind as WebPushNotificationKind,
     subscription: copiedSubscription as PushSubscription,
     vapidDetails: Object.freeze({ subject: vapid.subject, publicKey: vapid.publicKey, privateKey: vapid.privateKey }),
     assertBeforeDispatch: input.assertBeforeDispatch as () => void,
@@ -300,7 +308,7 @@ export function createWebPushTransport(ports: WebPushTransportPorts = {}) {
       let generated: GeneratedRequest;
       try {
         destination = safeEndpoint(captured.subscription.endpoint);
-        const details = webPush.generateRequestDetails(captured.subscription, FIXED_PAYLOAD,
+        const details = webPush.generateRequestDetails(captured.subscription, FIXED_PAYLOADS[captured.kind],
           { vapidDetails: captured.vapidDetails, contentEncoding: 'aes128gcm', TTL: 60, urgency: 'normal' });
         if (details.method !== 'POST' || !Buffer.isBuffer(details.body) || details.endpoint !== captured.subscription.endpoint || details.proxy) {
           return Object.freeze({ kind: 'not_started', reason: 'invalid_request' });

@@ -144,6 +144,14 @@ export interface WebPushReconcileRequest {
   readonly subscription: Readonly<{ endpoint: string; keys: Readonly<{ p256dh: string; auth: string }> }>;
 }
 
+export interface WebPushDeliveryMaterial {
+  readonly deviceId: string;
+  readonly generation: number;
+  readonly keyId: string;
+  readonly subscription: Readonly<{ endpoint: Buffer; keys: Readonly<{ p256dh: Buffer; auth: Buffer }> }>;
+  readonly vapid: Readonly<{ publicKey: string; privateKey: Buffer }>;
+}
+
 /** Owned-workspace Web Push keyring and subscription registry. It performs no network requests. */
 export class WebPushSubscriptions implements WebPushHttpApi {
   readonly #kernel: DurableKernel;
@@ -249,6 +257,83 @@ export class WebPushSubscriptions implements WebPushHttpApi {
       return Object.freeze({ schemaVersion: 1, privacyEpoch: context.privacyEpoch, deviceId: request.deviceId,
         status: matches ? 'matched' : 'unmatched', generation: head.generation, keyId: head.key_id, publicKey: row.public_key });
     });
+  }
+
+  readDeliveryMaterialWithinTransaction(context: OwnedTransactionContext, input: unknown): WebPushDeliveryMaterial | undefined {
+    activeContext(this.#kernel, context);
+    const request = closedFields(input, ['deviceId', 'generation']);
+    const deviceId = uuid(request.deviceId);
+    const generation = safeInteger(request.generation, 1);
+    const head = context.db.prepare(`SELECT generation,status,key_id FROM web_push_subscription_heads
+      WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND device_id=?`)
+      .get(context.workspaceId, context.ownerId, context.privacyEpoch, deviceId) as HeadRow | undefined;
+    if (!head || head.status !== 'active' || head.generation !== generation) return undefined;
+    const row = context.db.prepare(`SELECT s.key_version AS subscription_version,s.nonce AS subscription_nonce,
+        s.tag AS subscription_tag,s.ciphertext AS subscription_ciphertext,k.key_version AS vapid_version,
+        k.public_key,k.nonce AS vapid_nonce,k.tag AS vapid_tag,k.ciphertext AS vapid_ciphertext
+      FROM web_push_subscriptions s JOIN web_push_vapid_keys k ON k.workspace_id=s.workspace_id AND k.owner_id=s.owner_id
+        AND k.privacy_epoch=s.privacy_epoch AND k.key_id=s.key_id
+      WHERE s.workspace_id=? AND s.owner_id=? AND s.privacy_epoch=? AND s.device_id=? AND s.generation=? AND s.key_id=?`)
+      .get(context.workspaceId, context.ownerId, context.privacyEpoch, deviceId, generation, head.key_id) as {
+        subscription_version: number; subscription_nonce: Buffer; subscription_tag: Buffer; subscription_ciphertext: Buffer;
+        vapid_version: number; public_key: string; vapid_nonce: Buffer; vapid_tag: Buffer; vapid_ciphertext: Buffer;
+      } | undefined;
+    if (!row || row.subscription_version !== SECRET_FORMAT || row.vapid_version !== SECRET_FORMAT) fail('web_push_registry_corrupt');
+    let subscriptionBytes: Buffer | undefined;
+    let privateKey: Buffer | undefined;
+    let endpointBytes: Buffer | undefined;
+    let pointBytes: Buffer | undefined;
+    let authBytes: Buffer | undefined;
+    let materialTransferred = false;
+    try {
+      subscriptionBytes = this.#vault.openWebPushSecretWithinTransaction(context,
+        { kind: 'subscription', deviceId, generation, keyId: head.key_id },
+        { format: row.subscription_version, nonce: row.subscription_nonce, tag: row.subscription_tag, ciphertext: row.subscription_ciphertext });
+      privateKey = this.#vault.openWebPushSecretWithinTransaction(context, { kind: 'vapid', keyId: head.key_id },
+        { format: row.vapid_version, nonce: row.vapid_nonce, tag: row.vapid_tag, ciphertext: row.vapid_ciphertext });
+      const parsed = closedFields(JSON.parse(subscriptionBytes.toString('utf8')) as unknown, ['endpoint', 'p256dh', 'auth']);
+      const endpointValue = endpoint(parsed.endpoint);
+      const p256dh = canonicalBase64Url(parsed.p256dh, 65);
+      const auth = canonicalBase64Url(parsed.auth, 16);
+      if (!validP256Point(p256dh) || privateKey.length !== 32 || typeof row.public_key !== 'string' ||
+          canonicalBase64Url(row.public_key, 65) !== row.public_key || !validP256Point(row.public_key)) fail('web_push_registry_corrupt');
+      const publicBytes = Buffer.from(row.public_key, 'base64url');
+      const derived = createECDH('prime256v1');
+      try {
+        derived.setPrivateKey(privateKey);
+        if (!derived.getPublicKey(undefined, 'uncompressed').equals(publicBytes)) fail('web_push_registry_corrupt');
+      } finally { publicBytes.fill(0); }
+      endpointBytes = Buffer.from(endpointValue, 'utf8');
+      pointBytes = Buffer.from(p256dh, 'base64url');
+      authBytes = Buffer.from(auth, 'base64url');
+      const result = Object.freeze({ deviceId, generation, keyId: head.key_id,
+        subscription: Object.freeze({ endpoint: endpointBytes,
+          keys: Object.freeze({ p256dh: pointBytes, auth: authBytes }) }),
+        vapid: Object.freeze({ publicKey: row.public_key, privateKey }) });
+      materialTransferred = true;
+      privateKey = undefined;
+      return result;
+    } catch (error) {
+      if (error instanceof WebPushRegistryError && error.code === 'web_push_registry_corrupt') throw error;
+      fail('web_push_registry_corrupt');
+    } finally {
+      subscriptionBytes?.fill(0);
+      privateKey?.fill(0);
+      if (!materialTransferred) { endpointBytes?.fill(0); pointBytes?.fill(0); authBytes?.fill(0); }
+    }
+  }
+
+  expireDeliveryGenerationWithinTransaction(context: OwnedTransactionContext, input: unknown): boolean {
+    activeContext(this.#kernel, context);
+    const request = closedFields(input, ['deviceId', 'generation', 'keyId']);
+    const deviceId = uuid(request.deviceId);
+    const generation = safeInteger(request.generation, 1);
+    const keyId = uuid(request.keyId);
+    const now = nowMilliseconds(this.#now());
+    const result = context.db.prepare(`UPDATE web_push_subscription_heads SET status='revoked',updated_at=?
+      WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND device_id=? AND generation=? AND key_id=? AND status='active'`)
+      .run(now, context.workspaceId, context.ownerId, context.privacyEpoch, deviceId, generation, keyId);
+    return result.changes === 1;
   }
 
   provision(admission: WorkspaceHttpAdmission, input: unknown): WebPushCommandReceipt {
