@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { createDurableKernel, SecretVault } from '../dist/index.js';
+import { AuthService } from '../dist/auth.js';
 import { ProcessWorkspaceActors } from '../dist/runtimeActors.js';
 import { createProductionApplicationRuntimeFactory } from '../dist/applicationHost.node.mjs';
 import { createInitialWorkspaceState } from '../dist/sharedControllerNode.mjs';
@@ -28,13 +29,16 @@ test('production workspace factory composes the real Node controller, Batch-only
   const kernel = createDurableKernel({ databasePath: join(directory, 'private', 'workspace.sqlite'),
     validateSnapshot(value) { assert.ok(value && typeof value === 'object' && !Array.isArray(value)); } });
   const vault = new SecretVault(kernel, randomBytes(32));
+  const auth = new AuthService(kernel, { canonicalOrigin: 'https://app.example.test', authSecret: randomBytes(32) });
   const ownerId = randomUUID();
   const workspace = kernel.createWorkspace(ownerId, createInitialWorkspaceState(randomUUID));
   const userSession = kernel.createSession(workspace.workspaceId, ownerId, Date.now() + 60 * 60_000);
   const actors = new ProcessWorkspaceActors(kernel);
   const runtime = createProductionApplicationRuntimeFactory({ dataDirectory: join(directory, 'private', 'data'), canonicalOrigin: 'https://app.example.test' }, {
     fetcher: async (input) => { calls.push(String(input)); throw new Error('unexpected provider request'); },
-  })({ kernel, vault, runtimeSessionFor: (identity) => actors.sessionForRegistry(identity) });
+  })({ kernel, vault, auth, runtimeSessionFor: (identity) => actors.sessionForRegistry(identity),
+    listWorkspaceMetadataPage: (afterWorkspaceId, limit) => actors.listWorkspaceMetadataPage(afterWorkspaceId, limit),
+    processInstanceId: randomUUID() });
   const admission = { sessionToken: userSession, assertCurrent: () => kernel.getOwnedIdentity(userSession) };
   try {
     const snapshot = await runtime.workspaceApi.getSnapshot(admission);
@@ -93,7 +97,7 @@ test('production workspace factory composes the real Node controller, Batch-only
     assert.deepEqual(calls, [], 'construction and local controller work make no provider request');
   } finally {
     try { await runtime.drainAndDispose(); } finally {
-      try { await actors.closeAfterDrain(async () => {}); } finally { vault.close(); kernel.close();
+      try { await actors.closeAfterDrain(async () => {}); } finally { auth.close(); vault.close(); kernel.close();
         rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
     }
   }

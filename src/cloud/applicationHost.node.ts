@@ -14,6 +14,7 @@ import { createServerOAuthProviderAdapter } from '../../server/src/oauthProvider
 import { OAuthConnectionService } from '../../server/src/oauthConnectionService.js';
 import type { NodeProviderResponseLifetimeOwner } from './providerResponseLifetime.node';
 import type { ServerOAuthProviderAdapter } from '../../server/src/oauthProviderAdapter.js';
+import { BackgroundRuntimeOwner } from './backgroundRuntime.node';
 
 export { NodeVaultOAuthTokenStore } from './nodeOAuthTokenStore.node';
 export { createProductionWorkspacePortsFor } from './productionWorkspacePorts.node';
@@ -34,7 +35,7 @@ export function createCloudApplicationRuntimeFactory(options: CloudApplicationRu
   if (!options || typeof options !== 'object' || typeof options.workspacePortsFor !== 'function') {
     throw new TypeError('application_workspace_ports_factory_required');
   }
-  const factory: ApplicationRuntimeFactory = ({ kernel, vault, auth, runtimeSessionFor, processInstanceId }) => {
+  const factory: ApplicationRuntimeFactory = ({ kernel, vault, auth, runtimeSessionFor, listWorkspaceMetadataPage, processInstanceId }) => {
     const oauthStages = new OAuthInstallStages(kernel, vault, auth);
     const oauthBindings = new ServerOAuthTokenBindings(kernel);
     const runtime = new OwnedWorkspaceRuntime({ kernel, runtimeSessionFor, processInstanceId, oauthInstall: { auth, vault, stages: oauthStages, bindings: oauthBindings },
@@ -46,10 +47,12 @@ export function createCloudApplicationRuntimeFactory(options: CloudApplicationRu
     });
     const oauthService = options.oauth ? new OAuthConnectionService({ kernel, auth, stages: oauthStages,
       provider: options.oauth.provider, config: options.oauth.config, runtimeSessionFor }) : undefined;
-    return Object.freeze({ workspaceApi: createWorkspaceHttpApi(runtime), audioHttpApi: runtime.createAudioHttpApi(),
+    const background = new BackgroundRuntimeOwner({ kernel, auth, runtime, runtimeSessionFor, listWorkspaceMetadataPage });
+    return Object.freeze({ workspaceApi: createWorkspaceHttpApi(runtime, background?.policies), audioHttpApi: runtime.createAudioHttpApi(),
       ...(oauthService ? { oauthHttpApi: oauthService } : {}),
-      stopAdmission: () => { oauthService?.stopAdmission(); options.oauth?.responseLifetimeOwner.stopAdmission(); runtime.stopAdmission(); },
+      stopAdmission: () => { background.stopAdmission(); oauthService?.stopAdmission(); options.oauth?.responseLifetimeOwner.stopAdmission(); runtime.stopAdmission(); },
       drainAndDispose: async () => {
+        await background.drainAndDispose();
         await oauthService?.drain();
         await options.oauth?.responseLifetimeOwner.drain();
         await runtime.closeAfterDrain();
@@ -74,9 +77,9 @@ export function createProductionApplicationRuntimeFactory(config: ServerConfig,
         ffmpegPath: adapters.ffmpegPath ?? config.ffmpegPath,
         ffprobePath: adapters.ffprobePath ?? config.ffprobePath,
         ...(adapters.fetcher ? { fetcher: adapters.fetcher } : {}),
-        ...(adapters.documentFileOperations ? { documentFileOperations: adapters.documentFileOperations } : {}),
+      ...(adapters.documentFileOperations ? { documentFileOperations: adapters.documentFileOperations } : {}),
       });
-  return ({ kernel, vault, auth, runtimeSessionFor, processInstanceId }) => {
+  return ({ kernel, vault, auth, runtimeSessionFor, listWorkspaceMetadataPage, processInstanceId }) => {
     const fetcher = adapters.fetcher ?? globalThis.fetch;
     const responseLifetimeOwner = createNodeProviderResponseLifetimeOwner({ fetcher, createId: randomUUID });
     const registrations = [
@@ -90,6 +93,6 @@ export function createProductionApplicationRuntimeFactory(config: ServerConfig,
     return createCloudApplicationRuntimeFactory({
       workspacePortsFor: (context) => makeWorkspacePorts(context, vault, kernel),
       oauth: { provider, responseLifetimeOwner, config },
-    })({ kernel, vault, auth, runtimeSessionFor, processInstanceId });
+    })({ kernel, vault, auth, runtimeSessionFor, listWorkspaceMetadataPage, processInstanceId });
   };
 }

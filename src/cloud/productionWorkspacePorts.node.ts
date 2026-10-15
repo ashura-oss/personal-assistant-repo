@@ -263,7 +263,7 @@ export function createProductionWorkspacePortsFor(config: Pick<ServerConfig,
     const openRouterSpeech = new SharedOpenRouterSpeechAdapter({ audio: speechAudio, client: openRouterSpeechClient,
       sha256: async (value) => createHash('sha256').update(value).digest('hex') });
     const tokenStore = new NodeVaultOAuthTokenStore(kernel, vault, actorToken, identity,
-      () => currentController?.getSnapshot().accounts ?? []);
+      () => currentController?.getOAuthTokenStoreAccounts() ?? []);
     let connector: ConnectorClient | undefined;
     const connectorFactory = (store: OAuthTokenStore, onAuthStatus: (accountId: string, status: Account['authStatus']) => Promise<void> | void) => {
       connector = new ConnectorClient({ tokenStore: store, ...(config.googleClientId ? { googleClientId: config.googleClientId } : {}),

@@ -6,17 +6,17 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { createDurableKernel } from '../dist/index.js';
 import { acquireApplicationOwnership } from '../dist/applicationOwnership.js';
-import { AppControllerImpl } from '../dist/sharedControllerNode.mjs';
+import { AppControllerImpl, createInitialWorkspaceState } from '../dist/sharedControllerNode.mjs';
 import { CommandJournal, WorkspaceRegistry } from '../dist/workspaceRuntime.js';
 
-function fixture() {
+function fixture(initialSnapshot = { notes: [], proposals: [], tasks: [], accounts: [], calendars: [], documents: [], activity: [] }) {
   const directory = mkdtempSync(join(tmpdir(), 'still-workspace-registry-'));
   const databasePath = join(directory, 'workspace.sqlite');
   const applicationOwnership = acquireApplicationOwnership(databasePath);
   const kernel = createDurableKernel({ databasePath, applicationOwnership,
     validateSnapshot: (value) => assert.ok(value && typeof value === 'object' && !Array.isArray(value)) });
   const ownerId = randomUUID();
-  const workspace = kernel.createWorkspace(ownerId, { notes: [], proposals: [], tasks: [], accounts: [], calendars: [], documents: [], activity: [] });
+  const workspace = kernel.createWorkspace(ownerId, initialSnapshot);
   const expiry = Date.now() + 60 * 60_000;
   const admissionA = kernel.createSession(workspace.workspaceId, ownerId, expiry);
   const admissionB = kernel.createSession(workspace.workspaceId, ownerId, expiry);
@@ -33,7 +33,7 @@ function removeFixture(f) {
   }
 }
 
-function createController({ store }) {
+function createController({ store, tokenStore }) {
   const unavailable = async () => 'unavailable';
   const notificationBackend = {
     platform: 'web', getPermission: unavailable, requestPermission: unavailable,
@@ -52,11 +52,63 @@ function createController({ store }) {
   return new AppControllerImpl({ store, crypto: { randomUUID,
     async sha256(value) { return createHash('sha256').update(value).digest('hex'); } },
     providers: { speech: { disposeMemory() {} }, openAi: deniedProvider },
-    integration: { reminderBackend: notificationBackend, mailAlertBackend, deviceCalendarBackend,
+    integration: { ...(tokenStore ? { tokenStore } : {}), reminderBackend: notificationBackend, mailAlertBackend, deviceCalendarBackend,
       async writeDocument() {}, async removeAudio() { throw new Error('audio unsupported'); },
       async loadRecordingRecovery() { throw new Error('recording recovery unsupported'); }, bindRecordingRecovery(service) { return service; } },
   });
 }
+
+test('Node token-store authority reads the normalized initializing account without publishing it early', async () => {
+  for (const tokenResult of ['valid', null, 'wrong-identity']) {
+    const identity = Object.freeze({ providerNamespace: 'google', clientId: 'fixture-client', subject: 'fixture-subject',
+      issuer: 'https://accounts.google.com' });
+    const initial = createInitialWorkspaceState(randomUUID);
+    initial.accounts.push({ id: 'google:fixture-account', provider: 'google', displayName: 'Fixture', email: 'fixture@example.test',
+      connected: true, authStatus: 'connected', identity: { ...identity }, tokenRef: 'fixture-token-ref',
+      grantedScopes: ['https://www.googleapis.com/auth/gmail.readonly'], capabilities: ['mail.read'], capabilityLimits: ['mail.read'],
+      connectionGeneration: 1, syncStatus: 'idle' });
+    const f = fixture(initial);
+    try {
+      let initializingController;
+      let observedPrepublicationAuthority = false;
+      const tokenStore = { async get() {
+        assert.deepEqual(initializingController.getSnapshot().accounts, [], 'public snapshot remains unpublished during token lookup');
+        const duringInitialization = initializingController.getOAuthTokenStoreAccounts();
+        assert.equal(duringInitialization.length, 1);
+        assert.equal(duringInitialization[0].id, 'google:fixture-account');
+        assert.equal(Object.isFrozen(duringInitialization), true);
+        assert.equal(Object.isFrozen(duringInitialization[0]), true);
+        assert.equal(Object.isFrozen(duringInitialization[0].identity), true);
+        assert.throws(() => { duringInitialization[0].identity.subject = 'mutated'; }, TypeError);
+        observedPrepublicationAuthority = true;
+        if (tokenResult === null) return null;
+        return { accessToken: 'synthetic-access-token', expiresAt: Date.now() + 60_000,
+          identity: tokenResult === 'wrong-identity' ? { ...identity, subject: 'different-subject' } : identity };
+      } };
+      const registry = new WorkspaceRegistry(f.kernel, f.journal, () => f.runtimeSession,
+        (context) => { initializingController = createController({ ...context, tokenStore }); return initializingController; });
+      const runtime = await registry.get(f.admissionA);
+      assert.equal(observedPrepublicationAuthority, true);
+      const authority = runtime.controller.getOAuthTokenStoreAccounts();
+      assert.equal(Object.isFrozen(authority), true);
+      assert.equal(Object.isFrozen(authority[0]), true);
+      assert.equal(Object.isFrozen(authority[0].identity), true);
+      if (tokenResult === 'valid') {
+        assert.equal(authority[0].connected, true);
+        assert.equal(authority[0].authStatus, 'connected');
+        assert.equal(authority[0].connectionGeneration, 1);
+        assert.equal(authority[0].identity.subject, 'fixture-subject');
+        assert.throws(() => { authority[0].identity.subject = 'mutated'; }, TypeError);
+        assert.equal(runtime.controller.getSnapshot().accounts[0].identity.subject, 'fixture-subject');
+      } else {
+        assert.equal(authority[0].connected, false);
+        assert.equal(authority[0].authStatus, 'reauth_required');
+        assert.equal(authority[0].connectionGeneration, 2);
+      }
+      await registry.disposeAll();
+    } finally { removeFixture(f); }
+  }
+});
 
 test('registry loads one real shared controller and durable note commands never rerun on duplicate admission', async () => {
   const f = fixture();

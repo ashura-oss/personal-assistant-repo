@@ -340,6 +340,25 @@ export interface Account {
   connectionGeneration?: number;
 }
 
+/** Canonical verified provider identity projection used for durable server authority bindings.
+ * Display labels, local account row IDs and credential references are deliberately excluded.
+ */
+export function canonicalVerifiedProviderIdentity(account: Pick<Account, 'provider' | 'identity'>): string {
+  const identity = account?.identity;
+  if (!account || (account.provider !== 'google' && account.provider !== 'microsoft') || !identity ||
+      identity.providerNamespace !== account.provider || typeof identity.clientId !== 'string' || !identity.clientId ||
+      typeof identity.subject !== 'string' || !identity.subject ||
+      (identity.issuer !== undefined && typeof identity.issuer !== 'string') ||
+      (identity.tenantId !== undefined && typeof identity.tenantId !== 'string') ||
+      (identity.resourceUserId !== undefined && typeof identity.resourceUserId !== 'string') ||
+      (account.provider === 'microsoft' && !identity.resourceUserId)) {
+    throw new TypeError('verified_provider_identity_invalid');
+  }
+  return JSON.stringify({ provider: account.provider, providerNamespace: identity.providerNamespace, clientId: identity.clientId,
+    subject: identity.subject, issuer: identity.issuer ?? null, tenantId: identity.tenantId ?? null,
+    resourceUserId: identity.resourceUserId ?? null });
+}
+
 /** OAuth result supplied by the trusted auth bridge after provider identity verification. */
 export interface OAuthInstallResult {
   provider: Extract<Account['provider'], 'google' | 'microsoft'>;
@@ -1165,3 +1184,4 @@ export interface StartupRecoveryStatus {
   inspection?: StartupRecoveryInspection;
 }
 export { isValidAccountId } from './accountIds';
+export { projectBackgroundAuthorityAccounts, type BackgroundAuthorityAccount } from './backgroundAccountAuthority';

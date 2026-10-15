@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { createDurableKernel, SecretVault } from '../dist/index.js';
+import { AuthService } from '../dist/auth.js';
 import { ProcessWorkspaceActors } from '../dist/runtimeActors.js';
 import { createInitialWorkspaceState } from '../dist/sharedControllerNode.mjs';
 import { createProductionApplicationRuntimeFactory } from '../dist/applicationHost.node.mjs';
@@ -43,6 +44,7 @@ test('real production factory submits and checks one authenticated OpenRouter Ba
   const kernel = createDurableKernel({ databasePath: join(directory, 'private', 'workspace.sqlite'),
     validateSnapshot(value) { assert.ok(value && typeof value === 'object' && !Array.isArray(value)); } });
   const vault = new SecretVault(kernel, randomBytes(32));
+  const auth = new AuthService(kernel, { canonicalOrigin: 'https://app.example.test', authSecret: randomBytes(32) });
   const ownerId = randomUUID();
   const initial = createInitialWorkspaceState(randomUUID);
   initial.settings.mode = 'provider';
@@ -57,7 +59,9 @@ test('real production factory submits and checks one authenticated OpenRouter Ba
   });
   const browserSession = kernel.createSession(workspace.workspaceId, ownerId, Date.now() + 60 * 60_000);
   const admission = { sessionToken: browserSession, assertCurrent() { kernel.getOwnedIdentity(browserSession); } };
-  const runtime = createProductionApplicationRuntimeFactory({ dataDirectory: join(directory, 'private', 'data'), canonicalOrigin: 'https://app.example.test' }, { fetcher })({ kernel, vault, runtimeSessionFor });
+  const runtime = createProductionApplicationRuntimeFactory({ dataDirectory: join(directory, 'private', 'data'), canonicalOrigin: 'https://app.example.test' }, { fetcher })({
+    kernel, vault, auth, runtimeSessionFor, listWorkspaceMetadataPage: (afterWorkspaceId, limit) => actors.listWorkspaceMetadataPage(afterWorkspaceId, limit),
+    processInstanceId: randomUUID() });
   try {
     const initialSnapshot = await runtime.workspaceApi.getSnapshot(admission);
     const saved = await runtime.workspaceApi.dispatchCommand(admission, { schemaVersion: 1, commandId: randomUUID(),
@@ -88,7 +92,7 @@ test('real production factory submits and checks one authenticated OpenRouter Ba
     assert.equal(job.unknownCharge, false);
   } finally {
     try { await runtime.drainAndDispose(); } finally {
-      try { await actors.closeAfterDrain(async () => {}); } finally { vault.close(); kernel.close(); rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+      try { await actors.closeAfterDrain(async () => {}); } finally { auth.close(); vault.close(); kernel.close(); rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
     }
   }
 });

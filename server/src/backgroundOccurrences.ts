@@ -3,7 +3,7 @@ import type Database from 'better-sqlite3';
 import type { DurableKernel, OwnedTransactionContext } from './kernel.js';
 import type { ApplicationStartupCapability } from './applicationStartup.js';
 import { ensureBackgroundSchema } from './backgroundSchema.js';
-import { canonicalBackgroundJson, isBackgroundUuidV4, type BackgroundAccounting, type BackgroundOccurrenceDisplay, type BackgroundPolicyKind, type BackgroundPolicySpecification } from './backgroundContracts.js';
+import { BACKGROUND_REQUEST_MAX_BYTES, canonicalBackgroundJson, isBackgroundUuidV4, parseBackgroundOccurrenceDisplay, type BackgroundAccounting, type BackgroundOccurrenceDisplay, type BackgroundPolicyKind, type BackgroundPolicySpecification } from './backgroundContracts.js';
 import { backgroundBindingAuthority, normalizeResolvedBackgroundBinding, type BackgroundBindingResolver, type ResolvedBackgroundBinding } from './backgroundPolicies.js';
 import { resolveCompletePeriod } from './backgroundClock.js';
 
@@ -50,6 +50,19 @@ export interface ClaimedBackgroundOccurrence {
   readonly claim: BackgroundClaim;
 }
 
+export interface BackgroundAccountSyncClaimMetadata {
+  readonly workspaceId: string;
+  readonly ownerId: string;
+  readonly privacyEpoch: number;
+  readonly revision: number;
+  readonly policyId: string;
+  readonly policyRevision: number;
+  readonly accountId: string;
+  readonly targetGeneration: number;
+  readonly resource: 'mail' | 'calendars';
+  readonly scheduledAt: number;
+}
+
 interface PolicyRow {
   current_revision: number; status: string; suspension: string | null; updated_at: number;
 }
@@ -68,13 +81,23 @@ interface OccurrenceRow {
 interface AttemptRow {
   attempt_id: string; occurrence_id: string; target_id: string; target_generation: number; capability_hash: string;
   status: AttemptStatus; claimed_at: number; dispatch_started_at: number | null; settled_at: number | null;
-  accounting_json: string; result_code: string | null;
+  accounting_json: string; result_code: string | null; finalization_operation: string | null;
+  finalization_request_json: string | null; finalization_receipt_json: string | null; finalization_receipt_digest: string | null;
 }
 
 interface FrozenTarget { readonly targetId: string; readonly generation: number }
-interface TargetRow { target_id: string; target_generation: number; status: 'pending' | AttemptStatus; attempt_id: string | null; accounting_json: string }
+interface TargetRow { target_id: string; target_generation: number; status: 'pending' | AttemptStatus; attempt_id: string | null; accounting_json: string; updated_at: number }
 
 function fail(code: string): never { throw new Error(code); }
+function priorFinalization(attempt: AttemptRow, operation: string, requestJson: string): string | undefined {
+  const fields = [attempt.finalization_operation, attempt.finalization_request_json, attempt.finalization_receipt_json, attempt.finalization_receipt_digest];
+  if (fields.every((field) => field === null)) return undefined;
+  if (fields.some((field) => field === null) || attempt.finalization_operation !== operation || attempt.finalization_request_json !== requestJson) {
+    return fail('background_claim_finalization_conflict');
+  }
+  if (hash(attempt.finalization_receipt_json!) !== attempt.finalization_receipt_digest) return fail('background_occurrence_storage_invalid');
+  return attempt.finalization_receipt_json!;
+}
 function hash(text: string): string { return createHash('sha256').update(text, 'utf8').digest('hex'); }
 function timestamp(value: unknown): number {
   if (!Number.isSafeInteger(value) || (value as number) < 0) return fail('background_occurrence_input_invalid');
@@ -189,7 +212,12 @@ function verifyPolicy(context: OwnedTransactionContext, db: Database.Database, r
     privacyEpoch: context.privacyEpoch, policyId: occurrence.policy_id, revision: found.revision.revision,
     enabled: true, specification: spec, bindingDigest, effectiveFrom: found.revision.effective_from }));
   if (bindingDigest !== found.revision.binding_digest || expectedPolicyDigest !== found.revision.policy_digest) return fail('background_occurrence_policy_corrupt');
-  const current = normalizeResolvedBackgroundBinding(resolver.resolve(context, spec), spec, context.privacyEpoch);
+  let current: ResolvedBackgroundBinding;
+  try { current = normalizeResolvedBackgroundBinding(resolver.resolve(context, spec), spec, context.privacyEpoch); }
+  catch (error) {
+    if (error instanceof Error && error.message === 'background_binding_changed') return fail('background_occurrence_binding_changed');
+    throw error;
+  }
   const currentText = canonicalBackgroundJson(backgroundBindingAuthority(current), PRIVATE_MAX);
   if (currentText !== canonicalBackgroundJson(backgroundBindingAuthority(normalizedStored), PRIVATE_MAX)) return fail('background_occurrence_binding_changed');
   return { spec, binding: normalizedStored, digest: found.revision.policy_digest };
@@ -261,6 +289,27 @@ export class BackgroundOccurrenceStore {
         (options.resolver.captureReminderTargets && options.resolver.captureReminderTargets.constructor?.name === 'AsyncFunction')) throw new TypeError('background_occurrence_store_invalid');
     this.#kernel = options.kernel; this.#actor = options.actorSessionToken; this.#resolver = options.resolver;
     this.#clock = options.clock ?? Date.now;
+  }
+
+  private fenceStaleScheduled(context: OwnedTransactionContext): void {
+    const rows = context.db.prepare(`SELECT occurrence_id,policy_id,logical_key_digest,policy_revision,policy_kind,policy_digest,status,scheduled_at,
+      actual_at,period_kind,local_period_start,time_zone,source_digest,source_json,descriptor_json,request_json,source_version_digest,request_digest,target_snapshot_json,
+      batch_job_id,accounting_json,created_at,updated_at FROM background_occurrences
+      WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND policy_kind='account_sync' AND status='scheduled'`)
+      .all(context.workspaceId, context.ownerId, context.privacyEpoch) as OccurrenceRow[];
+    for (const occurrence of rows) {
+      try { verifyPolicy(context, context.db, this.#resolver, occurrence); }
+      catch (error) {
+        if (!(error instanceof Error) || !['background_occurrence_policy_stale', 'background_occurrence_binding_changed'].includes(error.message)) throw error;
+        const now = timestamp(this.#clock());
+        context.db.prepare(`UPDATE background_occurrences SET status='inspect_required',updated_at=?
+          WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND occurrence_id=? AND status='scheduled'`)
+          .run(now, context.workspaceId, context.ownerId, context.privacyEpoch, occurrence.occurrence_id);
+        context.db.prepare(`UPDATE background_occurrence_targets SET status='inspect_required',updated_at=?
+          WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND occurrence_id=? AND status='pending'`)
+          .run(now, context.workspaceId, context.ownerId, context.privacyEpoch, occurrence.occurrence_id);
+      }
+    }
   }
 
   schedule(input: ScheduleBackgroundOccurrenceInput): BackgroundOccurrenceDisplay {
@@ -382,10 +431,10 @@ export class BackgroundOccurrenceStore {
       const generation = input.targetGeneration ?? 0;
       const verified = verifyPolicy(context, context.db, this.#resolver, occurrence);
       if (!allowedTarget(verified.spec, verified.binding, occurrence, input.targetId, generation)) return fail('background_target_not_bound');
-      const target = context.db.prepare(`SELECT target_id,target_generation,status,attempt_id,accounting_json FROM background_occurrence_targets
+      const target = context.db.prepare(`SELECT target_id,target_generation,status,attempt_id,accounting_json,updated_at FROM background_occurrence_targets
         WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND occurrence_id=? AND target_id=? AND target_generation=?`)
         .get(context.workspaceId, context.ownerId, context.privacyEpoch, occurrence.occurrence_id, input.targetId, generation) as TargetRow | undefined;
-      if (!target || target.status !== 'pending' || target.attempt_id !== null) return fail('background_occurrence_not_claimable');
+      if (!target || target.status !== 'pending' || target.attempt_id !== null || target.updated_at > timestamp(this.#clock())) return fail('background_occurrence_not_claimable');
       const claimId = randomUUID(); const capability = randomUUID(); const now = timestamp(this.#clock());
       context.db.prepare(`INSERT INTO background_occurrence_attempts(workspace_id,owner_id,privacy_epoch,attempt_id,occurrence_id,target_id,
         target_generation,capability_hash,status,claimed_at,dispatch_started_at,settled_at,accounting_json,result_code)
@@ -402,6 +451,172 @@ export class BackgroundOccurrenceStore {
       if (!fresh) return fail('background_occurrence_storage_invalid');
       return Object.freeze({ occurrence: project(fresh), claim: Object.freeze({ occurrenceId: occurrence.occurrence_id, attemptId: claimId,
         targetId: input.targetId, ...(generation === 0 ? {} : { targetGeneration: generation }), capability }) });
+    });
+  }
+
+  /** Metadata-only due timestamp query for the trusted scheduler. */
+  readNextDueAt(expectedPrivacyEpoch: number): number | null {
+    return this.#kernel.withOwnedTransaction(this.#actor, expectedPrivacyEpoch, (context) => {
+      ensureBackgroundSchema(context.db);
+      this.fenceStaleScheduled(context);
+      const row = context.db.prepare(`SELECT MIN(max(o.scheduled_at,t.updated_at)) AS dueAt FROM background_occurrences o
+        JOIN background_occurrence_targets t ON t.workspace_id=o.workspace_id AND t.owner_id=o.owner_id AND t.privacy_epoch=o.privacy_epoch
+          AND t.occurrence_id=o.occurrence_id AND t.status='pending'
+        JOIN background_policy_heads h ON h.workspace_id=o.workspace_id AND h.owner_id=o.owner_id AND h.privacy_epoch=o.privacy_epoch
+          AND h.policy_id=o.policy_id AND h.current_revision=o.policy_revision AND h.status='enabled'
+        JOIN background_policy_revisions r ON r.workspace_id=o.workspace_id AND r.owner_id=o.owner_id AND r.privacy_epoch=o.privacy_epoch
+          AND r.policy_id=o.policy_id AND r.revision=o.policy_revision AND r.enabled=1 AND r.policy_digest=o.policy_digest
+        WHERE o.workspace_id=? AND o.owner_id=? AND o.privacy_epoch=? AND o.policy_kind='account_sync' AND o.status='scheduled'`)
+        .get(context.workspaceId, context.ownerId, context.privacyEpoch) as { dueAt: number | null };
+      return row.dueAt;
+    });
+  }
+
+  /** Closed keyset page containing only due account-sync occurrence/target metadata. */
+  listDueAccountSyncWork(expectedPrivacyEpoch: number, now: number, afterWorkId?: string, limit = PAGE_MAX): readonly Readonly<{ workId: string; dueAt: number }>[] {
+    if (!Number.isSafeInteger(now) || now < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > PAGE_MAX ||
+        (afterWorkId !== undefined && (afterWorkId.length > 256 || /[\u0000-\u001f\u007f]/.test(afterWorkId)))) return fail('background_occurrence_query_invalid');
+    let cursor: readonly [string, string, number] | undefined;
+    if (afterWorkId !== undefined) {
+      try {
+        const parsed = JSON.parse(afterWorkId) as unknown;
+        if (!Array.isArray(parsed) || parsed.length !== 3 || !isBackgroundUuidV4(parsed[0]) || typeof parsed[1] !== 'string' ||
+            !parsed[1] || !Number.isSafeInteger(parsed[2]) || (parsed[2] as number) < 0 || JSON.stringify(parsed) !== afterWorkId) return fail('background_occurrence_query_invalid');
+        cursor = [parsed[0], parsed[1], parsed[2] as number];
+      } catch { return fail('background_occurrence_query_invalid'); }
+    }
+    return this.#kernel.withOwnedTransaction(this.#actor, expectedPrivacyEpoch, (context) => {
+      ensureBackgroundSchema(context.db);
+      this.fenceStaleScheduled(context);
+      const rows = context.db.prepare(`SELECT o.occurrence_id,max(o.scheduled_at,t.updated_at) AS scheduled_at,t.target_id,t.target_generation
+        FROM background_occurrences o JOIN background_occurrence_targets t ON t.workspace_id=o.workspace_id AND t.owner_id=o.owner_id
+          AND t.privacy_epoch=o.privacy_epoch AND t.occurrence_id=o.occurrence_id
+        JOIN background_policy_heads h ON h.workspace_id=o.workspace_id AND h.owner_id=o.owner_id AND h.privacy_epoch=o.privacy_epoch
+          AND h.policy_id=o.policy_id AND h.current_revision=o.policy_revision AND h.status='enabled'
+        JOIN background_policy_revisions r ON r.workspace_id=o.workspace_id AND r.owner_id=o.owner_id AND r.privacy_epoch=o.privacy_epoch
+          AND r.policy_id=o.policy_id AND r.revision=o.policy_revision AND r.enabled=1 AND r.policy_digest=o.policy_digest
+        WHERE o.workspace_id=? AND o.owner_id=? AND o.privacy_epoch=? AND o.policy_kind='account_sync' AND o.status='scheduled'
+          AND o.scheduled_at<=? AND t.status='pending' AND t.updated_at<=?
+          AND (? IS NULL OR o.occurrence_id>? OR (o.occurrence_id=? AND t.target_id>?) OR
+            (o.occurrence_id=? AND t.target_id=? AND t.target_generation>?))
+        ORDER BY o.occurrence_id,t.target_id,t.target_generation LIMIT ?`)
+        .all(context.workspaceId, context.ownerId, context.privacyEpoch, now, now,
+          cursor?.[0] ?? null, cursor?.[0] ?? null, cursor?.[0] ?? null, cursor?.[1] ?? null,
+          cursor?.[0] ?? null, cursor?.[1] ?? null, cursor?.[2] ?? null, limit) as { occurrence_id: string; scheduled_at: number; target_id: string; target_generation: number }[];
+      const output = rows.map((row) => Object.freeze({ workId: JSON.stringify([row.occurrence_id, row.target_id, row.target_generation]), dueAt: row.scheduled_at }));
+      return Object.freeze(output);
+    });
+  }
+
+  /** Returns exact bound metadata for one live claim; never returns source/request bodies or capability. */
+  readAccountSyncClaimMetadata(claim: BackgroundClaim, expectedPrivacyEpoch: number): BackgroundAccountSyncClaimMetadata {
+    return this.#withClaim(claim, expectedPrivacyEpoch, (context, occurrence, attempt) => {
+      if (occurrence.policy_kind !== 'account_sync' || attempt.status !== 'claimed') return fail('background_claim_invalid');
+      const verified = verifyPolicy(context, context.db, this.#resolver, occurrence);
+      const descriptor = safeStored<BackgroundOccurrenceDescriptor>(occurrence.descriptor_json);
+      if (descriptor.kind !== 'account_sync' || descriptor.accountId !== attempt.target_id || attempt.target_generation < 1 ||
+          !allowedTarget(verified.spec, verified.binding, occurrence, attempt.target_id, attempt.target_generation)) return fail('background_claim_invalid');
+      return Object.freeze({ workspaceId: context.workspaceId, ownerId: context.ownerId, privacyEpoch: context.privacyEpoch,
+        revision: context.revision, policyId: occurrence.policy_id, policyRevision: occurrence.policy_revision,
+        accountId: descriptor.accountId, targetGeneration: attempt.target_generation, resource: descriptor.resource,
+        scheduledAt: occurrence.scheduled_at });
+    });
+  }
+
+  /** Releases only a proven pre-dispatch claim so a foreground account sync can finish first. */
+  deferClaimBeforeDispatch(claim: BackgroundClaim, expectedPrivacyEpoch: number, resultCode = 'foreground_sync_busy', nextDueAt?: number): void {
+    if (!/^[a-z][a-z0-9_]{0,63}$/.test(resultCode)) return fail('background_settlement_invalid');
+    if (nextDueAt !== undefined && (!Number.isSafeInteger(nextDueAt) || nextDueAt < 0)) return fail('background_settlement_invalid');
+    this.#withClaim(claim, expectedPrivacyEpoch, (context, occurrence, attempt) => {
+      const requestJson = canonicalBackgroundJson({ operation: 'defer', resultCode, nextDueAt: nextDueAt ?? null }, 64 * 1024);
+      const prior = priorFinalization(attempt, 'defer', requestJson);
+      if (prior !== undefined) return;
+      if (occurrence.status !== 'claimed' || attempt.status !== 'claimed') return fail('background_claim_not_deferable');
+      const now = timestamp(this.#clock());
+      const eligibleAt = Math.max(now, nextDueAt ?? now);
+      const receiptJson = canonicalBackgroundJson({ schemaVersion: 1, operation: 'defer', attemptId: attempt.attempt_id,
+        resultCode, nextDueAt: eligibleAt, settledAt: now }, 64 * 1024);
+      const attemptUpdated = context.db.prepare(`UPDATE background_occurrence_attempts SET status='skipped',settled_at=?,result_code=?,
+        finalization_operation='defer',finalization_request_json=?,finalization_receipt_json=?,finalization_receipt_digest=?
+        WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND attempt_id=? AND status='claimed' AND finalization_operation IS NULL`)
+        .run(now, resultCode, requestJson, receiptJson, hash(receiptJson), context.workspaceId, context.ownerId, context.privacyEpoch, attempt.attempt_id);
+      const targetUpdated = context.db.prepare(`UPDATE background_occurrence_targets SET status='pending',attempt_id=NULL,updated_at=?
+        WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND occurrence_id=? AND target_id=? AND target_generation=? AND attempt_id=? AND status='claimed'`)
+        .run(eligibleAt, context.workspaceId, context.ownerId, context.privacyEpoch, occurrence.occurrence_id, attempt.target_id,
+          attempt.target_generation, attempt.attempt_id);
+      if (attemptUpdated.changes !== 1 || targetUpdated.changes !== 1) return fail('background_claim_not_deferable');
+      const occurrenceUpdated = context.db.prepare(`UPDATE background_occurrences SET status='scheduled',updated_at=?
+        WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND occurrence_id=? AND status='claimed'`)
+        .run(now, context.workspaceId, context.ownerId, context.privacyEpoch, occurrence.occurrence_id);
+      if (occurrenceUpdated.changes !== 1) return fail('background_claim_not_deferable');
+    });
+  }
+
+  /** Fences a target when claim commit acknowledgement was ambiguous and its capability was not returned. */
+  inspectUnacknowledgedAccountSyncWork(expectedPrivacyEpoch: number, occurrenceId: string, targetId: string, generation: number): void {
+    if (!isBackgroundUuidV4(occurrenceId) || typeof targetId !== 'string' || !targetId || Buffer.byteLength(targetId, 'utf8') > 1024 ||
+        /[\u0000-\u001f\u007f]/.test(targetId) || !Number.isSafeInteger(generation) || generation < 1) return fail('background_claim_invalid');
+    this.#kernel.withOwnedTransaction(this.#actor, expectedPrivacyEpoch, (context) => {
+      ensureBackgroundSchema(context.db);
+      const row = context.db.prepare(`SELECT status,attempt_id FROM background_occurrence_targets
+        WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND occurrence_id=? AND target_id=? AND target_generation=?`)
+        .get(context.workspaceId, context.ownerId, context.privacyEpoch, occurrenceId, targetId, generation) as { status: string; attempt_id: string | null } | undefined;
+      if (!row || !row.attempt_id) return;
+      const attempt = context.db.prepare(`SELECT attempt_id,occurrence_id,target_id,target_generation,capability_hash,status,claimed_at,
+        dispatch_started_at,settled_at,accounting_json,result_code,finalization_operation,finalization_request_json,finalization_receipt_json,finalization_receipt_digest
+        FROM background_occurrence_attempts WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND attempt_id=?`)
+        .get(context.workspaceId, context.ownerId, context.privacyEpoch, row.attempt_id) as AttemptRow | undefined;
+      if (!attempt) return fail('background_occurrence_storage_invalid');
+      const requestJson = canonicalBackgroundJson({ operation: 'inspect_unacknowledged', occurrenceId, targetId, generation,
+        resultCode: 'claim_outcome_unknown' }, 64 * 1024);
+      const prior = priorFinalization(attempt, 'inspect_unacknowledged', requestJson);
+      if (prior !== undefined) return;
+      if (!['claimed', 'dispatching'].includes(row.status) || !['claimed', 'dispatching'].includes(attempt.status)) {
+        return fail('background_claim_not_inspectable');
+      }
+      const now = timestamp(this.#clock());
+      const receiptJson = canonicalBackgroundJson({ schemaVersion: 1, operation: 'inspect_unacknowledged', attemptId: attempt.attempt_id,
+        resultCode: 'claim_outcome_unknown', settledAt: now }, 64 * 1024);
+      const attemptUpdated = context.db.prepare(`UPDATE background_occurrence_attempts SET status='inspect_required',settled_at=?,result_code='claim_outcome_unknown',
+        finalization_operation='inspect_unacknowledged',finalization_request_json=?,finalization_receipt_json=?,finalization_receipt_digest=?
+        WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND attempt_id=? AND status IN ('claimed','dispatching') AND finalization_operation IS NULL`)
+        .run(now, requestJson, receiptJson, hash(receiptJson), context.workspaceId, context.ownerId, context.privacyEpoch, row.attempt_id);
+      if (attemptUpdated.changes !== 1) return fail('background_claim_not_inspectable');
+      context.db.prepare(`UPDATE background_occurrence_targets SET status='inspect_required',updated_at=?
+        WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND occurrence_id=? AND target_id=? AND target_generation=?`)
+        .run(now, context.workspaceId, context.ownerId, context.privacyEpoch, occurrenceId, targetId, generation);
+      context.db.prepare(`UPDATE background_occurrences SET status='inspect_required',updated_at=?
+        WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND occurrence_id=? AND status IN ('scheduled','claimed','dispatching')`)
+        .run(now, context.workspaceId, context.ownerId, context.privacyEpoch, occurrenceId);
+    });
+  }
+
+  /** Durable hold for an exact owned claim whether dispatch had begun or not. */
+  inspectClaimForRecovery(claim: BackgroundClaim, expectedPrivacyEpoch: number, resultCode = 'execution_outcome_unknown'): void {
+    if (!/^[a-z][a-z0-9_]{0,63}$/.test(resultCode)) return fail('background_settlement_invalid');
+    this.#withClaim(claim, expectedPrivacyEpoch, (context, occurrence, attempt) => {
+      const requestJson = canonicalBackgroundJson({ operation: 'inspect', resultCode }, 64 * 1024);
+      const prior = priorFinalization(attempt, 'inspect', requestJson);
+      if (prior !== undefined) return;
+      if (!['claimed', 'dispatching'].includes(attempt.status) || !['claimed', 'dispatching', 'inspect_required', 'unknown'].includes(occurrence.status)) {
+        return fail('background_claim_not_inspectable');
+      }
+      const now = timestamp(this.#clock());
+      const receiptJson = canonicalBackgroundJson({ schemaVersion: 1, operation: 'inspect', attemptId: attempt.attempt_id,
+        resultCode, settledAt: now }, 64 * 1024);
+      const attemptUpdated = context.db.prepare(`UPDATE background_occurrence_attempts SET status='inspect_required',settled_at=?,result_code=?,
+        finalization_operation='inspect',finalization_request_json=?,finalization_receipt_json=?,finalization_receipt_digest=?
+        WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND attempt_id=? AND status IN ('claimed','dispatching') AND finalization_operation IS NULL`)
+        .run(now, resultCode, requestJson, receiptJson, hash(receiptJson), context.workspaceId, context.ownerId, context.privacyEpoch, attempt.attempt_id);
+      if (attemptUpdated.changes !== 1) return fail('background_claim_not_inspectable');
+      const targetUpdated = context.db.prepare(`UPDATE background_occurrence_targets SET status='inspect_required',updated_at=?
+        WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND occurrence_id=? AND target_id=? AND target_generation=? AND attempt_id=?
+          AND status IN ('claimed','dispatching')`)
+        .run(now, context.workspaceId, context.ownerId, context.privacyEpoch, occurrence.occurrence_id, attempt.target_id, attempt.target_generation, attempt.attempt_id);
+      if (targetUpdated.changes !== 1) return fail('background_claim_not_inspectable');
+      context.db.prepare(`UPDATE background_occurrences SET status='inspect_required',updated_at=?
+        WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND occurrence_id=? AND status IN ('claimed','dispatching')`)
+        .run(now, context.workspaceId, context.ownerId, context.privacyEpoch, occurrence.occurrence_id);
     });
   }
 
@@ -425,6 +640,17 @@ export class BackgroundOccurrenceStore {
     });
   }
 
+  /** Final synchronous provider-read fence, called after any credential lookup and before fetch admission. */
+  assertDispatchAuthorized(claim: BackgroundClaim, expectedPrivacyEpoch: number): void {
+    this.#withClaim(claim, expectedPrivacyEpoch, (context, occurrence, attempt) => {
+      if (attempt.status !== 'dispatching' || occurrence.status !== 'dispatching') return fail('background_claim_not_dispatchable');
+      const verified = verifyPolicy(context, context.db, this.#resolver, occurrence);
+      if (!allowedTarget(verified.spec, verified.binding, occurrence, attempt.target_id, attempt.target_generation)) {
+        return fail('background_occurrence_binding_changed');
+      }
+    });
+  }
+
   settle(claim: BackgroundClaim, expectedPrivacyEpoch: number, outcome: { readonly status: 'completed' | 'unknown' | 'inspect_required'; readonly accounting: BackgroundAccounting; readonly actualAt?: number; readonly batchJobId?: string; readonly resultCode?: string }): BackgroundOccurrenceDisplay {
     const cleanAccounting = accounting(outcome?.accounting);
     if (!outcome || !['completed', 'unknown', 'inspect_required'].includes(outcome.status) ||
@@ -432,6 +658,10 @@ export class BackgroundOccurrenceStore {
         (outcome.batchJobId !== undefined && !isBackgroundUuidV4(outcome.batchJobId)) ||
         (outcome.resultCode !== undefined && (typeof outcome.resultCode !== 'string' || !/^[a-z][a-z0-9_]{0,63}$/.test(outcome.resultCode)))) return fail('background_settlement_invalid');
     return this.#withClaim(claim, expectedPrivacyEpoch, (context, occurrence, attempt) => {
+      const requestJson = canonicalBackgroundJson({ operation: 'settle', status: outcome.status, accounting: cleanAccounting,
+        actualAt: outcome.actualAt ?? null, batchJobId: outcome.batchJobId ?? null, resultCode: outcome.resultCode ?? null }, 64 * 1024);
+      const prior = priorFinalization(attempt, 'settle', requestJson);
+      if (prior !== undefined) return parseBackgroundOccurrenceDisplay(safeStored(prior));
       // An already-dispatched exact target must be allowed to record its real outcome even if a sibling
       // has moved the aggregate occurrence into inspection/unknown. That aggregate state still fences
       // every new claim and dispatch; it must not erase an admitted target's settlement authority.
@@ -440,9 +670,10 @@ export class BackgroundOccurrenceStore {
       }
       const now = timestamp(this.#clock());
       const accountingJson = canonicalBackgroundJson(cleanAccounting, 64 * 1024);
-      context.db.prepare(`UPDATE background_occurrence_attempts SET status=?,settled_at=?,accounting_json=?,result_code=?
-        WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND attempt_id=? AND status='dispatching'`)
+      const attemptUpdated = context.db.prepare(`UPDATE background_occurrence_attempts SET status=?,settled_at=?,accounting_json=?,result_code=?
+        WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND attempt_id=? AND status='dispatching' AND finalization_operation IS NULL`)
         .run(outcome.status, now, accountingJson, outcome.resultCode ?? null, context.workspaceId, context.ownerId, context.privacyEpoch, attempt.attempt_id);
+      if (attemptUpdated.changes !== 1) return fail('background_claim_not_settleable');
       const targetChanged = context.db.prepare(`UPDATE background_occurrence_targets SET status=?,accounting_json=?,updated_at=?
         WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND occurrence_id=? AND target_id=? AND target_generation=?
           AND attempt_id=? AND status='dispatching'`)
@@ -466,7 +697,13 @@ export class BackgroundOccurrenceStore {
           context.workspaceId, context.ownerId, context.privacyEpoch, occurrence.occurrence_id);
       const fresh = readOccurrence(context.db, context, occurrence.occurrence_id);
       if (!fresh) return fail('background_occurrence_storage_invalid');
-      return project(fresh);
+      const receipt = project(fresh);
+      const receiptJson = canonicalBackgroundJson(receipt, BACKGROUND_REQUEST_MAX_BYTES);
+      const finalized = context.db.prepare(`UPDATE background_occurrence_attempts SET finalization_operation='settle',finalization_request_json=?,
+        finalization_receipt_json=?,finalization_receipt_digest=? WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND attempt_id=? AND finalization_operation IS NULL`)
+        .run(requestJson, receiptJson, hash(receiptJson), context.workspaceId, context.ownerId, context.privacyEpoch, attempt.attempt_id);
+      if (finalized.changes !== 1) return fail('background_claim_not_settleable');
+      return receipt;
     });
   }
 
@@ -492,7 +729,7 @@ export class BackgroundOccurrenceStore {
       ensureBackgroundSchema(context.db);
       const occurrence = readOccurrence(context.db, context, claim.occurrenceId);
       const attempt = context.db.prepare(`SELECT attempt_id,occurrence_id,target_id,target_generation,capability_hash,status,claimed_at,
-        dispatch_started_at,settled_at,accounting_json,result_code FROM background_occurrence_attempts
+        dispatch_started_at,settled_at,accounting_json,result_code,finalization_operation,finalization_request_json,finalization_receipt_json,finalization_receipt_digest FROM background_occurrence_attempts
         WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND attempt_id=? AND occurrence_id=?`)
         .get(context.workspaceId, context.ownerId, context.privacyEpoch, claim.attemptId, claim.occurrenceId) as AttemptRow | undefined;
       if (!occurrence || !attempt || attempt.capability_hash !== hash(claim.capability) || attempt.target_id !== claim.targetId ||

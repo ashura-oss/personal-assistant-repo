@@ -21,7 +21,8 @@ import { WorkspaceControllerFactoryInitializationError, WorkspaceRegistry,
 import type { LoadedWorkspaceIdentity } from '../../server/src/workspaceStore.js';
 import type { ServerWorkspaceStore } from '../../server/src/workspaceStore.js';
 import type { WorkspaceCommandHistoryPage } from './workspaceCommandHistory';
-import type { WorkspaceCommandReceipt } from './workspaceCommands';
+import { canonicalWorkspaceCommand, parseWorkspaceCommandReceipt, type WorkspaceCommandEnvelope, type WorkspaceCommandReceipt } from './workspaceCommands';
+import type { BackgroundClaim, BackgroundOccurrenceStore } from '../../server/src/backgroundOccurrences.js';
 import { projectKnowledgeSourceChoiceReference } from '../knowledge/sourceChoices';
 import { projectKnowledgeSuggestionForHttp, type KnowledgeSourceChoicesDTO, type KnowledgeSuggestionReviewDTO } from './knowledgeHttpContracts';
 import { buildCloudKnowledgeSourceChoiceOptions, knowledgeSourceChoiceId } from './knowledgeSourceChoices.node';
@@ -528,7 +529,13 @@ export class OwnedWorkspaceRuntime {
     return this.track(identity.workspaceId, () => {
       this.cache.delete(identity.workspaceId);
       this.refreshRequired.add(identity.workspaceId);
-    }, async () => {
+    }, () => this.executeWithinReservedWorkspace(input, identity, operation, projectReceipt));
+  }
+
+  /** Shared command path for callers that already hold this runtime's workspace reservation. */
+  private async executeWithinReservedWorkspace<T>(input: OwnedWorkspaceCommandInput, identity: OwnedWorkspaceIdentity,
+    operation: (controller: AppControllerImpl, identity: OwnedWorkspaceIdentity) => Promise<T>,
+    projectReceipt: (result: T) => JsonValue): Promise<OwnedWorkspaceCommandResult<T>> {
       let commandController: AppControllerImpl | undefined;
       let parentTicketId: string | undefined;
       try {
@@ -557,7 +564,79 @@ export class OwnedWorkspaceRuntime {
       } finally {
         if (commandController && parentTicketId) this.speechAdapters.get(commandController)?.parentInvocationCompleted(parentTicketId);
       }
+  }
+
+
+  /** Named private scheduler gateway. The journal command ID is the exact persisted attempt ID. */
+  async executeScheduledAccountSync(input: Readonly<{ sessionToken: string; ownerId: string; privacyEpoch: number;
+    claim: BackgroundClaim; occurrences: BackgroundOccurrenceStore }>): Promise<Readonly<{ status: 'completed' | 'inspect_required'; commandId: string; code: string }>> {
+    const initialIdentity = this.options.kernel.getOwnedIdentity(input.sessionToken);
+    if (initialIdentity.ownerId !== input.ownerId || initialIdentity.privacyEpoch !== input.privacyEpoch) throw new Error('background_execution_stale');
+    // Active work sets refreshRequired before its first await. Prefer the
+    // precise busy outcome so the durable scheduler can defer this proven
+    // pre-dispatch claim; a sticky refresh fence still rejects idle work.
+    if (this.busy.has(initialIdentity.workspaceId)) throw new Error('The workspace runtime is busy.');
+    if (this.refreshRequired.has(initialIdentity.workspaceId)) throw new Error('workspace_refresh_required');
+    const admission: OwnedWorkspaceAdmission = Object.freeze({ sessionToken: input.sessionToken,
+      assertCurrent: () => {
+        const current = this.options.kernel.getOwnedIdentity(input.sessionToken);
+        if (current.workspaceId !== initialIdentity.workspaceId || current.ownerId !== initialIdentity.ownerId ||
+            current.privacyEpoch !== initialIdentity.privacyEpoch) throw new Error('workspace_ownership_changed');
+      } });
+    const executed = await this.track(initialIdentity.workspaceId, () => {
+      this.cache.delete(initialIdentity.workspaceId);
+      this.refreshRequired.add(initialIdentity.workspaceId);
+    }, async () => {
+      this.assertAdmission(admission);
+      const runtime = await this.registry.get(input.sessionToken);
+      this.assertAdmission(admission);
+      const loaded = runtime.store.getLoadedIdentity();
+      const currentIdentity = this.options.kernel.getOwnedIdentity(input.sessionToken);
+      this.assertStillCurrent(admission, initialIdentity, loaded, currentIdentity);
+      if (!loaded || loaded.revision !== currentIdentity.revision) throw new Error('workspace_loaded_revision_mismatch');
+      const bound = input.occurrences.readAccountSyncClaimMetadata(input.claim, input.privacyEpoch);
+      if (currentIdentity.workspaceId !== bound.workspaceId || currentIdentity.ownerId !== input.ownerId ||
+          currentIdentity.ownerId !== bound.ownerId || currentIdentity.privacyEpoch !== input.privacyEpoch || bound.privacyEpoch !== input.privacyEpoch) {
+        throw new Error('background_execution_stale');
+      }
+      const kind: 'accounts.refreshMail' | 'accounts.syncCalendars' = bound.resource === 'mail' ? 'accounts.refreshMail' : 'accounts.syncCalendars';
+      const envelope = Object.freeze({ schemaVersion: 1 as const, commandId: input.claim.attemptId,
+        expectedRevision: currentIdentity.revision, expectedPrivacyEpoch: currentIdentity.privacyEpoch,
+        command: Object.freeze({ kind, accountId: bound.accountId, expectedConnectionGeneration: bound.targetGeneration }) }) as WorkspaceCommandEnvelope;
+      const commandInput: OwnedWorkspaceCommandInput = { ...admission, expectedRevision: currentIdentity.revision,
+        expectedPrivacyEpoch: currentIdentity.privacyEpoch, idempotencyKey: input.claim.attemptId,
+        kind: kind.toLowerCase(), canonicalBody: canonicalWorkspaceCommand(envelope) };
+      const result = await this.executeWithinReservedWorkspace(commandInput, currentIdentity, async (controller) => {
+        input.occurrences.beginDispatch(input.claim, input.privacyEpoch);
+        const beforeProviderRead = () => input.occurrences.assertDispatchAuthorized(input.claim, input.privacyEpoch);
+        if (bound.resource === 'mail') {
+          const outcome = await controller.refreshMailHeadForCommand(bound.accountId, { expectedConnectionGeneration: bound.targetGeneration, beforeProviderRead });
+          return parseWorkspaceCommandReceipt({ schemaVersion: 1, commandId: input.claim.attemptId, kind, objectId: bound.accountId,
+            accountId: bound.accountId, connectionGeneration: outcome.connectionGeneration, lane: 'head',
+            laneStatus: outcome.result.status, syncStatus: outcome.result.state.status },
+          { commandId: input.claim.attemptId, kind, objectId: bound.accountId, accountId: bound.accountId,
+            connectionGeneration: bound.targetGeneration });
+        }
+        const outcome = await controller.syncCalendarsForCommand(bound.accountId, { expectedConnectionGeneration: bound.targetGeneration, beforeProviderRead });
+        return parseWorkspaceCommandReceipt({ schemaVersion: 1, commandId: input.claim.attemptId, kind, objectId: bound.accountId,
+          accountId: bound.accountId, connectionGeneration: outcome.connectionGeneration, syncStatus: outcome.state.status,
+          calendarsPartial: outcome.state.calendarsPartial },
+        { commandId: input.claim.attemptId, kind, objectId: bound.accountId, accountId: bound.accountId,
+          connectionGeneration: bound.targetGeneration });
+      }, (receipt): JsonValue => receipt as unknown as JsonValue);
+      return Object.freeze({ result, bound, kind });
     });
+    const { result, bound, kind } = executed;
+    const rawReceipt = result.result ?? (result.admission.status === 'finished' ? result.admission.receipt : undefined);
+    if (!rawReceipt) throw new Error('background_command_outcome_unknown');
+    const receipt = parseWorkspaceCommandReceipt(rawReceipt, { commandId: input.claim.attemptId, kind, objectId: bound.accountId,
+      accountId: bound.accountId, connectionGeneration: bound.targetGeneration });
+    const fullyComplete = receipt.kind === 'accounts.refreshMail' ? receipt.laneStatus === 'complete'
+      : receipt.kind === 'accounts.syncCalendars' ? receipt.syncStatus === 'idle' && !receipt.calendarsPartial
+        : false;
+    return fullyComplete
+      ? Object.freeze({ status: 'completed', commandId: input.claim.attemptId, code: 'sync_complete' })
+      : Object.freeze({ status: 'inspect_required', commandId: input.claim.attemptId, code: 'sync_incomplete' });
   }
 
   /** Named journal path for cloud transcription; duplicates only replay their stored receipt. */

@@ -20,6 +20,13 @@ interface ActorEntry extends ActorBinding {
   readonly token: string;
 }
 
+export interface WorkspaceActorMetadata {
+  readonly workspaceId: string;
+  readonly ownerId: string;
+  readonly privacyEpoch: number;
+  readonly revision: number;
+}
+
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function bindingFrom(identity: OwnedWorkspaceIdentity): ActorBinding {
@@ -79,6 +86,20 @@ export class ProcessWorkspaceActors {
     // Publish the token to the private cache only after the validating transaction commits.
     this.actors.set(key, Object.freeze({ ...binding, token }));
     return token;
+  }
+
+  /** Private sealed-host enumeration for durable background metadata scans; returns no snapshots or sessions. */
+  listWorkspaceMetadataPage(afterWorkspaceId?: string, limit = 100): readonly WorkspaceActorMetadata[] {
+    if (!this.accepting || (afterWorkspaceId !== undefined && !UUID_V4.test(afterWorkspaceId)) ||
+        !Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new RuntimeActorError('workspace_binding_rejected');
+    this.kernel.assertRuntimeStartupSealed();
+    return this.kernel.withTrustedDatabaseTransaction((db) => Object.freeze(db.prepare(`SELECT id AS workspaceId,owner_id AS ownerId,
+      privacy_epoch AS privacyEpoch,revision FROM workspaces WHERE (? IS NULL OR id>?) ORDER BY id LIMIT ?`)
+      .all(afterWorkspaceId ?? null, afterWorkspaceId ?? null, limit).map((row) => {
+        const value = row as WorkspaceActorMetadata;
+        return Object.freeze({ workspaceId: value.workspaceId, ownerId: value.ownerId,
+          privacyEpoch: value.privacyEpoch, revision: value.revision });
+      })));
   }
 
   /** Stops new lookups immediately, drains owned runtimes, then revokes every cached actor. */

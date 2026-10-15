@@ -1,6 +1,6 @@
 import type Database from 'better-sqlite3';
 
-export const BACKGROUND_SCHEMA_VERSION = 1;
+export const BACKGROUND_SCHEMA_VERSION = 3;
 const TABLES = Object.freeze([
   'background_schema',
   'background_policy_heads',
@@ -94,6 +94,10 @@ const REQUIRED_COLUMNS: Readonly<Record<string, readonly Column[]>> = Object.fre
     { name: 'settled_at', type: 'INTEGER', notnull: 0, pk: 0 },
     { name: 'accounting_json', type: 'TEXT', notnull: 1, pk: 0 },
     { name: 'result_code', type: 'TEXT', notnull: 0, pk: 0 },
+    { name: 'finalization_operation', type: 'TEXT', notnull: 0, pk: 0 },
+    { name: 'finalization_request_json', type: 'TEXT', notnull: 0, pk: 0 },
+    { name: 'finalization_receipt_json', type: 'TEXT', notnull: 0, pk: 0 },
+    { name: 'finalization_receipt_digest', type: 'TEXT', notnull: 0, pk: 0 },
   ],
   background_occurrence_targets: [
     { name: 'workspace_id', type: 'TEXT', notnull: 1, pk: 1 },
@@ -178,9 +182,15 @@ CREATE TABLE background_occurrence_attempts (
   claimed_at INTEGER NOT NULL CHECK(claimed_at>=0), dispatch_started_at INTEGER CHECK(dispatch_started_at IS NULL OR dispatch_started_at>=0),
   settled_at INTEGER CHECK(settled_at IS NULL OR settled_at>=0), accounting_json TEXT NOT NULL CHECK(length(accounting_json)>0),
   result_code TEXT CHECK(result_code IS NULL OR length(result_code)>0),
-  PRIMARY KEY(workspace_id,owner_id,privacy_epoch,attempt_id),
-  UNIQUE(workspace_id,owner_id,privacy_epoch,occurrence_id,target_id,target_generation)
+  finalization_operation TEXT CHECK(finalization_operation IS NULL OR finalization_operation IN ('settle','defer','inspect','inspect_unacknowledged')),
+  finalization_request_json TEXT, finalization_receipt_json TEXT, finalization_receipt_digest TEXT CHECK(finalization_receipt_digest IS NULL OR length(finalization_receipt_digest)=64),
+  CHECK((finalization_operation IS NULL AND finalization_request_json IS NULL AND finalization_receipt_json IS NULL AND finalization_receipt_digest IS NULL) OR
+    (finalization_operation IS NOT NULL AND finalization_request_json IS NOT NULL AND finalization_receipt_json IS NOT NULL AND finalization_receipt_digest IS NOT NULL)),
+  PRIMARY KEY(workspace_id,owner_id,privacy_epoch,attempt_id)
 ) STRICT;
+CREATE UNIQUE INDEX background_occurrence_active_attempt_unique
+  ON background_occurrence_attempts(workspace_id,owner_id,privacy_epoch,occurrence_id,target_id,target_generation)
+  WHERE status IN ('claimed','dispatching');
 CREATE INDEX background_policy_status_idx ON background_policy_heads(workspace_id,owner_id,privacy_epoch,status,updated_at);
 CREATE INDEX background_occurrence_due_idx ON background_occurrences(workspace_id,owner_id,privacy_epoch,status,scheduled_at);
 CREATE INDEX background_occurrence_target_due_idx ON background_occurrence_targets(workspace_id,owner_id,privacy_epoch,status,updated_at);
@@ -216,7 +226,8 @@ function validateIndexes(db: Database.Database): void {
     background_occurrence_targets: [{ columns: ['workspace_id', 'owner_id', 'privacy_epoch', 'occurrence_id', 'target_id', 'target_generation'], unique: true },
       { columns: ['workspace_id', 'owner_id', 'privacy_epoch', 'status', 'updated_at'], unique: false, name: 'background_occurrence_target_due_idx' }],
     background_occurrence_attempts: [{ columns: ['workspace_id', 'owner_id', 'privacy_epoch', 'attempt_id'], unique: true },
-      { columns: ['workspace_id', 'owner_id', 'privacy_epoch', 'occurrence_id', 'target_id', 'target_generation'], unique: true }],
+      { columns: ['workspace_id', 'owner_id', 'privacy_epoch', 'occurrence_id', 'target_id', 'target_generation'], unique: true, partial: true,
+        name: 'background_occurrence_active_attempt_unique', predicate: "status IN ('claimed','dispatching')" }],
   };
   for (const [table, required] of Object.entries(expected)) {
     const indexes = db.pragma(`index_list(${table})`) as { name: string; unique: number; partial: number }[];
@@ -249,7 +260,67 @@ export function ensureBackgroundSchema(db: Database.Database): void {
 
   const versions = db.prepare('SELECT singleton,version FROM background_schema').all() as { singleton: number; version: number }[];
   if (versions.length !== 1 || versions[0]?.singleton !== 1) throw new Error('background_schema_invalid');
-  if (versions[0]!.version !== BACKGROUND_SCHEMA_VERSION) throw new Error('background_schema_unsupported');
+  if (versions[0]!.version === 1) {
+    const attemptColumns = db.pragma('table_info(background_occurrence_attempts)') as Column[];
+    const present = new Set(attemptColumns.map((column) => column.name));
+    if (['finalization_operation', 'finalization_request_json', 'finalization_receipt_json', 'finalization_receipt_digest'].some((name) => present.has(name))) {
+      throw new Error('background_schema_invalid');
+    }
+    db.exec(`ALTER TABLE background_occurrence_attempts ADD COLUMN finalization_operation TEXT;
+      ALTER TABLE background_occurrence_attempts ADD COLUMN finalization_request_json TEXT;
+      ALTER TABLE background_occurrence_attempts ADD COLUMN finalization_receipt_json TEXT;
+      ALTER TABLE background_occurrence_attempts ADD COLUMN finalization_receipt_digest TEXT;
+      UPDATE background_schema SET version=2 WHERE singleton=1 AND version=1;`);
+  }
+  const migratedVersion = (db.prepare('SELECT version FROM background_schema WHERE singleton=1').get() as { version: number } | undefined)?.version;
+  if (migratedVersion === 2) {
+    migrateAttemptHistoryIndex(db);
+  } else if (migratedVersion !== BACKGROUND_SCHEMA_VERSION) {
+    throw new Error('background_schema_unsupported');
+  }
   for (const name of TABLES) validateTable(db, name);
   validateIndexes(db);
+}
+
+const ATTEMPT_HISTORY_COLUMNS = `workspace_id,owner_id,privacy_epoch,attempt_id,occurrence_id,target_id,target_generation,
+  capability_hash,status,claimed_at,dispatch_started_at,settled_at,accounting_json,result_code,finalization_operation,
+  finalization_request_json,finalization_receipt_json,finalization_receipt_digest`;
+
+function migrateAttemptHistoryIndex(db: Database.Database): void {
+  // Validate the known v2 table before rebuilding its autoindex. This preserves every durable attempt byte-for-byte
+  // while replacing the lifetime target uniqueness constraint with a uniqueness fence for live attempts only.
+  validateTable(db, 'background_occurrence_attempts');
+  const indexes = db.pragma('index_list(background_occurrence_attempts)') as { name: string; unique: number; partial: number }[];
+  const legacyTargetIndex = indexes.filter((index) => index.unique === 1 && index.partial === 0 &&
+    JSON.stringify((db.pragma(`index_info("${index.name.replaceAll('"', '""')}")`) as { name: string | null }[]).map((column) => column.name)) ===
+      JSON.stringify(['workspace_id', 'owner_id', 'privacy_epoch', 'occurrence_id', 'target_id', 'target_generation']));
+  if (legacyTargetIndex.length !== 1) throw new Error('background_schema_invalid');
+  const primaryAttemptIndex = indexes.filter((index) => index.unique === 1 && index.partial === 0 &&
+    JSON.stringify((db.pragma(`index_info("${index.name.replaceAll('"', '""')}")`) as { name: string | null }[]).map((column) => column.name)) ===
+      JSON.stringify(['workspace_id', 'owner_id', 'privacy_epoch', 'attempt_id']));
+  if (primaryAttemptIndex.length !== 1) throw new Error('background_schema_invalid');
+
+  db.exec(`ALTER TABLE background_occurrence_attempts RENAME TO background_occurrence_attempts_v2;
+    CREATE TABLE background_occurrence_attempts (
+      workspace_id TEXT NOT NULL, owner_id TEXT NOT NULL, privacy_epoch INTEGER NOT NULL CHECK(privacy_epoch>=0),
+      attempt_id TEXT NOT NULL CHECK(length(attempt_id)=36), occurrence_id TEXT NOT NULL CHECK(length(occurrence_id)=36),
+      target_id TEXT NOT NULL, target_generation INTEGER NOT NULL CHECK(target_generation>=0),
+      capability_hash TEXT NOT NULL CHECK(length(capability_hash)=64),
+      status TEXT NOT NULL CHECK(status IN ('claimed','dispatching','completed','unknown','inspect_required','skipped')),
+      claimed_at INTEGER NOT NULL CHECK(claimed_at>=0), dispatch_started_at INTEGER CHECK(dispatch_started_at IS NULL OR dispatch_started_at>=0),
+      settled_at INTEGER CHECK(settled_at IS NULL OR settled_at>=0), accounting_json TEXT NOT NULL CHECK(length(accounting_json)>0),
+      result_code TEXT CHECK(result_code IS NULL OR length(result_code)>0),
+      finalization_operation TEXT CHECK(finalization_operation IS NULL OR finalization_operation IN ('settle','defer','inspect','inspect_unacknowledged')),
+      finalization_request_json TEXT, finalization_receipt_json TEXT, finalization_receipt_digest TEXT CHECK(finalization_receipt_digest IS NULL OR length(finalization_receipt_digest)=64),
+      CHECK((finalization_operation IS NULL AND finalization_request_json IS NULL AND finalization_receipt_json IS NULL AND finalization_receipt_digest IS NULL) OR
+        (finalization_operation IS NOT NULL AND finalization_request_json IS NOT NULL AND finalization_receipt_json IS NOT NULL AND finalization_receipt_digest IS NOT NULL)),
+      PRIMARY KEY(workspace_id,owner_id,privacy_epoch,attempt_id)
+    ) STRICT;
+    INSERT INTO background_occurrence_attempts(${ATTEMPT_HISTORY_COLUMNS})
+      SELECT ${ATTEMPT_HISTORY_COLUMNS} FROM background_occurrence_attempts_v2;
+    DROP TABLE background_occurrence_attempts_v2;
+    CREATE UNIQUE INDEX background_occurrence_active_attempt_unique
+      ON background_occurrence_attempts(workspace_id,owner_id,privacy_epoch,occurrence_id,target_id,target_generation)
+      WHERE status IN ('claimed','dispatching');
+    UPDATE background_schema SET version=${BACKGROUND_SCHEMA_VERSION} WHERE singleton=1 AND version=2;`);
 }

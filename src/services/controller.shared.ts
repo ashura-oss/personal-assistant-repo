@@ -2405,6 +2405,15 @@ export class AppControllerImpl implements AppController {
   }
 
   getSnapshot(): AppState { return this.snapshot; }
+  /** Trusted Node token-store view of the normalized account currently being initialized. */
+  getOAuthTokenStoreAccounts(): readonly Readonly<Pick<Account, 'id' | 'provider' | 'connected' | 'authStatus' | 'tokenRef' | 'connectionGeneration' | 'identity'>>[] {
+    return Object.freeze(this.state.accounts.map((account) => Object.freeze({
+      id: account.id, provider: account.provider, connected: account.connected, authStatus: account.authStatus,
+      ...(account.tokenRef === undefined ? {} : { tokenRef: account.tokenRef }),
+      ...(account.connectionGeneration === undefined ? {} : { connectionGeneration: account.connectionGeneration }),
+      ...(account.identity === undefined ? {} : { identity: Object.freeze({ ...account.identity }) }),
+    })));
+  }
   subscribe(listener: (state: AppState) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
@@ -11660,7 +11669,7 @@ export class AppControllerImpl implements AppController {
     return Object.freeze({ account: clone(disconnected.account), cleanup, retryFailed });
   }
 
-  async syncAccount(id: string, options: { continue?: boolean; expectedConnectionGeneration?: number } = {}): Promise<AccountSyncState> {
+  async syncAccount(id: string, options: { continue?: boolean; expectedConnectionGeneration?: number; beforeProviderRead?: () => void } = {}): Promise<AccountSyncState> {
     await this.load();
     const configured = this.snapshot.accounts.find((item) => item.id === id);
     if (!configured || options.expectedConnectionGeneration !== undefined && (configured.connectionGeneration ?? 0) !== options.expectedConnectionGeneration) {
@@ -11678,7 +11687,7 @@ export class AppControllerImpl implements AppController {
     return job;
   }
 
-  async syncCalendarsForCommand(accountId: string, options: { expectedConnectionGeneration: number; continue?: boolean }): Promise<{ state: AccountSyncState; connectionGeneration: number }> {
+  async syncCalendarsForCommand(accountId: string, options: { expectedConnectionGeneration: number; continue?: boolean; beforeProviderRead?: () => void }): Promise<{ state: AccountSyncState; connectionGeneration: number }> {
     const state = await this.syncAccount(accountId, options);
     return Object.freeze({ state: clone(state), connectionGeneration: options.expectedConnectionGeneration });
   }
@@ -12363,9 +12372,9 @@ export class AppControllerImpl implements AppController {
     };
   }
 
-  async refreshMailHead(accountId: string, options: { reason?: 'manual' | 'foreground'; expectedConnectionGeneration?: number } = {}): Promise<MailLaneResult> {
+  async refreshMailHead(accountId: string, options: { reason?: 'manual' | 'foreground'; expectedConnectionGeneration?: number; beforeProviderRead?: () => void } = {}): Promise<MailLaneResult> {
     const pages = new Map<string, CommittedMailAlertPage>();
-    const result = await this.startMailLane(accountId, 'head', options.reason ?? 'manual', false, pages, options.expectedConnectionGeneration);
+    const result = await this.startMailLane(accountId, 'head', options.reason ?? 'manual', false, pages, options.expectedConnectionGeneration, options.beforeProviderRead);
     if (result.status === 'complete' || result.status === 'partial') {
       await this.withMailAlertTransactionSlot(() => this.commitMailAlertPlan([...pages.values()]));
     }
@@ -12376,11 +12385,11 @@ export class AppControllerImpl implements AppController {
     return this.startMailLane(accountId, 'backfill', 'manual', false, undefined, options.expectedConnectionGeneration);
   }
 
-  async refreshMailHeadForCommand(accountId: string, options: { expectedConnectionGeneration: number }): Promise<{ result: MailLaneResult; connectionGeneration: number }> {
+  async refreshMailHeadForCommand(accountId: string, options: { expectedConnectionGeneration: number; beforeProviderRead?: () => void }): Promise<{ result: MailLaneResult; connectionGeneration: number }> {
     await this.load();
     const account = this.snapshot.accounts.find((item) => item.id === accountId);
     if (!account || (account.connectionGeneration ?? 0) !== options.expectedConnectionGeneration) throw new Error('Account connection changed. Refresh the account before continuing.');
-    const result = await this.refreshMailHead(accountId, { expectedConnectionGeneration: options.expectedConnectionGeneration });
+    const result = await this.refreshMailHead(accountId, { expectedConnectionGeneration: options.expectedConnectionGeneration, beforeProviderRead: options.beforeProviderRead });
     return Object.freeze({ result: clone(result), connectionGeneration: options.expectedConnectionGeneration });
   }
 
@@ -12433,20 +12442,20 @@ export class AppControllerImpl implements AppController {
   }
 
   private startMailLane(accountId: string, lane: 'head' | 'backfill', reason: 'manual' | 'foreground', doNotQueue = false,
-    committedPages?: Map<string, CommittedMailAlertPage>, expectedConnectionGeneration?: number): Promise<MailLaneResult> {
+    committedPages?: Map<string, CommittedMailAlertPage>, expectedConnectionGeneration?: number, beforeProviderRead?: () => void): Promise<MailLaneResult> {
     const key = `${accountId}:${lane}`;
     const sameLane = this.mailLaneJobs.get(key);
     if (sameLane) return sameLane;
     if (this.busySyncAccounts.has(accountId)) return Promise.reject(new Error('Another sync lane is already active for this account.'));
     this.busySyncAccounts.add(accountId);
-    const job = this.runMailLane(accountId, lane, reason, doNotQueue, committedPages, expectedConnectionGeneration)
+    const job = this.runMailLane(accountId, lane, reason, doNotQueue, committedPages, expectedConnectionGeneration, beforeProviderRead)
       .finally(() => { this.mailLaneJobs.delete(key); this.busySyncAccounts.delete(accountId); });
     this.mailLaneJobs.set(key, job);
     return job;
   }
 
   private async runMailLane(accountId: string, lane: 'head' | 'backfill', reason: 'manual' | 'foreground', doNotQueue: boolean,
-    committedPages?: Map<string, CommittedMailAlertPage>, expectedConnectionGeneration?: number): Promise<MailLaneResult> {
+    committedPages?: Map<string, CommittedMailAlertPage>, expectedConnectionGeneration?: number, beforeProviderRead?: () => void): Promise<MailLaneResult> {
     if (!this.connector) throw new Error('Provider mail sync is not configured.');
     const release = doNotQueue ? this.tryAcquireSyncSlot() : await this.acquireSyncSlot();
     if (!release) throw new Error('Both sync slots are busy.');
@@ -12464,6 +12473,7 @@ export class AppControllerImpl implements AppController {
         if (abortController.signal.aborted) throw new Error('Mail sync was cancelled or reached its 30 second deadline.');
         if (Date.now() - started >= 30_000) throw new Error('Mail sync reached its 30 second deadline.');
         if (++requests > 20) throw new Error('Mail sync reached its 20 request limit.');
+        beforeProviderRead?.();
       };
       const prepared = await this.mutate((state) => {
         const currentAccount = state.accounts.find((item) => item.id === accountId);
@@ -12750,7 +12760,7 @@ export class AppControllerImpl implements AppController {
     return left;
   }
 
-  private async runSyncAccount(id: string, options: { continue?: boolean; expectedConnectionGeneration?: number }): Promise<AccountSyncState> {
+  private async runSyncAccount(id: string, options: { continue?: boolean; expectedConnectionGeneration?: number; beforeProviderRead?: () => void }): Promise<AccountSyncState> {
     if (!this.connector) throw new Error('Provider sync is not configured.');
     const release = await this.acquireSyncSlot();
     const abortController = new AbortController();
@@ -12763,6 +12773,7 @@ export class AppControllerImpl implements AppController {
         if (abortController.signal.aborted) throw new Error('Sync was cancelled or reached its 30 second deadline. Continue manually when the account is available.');
         if (Date.now() - started > 30_000) throw new Error('Sync stopped at its 30 second run limit. Continue manually to resume.');
         if (++requests > 20) throw new Error('Sync stopped at its 20 request run limit. Continue manually to resume.');
+        options.beforeProviderRead?.();
       };
       const { account, sync } = await this.mutate((state) => {
         const account = state.accounts.find((item) => item.id === id);

@@ -312,6 +312,7 @@ export class DurableKernel {
   private readonly now: () => number;
   private readonly applicationOwnership?: ApplicationOwnershipHandle;
   private readonly ownsApplicationOwnership: boolean;
+  private readonly activeOwnedContexts = new WeakSet<object>();
   private closed = false;
 
   /** Internal identity check used when the host binds its one-shot startup capability. */
@@ -656,6 +657,7 @@ export class DurableKernel {
       const context: OwnedTransactionContext = Object.freeze({ workspaceId: workspace.id, ownerId: session.owner_id,
         privacyEpoch: workspace.privacy_epoch, revision: workspace.revision, now, db: this.db,
         assertActive: () => { if (!active) fail('transaction_context_expired', 'The owned transaction context is no longer active.'); } });
+      this.activeOwnedContexts.add(context);
       try {
         const result = callback(context);
         if (result !== null && (typeof result === 'object' || typeof result === 'function') &&
@@ -665,9 +667,24 @@ export class DurableKernel {
         return result;
       } finally {
         active = false;
+        this.activeOwnedContexts.delete(context);
       }
     });
     return transaction.immediate();
+  }
+
+  /** Reads and validates the exact canonical application snapshot inside an active owned transaction. */
+  readOwnedSnapshotWithinTransaction(context: OwnedTransactionContext): WorkspaceSnapshot {
+    if (!context || typeof context !== 'object' || !this.activeOwnedContexts.has(context) || context.db !== this.db ||
+        typeof context.assertActive !== 'function' || !context.db.inTransaction) {
+      fail('transaction_context_expired', 'An active owned transaction is required.');
+    }
+    context.assertActive();
+    const row = context.db.prepare(`SELECT id,owner_id,revision,privacy_epoch,schema_version,snapshot_json
+      FROM workspaces WHERE id=?`).get(context.workspaceId) as WorkspaceRow | undefined;
+    if (!row || row.id !== context.workspaceId || row.owner_id !== context.ownerId || row.revision !== context.revision ||
+        row.privacy_epoch !== context.privacyEpoch) fail('stale_revision', 'The workspace identity changed during the owned transaction.');
+    return this.loadWorkspaceSnapshot(row);
   }
 
   /** TRUSTED INTERNAL ONLY. Used for module-owned schema setup, never for request authority. */

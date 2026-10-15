@@ -11,6 +11,7 @@ import type { WorkspaceHttpAdmission, WorkspaceHttpApi } from './workspaceHttp.j
 import { KNOWLEDGE_SOURCE_CHOICES_PATH, KNOWLEDGE_SUGGESTION_REVIEW_PATH, parseKnowledgeHttpRead } from './knowledgeHttp.js';
 import type { AudioHttpApi, AudioUploadCaptureHeader } from './audioHttp.js';
 import type { OAuthHttpApi } from './oauthHttp.js';
+import { BACKGROUND_POLICIES_PATH, BACKGROUND_POLICY_PAUSE_PATH, BACKGROUND_POLICY_REVOKE_PATH } from './backgroundHttp.js';
 import { OAuthConnectionServiceError } from './oauthConnectionService.js';
 import { registerAcceptedHttpServer, trackAcceptedHttpRequest } from './httpRequestDrain.js';
 
@@ -295,6 +296,11 @@ function workspaceFailure(error: unknown): { readonly status: number; readonly c
     }
     if (error.message === 'workspace_refresh_required') return { status: 409, code: 'workspace_refresh_required' };
     if (['workspace_read_stale', 'workspace_runtime_busy'].includes(error.message)) return { status: 409, code: 'workspace_conflict' };
+    if (['background_policy_invalid', 'background_policy_query_invalid', 'background_policy_id_invalid',
+      'background_policy_receipt_invalid'].includes(error.message)) return { status: 400, code: 'invalid_background_request' };
+    if (error.message === 'background_policy_kind_unavailable') return { status: 501, code: 'background_policy_kind_unavailable' };
+    if (['background_policy_revision_stale', 'background_policy_revoked', 'background_binding_changed',
+      'background_occurrence_policy_stale', 'stale_epoch', 'stale_revision'].includes(error.message)) return { status: 409, code: 'background_conflict' };
     if (['This command idempotency key is already bound to different ownership or request content.',
       'The workspace revision changed before command admission.', 'The workspace runtime is busy.',
       'workspace_ownership_changed', 'workspace_loaded_revision_mismatch'].includes(error.message)) {
@@ -922,6 +928,79 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
         : await workspaceApi.readKnowledgeSuggestionReview!(admission, read);
       admission.assertCurrent();
       if (!response.destroyed) sendJson(response, 200, result);
+    } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
+    return;
+  }
+  if (pathname === BACKGROUND_POLICIES_PATH) {
+    if (!workspaceApi) throw problem(503, 'service_unavailable');
+    if (request.method === 'GET') {
+      const values = strictQuery(rawQuery, ['expectedPrivacyEpoch', 'afterPolicyId', 'limit']);
+      const parseDecimal = (key: string, minimum = 0, maximum = Number.MAX_SAFE_INTEGER) => {
+        const raw = values.get(key);
+        if (raw === undefined || !/^(0|[1-9][0-9]{0,15})$/.test(raw)) throw problem(400, 'bad_request');
+        const parsed = Number(raw);
+        if (!Number.isSafeInteger(parsed) || parsed < minimum || parsed > maximum) throw problem(400, 'bad_request');
+        return parsed;
+      };
+      const expectedPrivacyEpoch = parseDecimal('expectedPrivacyEpoch');
+      const afterPolicyId = values.get('afterPolicyId');
+      if (afterPolicyId !== undefined && !COMMAND_ID_RE.test(afterPolicyId)) throw problem(400, 'bad_request');
+      const limit = values.has('limit') ? parseDecimal('limit', 1, 100) : undefined;
+      if (typeof workspaceApi.listBackgroundPolicies !== 'function') throw problem(503, 'service_unavailable');
+      const admission = workspaceReadAdmission(request, auth, canonicalOrigin);
+      try {
+        admission.assertCurrent();
+        const result = workspaceApi.listBackgroundPolicies(admission, { expectedPrivacyEpoch,
+          ...(afterPolicyId ? { afterPolicyId } : {}), ...(limit ? { limit } : {}) });
+        admission.assertCurrent();
+        if (!response.destroyed) sendJson(response, 200, result);
+      } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
+      return;
+    }
+    if (request.method !== 'POST') { response.setHeader('Allow', 'GET, POST'); throw problem(405, 'method_not_allowed'); }
+    if (hasQuery) throw problem(400, 'bad_request');
+    if (typeof workspaceApi.saveBackgroundPolicy !== 'function') throw problem(503, 'service_unavailable');
+    const admission = workspaceMutationAdmission(request, auth, canonicalOrigin);
+    try {
+      const envelope = await readJsonBody(request, response, WORKSPACE_COMMAND_TEXT_BODY_LIMIT);
+      admission.assertCurrent();
+      if (admissionOpen && !admissionOpen()) throw problem(503, 'service_unavailable');
+      const result = workspaceApi.saveBackgroundPolicy(admission, envelope);
+      admission.assertCurrent();
+      if (!response.destroyed) sendJson(response, 200, result);
+    } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
+    return;
+  }
+  if (pathname === BACKGROUND_POLICY_PAUSE_PATH || pathname === BACKGROUND_POLICY_REVOKE_PATH) {
+    if (request.method !== 'POST') { response.setHeader('Allow', 'POST'); throw problem(405, 'method_not_allowed'); }
+    if (hasQuery) throw problem(400, 'bad_request');
+    if (!workspaceApi) throw problem(503, 'service_unavailable');
+    const method = pathname === BACKGROUND_POLICY_PAUSE_PATH ? workspaceApi.pauseBackgroundPolicy : workspaceApi.revokeBackgroundPolicy;
+    if (typeof method !== 'function') throw problem(503, 'service_unavailable');
+    const admission = workspaceMutationAdmission(request, auth, canonicalOrigin);
+    try {
+      const envelope = await readJsonBody(request, response);
+      admission.assertCurrent();
+      if (admissionOpen && !admissionOpen()) throw problem(503, 'service_unavailable');
+      const result = method.call(workspaceApi, admission, envelope);
+      admission.assertCurrent();
+      if (!response.destroyed) sendJson(response, 200, result);
+    } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
+    return;
+  }
+  const backgroundReceiptMatch = /^\/api\/workspace\/background\/policy-receipts\/([0-9a-f-]{36})$/i.exec(pathname);
+  if (backgroundReceiptMatch) {
+    if (request.method !== 'GET') { response.setHeader('Allow', 'GET'); throw problem(405, 'method_not_allowed'); }
+    const values = strictQuery(rawQuery, ['expectedPrivacyEpoch']);
+    const rawEpoch = values.get('expectedPrivacyEpoch');
+    if (values.size !== 1 || rawEpoch === undefined || !/^(0|[1-9][0-9]{0,15})$/.test(rawEpoch) || !Number.isSafeInteger(Number(rawEpoch))) throw problem(400, 'bad_request');
+    if (!workspaceApi || typeof workspaceApi.inspectBackgroundPolicyReceipt !== 'function') throw problem(503, 'service_unavailable');
+    const admission = workspaceReadAdmission(request, auth, canonicalOrigin);
+    try {
+      admission.assertCurrent();
+      const result = workspaceApi.inspectBackgroundPolicyReceipt(admission, { commandId: backgroundReceiptMatch[1]!, expectedPrivacyEpoch: Number(rawEpoch) });
+      admission.assertCurrent();
+      if (!response.destroyed) sendJson(response, result ? 200 : 404, result ?? { error: 'receipt_not_found' });
     } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
     return;
   }

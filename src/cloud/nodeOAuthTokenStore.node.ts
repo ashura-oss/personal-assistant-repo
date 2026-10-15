@@ -5,6 +5,8 @@ import type { SecretVault } from '../../server/src/vault.js';
 import { ServerOAuthTokenBindings, isValidOAuthTokenRef, type OAuthTokenBinding } from '../../server/src/oauthTokenBindings.js';
 
 type Identity = NonNullable<Account['identity']>;
+type OAuthTokenStoreAccountAuthority = Readonly<Pick<Account,
+  'id' | 'provider' | 'connected' | 'authStatus' | 'tokenRef' | 'connectionGeneration' | 'identity'>>;
 type OAuthPurpose = 'googleOAuth' | 'microsoftOAuth';
 type Binding = OAuthTokenBinding;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -40,7 +42,7 @@ export class NodeVaultOAuthTokenStore implements OAuthTokenStore {
 
   constructor(private readonly kernel: DurableKernel, private readonly vault: SecretVault,
     private readonly actorToken: string, private readonly binding: Readonly<{ workspaceId: string; ownerId: string; privacyEpoch: number }>,
-    private readonly currentAccounts: () => readonly Account[]) {
+    private readonly currentAccounts: () => readonly OAuthTokenStoreAccountAuthority[]) {
     if (!UUID.test(binding.workspaceId) || !UUID.test(binding.ownerId) || !Number.isSafeInteger(binding.privacyEpoch) || binding.privacyEpoch < 0) {
       throw new Error('oauth_token_store_binding_invalid');
     }

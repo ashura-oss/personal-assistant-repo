@@ -5,9 +5,10 @@ import type { OwnedWorkspaceRuntime } from './ownedWorkspaceRuntime.node';
 import { dispatchWorkspaceCommand, inspectWorkspaceCommand } from './workspaceCommands.node';
 import type { WorkspaceCommandResponse } from './workspaceCommands';
 import type { WorkspaceSnapshotDTO } from './workspaceDto';
+import type { BackgroundPolicyStore } from '../../server/src/backgroundPolicies.js';
 
 /** Binds the HTTP port only to the safe snapshot and explicit command APIs. */
-export function createWorkspaceHttpApi(runtime: OwnedWorkspaceRuntime): WorkspaceHttpApi {
+export function createWorkspaceHttpApi(runtime: OwnedWorkspaceRuntime, backgroundPolicies?: BackgroundPolicyStore): WorkspaceHttpApi {
   return Object.freeze({
     async getSnapshot(admission: WorkspaceHttpAdmission): Promise<JsonValue> {
       return serializeSnapshot(await runtime.getSnapshot(admission));
@@ -18,6 +19,38 @@ export function createWorkspaceHttpApi(runtime: OwnedWorkspaceRuntime): Workspac
     async dispatchCommand(admission: WorkspaceHttpAdmission, envelope: unknown): Promise<JsonValue> {
       return serializeCommandResponse(await dispatchWorkspaceCommand(runtime, admission, envelope));
     },
+    ...(backgroundPolicies ? {
+      saveBackgroundPolicy(admission: WorkspaceHttpAdmission, envelope: unknown) {
+        admission.assertCurrent();
+        const receipt = backgroundPolicies.save(admission.sessionToken, envelope);
+        admission.assertCurrent();
+        return receipt;
+      },
+      pauseBackgroundPolicy(admission: WorkspaceHttpAdmission, envelope: unknown) {
+        admission.assertCurrent();
+        const receipt = backgroundPolicies.pause(admission.sessionToken, envelope);
+        admission.assertCurrent();
+        return receipt;
+      },
+      revokeBackgroundPolicy(admission: WorkspaceHttpAdmission, envelope: unknown) {
+        admission.assertCurrent();
+        const receipt = backgroundPolicies.revoke(admission.sessionToken, envelope);
+        admission.assertCurrent();
+        return receipt;
+      },
+      listBackgroundPolicies(admission: WorkspaceHttpAdmission, input: Parameters<BackgroundPolicyStore['list']>[1]) {
+        admission.assertCurrent();
+        const result = backgroundPolicies.list(admission.sessionToken, input);
+        admission.assertCurrent();
+        return result;
+      },
+      inspectBackgroundPolicyReceipt(admission: WorkspaceHttpAdmission, input: Parameters<BackgroundPolicyStore['inspect']>[1]) {
+        admission.assertCurrent();
+        const result = backgroundPolicies.inspect(admission.sessionToken, input);
+        admission.assertCurrent();
+        return result;
+      },
+    } : {}),
     async readKnowledgeSourceChoices(admission: WorkspaceHttpAdmission, input: Parameters<KnowledgeHttpApi['readKnowledgeSourceChoices']>[1]) {
       admission.assertCurrent();
       const result = await runtime.readKnowledgeSourceChoices(admission, input);

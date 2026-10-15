@@ -94,6 +94,30 @@ function speechPrepared(leaseId, durationSeconds = 1) {
     sha256: 'a'.repeat(64), durationSeconds, upload: { blob: new Blob(['voice']), fileName: 'note.wav' } };
 }
 
+test('scheduled account sync observes active foreground busy before sticky refresh-required state', async () => {
+  const f = fixture();
+  const entered = deferred();
+  const release = deferred();
+  try {
+    const snapshot = await f.runtime.getSnapshot(f.admission);
+    const foreground = f.runtime.executeCommand({ ...f.admission, expectedRevision: snapshot.revision,
+      expectedPrivacyEpoch: snapshot.privacyEpoch, idempotencyKey: randomUUID(), kind: 'notes.save', canonicalBody: '{}' },
+    async () => { entered.resolve(); await release.promise; return Object.freeze({ saved: true }); },
+    () => Object.freeze({ kind: 'note.saved', noteId: randomUUID() }));
+    await entered.promise;
+    await assert.rejects(f.runtime.executeScheduledAccountSync({ sessionToken: f.admissionSession, ownerId: f.ownerId,
+      privacyEpoch: snapshot.privacyEpoch, claim: Object.freeze({ occurrenceId: randomUUID(), attemptId: randomUUID(),
+        targetId: 'google:account', targetGeneration: 1, capability: randomUUID() }), occurrences: {} }),
+    /The workspace runtime is busy\./);
+    release.resolve();
+    await foreground;
+  } finally {
+    release.resolve();
+    await f.runtime.closeAfterDrain();
+    removeFixture(f);
+  }
+});
+
 async function executeAtCurrent(runtime, kernel, admission, kind, canonicalBody, operation, receipt) {
   const identity = kernel.getOwnedIdentity(admission.sessionToken);
   return runtime.executeCommand({ ...admission, expectedRevision: identity.revision, expectedPrivacyEpoch: identity.privacyEpoch,

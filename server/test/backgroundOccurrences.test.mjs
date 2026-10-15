@@ -24,15 +24,17 @@ async function setup() {
   const challenge = auth.createLoginChallenge(origin);
   const browserSessionToken = (await auth.login({ password: 'correct horse battery staple', origin,
     preAuthToken: challenge.preAuthToken, csrfToken: challenge.csrfToken })).sessionToken;
-  const actorSessionToken = kernel.createSession(workspaceId, ownerId, now + 60_000);
+  const actorSessionToken = kernel.createSession(workspaceId, ownerId, now + 24 * 60 * 60_000);
   const workspace = kernel.getOwnedSnapshot(actorSessionToken);
   let devices = [{ subscriptionId: randomUUID(), generation: 1 }];
   let savedRuleRevision = 7;
+  let accountIdentityKey;
+  let accountGeneration;
   let targetCaptureCount = 0;
   const resolver = { resolve(_context, specification) {
     const selections = specification.kind === 'account_sync' || specification.kind === 'proactive_draft' ? specification.accounts : [];
-    return { ...(selections.length ? { accounts: selections.map((entry) => ({ accountId: entry.accountId, provider: 'google', identityKey: createHash('sha256').update(JSON.stringify({ accountId: entry.accountId, provider: 'google' })).digest('hex'),
-      connectionGeneration: entry.expectedConnectionGeneration, label: 'Account', connected: true })) } : {}),
+    return { ...(selections.length ? { accounts: selections.map((entry) => ({ accountId: entry.accountId, provider: 'google', identityKey: accountIdentityKey ?? createHash('sha256').update(JSON.stringify({ accountId: entry.accountId, provider: 'google' })).digest('hex'),
+      connectionGeneration: accountGeneration ?? entry.expectedConnectionGeneration, label: 'Account', connected: true })) } : {}),
     ...(specification.kind === 'proactive_draft' ? { rule: { ruleId: specification.ruleId, revision: savedRuleRevision, specificationDigest: 'd'.repeat(64) } } : {}),
     ...(specification.kind === 'approved_reminder_delivery' ? { reminder: { reminderId: specification.reminderId, revision: specification.expectedReminderRevision,
       approvedDigest: 'c'.repeat(64), dueAt: 1_800_000_000_000, privacyEpoch: 0, intentId: 'intent-approved', privacyMode: 'private', deviceSelection: 'all_current' } } : {}) };
@@ -41,7 +43,10 @@ async function setup() {
   const policies = new BackgroundPolicyStore({ kernel, auth, resolver, clock });
   const occurrences = new BackgroundOccurrenceStore({ kernel, actorSessionToken, resolver, clock });
   return { directory, kernel, auth, ownerId, workspace, browserSessionToken, actorSessionToken, resolver, policies, occurrences,
-    setDevices(value) { devices = value; }, setSavedRuleRevision(value) { savedRuleRevision = value; }, get targetCaptureCount() { return targetCaptureCount; } };
+    setNow(value) { now = value; },
+    setDevices(value) { devices = value; }, setSavedRuleRevision(value) { savedRuleRevision = value; },
+    setAccountIdentityKey(value) { accountIdentityKey = value; }, setAccountGeneration(value) { accountGeneration = value; },
+    get targetCaptureCount() { return targetCaptureCount; } };
 }
 function cleanup(f) { try { f.auth.close(); } catch {} try { f.kernel.close(); } catch {} rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 }); }
 function accountPolicy() {
@@ -71,6 +76,29 @@ test('occurrence identity is stable across retries and policy edits cannot mint 
   } finally { cleanup(f); }
 });
 
+test('live account generation and same-generation identity changes fence the occurrence and suspend only its unchanged consent head', async () => {
+  for (const change of ['generation', 'identity']) {
+    const f = await setup();
+    try {
+      const policy = accountPolicy(); f.policies.save(f.browserSessionToken, policy);
+      const occurrence = f.occurrences.schedule(occurrenceInput(policy.policyId));
+      if (change === 'generation') f.setAccountGeneration(4);
+      else f.setAccountIdentityKey('f'.repeat(64));
+      assert.deepEqual(f.occurrences.listDueAccountSyncWork(0, Number.MAX_SAFE_INTEGER), [],
+        'stale scheduled work is fenced before it can be claimed');
+      assert.equal(f.occurrences.list({ expectedPrivacyEpoch: 0 })[0].status, 'inspect_required');
+      f.policies.suspendAccountSyncAfterBindingChange(f.actorSessionToken, { expectedPrivacyEpoch: 0,
+        policyId: policy.policyId, expectedPolicyRevision: 1 });
+      const displayed = f.policies.list(f.actorSessionToken, { expectedPrivacyEpoch: 0 })[0];
+      assert.equal(displayed.status, 'suspended');
+      assert.equal(displayed.suspension, 'account_changed');
+      assert.equal(displayed.revision, 1, 'the immutable consent revision is retained');
+      assert.equal(f.policies.listAccountSyncCandidatePage(f.actorSessionToken, { expectedPrivacyEpoch: 0 }).candidates.length, 0);
+      assert.equal(f.occurrences.list({ expectedPrivacyEpoch: 0 })[0].occurrenceId, occurrence.occurrenceId);
+    } finally { cleanup(f); }
+  }
+});
+
 test('claim capability is private, attempt is recorded before dispatch, and unknown outcome is never automatically resubmitted', async () => {
   const f = await setup();
   try {
@@ -86,6 +114,227 @@ test('claim capability is private, attempt is recorded before dispatch, and unkn
     assert.equal(result.accounting.status, 'unknown');
     assert.throws(() => f.occurrences.claim({ expectedPrivacyEpoch: 0, occurrenceId: occurrence.occurrenceId, targetId: 'google:acct-1', targetGeneration: 3 }), /not_claimable/);
     assert.throws(() => f.occurrences.beginDispatch(claimed.claim, 0), /not_dispatchable/);
+  } finally { cleanup(f); }
+});
+
+test('settle, defer, and inspect retain exact idempotent finalization receipts after a lost acknowledgement', async () => {
+  for (const mode of ['settle', 'defer', 'inspect']) {
+    const f = await setup();
+    try {
+      const policy = accountPolicy(); f.policies.save(f.browserSessionToken, policy);
+      const occurrence = f.occurrences.schedule(occurrenceInput(policy.policyId));
+      const claimed = f.occurrences.claim({ expectedPrivacyEpoch: 0, occurrenceId: occurrence.occurrenceId,
+        targetId: 'google:acct-1', targetGeneration: 3 });
+      if (mode === 'settle') f.occurrences.beginDispatch(claimed.claim, 0);
+      const operation = () => mode === 'settle'
+        ? f.occurrences.settle(claimed.claim, 0, { status: 'completed', accounting: { status: 'not_applicable' }, resultCode: 'sync_complete' })
+        : mode === 'defer' ? f.occurrences.deferClaimBeforeDispatch(claimed.claim, 0, 'foreground_sync_busy', 1_800_000_060_000)
+          : f.occurrences.inspectClaimForRecovery(claimed.claim, 0, 'gateway_paused');
+      const real = f.kernel.withOwnedTransaction.bind(f.kernel);
+      let loseAck = true;
+      f.kernel.withOwnedTransaction = (token, epoch, callback) => {
+        const result = real(token, epoch, callback);
+        if (loseAck) { loseAck = false; throw new Error('simulated_commit_ack_loss'); }
+        return result;
+      };
+      assert.throws(operation, /simulated_commit_ack_loss/);
+      f.kernel.withOwnedTransaction = real;
+      const exact = operation();
+      if (mode === 'settle') {
+        assert.equal(exact.status, 'completed');
+        assert.deepEqual(exact, f.occurrences.list({ expectedPrivacyEpoch: 0 })[0]);
+        assert.throws(() => f.occurrences.settle(claimed.claim, 0,
+          { status: 'unknown', accounting: { status: 'unknown' }, resultCode: 'different_result' }), /finalization_conflict/);
+      } else if (mode === 'defer') {
+        assert.equal(f.occurrences.listDueAccountSyncWork(0, 1_800_000_030_000).length, 0);
+        assert.throws(() => f.occurrences.deferClaimBeforeDispatch(claimed.claim, 0, 'foreground_sync_busy', 1_800_000_120_000), /finalization_conflict/);
+      } else {
+        assert.equal(f.occurrences.list({ expectedPrivacyEpoch: 0 })[0].status, 'inspect_required');
+        assert.throws(() => f.occurrences.inspectClaimForRecovery(claimed.claim, 0, 'different_reason'), /finalization_conflict/);
+      }
+    } finally { cleanup(f); }
+  }
+});
+
+test('durable account-sync paging advances exact occurrence, target and generation cursors', async () => {
+  const f = await setup();
+  try {
+    const policy = accountPolicy();
+    policy.specification.accounts.push({ accountId: 'google:acct-2', expectedConnectionGeneration: 4 });
+    policy.specification.resources.push('calendars');
+    f.policies.save(f.browserSessionToken, policy);
+    const slots = [
+      ['google:acct-1', 'mail', 3], ['google:acct-1', 'calendars', 3],
+      ['google:acct-2', 'mail', 4], ['google:acct-2', 'calendars', 4],
+    ];
+    for (const [accountId, resource, generation] of slots) {
+      f.occurrences.schedule({ expectedPrivacyEpoch: 0, policyId: policy.policyId, expectedPolicyRevision: 1,
+        descriptor: { kind: 'account_sync', accountId, resource, scheduledSlotUtc: new Date(1_800_000_000_000).toISOString() },
+        scheduledAt: 1_800_000_000_000, source: {} });
+    }
+    const first = f.occurrences.listDueAccountSyncWork(0, Number.MAX_SAFE_INTEGER, undefined, 1);
+    assert.equal(first.length, 1);
+    const second = f.occurrences.listDueAccountSyncWork(0, Number.MAX_SAFE_INTEGER, first[0].workId, 1);
+    const third = f.occurrences.listDueAccountSyncWork(0, Number.MAX_SAFE_INTEGER, second[0].workId, 1);
+    const fourth = f.occurrences.listDueAccountSyncWork(0, Number.MAX_SAFE_INTEGER, third[0].workId, 1);
+    assert.equal(f.occurrences.listDueAccountSyncWork(0, Number.MAX_SAFE_INTEGER, fourth[0].workId, 1).length, 0);
+    assert.equal(new Set([first[0].workId, second[0].workId, third[0].workId, fourth[0].workId]).size, 4);
+    const nextDue = f.kernel.withTrustedDatabaseTransaction((db) => db.prepare(`SELECT min(max(o.scheduled_at,t.updated_at)) AS due
+      FROM background_occurrences o JOIN background_occurrence_targets t USING(workspace_id,owner_id,privacy_epoch,occurrence_id)
+      WHERE o.occurrence_id IN (${slots.map(() => '?').join(',')})`).get(...f.occurrences.list({ expectedPrivacyEpoch: 0 }).map((item) => item.occurrenceId)).due);
+    assert.equal(f.occurrences.readNextDueAt(0), nextDue);
+    assert.ok(f.occurrences.list({ expectedPrivacyEpoch: 0 }).every((item) => item.scheduledAt === 1_800_000_000_000));
+  } finally { cleanup(f); }
+});
+
+test('pre-dispatch deferral durably delays the next claim without changing its immutable slot', async () => {
+  const f = await setup();
+  try {
+    const policy = accountPolicy(); f.policies.save(f.browserSessionToken, policy);
+    const occurrence = f.occurrences.schedule(occurrenceInput(policy.policyId));
+    const claimed = f.occurrences.claim({ expectedPrivacyEpoch: 0, occurrenceId: occurrence.occurrenceId,
+      targetId: 'google:acct-1', targetGeneration: 3 });
+    const retryAt = 1_800_000_060_000;
+    f.occurrences.deferClaimBeforeDispatch(claimed.claim, 0, 'foreground_sync_busy', retryAt);
+    assert.equal(f.occurrences.readNextDueAt(0), retryAt);
+    assert.equal(f.occurrences.listDueAccountSyncWork(0, retryAt - 1).length, 0);
+    assert.equal(f.occurrences.listDueAccountSyncWork(0, retryAt).length, 1);
+    f.setNow(retryAt);
+    const retry = f.occurrences.claim({ expectedPrivacyEpoch: 0, occurrenceId: occurrence.occurrenceId,
+      targetId: 'google:acct-1', targetGeneration: 3 });
+    assert.equal(retry.occurrence.scheduledAt, occurrence.scheduledAt);
+    const history = f.kernel.withTrustedDatabaseTransaction((db) => db.prepare(`SELECT attempt_id,status,finalization_operation
+      FROM background_occurrence_attempts WHERE occurrence_id=? ORDER BY claimed_at,attempt_id`).all(occurrence.occurrenceId));
+    assert.equal(history.length, 2);
+    assert.equal(history[0].status, 'skipped');
+    assert.equal(history[0].finalization_operation, 'defer');
+    assert.equal(history[1].attempt_id, retry.claim.attemptId);
+    assert.equal(history[1].status, 'claimed');
+    assert.throws(() => f.occurrences.claim({ expectedPrivacyEpoch: 0, occurrenceId: occurrence.occurrenceId,
+      targetId: 'google:acct-1', targetGeneration: 3 }), /not_claimable/);
+  } finally { cleanup(f); }
+});
+
+function replaceAttemptTableWithLegacyVersion(f, version, includeTargetUnique = true) {
+  f.kernel.withTrustedDatabaseTransaction((db) => {
+    const columns = `workspace_id,owner_id,privacy_epoch,attempt_id,occurrence_id,target_id,target_generation,capability_hash,status,
+      claimed_at,dispatch_started_at,settled_at,accounting_json,result_code`;
+    const finalization = `,finalization_operation,finalization_request_json,finalization_receipt_json,finalization_receipt_digest`;
+    db.exec(`DROP INDEX background_occurrence_active_attempt_unique;
+      ALTER TABLE background_occurrence_attempts RENAME TO background_occurrence_attempts_new;
+      CREATE TABLE background_occurrence_attempts (
+        workspace_id TEXT NOT NULL, owner_id TEXT NOT NULL, privacy_epoch INTEGER NOT NULL CHECK(privacy_epoch>=0),
+        attempt_id TEXT NOT NULL CHECK(length(attempt_id)=36), occurrence_id TEXT NOT NULL CHECK(length(occurrence_id)=36),
+        target_id TEXT NOT NULL, target_generation INTEGER NOT NULL CHECK(target_generation>=0),
+        capability_hash TEXT NOT NULL CHECK(length(capability_hash)=64),
+        status TEXT NOT NULL CHECK(status IN ('claimed','dispatching','completed','unknown','inspect_required','skipped')),
+        claimed_at INTEGER NOT NULL CHECK(claimed_at>=0), dispatch_started_at INTEGER CHECK(dispatch_started_at IS NULL OR dispatch_started_at>=0),
+        settled_at INTEGER CHECK(settled_at IS NULL OR settled_at>=0), accounting_json TEXT NOT NULL CHECK(length(accounting_json)>0),
+        result_code TEXT CHECK(result_code IS NULL OR length(result_code)>0),
+        ${version === 2 ? `finalization_operation TEXT,finalization_request_json TEXT,finalization_receipt_json TEXT,
+          finalization_receipt_digest TEXT CHECK(finalization_receipt_digest IS NULL OR length(finalization_receipt_digest)=64),` : ''}
+        PRIMARY KEY(workspace_id,owner_id,privacy_epoch,attempt_id)
+        ${includeTargetUnique ? ',UNIQUE(workspace_id,owner_id,privacy_epoch,occurrence_id,target_id,target_generation)' : ''}
+      ) STRICT;
+      INSERT INTO background_occurrence_attempts(${columns}${version === 2 ? finalization : ''})
+        SELECT ${columns}${version === 2 ? finalization : ''} FROM background_occurrence_attempts_new;
+      DROP TABLE background_occurrence_attempts_new;
+      UPDATE background_schema SET version=${version} WHERE singleton=1;`);
+  });
+}
+
+test('v1 and v2 attempt-history migrations preserve every existing row and install active-only target uniqueness', async () => {
+  for (const version of [1, 2]) {
+    const f = await setup();
+    try {
+      const policy = accountPolicy(); f.policies.save(f.browserSessionToken, policy);
+      const occurrence = f.occurrences.schedule(occurrenceInput(policy.policyId));
+      const claimed = f.occurrences.claim({ expectedPrivacyEpoch: 0, occurrenceId: occurrence.occurrenceId,
+        targetId: 'google:acct-1', targetGeneration: 3 });
+      if (version === 2) {
+        f.occurrences.beginDispatch(claimed.claim, 0);
+        f.occurrences.settle(claimed.claim, 0, { status: 'completed', accounting: { status: 'not_applicable' }, resultCode: 'sync_complete' });
+      }
+      const before = f.kernel.withTrustedDatabaseTransaction((db) => db.prepare(`SELECT * FROM background_occurrence_attempts WHERE attempt_id=?`)
+        .get(claimed.claim.attemptId));
+      const beforeCount = f.kernel.withTrustedDatabaseTransaction((db) => db.prepare('SELECT count(*) AS count FROM background_occurrence_attempts').get().count);
+      replaceAttemptTableWithLegacyVersion(f, version);
+      f.policies.list(f.actorSessionToken, { expectedPrivacyEpoch: 0 });
+      const after = f.kernel.withTrustedDatabaseTransaction((db) => ({
+        row: db.prepare(`SELECT * FROM background_occurrence_attempts WHERE attempt_id=?`).get(claimed.claim.attemptId),
+        count: db.prepare('SELECT count(*) AS count FROM background_occurrence_attempts').get().count,
+        version: db.prepare('SELECT version FROM background_schema').get().version,
+        index: db.prepare("SELECT sql FROM sqlite_master WHERE type='index' AND name='background_occurrence_active_attempt_unique'").get()?.sql,
+      }));
+      const expected = { ...before, ...(version === 1 ? { finalization_operation: null, finalization_request_json: null,
+        finalization_receipt_json: null, finalization_receipt_digest: null } : {}) };
+      assert.deepEqual(after.row, expected);
+      assert.equal(after.count, beforeCount);
+      assert.equal(after.version, 3);
+      assert.match(after.index, /WHERE status IN \('claimed','dispatching'\)/i);
+    } finally { cleanup(f); }
+  }
+});
+
+test('failed legacy attempt-index validation rolls migration back without replacing the stored table', async () => {
+  const f = await setup();
+  try {
+    const policy = accountPolicy(); f.policies.save(f.browserSessionToken, policy);
+    const occurrence = f.occurrences.schedule(occurrenceInput(policy.policyId));
+    const claimed = f.occurrences.claim({ expectedPrivacyEpoch: 0, occurrenceId: occurrence.occurrenceId,
+      targetId: 'google:acct-1', targetGeneration: 3 });
+    const before = f.kernel.withTrustedDatabaseTransaction((db) => db.prepare(`SELECT * FROM background_occurrence_attempts WHERE attempt_id=?`)
+      .get(claimed.claim.attemptId));
+    replaceAttemptTableWithLegacyVersion(f, 2, false);
+    assert.throws(() => f.policies.list(f.actorSessionToken, { expectedPrivacyEpoch: 0 }), /background_schema_invalid/);
+    const after = f.kernel.withTrustedDatabaseTransaction((db) => ({
+      row: db.prepare(`SELECT * FROM background_occurrence_attempts WHERE attempt_id=?`).get(claimed.claim.attemptId),
+      version: db.prepare('SELECT version FROM background_schema').get().version,
+    }));
+    assert.deepEqual(after.row, before);
+    assert.equal(after.version, 2);
+  } finally { cleanup(f); }
+});
+
+test('schema validation rejects a same-name active-attempt index with a weakened predicate', async () => {
+  const f = await setup();
+  try {
+    const policy = accountPolicy();
+    f.policies.save(f.browserSessionToken, policy);
+    f.kernel.withTrustedDatabaseTransaction((db) => db.exec(`DROP INDEX background_occurrence_active_attempt_unique;
+      CREATE UNIQUE INDEX background_occurrence_active_attempt_unique
+      ON background_occurrence_attempts(workspace_id,owner_id,privacy_epoch,occurrence_id,target_id,target_generation) WHERE 0;`));
+    assert.throws(() => f.policies.list(f.actorSessionToken, { expectedPrivacyEpoch: 0 }), /background_schema_invalid/);
+  } finally { cleanup(f); }
+});
+
+test('ambiguous claim acknowledgement is durably inspection-only and does not strand the scheduler owner', async () => {
+  const f = await setup();
+  try {
+    const policy = accountPolicy();
+    policy.specification.resources.push('calendars');
+    f.policies.save(f.browserSessionToken, policy);
+    const occurrence = f.occurrences.schedule(occurrenceInput(policy.policyId));
+    const original = f.kernel.withOwnedTransaction.bind(f.kernel);
+    let loseAck = true;
+    f.kernel.withOwnedTransaction = (token, epoch, callback) => {
+      const result = original(token, epoch, callback);
+      if (loseAck) { loseAck = false; throw new Error('simulated_claim_ack_loss'); }
+      return result;
+    };
+    assert.throws(() => f.occurrences.claim({ expectedPrivacyEpoch: 0, occurrenceId: occurrence.occurrenceId,
+      targetId: 'google:acct-1', targetGeneration: 3 }), /simulated_claim_ack_loss/);
+    f.kernel.withOwnedTransaction = original;
+    f.occurrences.inspectUnacknowledgedAccountSyncWork(0, occurrence.occurrenceId, 'google:acct-1', 3);
+    assert.equal(f.occurrences.listDueAccountSyncWork(0, Number.MAX_SAFE_INTEGER).length, 0);
+    assert.equal(f.occurrences.list({ expectedPrivacyEpoch: 0 })[0].status, 'inspect_required');
+    const unclaimed = f.occurrences.schedule({ expectedPrivacyEpoch: 0, policyId: policy.policyId, expectedPolicyRevision: 1,
+      descriptor: { kind: 'account_sync', accountId: 'google:acct-1', resource: 'calendars',
+        scheduledSlotUtc: new Date(1_800_000_000_000).toISOString() },
+      scheduledAt: 1_800_000_000_000, source: { accountId: 'google:acct-1', resource: 'calendars' } });
+    f.occurrences.inspectUnacknowledgedAccountSyncWork(0, unclaimed.occurrenceId, 'google:acct-1', 3);
+    assert.equal(f.occurrences.listDueAccountSyncWork(0, Number.MAX_SAFE_INTEGER).length, 1,
+      'a row with no committed claim is proven non-admission and remains eligible');
   } finally { cleanup(f); }
 });
 

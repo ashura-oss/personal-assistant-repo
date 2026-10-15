@@ -143,7 +143,7 @@ test('binding resolver cannot silently accept a reconnected account generation o
     f.setGeneration(4);
     assert.throws(() => f.store.save(f.browserSessionToken, envelope), /binding_changed/);
     f.setGeneration(3);
-    f.setIdentityKey('f'.repeat(64));
+    f.setIdentityKey('z'.repeat(64));
     assert.throws(() => f.store.save(f.browserSessionToken, envelope), /background_binding_invalid/);
     f.setIdentityKey(undefined);
     const saved = f.store.save(f.browserSessionToken, envelope);

@@ -5,13 +5,14 @@ import { createStillHttpServer } from './http.js';
 import { drainAcceptedHttpRequests } from './httpRequestDrain.js';
 import type { AudioHttpApi } from './audioHttp.js';
 import type { DurableKernel, OwnedWorkspaceIdentity } from './kernel.js';
-import { ProcessWorkspaceActors } from './runtimeActors.js';
+import { ProcessWorkspaceActors, type WorkspaceActorMetadata } from './runtimeActors.js';
 import type { SecretVault } from './vault.js';
 import type { AuthService } from './auth.js';
 import type { RuntimeSessionResolver } from './workspaceRegistry.js';
 import type { WorkspaceHttpApi } from './workspaceHttp.js';
 import type { OAuthHttpApi } from './oauthHttp.js';
 import { AudioColdStartRecovery } from './audioColdStartRecovery.js';
+import { markInterruptedBackgroundWorkForInspection } from './backgroundOccurrences.js';
 import { join } from 'node:path';
 
 /** Trusted runtime owner contract. It contains no caller supplied workspace authority. */
@@ -30,6 +31,8 @@ export interface ApplicationRuntimeFactoryContext {
   readonly vault: SecretVault;
   readonly auth: AuthService;
   readonly runtimeSessionFor: RuntimeSessionResolver;
+  /** Private post-seal metadata-only enumeration closure for background scans. */
+  readonly listWorkspaceMetadataPage: (afterWorkspaceId?: string, limit?: number) => readonly WorkspaceActorMetadata[];
   /** One UUID shared by every private media runtime in this host process. */
   readonly processInstanceId: string;
 }
@@ -217,6 +220,7 @@ export async function startApplicationHost(options: ApplicationHostOptions): Pro
       capability: startup.capability, privateRoot: join(options.config.dataDirectory, 'private-audio'),
       processInstanceId: opened.privateContext.processInstanceId });
     await recovery.run();
+    markInterruptedBackgroundWorkForInspection(opened.privateContext.kernel, startup.capability);
     recoverySettled = true;
   } catch (error) {
     try { await recovery?.retryCloseOwnedDescriptors(); }
@@ -242,6 +246,7 @@ export async function startApplicationHost(options: ApplicationHostOptions): Pro
       vault: opened.privateContext.vault,
       auth: opened.foundation.auth,
       runtimeSessionFor: (identity: OwnedWorkspaceIdentity) => actors.sessionForRegistry(identity),
+      listWorkspaceMetadataPage: (afterWorkspaceId?: string, limit?: number) => actors.listWorkspaceMetadataPage(afterWorkspaceId, limit),
       processInstanceId: opened.privateContext.processInstanceId,
     }));
     if (runtime && typeof runtime === 'object' && typeof runtime.stopAdmission === 'function' &&

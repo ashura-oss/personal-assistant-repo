@@ -22,7 +22,7 @@ export interface ResolvedBackgroundAccount {
   readonly identityKey: string;
   readonly connectionGeneration: number;
   readonly label: string;
-  readonly connected: true;
+  readonly connected: boolean;
 }
 
 export type ResolvedBackgroundBinding = Readonly<{
@@ -45,6 +45,13 @@ export interface BackgroundPolicyStoreOptions {
   readonly auth: AuthService;
   readonly resolver: BackgroundBindingResolver;
   readonly clock?: () => number;
+  /** Synchronous wake signal invoked only after the owned policy transaction commits. */
+  readonly onCommitted?: (identity: Readonly<{ workspaceId: string; ownerId: string; privacyEpoch: number }>) => void;
+}
+
+export interface BackgroundAccountSyncCandidate {
+  readonly policy: BackgroundPolicyDisplay;
+  readonly initialEffectiveFrom: number;
 }
 
 interface PolicyHeadRow {
@@ -89,10 +96,9 @@ export function normalizeResolvedBackgroundBinding(value: unknown, specification
     if (!account || Object.keys(account as object).sort().join(',') !== 'accountId,connected,connectionGeneration,identityKey,label,provider' ||
         !isValidAccountId(account.accountId) || !ACCOUNT_PROVIDERS.has(account.provider) ||
         typeof account.identityKey !== 'string' || !SHA256.test(account.identityKey) ||
-        account.identityKey !== digest(canonicalBackgroundJson({ accountId: account.accountId, provider: account.provider })) ||
         !Number.isSafeInteger(account.connectionGeneration) || account.connectionGeneration < 1 ||
         typeof account.label !== 'string' || Buffer.byteLength(account.label, 'utf8') > 1024 ||
-        /[\u0000-\u001f\u007f]/.test(account.label) || account.connected !== true || actualMap.has(account.accountId)) return fail('background_binding_invalid');
+        /[\u0000-\u001f\u007f]/.test(account.label) || typeof account.connected !== 'boolean' || actualMap.has(account.accountId)) return fail('background_binding_invalid');
     if (expectedMap.get(account.accountId) !== account.connectionGeneration) return fail('background_binding_changed');
     actualMap.set(account.accountId, account);
   }
@@ -154,6 +160,7 @@ export class BackgroundPolicyStore {
   readonly #auth: AuthService;
   readonly #resolver: BackgroundBindingResolver;
   readonly #clock: () => number;
+  readonly #onCommitted?: BackgroundPolicyStoreOptions['onCommitted'];
 
   constructor(options: BackgroundPolicyStoreOptions) {
     if (!options || !options.kernel || !options.auth || !options.resolver || typeof options.resolver.resolve !== 'function' ||
@@ -165,13 +172,14 @@ export class BackgroundPolicyStore {
     this.#auth = options.auth;
     this.#resolver = options.resolver;
     this.#clock = options.clock ?? Date.now;
+    this.#onCommitted = options.onCommitted;
   }
 
   /** Pass the authenticated browser's private kernel admission token for each human-consent mutation. */
   save(admissionSessionToken: string, raw: unknown): BackgroundPolicyReceipt {
     if (typeof admissionSessionToken !== 'string' || !admissionSessionToken) return fail('background_admission_required');
     const envelope = parseSaveBackgroundPolicyEnvelope(raw);
-    return this.#kernel.withOwnedTransaction(admissionSessionToken, envelope.expectedPrivacyEpoch, (context) => {
+    const result = this.#kernel.withOwnedTransaction(admissionSessionToken, envelope.expectedPrivacyEpoch, (context) => {
       this.#auth.bindInitiatingSessionWithinTransaction(context, admissionSessionToken);
       ensureBackgroundSchema(context.db);
       const request = canonicalBackgroundJson({ operation: 'save', envelope });
@@ -205,10 +213,25 @@ export class BackgroundPolicyStore {
       return this.#saveReceipt(context, envelope.commandId, request, { schemaVersion: 1, commandId: envelope.commandId,
         operation: 'save', policyId: envelope.policyId, policyRevision: revision, status, effectiveFrom });
     });
+    try { this.#onCommitted?.(this.#kernel.getOwnedIdentity(admissionSessionToken)); } catch { /* committed receipt remains authoritative */ }
+    return result;
   }
 
   pause(admissionSessionToken: string, raw: unknown): BackgroundPolicyReceipt { return this.#change(admissionSessionToken, raw, parsePauseBackgroundPolicyEnvelope, 'pause'); }
   revoke(admissionSessionToken: string, raw: unknown): BackgroundPolicyReceipt { return this.#change(admissionSessionToken, raw, parseRevokeBackgroundPolicyEnvelope, 'revoke'); }
+
+  inspect(admissionSessionToken: string, input: { readonly commandId: string; readonly expectedPrivacyEpoch: number }): BackgroundPolicyReceipt | undefined {
+    if (!input || Object.keys(input).some((key) => !['commandId', 'expectedPrivacyEpoch'].includes(key)) ||
+        !isBackgroundUuidV4(input.commandId) || !Number.isSafeInteger(input.expectedPrivacyEpoch) || input.expectedPrivacyEpoch < 0) return fail('background_policy_query_invalid');
+    return this.#kernel.withOwnedTransaction(admissionSessionToken, input.expectedPrivacyEpoch, (context) => {
+      this.#auth.bindInitiatingSessionWithinTransaction(context, admissionSessionToken);
+      ensureBackgroundSchema(context.db);
+      const row = context.db.prepare(`SELECT receipt_json FROM background_policy_commands
+        WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND command_id=?`)
+        .get(context.workspaceId, context.ownerId, context.privacyEpoch, input.commandId) as { receipt_json: string } | undefined;
+      return row ? parseBackgroundPolicyReceipt(parseStored<unknown>(row.receipt_json)) : undefined;
+    });
+  }
 
   list(admissionSessionToken: string, input: { readonly expectedPrivacyEpoch: number; readonly afterPolicyId?: string; readonly limit?: number }): readonly BackgroundPolicyDisplay[] {
     if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some((key) => !['expectedPrivacyEpoch', 'afterPolicyId', 'limit'].includes(key))) {
@@ -229,10 +252,65 @@ export class BackgroundPolicyStore {
     });
   }
 
+  /** Private scheduler metadata page; candidates contain only account-sync policy and cadence metadata. */
+  listAccountSyncCandidatePage(actorSessionToken: string, input: { readonly expectedPrivacyEpoch: number; readonly afterPolicyId?: string; readonly limit?: number }): Readonly<{ candidates: readonly BackgroundAccountSyncCandidate[]; nextCursor?: string }> {
+    const policies = this.list(actorSessionToken, input);
+    return this.#kernel.withOwnedTransaction(actorSessionToken, input.expectedPrivacyEpoch, (context) => {
+      ensureBackgroundSchema(context.db);
+      const candidates: BackgroundAccountSyncCandidate[] = [];
+      for (const policy of policies) {
+        if (policy.status !== 'enabled' || !policy.enabled || policy.specification.kind !== 'account_sync') continue;
+        const row = context.db.prepare(`SELECT effective_from FROM background_policy_revisions
+          WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND policy_id=? AND revision=1`)
+          .get(context.workspaceId, context.ownerId, context.privacyEpoch, policy.policyId) as { effective_from: number } | undefined;
+        if (!row || !Number.isSafeInteger(row.effective_from) || row.effective_from < 0) return fail('background_policy_storage_invalid');
+        candidates.push(Object.freeze({ policy, initialEffectiveFrom: row.effective_from }));
+      }
+      const nextCursor = policies.length === (input.limit ?? 100) ? policies.at(-1)?.policyId : undefined;
+      return Object.freeze({ candidates: Object.freeze(candidates), ...(nextCursor ? { nextCursor } : {}) });
+    });
+  }
+
+  /** Trusted scheduler hold for an exact account-sync revision whose live identity no longer matches consent. */
+  suspendAccountSyncAfterBindingChange(actorSessionToken: string, input: { readonly expectedPrivacyEpoch: number;
+    readonly policyId: string; readonly expectedPolicyRevision: number }): void {
+    if (!input || !isBackgroundUuidV4(input.policyId) || !Number.isSafeInteger(input.expectedPrivacyEpoch) || input.expectedPrivacyEpoch < 0 ||
+        !Number.isSafeInteger(input.expectedPolicyRevision) || input.expectedPolicyRevision < 1) return fail('background_policy_query_invalid');
+    this.#kernel.withOwnedTransaction(actorSessionToken, input.expectedPrivacyEpoch, (context) => {
+      ensureBackgroundSchema(context.db);
+      const head = this.#head(context.db, context, input.policyId);
+      if (!head || head.current_revision !== input.expectedPolicyRevision || head.status !== 'enabled') return;
+      const revision = context.db.prepare(`SELECT revision,enabled,specification_json,binding_json,binding_digest,policy_digest,effective_from,created_at
+        FROM background_policy_revisions WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND policy_id=? AND revision=?`)
+        .get(context.workspaceId, context.ownerId, context.privacyEpoch, input.policyId, input.expectedPolicyRevision) as PolicyRevisionRow | undefined;
+      if (!revision) return fail('background_policy_storage_invalid');
+      const displayed = projection(head, revision, context);
+      let authorityChanged = false;
+      try {
+        const current = normalizeResolvedBackgroundBinding(this.#resolver.resolve(context, displayed.specification), displayed.specification, context.privacyEpoch);
+        const stored = parseStored<ResolvedBackgroundBinding>(revision.binding_json);
+        authorityChanged = canonicalBackgroundJson(backgroundBindingAuthority(current), MAX_PRIVATE_BYTES) !==
+          canonicalBackgroundJson(backgroundBindingAuthority(stored), MAX_PRIVATE_BYTES);
+      } catch (error) {
+        if (!(error instanceof Error) || !['background_binding_changed', 'background_occurrence_binding_changed'].includes(error.message)) throw error;
+        authorityChanged = true;
+      }
+      if (!authorityChanged) return;
+      const updated = context.db.prepare(`UPDATE background_policy_heads SET status='suspended',suspension='account_changed',updated_at=?
+        WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND policy_id=? AND current_revision=? AND status='enabled'
+          AND EXISTS (SELECT 1 FROM background_policy_revisions r WHERE r.workspace_id=background_policy_heads.workspace_id
+            AND r.owner_id=background_policy_heads.owner_id AND r.privacy_epoch=background_policy_heads.privacy_epoch
+            AND r.policy_id=background_policy_heads.policy_id AND r.revision=background_policy_heads.current_revision AND r.policy_digest=?)`)
+        .run(epoch(this.#clock()), context.workspaceId, context.ownerId, context.privacyEpoch, input.policyId,
+          input.expectedPolicyRevision, revision.policy_digest);
+      if (updated.changes > 1) return fail('background_policy_storage_invalid');
+    });
+  }
+
   #change(admissionSessionToken: string, raw: unknown, parse: (value: unknown) => ChangeBackgroundPolicyEnvelope, operation: 'pause' | 'revoke'): BackgroundPolicyReceipt {
     if (typeof admissionSessionToken !== 'string' || !admissionSessionToken) return fail('background_admission_required');
     const envelope = parse(raw);
-    return this.#kernel.withOwnedTransaction(admissionSessionToken, envelope.expectedPrivacyEpoch, (context) => {
+    const result = this.#kernel.withOwnedTransaction(admissionSessionToken, envelope.expectedPrivacyEpoch, (context) => {
       this.#auth.bindInitiatingSessionWithinTransaction(context, admissionSessionToken);
       ensureBackgroundSchema(context.db);
       const request = canonicalBackgroundJson({ operation, envelope });
@@ -264,6 +342,8 @@ export class BackgroundPolicyStore {
       return this.#saveReceipt(context, envelope.commandId, request, { schemaVersion: 1, commandId: envelope.commandId,
         operation, policyId: envelope.policyId, policyRevision: revision, status, effectiveFrom: now });
     });
+    try { this.#onCommitted?.(this.#kernel.getOwnedIdentity(admissionSessionToken)); } catch { /* committed receipt remains authoritative */ }
+    return result;
   }
 
   #head(db: Database.Database, context: OwnedTransactionContext, policyId: string): PolicyHeadRow | undefined {

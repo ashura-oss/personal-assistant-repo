@@ -1,5 +1,6 @@
 import type { JsonValue } from './kernel.js';
 import type { KnowledgeHttpApi } from './knowledgeHttp.js';
+import type { BackgroundHttpApi } from './backgroundHttp.js';
 
 /** Trusted in-process port for explicitly mounted workspace routes. */
 export interface WorkspaceHttpAdmission {
@@ -7,7 +8,7 @@ export interface WorkspaceHttpAdmission {
   readonly assertCurrent: () => void;
 }
 
-export interface WorkspaceHttpApi extends Partial<KnowledgeHttpApi> {
+export interface WorkspaceHttpApi extends Partial<KnowledgeHttpApi>, Partial<BackgroundHttpApi> {
   getSnapshot(admission: WorkspaceHttpAdmission): Promise<JsonValue>;
   refreshSnapshot(admission: WorkspaceHttpAdmission): Promise<JsonValue>;
   dispatchCommand(admission: WorkspaceHttpAdmission, envelope: unknown): Promise<JsonValue>;
