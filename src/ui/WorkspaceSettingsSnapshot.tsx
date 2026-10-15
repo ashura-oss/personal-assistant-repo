@@ -1,14 +1,14 @@
 import React from 'react';
 import { ScrollView, Text, View } from 'react-native';
 import type { WorkspaceSnapshotDTO } from '../cloud/workspaceDto';
-import type { WorkspaceActionCapability } from './workspaceCapabilities';
 import { Button } from './primitives';
 import { C, s } from './theme';
+import { WorkspaceSettingsPreferences, type WorkspaceSettingsPreferenceSave, type WorkspaceSettingsPreferenceUpdate } from './WorkspaceSettingsPreferences';
 
 export type WorkspaceSettingsDisplay = WorkspaceSnapshotDTO['state'];
-export type WorkspaceSettingsAction = WorkspaceActionCapability<() => void | Promise<void>>;
+export type WorkspaceSettingsAction = Readonly<{ available: true; action: () => void | Promise<void> }> | Readonly<{ available: false; reason: string }>;
 export type WorkspaceSettingsActions = Readonly<{
-  preferences: WorkspaceSettingsAction;
+  preferences: Readonly<{ update: WorkspaceSettingsPreferenceUpdate; save: WorkspaceSettingsPreferenceSave }>;
   accounts: WorkspaceSettingsAction;
   calendars: WorkspaceSettingsAction;
   connections: WorkspaceSettingsAction;
@@ -38,6 +38,14 @@ export function WorkspaceSettingsScreen({ display, actions, busy, onClose }: { d
       <View style={{ width: 46 }} />
     </View>
     <Text style={s.intro}>Saved workspace preferences and connected account details.</Text>
+    <WorkspaceSettingsPreferences
+      draft={{ providerEnabled: settings.mode === 'provider', speechEnabled: settings.speechEnabled === true, speechProvider: settings.speechProvider ?? 'azure', speechEndpoint: settings.speechEndpoint ?? '', effort: settings.openRouterReasoningEffort ?? 'low', maxAudioSeconds: String(settings.maxAudioSeconds), retention: settings.audioRetention }}
+      update={actions.preferences.update}
+      save={actions.preferences.save}
+      busy={busy}
+      demoMode={false}
+      description={settings.llmProvider !== 'openrouter' ? 'Legacy text-provider settings are inactive. Saving explicitly switches new text requests to OpenRouter Batch.' : undefined}
+    />
     <View style={styles.card}>
       <Text style={styles.title}>Workspace</Text>
       <Text style={styles.meta}>Mode · {settings.mode}</Text>
@@ -48,7 +56,6 @@ export function WorkspaceSettingsScreen({ display, actions, busy, onClose }: { d
       <Text style={styles.meta}>Audio retention · {settings.audioRetention}</Text>
       <Text style={styles.meta}>Speech · {settings.speechEnabled ? 'enabled' : 'disabled'} · {settings.speechProvider ?? 'not configured'}</Text>
       <Text style={styles.meta}>Maximum audio · {settings.maxAudioSeconds} seconds</Text>
-      <CapabilityButton label="Edit workspace preferences" capability={actions.preferences} busy={busy} />
     </View>
     <View style={styles.card}>
       <Text style={styles.title}>Usage</Text>

@@ -17,7 +17,7 @@ vi.mock('react-native', async () => {
     ...(onPress ? { onClick: onPress } : {}),
     ...(onChangeText ? { onChange: (event: React.ChangeEvent<HTMLTextAreaElement>) => onChangeText(event.target.value) } : {}),
   }, children);
-  return { ActivityIndicator: () => ReactModule.createElement('span', null, 'loading'), KeyboardAvoidingView: element('div'), Modal: element('div'), View: element('div'), Text: element('span'), Pressable: element('button'), ScrollView: element('div'), TextInput: element('textarea'), StyleSheet: { create: (value: unknown) => value }, Platform: { OS: 'web' } };
+  return { ActivityIndicator: () => ReactModule.createElement('span', null, 'loading'), KeyboardAvoidingView: element('div'), Modal: element('div'), View: element('div'), Text: element('span'), Pressable: element('button'), ScrollView: element('div'), TextInput: element('textarea'), Switch: ({ value, disabled, accessibilityLabel }: { value: boolean; disabled?: boolean; accessibilityLabel: string }) => ReactModule.createElement('input', { type: 'checkbox', checked: value, disabled, 'aria-label': accessibilityLabel, readOnly: true }), StyleSheet: { create: (value: unknown) => value }, Platform: { OS: 'web' } };
 });
 vi.mock('react-native-safe-area-context', async () => {
   const ReactModule = await import('react');
@@ -99,37 +99,101 @@ describe('CloudWorkspace safe DTO presentation', () => {
     expect(host.textContent).toContain('Note saved.');
   });
 
-  it('binds a saved note draft to its exact receipt and does not overwrite another selected note', async () => {
+  it('renders shared NoteDetail and saves each edited transcript against the selected note revision', async () => {
     const { snapshot } = fixture();
-    const savedId = '99999999-9999-4999-8999-999999999999';
     const updateId = '88888888-8888-4888-8888-888888888888';
     const commands: WorkspaceCommand[] = [];
     const execute = vi.fn(async (command: WorkspaceCommand): Promise<WorkspaceCommandResponse> => {
       commands.push(command);
-      const commandId = command.kind === 'notes.save' ? savedId : updateId;
-      return { schemaVersion: 1, commandId, status: 'finished', receipt: { schemaVersion: 1, commandId, kind: command.kind, objectId: command.kind === 'notes.save' ? '33333333-3333-4333-8333-333333333333' : command.kind === 'notes.updateTranscript' ? command.noteId : 'safe-object' } as WorkspaceCommandResponse['receipt'] };
+      return { schemaVersion: 1, commandId: updateId, status: 'finished', receipt: { schemaVersion: 1, commandId: updateId, kind: command.kind, objectId: command.kind === 'notes.updateTranscript' ? command.noteId : 'safe-object' } as WorkspaceCommandResponse['receipt'] };
     });
     const store = { getSnapshot: () => ({ status: 'ready', snapshot, busy: false, refreshRequired: false } satisfies CloudWorkspaceSessionState), execute, inspect: vi.fn(), refresh: vi.fn(async () => snapshot) };
     act(() => root.render(<CloudWorkspace store={store} state={store.getSnapshot()} onLogout={vi.fn()} />));
-    click('Record');
-    click('Write a note instead');
-    const composer = host.querySelector('textarea[aria-label="Your note"]') as HTMLTextAreaElement;
-    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
-    act(() => { setter?.call(composer, 'Fresh note A text'); composer.dispatchEvent(new Event('input', { bubbles: true })); });
-    click('Save note');
-    await act(async () => { await Promise.resolve(); });
     click('Library');
-    expect((host.querySelector('textarea[accessibilityLabel="Edit note text"]') as HTMLTextAreaElement | null)?.value).toBe('Fresh note A text');
+    click('Notes');
+    click('A saved DTO note');
+    expect(host.textContent).toContain('A thought, kept.');
+    expect(host.textContent).toContain('SAVED NOTE');
+    expect(host.textContent).toContain('Note deletion is not connected to a server command.');
+    expect([...host.querySelectorAll('button')].find((button) => button.textContent?.includes('Delete note'))?.disabled).toBe(true);
+    expect(host.textContent).toContain('Saving a memory suggestion is not connected to a server command.');
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+    const editorA = host.querySelector('textarea[aria-label="Transcript"]') as HTMLTextAreaElement;
+    act(() => { setter?.call(editorA, 'Edited note A only'); editorA.dispatchEvent(new Event('input', { bubbles: true })); });
+    click('Save transcript');
+    await act(async () => { await Promise.resolve(); });
     click('Second note original text');
-    const editor = host.querySelector('textarea[accessibilityLabel="Edit note text"]') as HTMLTextAreaElement;
-    expect(editor?.value ?? host.textContent).toContain('Second note original text');
-    act(() => { setter?.call(editor, 'Edited note B only'); editor.dispatchEvent(new Event('input', { bubbles: true })); });
-    click('Save changes');
+    const editorB = host.querySelector('textarea[aria-label="Transcript"]') as HTMLTextAreaElement;
+    expect(editorB?.value).toBe('Second note original text');
+    act(() => { setter?.call(editorB, 'Edited note B only'); editorB.dispatchEvent(new Event('input', { bubbles: true })); });
+    click('Save transcript');
     await act(async () => { await Promise.resolve(); });
     expect(commands).toEqual([
-      { kind: 'notes.save', transcript: 'Fresh note A text' },
+      { kind: 'notes.updateTranscript', noteId: '33333333-3333-4333-8333-333333333333', text: 'Edited note A only', expectedNoteRevision: 1 },
       { kind: 'notes.updateTranscript', noteId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', text: 'Edited note B only', expectedNoteRevision: 2 },
     ]);
+  });
+
+  it.each([
+    ['preview', 'openrouter'],
+    ['provider', 'azure'],
+  ] as const)('does not queue note assistance in %s mode with %s selected', async (mode, llmProvider) => {
+    const { state } = fixture();
+    state.settings.mode = mode;
+    state.settings.llmProvider = llmProvider;
+    const snapshot = createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: 7 });
+    const execute = vi.fn(async () => { throw new Error('must remain disabled'); });
+    const sessionState = { status: 'ready', snapshot, busy: false, refreshRequired: false } satisfies CloudWorkspaceSessionState;
+    const store = { getSnapshot: () => sessionState, execute, inspect: vi.fn(), refresh: vi.fn(async () => snapshot) };
+    act(() => root.render(<CloudWorkspace store={store} state={sessionState} onLogout={vi.fn()} />));
+    click('Library');
+    click('Notes');
+    click('A saved DTO note');
+    expect(host.textContent).toContain('Enable OpenRouter provider analysis in Settings to queue this note.');
+    const assist = [...host.querySelectorAll('button')].find((button) => button.textContent?.includes('Assist with this note'));
+    expect(assist?.disabled).toBe(true);
+    if (assist) act(() => assist.click());
+    await act(async () => { await Promise.resolve(); });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('queues the selected assistance intent only for provider-mode OpenRouter and rechecks current settings before dispatch', async () => {
+    const { state } = fixture();
+    state.settings.mode = 'provider';
+    state.settings.llmProvider = 'openrouter';
+    const snapshot = createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: 7 });
+    const commandId = '88888888-8888-4888-8888-888888888888';
+    const execute = vi.fn(async (command: WorkspaceCommand): Promise<WorkspaceCommandResponse> => ({
+      schemaVersion: 1, commandId, status: 'finished',
+      receipt: { schemaVersion: 1, commandId, kind: command.kind, objectId: '33333333-3333-4333-8333-333333333333', jobId: '99999999-9999-4999-8999-999999999999' } as WorkspaceCommandResponse['receipt'],
+    }));
+    const sessionState = { status: 'ready', snapshot, busy: false, refreshRequired: false } satisfies CloudWorkspaceSessionState;
+    const store = { getSnapshot: () => sessionState, execute, inspect: vi.fn(), refresh: vi.fn(async () => snapshot) };
+    act(() => root.render(<CloudWorkspace store={store} state={sessionState} onLogout={vi.fn()} />));
+    click('Library');
+    click('Notes');
+    click('A saved DTO note');
+    click('Show assistance options');
+    click('Summarize');
+    click('Assist with this note');
+    await act(async () => { await Promise.resolve(); });
+    expect(execute).toHaveBeenCalledExactlyOnceWith({ kind: 'assistant.batch.submitNote', noteId: '33333333-3333-4333-8333-333333333333', intent: 'summarize' });
+
+    const latestState = createWorkspaceSnapshotDTO({ getSnapshot: () => {
+      state.settings.mode = 'provider';
+      state.settings.llmProvider = 'azure';
+      return state;
+    } }, { workspaceId, privacyEpoch: 3, revision: 8 });
+    const staleGuardExecute = vi.fn(async () => { throw new Error('must not dispatch under changed settings'); });
+    const changingStore = { getSnapshot: () => ({ ...sessionState, snapshot: latestState }), execute: staleGuardExecute, inspect: vi.fn(), refresh: vi.fn(async () => latestState) };
+    act(() => root.render(<CloudWorkspace store={changingStore} state={sessionState} onLogout={vi.fn()} />));
+    click('Library');
+    click('Notes');
+    click('A saved DTO note');
+    click('Assist with this note');
+    await act(async () => { await Promise.resolve(); });
+    expect(staleGuardExecute).not.toHaveBeenCalled();
+    expect(host.textContent).toContain('Enable OpenRouter provider analysis in Settings to queue this note.');
   });
 
   it('renders validated connection, mail, note, and task display data without native credentials or audio paths', () => {

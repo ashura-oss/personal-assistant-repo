@@ -10,6 +10,8 @@ import { LibraryScreen } from '../ui/LibraryScreen';
 import { projectKnowledgeDisplay } from '../ui/libraryDisplay';
 import { safeChatMemoryEvidenceLabels } from '../ui/chatMemoryReview';
 import { WorkspaceSettingsScreen } from '../ui/WorkspaceSettingsSnapshot';
+import { noteDetailDisplayNote } from '../ui/NoteDetail';
+import { WorkspaceModals } from '../ui/WorkspaceModals';
 import { ChatSection } from '../ui/ChatSection';
 import { AssistantBatchJobCard } from '../ui/AssistantBatchJobCard';
 import { projectChatKnowledgeChoices } from '../ui/workspaceChatDisplayTypes';
@@ -19,7 +21,7 @@ import { C, s } from '../ui/theme';
 
 export type CloudWorkspaceActions = Readonly<{
   tasks: Readonly<{ complete: (taskId: string) => Promise<WorkspaceCommandResponse>; reopen: (taskId: string) => Promise<WorkspaceCommandResponse> }>;
-  notes: Readonly<{ save: (transcript: string) => Promise<WorkspaceCommandResponse>; updateTranscript: (noteId: string, text: string, expectedNoteRevision: number) => Promise<WorkspaceCommandResponse>; submitAssistance: (noteId: string, question: string) => Promise<WorkspaceCommandResponse> }>;
+  notes: Readonly<{ save: (transcript: string) => Promise<WorkspaceCommandResponse>; updateTranscript: (noteId: string, text: string, expectedNoteRevision: number) => Promise<WorkspaceCommandResponse>; submitAssistance: (noteId: string, options: { intent: 'assist' | 'summarize' | 'answer' | 'extract'; question?: string; knowledgeSelection?: readonly { kind: 'person' | 'project'; id: string }[] }) => Promise<WorkspaceCommandResponse>; transcribe: (noteId: string, expectedNoteRevision: number, onAdmitted: (envelope: WorkspaceCommandAdmission) => void) => Promise<WorkspaceCommandResponse> }>;
   chat: Readonly<{ create: () => Promise<WorkspaceCommandResponse>; submit: (attempt: ChatSendAttempt) => Promise<WorkspaceCommandResponse>; refine: (conversationId: string, parentTurnId: string, effort: 'medium' | 'high' | 'max') => Promise<WorkspaceCommandResponse>; inspect: (commandId: string) => Promise<WorkspaceCommandResponse> }>;
   batch: Readonly<{ check: (jobId: string) => Promise<WorkspaceCommandResponse> }>;
 }>;
@@ -38,7 +40,6 @@ export function CloudWorkspace({ store, state, onLogout }: { store: Pick<CloudWo
   const dto = snapshot.state;
   const [tab, setTab] = useState<WorkspaceTab>('inbox');
   const [draft, setDraft] = useState('');
-  const [noteDraft, setNoteDraft] = useState('');
   const [selectedNoteId, setSelectedNoteId] = useState<string>();
   const [selectedConversationId, setSelectedConversationId] = useState<string>();
   const [manualOpen, setManualOpen] = useState(false);
@@ -49,6 +50,8 @@ export function CloudWorkspace({ store, state, onLogout }: { store: Pick<CloudWo
   const [notice, setNotice] = useState<string>();
   const originalChatAttempts = useRef(new Map<number, Readonly<{ attempt: ChatSendAttempt; envelope: WorkspaceCommandAdmission; text: string; conversationId: string; ownerGeneration: number; knowledgeSelection: ChatSendAttempt['knowledgeSelection'] }>>());
   const selectedNote = dto.notes.find((note) => note.id === selectedNoteId);
+  const selectedNoteOwner = useRef<string | undefined>(undefined);
+  selectedNoteOwner.current = selectedNote ? `${snapshot.workspaceId}:${snapshot.privacyEpoch}:${selectedNote.id}:${selectedNote.revision}` : undefined;
   const libraryNotes = useMemo(() => dto.notes.filter((note) => note.origin !== 'assistant_chat' &&
     `${note.title} ${note.transcript}`.toLocaleLowerCase().includes(libraryQuery.toLocaleLowerCase())), [dto.notes, libraryQuery]);
   const conversations = dto.assistantChatConversations;
@@ -62,7 +65,8 @@ export function CloudWorkspace({ store, state, onLogout }: { store: Pick<CloudWo
     notes: {
       save: (transcript) => store.execute({ kind: 'notes.save', transcript }),
       updateTranscript: (noteId, text, expectedNoteRevision) => store.execute({ kind: 'notes.updateTranscript', noteId, text, expectedNoteRevision }),
-      submitAssistance: (noteId, question) => store.execute({ kind: 'assistant.batch.submitNote', noteId, intent: question.trim() ? 'answer' : 'assist', ...(question.trim() ? { question: question.trim() } : {}) }),
+      submitAssistance: (noteId, options) => store.execute({ kind: 'assistant.batch.submitNote', noteId, intent: options.intent, ...(options.question?.trim() ? { question: options.question.trim() } : {}), ...(options.knowledgeSelection?.length ? { knowledgeSelection: options.knowledgeSelection } : {}) }),
+      transcribe: (noteId, expectedNoteRevision, onAdmitted) => store.execute({ kind: 'notes.transcribe', noteId, expectedNoteRevision }, onAdmitted),
     },
     chat: {
       create: () => store.execute({ kind: 'chat.create' }),
@@ -141,27 +145,50 @@ export function CloudWorkspace({ store, state, onLogout }: { store: Pick<CloudWo
       if (receipt) {
         setManualOpen(false);
         setSelectedNoteId(receipt.objectId);
-        setNoteDraft(transcript);
         setDraft('');
         setNotice('Note saved.');
       } else setNotice('The note request is still being checked. Refresh the workspace to see its result.');
     } catch (error) { setNotice(errText(error)); }
   };
 
-  const updateNote = async () => {
-    if (!selectedNote || state.busy || noteDraft === selectedNote.transcript) return;
+  const updateNote = async (note: NonNullable<typeof selectedNote>, text: string) => {
+    if (state.busy || state.refreshRequired || text === note.transcript) return;
+    const owner = `${snapshot.workspaceId}:${snapshot.privacyEpoch}:${note.id}:${note.revision}`;
     try {
-      const response = await actions.notes.updateTranscript(selectedNote.id, noteDraft, selectedNote.revision);
-      setNotice(receiptFor(response, 'notes.updateTranscript') ? 'Note updated.' : 'The update is still being checked. Refresh the workspace to see its result.');
-    } catch (error) { setNotice(errText(error)); }
+      const response = await actions.notes.updateTranscript(note.id, text, note.revision);
+      if (selectedNoteOwner.current !== owner) return;
+      const receipt = receiptFor(response, 'notes.updateTranscript');
+      setNotice(receipt?.objectId === note.id ? 'Note updated.' : 'The update is still being checked. Refresh the workspace to see its result.');
+    } catch (error) { if (selectedNoteOwner.current === owner) setNotice(errText(error)); }
   };
 
-  const submitNoteAssistance = async () => {
-    if (!selectedNote || state.busy) return;
+  const transcribeNote = async (note: NonNullable<typeof selectedNote>, expectedRevision: number) => {
+    if (state.busy || state.refreshRequired || expectedRevision !== note.revision || note.audio?.available !== true) return;
+    const owner = `${snapshot.workspaceId}:${snapshot.privacyEpoch}:${note.id}:${note.revision}`;
+    let admitted: WorkspaceCommandAdmission | undefined;
+    setNotice(undefined);
     try {
-      const response = await actions.notes.submitAssistance(selectedNote.id, draft);
-      setNotice(receiptFor(response, 'assistant.batch.submitNote') ? 'Request queued. Check Batch history when you choose.' : 'The request is still being checked. Refresh the workspace to see its result.');
-    } catch (error) { setNotice(errText(error)); }
+      const response = await actions.notes.transcribe(note.id, expectedRevision, (envelope) => { admitted = envelope; });
+      if (selectedNoteOwner.current !== owner) return;
+      const receipt = receiptFor(response, 'notes.transcribe');
+      if (!admitted || admitted.command.kind !== 'notes.transcribe' || !receipt || receipt.kind !== 'notes.transcribe' || receipt.commandId !== admitted.commandId ||
+          receipt.objectId !== note.id || receipt.sourceRevision !== expectedRevision) {
+        setNotice('The exact transcription result is not confirmed. Refresh the workspace before editing this note.');
+        return;
+      }
+      switch (receipt.outcome) {
+        case 'completed':
+          setNotice(response.snapshot?.state.notes.some((item) => item.id === note.id && item.revision > expectedRevision)
+            ? 'Transcription completed. The updated note is available in the refreshed workspace.'
+            : 'Transcription completed. Refresh the workspace to load the saved transcript.');
+          break;
+        case 'no_speech': setNotice('No speech was detected. The transcript was left unchanged.'); break;
+        case 'cancelled': setNotice('Transcription was cancelled. The transcript was left unchanged.'); break;
+        case 'failed': setNotice('Transcription did not complete. The transcript was left unchanged.'); break;
+        case 'unknown': setNotice('The transcription result is uncertain. Check its status before trying again.'); break;
+        case 'discarded': setNotice('The note changed before transcription finished. The result was not applied. Refresh the workspace.'); break;
+      }
+    } catch (error) { if (selectedNoteOwner.current === owner) setNotice(errText(error)); }
   };
 
   const refresh = async () => { await store.refresh(); };
@@ -205,7 +232,10 @@ export function CloudWorkspace({ store, state, onLogout }: { store: Pick<CloudWo
       {settingsOpen ? <WorkspaceSettingsScreen
         display={dto}
         actions={{
-          preferences: { available: false, reason: 'Preference edits are unavailable until the server exposes a settings command.' },
+          preferences: {
+            update: { available: false, reason: 'Preference edits are unavailable until the server exposes a settings command.' },
+            save: { available: false, reason: 'Saving settings is unavailable until the server exposes a settings command.' },
+          },
           accounts: { available: false, reason: 'Account setup and credential changes are unavailable until matching server actions are available.' },
           calendars: { available: false, reason: 'Calendar setup and device calendar actions are unavailable in this browser workspace.' },
           connections: { available: false, reason: 'Connection setup, sync, and mail actions are unavailable until matching server actions are available.' },
@@ -241,7 +271,7 @@ export function CloudWorkspace({ store, state, onLogout }: { store: Pick<CloudWo
             recovery={{ available: false, reason: 'Pending native recording recovery is unavailable in this browser workspace.' }}
             busy={state.busy || state.refreshRequired}
             recent={dto.notes.slice(0, 3).map((note) => workspaceNoteCardDisplay({ ...note, recordingAvailable: note.audio?.available === true }))}
-            onOpenNote={(id) => { setSelectedNoteId(id); const note = dto.notes.find((item) => item.id === id); if (note) setNoteDraft(note.transcript); setTab('library'); }}
+            onOpenNote={(id) => { setSelectedNoteId(id); setTab('library'); }}
             onSeeAll={() => { setTab('library'); }}
             onWrite={() => setManualOpen(true)}
             storageHint="Your note is saved to this server workspace before any optional processing."
@@ -271,20 +301,86 @@ export function CloudWorkspace({ store, state, onLogout }: { store: Pick<CloudWo
             onOpenNote={(id, expectedRevision) => {
               const note = dto.notes.find((item) => item.id === id && item.revision === expectedRevision);
               if (!note) return;
-              setSelectedNoteId(id); setNoteDraft(note.transcript); setDraft('');
+              setSelectedNoteId(id); setDraft('');
             }}
             documentActions={{ available: false, reason: 'Document editing is not connected to server commands yet.' }}
             knowledgeEntityActions={{ available: false, reason: 'People and project editing are not connected to server commands yet.' }}
             knowledgeSuggestionActions={{ available: false, reason: 'Knowledge suggestion review is not connected to server commands yet.' }}
             onExport={{ available: false, reason: 'Workspace export is not connected to the browser workspace yet.' }}
           />
-          {selectedNote ? <View style={styles.detail}>
-            <Text style={s.sectionTitle}>Note</Text>
-            <TextInput multiline value={noteDraft} onChangeText={setNoteDraft} style={styles.editor} accessibilityLabel="Edit note text" />
-            <View style={styles.actions}><Button label="Save changes" disabled={state.busy || noteDraft === selectedNote.transcript || state.refreshRequired} onPress={() => void updateNote()} /><Button label="Ask about this note" tone="quiet" disabled={state.busy || state.refreshRequired} onPress={() => void submitNoteAssistance()} /></View>
-            <Text style={styles.meta}>Audio playback and export are not connected in this browser workspace.</Text>
-            {selectedNote.analysis ? <View style={styles.card}><Text style={styles.cardTitle}>Saved analysis</Text><Text style={styles.body}>{selectedNote.analysis.summary}</Text>{selectedNote.analysis.answer ? <Text style={styles.body}>{selectedNote.analysis.answer}</Text> : null}</View> : null}
-          </View> : null}
+          {selectedNote ? <WorkspaceModals
+            key={`${selectedNote.id}:${selectedNote.revision}`}
+            note={noteDetailDisplayNote(selectedNote)}
+            recordingAvailable={selectedNote.audio?.available === true}
+            importedAudioMissing={selectedNote.importOrigin?.audioMissing === true}
+            analysis={selectedNote.analysis}
+            proposals={dto.proposals.filter((proposal) => proposal.noteId === selectedNote.id).map((proposal) => ({ status: proposal.status }))}
+            busy={state.busy || state.refreshRequired}
+            preview={dto.settings.mode === 'preview'} demoMode={false}
+            providerReady={false} speechEnabled={dto.settings.speechEnabled === true} speechProvider={dto.settings.speechProvider}
+            serverManagedTranscription
+            transcriptionAttempts={dto.transcription.attempts.filter((attempt) => attempt.noteId === selectedNote.id)}
+            assistantBatchJobs={dto.assistantBatchJobs} assistantBatchActionsBlocked={state.refreshRequired || Boolean(dto.assistantBatchRecoveryStatus)}
+            people={dto.knowledge.people.map((person) => ({ id: person.id, name: person.name, revision: person.revision, archivedAt: person.archivedAt, importOrigin: person.importOrigin }))}
+            projects={dto.knowledge.projects.map((project) => ({ id: project.id, name: project.name, revision: project.revision, archivedAt: project.archivedAt, importOrigin: project.importOrigin }))}
+            actionCapabilities={{
+              delete: { available: false, reason: 'Note deletion is not connected to a server command.' },
+              confirmImportedTimeZone: { available: false, reason: 'Imported time zone confirmation is not connected to a server command.' },
+              attachRecording: { available: false, reason: 'Attaching a replacement recording is not connected to the server workspace.' },
+              playback: { available: false, reason: 'Recording playback is not available in this browser workspace yet.' },
+              exportAudio: { available: false, reason: 'Recording export is not available in this browser workspace yet.' },
+              cancelTranscription: { available: false, reason: 'Transcription cancellation is not connected to the browser workspace yet.' },
+              retryTranscriptionCleanup: { available: false, reason: 'Transcription cleanup is managed by the workspace service.' },
+              transcribe: { available: true },
+              speechSettings: { available: false, reason: 'Speech preference and credential changes are not connected to a server command yet.' },
+              assistance: dto.settings.mode === 'provider' && dto.settings.llmProvider === 'openrouter'
+                ? { available: true }
+                : { available: false, reason: 'Enable OpenRouter provider analysis in Settings to queue this note.' },
+              memorySuggestion: { available: false, reason: 'Saving a memory suggestion is not connected to a server command.' },
+              chatTransfer: { available: false, reason: 'Transcript transfer review is not connected to the browser workspace yet.' },
+              sourceCheck: { available: false, reason: 'Source rechecks are not connected to the browser workspace yet.' },
+              openProposals: { available: true },
+            }}
+            serverManagedAssistance
+            onRetryStatus={() => setNotice('Source rechecks are not connected to this browser workspace yet.')}
+            onClose={() => setSelectedNoteId(undefined)}
+            onUpdate={(text) => void updateNote(selectedNote, text)}
+            onConfirmImportedTimeZone={() => setNotice('Imported time zone confirmation is not connected to a server command.')}
+            onAssist={(options) => {
+              const owner = `${snapshot.workspaceId}:${snapshot.privacyEpoch}:${selectedNote.id}:${selectedNote.revision}`;
+              const current = store.getSnapshot();
+              const currentSnapshot = current.snapshot;
+              if (!currentSnapshot || currentSnapshot.workspaceId !== snapshot.workspaceId || currentSnapshot.privacyEpoch !== snapshot.privacyEpoch ||
+                  current.busy || current.refreshRequired || current.pendingCommand) {
+                if (selectedNoteOwner.current === owner) setNotice('Refresh the workspace and resolve any pending command before requesting note assistance.');
+                return;
+              }
+              const currentNote = currentSnapshot.state.notes.find((item) => item.id === selectedNote.id);
+              if (!currentNote || currentNote.revision !== selectedNote.revision) {
+                if (selectedNoteOwner.current === owner) setNotice('This note changed. Refresh it before requesting assistance.');
+                return;
+              }
+              if (currentSnapshot.state.settings.mode !== 'provider' || currentSnapshot.state.settings.llmProvider !== 'openrouter') {
+                if (selectedNoteOwner.current === owner) setNotice('Enable OpenRouter provider analysis in Settings to queue this note.');
+                return;
+              }
+              void actions.notes.submitAssistance(selectedNote.id, options).then((response) => {
+                if (selectedNoteOwner.current !== owner) return;
+                const receipt = receiptFor(response, 'assistant.batch.submitNote');
+                setNotice(receipt?.objectId === selectedNote.id ? 'Request queued. Check Batch history when you choose.' : 'The request is still being checked. Refresh the workspace to see its result.');
+              }).catch((error) => { if (selectedNoteOwner.current === owner) setNotice(errText(error)); });
+            }}
+            onCreateMemorySuggestion={async () => { throw new Error('Saving a memory suggestion is not connected to a server command.'); }}
+            onOpenProposals={() => { setSelectedNoteId(undefined); setTab('inbox'); setInboxSection('inbox'); setProposalFilter('pending'); }}
+            onTranscribe={(expectedRevision) => void transcribeNote(selectedNote, expectedRevision)}
+            onCancelTranscription={() => setNotice('Transcription cancellation is not connected to the browser workspace yet.')}
+            onCheckAssistantBatch={(jobId) => actions.batch.check(jobId)}
+            onOpenSpeechSettings={() => setSettingsOpen(true)}
+            onAttachRecording={() => setNotice('Attaching a replacement recording is not connected to the server workspace.')}
+            onPlay={() => setNotice('Recording playback is not available in this browser workspace yet.')}
+            onExportAudio={() => setNotice('Recording export is not available in this browser workspace yet.')}
+            onDelete={() => setNotice('Note deletion is not connected to a server command.')}
+          /> : null}
         </>
       ) : (
         <ScrollView contentContainerStyle={s.scroll}>

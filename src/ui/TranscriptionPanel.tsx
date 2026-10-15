@@ -28,8 +28,16 @@ type Props = {
   requestRunning: boolean;
   demoMode: boolean;
   cancelingAttemptId?: string;
+  cancelAvailable?: boolean;
+  cancelUnavailableReason?: string;
+  transcribeAvailable?: boolean;
+  transcribeUnavailableReason?: string;
+  serverManaged?: boolean;
   requestCleanupAttemptIds?: readonly string[];
   retryingCleanupAttemptId?: string;
+  retryCleanupUnavailableReason?: string;
+  settingsAvailable?: boolean;
+  settingsUnavailableReason?: string;
   onTranscribe: (expectedRevision: number) => void;
   onCancel: (attemptId: string) => void;
   onRetryRequestCleanup?: (attemptId: string) => Promise<void>;
@@ -125,8 +133,16 @@ export function TranscriptionPanel({
   requestRunning,
   demoMode,
   cancelingAttemptId,
+  cancelAvailable = true,
+  cancelUnavailableReason,
+  transcribeAvailable = true,
+  transcribeUnavailableReason,
+  serverManaged = false,
   requestCleanupAttemptIds = [],
   retryingCleanupAttemptId,
+  retryCleanupUnavailableReason,
+  settingsAvailable = true,
+  settingsUnavailableReason,
   onTranscribe,
   onCancel,
   onRetryRequestCleanup,
@@ -146,7 +162,7 @@ export function TranscriptionPanel({
     : latest.dispatchStarted && ["unknown", "failed", "cancelled", "discarded"].includes(latest.outcome)));
   const cleanupPending = new Set(requestCleanupAttemptIds);
   const hasPendingCleanup = attempts.some((attempt) => cleanupPending.has(attempt.id));
-  const canStart = recordingAttached && enabled && configured && !busy && !active && !hasPendingCleanup && !durationUnavailable && !demoMode;
+  const canStart = recordingAttached && enabled && (configured || serverManaged) && transcribeAvailable && !busy && !active && !hasPendingCleanup && !durationUnavailable && !demoMode;
   const sampleCanStart = recordingAttached && enabled && configured && !busy && !active && !hasPendingCleanup && !durationUnavailable && demoMode;
 
   const retryCleanup = async (attemptId: string) => {
@@ -172,7 +188,8 @@ export function TranscriptionPanel({
       {!enabled ? (
         <Text style={s.setupBody}>{selectedProviderLabel} transcription is off. It is separate from the AI analysis setting.</Text>
       ) : null}
-      {enabled && !configured ? (
+      {serverManaged && recordingAttached && enabled ? <Text style={styles.helper}>This uses the current workspace speech settings. The service checks its saved provider setup when you choose to transcribe.</Text> : null}
+      {!serverManaged && enabled && !configured ? (
         <Text style={s.setupBody}>{speechProvider === "openrouter"
           ? "Save an OpenRouter API key in Settings before transcribing this recording. Your recording remains local until you choose Transcribe."
           : "Add an Azure Speech endpoint and key in Settings before starting a request."}</Text>
@@ -214,10 +231,11 @@ export function TranscriptionPanel({
             <Button
               label={cancelingAttemptId === active.id ? "Resolving transcription…" : requestRunning ? "Cancel transcription" : "Recover interrupted transcription"}
               tone="quiet"
-              disabled={cancelingAttemptId === active.id}
+              disabled={!cancelAvailable || cancelingAttemptId === active.id}
               onPress={() => onCancel(active.id)}
             />
           ) : null}
+          {active && !cancelAvailable && cancelUnavailableReason ? <Text style={styles.meta}>{cancelUnavailableReason}</Text> : null}
         </View>
       ) : null}
       {cleanupAttempts.length ? (
@@ -233,12 +251,12 @@ export function TranscriptionPanel({
                   disabled={retryingCleanupAttemptId === attempt.id}
                   onPress={() => void retryCleanup(attempt.id)}
                 />
-              ) : null}
+              ) : retryCleanupUnavailableReason ? <Text style={styles.meta}>{retryCleanupUnavailableReason}</Text> : null}
             </View>
           ))}
         </View>
       ) : null}
-      {recordingAttached && enabled && configured && !durationUnavailable ? (
+      {recordingAttached && enabled && (configured || serverManaged) && transcribeAvailable && !durationUnavailable ? (
         <Button
           label={demoMode
             ? retryAfterUnknown ? "Run sample upload again" : "Run sample transcription"
@@ -250,10 +268,12 @@ export function TranscriptionPanel({
         <Button
           label={enabled ? `Set up ${selectedProviderLabel}` : `Enable ${selectedProviderLabel} transcription`}
           tone="quiet"
-          disabled={demoMode || busy || durationUnavailable}
+          disabled={demoMode || busy || durationUnavailable || !transcribeAvailable || !settingsAvailable}
           onPress={onOpenSettings}
         />
       ) : null}
+      {!transcribeAvailable && transcribeUnavailableReason ? <Text style={styles.meta}>{transcribeUnavailableReason}</Text> : null}
+      {!settingsAvailable && settingsUnavailableReason ? <Text style={styles.meta}>{settingsUnavailableReason}</Text> : null}
       {ordered.length > 1 ? (
         <>
           <Button

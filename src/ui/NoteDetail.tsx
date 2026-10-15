@@ -18,6 +18,24 @@ import { AssistantBatchJobCard } from "./AssistantBatchJobCard";
 import { VoiceChatTransferReview } from "./VoiceChatTransferReview";
 import { C, s } from "./theme";
 import type { MoreComputeReviewActions } from "./MoreComputeReview";
+import type { WorkspaceCapabilityStatus } from "./workspaceCapabilities";
+
+export type NoteDetailCapabilityStatuses = Readonly<{
+  delete: WorkspaceCapabilityStatus;
+  confirmImportedTimeZone: WorkspaceCapabilityStatus;
+  attachRecording: WorkspaceCapabilityStatus;
+  playback: WorkspaceCapabilityStatus;
+  exportAudio: WorkspaceCapabilityStatus;
+  cancelTranscription: WorkspaceCapabilityStatus;
+  transcribe: WorkspaceCapabilityStatus;
+  speechSettings: WorkspaceCapabilityStatus;
+  retryTranscriptionCleanup: WorkspaceCapabilityStatus;
+  memorySuggestion: WorkspaceCapabilityStatus;
+  chatTransfer: WorkspaceCapabilityStatus;
+  sourceCheck: WorkspaceCapabilityStatus;
+  openProposals: WorkspaceCapabilityStatus;
+  assistance: WorkspaceCapabilityStatus;
+}>;
 
 function validTimeZone(value: string) {
   try {
@@ -33,11 +51,29 @@ type WorkspaceProposal = WorkspaceSnapshotDTO["state"]["proposals"][number];
 type WorkspacePerson = WorkspaceSnapshotDTO["state"]["knowledge"]["people"][number];
 type WorkspaceProject = WorkspaceSnapshotDTO["state"]["knowledge"]["projects"][number];
 
-type NoteImportDisplay = Pick<NonNullable<WorkspaceNote["importOrigin"]>, "kind" | "audioMissing" | "originalTimeZoneUnknown">;
+type NoteImportDisplay = Pick<NonNullable<WorkspaceNote["importOrigin"]>, "kind"> & Partial<Pick<NonNullable<WorkspaceNote["importOrigin"]>, "audioMissing" | "originalTimeZoneUnknown">>;
 export type NoteDetailDisplayNote = Pick<WorkspaceNote,
   "id" | "transcript" | "revision" | "createdAt" | "capturedAt" | "captureTimeZone" |
   "audioAttachment" | "durationSeconds"
 > & { readonly importOrigin?: NoteImportDisplay };
+
+export function noteDetailDisplayNote(note: WorkspaceNote): NoteDetailDisplayNote {
+  return {
+    id: note.id,
+    transcript: note.transcript,
+    revision: note.revision,
+    createdAt: note.createdAt,
+    ...(note.capturedAt !== undefined ? { capturedAt: note.capturedAt } : {}),
+    ...(note.captureTimeZone !== undefined ? { captureTimeZone: note.captureTimeZone } : {}),
+    durationSeconds: note.durationSeconds,
+    ...(note.audioAttachment ? { audioAttachment: note.audioAttachment } : {}),
+    ...(note.importOrigin ? { importOrigin: {
+      kind: note.importOrigin.kind,
+      ...(note.importOrigin.audioMissing !== undefined ? { audioMissing: note.importOrigin.audioMissing } : {}),
+      ...(note.importOrigin.originalTimeZoneUnknown !== undefined ? { originalTimeZoneUnknown: note.importOrigin.originalTimeZoneUnknown } : {}),
+    } } : {}),
+  };
+}
 
 export function canUseSavedTranscriptInChat(note: Pick<NoteDetailDisplayNote, "transcript" | "importOrigin" | "captureTimeZone">, draft: string, busy: boolean, blocked: boolean): boolean {
   return !busy && !blocked && draft === note.transcript && Boolean(draft.trim()) &&
@@ -57,6 +93,8 @@ export type NoteDetailProps = {
   speechProvider?: "azure" | "openrouter";
   providerReady: boolean;
   speechEnabled: boolean;
+  serverManagedTranscription?: boolean;
+  serverManagedAssistance?: boolean;
   transcriptionAttempts: readonly TranscriptionPanelAttempt[];
   assistantBatchJobs?: readonly AssistantBatchJobDTO[];
   assistantBatchActionsBlocked?: boolean;
@@ -104,6 +142,7 @@ export type NoteDetailProps = {
   onPlay: () => void;
   onExportAudio: () => void;
   onDelete: () => void;
+  actionCapabilities?: Partial<NoteDetailCapabilityStatuses>;
 };
 
 const intents: { key: AssistIntent; label: string }[] = [
@@ -126,6 +165,8 @@ export function NoteDetail({
   speechProvider = "azure",
   providerReady,
   speechEnabled,
+  serverManagedTranscription = false,
+  serverManagedAssistance = false,
   transcriptionAttempts,
   assistantBatchJobs = [],
   assistantBatchActionsBlocked = false,
@@ -156,7 +197,9 @@ export function NoteDetail({
   onPlay,
   onExportAudio,
   onDelete,
+  actionCapabilities,
 }: NoteDetailProps) {
+  const status = (value: WorkspaceCapabilityStatus | undefined): WorkspaceCapabilityStatus => value ?? { available: true };
   const [text, setText] = useState(note.transcript);
   const [importedTimeZone, setImportedTimeZone] = useState(
     Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
@@ -198,7 +241,8 @@ export function NoteDetail({
     Boolean(text.trim()) &&
     !dirty &&
     !busy &&
-      !timeZoneUnconfirmed &&
+    !timeZoneUnconfirmed &&
+    status(actionCapabilities?.assistance).available &&
     !(effectiveIntent === "answer" && !question.trim());
   const availableEntities = [
     ...people.map((item) => ({ kind: 'person' as const, id: item.id, name: item.name, archived: Boolean(item.archivedAt), importedCopy: item.importOrigin?.kind === 'backup_knowledge' })),
@@ -236,11 +280,13 @@ export function NoteDetail({
           <IconButton
             name="trash-outline"
             label="Delete note"
+            disabled={!status(actionCapabilities?.delete).available}
             onPress={onDelete}
             color={C.red}
           />
         </View>
-        <Text style={s.kicker}>SAVED LOCALLY</Text>
+        {actionCapabilities?.delete && !actionCapabilities.delete.available ? <Text style={s.disclaimer}>{actionCapabilities.delete.reason}</Text> : null}
+        <Text style={s.kicker}>SAVED NOTE</Text>
         <Text style={s.analysisSource}>
           {note.importOrigin?.originalTimeZoneUnknown
             ? `Imported timestamp ${note.capturedAt ?? note.createdAt} · original time zone unavailable`
@@ -267,12 +313,14 @@ export function NoteDetail({
               value={importedTimeZone}
               onChangeText={setImportedTimeZone}
               placeholder="Asia/Singapore"
+              editable={status(actionCapabilities?.confirmImportedTimeZone).available}
             />
             <Button
               label="Confirm capture time zone"
-              disabled={busy || !validTimeZone(importedTimeZone)}
+              disabled={busy || !status(actionCapabilities?.confirmImportedTimeZone).available || !validTimeZone(importedTimeZone)}
               onPress={() => onConfirmImportedTimeZone(importedTimeZone.trim())}
             />
+            {actionCapabilities?.confirmImportedTimeZone && !actionCapabilities.confirmImportedTimeZone.available ? <Text style={s.disclaimer}>{actionCapabilities.confirmImportedTimeZone.reason}</Text> : null}
           </View>
         ) : null}
         {importedAudioMissing && !recordingAvailable ? (
@@ -286,9 +334,10 @@ export function NoteDetail({
               label={dirty ? "Save transcript before attaching" : "Attach a recording"}
               tone="quiet"
               icon="attach-outline"
-              disabled={busy || dirty}
+              disabled={busy || dirty || !status(actionCapabilities?.attachRecording).available}
               onPress={onAttachRecording}
             />
+            {actionCapabilities?.attachRecording && !actionCapabilities.attachRecording.available ? <Text style={s.disclaimer}>{actionCapabilities.attachRecording.reason}</Text> : null}
           </View>
         ) : null}
         {note.audioAttachment ? (
@@ -310,16 +359,18 @@ export function NoteDetail({
               label={demoMode ? "Playback unavailable in sample preview" : "Play recording"}
               tone="quiet"
               icon="play-circle-outline"
-              disabled={demoMode}
+              disabled={demoMode || !status(actionCapabilities?.playback).available}
               onPress={onPlay}
             />
             <Button
               label={demoMode ? "Audio export unavailable in sample preview" : "Export audio"}
               tone="quiet"
               icon="download-outline"
-              disabled={demoMode}
+              disabled={demoMode || !status(actionCapabilities?.exportAudio).available}
               onPress={onExportAudio}
             />
+            {actionCapabilities?.playback && !actionCapabilities.playback.available ? <Text style={s.disclaimer}>{actionCapabilities.playback.reason}</Text> : null}
+            {actionCapabilities?.exportAudio && !actionCapabilities.exportAudio.available ? <Text style={s.disclaimer}>{actionCapabilities.exportAudio.reason}</Text> : null}
             {demoMode ? (
               <Text style={s.analysisSource}>
                 This sample keeps attached audio in memory and does not create a playable production recording.
@@ -366,7 +417,7 @@ export function NoteDetail({
               onCancel={voiceChatTransfer.onCancel}
             />
           </>
-        ) : null}
+        ) : actionCapabilities?.chatTransfer && !actionCapabilities.chatTransfer.available ? <><Button label="Use saved transcript in Chat" tone="quiet" disabled /><Text style={s.disclaimer}>{actionCapabilities.chatTransfer.reason}</Text></> : null}
         {(!demoMode || transcriptionDemoMode) &&
         (recordingAvailable || transcriptionAttempts.length > 0) ? (
           <TranscriptionPanel
@@ -380,12 +431,20 @@ export function NoteDetail({
             requestRunning={transcriptionRequestRunning}
             demoMode={transcriptionDemoMode}
             cancelingAttemptId={cancelingTranscriptionId}
+            cancelAvailable={status(actionCapabilities?.cancelTranscription).available}
+            cancelUnavailableReason={actionCapabilities?.cancelTranscription && !actionCapabilities.cancelTranscription.available ? actionCapabilities.cancelTranscription.reason : undefined}
+            transcribeAvailable={status(actionCapabilities?.transcribe).available}
+            transcribeUnavailableReason={actionCapabilities?.transcribe && !actionCapabilities.transcribe.available ? actionCapabilities.transcribe.reason : undefined}
             requestCleanupAttemptIds={transcriptionRequestCleanupAttemptIds}
             retryingCleanupAttemptId={retryingTranscriptionCleanupId}
+            retryCleanupUnavailableReason={actionCapabilities?.retryTranscriptionCleanup && !actionCapabilities.retryTranscriptionCleanup.available ? actionCapabilities.retryTranscriptionCleanup.reason : undefined}
+            settingsAvailable={status(actionCapabilities?.speechSettings).available}
+            settingsUnavailableReason={actionCapabilities?.speechSettings && !actionCapabilities.speechSettings.available ? actionCapabilities.speechSettings.reason : undefined}
             onTranscribe={onTranscribe}
             onCancel={onCancelTranscription}
             onRetryRequestCleanup={onRetryTranscriptionRequestCleanup}
             onOpenSettings={onOpenSpeechSettings}
+            serverManaged={serverManagedTranscription}
           />
         ) : null}
 
@@ -412,7 +471,8 @@ export function NoteDetail({
               Get a summary, answer, decisions, and possible next steps from
               this saved note.
             </Text>
-            {preview ? (
+            {serverManagedAssistance ? <Text style={s.analysisSource}>Provider analysis is submitted as a delayed Batch job. A request starts only when you choose Assist.</Text> : null}
+            {preview && !serverManagedAssistance ? (
               <Text style={s.previewText}>
                 Local preview · AI not connected
               </Text>
@@ -485,8 +545,10 @@ export function NoteDetail({
                 <Button
                   label="Check source status again"
                   tone="quiet"
+                  disabled={!status(actionCapabilities?.sourceCheck).available}
                   onPress={onRetryStatus}
                 />
+                {actionCapabilities?.sourceCheck && !actionCapabilities.sourceCheck.available ? <Text style={s.disclaimer}>{actionCapabilities.sourceCheck.reason}</Text> : null}
               </View>
             ) : analysisStatusChecking ? (
               <View style={s.analysisStale}>
@@ -498,9 +560,11 @@ export function NoteDetail({
                   Some sources changed since this response. Refresh when ready.
                 </Text>
                 <Text style={s.analysisSource}>
-                  {preview
+                  {preview && !serverManagedAssistance
                     ? "A refreshed preview stays local. No refresh happens automatically."
-                    : "Refreshing may use one provider request. No refresh happens automatically."}
+                    : serverManagedAssistance
+                      ? "Refreshing submits a separate delayed Batch request. No request starts automatically."
+                      : "Refreshing may use one provider request. No refresh happens automatically."}
                 </Text>
               </View>
             ) : null}
@@ -521,7 +585,9 @@ export function NoteDetail({
                 })
               }
             />
-            <Button label="Suggest a memory connection" tone="quiet" icon="git-branch-outline" disabled={busy || dirty || !note.transcript.trim()} onPress={() => { setSuggestionQuote(''); setSuggestionValue(''); setSuggestionMessage(''); setSuggestionOpen(true); }} />
+            {actionCapabilities?.assistance && !actionCapabilities.assistance.available ? <Text style={s.disclaimer}>{actionCapabilities.assistance.reason}</Text> : null}
+            <Button label="Suggest a memory connection" tone="quiet" icon="git-branch-outline" disabled={busy || dirty || !note.transcript.trim() || !status(actionCapabilities?.memorySuggestion).available} onPress={() => { setSuggestionQuote(''); setSuggestionValue(''); setSuggestionMessage(''); setSuggestionOpen(true); }} />
+            {actionCapabilities?.memorySuggestion && !actionCapabilities.memorySuggestion.available ? <Text style={s.disclaimer}>{actionCapabilities.memorySuggestion.reason}</Text> : null}
             {suggestionOpen ? <View style={s.setupCard}>
               <View style={s.sectionHeader}><Text style={s.setupTitle}>Ground it in this note</Text><IconButton name="close" label="Close memory suggestion form" onPress={() => setSuggestionOpen(false)} /></View>
               <Text style={s.knowledgeFootnote}>This saves a suggestion for review. It does not make another model request.</Text>
@@ -536,7 +602,7 @@ export function NoteDetail({
               <Field label="Exact quote from this saved note" value={suggestionQuote} onChangeText={setSuggestionQuote} multiline placeholder="Copy an exact sentence from the transcript" />
               {!exactQuote && suggestionQuote.trim() ? <Text style={s.knowledgeError}>The quote must appear exactly in this saved transcript.</Text> : null}
               {suggestionMessage ? <Text accessibilityRole="alert" style={s.knowledgeError}>{suggestionMessage}</Text> : null}
-              <Button label="Save for memory review" disabled={busy || !selectedSuggestionTarget || !exactQuote || (suggestionOperation === 'add_fact' && !suggestionValue.trim()) || (suggestionOperation === 'add_contact' && !suggestionValue.trim()) || (suggestionOperation === 'add_source_link' && !suggestionValue.trim()) || (suggestionOperation === 'add_member' && !suggestionPersonId)} onPress={() => {
+              <Button label="Save for memory review" disabled={busy || !status(actionCapabilities?.memorySuggestion).available || !selectedSuggestionTarget || !exactQuote || (suggestionOperation === 'add_fact' && !suggestionValue.trim()) || (suggestionOperation === 'add_contact' && !suggestionValue.trim()) || (suggestionOperation === 'add_source_link' && !suggestionValue.trim()) || (suggestionOperation === 'add_member' && !suggestionPersonId)} onPress={() => {
                 if (!selectedSuggestionTarget || !exactQuote) return;
                 const entityKind = suggestionTargetKind;
                 const entityId = suggestionTargetId;
@@ -694,11 +760,15 @@ export function NoteDetail({
                   </>
                 ) : null}
                 {reviewableProposalCount ? (
-                  <Button
-                    label={`Review ${reviewableProposalCount} suggested action${reviewableProposalCount === 1 ? "" : "s"}`}
-                    tone="quiet"
-                    onPress={onOpenProposals}
-                  />
+                  <>
+                    <Button
+                      label={`Review ${reviewableProposalCount} suggested action${reviewableProposalCount === 1 ? "" : "s"}`}
+                      tone="quiet"
+                      disabled={!status(actionCapabilities?.openProposals).available}
+                      onPress={onOpenProposals}
+                    />
+                    {actionCapabilities?.openProposals && !actionCapabilities.openProposals.available ? <Text style={s.disclaimer}>{actionCapabilities.openProposals.reason}</Text> : null}
+                  </>
                 ) : null}
               </View>
             ) : null}

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
-import { ActivityIndicator, Alert, Modal, Platform, Pressable, ScrollView, Switch, Text, TextInput, View } from "react-native";
+import { ActivityIndicator, Alert, Modal, Platform, Pressable, ScrollView, Text, TextInput, View } from "react-native";
 import Ionicons from "@expo/vector-icons/Ionicons";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import type { Note, Proposal, AppState, AppSettings, AppController, AccountCapability, SavedProactiveRule, StartupRecoveryStatus, MailReplyBatchReviewPlan, MailReplyBatchSourcesRefreshResult, MailReplyContextSelection, MailReplyConversationContextDiscovery } from "./src/core";
@@ -8,7 +8,6 @@ import type { DispatchRecoveryPlan, DispatchRecoveryStatus } from "./src/dispatc
 import type { StartupRecoveryPlan } from "./src/storage/startupRecovery";
 import type { KnowledgeChange, KnowledgeReference, KnowledgeSuggestionReview } from "./src/knowledge/types";
 import { SpeechTranscriptionError } from "./src/transcription/types";
-import { OPENROUTER_SPEECH_DEFAULT_MODEL } from "./src/transcription/openRouterSpeechProfiles";
 import { RecordingAutoStopGate } from "./src/audio/autoStop";
 import type { AudioCapture } from "./src/audio/types";
 import type { PendingCaptureJournalPort, PendingCaptureReceipt, PendingCaptureSafeStatus } from "./src/audio/pendingCaptureService.types";
@@ -28,6 +27,7 @@ import { ReviewSheet } from "./src/ui/ReviewSheet";
 import type { MoreComputeReviewActions } from "./src/ui/MoreComputeReview";
 import { moreComputeConfigurationFingerprint, moreComputeWorkspaceIsBlocked } from "./src/ui/moreComputeOwnership";
 import { WorkspaceModals } from "./src/ui/WorkspaceModals";
+import { WorkspaceSettingsPreferences } from "./src/ui/WorkspaceSettingsPreferences";
 import { InboxWorkspaceContent, inboxAccountDisplay, inboxDeviceCalendarDisplay } from "./src/ui/InboxWorkspaceContent";
 import { LibraryScreen } from "./src/ui/LibraryScreen";
 import { findCurrentNativeDetailNote } from "./src/ui/nativeDetailSelection";
@@ -4832,102 +4832,24 @@ function SettingsScreen({
         {mailAlertTapStatus ? (
           <MailAlertTapStatusCard status={mailAlertTapStatus} />
         ) : null}
-        <View style={s.providerToggle}>
-          <View style={{ flex: 1 }}>
-            <Text style={s.accountName}>Enable provider analysis</Text>
-            <Text style={s.accountSub}>
-              New text requests use delayed OpenRouter Batch. Nothing is sent until you submit a request.
-            </Text>
-          </View>
-          <Switch
-            accessibilityLabel="Enable provider analysis"
-            value={providerEnabled}
-            onValueChange={setProviderEnabled}
-            disabled={demoMode}
-            trackColor={{ false: C.border, true: C.sage }}
-            thumbColor={C.text}
-          />
-        </View>
-        <View style={s.providerToggle}>
-          <View style={{ flex: 1 }}>
-            <Text style={s.accountName}>Enable {speechProvider === "azure" ? "Azure" : "OpenRouter"} transcription</Text>
-            <Text style={s.accountSub}>
-              Separate from AI analysis. A saved recording is uploaded only after you choose Transcribe.
-            </Text>
-          </View>
-          <Switch
-            accessibilityLabel={`Enable ${speechProvider === "azure" ? "Azure" : "OpenRouter"} transcription`}
-            value={speechEnabled}
-            onValueChange={setSpeechEnabled}
-            disabled={demoMode}
-            trackColor={{ false: C.border, true: C.sage }}
-            thumbColor={C.text}
-          />
-        </View>
-        <Text style={s.sectionTitle}>Speech provider</Text>
-        <View style={s.pills}>
-          {(["azure", "openrouter"] as const).map((value) => (
-            <Pressable
-              key={value}
-              accessibilityRole="radio"
-              accessibilityState={{ checked: speechProvider === value }}
-              accessibilityLabel={`Use ${value === "azure" ? "Azure Speech" : "OpenRouter Speech"}`}
-              onPress={() => {
-                if (value === "openrouter") setSpeechKey("");
-                setSpeechProvider(value);
-              }}
-              style={[s.pill, speechProvider === value && s.pillActive]}
-            >
-              <Text style={[s.pillText, speechProvider === value && s.pillTextActive]}>
-                {value === "azure" ? "Azure Speech" : "OpenRouter"}
-              </Text>
-            </Pressable>
-          ))}
-        </View>
-        {speechProvider === "openrouter" ? (
-          <View style={s.analysisStale}>
-            <Text style={s.accountName}>OpenRouter transcription model</Text>
-            <Text accessibilityLabel={`OpenRouter transcription model ${OPENROUTER_SPEECH_DEFAULT_MODEL}`} style={s.analysisText}>
-              {OPENROUTER_SPEECH_DEFAULT_MODEL}
-            </Text>
-            <Text style={s.disclaimer}>
-              Choose Transcribe on a saved recording to upload it to OpenRouter. Usage appears only when reported; no cost is estimated. This does not use Batch.
-            </Text>
-          </View>
-        ) : null}
-        <Text style={s.sectionTitle}>Text provider</Text>
-        <View style={s.analysisStale}>
-          <Text style={s.accountName}>OpenRouter Batch · openai/gpt-6-luna:batch</Text>
-          <Text style={s.disclaimer}>
-            Requests may take up to 24 hours. OpenRouter retains batch inputs and results for 30 days or until the batch is deleted. Provider cost appears only when reported; no cost is estimated.
-          </Text>
-          {state.settings.llmProvider !== "openrouter" ? <Text style={s.disclaimer}>Legacy text-provider settings are inactive. Saving these Settings explicitly switches new text requests to OpenRouter Batch.</Text> : null}
-        </View>
-        {speechProvider === "azure" ? <Field
-          label="Speech endpoint"
-          value={speechEndpoint}
-          onChangeText={setSpeechEndpoint}
-          placeholder="Speech resource endpoint"
-          keyboardType="url"
-        /> : null}
-        <Text style={s.label}>Reasoning effort</Text>
-        <View style={s.pills}>
-          {(["none", "low"] as const).map((v) => (
-            <Pressable
-              key={v}
-              onPress={() => setEffort(v)}
-              style={[s.pill, effort === v && s.pillActive]}
-            >
-              <Text style={[s.pillText, effort === v && s.pillTextActive]}>
-                {v}
-              </Text>
-            </Pressable>
-          ))}
-        </View>
-        <Button
-          label="Save OpenRouter Batch settings"
-          disabled={demoMode || busy}
-          onPress={() => void saveSettings()}
+        <WorkspaceSettingsPreferences
+          draft={{ providerEnabled, speechEnabled, speechProvider, speechEndpoint, effort, maxAudioSeconds, retention }}
+          update={{ available: true, action: (patch) => {
+            if (patch.providerEnabled !== undefined) setProviderEnabled(patch.providerEnabled);
+            if (patch.speechEnabled !== undefined) setSpeechEnabled(patch.speechEnabled);
+            if (patch.speechProvider !== undefined) {
+              if (patch.speechProvider === "openrouter") setSpeechKey("");
+              setSpeechProvider(patch.speechProvider);
+            }
+            if (patch.speechEndpoint !== undefined) setSpeechEndpoint(patch.speechEndpoint);
+            if (patch.effort !== undefined) setEffort(patch.effort);
+            if (patch.maxAudioSeconds !== undefined) setMaxAudioSeconds(patch.maxAudioSeconds);
+            if (patch.retention !== undefined) setRetention(patch.retention);
+          } }}
+          save={{ available: true, action: saveSettings }}
+          busy={busy}
+          demoMode={demoMode}
+          description={state.settings.llmProvider !== "openrouter" ? "Legacy text-provider settings are inactive. Saving explicitly switches new text requests to OpenRouter Batch." : undefined}
         />
         {demoMode ? null : (
           <>
@@ -4993,29 +4915,6 @@ function SettingsScreen({
             ) : null}
           </>
         )}
-        <Text style={s.sectionTitle}>Recording limits & retention</Text>
-        <Field
-          label="Maximum recording length · seconds"
-          value={maxAudioSeconds}
-          onChangeText={setMaxAudioSeconds}
-          keyboardType="numeric"
-        />
-        <Text style={s.label}>Audio retention</Text>
-        <View style={s.pills}>
-          {(["keep", "delete_after_transcription"] as const).map((v) => (
-            <Pressable
-              key={v}
-              onPress={() => setRetention(v)}
-              style={[s.pill, retention === v && s.pillActive]}
-            >
-              <Text style={[s.pillText, retention === v && s.pillTextActive]}>
-                {v === "keep"
-                  ? "Keep until deleted"
-                  : "Delete after transcription"}
-              </Text>
-            </Pressable>
-          ))}
-        </View>
         {assistantBatchJobs.length > 0 || assistantBatchRecoveryMessage ? (
           <AssistantBatchHistorySection
             jobs={assistantBatchJobs}
@@ -5092,11 +4991,6 @@ function SettingsScreen({
         }} />
         <Text style={s.disclaimer}>Reloads changes saved while the app was away. It does not check mail; use Inbox for that.</Text>
         {localRefreshMessage ? <Text accessibilityLiveRegion="polite" style={s.disclaimer}>{localRefreshMessage}</Text> : null}
-        <Button
-          label="Save limits & retention"
-          tone="quiet"
-          onPress={() => void saveSettings()}
-        />
         <ProactiveRulesSection
           rules={state.proactive.rules}
           accounts={state.accounts}

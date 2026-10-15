@@ -7,7 +7,14 @@ export function IconButton({ name, onPress, label, color = C.text, disabled = fa
   return <Pressable accessibilityRole="button" accessibilityLabel={label} disabled={disabled} onPress={onPress} style={({ pressed }) => [s.iconButton, disabled && s.disabled, pressed && !disabled && s.pressed]}><Ionicons accessible={false} importantForAccessibility="no" name={name} size={21} color={color} /></Pressable>;
 }
 
-export function Button({ label, onPress, tone = 'light', disabled = false, icon }: { label: string; onPress: () => void; tone?: 'light' | 'quiet' | 'danger'; disabled?: boolean; icon?: React.ComponentProps<typeof Ionicons>['name'] }) {
+type ButtonProps = {
+  label: string;
+  tone?: 'light' | 'quiet' | 'danger';
+  disabled?: boolean;
+  icon?: React.ComponentProps<typeof Ionicons>['name'];
+} & ({ disabled?: boolean; onPress: () => void } | { disabled: true; onPress?: undefined });
+
+export function Button({ label, onPress, tone = 'light', disabled = false, icon }: ButtonProps) {
   return <Pressable accessibilityRole="button" accessibilityLabel={label} disabled={disabled} onPress={onPress} style={({ pressed }) => [s.button, tone === 'quiet' && s.quietButton, tone === 'danger' && s.dangerButton, disabled && s.disabled, pressed && !disabled && s.pressed]}>{icon ? <Ionicons accessible={false} importantForAccessibility="no" name={icon} size={16} color={tone === 'light' ? C.bg : tone === 'danger' ? C.red : C.text} /> : null}<Text style={[s.buttonText, tone === 'quiet' && s.quietText, tone === 'danger' && s.dangerText]}>{label}</Text></Pressable>;
 }
 
