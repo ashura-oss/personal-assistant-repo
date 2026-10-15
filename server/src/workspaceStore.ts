@@ -13,9 +13,55 @@ export interface SnapshotCommitParticipantInput<TState extends object> {
 
 /** Trusted synchronous side effects that must commit atomically with a persisted snapshot. */
 export interface SnapshotCommitParticipant<TState extends object = Record<string, unknown>> {
+  /** Synchronous transactional validation/checkpoint work before the snapshot revision advances. */
+  beforeCommit?(context: OwnedTransactionContext, input: SnapshotCommitParticipantInput<TState>): void;
   commit(context: OwnedTransactionContext, input: SnapshotCommitParticipantInput<TState>): readonly string[] | void;
   /** Starts best-effort physical work only after the snapshot acknowledgement was adopted. */
   afterAcknowledged?(intentIds: readonly string[]): void;
+}
+
+/** Composes independent trusted participants without installing a second save hook. */
+export function composeSnapshotCommitParticipants<TState extends object>(
+  entries: readonly Readonly<{ readonly name: string; readonly participant: SnapshotCommitParticipant<TState> }>[],
+): SnapshotCommitParticipant<TState> {
+  if (!Array.isArray(entries) || entries.length < 1 || entries.length > 16) throw new Error('workspace_snapshot_commit_participant_unavailable');
+  const names = new Set<string>();
+  const frozen = entries.map((entry) => {
+    if (!entry || typeof entry.name !== 'string' || !/^[a-z][a-z0-9_-]{0,31}$/.test(entry.name) || names.has(entry.name)) {
+      throw new Error('workspace_snapshot_commit_participant_unavailable');
+    }
+    names.add(entry.name);
+    validateSnapshotCommitParticipant(entry.participant);
+    return Object.freeze({ name: entry.name, participant: entry.participant });
+  });
+  return Object.freeze({
+    beforeCommit: (context: OwnedTransactionContext, input: SnapshotCommitParticipantInput<TState>) => {
+      for (const entry of frozen) {
+        const result = entry.participant.beforeCommit?.(context, input);
+        rejectAsyncParticipantResult(result);
+      }
+    },
+    commit: (context: OwnedTransactionContext, input: SnapshotCommitParticipantInput<TState>) => {
+      const routed: string[] = [];
+      for (const entry of frozen) {
+        const result = entry.participant.commit(context, input);
+        if (isPromiseLike(result)) { void Promise.resolve(result).catch(() => undefined); throw new Error('workspace_snapshot_commit_participant_must_be_synchronous'); }
+        if (result !== undefined && (!Array.isArray(result) || result.some((id) => typeof id !== 'string'))) {
+          throw new Error('workspace_snapshot_commit_participant_invalid_result');
+        }
+        for (const id of result ?? []) routed.push(`${entry.name}:${id}`);
+      }
+      return Object.freeze(routed);
+    },
+    afterAcknowledged: (routed: readonly string[]) => {
+      if (!Array.isArray(routed)) return;
+      for (const entry of frozen) {
+        const prefix = `${entry.name}:`;
+        const ids = routed.filter((value) => typeof value === 'string' && value.startsWith(prefix)).map((value) => value.slice(prefix.length));
+        try { entry.participant.afterAcknowledged?.(Object.freeze(ids)); } catch { /* Durable participant work remains retryable. */ }
+      }
+    },
+  });
 }
 
 export interface ServerWorkspaceStoreOptions<TState extends object = Record<string, unknown>> {
@@ -134,11 +180,16 @@ export class ServerWorkspaceStore<TState extends object = Record<string, unknown
               previous.schema_version !== loaded.schemaVersion || Buffer.byteLength(previous.snapshot_json, 'utf8') > SERVER_SNAPSHOT_MAX_BYTES) {
             throw new Error('Workspace changed while preparing the snapshot and private cleanup.');
           }
-          const previousSnapshot = parseState<TState>(previous.snapshot_json);
+          const previousSnapshot = deepFreezeSnapshot(parseState<TState>(previous.snapshot_json));
+          const nextSnapshot = deepFreezeSnapshot(JSON.parse(serialized) as TState);
+          const participantInput = Object.freeze({ previousSnapshot, nextSnapshot,
+            nextRevision: context.revision + 1, ...(ticket ? { commandId: ticket.idempotencyKey } : {}) });
+          const beforeCommitResult = participant.beforeCommit?.(context, participantInput);
+          rejectAsyncParticipantResult(beforeCommitResult);
           const revision = this.commitExistingSnapshotPath(loaded, serialized, accountGenerations, ticket, options);
+          if (revision !== participantInput.nextRevision) throw new Error('workspace_snapshot_commit_revision_mismatch');
           context.assertActive();
-          const intentIds = participant.commit(context, { previousSnapshot, nextSnapshot: JSON.parse(serialized) as TState,
-            nextRevision: revision, ...(ticket ? { commandId: ticket.idempotencyKey } : {}) });
+          const intentIds = participant.commit(context, participantInput);
           if (isPromiseLike(intentIds)) { void Promise.resolve(intentIds).catch(() => undefined); throw new Error('workspace_snapshot_commit_participant_must_be_synchronous'); }
           if (intentIds !== undefined && (!Array.isArray(intentIds) || intentIds.some((id) => typeof id !== 'string'))) {
             throw new Error('workspace_snapshot_commit_participant_invalid_result');
@@ -273,6 +324,12 @@ function parseState<TState extends object>(raw: string): TState {
   return value as TState;
 }
 
+function deepFreezeSnapshot<T>(value: T): T {
+  if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value;
+  for (const child of Object.values(value as Record<string, unknown>)) deepFreezeSnapshot(child);
+  return Object.freeze(value);
+}
+
 function canonicalSnapshot(state: object): string {
   let parsed: unknown;
   try { parsed = JSON.parse(JSON.stringify(state)); } catch { throw new Error('Workspace state cannot be serialized as JSON.'); }
@@ -301,9 +358,15 @@ function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
   return value !== null && (typeof value === 'object' || typeof value === 'function') &&
     typeof (value as { then?: unknown }).then === 'function';
 }
+function rejectAsyncParticipantResult(value: unknown): void {
+  if (!isPromiseLike(value)) return;
+  void Promise.resolve(value).catch(() => undefined);
+  throw new Error('workspace_snapshot_commit_participant_must_be_synchronous');
+}
 function validateSnapshotCommitParticipant<TState extends object>(participant: SnapshotCommitParticipant<TState>): void {
   if (!participant || typeof participant !== 'object' || typeof participant.commit !== 'function' ||
-      participant.commit.constructor?.name === 'AsyncFunction' || participant.afterAcknowledged !== undefined &&
+      participant.commit.constructor?.name === 'AsyncFunction' || participant.beforeCommit !== undefined &&
+      (typeof participant.beforeCommit !== 'function' || participant.beforeCommit.constructor?.name === 'AsyncFunction') || participant.afterAcknowledged !== undefined &&
       (typeof participant.afterAcknowledged !== 'function' || participant.afterAcknowledged.constructor?.name === 'AsyncFunction')) {
     throw new Error('workspace_snapshot_commit_participant_unavailable');
   }
