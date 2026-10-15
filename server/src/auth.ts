@@ -8,6 +8,7 @@ const PASSWORD_R = 8;
 const PASSWORD_P = 1;
 const PASSWORD_BYTES = 32;
 const SALT_BYTES = 32;
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const CHALLENGE_TTL_MS = 10 * 60 * 1000;
@@ -117,6 +118,7 @@ export class AuthService {
   readonly #secret: Buffer;
   readonly #now: () => number;
   readonly #canonicalOrigin: string;
+  readonly #db: Database.Database;
   readonly #afterPasswordHashForTesting: (() => Promise<void>) | undefined;
   private hashBusy = false;
   private closed = false;
@@ -129,7 +131,7 @@ export class AuthService {
     this.#now = options.now ?? Date.now;
     this.#canonicalOrigin = this.validateConfiguredOrigin(options.canonicalOrigin, options.allowLocalHttp === true);
     this.#afterPasswordHashForTesting = options.afterPasswordHashForTesting;
-    try { this.kernel.withTrustedDatabaseTransaction((db) => this.initialize(db)); }
+    try { this.#db = this.kernel.withTrustedDatabaseTransaction((db) => { this.initialize(db); return db; }); }
     catch (error) { this.#secret.fill(0); throw error; }
   }
 
@@ -458,14 +460,64 @@ export class AuthService {
     });
   }
 
-  private sessionProjection(context: OwnedTransactionContext, sessionToken: string): SessionDTO {
-    const row = context.db.prepare('SELECT * FROM auth_sessions WHERE token_hash=?').get(sha256(sessionToken)) as
-      { owner_id: string; workspace_id: string; auth_generation: number; csrf_hash: string; expires_at: number; revoked_at: number | null } | undefined;
+  /** Trusted internal binding helper. Returns only a SHA-256 session binding, never the raw bearer token. */
+  bindInitiatingSessionWithinTransaction(context: OwnedTransactionContext, rawSession: string): string {
+    this.assertOpen();
+    this.assertOwnedContext(context);
+    validToken(rawSession, 'initiating_session_inactive');
+    const sessionHash = sha256(rawSession);
+    if (!this.liveAuthSession(context, sessionHash)) {
+      reject('initiating_session_inactive', 'The OAuth initiating session is no longer active.');
+    }
+    return sessionHash;
+  }
+
+  /** Confirms that an already hashed initiating session remains live in this exact owned transaction. */
+  assertInitiatingSessionWithinTransaction(context: OwnedTransactionContext, sessionHash: string): void {
+    this.assertOpen();
+    this.assertOwnedContext(context);
+    if (typeof sessionHash !== 'string' || !/^[0-9a-f]{64}$/.test(sessionHash) || !this.liveAuthSession(context, sessionHash)) {
+      reject('initiating_session_inactive', 'The OAuth initiating session is no longer active.');
+    }
+  }
+
+  private assertOwnedContext(context: OwnedTransactionContext): void {
+    if (!context || context.db !== this.#db || !UUID_V4.test(context.ownerId) || !UUID_V4.test(context.workspaceId) ||
+        !Number.isSafeInteger(context.privacyEpoch) || context.privacyEpoch < 0 || typeof context.assertActive !== 'function') {
+      reject('invalid_transaction_context', 'A current owned transaction context is required.');
+    }
+    context.assertActive();
+    const workspace = context.db.prepare('SELECT owner_id,privacy_epoch FROM workspaces WHERE id=?').get(context.workspaceId) as
+      { owner_id: string; privacy_epoch: number } | undefined;
+    if (!workspace || workspace.owner_id !== context.ownerId || workspace.privacy_epoch !== context.privacyEpoch) {
+      reject('initiating_session_inactive', 'The OAuth initiating session is no longer active.');
+    }
+  }
+
+  private liveAuthSession(context: OwnedTransactionContext, sessionHash: string): { csrf_hash: string } | undefined {
+    const row = context.db.prepare(`SELECT a.owner_id AS auth_owner_id,a.workspace_id AS auth_workspace_id,
+      a.auth_generation,a.csrf_hash,a.expires_at AS auth_expires_at,a.revoked_at AS auth_revoked_at,
+      s.owner_id AS session_owner_id,s.workspace_id AS session_workspace_id,s.expires_at AS session_expires_at,
+      s.revoked_at AS session_revoked_at,s.privacy_epoch AS session_privacy_epoch
+      FROM auth_sessions a JOIN sessions s ON s.token_hash=a.token_hash WHERE a.token_hash=?`).get(sessionHash) as
+      { auth_owner_id: string; auth_workspace_id: string; auth_generation: number; csrf_hash: string;
+        auth_expires_at: number; auth_revoked_at: number | null; session_owner_id: string; session_workspace_id: string;
+        session_expires_at: number; session_revoked_at: number | null; session_privacy_epoch: number } | undefined;
     const owner = context.db.prepare('SELECT owner_id,workspace_id,auth_generation FROM auth_owner WHERE singleton=1').get() as
       Pick<OwnerRow, 'owner_id' | 'workspace_id' | 'auth_generation'> | undefined;
-    if (!row || !owner || row.revoked_at !== null || row.expires_at <= context.now || row.owner_id !== context.ownerId ||
-      row.workspace_id !== context.workspaceId || owner.owner_id !== context.ownerId || owner.workspace_id !== context.workspaceId ||
-      owner.auth_generation !== row.auth_generation) return Object.freeze({ authenticated: false });
+    if (!row || !owner || row.auth_revoked_at !== null || row.session_revoked_at !== null ||
+        row.auth_expires_at <= context.now || row.session_expires_at <= context.now ||
+        row.auth_owner_id !== context.ownerId || row.session_owner_id !== context.ownerId ||
+        row.auth_workspace_id !== context.workspaceId || row.session_workspace_id !== context.workspaceId ||
+        row.session_privacy_epoch !== context.privacyEpoch || owner.owner_id !== context.ownerId ||
+        owner.workspace_id !== context.workspaceId || owner.auth_generation !== row.auth_generation) return undefined;
+    return { csrf_hash: row.csrf_hash };
+  }
+
+  private sessionProjection(context: OwnedTransactionContext, sessionToken: string): SessionDTO {
+    this.assertOwnedContext(context);
+    const row = this.liveAuthSession(context, sha256(sessionToken));
+    if (!row) return Object.freeze({ authenticated: false });
     const csrfToken = hmac(this.#secret, 'session-csrf:v1', sessionToken);
     if (!constantTimeHexEqual(row.csrf_hash, sha256(csrfToken))) return Object.freeze({ authenticated: false });
     return Object.freeze({ authenticated: true, workspaceId: context.workspaceId,
