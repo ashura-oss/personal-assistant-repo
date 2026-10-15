@@ -38,6 +38,7 @@ export type WorkspaceClient = Readonly<{
   inspectCommand(commandId?: string): Promise<WorkspaceCommandResponse>;
   inspectRecoveredCommand(entry: WorkspaceCommandHistoryEntry): Promise<WorkspaceCommandResponse>;
   listCommandHistory(cursor?: string): Promise<WorkspaceCommandHistoryPage>;
+  cancelTranscription(commandId: string): Promise<'cancellation_requested' | 'not_running'>;
   getPendingCommand(): PendingWorkspaceCommand | undefined;
   dispose(): void;
 }>;
@@ -130,6 +131,7 @@ export function createWebWorkspaceClient(session: AuthenticatedSession, options:
   let highestRevision = -1;
   let pending: HeldCommand | undefined;
   let operation = 0;
+  const cancellationControllers = new Set<AbortController>();
 
   function assertUsable(): void {
     if (disposed) throw new WorkspaceClientError('disposed', 'This workspace client is no longer active.');
@@ -403,6 +405,50 @@ export function createWebWorkspaceClient(session: AuthenticatedSession, options:
     catch { throw new WorkspaceClientError('malformed', 'The command history could not be confirmed.'); }
   }
 
+  async function cancelTranscription(commandId: string): Promise<'cancellation_requested' | 'not_running'> {
+    assertUsable();
+    let parsedId: string;
+    try { parsedId = parseWorkspaceCommandId(commandId); }
+    catch { throw new WorkspaceClientError('malformed', 'The workspace command identifier is invalid.'); }
+    const controller = new AbortController();
+    cancellationControllers.add(controller);
+    let timedOut = false;
+    let rejectTimeout!: (error: Error) => void;
+    const timeoutPromise = new Promise<never>((_, reject) => { rejectTimeout = reject; });
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+      rejectTimeout(new WorkspaceClientError('timeout', 'The cancellation request timed out.'));
+    }, timeoutMs);
+    try {
+      const response = await Promise.race([fetcher(`/api/workspace/commands/${parsedId}/cancel-transcription`, {
+        method: 'POST', credentials: 'same-origin', redirect: 'error', cache: 'no-store', signal: controller.signal,
+        headers: { 'Content-Type': 'application/json', 'X-Still-CSRF': session.csrfToken }, body: '{}',
+      }), timeoutPromise]);
+      assertUsable();
+      if (!response.ok) throw new WorkspaceClientError('http', fixedHttpMessage(response.status), response.status);
+      const raw = await Promise.race([response.json(), timeoutPromise]);
+      assertUsable();
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw) || Object.getPrototypeOf(raw) !== Object.prototype) throw new Error('invalid');
+      const keys = Reflect.ownKeys(raw);
+      if (keys.length !== 3 || keys.some((key) => typeof key !== 'string' || !['schemaVersion', 'commandId', 'status'].includes(key)) ||
+          keys.some((key) => { const desc = Object.getOwnPropertyDescriptor(raw, key); return !desc?.enumerable || !Object.hasOwn(desc, 'value'); })) throw new Error('invalid');
+      const result = raw as Record<string, unknown>;
+      if (result.schemaVersion !== 1 || result.commandId !== parsedId ||
+          (result.status !== 'cancellation_requested' && result.status !== 'not_running')) throw new Error('invalid');
+      return result.status;
+    } catch (error) {
+      if (error instanceof WorkspaceClientError) throw error;
+      if (timedOut) throw new WorkspaceClientError('timeout', 'The cancellation request timed out.');
+      if (controller.signal.aborted) throw new WorkspaceClientError('disposed', 'The workspace request was cancelled.');
+      if (error instanceof TypeError) throw new WorkspaceClientError('network', 'The workspace connection was interrupted.');
+      throw new WorkspaceClientError('malformed', 'The cancellation acknowledgement could not be confirmed.');
+    } finally {
+      clearTimeout(timeout);
+      cancellationControllers.delete(controller);
+    }
+  }
+
   return Object.freeze({
     getSnapshot: () => readSnapshot('/api/workspace/snapshot', 'GET'),
     refresh: () => readSnapshot('/api/workspace/refresh', 'POST'),
@@ -410,9 +456,12 @@ export function createWebWorkspaceClient(session: AuthenticatedSession, options:
     inspectCommand,
     inspectRecoveredCommand,
     listCommandHistory,
+    cancelTranscription,
     getPendingCommand: () => pending ? Object.freeze({ commandId: pending.envelope.commandId, command: pending.envelope.command }) : undefined,
     dispose: () => {
       disposed = true;
+      for (const controller of cancellationControllers) controller.abort();
+      cancellationControllers.clear();
       operation += 1;
       pending = undefined;
       snapshot = undefined;
@@ -432,6 +481,8 @@ function expectedReceiptFor(envelope: WorkspaceCommandEnvelope) {
         captureId: command.captureId, captureRevision: command.captureRevision };
     case 'notes.updateTranscript':
       return { commandId: envelope.commandId, kind: command.kind, objectId: command.noteId };
+    case 'notes.transcribe':
+      return { commandId: envelope.commandId, kind: command.kind, objectId: command.noteId, sourceRevision: command.expectedNoteRevision };
     case 'assistant.batch.submitNote':
       return { commandId: envelope.commandId, kind: command.kind, objectId: command.noteId };
     case 'assistant.batch.check':

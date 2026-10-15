@@ -78,6 +78,7 @@ import { BACKUP_LIMITS, PORTABLE_BACKUP_FORMAT, canonicalPortableContent, legacy
 import type { ImportedBackupArchive, PortableBackupV4, PortableKnowledgeCohort } from '../backup';
 import { createPortableChatHistory, materializeInertChatHistory } from '../chat/portable';
 import { SpeechTranscriptionError, validateTranscriptionState, validateSpeechAudioSnapshot } from '../transcription';
+export { SpeechTranscriptionError };
 import type { AnySpeechTranscriptionResult, OpenRouterSpeechTranscriptionResult, SpeechAudioSnapshot, SpeechAttemptCode, TranscriptionAttempt, TranscriptionState } from '../transcription';
 import { OPENROUTER_SPEECH_DEFAULT_MODEL, OPENROUTER_SPEECH_DEFAULT_PROFILE_VERSION } from '../transcription/openRouterSpeechProfiles';
 import type { PreparedSpeechAudio, SpeechAudioService } from '../audio/speechUpload.types';
@@ -8141,6 +8142,25 @@ export class AppControllerImpl implements AppController {
       if (existing.sourceRevision !== requestedRevision) return Promise.reject(new Error('A transcription is already running for a different note revision.'));
       return existing.promise;
     }
+    return this.startTranscriptionJob(id, requestedRevision).promise;
+  }
+
+  /** Server-owned journal commands get a unique job and exact signal closure; they never share native jobs. */
+  startOwnedTranscription(id: string, options: { expectedRevision: number }): Readonly<{
+    attemptId: string; result: Promise<Note>; requestCancellation: () => 'cancellation_requested' | 'not_running';
+  }> {
+    const requestedRevision = options.expectedRevision;
+    if (!Number.isSafeInteger(requestedRevision) || requestedRevision < 1) throw new Error('workspace_transcription_revision_invalid');
+    if (this.transcriptionJobs.has(id)) throw new Error('A transcription is already running for this note.');
+    const job = this.startTranscriptionJob(id, requestedRevision);
+    return Object.freeze({ attemptId: job.attemptId, result: job.promise, requestCancellation: () => {
+      if (this.transcriptionJobs.get(id) !== job) return 'not_running';
+      job.controller.abort();
+      return 'cancellation_requested';
+    } });
+  }
+
+  private startTranscriptionJob(id: string, requestedRevision: number): ControllerTranscriptionJob {
     const controller = new AbortController();
     const attemptId = this.newId();
     const job: ControllerTranscriptionJob = {
@@ -8153,7 +8173,7 @@ export class AppControllerImpl implements AppController {
       });
     job.promise = promise;
     this.transcriptionJobs.set(id, job);
-    return promise;
+    return job;
   }
 
   private async transcribeNoteInternal(id: string, requestedRevision: number, attemptId: string, controller: AbortController,

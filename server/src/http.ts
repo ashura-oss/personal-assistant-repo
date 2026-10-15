@@ -729,6 +729,24 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
     return;
   }
+  const workspaceCancelMatch = /^\/api\/workspace\/commands\/([^/]+)\/cancel-transcription$/.exec(pathname);
+  if (workspaceCancelMatch) {
+    if (request.method !== 'POST') { response.setHeader('Allow', 'POST'); throw problem(405, 'method_not_allowed'); }
+    if (hasQuery) throw problem(400, 'bad_request');
+    if (!workspaceApi) throw problem(503, 'service_unavailable');
+    const commandId = workspaceCancelMatch[1]!;
+    if (!COMMAND_ID_RE.test(commandId)) throw problem(400, 'bad_request');
+    const admission = workspaceMutationAdmission(request, auth, canonicalOrigin);
+    try {
+      exactObject(await readJsonBody(request, response), []);
+      admission.assertCurrent();
+      if (admissionOpen && !admissionOpen()) throw problem(503, 'service_unavailable');
+      const result = workspaceApi.cancelTranscription(admission, commandId);
+      admission.assertCurrent();
+      if (!response.destroyed) sendJson(response, 200, result);
+    } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
+    return;
+  }
   const workspaceCommandPrefix = '/api/workspace/commands/';
   if (pathname.startsWith(workspaceCommandPrefix)) {
     if (request.method !== 'GET') { response.setHeader('Allow', 'GET'); throw problem(405, 'method_not_allowed'); }

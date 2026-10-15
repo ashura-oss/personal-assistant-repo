@@ -5,6 +5,7 @@ import { parseWorkspaceCommandEnvelope } from '../src/cloud/workspaceCommands';
 import { createWebWorkspaceClient, WorkspaceClientError, WorkspaceCommandNotStartedError, WorkspaceCommandUnknownError } from '../src/web/workspaceClient';
 import { parseWorkspaceCommandHistoryPage } from '../src/cloud/workspaceCommandHistory';
 import { WORKSPACE_COMMAND_HISTORY_KINDS as SERVER_HISTORY_KINDS, workspaceCommandKindFromJournal as serverJournalKind } from '../server/src/workspaceCommandHistory';
+import { WORKSPACE_COMMAND_HISTORY_KINDS as CLIENT_HISTORY_KINDS, workspaceCommandKindFromJournal as clientJournalKind } from '../src/cloud/workspaceCommandHistory';
 import type { AuthenticatedSession } from '../src/web/authClient';
 
 const workspaceId = '7b906fca-65c1-4bd2-b18e-1b56cc6f48a8';
@@ -56,12 +57,52 @@ function deferred<T>() {
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers(); });
 
 describe('same-origin web workspace command client', () => {
-  it('keeps the server projection map and browser history decoder on the same ten public command kinds', () => {
+  it('keeps the server projection map and browser history decoder on the same eleven public command kinds', () => {
     expect(SERVER_HISTORY_KINDS).toEqual(['tasks.complete', 'tasks.reopen', 'chat.create', 'notes.save', 'notes.capture.adopt',
-      'notes.updateTranscript', 'assistant.batch.submitNote', 'assistant.batch.check', 'chat.submit', 'chat.refine']);
-    for (const kind of SERVER_HISTORY_KINDS) expect(serverJournalKind(kind.toLowerCase())).toBe(kind);
+      'notes.updateTranscript', 'assistant.batch.submitNote', 'assistant.batch.check', 'chat.submit', 'chat.refine', 'notes.transcribe']);
+    expect(CLIENT_HISTORY_KINDS).toEqual(SERVER_HISTORY_KINDS);
+    for (const kind of SERVER_HISTORY_KINDS) {
+      expect(serverJournalKind(kind.toLowerCase())).toBe(kind);
+      expect(clientJournalKind(kind.toLowerCase())).toBe(kind);
+    }
     expect(parseWorkspaceCommandHistoryPage({ entries: [{ updatedAt: 2, createdAt: 1, status: 'finished',
       kind: 'tasks.complete', commandId }], schemaVersion: 1 }).entries[0]?.commandId).toBe(commandId);
+  });
+
+  it('signals cancellation independently while a command POST remains pending', async () => {
+    const commandResponse = deferred<ReturnType<typeof body>>();
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(body(snapshot(1)))
+      .mockReturnValueOnce(commandResponse.promise)
+      .mockResolvedValueOnce(body({ schemaVersion: 1, commandId, status: 'cancellation_requested' }));
+    const client = makeClient(fetcher);
+    await client.getSnapshot();
+    const command = client.execute({ kind: 'chat.create' });
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledTimes(2));
+    await expect(client.cancelTranscription(commandId)).resolves.toBe('cancellation_requested');
+    expect(fetcher.mock.calls[2]?.[0]).toBe(`/api/workspace/commands/${commandId}/cancel-transcription`);
+    expect(fetcher.mock.calls[2]?.[1]).toMatchObject({ method: 'POST', body: '{}', credentials: 'same-origin' });
+    expect(client.getPendingCommand()?.commandId).toBe(commandId);
+    commandResponse.resolve(body({ schemaVersion: 1, commandId, status: 'finished', receipt: {
+      schemaVersion: 1, commandId, kind: 'chat.create', objectId: '00000000-0000-4000-8000-000000000099',
+    }, snapshot: snapshot(1) }));
+    await expect(command).resolves.toMatchObject({ status: 'finished' });
+    expect(client.getPendingCommand()).toBeUndefined();
+    client.dispose();
+  });
+
+  it('bounds cancellation even when fetch ignores abort and rejects a late acknowledgement', async () => {
+    vi.useFakeTimers();
+    const late = deferred<ReturnType<typeof body>>();
+    const fetcher = vi.fn().mockReturnValueOnce(late.promise);
+    const client = createWebWorkspaceClient(session, { assertCurrent() {}, decodeSnapshot: () => snapshot(1), fetcher: fetcher as never, timeoutMs: 10 });
+    const cancellation = client.cancelTranscription(commandId);
+    const timedOut = expect(cancellation).rejects.toMatchObject({ kind: 'timeout' });
+    await vi.advanceTimersByTimeAsync(10);
+    await timedOut;
+    late.resolve(body({ schemaVersion: 1, commandId, status: 'cancellation_requested' }));
+    expect(client.getPendingCommand()).toBeUndefined();
+    client.dispose();
   });
 
   it('decodes bounded history and explicitly inspects a recovered receipt without clearing unrelated pending work', async () => {

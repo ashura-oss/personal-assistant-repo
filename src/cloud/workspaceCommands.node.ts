@@ -19,11 +19,25 @@ export async function dispatchWorkspaceCommand(runtime: OwnedWorkspaceRuntime, a
   untrustedEnvelope: unknown): Promise<WorkspaceCommandResponse> {
   const envelope = parseWorkspaceCommandEnvelope(untrustedEnvelope);
   const command = envelope.command;
-  const result = await runtime.executeCommand({ ...admission, expectedRevision: envelope.expectedRevision,
-    expectedPrivacyEpoch: envelope.expectedPrivacyEpoch, idempotencyKey: envelope.commandId,
-    // Journal kinds use a stable lowercase namespace; the canonical envelope
-    // still binds the exact public discriminant and input bytes.
-    kind: command.kind.toLowerCase(), canonicalBody: canonicalWorkspaceCommand(envelope) }, async (controller) => {
+  const commandInput = { ...admission, expectedRevision: envelope.expectedRevision, expectedPrivacyEpoch: envelope.expectedPrivacyEpoch,
+    idempotencyKey: envelope.commandId, kind: command.kind.toLowerCase(), canonicalBody: canonicalWorkspaceCommand(envelope) };
+  if (command.kind === 'notes.transcribe') {
+    const result = await runtime.executeTranscriptionCommand(commandInput, { noteId: command.noteId, expectedNoteRevision: command.expectedNoteRevision });
+    const expectation = expectedReceipt(envelope.commandId, command);
+    if (result.admission.fresh) {
+      const commandReceipt = parseWorkspaceCommandReceipt(result.result, expectation);
+      return Object.freeze({ schemaVersion: 1, commandId: envelope.commandId, status: 'finished', receipt: commandReceipt,
+        ...(result.snapshot ? { snapshot: result.snapshot } : {}) });
+    }
+    const status = result.admission.status as WorkspaceCommandStatus;
+    if (status === 'finished') {
+      const commandReceipt = parseWorkspaceCommandReceipt(result.admission.receipt, expectation);
+      return Object.freeze({ schemaVersion: 1, commandId: envelope.commandId, status, receipt: commandReceipt,
+        ...(result.snapshot ? { snapshot: result.snapshot } : {}) });
+    }
+    return Object.freeze({ schemaVersion: 1, commandId: envelope.commandId, status });
+  }
+  const result = await runtime.executeCommand(commandInput, async (controller) => {
     switch (command.kind) {
       case 'tasks.complete': return receipt(envelope, command, { objectId: (await controller.completeTask(command.taskId)).id });
       case 'tasks.reopen': return receipt(envelope, command, { objectId: (await controller.reopenTask(command.taskId)).id });
@@ -108,6 +122,7 @@ function expectedReceipt(commandId: string, command: WorkspaceCommand) {
     case 'notes.capture.adopt': return { commandId, kind: command.kind, objectId: command.captureId,
       captureId: command.captureId, captureRevision: command.captureRevision };
     case 'notes.updateTranscript': return { commandId, kind: command.kind, objectId: command.noteId };
+    case 'notes.transcribe': return { commandId, kind: command.kind, objectId: command.noteId, sourceRevision: command.expectedNoteRevision };
     case 'assistant.batch.submitNote': return { commandId, kind: command.kind, objectId: command.noteId };
     case 'assistant.batch.check': return { commandId, kind: command.kind, objectId: command.jobId };
     case 'chat.submit': return { commandId, kind: command.kind, objectId: command.conversationId };

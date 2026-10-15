@@ -12,4 +12,5 @@ export interface WorkspaceHttpApi {
   dispatchCommand(admission: WorkspaceHttpAdmission, envelope: unknown): Promise<JsonValue>;
   inspectCommand(admission: WorkspaceHttpAdmission, commandId: string): JsonValue;
   listCommandHistory(admission: WorkspaceHttpAdmission, cursor?: string): JsonValue;
+  cancelTranscription(admission: WorkspaceHttpAdmission, commandId: string): JsonValue;
 }

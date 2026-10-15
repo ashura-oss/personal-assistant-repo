@@ -29,7 +29,8 @@ function validateAttempt(value: unknown): TranscriptionAttempt {
   const row = value as Record<string, unknown>;
   const allowedAttemptKeys = new Set(['id', 'leaseId', 'noteId', 'sourceRevision', 'source', 'endpoint', 'provider', 'profileVersion', 'model', 'locale', 'createdAt', 'prepared', 'reservation', 'dispatchStarted', 'outcome', 'terminalAt', 'code', 'durationMilliseconds', 'billedEstimateSeconds', 'rateEstimated', 'transcriptSha256', 'actualUsage', 'unknownCharge', 'lateObservations']);
   if (Object.keys(row).some((key) => !allowedAttemptKeys.has(key))) throw new Error('Transcription attempt contains unsupported fields.');
-  if (typeof row.id !== 'string' || !UUID.test(row.id) || typeof row.noteId !== 'string' || !UUID.test(row.noteId)) throw new Error('Transcription attempt identity is invalid.');
+  if (typeof row.id !== 'string' || !UUID.test(row.id) || typeof row.noteId !== 'string' || !row.noteId.length ||
+      new TextEncoder().encode(row.noteId).byteLength > 1024 || /[\u0000-\u001f\u007f]/.test(row.noteId)) throw new Error('Transcription attempt identity is invalid.');
   if (typeof row.leaseId !== 'string' || !UUID.test(row.leaseId)) throw new Error('Transcription upload lease is invalid.');
   const sourceRevision = safeInteger(row.sourceRevision, 1, Number.MAX_SAFE_INTEGER, 'Transcription source revision');
   if (!row.source || typeof row.source !== 'object' || Array.isArray(row.source)) throw new Error('Transcription source snapshot is invalid.');

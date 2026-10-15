@@ -225,6 +225,23 @@ test('authenticated workspace snapshot, refresh, command dispatch, and receipt i
   } finally { await f.close(); }
 });
 
+test('transcription cancellation is an authenticated, exact empty-body signal route', async () => {
+  const f = await fixture();
+  try {
+    const auth = await login(f);
+    const commandId = randomUUID();
+    const path = `/api/workspace/commands/${commandId}/cancel-transcription`;
+    assert.equal((await f.request(path, { method: 'POST', headers: { Cookie: auth.cookie, Origin: f.canonicalOrigin,
+      'Content-Type': 'application/json' }, body: '{}' })).status, 403);
+    assert.equal((await f.request(`${path}?retry=1`, { method: 'POST', headers: mutationHeaders(f, auth), body: '{}' })).status, 400);
+    assert.equal((await f.request(path, { method: 'POST', headers: mutationHeaders(f, auth), body: '{"cancel":true}' })).status, 400);
+    assert.equal((await f.request(path, { method: 'GET', headers: { Cookie: auth.cookie } })).status, 405);
+    const response = await f.request(path, { method: 'POST', headers: mutationHeaders(f, auth), body: '{}' });
+    assert.equal(response.status, 200, await response.clone().text());
+    assert.deepEqual(await response.json(), { schemaVersion: 1, commandId, status: 'not_running' });
+  } finally { await f.close(); }
+});
+
 test('authenticated raw audio upload, inspect, adoption and range playback use the runtime HTTP bridge', async () => {
   const f = await fixture({ withAudioApi: true });
   try {

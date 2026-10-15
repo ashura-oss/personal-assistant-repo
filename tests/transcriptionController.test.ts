@@ -63,6 +63,26 @@ async function readyApp(store = new MemoryStore(), speech = speechClient(async (
 }
 
 describe('explicit transcription controller lifecycle', () => {
+  it('starts a non-shared owned transcription with an exact, signal-only cancellation handle', async () => {
+    const started = deferred<void>();
+    const client = speechClient(async ({ signal, onPrepared, leaseId }) => {
+      await onPrepared!(makePrepared(leaseId!));
+      started.resolve();
+      await new Promise<void>((resolve) => signal?.addEventListener('abort', () => resolve(), { once: true }));
+      throw new SpeechTranscriptionError('cancelled', 'cancelled', false);
+    });
+    const { app, note } = await readyApp(new MemoryStore(), client);
+    const handle = app.startOwnedTranscription(note.id, { expectedRevision: note.revision });
+    expect(Object.isFrozen(handle)).toBe(true);
+    expect(handle.attemptId).toEqual(expect.any(String));
+    await started.promise;
+    expect(() => app.startOwnedTranscription(note.id, { expectedRevision: note.revision })).toThrow(/already running/i);
+    expect(handle.requestCancellation()).toBe('cancellation_requested');
+    await expect(handle.result).rejects.toThrow(/cancelled/i);
+    expect(handle.requestCancellation()).toBe('not_running');
+    expect(client.transcribe).toHaveBeenCalledTimes(1);
+  });
+
   it('persists the attempt and lease before audio preparation, and joins an identical in-flight request', async () => {
     const started = deferred<void>();
     const finish = deferred<void>();

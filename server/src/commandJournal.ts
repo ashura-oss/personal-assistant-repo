@@ -375,12 +375,49 @@ export class CommandJournal {
         return parseJson(row.receipt_json);
       }
       if (row.status === 'inspect_required') throw new Error('This command requires manual inspection and cannot be finished automatically.');
+      if (ticket.kind === 'notes.transcribe' && receipt.value && typeof receipt.value === 'object' && !Array.isArray(receipt.value) &&
+          (receipt.value as Record<string, JsonValue>).kind === 'notes.transcribe') {
+        this.validateTranscriptionFinish(context, row, receipt.value as Record<string, JsonValue>);
+      }
       const update = context.db.prepare(`UPDATE async_command_journal SET status='finished',updated_at=?,receipt_json=?
         WHERE workspace_id=? AND idempotency_key=? AND ticket_id=? AND ticket_digest=? AND status IN ('claimed','checkpointed')`)
         .run(this.clock(), receipt.text, ticket.workspaceId, ticket.idempotencyKey, ticket.ticketId, digest(ticket.capability));
       if (update.changes !== 1) throw new Error('The command finish receipt could not be recorded.');
       return receipt.value;
     });
+  }
+
+  /** Bind the named public transcription receipt to its exact durable local terminal checkpoint. */
+  private validateTranscriptionFinish(context: OwnedTransactionContext, row: JournalRow,
+    receipt: Record<string, JsonValue>): void {
+    const fields = ['attemptId', 'commandId', 'kind', 'objectId', 'outcome', 'schemaVersion', 'sourceRevision'].sort();
+    if (Object.keys(receipt).sort().join('\0') !== fields.join('\0') || receipt.schemaVersion !== 1 ||
+        receipt.commandId !== row.idempotency_key || receipt.kind !== 'notes.transcribe' ||
+        typeof receipt.objectId !== 'string' || receipt.objectId.length === 0 || Buffer.byteLength(receipt.objectId, 'utf8') > 1024 || /[\u0000-\u001f\u007f]/.test(receipt.objectId) ||
+        typeof receipt.attemptId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(receipt.attemptId) ||
+        typeof receipt.sourceRevision !== 'number' || !Number.isSafeInteger(receipt.sourceRevision) || receipt.sourceRevision < 1 ||
+        typeof receipt.outcome !== 'string' || !['completed', 'no_speech', 'cancelled', 'failed', 'unknown', 'discarded'].includes(receipt.outcome)) {
+      throw new Error('transcription_receipt_binding_invalid');
+    }
+    if (row.checkpoint_revision === null || row.checkpoint_revision !== context.revision || !row.snapshot_digest) {
+      throw new Error('transcription_terminal_checkpoint_unavailable');
+    }
+    const stored = context.db.prepare('SELECT snapshot_json FROM workspaces WHERE id=? AND revision=? AND privacy_epoch=?')
+      .get(context.workspaceId, context.revision, context.privacyEpoch) as { snapshot_json: string } | undefined;
+    if (!stored) throw new Error('transcription_terminal_checkpoint_unavailable');
+    const snapshot = parseCanonical(stored.snapshot_json, 16 * 1024 * 1024);
+    if (digest(snapshot.text) !== row.snapshot_digest) throw new Error('transcription_terminal_checkpoint_mismatch');
+    const transcription = (snapshot.value && typeof snapshot.value === 'object' && !Array.isArray(snapshot.value)
+      ? (snapshot.value as Record<string, JsonValue>).transcription : undefined) as Record<string, JsonValue> | undefined;
+    const attempts = transcription?.attempts;
+    const attempt = Array.isArray(attempts) ? attempts.find((candidate) => candidate && typeof candidate === 'object' && !Array.isArray(candidate) &&
+      (candidate as Record<string, JsonValue>).id === receipt.attemptId) as Record<string, JsonValue> | undefined : undefined;
+    const terminalAt = attempt?.terminalAt;
+    if (!attempt || attempt.noteId !== receipt.objectId || attempt.sourceRevision !== receipt.sourceRevision || attempt.outcome !== receipt.outcome ||
+        typeof terminalAt !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(terminalAt) ||
+        new Date(terminalAt).toISOString() !== terminalAt || !['completed', 'no_speech', 'cancelled', 'failed', 'unknown', 'discarded'].includes(String(attempt.outcome))) {
+      throw new Error('transcription_terminal_checkpoint_mismatch');
+    }
   }
 
   requireInspection(ticket: CommandTicketContext): void {

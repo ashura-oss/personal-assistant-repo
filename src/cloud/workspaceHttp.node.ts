@@ -26,6 +26,10 @@ export function createWorkspaceHttpApi(runtime: OwnedWorkspaceRuntime): Workspac
       admission.assertCurrent();
       return JSON.parse(JSON.stringify(page)) as JsonValue;
     },
+    cancelTranscription(admission: WorkspaceHttpAdmission, commandId: string): JsonValue {
+      const status = runtime.requestTranscriptionCancellation(admission, commandId);
+      return { schemaVersion: 1, commandId, status };
+    },
   });
 }
 

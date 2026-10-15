@@ -14,6 +14,7 @@ export type WorkspaceCommand =
   | { readonly kind: 'notes.save'; readonly transcript: string }
   | { readonly kind: 'notes.capture.adopt'; readonly captureId: string; readonly captureRevision: string }
   | { readonly kind: 'notes.updateTranscript'; readonly noteId: string; readonly text: string; readonly expectedNoteRevision: number }
+  | { readonly kind: 'notes.transcribe'; readonly noteId: string; readonly expectedNoteRevision: number }
   | { readonly kind: 'assistant.batch.submitNote'; readonly noteId: string; readonly intent?: AssistIntent; readonly question?: string; readonly knowledgeSelection?: PublicKnowledgeSelection }
   | { readonly kind: 'assistant.batch.check'; readonly jobId: string }
   | { readonly kind: 'chat.submit'; readonly conversationId: string; readonly text: string; readonly knowledgeSelection?: PublicKnowledgeSelection }
@@ -43,6 +44,7 @@ export type WorkspaceCommandReceipt =
   | WorkspaceCommandReceiptBase<'notes.save'>
   | (WorkspaceCommandReceiptBase<'notes.capture.adopt'> & Readonly<{ captureId: string; captureRevision: string }>)
   | WorkspaceCommandReceiptBase<'notes.updateTranscript'>
+  | (WorkspaceCommandReceiptBase<'notes.transcribe'> & Readonly<{ attemptId: string; sourceRevision: number; outcome: 'completed' | 'no_speech' | 'cancelled' | 'failed' | 'unknown' | 'discarded' }> )
   | (WorkspaceCommandReceiptBase<'assistant.batch.submitNote'> & Readonly<{ jobId: string }>)
   | WorkspaceCommandReceiptBase<'assistant.batch.check'>
   | (WorkspaceCommandReceiptBase<'chat.submit'> & Readonly<{ turnId: string; jobId: string }>)
@@ -63,6 +65,7 @@ const COMMAND_KEYS: Record<WorkspaceCommand['kind'], readonly string[]> = {
   'tasks.complete': ['kind', 'taskId'], 'tasks.reopen': ['kind', 'taskId'], 'chat.create': ['kind', 'title'],
   'notes.save': ['kind', 'transcript'], 'notes.updateTranscript': ['kind', 'noteId', 'text', 'expectedNoteRevision'],
   'notes.capture.adopt': ['kind', 'captureId', 'captureRevision'],
+  'notes.transcribe': ['kind', 'noteId', 'expectedNoteRevision'],
   'assistant.batch.submitNote': ['kind', 'noteId', 'intent', 'question', 'knowledgeSelection'],
   'assistant.batch.check': ['kind', 'jobId'], 'chat.submit': ['kind', 'conversationId', 'text', 'knowledgeSelection'],
   'chat.refine': ['kind', 'conversationId', 'parentTurnId', 'effort'],
@@ -232,6 +235,12 @@ function freezeCommand(raw: Record<string, unknown>): WorkspaceCommand {
         !Number.isSafeInteger(raw.expectedNoteRevision) || (raw.expectedNoteRevision as number) < 1) throw new Error('workspace_command_invalid');
     return Object.freeze({ kind, noteId: raw.noteId, text: raw.text, expectedNoteRevision: raw.expectedNoteRevision as number });
   }
+  if (kind === 'notes.transcribe') {
+    assertExactKeys(raw, COMMAND_KEYS[kind], COMMAND_KEYS[kind]);
+    if (!boundedString(raw.noteId, MAX_ID_BYTES, { identifier: true }) ||
+        !Number.isSafeInteger(raw.expectedNoteRevision) || (raw.expectedNoteRevision as number) < 1) throw new Error('workspace_command_invalid');
+    return Object.freeze({ kind, noteId: raw.noteId, expectedNoteRevision: raw.expectedNoteRevision as number });
+  }
   if (kind === 'assistant.batch.submitNote') {
     assertExactKeys(raw, COMMAND_KEYS[kind], ['kind', 'noteId']);
     if (!boundedString(raw.noteId, MAX_ID_BYTES, { identifier: true }) ||
@@ -309,6 +318,9 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
   readonly parentTurnId?: string;
   readonly captureId?: string;
   readonly captureRevision?: string;
+  readonly attemptId?: string;
+  readonly sourceRevision?: number;
+  readonly outcome?: 'completed' | 'no_speech' | 'cancelled' | 'failed' | 'unknown' | 'discarded';
 }): WorkspaceCommandReceipt {
   if (!isRecord(value)) throw new Error('workspace_command_receipt_invalid');
   assertPlainDataProperties(value);
@@ -321,6 +333,7 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
     'notes.save': ['commandId', 'kind', 'objectId', 'schemaVersion'],
     'notes.capture.adopt': ['captureId', 'captureRevision', 'commandId', 'kind', 'objectId', 'schemaVersion'],
     'notes.updateTranscript': ['commandId', 'kind', 'objectId', 'schemaVersion'],
+    'notes.transcribe': ['attemptId', 'commandId', 'kind', 'objectId', 'outcome', 'schemaVersion', 'sourceRevision'],
     'assistant.batch.submitNote': ['commandId', 'jobId', 'kind', 'objectId', 'schemaVersion'],
     'assistant.batch.check': ['commandId', 'kind', 'objectId', 'schemaVersion'],
     'chat.submit': ['commandId', 'jobId', 'kind', 'objectId', 'schemaVersion', 'turnId'],
@@ -336,10 +349,14 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
       (Object.hasOwn(value, 'parentTurnId') && !uuidId(value.parentTurnId)) ||
       (Object.hasOwn(value, 'captureId') && !uuidId(value.captureId)) ||
       (Object.hasOwn(value, 'captureRevision') && !uuidId(value.captureRevision)) ||
+      (kind === 'notes.transcribe' && (!uuidId(value.attemptId) || !Number.isSafeInteger(value.sourceRevision) || (value.sourceRevision as number) < 1 ||
+        !['completed', 'no_speech', 'cancelled', 'failed', 'unknown', 'discarded'].includes(value.outcome as string))) ||
       (expected && (value.commandId !== expected.commandId || (expected.kind !== undefined && kind !== expected.kind) ||
         (expected.objectId !== undefined && value.objectId !== expected.objectId) || (expected.jobId !== undefined && value.jobId !== expected.jobId) ||
         (expected.turnId !== undefined && value.turnId !== expected.turnId) || (expected.parentTurnId !== undefined && value.parentTurnId !== expected.parentTurnId) ||
-        (expected.captureId !== undefined && value.captureId !== expected.captureId) || (expected.captureRevision !== undefined && value.captureRevision !== expected.captureRevision)))) {
+        (expected.captureId !== undefined && value.captureId !== expected.captureId) || (expected.captureRevision !== undefined && value.captureRevision !== expected.captureRevision) ||
+        (expected.attemptId !== undefined && value.attemptId !== expected.attemptId) || (expected.sourceRevision !== undefined && value.sourceRevision !== expected.sourceRevision) ||
+        (expected.outcome !== undefined && value.outcome !== expected.outcome)))) {
     throw new Error('workspace_command_receipt_invalid');
   }
   const commandId = value.commandId;
@@ -352,6 +369,10 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
     case 'tasks.complete': case 'tasks.reopen': case 'chat.create': case 'notes.save': case 'notes.updateTranscript':
     case 'assistant.batch.check':
       return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId });
+    case 'notes.transcribe':
+      return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId,
+        attemptId: jobId(value.attemptId), sourceRevision: value.sourceRevision as number,
+        outcome: value.outcome as 'completed' | 'no_speech' | 'cancelled' | 'failed' | 'unknown' | 'discarded' });
     case 'notes.capture.adopt':
       return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId,
         captureId: jobId(value.captureId), captureRevision: jobId(value.captureRevision) });

@@ -1,5 +1,6 @@
 import type { AppState } from '../core';
 import { AppControllerImpl, type ControllerCryptoPort, type ControllerRuntimePorts } from '../services/controller.shared';
+export { SpeechTranscriptionError } from '../services/controller.shared';
 import type { PendingCaptureControllerPort } from '../audio/pendingCaptureService.types';
 import type { AudioHttpApi, AudioHttpMediaResponse, AudioUploadCaptureHeader, AudioUploadReceiptDTO } from '../../server/src/audioHttp.js';
 import type { WorkspaceHttpAdmission } from '../../server/src/workspaceHttp.js';
@@ -13,7 +14,9 @@ import { SpeechCleanupChildren } from '../../server/src/speechCleanupChildren.js
 import { WorkspaceControllerFactoryInitializationError, WorkspaceRegistry,
   type RuntimeSessionResolver, type WorkspaceRuntimeContext } from '../../server/src/workspaceRegistry.js';
 import type { LoadedWorkspaceIdentity } from '../../server/src/workspaceStore.js';
+import type { ServerWorkspaceStore } from '../../server/src/workspaceStore.js';
 import type { WorkspaceCommandHistoryPage } from './workspaceCommandHistory';
+import type { WorkspaceCommandReceipt } from './workspaceCommands';
 
 export type OwnedWorkspaceFactoryContext = WorkspaceRuntimeContext<AppState> & {
   readonly speechCleanupChildren: SpeechCleanupChildren;
@@ -87,6 +90,18 @@ interface CachedWorkspaceSnapshot {
   readonly snapshot: WorkspaceSnapshotDTO;
 }
 
+interface ActiveTranscriptionCommand {
+  readonly ownerId: string;
+  readonly workspaceId: string;
+  readonly privacyEpoch: number;
+  readonly commandId: string;
+  readonly requestCancellation: () => 'cancellation_requested' | 'not_running';
+}
+
+function transcriptionBindingKey(ownerId: string, workspaceId: string, privacyEpoch: number, commandId: string): string {
+  return JSON.stringify([ownerId, workspaceId, privacyEpoch, commandId]);
+}
+
 /**
  * Private Node owner for one shared controller registry and journal. This is a
  * trusted module interface, not an HTTP dispatcher or caller-defined state API.
@@ -104,6 +119,8 @@ export class OwnedWorkspaceRuntime {
   private readonly responseOwners = new Set<NodeProviderResponseLifetimeOwner>();
   private readonly responseOwnerByWorkspace = new Map<string, NodeProviderResponseLifetimeOwner>();
   private readonly responseOwnerByController = new WeakMap<AppControllerImpl, NodeProviderResponseLifetimeOwner>();
+  private readonly storeByController = new WeakMap<AppControllerImpl, ServerWorkspaceStore<AppState>>();
+  private readonly activeTranscriptionCommands = new Map<string, ActiveTranscriptionCommand>();
   private readonly controllers = new Set<AppControllerImpl>();
   private readonly refreshRequired = new Set<string>();
   private readonly busy = new Set<string>();
@@ -136,6 +153,7 @@ export class OwnedWorkspaceRuntime {
             ...(options.pendingCapture ? { pendingCapture: options.pendingCapture } : {}) });
           if (options.mediaResolver) this.mediaResolvers.set(controller, options.mediaResolver);
           if (options.audioHttpApi) this.audioApis.set(controller, options.audioHttpApi);
+          this.storeByController.set(controller, context.store);
           this.attachController(controller, adapter, context.identity.workspaceId, options.responseLifetimeOwner);
           return controller;
         }
@@ -186,6 +204,7 @@ export class OwnedWorkspaceRuntime {
           returned.attachController?.(controller);
           if (returned.mediaResolver) this.mediaResolvers.set(controller, returned.mediaResolver);
           if (returned.audioHttpApi) this.audioApis.set(controller, returned.audioHttpApi);
+          this.storeByController.set(controller, context.store);
           if (returned.attachedLifecycle) this.attachedLifecycles.set(controller, returned.attachedLifecycle);
           this.attachController(controller, adapter, context.identity.workspaceId, returned.responseLifetimeOwner);
           return controller;
@@ -425,6 +444,70 @@ export class OwnedWorkspaceRuntime {
         if (commandController && parentTicketId) this.speechAdapters.get(commandController)?.parentInvocationCompleted(parentTicketId);
       }
     });
+  }
+
+  /** Named journal path for cloud transcription; duplicates only replay their stored receipt. */
+  async executeTranscriptionCommand(input: OwnedWorkspaceCommandInput,
+    request: { readonly noteId: string; readonly expectedNoteRevision: number }): Promise<OwnedWorkspaceCommandResult<WorkspaceCommandReceipt>> {
+    this.assertAdmission(input);
+    if (!request || typeof request.noteId !== 'string' || !request.noteId ||
+        !Number.isSafeInteger(request.expectedNoteRevision) || request.expectedNoteRevision < 1 || input.kind !== 'notes.transcribe') {
+      throw new Error('workspace_transcription_request_invalid');
+    }
+    const identity = this.options.kernel.getOwnedIdentity(input.sessionToken);
+    const result = await this.executeCommand(input, async (controller) => {
+      const handle = controller.startOwnedTranscription(request.noteId, { expectedRevision: request.expectedNoteRevision });
+      const binding: ActiveTranscriptionCommand = Object.freeze({ ownerId: identity.ownerId,
+        workspaceId: identity.workspaceId, privacyEpoch: identity.privacyEpoch, commandId: input.idempotencyKey,
+        requestCancellation: handle.requestCancellation });
+      const bindingKey = transcriptionBindingKey(identity.ownerId, identity.workspaceId, identity.privacyEpoch, input.idempotencyKey);
+      this.activeTranscriptionCommands.set(bindingKey, binding);
+      let operationError: unknown;
+      let operationFailed = false;
+      try {
+        try { await handle.result; } catch (error) { operationFailed = true; operationError = error; }
+        const store = this.storeByController.get(controller);
+        if (!store?.readCurrentSnapshot) throw operationFailed ? operationError : new Error('transcription_terminal_proof_unavailable');
+        let raw: string;
+        try {
+          const current = await store.readCurrentSnapshot();
+          if (!current) throw new Error('transcription_terminal_proof_unavailable');
+          raw = current.raw;
+        } catch (error) { throw operationFailed ? operationError : error; }
+        let attempt: Record<string, unknown> | undefined;
+        const outcomes = ['completed', 'no_speech', 'cancelled', 'failed', 'unknown', 'discarded'] as const;
+        try {
+          const snapshot = JSON.parse(raw) as { transcription?: { attempts?: unknown } };
+          const attempts = snapshot.transcription?.attempts;
+          attempt = Array.isArray(attempts) ? attempts.find((value) => value && typeof value === 'object' &&
+            (value as Record<string, unknown>).id === handle.attemptId) as Record<string, unknown> | undefined : undefined;
+          const terminalAt = attempt?.terminalAt;
+          if (!attempt || attempt.noteId !== request.noteId || attempt.sourceRevision !== request.expectedNoteRevision ||
+              typeof terminalAt !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(terminalAt) ||
+              new Date(terminalAt).toISOString() !== terminalAt || !outcomes.includes(attempt.outcome as typeof outcomes[number])) {
+            throw new Error('transcription_terminal_proof_unavailable');
+          }
+        } catch (error) { throw operationFailed ? operationError : error; }
+        return Object.freeze({ schemaVersion: 1 as const, commandId: input.idempotencyKey, kind: 'notes.transcribe' as const,
+          objectId: request.noteId, attemptId: handle.attemptId, sourceRevision: request.expectedNoteRevision,
+          outcome: attempt.outcome as typeof outcomes[number] });
+      } finally {
+        if (this.activeTranscriptionCommands.get(bindingKey) === binding) this.activeTranscriptionCommands.delete(bindingKey);
+      }
+    }, (receipt): JsonValue => ({ schemaVersion: receipt.schemaVersion, commandId: receipt.commandId, kind: receipt.kind,
+      objectId: receipt.objectId, attemptId: receipt.attemptId, sourceRevision: receipt.sourceRevision, outcome: receipt.outcome }));
+    return result;
+  }
+
+  /** Synchronous signal-only cancellation for one exact active journal parent. */
+  requestTranscriptionCancellation(admission: OwnedWorkspaceAdmission, commandId: string): 'cancellation_requested' | 'not_running' {
+    this.assertAdmission(admission);
+    const identity = this.options.kernel.getOwnedIdentity(admission.sessionToken);
+    const binding = this.activeTranscriptionCommands.get(transcriptionBindingKey(identity.ownerId, identity.workspaceId, identity.privacyEpoch, commandId));
+    if (!binding || binding.commandId !== commandId || binding.ownerId !== identity.ownerId ||
+        binding.workspaceId !== identity.workspaceId || binding.privacyEpoch !== identity.privacyEpoch) return 'not_running';
+    admission.assertCurrent();
+    return binding.requestCancellation();
   }
 
   /** Read-only receipt lookup. It deliberately bypasses busy/refresh-required state and never touches the controller. */

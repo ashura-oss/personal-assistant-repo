@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { createDurableKernel } from '../dist/index.js';
 import { CommandJournal } from '../dist/workspaceRuntime.js';
-import { OwnedWorkspaceRuntime } from '../dist/ownedWorkspaceRuntime.node.mjs';
+import { OwnedWorkspaceRuntime, SpeechTranscriptionError } from '../dist/ownedWorkspaceRuntime.node.mjs';
 import { PrivateAudioRepository } from '../dist/privateAudioRepository.js';
 import { RUNTIME_ACTOR_EXPIRES_AT } from '../dist/runtimeActors.js';
 import { createInitialWorkspaceState } from '../dist/sharedControllerNode.mjs';
@@ -17,14 +17,22 @@ import {
   dispatchWorkspaceCommand,
   inspectWorkspaceCommand,
   parseWorkspaceCommandEnvelope,
+  parseWorkspaceCommandReceipt,
 } from '../dist/workspaceCommands.node.mjs';
 
-function fixture({ providerBatchClient, withAudio = false } = {}) {
+function fixture({ providerBatchClient, withAudio = false, speechClient, speechEnabled = false, withSpeechCleanup = false, initialNoteId } = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'still-workspace-commands-'));
   const kernel = createDurableKernel({ databasePath: join(directory, 'workspace.sqlite'),
     validateSnapshot: (value) => assert.ok(value && typeof value === 'object' && !Array.isArray(value)) });
   const ownerId = randomUUID();
   const state = createInitialWorkspaceState(randomUUID);
+  if (speechEnabled) {
+    state.settings.speechEnabled = true;
+    state.settings.speechEndpoint = 'https://example.cognitiveservices.azure.com';
+  }
+  if (initialNoteId) state.notes.push({ id: initialNoteId, title: 'Imported audio note', transcript: 'Original transcript.',
+    audioUri: 'file:///private/imported.wav', durationSeconds: 2, createdAt: '2026-10-15T00:00:00.000Z',
+    status: 'recorded', revision: 1 });
   if (providerBatchClient) {
     state.settings.mode = 'provider';
     state.settings.llmProvider = 'openrouter';
@@ -35,6 +43,7 @@ function fixture({ providerBatchClient, withAudio = false } = {}) {
   const workspace = kernel.createWorkspace(ownerId, state);
   const admissionSession = kernel.createSession(workspace.workspaceId, ownerId, Date.now() + 60 * 60_000);
   const runtimeSession = kernel.createSession(workspace.workspaceId, ownerId, RUNTIME_ACTOR_EXPIRES_AT);
+  const runtimeSessions = new Map([[workspace.workspaceId, runtimeSession]]);
   const unavailable = async () => 'unavailable';
   let attachedSnapshot;
   let failNextWorkspaceCommitAck = false;
@@ -67,7 +76,7 @@ function fixture({ providerBatchClient, withAudio = false } = {}) {
     },
     async readConsumedEvidence(id) { return audioRepository.readConsumedCaptureEvidence(id); },
   }) : undefined;
-  const runtime = new OwnedWorkspaceRuntime({ kernel, runtimeSessionFor: () => runtimeSession,
+  const runtime = new OwnedWorkspaceRuntime({ kernel, runtimeSessionFor: (identity) => runtimeSessions.get(identity.workspaceId) ?? runtimeSession,
     afterWorkspaceCommitForTesting() {
       if (failNextWorkspaceCommitAck) { failNextWorkspaceCommitAck = false; throw new Error('simulated post-commit acknowledgement loss'); }
     },
@@ -77,8 +86,9 @@ function fixture({ providerBatchClient, withAudio = false } = {}) {
       return audioRepository.getRecord(match[1]).status === 'ready' ? match[1] : undefined;
     } } } : {}),
     crypto: { randomUUID, async sha256(value) { return createHash('sha256').update(value).digest('hex'); } },
-    providers: { speech: { async transcribe() { throw new Error('provider must not run'); }, async releaseUploadLease() {}, disposeMemory() {} },
+    providers: { speech: speechClient ?? { async transcribe() { throw new Error('provider must not run'); }, async releaseUploadLease() {}, disposeMemory() {} },
       openAi: { async prepare() { throw new Error('provider must not run'); }, async analyze() { throw new Error('provider must not run'); }, async generateReply() { throw new Error('provider must not run'); } } },
+    ...(withSpeechCleanup ? { responseLifetimeOwner: responseLifetimeOwner() } : {}),
     integration: {
       reminderBackend: { platform: 'web', getPermission: unavailable, requestPermission: unavailable,
         async listPending() { return []; }, async schedule() {}, async cancel() {}, async cancelLegacy() {}, async installForegroundHandler() {} },
@@ -93,7 +103,7 @@ function fixture({ providerBatchClient, withAudio = false } = {}) {
       ...(providerBatchClient ? { openRouterBatchClient: providerBatchClient } : {}),
     }, ...(pendingCapture ? { pendingCapture } : {}) });
   const admission = { sessionToken: admissionSession, assertCurrent() { kernel.getOwnedIdentity(admissionSession); } };
-  return { directory, kernel, ownerId, workspace, admissionSession, runtimeSession, runtime, admission, audioRepository,
+  return { directory, kernel, ownerId, workspace, admissionSession, runtimeSession, runtimeSessions, runtime, admission, audioRepository,
     setAttachedSnapshot(value) { attachedSnapshot = value; }, loseNextWorkspaceCommitAck() { failNextWorkspaceCommitAck = true; } };
 }
 
@@ -102,6 +112,11 @@ function deferred() {
   let reject;
   const promise = new Promise((done, fail) => { resolve = done; reject = fail; });
   return { promise, resolve, reject };
+}
+
+function responseLifetimeOwner() {
+  return { withResponseLifetimeFor() { throw new Error('unused in fake speech test'); }, stopAdmission() {}, async drain() {},
+    async retryCleanup() {}, getPending() { return []; }, subscribe() { return () => {}; } };
 }
 
 function envelope(command, expectedRevision = 0, expectedPrivacyEpoch = 0, commandId = randomUUID()) {
@@ -169,6 +184,23 @@ test('shared command envelope enforces exact keys, UUIDs, revision fences, and p
   assert.throws(() => parseWorkspaceCommandEnvelope(envelope({ kind: 'notes.save', transcript: `${escapedBoundaryText}a` })), /workspace_command_invalid/);
 });
 
+test('transcription command and receipt bind a strict note revision and generated attempt', () => {
+  const commandId = randomUUID();
+  const noteId = 'note-owned-id';
+  const parsed = parseWorkspaceCommandEnvelope(envelope({ kind: 'notes.transcribe', noteId, expectedNoteRevision: 3 }, 4, 2, commandId));
+  assert.deepEqual(parsed.command, { kind: 'notes.transcribe', noteId, expectedNoteRevision: 3 });
+  for (const invalid of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, '3']) {
+    assert.throws(() => parseWorkspaceCommandEnvelope(envelope({ kind: 'notes.transcribe', noteId, expectedNoteRevision: invalid })),
+      /workspace_command_invalid/);
+  }
+  const attemptId = randomUUID();
+  const receipt = { schemaVersion: 1, commandId, kind: 'notes.transcribe', objectId: noteId, attemptId, sourceRevision: 3, outcome: 'completed' };
+  assert.deepEqual(parseWorkspaceCommandReceipt(receipt, { commandId, kind: 'notes.transcribe', objectId: noteId, sourceRevision: 3 }), receipt);
+  assert.throws(() => parseWorkspaceCommandReceipt({ ...receipt, attemptId: 'not-a-uuid' }), /workspace_command_receipt_invalid/);
+  assert.throws(() => parseWorkspaceCommandReceipt(receipt, { commandId, kind: 'notes.transcribe', objectId: noteId, sourceRevision: 4 }),
+    /workspace_command_receipt_invalid/);
+});
+
 test('large escaped-Unicode note save dispatches through the actual controller once and returns a safe exact receipt', async () => {
   const f = fixture();
   try {
@@ -187,6 +219,46 @@ test('large escaped-Unicode note save dispatches through the actual controller o
     assert.equal(replay.snapshot.state.notes.filter((note) => note.transcript === transcript).length, 1);
     assert.equal(replay.snapshot.state.activity.filter((item) => item.noteId === first.receipt.objectId && item.type === 'note_saved').length, 1,
       'the exact duplicate receipt avoids a second controller save');
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test('transcription dispatcher rejects a stale note revision before any provider dispatch', async () => {
+  const f = fixture();
+  try {
+    const initial = await f.runtime.getSnapshot(f.admission);
+    const saved = await dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'notes.save', transcript: 'A note without current audio.' }, initial.revision, initial.privacyEpoch));
+    const note = saved.snapshot.state.notes.find((item) => item.id === saved.receipt.objectId);
+    assert.ok(note);
+    const command = envelope({ kind: 'notes.transcribe', noteId: note.id, expectedNoteRevision: note.revision + 1 },
+      saved.snapshot.revision, saved.snapshot.privacyEpoch);
+    await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission, command), /revision|changed|stale/i);
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test('finished transcription receipt accepts a bounded opaque existing note ID and proves completed locally', async () => {
+  const noteId = 'imported note: 17';
+  let providerCalls = 0;
+  const speechClient = {
+    async transcribe(note, _settings, _signal, onAttempt, beforeDispatch, onPrepared, leaseId) {
+      providerCalls += 1;
+      const prepared = { leaseId, platform: 'web', format: 'wav', mimeType: 'audio/wav', byteLength: 5,
+        sha256: 'd'.repeat(64), durationSeconds: note.durationSeconds, upload: { blob: new Blob(['voice']), fileName: 'clip.wav' } };
+      await onPrepared(prepared); await onAttempt(prepared); beforeDispatch(prepared);
+      return { transcript: 'The exact local terminal result is complete.', durationMilliseconds: 1000,
+        durationSeconds: 1, billedEstimateSeconds: 1, attempts: 1 };
+    }, async releaseUploadLease() {}, disposeMemory() {},
+  };
+  const f = fixture({ speechClient, speechEnabled: true, initialNoteId: noteId });
+  try {
+    const initial = await f.runtime.getSnapshot(f.admission);
+    const command = envelope({ kind: 'notes.transcribe', noteId, expectedNoteRevision: 1 }, initial.revision, initial.privacyEpoch);
+    const completed = await dispatchWorkspaceCommand(f.runtime, f.admission, command);
+    assert.equal(completed.status, 'finished');
+    assert.equal(completed.receipt.objectId, noteId);
+    assert.equal(completed.receipt.outcome, 'completed');
+    assert.equal(providerCalls, 1);
+    assert.equal(inspectWorkspaceCommand(f.runtime, f.admission, command.commandId).receipt.outcome, 'completed');
   } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
@@ -238,6 +310,181 @@ test('actual runtime adopts one ready upload atomically, recovers a lost checkpo
     assert.deepEqual(inspection.receipt, adopted.receipt);
     assert.equal(inspection.status, 'finished');
   } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test('owned transcription dispatch is cancellable by a replacement session, retains cleanup ownership, and replays one bound receipt', async () => {
+  const providerStarted = deferred();
+  const providerObservedAbort = deferred();
+  const cleanup = deferred();
+  let providerCalls = 0;
+  const speechClient = {
+    async transcribe(note, _settings, signal, onAttempt, beforeDispatch, onPrepared, leaseId) {
+      providerCalls += 1;
+      const prepared = { leaseId, platform: 'web', format: 'wav', mimeType: 'audio/wav', byteLength: 5,
+        sha256: 'a'.repeat(64), durationSeconds: note.durationSeconds, upload: { blob: new Blob(['voice']), fileName: 'clip.wav' } };
+      await onPrepared(prepared);
+      await onAttempt(prepared);
+      beforeDispatch(prepared);
+      providerStarted.resolve();
+      await new Promise((resolve) => signal.addEventListener('abort', resolve, { once: true }));
+      providerObservedAbort.resolve(signal.aborted);
+      throw new SpeechTranscriptionError('Speech request was cancelled after dispatch.', 'cancelled', true,
+        undefined, undefined, cleanup.promise);
+    },
+    async releaseUploadLease() {}, disposeMemory() {},
+  };
+  const f = fixture({ speechEnabled: true, speechClient, withSpeechCleanup: true });
+  try {
+    const initial = await f.runtime.getSnapshot(f.admission);
+    const saved = await f.runtime.executeCommand({ ...f.admission, expectedRevision: initial.revision,
+      expectedPrivacyEpoch: initial.privacyEpoch, idempotencyKey: randomUUID(), kind: 'test.seed-audio-note',
+      canonicalBody: '{"fixture":"audio-note"}' }, (controller) => controller.saveNote({ transcript: 'Audio note.',
+        audioUri: 'file:///private/voice.wav', durationSeconds: 2 }), (note) => ({ objectId: note.id }));
+    const note = saved.result;
+    const command = envelope({ kind: 'notes.transcribe', noteId: note.id, expectedNoteRevision: note.revision },
+      saved.snapshot.revision, saved.snapshot.privacyEpoch);
+    const pending = dispatchWorkspaceCommand(f.runtime, f.admission, command);
+    await providerStarted.promise;
+    const replacementSession = f.kernel.createSession(f.workspace.workspaceId, f.ownerId, Date.now() + 60 * 60_000);
+    const replacementAdmission = { sessionToken: replacementSession, assertCurrent() { f.kernel.getOwnedIdentity(replacementSession); } };
+    assert.equal(f.runtime.requestTranscriptionCancellation(replacementAdmission, command.commandId), 'cancellation_requested');
+    assert.equal(await providerObservedAbort.promise, true, 'the exact live provider signal was aborted synchronously');
+    const completed = await pending;
+    assert.equal(completed.status, 'finished');
+    assert.deepEqual(Object.keys(completed.receipt).sort(), ['attemptId', 'commandId', 'kind', 'objectId', 'outcome', 'schemaVersion', 'sourceRevision']);
+    assert.equal(completed.receipt.kind, 'notes.transcribe');
+    assert.equal(completed.receipt.objectId, note.id);
+    assert.equal(completed.receipt.sourceRevision, note.revision);
+    assert.equal(completed.receipt.outcome, 'cancelled', 'the receipt reports the durable local terminal result, not a provider billing assertion');
+    assert.match(completed.receipt.attemptId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+    assert.equal(Object.hasOwn(completed, 'snapshot'), false, 'the live cleanup child retains continuation ownership');
+    assert.equal(f.runtime.requestTranscriptionCancellation(replacementAdmission, command.commandId), 'not_running');
+
+    cleanup.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    let refreshed = false;
+    for (let attempt = 0; attempt < 50 && !refreshed; attempt += 1) {
+      try { await f.runtime.refreshSnapshot(replacementAdmission); refreshed = true; }
+      catch (error) {
+        if (!/workspace runtime is busy/i.test(String(error))) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+    }
+    assert.equal(refreshed, true, 'terminal cleanup settles before the explicit snapshot refresh');
+    const duplicate = await dispatchWorkspaceCommand(f.runtime, replacementAdmission, command);
+    assert.deepEqual(duplicate.receipt, completed.receipt);
+    assert.equal(providerCalls, 1, 'the duplicate returns the committed receipt without starting provider work again');
+    cleanup.resolve();
+  } finally {
+    cleanup.resolve();
+    await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+test('a lost terminal workspace acknowledgement keeps transcription inspect-required without fabricating a receipt', async () => {
+  const started = deferred();
+  const cleanup = deferred();
+  let providerCalls = 0;
+  const speechClient = {
+    async transcribe(_note, _settings, signal, onAttempt, beforeDispatch, onPrepared, leaseId) {
+      providerCalls += 1;
+      const prepared = { leaseId, platform: 'web', format: 'wav', mimeType: 'audio/wav', byteLength: 5,
+        sha256: 'c'.repeat(64), durationSeconds: 2, upload: { blob: new Blob(['voice']), fileName: 'clip.wav' } };
+      await onPrepared(prepared); await onAttempt(prepared); beforeDispatch(prepared); started.resolve();
+      await new Promise((resolve) => signal.addEventListener('abort', resolve, { once: true }));
+      throw new SpeechTranscriptionError('Cancelled after dispatch.', 'cancelled', true, undefined, undefined, cleanup.promise);
+    }, async releaseUploadLease() {}, disposeMemory() {},
+  };
+  const f = fixture({ speechClient, speechEnabled: true, withSpeechCleanup: true });
+  try {
+    const initial = await f.runtime.getSnapshot(f.admission);
+    const saved = await f.runtime.executeCommand({ ...f.admission, expectedRevision: initial.revision,
+      expectedPrivacyEpoch: initial.privacyEpoch, idempotencyKey: randomUUID(), kind: 'test.seed-audio-note',
+      canonicalBody: '{"fixture":"audio-note"}' }, (controller) => controller.saveNote({ transcript: 'Audio note.',
+        audioUri: 'file:///private/ack-loss.wav', durationSeconds: 2 }), (note) => ({ objectId: note.id }));
+    const command = envelope({ kind: 'notes.transcribe', noteId: saved.result.id, expectedNoteRevision: saved.result.revision },
+      saved.snapshot.revision, saved.snapshot.privacyEpoch);
+    const pending = dispatchWorkspaceCommand(f.runtime, f.admission, command);
+    await started.promise;
+    f.loseNextWorkspaceCommitAck();
+    assert.equal(f.runtime.requestTranscriptionCancellation(f.admission, command.commandId), 'cancellation_requested');
+    await assert.rejects(pending);
+    const inspection = inspectWorkspaceCommand(f.runtime, f.admission, command.commandId);
+    assert.equal(inspection.status, 'inspect_required');
+    assert.equal(Object.hasOwn(inspection, 'receipt'), false);
+    assert.equal(providerCalls, 1, 'uncertain terminal persistence does not retry provider work');
+  } finally {
+    cleanup.resolve();
+    await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+test('same command UUID in two owned workspaces retains two independent active cancellation bindings', async () => {
+  const started = [deferred(), deferred()];
+  const aborted = [deferred(), deferred()];
+  const cleanups = [deferred(), deferred()];
+  const abortSeen = [false, false];
+  const indexByNote = new Map();
+  let providerCalls = 0;
+  const speechClient = {
+    async transcribe(note, _settings, signal, onAttempt, beforeDispatch, onPrepared, leaseId) {
+      const index = indexByNote.get(note.id) ?? providerCalls;
+      providerCalls += 1;
+      const prepared = { leaseId, platform: 'web', format: 'wav', mimeType: 'audio/wav', byteLength: 5,
+        sha256: 'b'.repeat(64), durationSeconds: note.durationSeconds, upload: { blob: new Blob(['voice']), fileName: 'clip.wav' } };
+      await onPrepared(prepared); await onAttempt(prepared); beforeDispatch(prepared);
+      started[index].resolve();
+      await new Promise((resolve) => signal.addEventListener('abort', resolve, { once: true }));
+      abortSeen[index] = signal.aborted;
+      aborted[index].resolve();
+      return { transcript: 'Done.', durationMilliseconds: 1000, durationSeconds: 1, billedEstimateSeconds: 1,
+        attempts: 1, cleanupPromise: cleanups[index].promise };
+    }, async releaseUploadLease() {}, disposeMemory() {},
+  };
+  const f = fixture({ speechClient, speechEnabled: true, withSpeechCleanup: true });
+  try {
+    const ownerId2 = randomUUID();
+    const state2 = createInitialWorkspaceState(randomUUID);
+    state2.settings.speechEnabled = true; state2.settings.speechEndpoint = 'https://example.cognitiveservices.azure.com';
+    const workspace2 = f.kernel.createWorkspace(ownerId2, state2);
+    const session2 = f.kernel.createSession(workspace2.workspaceId, ownerId2, Date.now() + 60 * 60_000);
+    const runtimeSession2 = f.kernel.createSession(workspace2.workspaceId, ownerId2, RUNTIME_ACTOR_EXPIRES_AT);
+    f.runtimeSessions.set(workspace2.workspaceId, runtimeSession2);
+    const admission2 = { sessionToken: session2, assertCurrent() { f.kernel.getOwnedIdentity(session2); } };
+    const seed = async (admission, key) => {
+      const snapshot = await f.runtime.getSnapshot(admission);
+      const saved = await f.runtime.executeCommand({ ...admission, expectedRevision: snapshot.revision,
+        expectedPrivacyEpoch: snapshot.privacyEpoch, idempotencyKey: randomUUID(), kind: 'test.seed-audio-note',
+        canonicalBody: JSON.stringify({ key }) }, (controller) => controller.saveNote({ transcript: 'Audio note.',
+          audioUri: `file:///private/${key}.wav`, durationSeconds: 2 }), (note) => ({ objectId: note.id }));
+      return { snapshot: saved.snapshot, noteId: saved.result.id };
+    };
+    const firstSeed = await seed(f.admission, 'first');
+    const secondSeed = await seed(admission2, 'second');
+    indexByNote.set(firstSeed.noteId, 0); indexByNote.set(secondSeed.noteId, 1);
+    const sharedCommandId = randomUUID();
+    const first = envelope({ kind: 'notes.transcribe', noteId: firstSeed.noteId, expectedNoteRevision: 1 },
+      firstSeed.snapshot.revision, firstSeed.snapshot.privacyEpoch, sharedCommandId);
+    const second = envelope({ kind: 'notes.transcribe', noteId: secondSeed.noteId, expectedNoteRevision: 1 },
+      secondSeed.snapshot.revision, secondSeed.snapshot.privacyEpoch, sharedCommandId);
+    const firstPending = dispatchWorkspaceCommand(f.runtime, f.admission, first);
+    const secondPending = dispatchWorkspaceCommand(f.runtime, admission2, second);
+    await Promise.all(started.map((item) => item.promise));
+    assert.equal(providerCalls, 2);
+    assert.equal(f.runtime.requestTranscriptionCancellation(f.admission, sharedCommandId), 'cancellation_requested');
+    await aborted[0].promise;
+    assert.equal(abortSeen[1], false, 'signaling one workspace does not reach the other workspace controller');
+    assert.equal(f.runtime.requestTranscriptionCancellation(admission2, sharedCommandId), 'cancellation_requested');
+    await aborted[1].promise;
+    const [firstResult, secondResult] = await Promise.all([firstPending, secondPending]);
+    assert.notEqual(firstResult.receipt.attemptId, secondResult.receipt.attemptId);
+    assert.equal(firstResult.receipt.outcome, 'cancelled');
+    assert.equal(secondResult.receipt.outcome, 'cancelled');
+    cleanups.forEach((item) => item.resolve());
+  } finally {
+    cleanups.forEach((item) => item.resolve());
+    await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
 });
 
 test('a duplicate note Batch command returns its exact receipt without a second provider submission', async () => {
