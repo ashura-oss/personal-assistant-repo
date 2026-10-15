@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import { createCipheriv, createDecipheriv, createHmac, hkdfSync, randomBytes, timingSafeEqual } from 'node:crypto';
 import { constants, fstatSync, lstatSync, openSync, readSync, closeSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 import type Database from 'better-sqlite3';
@@ -9,7 +9,9 @@ const KEY_BYTES = 32;
 const NONCE_BYTES = 12;
 const TAG_BYTES = 16;
 const MAX_CREDENTIAL_BYTES = 16 * 1024 * 1024;
+const MAX_OAUTH_STAGE_BYTES = 64 * 1024;
 const KEY_CHECK_LABEL = 'still-server-vault-root-key-check:v1';
+const OAUTH_STAGE_DOMAIN = 'still-server:oauth-stage:v1';
 const PURPOSES = new Set(['openrouter', 'azureSpeech', 'googleOAuth', 'microsoftOAuth']);
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -23,6 +25,25 @@ export type VaultScope = { readonly type: 'workspace' } | {
 export interface VaultCredentialMetadata {
   readonly configured: boolean;
   readonly generation: number;
+}
+
+/** Cryptographic binding only; it is not proof of install authority, live session, or TTL validity. */
+export interface OAuthStageBinding {
+  readonly stageId: string;
+  readonly initiatingSessionBinding: string;
+  readonly registrationId: string;
+  readonly provider: 'google' | 'microsoft';
+  readonly expiresAt: number;
+  readonly payloadKind: 'authorization' | 'verified';
+  readonly payloadGeneration: number;
+}
+
+/** Closed encrypted OAuth-stage value for a trusted stage repository to persist. */
+export interface StageCiphertext {
+  readonly format: 1;
+  readonly nonce: Buffer;
+  readonly tag: Buffer;
+  readonly ciphertext: Buffer;
 }
 
 export class VaultError extends Error {
@@ -91,6 +112,76 @@ function checkContext(db: Database.Database, context: OwnedTransactionContext): 
   }
 }
 
+function closedDataFields(value: unknown, expected: readonly string[], code: string): Record<string, unknown> {
+  try {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) reject(code, 'The OAuth stage value is invalid.');
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) reject(code, 'The OAuth stage value is invalid.');
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    const keys = Reflect.ownKeys(descriptors);
+    if (keys.length !== expected.length || keys.some((key) => typeof key !== 'string' || !expected.includes(key))) {
+      reject(code, 'The OAuth stage value is invalid.');
+    }
+    const result: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+    for (const key of expected) {
+      const descriptor = descriptors[key];
+      if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, 'value')) {
+        reject(code, 'The OAuth stage value is invalid.');
+      }
+      result[key] = descriptor.value;
+    }
+    return result;
+  } catch {
+    return reject(code, 'The OAuth stage value is invalid.');
+  }
+}
+
+function normalizeOAuthStageBinding(value: unknown): OAuthStageBinding {
+  const fields = closedDataFields(value, ['stageId', 'initiatingSessionBinding', 'registrationId', 'provider', 'expiresAt',
+    'payloadKind', 'payloadGeneration'], 'oauth_stage_invalid_binding');
+  if (typeof fields.stageId !== 'string' || !UUID_V4.test(fields.stageId) ||
+      typeof fields.initiatingSessionBinding !== 'string' || !/^[0-9a-f]{64}$/.test(fields.initiatingSessionBinding) ||
+      typeof fields.registrationId !== 'string' || !/^[A-Za-z0-9._-]{1,128}$/.test(fields.registrationId) ||
+      (fields.provider !== 'google' && fields.provider !== 'microsoft') ||
+      typeof fields.expiresAt !== 'number' || !Number.isSafeInteger(fields.expiresAt) || fields.expiresAt <= 0 ||
+      (fields.payloadKind !== 'authorization' && fields.payloadKind !== 'verified') ||
+      typeof fields.payloadGeneration !== 'number' || !Number.isSafeInteger(fields.payloadGeneration) || fields.payloadGeneration <= 0) {
+    reject('oauth_stage_invalid_binding', 'The OAuth stage binding is invalid.');
+  }
+  return Object.freeze({ stageId: fields.stageId, initiatingSessionBinding: fields.initiatingSessionBinding,
+    registrationId: fields.registrationId, provider: fields.provider, expiresAt: fields.expiresAt,
+    payloadKind: fields.payloadKind, payloadGeneration: fields.payloadGeneration });
+}
+
+function normalizeStageCiphertext(value: unknown): StageCiphertext {
+  const fields = closedDataFields(value, ['format', 'nonce', 'tag', 'ciphertext'], 'oauth_stage_invalid_ciphertext');
+  if (fields.format !== 1 || !Buffer.isBuffer(fields.nonce) || fields.nonce.length !== NONCE_BYTES ||
+      !Buffer.isBuffer(fields.tag) || fields.tag.length !== TAG_BYTES || !Buffer.isBuffer(fields.ciphertext) ||
+      fields.ciphertext.length < 1 || fields.ciphertext.length > MAX_OAUTH_STAGE_BYTES) {
+    reject('oauth_stage_invalid_ciphertext', 'The OAuth stage ciphertext is invalid.');
+  }
+  return Object.freeze({ format: 1, nonce: Buffer.from(fields.nonce), tag: Buffer.from(fields.tag),
+    ciphertext: Buffer.from(fields.ciphertext) });
+}
+
+function oauthStageAad(context: OwnedTransactionContext, binding: OAuthStageBinding): Buffer {
+  return Buffer.from(JSON.stringify([1, OAUTH_STAGE_DOMAIN, context.ownerId, context.workspaceId, context.privacyEpoch,
+    binding.stageId, binding.initiatingSessionBinding, binding.registrationId, binding.provider, binding.expiresAt,
+    binding.payloadKind, binding.payloadGeneration]), 'utf8');
+}
+
+function oauthStagePlaintextBytes(value: unknown): Buffer {
+  if (typeof value !== 'string' || value.length === 0 || value.length > MAX_OAUTH_STAGE_BYTES) {
+    reject('oauth_stage_invalid_plaintext', 'OAuth stage plaintext is invalid.');
+  }
+  const bytes = Buffer.from(value, 'utf8');
+  if (bytes.length === 0 || bytes.length > MAX_OAUTH_STAGE_BYTES || bytes.toString('utf8') !== value) {
+    bytes.fill(0);
+    reject('oauth_stage_invalid_plaintext', 'OAuth stage plaintext is invalid.');
+  }
+  return bytes;
+}
+
 function checkedKeyBytes(input: Uint8Array): Buffer {
   if (!(input instanceof Uint8Array) || input.byteLength !== KEY_BYTES) reject('invalid_root_key', 'The vault root key must contain exactly 32 bytes.');
   return Buffer.from(input);
@@ -153,18 +244,23 @@ interface SecretRow {
  */
 export class SecretVault {
   readonly #key: Buffer;
+  readonly #oauthStageKey: Buffer;
   readonly #db: Database.Database;
   private closed = false;
 
   constructor(kernel: DurableKernel, rootKey: Uint8Array) {
     this.#key = checkedKeyBytes(rootKey);
+    let oauthStageKey: Buffer | undefined;
     try {
+      oauthStageKey = Buffer.from(hkdfSync('sha256', this.#key, Buffer.alloc(0), Buffer.from(OAUTH_STAGE_DOMAIN, 'utf8'), KEY_BYTES));
+      this.#oauthStageKey = oauthStageKey;
       this.#db = kernel.withTrustedDatabaseTransaction((db) => {
         this.initialize(db);
         return db;
       });
     } catch (error) {
       this.#key.fill(0);
+      oauthStageKey?.fill(0);
       throw error;
     }
   }
@@ -273,6 +369,64 @@ export class SecretVault {
     }
   }
 
+  /**
+   * Encrypts a durable OAuth stage payload. This binds ciphertext to trusted transaction identity and the supplied
+   * stage metadata; it does not establish install authority, session liveness, or whether expiresAt is still valid.
+   */
+  sealOAuthStageWithinTransaction(context: OwnedTransactionContext, bindingInput: OAuthStageBinding,
+    plaintext: string): StageCiphertext {
+    this.validateOAuthStageContext(context);
+    const binding = normalizeOAuthStageBinding(bindingInput);
+    const cleartext = oauthStagePlaintextBytes(plaintext);
+    try {
+      const nonce = randomBytes(NONCE_BYTES);
+      const cipher = createCipheriv('aes-256-gcm', this.#oauthStageKey, nonce);
+      cipher.setAAD(oauthStageAad(context, binding));
+      const ciphertext = Buffer.concat([cipher.update(cleartext), cipher.final()]);
+      return Object.freeze({ format: 1, nonce: Buffer.from(nonce), tag: Buffer.from(cipher.getAuthTag()), ciphertext });
+    } catch {
+      reject('oauth_stage_seal_failed', 'The OAuth stage could not be encrypted.');
+    } finally {
+      cleartext.fill(0);
+    }
+  }
+
+  /** Opens only a ciphertext with the exact trusted owner/workspace/epoch and complete stage binding. */
+  openOAuthStageWithinTransaction(context: OwnedTransactionContext, bindingInput: OAuthStageBinding,
+    ciphertextInput: StageCiphertext): string {
+    this.validateOAuthStageContext(context);
+    const binding = normalizeOAuthStageBinding(bindingInput);
+    const ciphertext = normalizeStageCiphertext(ciphertextInput);
+    let cleartext: Buffer | undefined;
+    let partialPlaintext: Buffer | undefined;
+    let finalPlaintext: Buffer | undefined;
+    try {
+      const decipher = createDecipheriv('aes-256-gcm', this.#oauthStageKey, ciphertext.nonce);
+      decipher.setAAD(oauthStageAad(context, binding));
+      decipher.setAuthTag(ciphertext.tag);
+      partialPlaintext = decipher.update(ciphertext.ciphertext);
+      finalPlaintext = decipher.final();
+      cleartext = Buffer.concat([partialPlaintext, finalPlaintext]);
+      if (cleartext.length === 0 || cleartext.length > MAX_OAUTH_STAGE_BYTES) {
+        reject('oauth_stage_open_failed', 'The OAuth stage could not be authenticated.');
+      }
+      const plaintext = cleartext.toString('utf8');
+      const utf8 = Buffer.from(plaintext, 'utf8');
+      try {
+        if (utf8.compare(cleartext) !== 0) reject('oauth_stage_open_failed', 'The OAuth stage could not be authenticated.');
+      } finally {
+        utf8.fill(0);
+      }
+      return plaintext;
+    } catch {
+      return reject('oauth_stage_open_failed', 'The OAuth stage could not be authenticated.');
+    } finally {
+      cleartext?.fill(0);
+      partialPlaintext?.fill(0);
+      finalPlaintext?.fill(0);
+    }
+  }
+
   setSecretWithinTransaction(context: OwnedTransactionContext, scope: VaultScope, purpose: VaultPurpose,
     expectedGeneration: number, secret: string): VaultCredentialMetadata {
     const normalized = this.validate(context, scope, purpose);
@@ -354,6 +508,12 @@ export class SecretVault {
   close(): void {
     this.closed = true;
     this.#key.fill(0);
+    this.#oauthStageKey.fill(0);
+  }
+
+  private validateOAuthStageContext(context: OwnedTransactionContext): void {
+    if (this.closed) reject('vault_closed', 'The credential vault is closed.');
+    checkContext(this.#db, context);
   }
 
   private validate(context: OwnedTransactionContext, scope: VaultScope, purpose: VaultPurpose): NormalizedScope {
