@@ -7,6 +7,9 @@ import {
 import { OPENROUTER_BATCH_MODEL } from '../src/services/openRouter';
 import { assistantChatRefinementSchemaV2, assistantResponseSchema, assistantResponseSchemaV2, assistantResponseSchemaV3 } from '../src/assistant';
 import { buildOpenRouterPeriodSummaryRequest, createOpenRouterPeriodSummaryBinding } from '../src/services/openRouterPeriodSummary';
+import { createInitialWorkspaceState } from '../src/services/controller.shared';
+import { createWorkspaceSnapshotDTO } from '../src/cloud/workspaceDto';
+import { decodeWorkspaceSnapshotDTO } from '../src/cloud/workspaceSnapshotCodec';
 
 const operationId = '20000000-0000-4000-8000-000000000001';
 function bodyFor(version: 1 | 2 | 5): string {
@@ -71,6 +74,17 @@ describe('private OpenRouter Batch ledger receipts', () => {
     expect(roundTrip.jobs[0]).not.toHaveProperty('requestBody');
     expect(roundTrip.jobs[0]).not.toHaveProperty('summaryBinding');
     expect(JSON.stringify(roundTrip)).not.toContain('Private source content');
+
+    const tombstoneDto = assistantBatchJobDTO(roundTrip.jobs[0]!);
+    expect(tombstoneDto.periodSummary).toEqual({ period: 'daily', timeZone: 'UTC', localInterval: { start: '2026-06-30', end: '2026-07-01' } });
+    expect(tombstoneDto.periodSummary).not.toHaveProperty('occurrenceId');
+    const state = createInitialWorkspaceState(() => operationId);
+    state.assistantBatchJobs = [tombstoneDto];
+    const snapshot = createWorkspaceSnapshotDTO({ getSnapshot: () => state },
+      { workspaceId: '7b906fca-65c1-4bd2-b18e-1b56cc6f48a8', privacyEpoch: 2, revision: 9 });
+    const decoded = decodeWorkspaceSnapshotDTO(JSON.parse(JSON.stringify(snapshot)) as unknown);
+    expect(decoded.state.assistantBatchJobs[0]?.periodSummary).toEqual(tombstoneDto.periodSummary);
+    expect(JSON.stringify(decoded.state.assistantBatchJobs[0])).not.toContain('occurrenceId');
   });
 
   it('requires the exact deterministic profile-6 body and Unicode-safe frozen source content', async () => {
@@ -84,6 +98,28 @@ describe('private OpenRouter Batch ledger receipts', () => {
     const binding = JSON.parse(JSON.stringify(job.summaryBinding)) as Record<string, any>;
     binding.sources[0].content = '\ud800';
     expect(() => validateOpenRouterBatchLedger({ version: 1, jobs: [{ ...job, summaryBinding: binding }] })).toThrow(/integrity validation/i);
+  });
+
+  it('retains cutoff bytes only in a separate bounded pair and scrubs them on explicit source removal', async () => {
+    const job = await summaryJob();
+    const partial = '{"markdown":"incomplete';
+    const truncated = { ...job, status: 'result_truncated' as const, failureCode: 'result_truncated' as const,
+      truncatedResultText: partial, truncatedResultSha256: 'd'.repeat(64), accounting: { providerReportedCostUsd: 0.002 } };
+    const validated = validateOpenRouterBatchLedger({ version: 1, jobs: [truncated] }).jobs[0]!;
+    expect(validated).toMatchObject({ status: 'result_truncated', truncatedResultText: partial, truncatedResultSha256: 'd'.repeat(64) });
+    expect(validated).not.toHaveProperty('resultText');
+    expect(JSON.stringify(assistantBatchJobDTO(validated))).not.toContain(partial);
+    expect(() => validateOpenRouterBatchLedger({ version: 1, jobs: [{ ...truncated, resultText: partial, resultSha256: 'e'.repeat(64) }] }))
+      .toThrow(/integrity validation/i);
+    expect(() => validateOpenRouterBatchLedger({ version: 1, jobs: [{ ...truncated, truncatedResultText: '\ud800' }] }))
+      .toThrow(/integrity validation/i);
+
+    const removed = tombstoneOpenRouterBatchJob(validated, at);
+    const receipt = validateOpenRouterBatchLedger({ version: 1, jobs: [removed] }).jobs[0]!;
+    expect(receipt).toMatchObject({ status: 'source_removed', batchId: 'batch_summary_fixture', accounting: { providerReportedCostUsd: 0.002 } });
+    expect(receipt).not.toHaveProperty('truncatedResultText');
+    expect(receipt).not.toHaveProperty('truncatedResultSha256');
+    expect(JSON.stringify(receipt)).not.toContain('incomplete');
   });
 
   it('replaces deleted source content with a verifiable content-free billing receipt', () => {

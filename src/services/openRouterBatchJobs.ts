@@ -1,5 +1,5 @@
 import type { AssistIntent, KnowledgeSelection } from '../core';
-import { higherOpenRouterRecoveryEfforts, type OpenRouterBatchBaseOperation, type OpenRouterBatchInspection, type OpenRouterBatchOutputPolicyVersion, type OpenRouterBatchPersistedRequestProfileVersion, type OpenRouterBatchRequestProfileVersion, type OpenRouterChatRefinementEffort } from './openRouter';
+import { higherOpenRouterRecoveryEfforts, OPENROUTER_BATCH_RESPONSE_MAX_BYTES, type OpenRouterBatchBaseOperation, type OpenRouterBatchInspection, type OpenRouterBatchOutputPolicyVersion, type OpenRouterBatchPersistedRequestProfileVersion, type OpenRouterBatchRequestProfileVersion, type OpenRouterChatRefinementEffort } from './openRouter';
 import { validOpenRouterMailReplyBinding, type OpenRouterMailReplyBinding } from './openRouterMailReply';
 import { validReplyText } from './openRouterMailReply';
 import { isOpenRouterBatchRequestProfile, OPENROUTER_BATCH_MODEL } from './openRouter';
@@ -9,6 +9,17 @@ import { isOpenRouterPeriodSummaryBindingShape, isOpenRouterPeriodSummaryRecover
 export const OPENROUTER_BATCH_LEDGER_VERSION = 1 as const;
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
+function validUnicodeText(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) return false;
+  }
+  return true;
+}
 const STATUSES = new Set([
   'preparing', 'submitting', 'submission_unknown', 'queued', 'processing', 'completed',
   'failed', 'expired', 'cancelled', 'result_stale', 'result_invalid', 'result_truncated', 'result_not_retained', 'cleanup_pending', 'source_removed',
@@ -122,6 +133,9 @@ export interface OpenRouterBatchJob {
   readonly mailReplyBinding?: OpenRouterMailReplyBinding;
   readonly resultText?: string;
   readonly resultSha256?: string;
+  /** Bounded provider cutoff bytes retained only as explicit MoreCompute evidence; never complete Markdown. */
+  readonly truncatedResultText?: string;
+  readonly truncatedResultSha256?: string;
   /** Permanent opaque link to the one draft activated from this job. */
   readonly proposalId?: string;
   /** Explicit operation for the permanently linked proposal; absent legacy jobs mean draft. */
@@ -137,10 +151,15 @@ export interface OpenRouterBatchJob {
 }
 
 export interface OpenRouterPeriodSummaryMetadata {
+  /** Private occurrence key retained only to prevent replay after source removal. */
+  readonly occurrenceId?: string;
   readonly period: OpenRouterPeriodSummaryKind;
   readonly timeZone: string;
   readonly localInterval: Readonly<{ start: string; end: string }>;
 }
+
+/** Public, content-free period projection. The private occurrence key is never exposed. */
+export type OpenRouterPeriodSummaryPublicMetadata = Omit<OpenRouterPeriodSummaryMetadata, 'occurrenceId'>;
 
 export interface OpenRouterPeriodSummaryLineage {
   readonly parentJobId: string | null;
@@ -221,7 +240,7 @@ export interface AssistantBatchJobDTO {
   readonly pendingRecoveryChildId?: string;
   readonly recoveredConversationId?: string;
   readonly recoveredTurnId?: string;
-  readonly periodSummary?: OpenRouterPeriodSummaryMetadata;
+  readonly periodSummary?: OpenRouterPeriodSummaryPublicMetadata;
   readonly summaryLineage?: OpenRouterPeriodSummaryLineage;
 }
 
@@ -359,7 +378,8 @@ function validChatBinding(value: unknown): value is OpenRouterChatBinding {
 function validSummaryMetadata(value: unknown): value is OpenRouterPeriodSummaryMetadata {
   const row = record(value);
   const interval = record(row?.localInterval);
-  if (!row || !exactKeys(row, ['period', 'timeZone', 'localInterval']) ||
+  if (!row || !exactKeys(row, ['period', 'timeZone', 'localInterval'], ['occurrenceId']) ||
+      (row.occurrenceId !== undefined && (typeof row.occurrenceId !== 'string' || !UUID_V4.test(row.occurrenceId))) ||
       !['daily', 'weekly', 'monthly', 'yearly'].includes(String(row.period)) ||
       typeof row.timeZone !== 'string' || !row.timeZone || row.timeZone.length > 128 ||
       !interval || !exactKeys(interval, ['start', 'end']) || typeof interval.start !== 'string' || typeof interval.end !== 'string' ||
@@ -399,7 +419,7 @@ function validPeriodSummaryJob(row: Record<string, unknown>): boolean {
       validSummaryLineage(row.summaryRecoveryLineage, row.id as string) && exactKeys(row, removedFields, commonOptional);
   }
   const required = [...commonRequired, 'operation', 'requestProfileVersion', 'inputPolicyVersion', 'outputPolicyVersion', 'requestBytes', 'requestBody', 'summaryBinding'];
-  const optional = [...commonOptional, 'summaryRecoveryBinding', 'resultText', 'resultSha256'];
+  const optional = [...commonOptional, 'summaryRecoveryBinding', 'resultText', 'resultSha256', 'truncatedResultText', 'truncatedResultSha256'];
   if (row.sourceRemoved !== undefined || row.status === 'source_removed' || !exactKeys(row, required, optional) ||
       row.operation !== 'period_summary' || row.requestProfileVersion !== 6 || row.inputPolicyVersion !== 2 || row.outputPolicyVersion !== 2 ||
       !Number.isSafeInteger(row.requestBytes) || (row.requestBytes as number) < 1 || (row.requestBytes as number) > 1024 * 1024 ||
@@ -411,11 +431,17 @@ function validPeriodSummaryJob(row: Record<string, unknown>): boolean {
   } else if (!isOpenRouterPeriodSummaryRecoveryBindingShape(row.summaryRecoveryBinding, row.summaryBinding, row.id)) return false;
   if (!isOpenRouterPeriodSummaryRequestBodyShape(row.requestBody, row.summaryBinding, row.summaryRecoveryBinding, row.id, row.requestSha256)) return false;
   const resultPair = row.resultText !== undefined || row.resultSha256 !== undefined;
+  const truncatedPair = row.truncatedResultText !== undefined || row.truncatedResultSha256 !== undefined;
+  if (truncatedPair) {
+    if (row.status !== 'result_truncated' || typeof row.truncatedResultText !== 'string' || !validUnicodeText(row.truncatedResultText) ||
+        !row.truncatedResultText.trim() || new TextEncoder().encode(row.truncatedResultText).byteLength > OPENROUTER_BATCH_RESPONSE_MAX_BYTES ||
+        typeof row.truncatedResultSha256 !== 'string' || !SHA256.test(row.truncatedResultSha256)) return false;
+  }
   if (resultPair) {
-    if (typeof row.resultText !== 'string' || typeof row.resultSha256 !== 'string' || !SHA256.test(row.resultSha256)) return false;
+    if (truncatedPair || typeof row.resultText !== 'string' || typeof row.resultSha256 !== 'string' || !SHA256.test(row.resultSha256)) return false;
     try { parseOpenRouterPeriodSummaryResult(row.resultText, row.summaryBinding); } catch { return false; }
   }
-  if ((row.status === 'completed') !== resultPair || (row.status === 'result_truncated' && resultPair)) return false;
+  if ((row.status === 'completed') !== resultPair || (row.status === 'result_truncated') !== truncatedPair) return false;
   if (['queued', 'processing', 'completed', 'expired', 'cancelled', 'result_stale', 'result_invalid', 'result_truncated', 'result_not_retained'].includes(String(row.status)) && !row.batchId) return false;
   if (row.status === 'failed' && !row.batchId && !(row.failureCode === 'not_submitted' && row.unknownCharge === false)) return false;
   return true;
@@ -688,7 +714,9 @@ export function assistantBatchJobDTO(job: OpenRouterBatchJob, cleanupPending = f
     ...(job.kind === 'mail_reply' && job.proposalId ? { proposalId: job.proposalId } : {}),
     ...(job.recoveryBinding && job.chatBinding ? { recoveredConversationId: job.chatBinding.conversationId, recoveredTurnId: job.chatBinding.turnId } : {}),
     ...(job.kind === 'period_summary' ? { periodSummary: job.summaryBinding ? Object.freeze({ period: job.summaryBinding.period,
-      timeZone: job.summaryBinding.timeZone, localInterval: Object.freeze({ ...job.summaryBinding.localInterval }) }) : job.summaryMetadata } : {}),
+      timeZone: job.summaryBinding.timeZone, localInterval: Object.freeze({ ...job.summaryBinding.localInterval }) }) : job.summaryMetadata ?
+        Object.freeze({ period: job.summaryMetadata.period, timeZone: job.summaryMetadata.timeZone,
+          localInterval: Object.freeze({ ...job.summaryMetadata.localInterval }) }) : undefined } : {}),
     ...(job.kind === 'period_summary' && job.summaryRecoveryBinding ? { summaryLineage: summaryLineageFromProof(job.summaryRecoveryBinding) } : {}),
     ...(job.kind === 'period_summary' && job.summaryRecoveryLineage ? { summaryLineage: job.summaryRecoveryLineage } : {}),
   });
@@ -736,7 +764,7 @@ export function tombstoneOpenRouterBatchJob(job: OpenRouterBatchJob, updatedAt: 
     return Object.freeze(contentFreeReceipt) as OpenRouterBatchTombstone;
   }
   if (job.kind === 'period_summary') {
-    const metadata = job.summaryBinding ? Object.freeze({ period: job.summaryBinding.period, timeZone: job.summaryBinding.timeZone,
+    const metadata = job.summaryBinding ? Object.freeze({ occurrenceId: job.summaryBinding.occurrenceId, period: job.summaryBinding.period, timeZone: job.summaryBinding.timeZone,
       localInterval: Object.freeze({ ...job.summaryBinding.localInterval }) }) : job.summaryMetadata;
     const lineage = job.summaryRecoveryBinding ? summaryLineageFromProof(job.summaryRecoveryBinding) :
       Object.freeze({ parentJobId: null, rootJobId: job.id, ancestorJobIds: Object.freeze([]) });

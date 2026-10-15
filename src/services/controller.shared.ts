@@ -17,7 +17,7 @@ import type { StateStore } from '../storage/contracts';
 import { STATE_SNAPSHOT_READ_MAX_BYTES } from '../storage/contracts';
 import type { OAuthInstallLifecycle, OAuthInstallCheckpoint, PreparedOAuthInstallFacts } from './oauthInstallContracts';
 import { recoveryUtf8Bytes, STARTUP_RECOVERY_SESSION_MS, validateRecoveryId, validateRecoveryIso, validateRecoveryReceipt, validateReplacementSnapshot, type StartupRecoveryInspection, type StartupRecoveryPlan, type StartupRecoveryReceipt, type StartupRecoveryCommitInput } from '../storage/startupRecovery';
-import { ReplyGenerationError, ReplyGenerationPreDispatchError, validateAzureEndpoint, type DraftAnalysis, type PreparedAnalysis, type ReplyGenerationInput, type ReplyGenerationUsage } from './controllerRuntimeContracts';
+import { ReplyGenerationError, ReplyGenerationPreDispatchError, validateAzureEndpoint, type DraftAnalysis, type PreparedAnalysis, type ReplyGenerationInput, type ReplyGenerationUsage, type TrustedPeriodSummaryDispatch } from './controllerRuntimeContracts';
 import type { AzureSpeechClient } from './azure';
 import { AssistantClientRouter, type AssistantModelClient } from './assistantClient';
 import {
@@ -95,8 +95,10 @@ import type { ProviderCredentialService } from './credentials';
 import type { BackgroundTaskBackend } from '../background/backend.types';
 import {
   OPENROUTER_BATCH_MODEL, OPENROUTER_BATCH_BODY_MODEL, OPENROUTER_BATCH_RESPONSE_MAX_BYTES, OPENROUTER_BATCH_REQUEST_PROFILE_VERSION, OpenRouterBatchClient, OpenRouterBatchDispatchError,
-  OpenRouterBatchRequestBuilder, isOpenRouterBatchRequestProfile, buildMoreComputeRequestBody, higherOpenRouterRecoveryEfforts, type OpenRouterBatchBaseOperation, type OpenRouterBatchInspection, type PreparedOpenRouterAnalysis,
+  OpenRouterBatchRequestBuilder, isOpenRouterBatchRequestProfile, buildMoreComputeRequestBody, higherOpenRouterRecoveryEfforts, type OpenRouterBatchBaseOperation, type OpenRouterBatchInspection, type OpenRouterBatchSubmitInput, type PreparedOpenRouterAnalysis,
 } from './openRouter';
+import { parseOpenRouterPeriodSummaryResult, isOpenRouterPeriodSummaryRequestBody, isOpenRouterPeriodSummaryRecoveryRequestBody,
+  validateOpenRouterPeriodSummarySubmission } from './openRouterPeriodSummary';
 import type { OpenRouterSpeechAdapterPort } from './openRouterSpeechAdapter.shared';
 import { emptyChatLedger, selectCompletedChatContext, validateChatLedger } from '../chat/ledger';
 import type { ChatConversation, ChatConversationDTO, ChatReplySnapshot, ChatTranscriptTransferPlan, ReadonlyChatLedger } from '../chat/types';
@@ -104,7 +106,7 @@ import type { KnowledgeSuggestionReview } from '../knowledge/types';
 import {
   emptyOpenRouterBatchLedger, validateOpenRouterBatchLedger, assistantBatchJobDTO, accountingFromInspection,
   isOpenRouterBatchContentJob, isOpenRouterMailReplyContentJob, tombstoneOpenRouterBatchJob,
-  type AssistantBatchJobDTO, type OpenRouterBatchJob, type OpenRouterBatchContentJob, type OpenRouterMailReplyContentJob, type OpenRouterBatchLedger, type OpenRouterBatchAccounting, type OpenRouterBatchRecoveryBinding,
+  type AssistantBatchJobDTO, type OpenRouterBatchJob, type OpenRouterBatchContentJob, type OpenRouterMailReplyContentJob, type OpenRouterPeriodSummaryContentJob as PeriodSummaryContentJob, type OpenRouterBatchLedger, type OpenRouterBatchAccounting, type OpenRouterBatchRecoveryBinding,
   type OpenRouterChatBinding,
 } from './openRouterBatchJobs';
 import { parseOpenRouterMailReplyResult, validOpenRouterMailReplyBinding, validReplyText, type OpenRouterMailReplyBinding, type OpenRouterMailReplyFrozenNote, type OpenRouterMailReplyFrozenPolicy, type OpenRouterMailReplyContextSource } from './openRouterMailReply';
@@ -3056,7 +3058,8 @@ export class AppControllerImpl implements AppController {
           const oldById = new Map(this.assistantBatchLedger.jobs.map((job) => [job.id, job]));
           const eligible = batchLedger.jobs.filter((job) => {
             const prior = oldById.get(job.id);
-            return (job.status === 'completed' || job.status === 'result_stale') && (prior?.status === 'queued' || prior?.status === 'processing');
+            return (job.status === 'completed' || job.status === 'result_stale' || job.status === 'result_truncated') &&
+              (prior?.status === 'queued' || prior?.status === 'processing');
           });
           if (eligible.length !== 1) throw new Error('The completed Batch reply could not be retained within the saved-data limit.');
           const targetId = eligible[0].id;
@@ -3065,7 +3068,10 @@ export class AppControllerImpl implements AppController {
             jobs: batchLedger.jobs.map((job) => {
               if (job.id !== targetId) return job;
               const { appliedNoteRevision: _appliedNoteRevision, ...withoutAppliedRevision } = job;
-              const receipt = job.kind === 'mail_reply'
+              const receipt = job.kind === 'period_summary'
+                ? (({ resultText: _resultText, resultSha256: _resultSha256, truncatedResultText: _truncatedResultText,
+                    truncatedResultSha256: _truncatedResultSha256, ...summaryReceipt }) => summaryReceipt)(withoutAppliedRevision)
+                : job.kind === 'mail_reply'
                 ? (({ resultText: _resultText, resultSha256: _resultSha256, ...mailReceipt }) => mailReceipt)(withoutAppliedRevision)
                 : withoutAppliedRevision;
               return { ...receipt, status: 'result_not_retained' as const, failureCode: 'result_not_retained' as const };
@@ -5859,6 +5865,53 @@ export class AppControllerImpl implements AppController {
     finally { this.activeBatchNoteOperations.delete(noteId); }
   }
 
+  /** Server gateway only: persists and dispatches one already-frozen profile-6 request. */
+  async submitPreparedPeriodSummary(input: TrustedPeriodSummaryDispatch): Promise<AssistantBatchJobDTO> {
+    const capturedState = this.state;
+    const capturedGeneration = this.bootstrapGeneration;
+    const capturedPrivacyEpoch = this.integration.privacySession?.epoch;
+    if (!input || typeof input !== 'object' || (Object.getPrototypeOf(input) !== Object.prototype && Object.getPrototypeOf(input) !== null) ||
+        Reflect.ownKeys(input).length !== 2 || !Reflect.ownKeys(input).every((key) => key === 'submission' || key === 'assertCurrentAuthorityBeforePost')) {
+      throw new Error('period_summary_gateway_required');
+    }
+    const descriptors = Object.getOwnPropertyDescriptors(input);
+    const submissionDescriptor = descriptors.submission;
+    const authorityDescriptor = descriptors.assertCurrentAuthorityBeforePost;
+    if (!submissionDescriptor?.enumerable || !Object.hasOwn(submissionDescriptor, 'value') ||
+        !authorityDescriptor?.enumerable || !Object.hasOwn(authorityDescriptor, 'value') ||
+        typeof authorityDescriptor.value !== 'function') throw new Error('period_summary_gateway_required');
+    const authorityCheck = authorityDescriptor.value as () => void;
+    if (!this.openRouterBatchClient) throw new Error('The OpenRouter Batch service is unavailable in this workspace.');
+    if (this.assistantBatchLedgerMalformed || !this.loaded || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired) {
+      throw new Error('Refresh local data before submitting this period summary.');
+    }
+    const submissionPromise = validateOpenRouterPeriodSummarySubmission(submissionDescriptor.value, (value) => this.crypto.sha256(value));
+    const submission = await submissionPromise;
+    if (!this.loaded || this.state !== capturedState || this.bootstrapGeneration !== capturedGeneration ||
+        this.integration.privacySession?.epoch !== capturedPrivacyEpoch || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired ||
+        this.assistantBatchLedgerMalformed) throw new Error('The period summary belongs to an earlier workspace session.');
+    const createdAt = now();
+    let staged!: PeriodSummaryContentJob;
+    await this.mutate(() => {
+      if (!this.loaded || this.state !== capturedState || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired ||
+          this.bootstrapGeneration !== capturedGeneration || this.integration.privacySession?.epoch !== capturedPrivacyEpoch || this.assistantBatchLedgerMalformed) {
+        throw new Error('The period summary belongs to an earlier workspace session.');
+      }
+      if (this.assistantBatchLedger.jobs.some((job) => job.kind === 'period_summary' &&
+          (job.summaryBinding?.occurrenceId === submission.summaryBinding.occurrenceId || job.summaryMetadata?.occurrenceId === submission.summaryBinding.occurrenceId))) {
+        throw new Error('This period already has a retained summary request. Inspect that saved job before queuing another.');
+      }
+      staged = Object.freeze({ id: submission.operationId, customId: submission.operationId, kind: 'period_summary', status: 'preparing',
+        createdAt, updatedAt: createdAt, model: OPENROUTER_BATCH_MODEL, effort: submission.summaryBinding.effort,
+        requestSha256: submission.requestSha256, unknownCharge: false, operation: 'period_summary', requestProfileVersion: 6,
+        inputPolicyVersion: 2, outputPolicyVersion: 2, requestBytes: new TextEncoder().encode(submission.requestBody).byteLength,
+        requestBody: submission.requestBody, summaryBinding: submission.summaryBinding,
+        ...(submission.summaryRecoveryBinding ? { summaryRecoveryBinding: submission.summaryRecoveryBinding } : {}) });
+      return assistantBatchJobDTO(staged);
+    }, undefined, () => validateOpenRouterBatchLedger({ version: 1, jobs: [...this.assistantBatchLedger.jobs, staged] }));
+    return this.dispatchPreparedBatch(staged, capturedGeneration, this.state, undefined, authorityCheck);
+  }
+
   async submitMailReplyBatch(input: Omit<MailReplyTextGenerationInput, 'forceRefresh'>, commandFence?: { accountId: string; expectedConnectionGeneration: number }): Promise<AssistantBatchJobDTO> {
     if (!input || !['reply', 'reply_all'].includes(input.mode) || !Number.isSafeInteger(input.composerRevision) || input.composerRevision < 0 ||
         typeof input.messageId !== 'string' || !input.messageId || input.messageId.length > 256 || typeof input.sourceDigest !== 'string' ||
@@ -7232,17 +7285,21 @@ export class AppControllerImpl implements AppController {
     }, undefined, () => nextLedger);
   }
 
-  private async dispatchPreparedBatch(staged: OpenRouterBatchContentJob | OpenRouterMailReplyContentJob, capturedBootstrapGeneration: number, preparedState: AppState, beforePersistSubmitting?: () => Promise<void>): Promise<AssistantBatchJobDTO> {
-    if (staged.kind === 'period_summary' || staged.operation === 'period_summary') {
-      throw new Error('summary_submission_unavailable');
-    }
+  private async dispatchPreparedBatch(staged: OpenRouterBatchContentJob | OpenRouterMailReplyContentJob | PeriodSummaryContentJob,
+    capturedBootstrapGeneration: number, preparedState: AppState, beforePersistSubmitting?: () => Promise<void>,
+    assertBeforeStart?: () => void): Promise<AssistantBatchJobDTO> {
     if (!this.openRouterBatchClient) throw new Error('The OpenRouter Batch service is unavailable in this workspace.');
     const capturedPrivacyEpoch = this.integration.privacySession?.epoch;
     let submittingState: AppState | undefined;
     const submittedContextIsCurrent = () => this.loaded && this.bootstrapGeneration === capturedBootstrapGeneration &&
       this.state === (submittingState ?? preparedState) && this.startupRecoveryPhase === 'ready' && !this.mailAlertRefreshRequired;
     try {
-      const ack = await this.openRouterBatchClient.submit({ operationId: staged.id, requestBody: staged.requestBody, requestProfileVersion: staged.requestProfileVersion, operation: staged.operation ?? 'note_assistance' }, async () => {
+      const submitInput: OpenRouterBatchSubmitInput = staged.kind === 'period_summary' ? { operationId: staged.id, requestBody: staged.requestBody!,
+        requestSha256: staged.requestSha256, requestProfileVersion: 6 as const, operation: 'period_summary' as const,
+        summaryBinding: staged.summaryBinding!, ...(staged.summaryRecoveryBinding ? { summaryRecoveryBinding: staged.summaryRecoveryBinding } : {}) } :
+        { operationId: staged.id, requestBody: staged.requestBody, requestProfileVersion: staged.requestProfileVersion as 1 | 2 | 3 | 4 | 5,
+          operation: (staged.operation === 'chat_refinement' || staged.operation === 'mail_reply_context' ? staged.operation : 'note_assistance') };
+      const ack = await this.openRouterBatchClient.submit(submitInput, async () => {
         if (!this.loaded || this.bootstrapGeneration !== capturedBootstrapGeneration || this.state !== preparedState || this.mailAlertRefreshRequired || this.assistantBatchLedgerMalformed) throw new Error('The saved note changed before Batch submission.');
         await beforePersistSubmitting?.();
         await this.updateOpenRouterBatchJob(staged.id, (job) => ({ ...job, status: 'submitting', unknownCharge: true, updatedAt: now() }), { state: preparedState, generation: capturedBootstrapGeneration });
@@ -7254,9 +7311,10 @@ export class AppControllerImpl implements AppController {
         }
         const current = this.assistantBatchLedger.jobs.find((job) => job.id === staged.id);
         if (!current || current.status !== 'submitting' || current.requestSha256 !== staged.requestSha256) throw new Error('The saved Batch request changed before submission.');
+        assertBeforeStart?.();
       });
       if (!submittedContextIsCurrent() || !submittingState) {
-        if (!isOpenRouterMailReplyContentJob(staged) || capturedPrivacyEpoch !== this.integration.privacySession?.epoch ||
+        if (!isOpenRouterMailReplyContentJob(staged) && staged.kind !== 'period_summary' || capturedPrivacyEpoch !== this.integration.privacySession?.epoch ||
             capturedBootstrapGeneration !== this.bootstrapGeneration || !this.loaded || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired) {
           throw new Error('The Batch acknowledgement belongs to an earlier workspace session.');
         }
@@ -7264,24 +7322,40 @@ export class AppControllerImpl implements AppController {
         await this.store.assertCurrent?.();
         const currentState = this.state;
         const currentJob = this.assistantBatchLedger.jobs.find((job) => job.id === staged.id);
-        if (!currentJob || !isOpenRouterMailReplyContentJob(currentJob) || currentJob.status !== 'submitting' ||
-            currentJob.customId !== staged.customId || currentJob.requestSha256 !== staged.requestSha256 || currentJob.requestBody !== staged.requestBody ||
-            stableJson(currentJob.mailReplyBinding) !== stableJson(staged.mailReplyBinding) || currentJob.batchId !== undefined) {
-          throw new Error('The acknowledged mail Batch request was no longer safely retained after account or workspace change.');
+        let sameFrozenJob = false;
+        if (currentJob?.kind === 'period_summary' && staged.kind === 'period_summary') {
+          sameFrozenJob = currentJob.status === 'submitting' && currentJob.customId === staged.customId && currentJob.requestSha256 === staged.requestSha256 &&
+            currentJob.requestBody === staged.requestBody && stableJson(currentJob.summaryBinding) === stableJson(staged.summaryBinding) &&
+            stableJson(currentJob.summaryRecoveryBinding ?? null) === stableJson(staged.summaryRecoveryBinding ?? null) && currentJob.batchId === undefined;
+        } else if (currentJob && isOpenRouterMailReplyContentJob(currentJob) && isOpenRouterMailReplyContentJob(staged)) {
+          sameFrozenJob = currentJob.status === 'submitting' && currentJob.customId === staged.customId && currentJob.requestSha256 === staged.requestSha256 &&
+            currentJob.requestBody === staged.requestBody && stableJson(currentJob.mailReplyBinding) === stableJson(staged.mailReplyBinding) && currentJob.batchId === undefined;
+        }
+        if (!sameFrozenJob) {
+          throw new Error('The acknowledged Batch request was no longer safely retained after account or workspace change.');
         }
         return await this.updateOpenRouterBatchJob(staged.id, (job) => {
           if (capturedPrivacyEpoch !== this.integration.privacySession?.epoch || capturedBootstrapGeneration !== this.bootstrapGeneration ||
               !this.loaded || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired) {
             throw new Error('The mail Batch acknowledgement belongs to an earlier privacy or workspace session.');
           }
-          if (!isOpenRouterMailReplyContentJob(job) || job.status !== 'submitting' || job.requestSha256 !== staged.requestSha256 ||
+          if (staged.kind === 'period_summary' ? job.kind !== 'period_summary' || job.status !== 'submitting' || job.requestSha256 !== staged.requestSha256 ||
+              job.requestBody !== staged.requestBody || stableJson(job.summaryBinding) !== stableJson(staged.summaryBinding) ||
+              stableJson(job.summaryRecoveryBinding ?? null) !== stableJson(staged.summaryRecoveryBinding ?? null) || job.batchId !== undefined :
+              !isOpenRouterMailReplyContentJob(job) || job.status !== 'submitting' || job.requestSha256 !== staged.requestSha256 ||
               job.requestBody !== staged.requestBody || stableJson(job.mailReplyBinding) !== stableJson(staged.mailReplyBinding) || job.batchId !== undefined) {
-            throw new Error('The acknowledged mail Batch request changed before its receipt was saved.');
+            throw new Error('The acknowledged Batch request changed before its receipt was saved.');
           }
           return { ...job, status: 'queued', batchId: ack.batchId, updatedAt: now() };
         }, { state: currentState, generation: capturedBootstrapGeneration });
       }
       return await this.updateOpenRouterBatchJob(staged.id, (job) => {
+        if (staged.kind === 'period_summary' && (job.kind !== 'period_summary' || job.status !== 'submitting' || job.customId !== staged.customId ||
+            job.requestSha256 !== staged.requestSha256 || job.requestBody !== staged.requestBody ||
+            stableJson(job.summaryBinding) !== stableJson(staged.summaryBinding) ||
+            stableJson(job.summaryRecoveryBinding ?? null) !== stableJson(staged.summaryRecoveryBinding ?? null) || job.batchId !== undefined)) {
+          throw new Error('The acknowledged period summary request changed before its receipt was saved.');
+        }
         if (isOpenRouterMailReplyContentJob(staged) && (capturedPrivacyEpoch !== this.integration.privacySession?.epoch ||
             capturedBootstrapGeneration !== this.bootstrapGeneration || !this.loaded || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired)) {
           throw new Error('The mail Batch acknowledgement belongs to an earlier privacy or workspace session.');
@@ -7331,7 +7405,8 @@ export class AppControllerImpl implements AppController {
   private projectBatchJob(job: OpenRouterBatchJob): AssistantBatchJobDTO {
     const dto = assistantBatchJobDTO(job, this.assistantBatchCleanupRetries.has(job.id));
     const child = this.moreComputeChild(job.id);
-    const available = job.status === 'result_truncated' && !job.sourceRemoved && !this.assistantBatchLedgerMalformed && !child;
+    const retainedCutoff = job.kind !== 'period_summary' || (typeof job.truncatedResultText === 'string' && typeof job.truncatedResultSha256 === 'string');
+    const available = job.status === 'result_truncated' && !job.sourceRemoved && !this.assistantBatchLedgerMalformed && !child && retainedCutoff;
     return Object.freeze({ ...dto, canRecoverMoreCompute: available && this.moreComputeEfforts(job).length > 0,
       moreComputeEfforts: this.moreComputeEfforts(job), ...(child ? { pendingRecoveryChildId: child.id } : {}) });
   }
@@ -7724,8 +7799,7 @@ export class AppControllerImpl implements AppController {
     if (this.assistantBatchLedgerMalformed) throw new Error('Saved Batch history could not be validated. Refresh local data before continuing.');
     const job = this.assistantBatchLedger.jobs.find((candidate) => candidate.id === jobId);
     if (!job) throw new Error('The saved Batch job was not found.');
-    if (job.kind === 'period_summary' && !job.sourceRemoved) throw new Error('summary_result_processing_unavailable');
-    if (!isOpenRouterBatchContentJob(job) && !isOpenRouterMailReplyContentJob(job)) {
+    if (!isOpenRouterBatchContentJob(job) && !isOpenRouterMailReplyContentJob(job) && !(job.kind === 'period_summary' && !job.sourceRemoved)) {
       if (!job.batchId || (!onProviderStatus && job.accounting?.providerReportedCostUsd !== undefined) || !this.openRouterBatchClient || this.assistantBatchCleanupRetries.has(job.id)) return this.batchDTO(job.id);
       const capturedState = this.state;
       const capturedGeneration = this.bootstrapGeneration;
@@ -7792,6 +7866,11 @@ export class AppControllerImpl implements AppController {
     const accounting = job.providerObservation
       ? this.fillMissingBatchAccounting(job.accounting, inspectedAccounting)
       : this.mergeBatchAccounting(job.accounting, inspectedAccounting);
+    if (job.kind === 'period_summary' && job.sourceRemoved) {
+      return this.updateOpenRouterBatchJob(job.id, (current) => ({ ...current, ...(inspection.batchId ? { batchId: inspection.batchId } : {}),
+        unknownCharge: accounting?.providerReportedCostUsd === undefined, ...(accounting ? { accounting } : {}), updatedAt: now() }),
+      { state: capturedState, generation: capturedGeneration });
+    }
     if (accountingOnly) {
       return this.updateOpenRouterBatchJob(job.id, (current) => ({
         ...current,
@@ -7824,6 +7903,65 @@ export class AppControllerImpl implements AppController {
         ...(accounting ? { accounting } : {}), updatedAt: now(),
       }), { state: capturedState, generation: capturedGeneration });
     }
+    if (job.kind === 'period_summary' && !job.sourceRemoved) {
+      const invalidSummary = () => this.updateOpenRouterBatchJob(job.id, (current) => ({ ...current, status: 'result_invalid', failureCode: 'invalid_result',
+        resultText: undefined, resultSha256: undefined, truncatedResultText: undefined, truncatedResultSha256: undefined,
+        unknownCharge: accounting?.providerReportedCostUsd === undefined, ...(accounting ? { accounting } : {}), updatedAt: now() }),
+      { state: capturedState, generation: capturedGeneration });
+      const rejectSummary = () => {
+        const current = this.assistantBatchLedger.jobs.find((candidate) => candidate.id === job.id);
+        return current?.providerObservation ? Promise.resolve(this.batchDTO(job.id)) : invalidSummary();
+      };
+      try {
+        requireInspectionContext();
+        const requestDigest = await this.crypto.sha256(job.requestBody!);
+        const requestValid = requestDigest === job.requestSha256 && (job.summaryRecoveryBinding
+          ? await isOpenRouterPeriodSummaryRecoveryRequestBody(job.requestBody, job.summaryBinding, job.summaryRecoveryBinding,
+            job.id, job.customId, (value) => this.crypto.sha256(value))
+          : await isOpenRouterPeriodSummaryRequestBody(job.requestBody, job.summaryBinding, (value) => this.crypto.sha256(value)));
+        if (!requestValid) return await rejectSummary();
+        const resultRow = inspection.result;
+        const body = resultRow?.responseBody && typeof resultRow.responseBody === 'object' && !Array.isArray(resultRow.responseBody)
+          ? resultRow.responseBody as Record<string, unknown> : undefined;
+        const choices = body?.choices;
+        const choice = Array.isArray(choices) && choices.length === 1 && choices[0] && typeof choices[0] === 'object' && !Array.isArray(choices[0])
+          ? choices[0] as Record<string, unknown> : undefined;
+        const message = choice?.message && typeof choice.message === 'object' && !Array.isArray(choice.message)
+          ? choice.message as Record<string, unknown> : undefined;
+        const raw = message?.content;
+        if (resultRow?.customId !== job.customId || resultRow.statusCode !== 200 || message?.role !== 'assistant' ||
+            typeof raw !== 'string' || message.refusal !== undefined || choice?.finish_reason !== (inspection.resultValidation === 'truncated' ? 'length' : 'stop')) {
+          return await rejectSummary();
+        }
+        if (inspection.resultValidation === 'truncated') {
+          const partialBytes = new TextEncoder().encode(raw).byteLength;
+          if (!raw.trim() || partialBytes > OPENROUTER_BATCH_RESPONSE_MAX_BYTES) return await rejectSummary();
+          const partialSha256 = await this.crypto.sha256(raw);
+          requireInspectionContext();
+          return this.updateOpenRouterBatchJob(job.id, (current) => {
+            const { resultText: _resultText, resultSha256: _resultSha256, ...withoutCompleteResult } = current;
+            return { ...withoutCompleteResult, status: 'result_truncated', failureCode: 'result_truncated', unknownCharge: accounting?.providerReportedCostUsd === undefined,
+              truncatedResultText: raw, truncatedResultSha256: partialSha256, ...(accounting ? { accounting } : {}), updatedAt: now() };
+          },
+          { state: capturedState, generation: capturedGeneration });
+        }
+        parseOpenRouterPeriodSummaryResult(raw, job.summaryBinding!);
+        const resultSha256 = await this.crypto.sha256(raw);
+        requireInspectionContext();
+        const checkpoint = await this.checkpointProviderObservation(job.id, resultSha256, accounting, { state: capturedState, generation: capturedGeneration });
+        capturedState = checkpoint.state;
+        requireInspectionContext();
+        return this.updateOpenRouterBatchJob(job.id, (current) => ({ ...current, status: 'completed', failureCode: undefined,
+          resultText: raw, resultSha256, truncatedResultText: undefined, truncatedResultSha256: undefined,
+          unknownCharge: accounting?.providerReportedCostUsd === undefined, ...(accounting ? { accounting } : {}), updatedAt: now() }),
+        { state: capturedState, generation: capturedGeneration });
+      } catch {
+        requireInspectionContext();
+        return await rejectSummary();
+      }
+    }
+    if (job.kind === 'period_summary') return this.batchDTO(job.id);
+    const legacyJob = job as OpenRouterBatchContentJob | OpenRouterMailReplyContentJob;
     if (isOpenRouterMailReplyContentJob(job)) {
       let parsed: ReturnType<typeof parseOpenRouterMailReplyResult> | undefined;
       let resultSha256: string | undefined;
@@ -7868,7 +8006,7 @@ export class AppControllerImpl implements AppController {
       const context = assistContext(fresh, note, job.intent!, job.question, [...(job.knowledgeSelection ?? [])],
         transcriptSource ? new Set([transcriptSource.noteId]) : new Set(), job.inputPolicyVersion ?? 1);
       const chatSources = job.chatBinding ? await this.chatSourcesForBinding(fresh, job.chatBinding) : [];
-      const baseProfile = job.requestProfileVersion === 4 ? job.recoveryBinding!.baseRequestProfileVersion : job.requestProfileVersion;
+      const baseProfile = legacyJob.requestProfileVersion === 4 ? legacyJob.recoveryBinding!.baseRequestProfileVersion : legacyJob.requestProfileVersion;
       const preparedBase = await this.createOpenRouterBatchRequestBuilder().prepareAnalysis(note, context.documents, fresh.settings, {
         intent: job.intent, question: job.question,
         ...(job.chatBinding ? { chatMode: true as const } : {}),
@@ -7877,11 +8015,11 @@ export class AppControllerImpl implements AppController {
         ...(!job.chatBinding && job.answeredAsOf ? { queryTimeAnchor: job.answeredAsOf, queryTimeZone: fresh.settings.timezone } : {}),
         additionalSources: [...context.additionalSources, ...chatSources],
         preselection: { omittedSourceCount: context.omittedSourceCount + (job.chatBinding?.omittedTurnCount ?? 0), omittedSourceIds: context.omittedSourceIds },
-      }, baseProfile, job.inputPolicyVersion ?? 1);
+      }, baseProfile, legacyJob.inputPolicyVersion ?? 1);
       prepared = job.requestProfileVersion === 4 ? { ...preparedBase, body: this.withBatchEffort(preparedBase.body, job.effort) } : preparedBase;
       requireInspectionContext();
       const digest = await this.crypto.sha256( prepared.body);
-      const sourceDigest = await this.crypto.sha256(stableJson(batchSourceFingerprintInput(prepared.sourceVersions, job.inputPolicyVersion)));
+      const sourceDigest = await this.crypto.sha256(stableJson(batchSourceFingerprintInput(prepared.sourceVersions, legacyJob.inputPolicyVersion)));
       requireInspectionContext();
       if (prepared.body !== job.requestBody || digest !== job.requestSha256 || sourceDigest !== job.sourceFingerprint || !sameSourceVersions({ ...job.sourceVersions }, { ...prepared.sourceVersions })) throw new Error('The saved analysis sources changed.');
     } catch {
@@ -7894,12 +8032,12 @@ export class AppControllerImpl implements AppController {
     let providerOutputText: string;
     try {
       if (inspection.resultValidation === 'truncated') {
-        if (!validBatchCutoffEnvelope(inspection, job.requestProfileVersion)) throw new Error('The truncated Batch envelope was invalid.');
+        if (!validBatchCutoffEnvelope(inspection, legacyJob.requestProfileVersion)) throw new Error('The truncated Batch envelope was invalid.');
         return this.updateOpenRouterBatchJob(job.id, (current) => { const { resultText: _resultText, resultSha256: _resultSha256, ...withoutResult } = current;
           return { ...withoutResult, status: 'result_truncated', failureCode: 'result_truncated', unknownCharge: accounting?.providerReportedCostUsd === undefined,
             ...(accounting ? { accounting } : {}), updatedAt: now() }; }, { state: capturedState, generation: capturedGeneration });
       }
-      const parsedResult = parseBatchAssistantResult(inspection, prepared, job.operation === 'chat_refinement' ? 'chat_refinement' : undefined, job.outputPolicyVersion ?? 1);
+      const parsedResult = parseBatchAssistantResult(inspection, prepared, legacyJob.operation === 'chat_refinement' ? 'chat_refinement' : undefined, legacyJob.outputPolicyVersion ?? 1);
       generated = parsedResult.generated;
       providerOutputText = parsedResult.providerOutputText;
     } catch {
@@ -7911,13 +8049,13 @@ export class AppControllerImpl implements AppController {
     let chatReplySha256: string | undefined;
     if (job.chatBinding) {
       try {
-        if (job.requestProfileVersion === 3) throw new Error('The saved chat request profile is invalid.');
+        if (legacyJob.requestProfileVersion === 3) throw new Error('The saved chat request profile is invalid.');
         chatReply = Object.freeze({ summary: generated.summary, answer: generated.answer,
           clarifications: Object.freeze([...generated.clarifications]), completedAt: now(),
-          requestSha256: job.requestSha256, requestProfileVersion: job.requestProfileVersion,
-          ...(job.outputPolicyVersion !== undefined ? { outputPolicyVersion: job.outputPolicyVersion } : {}) });
-        chatReplySha256 = await this.chatReplyDigest(chatReply);
-        this.chatLedgerWithReply(job.chatBinding, chatReply, chatReplySha256);
+          requestSha256: job.requestSha256, requestProfileVersion: legacyJob.requestProfileVersion,
+          ...(legacyJob.outputPolicyVersion !== undefined ? { outputPolicyVersion: legacyJob.outputPolicyVersion } : {}) });
+        chatReplySha256 = await this.chatReplyDigest(chatReply!);
+        this.chatLedgerWithReply(job.chatBinding, chatReply!, chatReplySha256!);
       } catch {
         requireInspectionContext();
         return this.updateOpenRouterBatchJob(job.id, (current) => ({ ...current, status: 'result_invalid', unknownCharge: accounting?.providerReportedCostUsd === undefined, failureCode: 'invalid_result', ...(accounting ? { accounting } : {}), updatedAt: now() }), { state: capturedState, generation: capturedGeneration });

@@ -1,5 +1,13 @@
 import type { ReplyGenerationUsage } from './azure';
+import type { OpenRouterPeriodSummarySubmission } from './openRouterPeriodSummary';
 export type { DraftAnalysis, PreparedAnalysis, ReplyGenerationInput, ReplyGenerationUsage } from './azure';
+
+/** Private server gateway handoff. Never construct this shape from a browser command. */
+export interface TrustedPeriodSummaryDispatch {
+  readonly submission: OpenRouterPeriodSummarySubmission;
+  /** Rechecks the owned policy/occurrence and completed UTC period immediately before POST. */
+  readonly assertCurrentAuthorityBeforePost: () => void;
+}
 
 export class ReplyGenerationError extends Error {
   constructor(message: string, readonly usage?: ReplyGenerationUsage) { super(message); this.name = 'ReplyGenerationError'; }
