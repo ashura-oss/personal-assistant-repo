@@ -9,7 +9,7 @@ import { ensurePrivateDirectory } from './config.js';
 import { AudioVerificationError, verifyPrivateAudioFile, type PrivateAudioFormat } from './audioVerification.js';
 
 const MAX_AUDIO_BYTES = 40 * 1024 * 1024;
-const AUDIO_SCHEMA_VERSION = 2;
+const AUDIO_SCHEMA_VERSION = 3;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SHA256 = /^[a-f0-9]{64}$/i;
 const MIME: Readonly<Record<PrivateAudioFormat, string>> = Object.freeze({
@@ -236,13 +236,15 @@ export class PrivateAudioRepository {
       ) STRICT;
       CREATE TRIGGER private_audio_consumed_capture_immutable BEFORE UPDATE ON private_audio_capture_uploads
         WHEN OLD.status='consumed' BEGIN SELECT RAISE(ABORT,'consumed capture receipt is immutable'); END;
+      CREATE INDEX private_audio_capture_upload_history
+        ON private_audio_capture_uploads(workspace_id,owner_id,privacy_epoch,created_at DESC,upload_id DESC);
       CREATE INDEX IF NOT EXISTS private_audio_reader_media ON private_audio_readers(media_id);`);
       } else {
         const markerColumns = db.pragma('table_info(private_audio_schema)') as { name: string; type: string }[];
         if (markerColumns.length !== 2 || markerColumns[0]?.name !== 'singleton' || markerColumns[0]?.type !== 'INTEGER' ||
           markerColumns[1]?.name !== 'version' || markerColumns[1]?.type !== 'INTEGER') throw new Error('audio_schema_invalid');
         const versions = db.prepare('SELECT singleton,version FROM private_audio_schema').all() as { singleton: number; version: number }[];
-        if (versions.length !== 1 || versions[0]?.singleton !== 1 || ![1, AUDIO_SCHEMA_VERSION].includes(versions[0]?.version ?? -1)) throw new Error('audio_schema_unsupported');
+        if (versions.length !== 1 || versions[0]?.singleton !== 1 || ![1, 2, AUDIO_SCHEMA_VERSION].includes(versions[0]?.version ?? -1)) throw new Error('audio_schema_unsupported');
         if (versions[0]!.version === 1) {
           if (db.prepare("SELECT 1 AS found FROM sqlite_master WHERE type='table' AND name='private_audio_capture_uploads'").get()) throw new Error('audio_schema_invalid');
           db.exec(`CREATE TABLE private_audio_capture_uploads (
@@ -260,7 +262,12 @@ export class PrivateAudioRepository {
           ) STRICT;
           CREATE TRIGGER private_audio_consumed_capture_immutable BEFORE UPDATE ON private_audio_capture_uploads
             WHEN OLD.status='consumed' BEGIN SELECT RAISE(ABORT,'consumed capture receipt is immutable'); END;
-          UPDATE private_audio_schema SET version=${AUDIO_SCHEMA_VERSION} WHERE singleton=1 AND version=1;`);
+          UPDATE private_audio_schema SET version=2 WHERE singleton=1 AND version=1;`);
+        }
+        if (versions[0]!.version <= 2) {
+          db.exec(`CREATE INDEX IF NOT EXISTS private_audio_capture_upload_history
+            ON private_audio_capture_uploads(workspace_id,owner_id,privacy_epoch,created_at DESC,upload_id DESC);
+            UPDATE private_audio_schema SET version=${AUDIO_SCHEMA_VERSION} WHERE singleton=1 AND version=2;`);
         }
       }
       const expectedColumns: Record<string, readonly { name: string; type: string; notnull: number; pk: number }[]> = {

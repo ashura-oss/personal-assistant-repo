@@ -1,6 +1,7 @@
 /** Same-origin raw audio upload transport. It never adopts media into a note. */
 import type { AuthenticatedSession } from './authClient';
 import { parseAudioUploadReceiptDTO, type AudioUploadReceiptDTO } from '../cloud/audioUploadDto';
+import { parseAudioUploadHistoryPageDTO, type AudioUploadHistoryPageDTO } from '../cloud/audioUploadHistoryDto';
 
 export const AUDIO_REQUEST_TIMEOUT_MS = 60_000;
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -27,6 +28,7 @@ export type AudioClientOptions = Readonly<{
 export type AudioUploadClient = Readonly<{
   uploadClip(input: Readonly<{ blob: Blob; capture: AudioCapture }>, onAdmitted?: (pending: PendingAudioUpload) => void): Promise<AudioUploadReceiptDTO>;
   inspectUpload(uploadId?: string): Promise<AudioUploadReceiptDTO>;
+  listUploads(cursor?: string): Promise<AudioUploadHistoryPageDTO>;
   getPendingUpload(): PendingAudioUpload | undefined;
   dispose(): void;
 }>;
@@ -233,9 +235,47 @@ export function createWebAudioUploadClient(session: AuthenticatedSession, option
     }
   }
 
+  async function listUploads(cursor?: string): Promise<AudioUploadHistoryPageDTO> {
+    assertUsable();
+    if (activeWrite || activeRead) throw new AudioClientError('busy', 'Wait for the audio upload request before reading upload history.', pending?.uploadId);
+    if (cursor !== undefined && (typeof cursor !== 'string' || cursor.length < 1 || cursor.length > 2048 || !/^[A-Za-z0-9_-]+$/.test(cursor))) {
+      throw new AudioClientError('malformed', 'The selected audio history page cannot be read.');
+    }
+    const ticket = generation;
+    const controller = new AbortController();
+    activeRead = true;
+    activeReadController = controller;
+    let timedOut = false;
+    let rejectTimeout!: (error: Error) => void;
+    const timeoutPromise = new Promise<never>((_, reject) => { rejectTimeout = reject; });
+    const timeout = setTimeout(() => { timedOut = true; controller.abort(); rejectTimeout(new Error('timeout')); }, timeoutMs);
+    const path = cursor === undefined ? '/api/audio/upload-history' : `/api/audio/upload-history?cursor=${encodeURIComponent(cursor)}`;
+    try {
+      const response = await Promise.race([fetcher(path, {
+        method: 'GET', credentials: 'same-origin', redirect: 'error', cache: 'no-store', signal: controller.signal,
+      }), timeoutPromise]);
+      assertUsable(ticket);
+      if (!response.ok) throw new AudioClientError('http', 'Audio upload history could not be read.', undefined, response.status);
+      const body = await Promise.race([response.json(), timeoutPromise]);
+      assertUsable(ticket);
+      try { return parseAudioUploadHistoryPageDTO(body); }
+      catch { throw new AudioClientError('malformed', 'Audio upload history could not be confirmed.'); }
+    } catch (error) {
+      if (error instanceof AudioClientError) throw error;
+      if (disposed || ticket !== generation) throw new AudioClientError('disposed', 'This audio client is no longer active.');
+      if (timedOut) throw new AudioClientError('timeout', 'Audio upload history read timed out.');
+      throw new AudioClientError('network', 'Audio upload history could not be read.');
+    } finally {
+      clearTimeout(timeout);
+      if (activeReadController === controller) activeReadController = undefined;
+      activeRead = false;
+    }
+  }
+
   return Object.freeze({
     uploadClip: sendUpload,
     inspectUpload,
+    listUploads,
     getPendingUpload: () => pending,
     dispose: () => { if (disposed) return; disposed = true; generation += 1; activeController?.abort(); activeController = undefined;
       activeReadController?.abort(); activeReadController = undefined; activeRead = false; activeWrite = false; pending = undefined; },

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { audioMediaUrl, parseAudioUploadReceiptDTO } from '../src/cloud/audioUploadDto';
+import { parseAudioUploadHistoryPageDTO } from '../src/cloud/audioUploadHistoryDto';
 import { AudioUploadNotStartedError, AudioUploadUnknownError, createWebAudioUploadClient,
   type AudioFetchLike } from '../src/web/audioClient';
 
@@ -13,6 +14,8 @@ const capture = Object.freeze({ id: captureId, capturedAt: '2026-10-15T02:03:04.
 const session = Object.freeze({ authenticated: true as const, workspaceId: 'workspace-safe-id', privacyEpoch: 3, csrfToken: 'private-csrf' });
 const media = Object.freeze({ mediaId: `still-media:${mediaId}`, sha256: 'a'.repeat(64), byteLength: 2048,
   durationSeconds: 1.25, format: 'm4a', mimeType: 'audio/mp4' });
+const historyEntry = Object.freeze({ uploadId, capture: Object.freeze({ id: captureId, revision: captureRevision,
+  capturedAt: capture.capturedAt, timeZone: capture.timeZone }), status: 'ready', createdAt: 1_800_000_000_000, updatedAt: 1_800_000_001_000 });
 
 function receipt(status: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
   return { schemaVersion: 1, uploadId, status,
@@ -206,5 +209,64 @@ describe('web audio upload transport', () => {
     expect(audioMediaUrl(mediaId)).toBe(`/api/audio/${mediaId}`);
     for (const id of ['../secret', 'https://example.test/a', 'still-media:66666666-6666-4666-8666-666666666666',
       '66666666-6666-4666-8666-66666666666/extra']) expect(() => audioMediaUrl(id)).toThrow();
+  });
+
+  it('lists durable metadata pages with same-origin GET and preserves an unknown pending upload', async () => {
+    const fetcher = vi.fn().mockRejectedValueOnce(new Error('lost acknowledgement'))
+      .mockResolvedValueOnce(response({ schemaVersion: 1, entries: [historyEntry], nextCursor: 'Y3Vyc29y' }))
+      .mockResolvedValueOnce(response({ schemaVersion: 1, entries: [] }));
+    const client = makeClient(fetcher);
+    await expect(client.uploadClip({ blob: blob(), capture })).rejects.toBeInstanceOf(AudioUploadUnknownError);
+    const pending = client.getPendingUpload();
+    await expect(client.listUploads()).resolves.toMatchObject({ entries: [{ uploadId, status: 'ready' }], nextCursor: 'Y3Vyc29y' });
+    await expect(client.listUploads('Y3Vyc29y')).resolves.toMatchObject({ entries: [] });
+    expect(fetcher.mock.calls.slice(1).map(([path, init]) => [path, init.method, init.credentials, init.redirect, init.cache])).toEqual([
+      ['/api/audio/upload-history', 'GET', 'same-origin', 'error', 'no-store'],
+      ['/api/audio/upload-history?cursor=Y3Vyc29y', 'GET', 'same-origin', 'error', 'no-store'],
+    ]);
+    expect(client.getPendingUpload()).toBe(pending);
+    expect(fetcher.mock.calls.every(([, init]) => init.method === 'POST' || init.method === 'GET')).toBe(true);
+    expect(fetcher.mock.calls.filter(([, init]) => init.method === 'POST')).toHaveLength(1);
+    client.dispose();
+  });
+
+  it('rejects malformed history and fences owner changes and disposal without changing pending state', async () => {
+    const malformed = { schemaVersion: 1, entries: [{ ...historyEntry, sha256: 'private' }] };
+    const fetcher = vi.fn().mockResolvedValueOnce(response(malformed));
+    const client = makeClient(fetcher);
+    await expect(client.listUploads()).rejects.toMatchObject({ kind: 'malformed' });
+    expect(client.getPendingUpload()).toBeUndefined();
+    client.dispose();
+
+    const lateBody = deferred<unknown>();
+    let current = true;
+    const stale = makeClient(vi.fn().mockResolvedValue({ ok: true, status: 200, json: () => lateBody.promise }), () => {
+      if (!current) throw new Error('stale');
+    });
+    const reading = stale.listUploads();
+    current = false;
+    lateBody.resolve({ schemaVersion: 1, entries: [historyEntry] });
+    await expect(reading).rejects.toMatchObject({ kind: 'stale' });
+    stale.dispose();
+
+    const lateResponse = deferred<ReturnType<typeof response>>();
+    const disposed = makeClient(vi.fn(() => lateResponse.promise));
+    const disposedRead = disposed.listUploads();
+    const result = expect(disposedRead).rejects.toMatchObject({ kind: 'disposed' });
+    disposed.dispose();
+    lateResponse.resolve(response({ schemaVersion: 1, entries: [historyEntry] }));
+    await result;
+  });
+
+  it('rejects non-plain, accessor, duplicate, oversized and malformed cursor history projections', () => {
+    expect(() => parseAudioUploadHistoryPageDTO({ schemaVersion: 1, entries: [], extra: true })).toThrow();
+    expect(() => parseAudioUploadHistoryPageDTO({ schemaVersion: 1, entries: [historyEntry, historyEntry] })).toThrow();
+    expect(() => parseAudioUploadHistoryPageDTO({ schemaVersion: 1, entries: [], nextCursor: 'bad=' })).toThrow();
+    expect(() => parseAudioUploadHistoryPageDTO({ schemaVersion: 1, entries: Array.from({ length: 51 }, () => historyEntry) })).toThrow();
+    let getterCalled = false;
+    const accessor = Object.defineProperty({}, 'schemaVersion', { enumerable: true, get() { getterCalled = true; throw new Error('must not execute'); } });
+    Object.defineProperties(accessor, { entries: { value: [], enumerable: true } });
+    expect(() => parseAudioUploadHistoryPageDTO(accessor)).toThrow();
+    expect(getterCalled).toBe(false);
   });
 });

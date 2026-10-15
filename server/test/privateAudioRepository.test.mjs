@@ -204,10 +204,39 @@ test('private audio schema upgrades an exact v1 marker and preserves existing re
     const migrated = new PrivateAudioRepository({ kernel: f.kernel, actorSessionToken: f.actorSessionToken, privateRoot: f.privateRoot,
       processId: f.processId, resolveAttachedMedia: () => undefined });
     const marker = f.kernel.withTrustedDatabaseTransaction((db) => db.prepare('SELECT version FROM private_audio_schema WHERE singleton=1').get().version);
-    assert.equal(marker, 2);
+    assert.equal(marker, 3);
     assert.equal(migrated.getRecord(original.mediaId).status, 'ready');
     assert.equal(migrated.getRecord(original.mediaId).sha256, original.sha256);
     assert.equal(migrated.getRecord(original.mediaId).byteLength, bytes.length);
+  } finally { cleanup(f); }
+});
+
+test('private audio schema upgrades v2 with only the scoped history index and preserves capture rows', async () => {
+  const f = setup();
+  try {
+    const identity = f.kernel.getOwnedIdentity(f.actorSessionToken);
+    const uploadId = randomUUID();
+    f.kernel.withTrustedDatabaseTransaction((db) => {
+      db.prepare(`INSERT INTO private_audio_capture_uploads (upload_id,capture_id,capture_revision,workspace_id,owner_id,privacy_epoch,
+        captured_at,time_zone,mime_type,expected_bytes,media_id,format,sha256,byte_length,duration_seconds,status,failure_code,
+        consumed_command_id,note_id,note_revision,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(uploadId, randomUUID(), randomUUID(), identity.workspaceId, identity.ownerId,
+        identity.privacyEpoch, '2026-10-15T02:03:04.000Z', 'Asia/Singapore', 'audio/mp4', null, randomUUID(), 'm4a', null, null, null,
+        'failed', 'audio_invalid', null, null, null, 1000, 1000);
+      db.exec('DROP INDEX private_audio_capture_upload_history');
+      db.prepare('UPDATE private_audio_schema SET version=2 WHERE singleton=1').run();
+    });
+    const migrated = new PrivateAudioRepository({ kernel: f.kernel, actorSessionToken: f.actorSessionToken, privateRoot: f.privateRoot,
+      processId: f.processId, resolveAttachedMedia: () => undefined });
+    const outcome = f.kernel.withTrustedDatabaseTransaction((db) => ({
+      version: db.prepare('SELECT version FROM private_audio_schema WHERE singleton=1').get().version,
+      index: db.prepare("SELECT sql FROM sqlite_master WHERE type='index' AND name='private_audio_capture_upload_history'").get()?.sql,
+      count: db.prepare('SELECT count(*) AS count FROM private_audio_capture_uploads WHERE upload_id=?').get(uploadId).count,
+    }));
+    assert.equal(outcome.version, 3);
+    assert.match(outcome.index, /workspace_id,owner_id,privacy_epoch,created_at DESC,upload_id DESC/);
+    assert.equal(outcome.count, 1);
+    assert.ok(migrated);
   } finally { cleanup(f); }
 });
 
