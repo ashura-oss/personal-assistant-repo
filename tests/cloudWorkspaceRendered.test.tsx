@@ -5,9 +5,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createInitialWorkspaceState } from '../src/services/controller.shared';
 import { createWorkspaceSnapshotDTO } from '../src/cloud/workspaceDto';
 import type { Account, LocalTask, MailboxSnapshotMessage, Note, Proposal } from '../src/core';
-import type { CloudWorkspaceSessionState } from '../src/web/CloudWorkspaceSession';
+import type { CloudWorkspaceSessionState, CloudWorkspaceVoiceActions } from '../src/web/CloudWorkspaceSession';
 import { CloudWorkspace } from '../src/web/CloudWorkspace';
 import { CloudWorkspaceSession } from '../src/web/CloudWorkspaceSession';
+import { ServerRecordingPanel } from '../src/ui/ServerRecordingPanel';
+import type { CloudVoiceCoordinatorState, CloudVoicePhase } from '../src/web/cloudVoiceCoordinator';
 import type { WorkspaceCommand, WorkspaceCommandResponse } from '../src/cloud/workspaceCommands';
 import { WorkspaceClientError } from '../src/web/workspaceClient';
 
@@ -74,11 +76,42 @@ function click(label: string) {
   act(() => item.click());
 }
 
+function clickOccurrence(label: string, occurrence: number) {
+  const matches = [...host.querySelectorAll('button')].filter((button) => button.textContent?.includes(label) || button.getAttribute('aria-label') === label || button.getAttribute('accessibilityLabel') === label);
+  const item = matches[occurrence];
+  if (!item) throw new Error(`Button occurrence not found: ${label} #${occurrence + 1}; rendered=${host.textContent}`);
+  act(() => item.click());
+}
+
+function clickTwice(label: string) {
+  const item = [...host.querySelectorAll('button')].find((button) => button.textContent?.includes(label) || button.getAttribute('aria-label') === label || button.getAttribute('accessibilityLabel') === label);
+  if (!item) throw new Error(`Button not found: ${label}; rendered=${host.textContent}`);
+  act(() => { item.click(); item.click(); });
+}
+
 function setTextField(label: string, value: string) {
   const field = host.querySelector(`textarea[aria-label="${label}"]`) as HTMLTextAreaElement | null;
   if (!field) throw new Error(`Field not found: ${label}`);
   const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
   act(() => { setter?.call(field, value); field.dispatchEvent(new Event('input', { bubbles: true })); });
+}
+
+class UiMediaRecorder {
+  static isTypeSupported = () => true;
+  state: RecordingState = 'inactive';
+  mimeType = 'audio/webm';
+  ondataavailable: ((event: BlobEvent) => void) | null = null;
+  onstop: ((event: Event) => void) | null = null;
+  onerror: ((event: Event) => void) | null = null;
+  constructor(readonly stream: MediaStream) { void stream; }
+  start() { this.state = 'recording'; }
+  pause() { this.state = 'paused'; }
+  resume() { this.state = 'recording'; }
+  stop() {
+    this.state = 'inactive';
+    this.ondataavailable?.({ data: new Blob(['recorded audio'], { type: this.mimeType }) } as BlobEvent);
+    queueMicrotask(() => this.onstop?.(new Event('stop')));
+  }
 }
 
 function deferred<T>() {
@@ -89,6 +122,73 @@ function deferred<T>() {
 }
 
 describe('CloudWorkspace safe DTO presentation', () => {
+  it('starts only after explicit choice, survives tab changes, and completes one upload and one note adoption without processing', async () => {
+    const { state } = fixture();
+    const session = { authenticated: true as const, workspaceId, privacyEpoch: 3, csrfToken: 'csrf-test' };
+    const track = { stopped: 0, stop() { this.stopped += 1; } };
+    const getUserMedia = vi.fn(async () => ({ getTracks: () => [track] } as unknown as MediaStream));
+    const mediaDescriptor = Object.getOwnPropertyDescriptor(navigator, 'mediaDevices');
+    Object.defineProperty(navigator, 'mediaDevices', { configurable: true, value: { getUserMedia } });
+    vi.stubGlobal('MediaRecorder', UiMediaRecorder);
+    const captureRevision = 'cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd';
+    const mediaId = 'efefefef-efef-4fef-8fef-efefefefefef';
+    const commandKinds: string[] = [];
+    const requests: { path: string; method: string }[] = [];
+    const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const path = String(input);
+      const method = init?.method ?? 'GET';
+      requests.push({ path, method });
+      if (path === '/api/workspace/snapshot' || path === '/api/workspace/refresh') {
+        return { ok: true, status: 200, json: async () => createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: state.notes.length > 2 ? 9 : 7 }) };
+      }
+      if (path === '/api/audio/uploads' && method === 'POST') {
+        const headers = new Headers(init?.headers);
+        const capture = JSON.parse(headers.get('X-Still-Capture') ?? '{}') as { id: string; capturedAt: string; timeZone: string };
+        expect((init?.body as Blob).type).toBe('audio/webm');
+        return { ok: true, status: 200, json: async () => ({ schemaVersion: 1, uploadId: headers.get('X-Still-Upload-ID'), status: 'ready', capture: { ...capture, revision: captureRevision },
+          media: { mediaId: `still-media:${mediaId}`, sha256: 'a'.repeat(64), byteLength: 14, durationSeconds: 2, format: 'webm', mimeType: 'audio/webm' } }) };
+      }
+      if (path === '/api/workspace/commands' && method === 'POST') {
+        const envelope = JSON.parse(String(init?.body)) as { commandId: string; command: { kind: string; captureId: string; captureRevision: string } };
+        commandKinds.push(envelope.command.kind);
+        expect(envelope.command).toEqual({ kind: 'notes.capture.adopt', captureId: expect.any(String), captureRevision });
+        const capturedAt = new Date().toISOString();
+        state.notes.push({ id: envelope.command.captureId, title: 'Saved voice capture', transcript: '', durationSeconds: 2, createdAt: capturedAt, status: 'recorded', revision: 1 });
+        const savedSnapshot = createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: 8 });
+        return { ok: true, status: 200, json: async () => ({ schemaVersion: 1, commandId: envelope.commandId, status: 'finished',
+          receipt: { schemaVersion: 1, commandId: envelope.commandId, kind: 'notes.capture.adopt', objectId: envelope.command.captureId,
+            captureId: envelope.command.captureId, captureRevision }, snapshot: savedSnapshot }) };
+      }
+      throw new Error(`Unexpected UI integration request: ${method} ${path}`);
+    });
+    vi.stubGlobal('fetch', fetcher);
+    try {
+      await act(async () => { root.render(<CloudWorkspaceSession session={session} onLogout={vi.fn()} />); await new Promise((resolve) => setTimeout(resolve, 0)); });
+      click('Record');
+      expect(getUserMedia).not.toHaveBeenCalled();
+      click('Start recording a voice note');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(getUserMedia).toHaveBeenCalledOnce();
+      expect(host.textContent).toContain('Audio stays in temporary browser memory until you explicitly save it to this workspace.');
+      click('Library');
+      click('Record');
+      expect(getUserMedia).toHaveBeenCalledOnce();
+      click('Stop and save recording');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(requests.filter((request) => request.path === '/api/audio/uploads' && request.method === 'POST')).toHaveLength(1);
+      expect(requests.filter((request) => request.path === '/api/workspace/commands' && request.method === 'POST')).toHaveLength(1);
+      expect(commandKinds).toEqual(['notes.capture.adopt']);
+      expect(host.textContent).toContain('Your recording is saved.');
+      expect(host.textContent).toContain('Open saved note');
+      expect(requests.some((request) => request.path.includes('transcribe') || request.path.includes('assistant'))).toBe(false);
+      expect(track.stopped).toBe(1);
+    } finally {
+      if (mediaDescriptor) Object.defineProperty(navigator, 'mediaDevices', mediaDescriptor);
+      else Reflect.deleteProperty(navigator, 'mediaDevices');
+      vi.unstubAllGlobals();
+    }
+  });
+
   it('uses the shared Record composer and sends one text-note command through the real cloud action', async () => {
     const { snapshot } = fixture();
     const commandId = '88888888-8888-4888-8888-888888888888';
@@ -569,5 +669,383 @@ describe('CloudWorkspace safe DTO presentation', () => {
     expect(onLogout).toHaveBeenCalledExactlyOnceWith();
     expect(fetcher.mock.calls).toHaveLength(requestCountBeforeLogout);
     vi.unstubAllGlobals();
+  });
+
+  it('holds an unknown recording upload for exact inspection and waits for an explicit save choice', async () => {
+    const { state } = fixture();
+    const session = { authenticated: true as const, workspaceId, privacyEpoch: 3, csrfToken: 'csrf-test' };
+    const track = { stopped: 0, stop() { this.stopped += 1; } };
+    const getUserMedia = vi.fn(async () => ({ getTracks: () => [track] } as unknown as MediaStream));
+    const mediaDescriptor = Object.getOwnPropertyDescriptor(navigator, 'mediaDevices');
+    Object.defineProperty(navigator, 'mediaDevices', { configurable: true, value: { getUserMedia } });
+    vi.stubGlobal('MediaRecorder', UiMediaRecorder);
+    const captureRevision = 'cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd';
+    const mediaId = 'efefefef-efef-4fef-8fef-efefefefefef';
+    let uploadId: string | undefined;
+    let capture: { id: string; capturedAt: string; timeZone: string } | undefined;
+    let commandEnvelope: { commandId: string; command: { kind: string; captureId: string; captureRevision: string } } | undefined;
+    const requests: { path: string; method: string }[] = [];
+    const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const path = String(input); const method = init?.method ?? 'GET'; requests.push({ path, method });
+      if (path === '/api/workspace/snapshot' || path === '/api/workspace/refresh') return { ok: true, status: 200, json: async () => createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: 7 }) };
+      if (path === '/api/audio/uploads' && method === 'POST') {
+        const headers = new Headers(init?.headers);
+        uploadId = headers.get('X-Still-Upload-ID') ?? undefined;
+        capture = JSON.parse(headers.get('X-Still-Capture') ?? '{}') as typeof capture;
+        expect(uploadId).toMatch(/^[0-9a-f-]{36}$/i);
+        return { ok: false, status: 503, json: async () => ({}) };
+      }
+      if (uploadId && path === `/api/audio/uploads/${uploadId}` && method === 'GET') return { ok: true, status: 200, json: async () => ({
+        schemaVersion: 1, uploadId, status: 'ready', capture: { ...capture, revision: captureRevision },
+        media: { mediaId: `still-media:${mediaId}`, sha256: 'a'.repeat(64), byteLength: 14, durationSeconds: 2, format: 'webm', mimeType: 'audio/webm' },
+      }) };
+      if (path === '/api/workspace/commands' && method === 'POST') {
+        commandEnvelope = JSON.parse(String(init?.body)) as typeof commandEnvelope;
+        if (commandEnvelope?.command.kind !== 'notes.capture.adopt') throw new Error('Only explicit save should adopt this capture.');
+        state.notes.push({ id: commandEnvelope.command.captureId, title: 'Saved voice capture', transcript: '', durationSeconds: 2, createdAt: capture?.capturedAt ?? new Date().toISOString(), status: 'recorded', revision: 1 });
+        const snapshot = createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: 8 });
+        return { ok: true, status: 200, json: async () => ({ schemaVersion: 1, commandId: commandEnvelope?.commandId, status: 'finished',
+          receipt: { schemaVersion: 1, commandId: commandEnvelope?.commandId, kind: 'notes.capture.adopt', objectId: commandEnvelope?.command.captureId,
+            captureId: commandEnvelope?.command.captureId, captureRevision }, snapshot }) };
+      }
+      throw new Error(`Unexpected upload integration request: ${method} ${path}`);
+    });
+    vi.stubGlobal('fetch', fetcher);
+    try {
+      await act(async () => { root.render(<CloudWorkspaceSession session={session} onLogout={vi.fn()} />); await new Promise((resolve) => setTimeout(resolve, 0)); });
+      click('Record');
+      expect(getUserMedia).not.toHaveBeenCalled();
+      clickTwice('Start recording a voice note');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(getUserMedia).toHaveBeenCalledOnce();
+      clickTwice('Stop and save recording');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(host.textContent).toContain('Check the original upload.');
+      expect(requests.filter((request) => request.path === '/api/audio/uploads' && request.method === 'POST')).toHaveLength(1);
+      expect(requests.filter((request) => request.path === '/api/workspace/commands' && request.method === 'POST')).toHaveLength(0);
+
+      click('Inspect exact upload');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(host.textContent).toContain('Save this recording to notes?');
+      expect(requests.filter((request) => request.path === `/api/audio/uploads/${uploadId}` && request.method === 'GET')).toHaveLength(1);
+      expect(requests.filter((request) => request.path === '/api/audio/uploads' && request.method === 'POST')).toHaveLength(1);
+      expect(requests.filter((request) => request.path === '/api/workspace/commands' && request.method === 'POST')).toHaveLength(0);
+
+      click('Save recording to notes');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(host.textContent).toContain('Your recording is saved.');
+      expect(requests.filter((request) => request.path === '/api/audio/uploads' && request.method === 'POST')).toHaveLength(1);
+      expect(requests.filter((request) => request.path === '/api/workspace/commands' && request.method === 'POST')).toHaveLength(1);
+      expect(commandEnvelope?.command.kind).toBe('notes.capture.adopt');
+      expect(track.stopped).toBe(1);
+    } finally {
+      if (mediaDescriptor) Object.defineProperty(navigator, 'mediaDevices', mediaDescriptor);
+      else Reflect.deleteProperty(navigator, 'mediaDevices');
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('requires an explicit history read, separates ready inspection from saving, and inspects a consumed upload command without re-adopting', async () => {
+    const { state } = fixture();
+    const readyUploadId = 'abababab-abab-4bab-8bab-abababababab';
+    const readyCaptureId = 'acacacac-acac-4cac-8cac-acacacacacac';
+    const readyRevision = 'adadadad-adad-4dad-8dad-adadadadadad';
+    const consumedUploadId = 'babababa-baba-4bab-8bab-babababababa';
+    const consumedCaptureId = 'bcbcbcbc-bcbc-4cbc-8cbc-bcbcbcbcbcbc';
+    const consumedRevision = 'bdbdbdbd-bdbd-4dbd-8dbd-bdbdbdbdbdbd';
+    const consumedCommandId = 'cececece-cece-4ece-8ece-cececececece';
+    const mediaId = 'dededede-dede-4ede-8ede-dededededede';
+    const createdAt = '2026-10-15T01:02:03.000Z';
+    const requests: { path: string; method: string }[] = [];
+    let adoptionPosts = 0;
+    const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const path = String(input); const method = init?.method ?? 'GET'; requests.push({ path, method });
+      if (path === '/api/workspace/snapshot' || path === '/api/workspace/refresh') return { ok: true, status: 200, json: async () => createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: state.notes.length > 2 ? 8 : 7 }) };
+      if (path === '/api/audio/upload-history' && method === 'GET') return { ok: true, status: 200, json: async () => ({ schemaVersion: 1, entries: [
+        { uploadId: readyUploadId, capture: { id: readyCaptureId, revision: readyRevision, capturedAt: createdAt, timeZone: 'UTC' }, status: 'ready', createdAt: Date.parse(createdAt), updatedAt: Date.parse(createdAt) },
+        { uploadId: consumedUploadId, capture: { id: consumedCaptureId, revision: consumedRevision, capturedAt: createdAt, timeZone: 'UTC' }, status: 'consumed', createdAt: Date.parse(createdAt), updatedAt: Date.parse(createdAt) },
+      ] }) };
+      if (path === `/api/audio/uploads/${readyUploadId}` && method === 'GET') return { ok: true, status: 200, json: async () => ({
+        schemaVersion: 1, uploadId: readyUploadId, status: 'ready', capture: { id: readyCaptureId, revision: readyRevision, capturedAt: createdAt, timeZone: 'UTC' },
+        media: { mediaId: `still-media:${mediaId}`, sha256: 'a'.repeat(64), byteLength: 14, durationSeconds: 2, format: 'webm', mimeType: 'audio/webm' },
+      }) };
+      if (path === `/api/audio/uploads/${consumedUploadId}` && method === 'GET') return { ok: true, status: 200, json: async () => ({
+        schemaVersion: 1, uploadId: consumedUploadId, status: 'consumed', capture: { id: consumedCaptureId, revision: consumedRevision, capturedAt: createdAt, timeZone: 'UTC' },
+        consumption: { commandId: consumedCommandId, noteId: consumedCaptureId, noteRevision: 1 },
+        media: { mediaId: `still-media:${mediaId}`, sha256: 'b'.repeat(64), byteLength: 14, durationSeconds: 2, format: 'webm', mimeType: 'audio/webm' },
+      }) };
+      if (path === '/api/workspace/commands' && method === 'POST') {
+        adoptionPosts += 1;
+        const envelope = JSON.parse(String(init?.body)) as { commandId: string; command: { kind: string; captureId: string; captureRevision: string } };
+        expect(envelope.command).toEqual({ kind: 'notes.capture.adopt', captureId: readyCaptureId, captureRevision: readyRevision });
+        state.notes.push({ id: readyCaptureId, title: 'Saved ready upload', transcript: '', durationSeconds: 2, createdAt, status: 'recorded', revision: 1 });
+        return { ok: true, status: 200, json: async () => ({ schemaVersion: 1, commandId: envelope.commandId, status: 'finished',
+          receipt: { schemaVersion: 1, commandId: envelope.commandId, kind: 'notes.capture.adopt', objectId: readyCaptureId,
+            captureId: readyCaptureId, captureRevision: readyRevision }, snapshot: createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: 8 }) }) };
+      }
+      if (path === `/api/workspace/commands/${consumedCommandId}` && method === 'GET') return { ok: true, status: 200, json: async () => ({ schemaVersion: 1, commandId: consumedCommandId, status: 'finished',
+        receipt: { schemaVersion: 1, commandId: consumedCommandId, kind: 'notes.capture.adopt', objectId: consumedCaptureId,
+          captureId: consumedCaptureId, captureRevision: consumedRevision } }) };
+      throw new Error(`Unexpected history integration request: ${method} ${path}`);
+    });
+    vi.stubGlobal('fetch', fetcher);
+    try {
+      await act(async () => { root.render(<CloudWorkspaceSession session={{ authenticated: true, workspaceId, privacyEpoch: 3, csrfToken: 'csrf' }} onLogout={vi.fn()} />); await new Promise((resolve) => setTimeout(resolve, 0)); });
+      click('Record');
+      expect(requests.some((request) => request.path === '/api/audio/upload-history')).toBe(false);
+      click('View saved recording history');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(requests.filter((request) => request.path === '/api/audio/upload-history' && request.method === 'GET')).toHaveLength(1);
+      expect(host.textContent).toContain('Saved recording history');
+      expect(host.textContent).toContain(new Date(createdAt).toLocaleString(undefined, { timeZone: 'UTC' }));
+      clickOccurrence('Inspect this saved recording', 0);
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(host.textContent).toContain('Save this recording to notes?');
+      expect(adoptionPosts).toBe(0);
+      click('Save recording to notes');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(host.textContent).toContain('Your recording is saved.');
+      expect(adoptionPosts).toBe(1);
+      click('Record another');
+      clickOccurrence('Inspect this saved recording', 1);
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(host.textContent).toContain('Your recording is saved.');
+      expect(requests.filter((request) => request.path === `/api/audio/uploads/${consumedUploadId}` && request.method === 'GET')).toHaveLength(1);
+      expect(requests.filter((request) => request.path === `/api/workspace/commands/${consumedCommandId}` && request.method === 'GET')).toHaveLength(1);
+      expect(adoptionPosts).toBe(1);
+      expect(requests.filter((request) => request.path === '/api/audio/uploads' && request.method === 'POST')).toHaveLength(0);
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it('keeps the exact live transcription parent cancellable while its command request is pending and does not clear it on acknowledgement', async () => {
+    const { state } = fixture();
+    state.settings.speechEnabled = true;
+    state.notes[0]!.audioUri = 'file:///private/native-recording.m4a';
+    const mediaId = 'edededed-eded-4ded-8ded-edededededed';
+    const commandResponse = deferred<{ ok: boolean; status: number; json: () => Promise<unknown> }>();
+    const cancellationResponse = deferred<{ ok: boolean; status: number; json: () => Promise<unknown> }>();
+    let admitted: { commandId: string; command: WorkspaceCommand } | undefined;
+    let commandId: string | undefined;
+    const cancellationCalls: { path: string; body?: string }[] = [];
+    const originalCreateElement = document.createElement;
+    const silentAudio = { preload: '', src: '', play: vi.fn(async () => undefined), pause: vi.fn(), load: vi.fn(), removeAttribute: vi.fn(),
+      addEventListener: vi.fn(), removeEventListener: vi.fn() };
+    document.createElement = ((tagName: string, options?: ElementCreationOptions) => tagName.toLowerCase() === 'audio'
+      ? silentAudio as unknown as HTMLAudioElement
+      : originalCreateElement.call(document, tagName, options)) as typeof document.createElement;
+    const snapshot = () => createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: 7 }, { resolveMediaId: () => mediaId });
+    const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const path = String(input);
+      if (path === '/api/workspace/snapshot' || path === '/api/workspace/refresh') return { ok: true, status: 200, json: async () => snapshot() };
+      if (path === '/api/workspace/commands' && init?.method === 'POST') {
+        admitted = JSON.parse(String(init.body)) as typeof admitted;
+        commandId = admitted?.commandId;
+        return commandResponse.promise;
+      }
+      if (commandId && path === `/api/workspace/commands/${commandId}/cancel-transcription` && init?.method === 'POST') {
+        cancellationCalls.push({ path, body: String(init.body) });
+        return cancellationResponse.promise;
+      }
+      throw new Error(`Unexpected cancellation request: ${init?.method ?? 'GET'} ${path}`);
+    });
+    vi.stubGlobal('fetch', fetcher);
+    try {
+      await act(async () => { root.render(<CloudWorkspaceSession session={{ authenticated: true, workspaceId, privacyEpoch: 3, csrfToken: 'csrf' }} onLogout={vi.fn()} />); await new Promise((resolve) => setTimeout(resolve, 0)); });
+      click('Library');
+      click('Notes');
+      click('A saved DTO note');
+      click('Replace transcript');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(admitted?.command).toEqual({ kind: 'notes.transcribe', noteId: '33333333-3333-4333-8333-333333333333', expectedNoteRevision: 1 });
+      expect(host.textContent).toContain('Cancel transcription request');
+      expect([...host.querySelectorAll('button')].find((button) => button.textContent?.includes('Library'))?.disabled).toBe(true);
+      expect([...host.querySelectorAll('button')].find((button) => button.textContent?.includes('Cancel transcription request'))?.disabled).toBe(false);
+      clickTwice('Cancel transcription request');
+      expect(cancellationCalls).toEqual([{ path: `/api/workspace/commands/${commandId}/cancel-transcription`, body: '{}' }]);
+      cancellationResponse.resolve({ ok: true, status: 200, json: async () => ({ schemaVersion: 1, commandId, status: 'cancellation_requested' }) });
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(host.textContent).toContain('Cancellation was requested for this transcription. The final command receipt is still pending.');
+      expect(host.textContent).toContain('Cancel transcription request');
+      expect(admitted?.commandId).toBe(commandId);
+
+      commandResponse.resolve({ ok: true, status: 200, json: async () => ({ schemaVersion: 1, commandId, status: 'claimed' }) });
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(host.textContent).toContain('Cancel transcription request');
+      expect(cancellationCalls).toHaveLength(1);
+      expect(fetcher.mock.calls.filter(([path, init]) => String(path) === '/api/workspace/commands' && init?.method === 'POST')).toHaveLength(1);
+    } finally { document.createElement = originalCreateElement; vi.unstubAllGlobals(); }
+  });
+
+  it('plays only the selected validated media URL, lets pause cancel a pending play, and releases audio when hidden', async () => {
+    const { state } = fixture();
+    state.notes[0]!.audioUri = 'file:///private/native-recording.m4a';
+    const mediaId = 'f1f1f1f1-f1f1-41f1-81f1-f1f1f1f1f1f1';
+    const resolver = { resolveMediaId: () => mediaId };
+    const snapshot = () => createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: 7 }, resolver);
+    const playPending = deferred<void>();
+    const makeAudio = (play: () => Promise<void>) => {
+      const listeners = new Map<string, Set<EventListener>>();
+      const audio = {
+        preload: '', src: '', play: vi.fn(play), pause: vi.fn(), load: vi.fn(),
+        removeAttribute: vi.fn((name: string) => { if (name === 'src') audio.src = ''; }),
+        addEventListener: vi.fn((type: string, listener: EventListener) => { const set = listeners.get(type) ?? new Set<EventListener>(); set.add(listener); listeners.set(type, set); }),
+        removeEventListener: vi.fn((type: string, listener: EventListener) => listeners.get(type)?.delete(listener)),
+        dispatch(type: string) { for (const listener of listeners.get(type) ?? []) listener(new Event(type)); },
+      };
+      return audio;
+    };
+    const firstAudio = makeAudio(() => playPending.promise);
+    const secondAudio = makeAudio(async () => undefined);
+    const thirdAudio = makeAudio(async () => undefined);
+    const audioElements = [firstAudio, secondAudio, thirdAudio];
+    const originalCreateElement = document.createElement;
+    document.createElement = ((tagName: string, options?: ElementCreationOptions) => tagName.toLowerCase() === 'audio'
+      ? audioElements.shift() as unknown as HTMLAudioElement
+      : originalCreateElement.call(document, tagName, options)) as typeof document.createElement;
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
+      const path = String(input);
+      if (path === '/api/workspace/snapshot' || path === '/api/workspace/refresh') return { ok: true, status: 200, json: async () => snapshot() };
+      throw new Error(`Playback must not create unrelated requests: ${path}`);
+    }));
+    try {
+      await act(async () => { root.render(<CloudWorkspaceSession session={{ authenticated: true, workspaceId, privacyEpoch: 3, csrfToken: 'csrf' }} onLogout={vi.fn()} />); await new Promise((resolve) => setTimeout(resolve, 0)); });
+      click('Library'); click('Notes'); click('A saved DTO note');
+      click('Play recording');
+      expect(firstAudio.src).toBe(`/api/audio/${mediaId}`);
+      expect(firstAudio.play).toHaveBeenCalledOnce();
+      expect(host.textContent).toContain('Playback · ready');
+      const pause = [...host.querySelectorAll('button')].find((button) => button.textContent?.includes('Pause recording'));
+      expect(pause?.disabled).toBe(false);
+      click('Pause recording');
+      expect(firstAudio.pause).toHaveBeenCalledOnce();
+      await act(async () => { playPending.resolve(); await Promise.resolve(); });
+      expect(host.textContent).toContain('Playback · paused');
+      expect(host.textContent).not.toContain('Playback · playing');
+
+      click('Inbox tab');
+      await act(async () => { await Promise.resolve(); });
+      expect(firstAudio.removeAttribute).toHaveBeenCalledWith('src');
+      expect(firstAudio.src).toBe('');
+
+      click('Library tab');
+      click('A saved DTO note');
+      click('Play recording');
+      expect(secondAudio.src).toBe(`/api/audio/${mediaId}`);
+      click('Open settings');
+      await act(async () => { await Promise.resolve(); });
+      expect(secondAudio.removeAttribute).toHaveBeenCalledWith('src');
+      expect(secondAudio.src).toBe('');
+
+      click('Close settings');
+      click('Play recording');
+      expect(thirdAudio.src).toBe(`/api/audio/${mediaId}`);
+      click('Back to recordings');
+      await act(async () => { await Promise.resolve(); });
+      expect(thirdAudio.removeAttribute).toHaveBeenCalledWith('src');
+      expect(thirdAudio.src).toBe('');
+    } finally {
+      document.createElement = originalCreateElement;
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('ignores a late exact upload inspection after a real session is replaced', async () => {
+    const { state } = fixture();
+    const secondState = createInitialWorkspaceState(() => '11111111-1111-4111-8111-111111111111');
+    secondState.notes.push({ id: 'f2f2f2f2-f2f2-42f2-82f2-f2f2f2f2f2f2', title: 'Replacement session marker', transcript: 'Only the new session is visible', durationSeconds: 0, createdAt: '2026-10-15T00:00:00.000Z', status: 'recorded', revision: 1 });
+    const sessionA = { authenticated: true as const, workspaceId, privacyEpoch: 3, csrfToken: 'csrf-a' };
+    const sessionB = { authenticated: true as const, workspaceId: 'f3f3f3f3-f3f3-43f3-83f3-f3f3f3f3f3f3', privacyEpoch: 4, csrfToken: 'csrf-b' };
+    const track = { stop: vi.fn() };
+    const mediaDescriptor = Object.getOwnPropertyDescriptor(navigator, 'mediaDevices');
+    Object.defineProperty(navigator, 'mediaDevices', { configurable: true, value: { getUserMedia: vi.fn(async () => ({ getTracks: () => [track] } as unknown as MediaStream)) } });
+    vi.stubGlobal('MediaRecorder', UiMediaRecorder);
+    let oldUploadId: string | undefined;
+    let oldCapture: { id: string; capturedAt: string; timeZone: string } | undefined;
+    const oldInspection = deferred<{ ok: boolean; status: number; json: () => Promise<unknown> }>();
+    let snapshotReads = 0;
+    const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const path = String(input); const method = init?.method ?? 'GET';
+      if (path === '/api/workspace/snapshot') {
+        snapshotReads += 1;
+        const isNewSession = snapshotReads > 1;
+        return { ok: true, status: 200, json: async () => createWorkspaceSnapshotDTO({ getSnapshot: () => isNewSession ? secondState : state }, {
+          workspaceId: isNewSession ? sessionB.workspaceId : workspaceId, privacyEpoch: isNewSession ? sessionB.privacyEpoch : sessionA.privacyEpoch, revision: isNewSession ? 2 : 7,
+        }) };
+      }
+      if (path === '/api/audio/uploads' && method === 'POST') {
+        const headers = new Headers(init?.headers);
+        oldUploadId = headers.get('X-Still-Upload-ID') ?? undefined;
+        oldCapture = JSON.parse(headers.get('X-Still-Capture') ?? '{}') as typeof oldCapture;
+        return { ok: false, status: 503, json: async () => ({}) };
+      }
+      if (oldUploadId && path === `/api/audio/uploads/${oldUploadId}` && method === 'GET') return oldInspection.promise;
+      throw new Error(`Unexpected session replacement request: ${method} ${path}`);
+    });
+    vi.stubGlobal('fetch', fetcher);
+    try {
+      await act(async () => { root.render(<CloudWorkspaceSession key="session-a" session={sessionA} onLogout={vi.fn()} />); await new Promise((resolve) => setTimeout(resolve, 0)); });
+      click('Record'); click('Start recording a voice note');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      click('Stop and save recording');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(host.textContent).toContain('Check the original upload.');
+      click('Inspect exact upload');
+      expect(oldUploadId).toBeDefined();
+      await act(async () => { await Promise.resolve(); });
+
+      await act(async () => { root.render(<CloudWorkspaceSession key="session-b" session={sessionB} onLogout={vi.fn()} />); await new Promise((resolve) => setTimeout(resolve, 0)); });
+      click('Library'); click('Notes');
+      expect(host.textContent).toContain('Only the new session is visible');
+      oldInspection.resolve({ ok: true, status: 200, json: async () => ({ schemaVersion: 1, uploadId: oldUploadId, status: 'ready',
+        capture: { ...oldCapture, revision: 'f4f4f4f4-f4f4-44f4-84f4-f4f4f4f4f4f4' },
+        media: { mediaId: 'still-media:f5f5f5f5-f5f5-45f5-85f5-f5f5f5f5f5f5', sha256: 'a'.repeat(64), byteLength: 14, durationSeconds: 2, format: 'webm', mimeType: 'audio/webm' } }) });
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(host.textContent).toContain('Only the new session is visible');
+      expect(host.textContent).not.toContain('Save this recording to notes?');
+      expect(fetcher.mock.calls.filter(([path, init]) => String(path) === '/api/workspace/commands' && init?.method === 'POST')).toHaveLength(0);
+    } finally {
+      if (mediaDescriptor) Object.defineProperty(navigator, 'mediaDevices', mediaDescriptor);
+      else Reflect.deleteProperty(navigator, 'mediaDevices');
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('offers local-copy cleanup after confirmed save when cleanup remains pending, then unlocks Record another without another save', async () => {
+    const noteId = 'f6f6f6f6-f6f6-46f6-86f6-f6f6f6f6f6f6';
+    const discardLocalClip = vi.fn(async () => undefined);
+    const uploadStoppedClip = vi.fn(async () => undefined);
+    const saveReady = vi.fn(async () => undefined);
+    const inspectAdoption = vi.fn(async () => undefined);
+    const resetAfterSave = vi.fn();
+    function Harness() {
+      const [localClipPresent, setLocalClipPresent] = React.useState(true);
+      const [phase, setPhase] = React.useState<CloudVoicePhase>('saved');
+      const actions: CloudWorkspaceVoiceActions = {
+        start: async () => {}, pause: async () => {}, resume: async () => {}, stopAndSave: async () => {},
+        uploadStoppedClip, saveReady, inspectUpload: async () => { throw new Error('not used'); }, listHistory: async () => ({ schemaVersion: 1, entries: [] }),
+        inspectAdoption, discardLocalClip: async () => { await discardLocalClip(); setLocalClipPresent(false); },
+        cancelCurrentRecording: async () => {}, resetAfterSave: () => { resetAfterSave(); setPhase('idle'); },
+      };
+      const voice: CloudVoiceCoordinatorState = { phase, localClipPresent, noteId };
+      return <ServerRecordingPanel voice={voice} actions={actions} busy={false} openNoteAvailable onOpenNote={vi.fn()} onError={vi.fn()} />;
+    }
+    act(() => root.render(<Harness />));
+    expect(host.textContent).toContain('Your recording is saved.');
+    expect(host.textContent).toContain('Open saved note');
+    expect([...host.querySelectorAll('button')].find((button) => button.textContent?.includes('Record another'))?.disabled).toBe(true);
+    const discardButton = [...host.querySelectorAll('button')].find((button) => button.textContent?.includes('Discard local recording copy'));
+    expect(discardButton).toBeDefined();
+    await act(async () => { discardButton!.click(); await Promise.resolve(); await Promise.resolve(); });
+    expect(discardLocalClip).toHaveBeenCalledOnce();
+    expect(host.textContent).toContain('Your recording is saved.');
+    expect(host.textContent).toContain('Open saved note');
+    expect([...host.querySelectorAll('button')].find((button) => button.textContent?.includes('Record another'))?.disabled).toBe(false);
+    const recordAnotherButton = [...host.querySelectorAll('button')].find((button) => button.textContent?.includes('Record another'));
+    expect(recordAnotherButton?.disabled).toBe(false);
+    await act(async () => { recordAnotherButton!.click(); await Promise.resolve(); });
+    expect(resetAfterSave).toHaveBeenCalledOnce();
+    expect(uploadStoppedClip).not.toHaveBeenCalled();
+    expect(saveReady).not.toHaveBeenCalled();
+    expect(inspectAdoption).not.toHaveBeenCalled();
   });
 });

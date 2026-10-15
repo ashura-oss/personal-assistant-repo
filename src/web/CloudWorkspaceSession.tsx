@@ -320,5 +320,13 @@ export function CloudWorkspaceSession({ session, onLogout }: { session: Authenti
     );
   }
 
-  return <CloudWorkspace store={store} state={state} onLogout={() => { store.invalidate(); onLogout(); }} />;
+  return <CloudWorkspace store={store} state={state} onLogout={() => { store.invalidate(); onLogout(); }} voiceCapability={state.voice ? {
+    available: true,
+    capture: { status: capture.status, canResume: capture.canResume, durationSeconds: capture.durationSeconds,
+      meter: capture.meter, hasPending: capture.hasPending, ...(capture.statusLabel ? { statusLabel: capture.statusLabel } : {}),
+      ...(capture.error ? { error: capture.error } : {}) },
+    voice: state.voice,
+    actions: store.voiceActions,
+    cancelTranscription: (commandId) => store.cancelTranscription(commandId),
+  } : { available: false, reason: 'Browser recording is not ready in this workspace session.' }} />;
 }

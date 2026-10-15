@@ -1,4 +1,4 @@
-import React, { useMemo, useRef, useState } from 'react';
+import React, { useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Pressable, ScrollView, Text, TextInput, View } from 'react-native';
 import type { WorkspaceCommand, WorkspaceCommandResponse } from '../cloud/workspaceCommands';
 import type { WorkspaceSettingsPatch } from '../cloud/workspaceCommands';
@@ -14,6 +14,8 @@ import { safeChatMemoryEvidenceLabels } from '../ui/chatMemoryReview';
 import { WorkspaceSettingsScreen } from '../ui/WorkspaceSettingsSnapshot';
 import { noteDetailDisplayNote } from '../ui/NoteDetail';
 import { WorkspaceModals } from '../ui/WorkspaceModals';
+import type { ServerRecordingPresentation } from '../ui/ServerRecordingPanel';
+import type { WorkspaceRecordDisplay } from '../ui/WorkspaceContent';
 import type { WorkspaceSettingsDraft } from '../ui/WorkspaceSettingsPreferences';
 import { ChatSection } from '../ui/ChatSection';
 import { AssistantBatchJobCard } from '../ui/AssistantBatchJobCard';
@@ -21,6 +23,9 @@ import { projectChatKnowledgeChoices } from '../ui/workspaceChatDisplayTypes';
 import { ChatSubmissionNotStartedError, type ChatSendAttempt, type ChatSendInspectionResult } from '../ui/chatSubmission';
 import { Button } from '../ui/primitives';
 import { C, s } from '../ui/theme';
+import { useCloudAudioPlayback } from './useCloudAudioPlayback';
+import type { CloudVoiceCoordinatorState } from './cloudVoiceCoordinator';
+import type { CloudWorkspaceVoiceActions } from './CloudWorkspaceSession';
 
 export type CloudWorkspaceActions = Readonly<{
   tasks: Readonly<{ complete: (taskId: string) => Promise<WorkspaceCommandResponse>; reopen: (taskId: string) => Promise<WorkspaceCommandResponse> }>;
@@ -28,6 +33,18 @@ export type CloudWorkspaceActions = Readonly<{
   chat: Readonly<{ create: () => Promise<WorkspaceCommandResponse>; submit: (attempt: ChatSendAttempt) => Promise<WorkspaceCommandResponse>; refine: (conversationId: string, parentTurnId: string, effort: 'medium' | 'high' | 'max') => Promise<WorkspaceCommandResponse>; inspect: (commandId: string) => Promise<WorkspaceCommandResponse> }>;
   batch: Readonly<{ check: (jobId: string) => Promise<WorkspaceCommandResponse> }>;
 }>;
+
+export type CloudWorkspaceVoiceCapability = Readonly<{
+  available: true;
+  capture: WorkspaceRecordDisplay & Readonly<{ error?: string }>;
+  voice: CloudVoiceCoordinatorState;
+  actions: CloudWorkspaceVoiceActions;
+  cancelTranscription: (commandId: string) => Promise<'cancellation_requested' | 'not_running'>;
+}> | Readonly<{ available: false; reason: string }>;
+
+function validatedAudioMediaId(value: string | undefined) {
+  return value && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value) ? value : undefined;
+}
 
 function receiptFor(response: WorkspaceCommandResponse, kind: WorkspaceCommand['kind']) {
   if (response.status !== 'finished' || response.receipt?.kind !== kind || response.receipt.commandId !== response.commandId) return undefined;
@@ -81,7 +98,7 @@ function equalSettingsBaseline(left: WorkspaceSettingsBaseline, right: Workspace
     left.maxAudioSeconds === right.maxAudioSeconds && left.retention === right.retention;
 }
 
-export function CloudWorkspace({ store, state, onLogout }: { store: Pick<CloudWorkspaceSessionStore, 'getSnapshot' | 'execute' | 'inspect' | 'refresh'>; state: CloudWorkspaceSessionState; onLogout: () => void }) {
+export function CloudWorkspace({ store, state, onLogout, voiceCapability }: { store: Pick<CloudWorkspaceSessionStore, 'getSnapshot' | 'execute' | 'inspect' | 'refresh'>; state: CloudWorkspaceSessionState; onLogout: () => void; voiceCapability?: CloudWorkspaceVoiceCapability }) {
   const snapshot = state.snapshot!;
   const dto = snapshot.state;
   const [tab, setTab] = useState<WorkspaceTab>('inbox');
@@ -102,10 +119,96 @@ export function CloudWorkspace({ store, state, onLogout }: { store: Pick<CloudWo
   const [proposalFilter, setProposalFilter] = useState<'pending' | 'done'>('pending');
   const [libraryQuery, setLibraryQuery] = useState('');
   const [notice, setNotice] = useState<string>();
+  const [voiceActionBusy, setVoiceActionBusy] = useState(false);
+  const voiceActionLock = useRef<object | undefined>(undefined);
+  const [cancelingTranscriptionCommandId, setCancelingTranscriptionCommandId] = useState<string>();
+  const transcriptionCancelLock = useRef<object | undefined>(undefined);
+  const [admittedTranscription, setAdmittedTranscription] = useState<Readonly<{ commandId: string; owner: string }>>();
   const originalChatAttempts = useRef(new Map<number, Readonly<{ attempt: ChatSendAttempt; envelope: WorkspaceCommandAdmission; text: string; conversationId: string; ownerGeneration: number; knowledgeSelection: ChatSendAttempt['knowledgeSelection'] }>>());
   const selectedNote = dto.notes.find((note) => note.id === selectedNoteId);
   const selectedNoteOwner = useRef<string | undefined>(undefined);
-  selectedNoteOwner.current = selectedNote ? `${snapshot.workspaceId}:${snapshot.privacyEpoch}:${selectedNote.id}:${selectedNote.revision}` : undefined;
+  const selectedNoteOwnerKey = selectedNote ? `${snapshot.workspaceId}:${snapshot.privacyEpoch}:${selectedNote.id}:${selectedNote.revision}` : undefined;
+  useLayoutEffect(() => { selectedNoteOwner.current = selectedNoteOwnerKey; }, [selectedNoteOwnerKey]);
+  const selectedMediaId = selectedNote ? validatedAudioMediaId(selectedNote.audio?.mediaId) : undefined;
+  const playbackVisible = tab === 'library' && !settingsOpen && Boolean(selectedNote);
+  const audioPlayback = useCloudAudioPlayback({
+    ownerKey: `${snapshot.workspaceId}:${snapshot.privacyEpoch}:${selectedNote?.id ?? 'hidden'}:${selectedNote?.revision ?? 0}`,
+    mediaId: playbackVisible ? selectedMediaId : undefined,
+  });
+  const voiceOwner = `${snapshot.workspaceId}:${snapshot.privacyEpoch}`;
+  const voiceError = (error: unknown) => {
+    const latest = store.getSnapshot().snapshot;
+    if (latest && `${latest.workspaceId}:${latest.privacyEpoch}` === voiceOwner) setNotice(errText(error));
+  };
+  const runVoiceAction = (operation: () => unknown) => {
+    if (voiceActionLock.current) return;
+    const latest = store.getSnapshot().snapshot;
+    if (!latest || `${latest.workspaceId}:${latest.privacyEpoch}` !== voiceOwner) return;
+    const token = {};
+    voiceActionLock.current = token;
+    setVoiceActionBusy(true);
+    try {
+      void Promise.resolve().then(operation).catch(voiceError).finally(() => {
+        if (voiceActionLock.current === token) {
+          voiceActionLock.current = undefined;
+          setVoiceActionBusy(false);
+        }
+      });
+    } catch (error) {
+      if (voiceActionLock.current === token) {
+        voiceActionLock.current = undefined;
+        setVoiceActionBusy(false);
+      }
+      voiceError(error);
+    }
+  };
+  const runTranscriptionCancellation = (commandId: string) => {
+    const binding = admittedTranscription;
+    const current = store.getSnapshot();
+    const currentSnapshot = current.snapshot;
+    const exactPending = current.pendingCommand?.commandId === commandId && current.pendingCommand.kind === 'notes.transcribe';
+    const noteOwner = selectedNote ? `${snapshot.workspaceId}:${snapshot.privacyEpoch}:${selectedNote.id}:${selectedNote.revision}` : undefined;
+    if (!voiceCapability?.available || !binding || binding.commandId !== commandId || binding.owner !== noteOwner ||
+        !currentSnapshot || `${currentSnapshot.workspaceId}:${currentSnapshot.privacyEpoch}` !== voiceOwner || !exactPending || transcriptionCancelLock.current) return;
+    const token = {};
+    transcriptionCancelLock.current = token;
+    setCancelingTranscriptionCommandId(commandId);
+    void voiceCapability.cancelTranscription(commandId).then((result) => {
+      const latest = store.getSnapshot();
+      if (selectedNoteOwner.current !== binding.owner || latest.pendingCommand?.commandId !== commandId) return;
+      setNotice(result === 'cancellation_requested'
+        ? 'Cancellation was requested for this transcription. The final command receipt is still pending.'
+        : 'The transcription service reports that this command is not running. Its final command receipt is still being checked.');
+    }).catch((error) => {
+      const latest = store.getSnapshot();
+      if (selectedNoteOwner.current === binding.owner && latest.pendingCommand?.commandId === commandId) voiceError(error);
+    }).finally(() => {
+      if (transcriptionCancelLock.current === token) {
+        transcriptionCancelLock.current = undefined;
+        setCancelingTranscriptionCommandId(undefined);
+      }
+    });
+  };
+  const pendingTranscriptionCancellation = selectedNote && state.pendingCommand?.kind === 'notes.transcribe' &&
+    admittedTranscription?.commandId === state.pendingCommand.commandId &&
+    admittedTranscription.owner === (selectedNote ? `${snapshot.workspaceId}:${snapshot.privacyEpoch}:${selectedNote.id}:${selectedNote.revision}` : undefined)
+      ? { commandId: state.pendingCommand.commandId, busy: cancelingTranscriptionCommandId === state.pendingCommand.commandId, onCancel: runTranscriptionCancellation }
+      : undefined;
+  const serverRecording: ServerRecordingPresentation | undefined = voiceCapability?.available ? {
+    voice: voiceCapability.voice,
+    actions: voiceCapability.actions,
+    busy: voiceActionBusy,
+    ...(voiceCapability.capture.error ? { captureError: voiceCapability.capture.error } : {}),
+    openNoteAvailable: Boolean(voiceCapability.voice.noteId && dto.notes.some((note) => note.id === voiceCapability.voice.noteId)),
+    onOpenNote: (noteId) => {
+      const current = store.getSnapshot();
+      const note = current.snapshot?.state.notes.find((item) => item.id === noteId);
+      if (!note || !current.snapshot || current.snapshot.workspaceId !== snapshot.workspaceId || current.snapshot.privacyEpoch !== snapshot.privacyEpoch) return;
+      setSelectedNoteId(note.id);
+      setTab('library');
+    },
+    onError: voiceError,
+  } : undefined;
   const libraryNotes = useMemo(() => dto.notes.filter((note) => note.origin !== 'assistant_chat' &&
     `${note.title} ${note.transcript}`.toLocaleLowerCase().includes(libraryQuery.toLocaleLowerCase())), [dto.notes, libraryQuery]);
   const conversations = dto.assistantChatConversations;
@@ -206,7 +309,7 @@ export function CloudWorkspace({ store, state, onLogout }: { store: Pick<CloudWo
       ? 'Open Settings again to load the current saved preferences.'
       : latestSettingsOwner !== settingsDraftOwner
         ? 'This workspace changed. Reload its saved settings before continuing.'
-        : latestSettingsState.busy || latestSettingsState.refreshRequired || latestSettingsState.pendingCommand || settingsSaving || Boolean(settingsOperationLock.current)
+        : latestSettingsState.busy || latestSettingsState.refreshRequired || latestSettingsState.pendingCommand || settingsSaving
           ? 'Resolve the current workspace operation before saving settings.'
           : undefined;
   const saveSettings = async () => {
@@ -392,7 +495,10 @@ export function CloudWorkspace({ store, state, onLogout }: { store: Pick<CloudWo
     let admitted: WorkspaceCommandAdmission | undefined;
     setNotice(undefined);
     try {
-      const response = await actions.notes.transcribe(note.id, expectedRevision, (envelope) => { admitted = envelope; });
+      const response = await actions.notes.transcribe(note.id, expectedRevision, (envelope) => {
+        admitted = envelope;
+        if (envelope.command.kind === 'notes.transcribe') setAdmittedTranscription({ commandId: envelope.commandId, owner });
+      });
       if (selectedNoteOwner.current !== owner) return;
       const receipt = receiptFor(response, 'notes.transcribe');
       if (!admitted || admitted.command.kind !== 'notes.transcribe' || !receipt || receipt.kind !== 'notes.transcribe' || receipt.commandId !== admitted.commandId ||
@@ -497,15 +603,23 @@ export function CloudWorkspace({ store, state, onLogout }: { store: Pick<CloudWo
       ) : tab === 'record' ? (
         manualOpen ? <ManualNoteComposer storageDescription="Saved to your server workspace. Nothing is transcribed or processed until you choose." onCancel={() => setManualOpen(false)} onSave={(text) => void saveManualNote(text)} />
           : <RecordWorkspaceContent
-            audio={{ status: 'idle', canResume: false, durationSeconds: 0, meter: [], hasPending: false, statusLabel: 'Browser audio capture is not connected.' }}
-            recording={{ available: false, reason: 'Browser audio capture is not connected to the server workspace.' }}
+            audio={voiceCapability?.available ? voiceCapability.capture : { status: 'idle', canResume: false, durationSeconds: 0, meter: [], hasPending: false, statusLabel: 'Browser audio capture is not connected.' }}
+            recording={voiceCapability?.available ? { available: true, action: {
+              start: () => { const current = store.getSnapshot(); if (current.busy || current.pendingCommand || current.refreshRequired) { setNotice('Resolve the current workspace operation before starting a recording.'); return; } runVoiceAction(voiceCapability.actions.start); },
+              pause: () => runVoiceAction(voiceCapability.actions.pause),
+              resume: () => runVoiceAction(voiceCapability.actions.resume),
+              stop: () => runVoiceAction(voiceCapability.actions.stopAndSave),
+              cancel: () => runVoiceAction(voiceCapability.actions.cancelCurrentRecording),
+              startDisabled: state.busy || state.refreshRequired || Boolean(state.pendingCommand) || voiceActionBusy,
+            } } : { available: false, reason: 'Browser audio capture is not connected to the server workspace.' }}
             recovery={{ available: false, reason: 'Pending native recording recovery is unavailable in this browser workspace.' }}
             busy={state.busy || state.refreshRequired}
+            serverRecording={serverRecording}
             recent={dto.notes.slice(0, 3).map((note) => workspaceNoteCardDisplay({ ...note, recordingAvailable: note.audio?.available === true }))}
-            onOpenNote={(id) => { setSelectedNoteId(id); setTab('library'); }}
+            onOpenNote={(id, revision) => { const note = store.getSnapshot().snapshot?.state.notes.find((item) => item.id === id && item.revision === revision); if (!note) return; setSelectedNoteId(id); setTab('library'); }}
             onSeeAll={() => { setTab('library'); }}
             onWrite={() => setManualOpen(true)}
-            storageHint="Your note is saved to this server workspace before any optional processing."
+            storageHint="Audio stays in temporary browser memory until you explicitly save it to this workspace."
           />
       ) : tab === 'library' ? (
         <>
@@ -558,7 +672,7 @@ export function CloudWorkspace({ store, state, onLogout }: { store: Pick<CloudWo
               delete: { available: false, reason: 'Note deletion is not connected to a server command.' },
               confirmImportedTimeZone: { available: false, reason: 'Imported time zone confirmation is not connected to a server command.' },
               attachRecording: { available: false, reason: 'Attaching a replacement recording is not connected to the server workspace.' },
-              playback: { available: false, reason: 'Recording playback is not available in this browser workspace yet.' },
+              playback: selectedMediaId ? { available: true } : { available: false, reason: 'This saved recording has no validated server media reference for playback.' },
               exportAudio: { available: false, reason: 'Recording export is not available in this browser workspace yet.' },
               cancelTranscription: { available: false, reason: 'Transcription cancellation is not connected to the browser workspace yet.' },
               retryTranscriptionCleanup: { available: false, reason: 'Transcription cleanup is managed by the workspace service.' },
@@ -604,11 +718,14 @@ export function CloudWorkspace({ store, state, onLogout }: { store: Pick<CloudWo
             onCreateMemorySuggestion={async () => { throw new Error('Saving a memory suggestion is not connected to a server command.'); }}
             onOpenProposals={() => { setSelectedNoteId(undefined); setTab('inbox'); setInboxSection('inbox'); setProposalFilter('pending'); }}
             onTranscribe={(expectedRevision) => void transcribeNote(selectedNote, expectedRevision)}
-            onCancelTranscription={() => setNotice('Transcription cancellation is not connected to the browser workspace yet.')}
+            onCancelTranscription={() => setNotice('Native transcription attempt cancellation is unavailable without its native attempt mapping.')}
+            transcriptionCommandCancellation={pendingTranscriptionCancellation}
             onCheckAssistantBatch={(jobId) => actions.batch.check(jobId)}
             onOpenSpeechSettings={openSettings}
             onAttachRecording={() => setNotice('Attaching a replacement recording is not connected to the server workspace.')}
-            onPlay={() => setNotice('Recording playback is not available in this browser workspace yet.')}
+            onPlay={() => { void audioPlayback.play(); }}
+            playbackState={selectedMediaId ? audioPlayback.state : undefined}
+            onPausePlayback={() => audioPlayback.pause()}
             onExportAudio={() => setNotice('Recording export is not available in this browser workspace yet.')}
             onDelete={() => setNotice('Note deletion is not connected to a server command.')}
           /> : null}

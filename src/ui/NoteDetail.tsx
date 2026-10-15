@@ -140,6 +140,9 @@ export type NoteDetailProps = {
   onOpenSpeechSettings: () => void;
   onAttachRecording: () => void;
   onPlay: () => void;
+  playbackState?: Readonly<{ status: 'idle' | 'ready' | 'playing' | 'paused' | 'error'; error?: string }>;
+  onPausePlayback?: () => void;
+  transcriptionCommandCancellation?: Readonly<{ commandId: string; busy: boolean; onCancel: (commandId: string) => void }>;
   onExportAudio: () => void;
   onDelete: () => void;
   actionCapabilities?: Partial<NoteDetailCapabilityStatuses>;
@@ -195,6 +198,9 @@ export function NoteDetail({
   onOpenSpeechSettings,
   onAttachRecording,
   onPlay,
+  playbackState,
+  onPausePlayback,
+  transcriptionCommandCancellation,
   onExportAudio,
   onDelete,
   actionCapabilities,
@@ -355,13 +361,21 @@ export function NoteDetail({
         ) : null}
         {recordingAvailable ? (
           <>
-            <Button
+            {playbackState ? <>
+              <Text style={s.analysisSource}>{playbackState.error ?? `Playback · ${playbackState.status}`}</Text>
+              <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
+                <Button label="Play recording" tone="quiet" icon="play-circle-outline"
+                  disabled={demoMode || !status(actionCapabilities?.playback).available || playbackState.status === 'playing'} onPress={onPlay} />
+                <Button label="Pause recording" tone="quiet" icon="pause"
+                  disabled={demoMode || !status(actionCapabilities?.playback).available || (playbackState.status !== 'ready' && playbackState.status !== 'playing') || !onPausePlayback} onPress={() => onPausePlayback?.()} />
+              </View>
+            </> : <Button
               label={demoMode ? "Playback unavailable in sample preview" : "Play recording"}
               tone="quiet"
               icon="play-circle-outline"
               disabled={demoMode || !status(actionCapabilities?.playback).available}
               onPress={onPlay}
-            />
+            />}
             <Button
               label={demoMode ? "Audio export unavailable in sample preview" : "Export audio"}
               tone="quiet"
@@ -378,6 +392,12 @@ export function NoteDetail({
             ) : null}
           </>
         ) : null}
+        {transcriptionCommandCancellation ? <View style={{ gap: 8 }}>
+          <Text style={s.analysisSource}>A transcription request is still being processed by the workspace service.</Text>
+          <Button label={transcriptionCommandCancellation.busy ? "Requesting cancellation…" : "Cancel transcription request"}
+            tone="quiet" disabled={transcriptionCommandCancellation.busy}
+            onPress={() => transcriptionCommandCancellation.onCancel(transcriptionCommandCancellation.commandId)} />
+        </View> : null}
         <Field
           label="Transcript"
           multiline

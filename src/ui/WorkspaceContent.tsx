@@ -7,6 +7,7 @@ import { PendingRecordingRecoveryPanel } from '../components/PendingRecordingRec
 import { Button, Field, IconButton } from './primitives';
 import { C, s } from './theme';
 import type { WorkspaceActionCapability } from './workspaceCapabilities';
+import { ServerRecordingPanel, type ServerRecordingPresentation } from './ServerRecordingPanel';
 
 type WorkspaceNoteDTO = WorkspaceSnapshotDTO['state']['notes'][number];
 type WorkspaceProposalDTO = WorkspaceSnapshotDTO['state']['proposals'][number];
@@ -57,16 +58,18 @@ export type WorkspaceCaptureRecoveryActions = Readonly<{
 }>;
 
 /** Same recording screen for both coordinators; native recording/recovery ports stay outside this view. */
-export function RecordWorkspaceContent({ audio, recording, recovery, busy, recent, onOpenNote, onSeeAll, onWrite, storageHint = 'Your recording is saved locally before any optional processing.', unavailableTitle = 'Recording unavailable' }:
-  { audio: WorkspaceRecordDisplay; recording: WorkspaceActionCapability<WorkspaceRecordingActions>; recovery: WorkspaceActionCapability<Readonly<{ status: PendingCaptureSafeStatus | null; loading: boolean; busy: boolean; error: string; actions: WorkspaceCaptureRecoveryActions }>>; busy: boolean; recent: readonly WorkspaceNoteCardDisplay[]; onOpenNote: (noteId: string, revision: number) => void; onSeeAll: () => void; onWrite: () => void; storageHint?: string; unavailableTitle?: string }) {
+export function RecordWorkspaceContent({ audio, recording, recovery, busy, recent, onOpenNote, onSeeAll, onWrite, serverRecording, storageHint = 'Your recording is saved locally before any optional processing.', unavailableTitle = 'Recording unavailable' }:
+  { audio: WorkspaceRecordDisplay; recording: WorkspaceActionCapability<WorkspaceRecordingActions>; recovery: WorkspaceActionCapability<Readonly<{ status: PendingCaptureSafeStatus | null; loading: boolean; busy: boolean; error: string; actions: WorkspaceCaptureRecoveryActions }>>; busy: boolean; recent: readonly WorkspaceNoteCardDisplay[]; onOpenNote: (noteId: string, revision: number) => void; onSeeAll: () => void; onWrite: () => void; serverRecording?: ServerRecordingPresentation; storageHint?: string; unavailableTitle?: string }) {
   const recordingActive = audio.status === 'recording' || audio.status === 'paused';
+  const serverRecoveryPhase = serverRecording && !['idle', 'recording', 'paused'].includes(serverRecording.voice.phase);
+  const recorderBusy = serverRecording && recordingActive ? serverRecording.busy : busy;
   const recoveryVisible = recovery.available && (recovery.action.loading || Boolean(recovery.action.status && recovery.action.status.kind !== 'empty'));
   const formatTime = (seconds: number) => `${Math.floor(seconds / 60).toString().padStart(2, '0')}:${Math.floor(seconds % 60).toString().padStart(2, '0')}`;
   return <ScrollView contentContainerStyle={s.scroll} showsVerticalScrollIndicator={false}>
     <Text style={s.kicker}>RECORD</Text>
     <Text style={s.h1}>Make space{'\n'}for a thought.</Text>
     <Text style={s.intro}>Capture it first. Decide what to do with it later.</Text>
-    <View style={s.recorder}>
+    {serverRecoveryPhase && serverRecording ? <ServerRecordingPanel {...serverRecording} /> : <View style={s.recorder}>
       {!recording.available ? <>
         <View style={[s.micOuter, { opacity: 0.45 }]}><View style={s.micInner}><Ionicons accessible={false} name="mic-off-outline" size={28} color={C.bg} /></View></View>
         <Text style={s.micTitle}>{unavailableTitle}</Text>
@@ -76,22 +79,23 @@ export function RecordWorkspaceContent({ audio, recording, recovery, busy, recen
         <View style={s.liveRow}><View style={[s.liveDot, audio.status === 'paused' && s.pausedDot]} /><Text style={s.liveText}>{audio.statusLabel ?? (audio.status === 'paused' ? 'Paused' : 'Recording')} · {formatTime(audio.durationSeconds)}</Text></View>
         <View style={s.wave} accessibilityLabel="Audio level meter">{audio.meter.map((value, index) => <View key={index} style={[s.waveBar, { height: 7 + value * 29 }]} />)}</View>
         <View style={s.recordControls}>
-          <Button label={audio.status === 'paused' ? 'Resume' : 'Pause'} tone="quiet" disabled={busy || (audio.status === 'paused' && !audio.canResume)} onPress={audio.status === 'paused' ? recording.action.resume : recording.action.pause} icon={audio.status === 'paused' ? 'play' : 'pause'} />
-          <Pressable accessibilityRole="button" accessibilityLabel="Stop and save recording" disabled={busy} onPress={recording.action.stop} style={s.stopButton}><View style={s.stopSquare} /></Pressable>
-          <Button label="Discard" tone="danger" disabled={busy} onPress={recording.action.cancel} icon="trash-outline" />
+          <Button label={audio.status === 'paused' ? 'Resume' : 'Pause'} tone="quiet" disabled={recorderBusy || (audio.status === 'paused' && !audio.canResume)} onPress={audio.status === 'paused' ? recording.action.resume : recording.action.pause} icon={audio.status === 'paused' ? 'play' : 'pause'} />
+          <Pressable accessibilityRole="button" accessibilityLabel="Stop and save recording" disabled={recorderBusy} onPress={recording.action.stop} style={s.stopButton}><View style={s.stopSquare} /></Pressable>
+          <Button label="Discard" tone="danger" disabled={recorderBusy} onPress={recording.action.cancel} icon="trash-outline" />
         </View>
       </> : recoveryVisible ? <PendingRecordingRecoveryPanel status={recovery.action.status} loading={recovery.action.loading} busy={recovery.action.busy} error={recovery.action.error}
         onRefresh={recovery.action.actions.refresh} onInspect={recovery.action.actions.inspect} onSave={recovery.action.actions.save} onExport={recovery.action.actions.export} onDiscard={recovery.action.actions.discard} onRetryCleanup={recovery.action.actions.retryCleanup} />
         : audio.hasPending ? <>
           <Ionicons name="save-outline" size={29} color={C.sage} /><Text style={s.micTitle}>Recording ready to save</Text><Text style={s.micSub}>The audio is preserved. Retry if storage was unavailable.</Text>
-          <Button label={busy ? 'Saving…' : 'Save recording'} disabled={busy || Boolean(recording.action.savePendingDisabled)} onPress={recording.action.stop} icon="save-outline" /><Button label="Discard recording" tone="danger" disabled={busy} onPress={recording.action.cancel} icon="trash-outline" />
+          <Button label={recorderBusy ? 'Saving…' : 'Save recording'} disabled={recorderBusy || Boolean(recording.action.savePendingDisabled)} onPress={recording.action.stop} icon="save-outline" /><Button label="Discard recording" tone="danger" disabled={recorderBusy} onPress={recording.action.cancel} icon="trash-outline" />
         </> : <>
           <Pressable accessibilityRole="button" accessibilityLabel="Start recording a voice note" disabled={busy || Boolean(recording.action.startDisabled)} onPress={recording.action.start} style={s.micOuter}><View style={s.micInner}><Ionicons accessible={false} name="mic" size={30} color={C.bg} /></View></Pressable>
           <Text style={s.micTitle}>Tap to record</Text><Text style={s.micSub}>Nothing starts until you choose.</Text>
           <Pressable accessibilityRole="button" accessibilityLabel="Write a note instead" onPress={onWrite} disabled={busy} style={s.writeInstead}><Ionicons accessible={false} name="create-outline" size={16} color={C.text} /><Text style={s.writeText}>Write a note instead</Text></Pressable>
         </>}
-      {recording.available && !recovery.available ? <Text style={s.micSub}>{recovery.reason}</Text> : null}
-    </View>
+      {recording.available && !recovery.available && !serverRecording ? <Text style={s.micSub}>{recovery.reason}</Text> : null}
+    </View>}
+    {serverRecording && serverRecording.voice.phase === 'idle' ? <ServerRecordingPanel {...serverRecording} /> : null}
     <View style={s.localHint}><Ionicons name="lock-closed-outline" size={15} color={C.sage} /><Text style={s.localHintText}>{storageHint}</Text></View>
     <View style={s.sectionHeader}><Text style={s.sectionTitle}>Recent notes</Text><Pressable accessibilityRole="button" onPress={onSeeAll}><Text style={s.seeAll}>See all</Text></Pressable></View>
     {recent.length ? recent.map((note) => <WorkspaceNoteCard key={note.id} note={note} onPress={() => onOpenNote(note.id, note.revision)} />)
