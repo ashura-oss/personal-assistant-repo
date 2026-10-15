@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { ScrollView, Text, TextInput, View } from 'react-native';
+import { Text, TextInput, View } from 'react-native';
 import type { CloudCredentialController } from '../web/useCloudCredentials';
 import type { WebCredentialKind } from '../web/credentialClient';
 import { Button } from './primitives';
@@ -110,7 +110,7 @@ export function CloudCredentialsPanel({ controller }: { controller: CloudCredent
     setActionError(message ? { ownerGeneration: controller.ownerGeneration, message } : null);
   };
   const blocked = controller.busy || controller.pendingCommandId !== null;
-  return <ScrollView contentContainerStyle={s.scroll}>
+  return <View style={{ gap: 13 }}>
     <Text style={s.modalTitle}>Provider credentials</Text>
     <Text style={styles.copy}>Keys are encrypted and stored on the server. They are never shown again in this browser. The Azure Speech endpoint is managed in workspace preferences.</Text>
     {controller.loading ? <Text accessibilityLiveRegion="polite" style={styles.status}>Loading saved credential status…</Text> : null}
@@ -133,7 +133,7 @@ export function CloudCredentialsPanel({ controller }: { controller: CloudCredent
     {actionError?.ownerGeneration === controller.ownerGeneration ? <Text accessibilityRole="alert" style={styles.error}>{actionError.message}</Text> : null}
     {controller.error ? <Text accessibilityRole="alert" style={styles.error}>{controller.error}</Text> : null}
     {controller.message ? <Text accessibilityLiveRegion="polite" style={styles.status}>{controller.message}</Text> : null}
-  </ScrollView>;
+  </View>;
 }
 
 const styles = {

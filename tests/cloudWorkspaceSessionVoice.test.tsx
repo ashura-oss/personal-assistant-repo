@@ -50,7 +50,14 @@ function fakeCapture(overrides: Partial<CloudVoiceCapturePort> = {}) {
 }
 
 function installFetch(fetcher: (...args: [string, RequestInit]) => Promise<ReturnType<typeof body>>) {
-  const mock = vi.fn(fetcher);
+  const mock = vi.fn((path: string, init: RequestInit) => {
+    if (path === '/api/credentials' && (init.method ?? 'GET') === 'GET') return Promise.resolve(body({
+      workspaceId,
+      privacyEpoch: session.privacyEpoch,
+      credentials: { speech: { configured: false, generation: 0 }, openrouter: { configured: false, generation: 0 } },
+    }));
+    return fetcher(path, init);
+  });
   vi.stubGlobal('fetch', mock);
   return mock;
 }

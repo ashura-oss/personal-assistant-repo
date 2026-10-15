@@ -15,12 +15,32 @@ import { WorkspaceClientError } from '../src/web/workspaceClient';
 
 vi.mock('react-native', async () => {
   const ReactModule = await import('react');
-  const element = (tag: string) => ({ children, onPress, onChangeText, style: _style, accessibilityRole: _role, accessibilityState: _state, ...props }: Record<string, unknown> & { children?: React.ReactNode; onPress?: () => void; onChangeText?: (value: string) => void }) => ReactModule.createElement(tag, {
+  const element = (tag: string) => ({ children, onPress, onChangeText, style: _style, accessibilityRole: _role, accessibilityState: _state, accessibilityLabel, secureTextEntry, ...props }: Record<string, unknown> & { children?: React.ReactNode; onPress?: () => void; onChangeText?: (value: string) => void; accessibilityLabel?: string; secureTextEntry?: boolean }) => ReactModule.createElement(tag, {
     ...props,
+    ...(accessibilityLabel ? { 'aria-label': accessibilityLabel } : {}),
+    ...(secureTextEntry ? { 'data-secure-text-entry': 'true' } : {}),
     ...(onPress ? { onClick: onPress } : {}),
     ...(onChangeText ? { onChange: (event: React.ChangeEvent<HTMLTextAreaElement>) => onChangeText(event.target.value) } : {}),
   }, children);
-  return { ActivityIndicator: () => ReactModule.createElement('span', null, 'loading'), KeyboardAvoidingView: element('div'), Modal: element('div'), View: element('div'), Text: element('span'), Pressable: element('button'), ScrollView: element('div'), TextInput: element('textarea'), Switch: ({ value, disabled, accessibilityLabel, onValueChange }: { value: boolean; disabled?: boolean; accessibilityLabel: string; onValueChange: (value: boolean) => void }) => ReactModule.createElement('input', { type: 'checkbox', checked: value, disabled, 'aria-label': accessibilityLabel, onChange: (event: React.ChangeEvent<HTMLInputElement>) => onValueChange(event.target.checked) }), StyleSheet: { create: (value: unknown) => value }, Platform: { OS: 'web' } };
+  const TextInput = ReactModule.forwardRef<HTMLElement, Record<string, unknown>>((props, ref) => {
+    const { accessibilityLabel, secureTextEntry, onChangeText, defaultValue, editable, ...rest } = props;
+    const tag = secureTextEntry ? 'input' : 'textarea';
+    const assignRef = (node: HTMLInputElement | HTMLTextAreaElement | null) => {
+      if (node) Object.assign(node, { clear: () => { node.value = ''; } });
+      if (typeof ref === 'function') ref(node);
+      else if (ref && typeof ref === 'object') (ref as { current: HTMLElement | null }).current = node;
+    };
+    return ReactModule.createElement(tag, {
+      ...rest,
+      ref: assignRef,
+      defaultValue,
+      disabled: editable === false,
+      ...(accessibilityLabel ? { 'aria-label': accessibilityLabel } : {}),
+      ...(secureTextEntry ? { type: 'password' } : {}),
+      onChange: (event: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => (onChangeText as ((value: string) => void) | undefined)?.(event.target.value),
+    });
+  });
+  return { ActivityIndicator: () => ReactModule.createElement('span', null, 'loading'), KeyboardAvoidingView: element('div'), Modal: element('div'), View: element('div'), Text: element('span'), Pressable: element('button'), ScrollView: element('div'), TextInput, Switch: ({ value, disabled, accessibilityLabel, onValueChange }: { value: boolean; disabled?: boolean; accessibilityLabel: string; onValueChange: (value: boolean) => void }) => ReactModule.createElement('input', { type: 'checkbox', checked: value, disabled, 'aria-label': accessibilityLabel, onChange: (event: React.ChangeEvent<HTMLInputElement>) => onValueChange(event.target.checked) }), StyleSheet: { create: (value: unknown) => value }, Platform: { OS: 'web' } };
 });
 vi.mock('react-native-safe-area-context', async () => {
   const ReactModule = await import('react');
@@ -41,6 +61,12 @@ vi.mock('../src/ui/primitives', async () => {
 vi.mock('../src/ui/theme', () => ({ C: { text: '#fff', muted: '#aaa', card: '#222', border: '#333', sage: '#9a9', red: '#f00', input: '#111' }, s: new Proxy({}, { get: () => ({}) }) }));
 
 const workspaceId = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+function credentialMetadata(openrouter = false, speech = false, epoch = 3, owner = workspaceId) {
+  return { workspaceId: owner, privacyEpoch: epoch, credentials: {
+    speech: { configured: speech, generation: speech ? 1 : 0 },
+    openrouter: { configured: openrouter, generation: openrouter ? 1 : 0 },
+  } };
+}
 let host: HTMLDivElement;
 let root: Root;
 beforeEach(() => {
@@ -90,10 +116,10 @@ function clickTwice(label: string) {
 }
 
 function setTextField(label: string, value: string) {
-  const field = host.querySelector(`textarea[aria-label="${label}"]`) as HTMLTextAreaElement | null;
+  const field = host.querySelector(`input[aria-label="${label}"], textarea[aria-label="${label}"]`) as HTMLInputElement | HTMLTextAreaElement | null;
   if (!field) throw new Error(`Field not found: ${label}`);
-  const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
-  act(() => { setter?.call(field, value); field.dispatchEvent(new Event('input', { bubbles: true })); });
+  const setter = Object.getOwnPropertyDescriptor(field.tagName === 'INPUT' ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype, 'value')?.set;
+  act(() => { setter?.call(field, value); field.dispatchEvent(new Event('input', { bubbles: true })); field.dispatchEvent(new Event('change', { bubbles: true })); });
 }
 
 class UiMediaRecorder {
@@ -122,6 +148,128 @@ function deferred<T>() {
 }
 
 describe('CloudWorkspace safe DTO presentation', () => {
+  it('keeps session credential service across Settings close and reopen, clears drafts, and sends only one explicit key mutation', async () => {
+    const { state } = fixture();
+    const requests: { path: string; method: string; body?: string }[] = [];
+    let configured = false;
+    let credentialReads = 0;
+    const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const path = String(input); const method = init?.method ?? 'GET';
+      requests.push({ path, method, ...(init?.body ? { body: String(init.body) } : {}) });
+      if (path === '/api/credentials' && method === 'GET') {
+        credentialReads += 1;
+        return { ok: true, status: 200, json: async () => credentialMetadata(configured, false) };
+      }
+      if (path === '/api/workspace/snapshot' || path === '/api/workspace/refresh') return { ok: true, status: 200, json: async () => createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: 7 }) };
+      if (path === '/api/credentials' && method === 'PUT') {
+        configured = true;
+        return { ok: true, status: 200, json: async () => credentialMetadata(true, false) };
+      }
+      throw new Error(`Unexpected credential composition request: ${method} ${path}`);
+    });
+    vi.stubGlobal('fetch', fetcher);
+    try {
+      await act(async () => { root.render(<CloudWorkspaceSession session={{ authenticated: true, workspaceId, privacyEpoch: 3, csrfToken: 'csrf' }} onLogout={vi.fn()} />); await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(credentialReads).toBe(1);
+      click('Open settings');
+      expect(host.textContent).toContain('OpenRouter · not configured');
+      const field = host.querySelector('input[aria-label="OpenRouter API key"]') as HTMLInputElement;
+      expect(field.type).toBe('password');
+      setTextField('OpenRouter API key', 'explicit-test-key');
+      click('Save OpenRouter key');
+      expect(field.value).toBe('');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(requests.filter((request) => request.path === '/api/credentials' && request.method === 'PUT')).toHaveLength(1);
+      expect(configured).toBe(true);
+      expect(requests.some((request) => request.path.includes('/api/assistant') || request.path.includes('/api/transcribe'))).toBe(false);
+      expect(host.textContent).toContain('OpenRouter credential saved.');
+      click('Close settings');
+      click('Open settings');
+      expect(credentialReads).toBe(1);
+      expect(host.textContent).toContain('OpenRouter · configured');
+      setTextField('OpenRouter API key', 'unsent-draft');
+      click('Close settings');
+      click('Open settings');
+      expect((host.querySelector('input[aria-label="OpenRouter API key"]') as HTMLInputElement).value).toBe('');
+      expect(credentialReads).toBe(1);
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it('holds an unknown credential save across Settings close and resolves only the exact receipt plus fresh metadata', async () => {
+    const { state } = fixture();
+    const requests: { path: string; method: string }[] = [];
+    let credentialReads = 0;
+    let commandId: string | null = null;
+    let mutationCount = 0;
+    const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const path = String(input); const method = init?.method ?? 'GET';
+      requests.push({ path, method });
+      if (path === '/api/credentials' && method === 'GET') {
+        credentialReads += 1;
+        return { ok: true, status: 200, json: async () => credentialMetadata(credentialReads > 1, false) };
+      }
+      if (path === '/api/workspace/snapshot' || path === '/api/workspace/refresh') return { ok: true, status: 200, json: async () => createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: 7 }) };
+      if (path === '/api/credentials' && method === 'PUT') {
+        mutationCount += 1;
+        commandId = new Headers(init?.headers).get('X-Still-Command');
+        return { ok: false, status: 503, json: async () => ({}) };
+      }
+      if (path.startsWith('/api/credential-commands/') && method === 'GET') return { ok: true, status: 200, json: async () => ({ status: 'finished' }) };
+      throw new Error(`Unexpected credential recovery request: ${method} ${path}`);
+    });
+    vi.stubGlobal('fetch', fetcher);
+    try {
+      await act(async () => { root.render(<CloudWorkspaceSession session={{ authenticated: true, workspaceId, privacyEpoch: 3, csrfToken: 'csrf' }} onLogout={vi.fn()} />); await new Promise((resolve) => setTimeout(resolve, 0)); });
+      click('Open settings');
+      setTextField('OpenRouter API key', 'unknown-outcome-key');
+      click('Save OpenRouter key');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(commandId).not.toBeNull();
+      expect(commandId ?? '').toMatch(/^[0-9a-f-]{36}$/i);
+      expect(host.textContent).toContain('Inspect its receipt before making another change.');
+      expect(mutationCount).toBe(1);
+      click('Close settings');
+      click('Open settings');
+      expect(host.textContent).toContain('A previous credential change needs an exact receipt check.');
+      expect(credentialReads).toBe(1);
+      click('Inspect pending credential change');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(requests).toContainEqual({ path: `/api/credential-commands/${commandId}`, method: 'GET' });
+      expect(credentialReads).toBe(2);
+      expect(host.textContent).toContain('OpenRouter · configured');
+      expect(host.querySelector('[aria-label="Inspect pending credential change"]')).toBeNull();
+      expect(mutationCount).toBe(1);
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it('disposes the session credential request on unmount and ignores its late acknowledgement', async () => {
+    const { state } = fixture();
+    const pendingAck = deferred<{ ok: boolean; status: number; json: () => Promise<unknown> }>();
+    const requests: { path: string; method: string }[] = [];
+    let putCount = 0;
+    const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const path = String(input); const method = init?.method ?? 'GET';
+      requests.push({ path, method });
+      if (path === '/api/credentials' && method === 'GET') return { ok: true, status: 200, json: async () => credentialMetadata() };
+      if (path === '/api/workspace/snapshot' || path === '/api/workspace/refresh') return { ok: true, status: 200, json: async () => createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: 7 }) };
+      if (path === '/api/credentials' && method === 'PUT') { putCount += 1; return pendingAck.promise; }
+      throw new Error(`Unexpected unmount credential request: ${method} ${path}`);
+    });
+    vi.stubGlobal('fetch', fetcher);
+    await act(async () => { root.render(<CloudWorkspaceSession session={{ authenticated: true, workspaceId, privacyEpoch: 3, csrfToken: 'csrf' }} onLogout={vi.fn()} />); await new Promise((resolve) => setTimeout(resolve, 0)); });
+    click('Open settings');
+    setTextField('OpenRouter API key', 'late-ack-key');
+    click('Save OpenRouter key');
+    expect(putCount).toBe(1);
+    const beforeUnmount = requests.length;
+    await act(async () => { root.unmount(); await Promise.resolve(); });
+    pendingAck.resolve({ ok: true, status: 200, json: async () => credentialMetadata(true) });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    expect(requests).toHaveLength(beforeUnmount);
+    expect(putCount).toBe(1);
+    vi.unstubAllGlobals();
+  });
+
   it('starts only after explicit choice, survives tab changes, and completes one upload and one note adoption without processing', async () => {
     const { state } = fixture();
     const session = { authenticated: true as const, workspaceId, privacyEpoch: 3, csrfToken: 'csrf-test' };
@@ -138,6 +286,7 @@ describe('CloudWorkspace safe DTO presentation', () => {
       const path = String(input);
       const method = init?.method ?? 'GET';
       requests.push({ path, method });
+      if (path === '/api/credentials' && method === 'GET') return { ok: true, status: 200, json: async () => credentialMetadata() };
       if (path === '/api/workspace/snapshot' || path === '/api/workspace/refresh') {
         return { ok: true, status: 200, json: async () => createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: state.notes.length > 2 ? 9 : 7 }) };
       }
@@ -615,6 +764,7 @@ describe('CloudWorkspace safe DTO presentation', () => {
     const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const path = String(input);
       calls.push({ path, init });
+      if (path === '/api/credentials' && (init?.method ?? 'GET') === 'GET') return { ok: true, status: 200, json: async () => credentialMetadata() };
       if (path.endsWith('/api/workspace/snapshot') || path.endsWith('/api/workspace/refresh')) {
         return { ok: true, status: 200, json: async () => snapshot };
       }
@@ -687,6 +837,7 @@ describe('CloudWorkspace safe DTO presentation', () => {
     const requests: { path: string; method: string }[] = [];
     const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const path = String(input); const method = init?.method ?? 'GET'; requests.push({ path, method });
+      if (path === '/api/credentials' && method === 'GET') return { ok: true, status: 200, json: async () => credentialMetadata() };
       if (path === '/api/workspace/snapshot' || path === '/api/workspace/refresh') return { ok: true, status: 200, json: async () => createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: 7 }) };
       if (path === '/api/audio/uploads' && method === 'POST') {
         const headers = new Headers(init?.headers);
@@ -760,6 +911,7 @@ describe('CloudWorkspace safe DTO presentation', () => {
     let adoptionPosts = 0;
     const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const path = String(input); const method = init?.method ?? 'GET'; requests.push({ path, method });
+      if (path === '/api/credentials' && method === 'GET') return { ok: true, status: 200, json: async () => credentialMetadata() };
       if (path === '/api/workspace/snapshot' || path === '/api/workspace/refresh') return { ok: true, status: 200, json: async () => createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: state.notes.length > 2 ? 8 : 7 }) };
       if (path === '/api/audio/upload-history' && method === 'GET') return { ok: true, status: 200, json: async () => ({ schemaVersion: 1, entries: [
         { uploadId: readyUploadId, capture: { id: readyCaptureId, revision: readyRevision, capturedAt: createdAt, timeZone: 'UTC' }, status: 'ready', createdAt: Date.parse(createdAt), updatedAt: Date.parse(createdAt) },
@@ -836,6 +988,7 @@ describe('CloudWorkspace safe DTO presentation', () => {
     const snapshot = () => createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: 7 }, { resolveMediaId: () => mediaId });
     const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const path = String(input);
+      if (path === '/api/credentials' && (init?.method ?? 'GET') === 'GET') return { ok: true, status: 200, json: async () => credentialMetadata() };
       if (path === '/api/workspace/snapshot' || path === '/api/workspace/refresh') return { ok: true, status: 200, json: async () => snapshot() };
       if (path === '/api/workspace/commands' && init?.method === 'POST') {
         admitted = JSON.parse(String(init.body)) as typeof admitted;
@@ -904,6 +1057,7 @@ describe('CloudWorkspace safe DTO presentation', () => {
       : originalCreateElement.call(document, tagName, options)) as typeof document.createElement;
     vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
       const path = String(input);
+      if (path === '/api/credentials') return { ok: true, status: 200, json: async () => credentialMetadata() };
       if (path === '/api/workspace/snapshot' || path === '/api/workspace/refresh') return { ok: true, status: 200, json: async () => snapshot() };
       throw new Error(`Playback must not create unrelated requests: ${path}`);
     }));
@@ -965,6 +1119,7 @@ describe('CloudWorkspace safe DTO presentation', () => {
     let snapshotReads = 0;
     const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const path = String(input); const method = init?.method ?? 'GET';
+      if (path === '/api/credentials' && method === 'GET') return { ok: true, status: 200, json: async () => credentialMetadata(false, false, snapshotReads > 1 ? sessionB.privacyEpoch : sessionA.privacyEpoch, snapshotReads > 1 ? sessionB.workspaceId : sessionA.workspaceId) };
       if (path === '/api/workspace/snapshot') {
         snapshotReads += 1;
         const isNewSession = snapshotReads > 1;

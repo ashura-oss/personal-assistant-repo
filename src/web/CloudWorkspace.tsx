@@ -1,9 +1,8 @@
 import React, { useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { Pressable, ScrollView, Text, TextInput, View } from 'react-native';
-import type { WorkspaceCommand, WorkspaceCommandResponse } from '../cloud/workspaceCommands';
-import type { WorkspaceSettingsPatch } from '../cloud/workspaceCommands';
+import { Pressable, ScrollView, Text, View } from 'react-native';
+import type { WorkspaceCommand, WorkspaceCommandResponse, WorkspaceSettingsPatch } from '../cloud/workspaceCommands';
 import type { WorkspaceSettingsDTO } from '../cloud/workspaceDto';
-import type { CloudWorkspaceSessionState, CloudWorkspaceSessionStore } from './CloudWorkspaceSession';
+import type { CloudWorkspaceSessionState, CloudWorkspaceSessionStore, CloudWorkspaceVoiceActions } from './CloudWorkspaceSession';
 import { WorkspaceClientError, WorkspaceCommandNotStartedError, type WorkspaceCommandAdmission } from './workspaceClient';
 import { WorkspaceScreen, type WorkspaceTab } from '../ui/WorkspaceScreen';
 import { InboxWorkspaceContent } from '../ui/InboxWorkspaceContent';
@@ -12,6 +11,7 @@ import { LibraryScreen } from '../ui/LibraryScreen';
 import { projectKnowledgeDisplay } from '../ui/libraryDisplay';
 import { safeChatMemoryEvidenceLabels } from '../ui/chatMemoryReview';
 import { WorkspaceSettingsScreen } from '../ui/WorkspaceSettingsSnapshot';
+import type { WorkspaceSettingsCredentialCapability } from '../ui/WorkspaceSettingsSnapshot';
 import { noteDetailDisplayNote } from '../ui/NoteDetail';
 import { WorkspaceModals } from '../ui/WorkspaceModals';
 import type { ServerRecordingPresentation } from '../ui/ServerRecordingPanel';
@@ -25,7 +25,7 @@ import { Button } from '../ui/primitives';
 import { C, s } from '../ui/theme';
 import { useCloudAudioPlayback } from './useCloudAudioPlayback';
 import type { CloudVoiceCoordinatorState } from './cloudVoiceCoordinator';
-import type { CloudWorkspaceVoiceActions } from './CloudWorkspaceSession';
+import type { CloudCredentialController } from './useCloudCredentials';
 
 export type CloudWorkspaceActions = Readonly<{
   tasks: Readonly<{ complete: (taskId: string) => Promise<WorkspaceCommandResponse>; reopen: (taskId: string) => Promise<WorkspaceCommandResponse> }>;
@@ -98,11 +98,11 @@ function equalSettingsBaseline(left: WorkspaceSettingsBaseline, right: Workspace
     left.maxAudioSeconds === right.maxAudioSeconds && left.retention === right.retention;
 }
 
-export function CloudWorkspace({ store, state, onLogout, voiceCapability }: { store: Pick<CloudWorkspaceSessionStore, 'getSnapshot' | 'execute' | 'inspect' | 'refresh'>; state: CloudWorkspaceSessionState; onLogout: () => void; voiceCapability?: CloudWorkspaceVoiceCapability }) {
+export function CloudWorkspace({ store, state, onLogout, voiceCapability, credentials }: { store: Pick<CloudWorkspaceSessionStore, 'getSnapshot' | 'execute' | 'inspect' | 'refresh'>; state: CloudWorkspaceSessionState; onLogout: () => void; voiceCapability?: CloudWorkspaceVoiceCapability; credentials?: CloudCredentialController }) {
   const snapshot = state.snapshot!;
   const dto = snapshot.state;
   const [tab, setTab] = useState<WorkspaceTab>('inbox');
-  const [draft, setDraft] = useState('');
+  const [, setDraft] = useState('');
   const [selectedNoteId, setSelectedNoteId] = useState<string>();
   const [selectedConversationId, setSelectedConversationId] = useState<string>();
   const [manualOpen, setManualOpen] = useState(false);
@@ -570,13 +570,16 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability }: { st
               ? { available: false, reason: settingsUnavailableReason }
               : { available: true, action: saveSettings },
           },
-          accounts: { available: false, reason: 'Account setup and credential changes are unavailable until matching server actions are available.' },
+          accounts: { available: false, reason: 'Connected account management is unavailable in this browser workspace.' },
           calendars: { available: false, reason: 'Calendar setup and device calendar actions are unavailable in this browser workspace.' },
           connections: { available: false, reason: 'Connection setup, sync, and mail actions are unavailable until matching server actions are available.' },
           recovery: { available: false, reason: 'Recovery actions must be performed by the workspace owner.' },
         }}
         preferencesDraft={settingsDraft ?? settingsDraftFrom(latestSettingsSnapshot.state.settings)}
         preferencesMessage={settingsFormMessage ?? (settingsConflict ? settingsUnavailableReason : settingsSaving ? 'Saving settings…' : undefined)}
+        credentials={credentials
+          ? { available: true, controller: credentials }
+          : { available: false, reason: 'Provider credentials are unavailable in this workspace view.' } satisfies WorkspaceSettingsCredentialCapability}
         onReloadPreferences={settingsConflict || settingsNeedsReload || state.refreshRequired ? reloadSettings : undefined}
         busy={state.busy || state.refreshRequired || Boolean(state.pendingCommand) || settingsSaving} onClose={closeSettings}
       /> : tab === 'chat' ? (
@@ -662,7 +665,7 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability }: { st
             proposals={dto.proposals.filter((proposal) => proposal.noteId === selectedNote.id).map((proposal) => ({ status: proposal.status }))}
             busy={state.busy || state.refreshRequired}
             preview={dto.settings.mode === 'preview'} demoMode={false}
-            providerReady={false} speechEnabled={dto.settings.speechEnabled === true} speechProvider={dto.settings.speechProvider}
+            providerReady={credentials?.presence ? (dto.settings.speechProvider === 'openrouter' ? credentials.presence.openrouter : credentials.presence.speech) : false} speechEnabled={dto.settings.speechEnabled === true} speechProvider={dto.settings.speechProvider}
             serverManagedTranscription
             transcriptionAttempts={dto.transcription.attempts.filter((attempt) => attempt.noteId === selectedNote.id)}
             assistantBatchJobs={dto.assistantBatchJobs} assistantBatchActionsBlocked={state.refreshRequired || Boolean(dto.assistantBatchRecoveryStatus)}
@@ -677,7 +680,7 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability }: { st
               cancelTranscription: { available: false, reason: 'Transcription cancellation is not connected to the browser workspace yet.' },
               retryTranscriptionCleanup: { available: false, reason: 'Transcription cleanup is managed by the workspace service.' },
               transcribe: { available: true },
-              speechSettings: { available: false, reason: 'Speech preference and credential changes are not connected to a server command yet.' },
+              speechSettings: { available: true },
               assistance: dto.settings.mode === 'provider' && dto.settings.llmProvider === 'openrouter'
                 ? { available: true }
                 : { available: false, reason: 'Enable OpenRouter provider analysis in Settings to queue this note.' },

@@ -11,6 +11,7 @@ import { createWebAudioUploadClient, type AudioUploadClient } from './audioClien
 import { CloudVoiceCoordinator, type CloudVoiceCapturePort, type CloudVoiceCoordinatorState } from './cloudVoiceCoordinator';
 import { useCloudAudioCapture } from './useCloudAudioCapture';
 import { C, s } from '../ui/theme';
+import { useCloudCredentials } from './useCloudCredentials';
 
 export type CloudWorkspaceSessionState = Readonly<{
   status: 'loading' | 'ready' | 'error';
@@ -298,6 +299,7 @@ export type CloudWorkspaceVoiceActions = Readonly<{
 }>;
 
 export function CloudWorkspaceSession({ session, onLogout }: { session: AuthenticatedSession; onLogout: () => void }) {
+  const credentials = useCloudCredentials(session);
   const capture = useCloudAudioCapture();
   const captureRef = useRef(capture);
   useLayoutEffect(() => { captureRef.current = capture; }, [capture]);
@@ -320,7 +322,7 @@ export function CloudWorkspaceSession({ session, onLogout }: { session: Authenti
     );
   }
 
-  return <CloudWorkspace store={store} state={state} onLogout={() => { store.invalidate(); onLogout(); }} voiceCapability={state.voice ? {
+  return <CloudWorkspace store={store} state={state} onLogout={() => { store.invalidate(); onLogout(); }} credentials={credentials} voiceCapability={state.voice ? {
     available: true,
     capture: { status: capture.status, canResume: capture.canResume, durationSeconds: capture.durationSeconds,
       meter: capture.meter, hasPending: capture.hasPending, ...(capture.statusLabel ? { statusLabel: capture.statusLabel } : {}),

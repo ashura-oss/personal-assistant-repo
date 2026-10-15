@@ -4,6 +4,8 @@ import type { WorkspaceSnapshotDTO } from '../cloud/workspaceDto';
 import { Button } from './primitives';
 import { C, s } from './theme';
 import { WorkspaceSettingsPreferences, type WorkspaceSettingsDraft, type WorkspaceSettingsPreferenceSave, type WorkspaceSettingsPreferenceUpdate } from './WorkspaceSettingsPreferences';
+import type { CloudCredentialController } from '../web/useCloudCredentials';
+import { CloudCredentialsPanel } from './CloudCredentialsPanel';
 
 export type WorkspaceSettingsDisplay = WorkspaceSnapshotDTO['state'];
 export type WorkspaceSettingsAction = Readonly<{ available: true; action: () => void | Promise<void> }> | Readonly<{ available: false; reason: string }>;
@@ -14,6 +16,7 @@ export type WorkspaceSettingsActions = Readonly<{
   connections: WorkspaceSettingsAction;
   recovery: WorkspaceSettingsAction;
 }>;
+export type WorkspaceSettingsCredentialCapability = Readonly<{ available: true; controller: CloudCredentialController }> | Readonly<{ available: false; reason: string }>;
 
 function Unavailable({ capability }: { capability: WorkspaceSettingsAction }) {
   return capability.available ? null : <Text style={styles.meta}>{capability.reason}</Text>;
@@ -25,7 +28,7 @@ function CapabilityButton({ label, capability, busy }: { label: string; capabili
     : <Unavailable capability={capability} />;
 }
 
-export function WorkspaceSettingsScreen({ display, actions, busy, onClose, preferencesDraft, preferencesMessage, onReloadPreferences }: { display: WorkspaceSettingsDisplay; actions: WorkspaceSettingsActions; busy: boolean; onClose: () => void; preferencesDraft?: WorkspaceSettingsDraft; preferencesMessage?: string; onReloadPreferences?: () => void }) {
+export function WorkspaceSettingsScreen({ display, actions, busy, onClose, preferencesDraft, preferencesMessage, onReloadPreferences, credentials }: { display: WorkspaceSettingsDisplay; actions: WorkspaceSettingsActions; busy: boolean; onClose: () => void; preferencesDraft?: WorkspaceSettingsDraft; preferencesMessage?: string; onReloadPreferences?: () => void; credentials?: WorkspaceSettingsCredentialCapability }) {
   const settings = display.settings;
   const activeRules = display.proactive.rules.filter((rule) => rule.enabled).length;
   const pendingSuggestions = display.knowledge.suggestions.filter((suggestion) => suggestion.status === 'pending').length;
@@ -47,6 +50,8 @@ export function WorkspaceSettingsScreen({ display, actions, busy, onClose, prefe
       description={settings.llmProvider !== 'openrouter' ? 'Legacy text-provider settings are inactive. Saving explicitly switches new text requests to OpenRouter Batch.' : undefined}
     />
     {preferencesMessage ? <View style={styles.card}><Text accessibilityRole="alert" style={styles.meta}>{preferencesMessage}</Text>{onReloadPreferences ? <Button label="Reload saved settings" tone="quiet" disabled={busy} onPress={onReloadPreferences} /> : null}</View> : null}
+    {credentials?.available ? <View style={styles.credentials}><CloudCredentialsPanel controller={credentials.controller} /></View>
+      : credentials ? <Text style={styles.meta}>{credentials.reason}</Text> : null}
     <View style={styles.card}>
       <Text style={styles.title}>Workspace</Text>
       <Text style={styles.meta}>Mode · {settings.mode}</Text>
@@ -140,4 +145,5 @@ const styles = {
   card: { gap: 7, padding: 14, marginBottom: 10, borderRadius: 16, borderWidth: 1, borderColor: C.border, backgroundColor: C.card },
   title: { color: C.text, fontSize: 15, fontWeight: '600' as const },
   meta: { color: C.muted, fontSize: 12, lineHeight: 18 },
+  credentials: { marginBottom: 10 },
 };
