@@ -3,7 +3,7 @@ import { ScrollView, Text, View } from 'react-native';
 import type { WorkspaceSnapshotDTO } from '../cloud/workspaceDto';
 import { Button } from './primitives';
 import { C, s } from './theme';
-import { WorkspaceSettingsPreferences, type WorkspaceSettingsPreferenceSave, type WorkspaceSettingsPreferenceUpdate } from './WorkspaceSettingsPreferences';
+import { WorkspaceSettingsPreferences, type WorkspaceSettingsDraft, type WorkspaceSettingsPreferenceSave, type WorkspaceSettingsPreferenceUpdate } from './WorkspaceSettingsPreferences';
 
 export type WorkspaceSettingsDisplay = WorkspaceSnapshotDTO['state'];
 export type WorkspaceSettingsAction = Readonly<{ available: true; action: () => void | Promise<void> }> | Readonly<{ available: false; reason: string }>;
@@ -25,7 +25,7 @@ function CapabilityButton({ label, capability, busy }: { label: string; capabili
     : <Unavailable capability={capability} />;
 }
 
-export function WorkspaceSettingsScreen({ display, actions, busy, onClose }: { display: WorkspaceSettingsDisplay; actions: WorkspaceSettingsActions; busy: boolean; onClose: () => void }) {
+export function WorkspaceSettingsScreen({ display, actions, busy, onClose, preferencesDraft, preferencesMessage, onReloadPreferences }: { display: WorkspaceSettingsDisplay; actions: WorkspaceSettingsActions; busy: boolean; onClose: () => void; preferencesDraft?: WorkspaceSettingsDraft; preferencesMessage?: string; onReloadPreferences?: () => void }) {
   const settings = display.settings;
   const activeRules = display.proactive.rules.filter((rule) => rule.enabled).length;
   const pendingSuggestions = display.knowledge.suggestions.filter((suggestion) => suggestion.status === 'pending').length;
@@ -39,13 +39,14 @@ export function WorkspaceSettingsScreen({ display, actions, busy, onClose }: { d
     </View>
     <Text style={s.intro}>Saved workspace preferences and connected account details.</Text>
     <WorkspaceSettingsPreferences
-      draft={{ providerEnabled: settings.mode === 'provider', speechEnabled: settings.speechEnabled === true, speechProvider: settings.speechProvider ?? 'azure', speechEndpoint: settings.speechEndpoint ?? '', effort: settings.openRouterReasoningEffort ?? 'low', maxAudioSeconds: String(settings.maxAudioSeconds), retention: settings.audioRetention }}
+      draft={preferencesDraft ?? { providerEnabled: settings.mode === 'provider', speechEnabled: settings.speechEnabled === true, speechProvider: settings.speechProvider ?? 'azure', speechEndpoint: settings.speechEndpoint ?? '', effort: settings.openRouterReasoningEffort ?? 'low', maxAudioSeconds: String(settings.maxAudioSeconds), retention: settings.audioRetention }}
       update={actions.preferences.update}
       save={actions.preferences.save}
       busy={busy}
       demoMode={false}
       description={settings.llmProvider !== 'openrouter' ? 'Legacy text-provider settings are inactive. Saving explicitly switches new text requests to OpenRouter Batch.' : undefined}
     />
+    {preferencesMessage ? <View style={styles.card}><Text accessibilityRole="alert" style={styles.meta}>{preferencesMessage}</Text>{onReloadPreferences ? <Button label="Reload saved settings" tone="quiet" disabled={busy} onPress={onReloadPreferences} /> : null}</View> : null}
     <View style={styles.card}>
       <Text style={styles.title}>Workspace</Text>
       <Text style={styles.meta}>Mode · {settings.mode}</Text>

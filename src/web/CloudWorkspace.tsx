@@ -1,6 +1,8 @@
 import React, { useMemo, useRef, useState } from 'react';
 import { Pressable, ScrollView, Text, TextInput, View } from 'react-native';
 import type { WorkspaceCommand, WorkspaceCommandResponse } from '../cloud/workspaceCommands';
+import type { WorkspaceSettingsPatch } from '../cloud/workspaceCommands';
+import type { WorkspaceSettingsDTO } from '../cloud/workspaceDto';
 import type { CloudWorkspaceSessionState, CloudWorkspaceSessionStore } from './CloudWorkspaceSession';
 import { WorkspaceClientError, WorkspaceCommandNotStartedError, type WorkspaceCommandAdmission } from './workspaceClient';
 import { WorkspaceScreen, type WorkspaceTab } from '../ui/WorkspaceScreen';
@@ -12,6 +14,7 @@ import { safeChatMemoryEvidenceLabels } from '../ui/chatMemoryReview';
 import { WorkspaceSettingsScreen } from '../ui/WorkspaceSettingsSnapshot';
 import { noteDetailDisplayNote } from '../ui/NoteDetail';
 import { WorkspaceModals } from '../ui/WorkspaceModals';
+import type { WorkspaceSettingsDraft } from '../ui/WorkspaceSettingsPreferences';
 import { ChatSection } from '../ui/ChatSection';
 import { AssistantBatchJobCard } from '../ui/AssistantBatchJobCard';
 import { projectChatKnowledgeChoices } from '../ui/workspaceChatDisplayTypes';
@@ -35,6 +38,49 @@ function errText(error: unknown) {
   return error instanceof WorkspaceClientError || error instanceof WorkspaceCommandNotStartedError ? error.message : 'The workspace action could not be confirmed.';
 }
 
+type WorkspaceSettingsBaseline = Readonly<{
+  mode: WorkspaceSettingsDTO['mode'];
+  llmProvider: WorkspaceSettingsDTO['llmProvider'];
+  speechEnabled: boolean;
+  speechProvider: NonNullable<WorkspaceSettingsDTO['speechProvider']>;
+  speechEndpoint: string;
+  effort: NonNullable<WorkspaceSettingsDTO['openRouterReasoningEffort']>;
+  maxAudioSeconds: number;
+  retention: WorkspaceSettingsDTO['audioRetention'];
+}>;
+
+function projectSettingsBaseline(settings: WorkspaceSettingsDTO): WorkspaceSettingsBaseline {
+  return {
+    mode: settings.mode,
+    llmProvider: settings.llmProvider,
+    speechEnabled: settings.speechEnabled === true,
+    speechProvider: settings.speechProvider ?? 'azure',
+    speechEndpoint: settings.speechEndpoint ?? '',
+    effort: settings.openRouterReasoningEffort ?? 'low',
+    maxAudioSeconds: settings.maxAudioSeconds,
+    retention: settings.audioRetention,
+  };
+}
+
+function settingsDraftFrom(settings: WorkspaceSettingsDTO): WorkspaceSettingsDraft {
+  const baseline = projectSettingsBaseline(settings);
+  return {
+    providerEnabled: baseline.mode === 'provider',
+    speechEnabled: baseline.speechEnabled,
+    speechProvider: baseline.speechProvider,
+    speechEndpoint: baseline.speechEndpoint,
+    effort: baseline.effort,
+    maxAudioSeconds: String(baseline.maxAudioSeconds),
+    retention: baseline.retention,
+  };
+}
+
+function equalSettingsBaseline(left: WorkspaceSettingsBaseline, right: WorkspaceSettingsBaseline) {
+  return left.mode === right.mode && left.llmProvider === right.llmProvider && left.speechEnabled === right.speechEnabled &&
+    left.speechProvider === right.speechProvider && left.speechEndpoint === right.speechEndpoint && left.effort === right.effort &&
+    left.maxAudioSeconds === right.maxAudioSeconds && left.retention === right.retention;
+}
+
 export function CloudWorkspace({ store, state, onLogout }: { store: Pick<CloudWorkspaceSessionStore, 'getSnapshot' | 'execute' | 'inspect' | 'refresh'>; state: CloudWorkspaceSessionState; onLogout: () => void }) {
   const snapshot = state.snapshot!;
   const dto = snapshot.state;
@@ -44,6 +90,14 @@ export function CloudWorkspace({ store, state, onLogout }: { store: Pick<CloudWo
   const [selectedConversationId, setSelectedConversationId] = useState<string>();
   const [manualOpen, setManualOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsDraft, setSettingsDraft] = useState<WorkspaceSettingsDraft>();
+  const [settingsBaseline, setSettingsBaseline] = useState<WorkspaceSettingsBaseline>();
+  const [settingsDraftOwner, setSettingsDraftOwner] = useState<string>();
+  const [settingsFormMessage, setSettingsFormMessage] = useState<string>();
+  const [settingsSaving, setSettingsSaving] = useState(false);
+  const [settingsNeedsReload, setSettingsNeedsReload] = useState(false);
+  const settingsFormGeneration = useRef(0);
+  const settingsOperationLock = useRef<object | undefined>(undefined);
   const [inboxSection, setInboxSection] = useState<'inbox' | 'activity' | 'history'>('inbox');
   const [proposalFilter, setProposalFilter] = useState<'pending' | 'done'>('pending');
   const [libraryQuery, setLibraryQuery] = useState('');
@@ -80,6 +134,176 @@ export function CloudWorkspace({ store, state, onLogout }: { store: Pick<CloudWo
       inspect: (commandId) => store.inspect(commandId),
     },
     batch: { check: (jobId) => store.execute({ kind: 'assistant.batch.check', jobId }) },
+  };
+
+  const settingsOwnerKey = (workspaceSnapshot: NonNullable<CloudWorkspaceSessionState['snapshot']>) => `${workspaceSnapshot.workspaceId}:${workspaceSnapshot.privacyEpoch}`;
+  const openSettings = () => {
+    const current = store.getSnapshot().snapshot ?? snapshot;
+    settingsFormGeneration.current += 1;
+    setSettingsDraft(settingsDraftFrom(current.state.settings));
+    setSettingsBaseline(projectSettingsBaseline(current.state.settings));
+    setSettingsDraftOwner(settingsOwnerKey(current));
+    setSettingsFormMessage(undefined);
+    setSettingsSaving(Boolean(settingsOperationLock.current));
+    setSettingsNeedsReload(false);
+    setSettingsOpen(true);
+  };
+  const closeSettings = () => {
+    settingsFormGeneration.current += 1;
+    setSettingsOpen(false);
+  };
+  const reloadSettings = async () => {
+    if (settingsOperationLock.current) {
+      setSettingsFormMessage('Wait for the current settings operation to finish.');
+      return;
+    }
+    const token = {};
+    settingsOperationLock.current = token;
+    const generation = ++settingsFormGeneration.current;
+    const ownerAtStart = settingsOwnerKey(store.getSnapshot().snapshot ?? snapshot);
+    setSettingsSaving(true);
+    setSettingsFormMessage(undefined);
+    try {
+      const refreshed = await store.refresh();
+      if (generation !== settingsFormGeneration.current) return;
+      if (!refreshed) {
+        setSettingsFormMessage('Saved settings could not be loaded. Your current draft is still here.');
+        return;
+      }
+      const latest = store.getSnapshot().snapshot;
+      if (!ownerAtStart || !latest || settingsOwnerKey(refreshed) !== ownerAtStart || settingsOwnerKey(latest) !== ownerAtStart) {
+        setSettingsFormMessage('The workspace changed while settings were reloading. Reload again from the current workspace.');
+        return;
+      }
+      setSettingsDraft(settingsDraftFrom(refreshed.state.settings));
+      setSettingsBaseline(projectSettingsBaseline(refreshed.state.settings));
+      setSettingsDraftOwner(settingsOwnerKey(refreshed));
+      setSettingsNeedsReload(false);
+      setSettingsFormMessage('Loaded the saved workspace settings.');
+    } catch (error) {
+      const latestOwner = store.getSnapshot().snapshot;
+      if (generation === settingsFormGeneration.current && latestOwner && settingsOwnerKey(latestOwner) === ownerAtStart) {
+        setSettingsFormMessage(errText(error));
+      }
+    } finally {
+      if (settingsOperationLock.current === token) {
+        settingsOperationLock.current = undefined;
+        setSettingsSaving(false);
+      }
+    }
+  };
+  const latestSettingsState = store.getSnapshot();
+  const latestSettingsSnapshot = latestSettingsState.snapshot ?? snapshot;
+  const latestSettingsOwner = settingsOwnerKey(latestSettingsSnapshot);
+  const currentSettingsBaseline = projectSettingsBaseline(latestSettingsSnapshot.state.settings);
+  const settingsConflict = Boolean(settingsOpen && settingsDraft && settingsBaseline &&
+    (settingsDraftOwner !== latestSettingsOwner || !equalSettingsBaseline(settingsBaseline, currentSettingsBaseline)));
+  const settingsUnavailableReason = settingsConflict
+    ? 'Saved settings changed after this form opened. Reload them before making another change.'
+    : settingsNeedsReload
+      ? 'Reload saved settings before making another change.'
+    : !settingsDraft || !settingsBaseline || !settingsDraftOwner
+      ? 'Open Settings again to load the current saved preferences.'
+      : latestSettingsOwner !== settingsDraftOwner
+        ? 'This workspace changed. Reload its saved settings before continuing.'
+        : latestSettingsState.busy || latestSettingsState.refreshRequired || latestSettingsState.pendingCommand || settingsSaving || Boolean(settingsOperationLock.current)
+          ? 'Resolve the current workspace operation before saving settings.'
+          : undefined;
+  const saveSettings = async () => {
+    const draft = settingsDraft;
+    const baseline = settingsBaseline;
+    const owner = settingsDraftOwner;
+    const generation = settingsFormGeneration.current;
+    if (settingsOperationLock.current) {
+      setSettingsFormMessage('Wait for the current settings operation to finish.');
+      return;
+    }
+    if (!draft || !baseline || !owner) {
+      setSettingsFormMessage('Open Settings again to load the current saved preferences.');
+      return;
+    }
+    if (!/^\d+$/.test(draft.maxAudioSeconds.trim())) {
+      setSettingsFormMessage('Maximum recording length must be a whole number from 10 to 600 seconds.');
+      return;
+    }
+    const maxAudioSeconds = Number(draft.maxAudioSeconds);
+    if (!Number.isSafeInteger(maxAudioSeconds) || maxAudioSeconds < 10 || maxAudioSeconds > 600) {
+      setSettingsFormMessage('Maximum recording length must be a whole number from 10 to 600 seconds.');
+      return;
+    }
+    const current = store.getSnapshot();
+    const currentSnapshot = current.snapshot;
+    if (!currentSnapshot || settingsOwnerKey(currentSnapshot) !== owner || current.busy || current.pendingCommand || current.refreshRequired) {
+      setSettingsFormMessage('Resolve the current workspace operation or reload saved settings before saving.');
+      return;
+    }
+    if (!equalSettingsBaseline(baseline, projectSettingsBaseline(currentSnapshot.state.settings))) {
+      setSettingsFormMessage('Saved settings changed after this form opened. Reload them before making another change.');
+      return;
+    }
+    const patch: WorkspaceSettingsPatch = {
+      mode: draft.providerEnabled ? 'provider' : 'preview',
+      speechEnabled: draft.speechEnabled,
+      speechProvider: draft.speechProvider,
+      speechEndpoint: draft.speechEndpoint.trim(),
+      openRouterReasoningEffort: draft.effort,
+      maxAudioSeconds,
+      audioRetention: draft.retention,
+    };
+    const token = {};
+    settingsOperationLock.current = token;
+    setSettingsSaving(true);
+    setSettingsFormMessage(undefined);
+    try {
+      const response = await store.execute({ kind: 'settings.update', patch });
+      const latestSnapshot = store.getSnapshot().snapshot;
+      if (generation !== settingsFormGeneration.current || settingsDraftOwner !== owner) return;
+      if (!latestSnapshot || settingsOwnerKey(latestSnapshot) !== owner) {
+        setSettingsFormMessage('The workspace changed while the settings command was in progress. Reload the current workspace settings.');
+        return;
+      }
+      const receipt = receiptFor(response, 'settings.update');
+      if (!receipt || receipt.kind !== 'settings.update' || receipt.objectId !== 'workspace-settings') {
+        setSettingsFormMessage('The settings command has no confirmed receipt. Inspect it before trying again.');
+        return;
+      }
+      if (!response.snapshot) {
+        setSettingsNeedsReload(true);
+        setSettingsFormMessage('Settings were saved. Reload the saved settings to load the confirmed values.');
+        return;
+      }
+      if (settingsOwnerKey(response.snapshot) !== owner) {
+        setSettingsFormMessage('The workspace changed while the settings command was in progress. Reload the current workspace settings.');
+        return;
+      }
+      setSettingsDraft(settingsDraftFrom(response.snapshot.state.settings));
+      setSettingsBaseline(projectSettingsBaseline(response.snapshot.state.settings));
+      setSettingsDraftOwner(settingsOwnerKey(response.snapshot));
+      setSettingsNeedsReload(false);
+      setSettingsFormMessage('Settings saved.');
+    } catch (error) {
+      const latestSnapshot = store.getSnapshot().snapshot;
+      if (generation === settingsFormGeneration.current && latestSnapshot && settingsOwnerKey(latestSnapshot) === owner) {
+        setSettingsFormMessage(errText(error));
+      }
+    } finally {
+      if (settingsOperationLock.current === token) {
+        settingsOperationLock.current = undefined;
+        setSettingsSaving(false);
+      }
+    }
+  };
+  const updateSettingsDraft = (patch: Partial<WorkspaceSettingsDraft>) => {
+    const current = store.getSnapshot();
+    const currentSnapshot = current.snapshot;
+    if (!settingsDraftOwner || !settingsBaseline || !currentSnapshot || settingsOwnerKey(currentSnapshot) !== settingsDraftOwner ||
+        current.busy || current.pendingCommand || current.refreshRequired || settingsNeedsReload ||
+        !equalSettingsBaseline(settingsBaseline, projectSettingsBaseline(currentSnapshot.state.settings))) {
+      setSettingsFormMessage('Saved settings changed or a workspace operation is active. Reload saved settings before editing.');
+      return;
+    }
+    setSettingsDraft((draft) => draft ? { ...draft, ...patch } : draft);
+    setSettingsFormMessage(undefined);
   };
 
   const createConversation = async () => {
@@ -214,7 +438,7 @@ export function CloudWorkspace({ store, state, onLogout }: { store: Pick<CloudWo
   return (
     <WorkspaceScreen
       model={{ activeTab: tab, busy: state.busy, tabBarVisible: true, tabNavigationLocked: Boolean(state.pendingCommand), snapshot, notice }}
-      actions={{ navigation: { selectTab: setTab }, settings: { open: () => setSettingsOpen(true) }, session: { logout: onLogout } }}
+      actions={{ navigation: { selectTab: setTab }, settings: { open: openSettings }, session: { logout: onLogout } }}
     >
       {notice || state.refreshRequired ? (
         <View style={s.notice}>
@@ -230,18 +454,25 @@ export function CloudWorkspace({ store, state, onLogout }: { store: Pick<CloudWo
         </View>
       ) : null}
       {settingsOpen ? <WorkspaceSettingsScreen
-        display={dto}
+        display={latestSettingsSnapshot.state}
         actions={{
           preferences: {
-            update: { available: false, reason: 'Preference edits are unavailable until the server exposes a settings command.' },
-            save: { available: false, reason: 'Saving settings is unavailable until the server exposes a settings command.' },
+            update: settingsUnavailableReason
+              ? { available: false, reason: settingsUnavailableReason }
+              : { available: true, action: updateSettingsDraft },
+            save: settingsUnavailableReason
+              ? { available: false, reason: settingsUnavailableReason }
+              : { available: true, action: saveSettings },
           },
           accounts: { available: false, reason: 'Account setup and credential changes are unavailable until matching server actions are available.' },
           calendars: { available: false, reason: 'Calendar setup and device calendar actions are unavailable in this browser workspace.' },
           connections: { available: false, reason: 'Connection setup, sync, and mail actions are unavailable until matching server actions are available.' },
           recovery: { available: false, reason: 'Recovery actions must be performed by the workspace owner.' },
         }}
-        busy={state.busy || state.refreshRequired} onClose={() => setSettingsOpen(false)}
+        preferencesDraft={settingsDraft ?? settingsDraftFrom(latestSettingsSnapshot.state.settings)}
+        preferencesMessage={settingsFormMessage ?? (settingsConflict ? settingsUnavailableReason : settingsSaving ? 'Saving settings…' : undefined)}
+        onReloadPreferences={settingsConflict || settingsNeedsReload || state.refreshRequired ? reloadSettings : undefined}
+        busy={state.busy || state.refreshRequired || Boolean(state.pendingCommand) || settingsSaving} onClose={closeSettings}
       /> : tab === 'chat' ? (
         <ChatSection
           conversations={conversations}
@@ -375,7 +606,7 @@ export function CloudWorkspace({ store, state, onLogout }: { store: Pick<CloudWo
             onTranscribe={(expectedRevision) => void transcribeNote(selectedNote, expectedRevision)}
             onCancelTranscription={() => setNotice('Transcription cancellation is not connected to the browser workspace yet.')}
             onCheckAssistantBatch={(jobId) => actions.batch.check(jobId)}
-            onOpenSpeechSettings={() => setSettingsOpen(true)}
+            onOpenSpeechSettings={openSettings}
             onAttachRecording={() => setNotice('Attaching a replacement recording is not connected to the server workspace.')}
             onPlay={() => setNotice('Recording playback is not available in this browser workspace yet.')}
             onExportAudio={() => setNotice('Recording export is not available in this browser workspace yet.')}

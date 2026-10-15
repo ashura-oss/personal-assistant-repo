@@ -9,6 +9,7 @@ import type { CloudWorkspaceSessionState } from '../src/web/CloudWorkspaceSessio
 import { CloudWorkspace } from '../src/web/CloudWorkspace';
 import { CloudWorkspaceSession } from '../src/web/CloudWorkspaceSession';
 import type { WorkspaceCommand, WorkspaceCommandResponse } from '../src/cloud/workspaceCommands';
+import { WorkspaceClientError } from '../src/web/workspaceClient';
 
 vi.mock('react-native', async () => {
   const ReactModule = await import('react');
@@ -17,7 +18,7 @@ vi.mock('react-native', async () => {
     ...(onPress ? { onClick: onPress } : {}),
     ...(onChangeText ? { onChange: (event: React.ChangeEvent<HTMLTextAreaElement>) => onChangeText(event.target.value) } : {}),
   }, children);
-  return { ActivityIndicator: () => ReactModule.createElement('span', null, 'loading'), KeyboardAvoidingView: element('div'), Modal: element('div'), View: element('div'), Text: element('span'), Pressable: element('button'), ScrollView: element('div'), TextInput: element('textarea'), Switch: ({ value, disabled, accessibilityLabel }: { value: boolean; disabled?: boolean; accessibilityLabel: string }) => ReactModule.createElement('input', { type: 'checkbox', checked: value, disabled, 'aria-label': accessibilityLabel, readOnly: true }), StyleSheet: { create: (value: unknown) => value }, Platform: { OS: 'web' } };
+  return { ActivityIndicator: () => ReactModule.createElement('span', null, 'loading'), KeyboardAvoidingView: element('div'), Modal: element('div'), View: element('div'), Text: element('span'), Pressable: element('button'), ScrollView: element('div'), TextInput: element('textarea'), Switch: ({ value, disabled, accessibilityLabel, onValueChange }: { value: boolean; disabled?: boolean; accessibilityLabel: string; onValueChange: (value: boolean) => void }) => ReactModule.createElement('input', { type: 'checkbox', checked: value, disabled, 'aria-label': accessibilityLabel, onChange: (event: React.ChangeEvent<HTMLInputElement>) => onValueChange(event.target.checked) }), StyleSheet: { create: (value: unknown) => value }, Platform: { OS: 'web' } };
 });
 vi.mock('react-native-safe-area-context', async () => {
   const ReactModule = await import('react');
@@ -71,6 +72,20 @@ function click(label: string) {
   const item = [...host.querySelectorAll('button')].find((button) => button.textContent?.includes(label) || button.getAttribute('aria-label') === label || button.getAttribute('accessibilityLabel') === label);
   if (!item) throw new Error(`Button not found: ${label}; rendered=${host.textContent}`);
   act(() => item.click());
+}
+
+function setTextField(label: string, value: string) {
+  const field = host.querySelector(`textarea[aria-label="${label}"]`) as HTMLTextAreaElement | null;
+  if (!field) throw new Error(`Field not found: ${label}`);
+  const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+  act(() => { setter?.call(field, value); field.dispatchEvent(new Event('input', { bubbles: true })); });
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
 }
 
 describe('CloudWorkspace safe DTO presentation', () => {
@@ -233,6 +248,7 @@ describe('CloudWorkspace safe DTO presentation', () => {
     expect(host.textContent).toContain(`${snapshot.state.usage.inputTokens} input tokens`);
     expect(host.textContent).toContain('Provider-reported token counts are not billing estimates.');
     expect(store.execute).not.toHaveBeenCalled();
+    expect([...host.querySelectorAll('button')].find((button) => button.textContent?.includes('Save provider and recording settings'))?.disabled).toBe(false);
   });
 
   it('shows complete safe status panels and explains unavailable settings actions', () => {
@@ -242,9 +258,186 @@ describe('CloudWorkspace safe DTO presentation', () => {
     expect(host.textContent).toContain('Attention and reminders');
     expect(host.textContent).toContain('Knowledge, documents, and backups');
     expect(host.textContent).toContain('Device calendars');
-    expect(host.textContent).toContain('Preference edits are unavailable until the server exposes a settings command.');
+    expect(host.textContent).toContain('Saving explicitly switches new text requests to OpenRouter Batch.');
     expect(host.textContent).toContain('Connection setup, sync, and mail actions are unavailable until matching server actions are available.');
     expect(store.execute).not.toHaveBeenCalled();
+  });
+
+  it('edits the controlled settings draft and sends one closed settings command with the fixed profile fields', async () => {
+    const { state } = fixture();
+    const initialSnapshot = createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: 7 });
+    let latestSnapshot = initialSnapshot;
+    const sessionState: CloudWorkspaceSessionState = { status: 'ready', snapshot: latestSnapshot, busy: false, refreshRequired: false };
+    const execute = vi.fn(async (command: WorkspaceCommand): Promise<WorkspaceCommandResponse> => {
+      expect(command.kind).toBe('settings.update');
+      if (command.kind !== 'settings.update') throw new Error('unexpected command');
+      state.settings.mode = command.patch.mode ?? state.settings.mode;
+      state.settings.llmProvider = 'openrouter';
+      state.settings.openRouterModel = 'openai/gpt-6-luna:batch';
+      state.settings.llmRequestContractVersion = 1;
+      state.settings.openRouterReasoningEffort = command.patch.openRouterReasoningEffort ?? state.settings.openRouterReasoningEffort;
+      state.settings.speechEnabled = command.patch.speechEnabled ?? state.settings.speechEnabled;
+      state.settings.speechProvider = command.patch.speechProvider ?? state.settings.speechProvider;
+      state.settings.speechEndpoint = command.patch.speechEndpoint ?? state.settings.speechEndpoint;
+      state.settings.maxAudioSeconds = command.patch.maxAudioSeconds ?? state.settings.maxAudioSeconds;
+      state.settings.audioRetention = command.patch.audioRetention ?? state.settings.audioRetention;
+      latestSnapshot = createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: 8 });
+      (sessionState as { snapshot: typeof latestSnapshot }).snapshot = latestSnapshot;
+      const commandId = '88888888-8888-4888-8888-888888888888';
+      return { schemaVersion: 1, commandId, status: 'finished', receipt: { schemaVersion: 1, commandId, kind: 'settings.update', objectId: 'workspace-settings' }, snapshot: latestSnapshot };
+    });
+    const store = { getSnapshot: () => sessionState, execute, inspect: vi.fn(), refresh: vi.fn(async () => latestSnapshot) };
+    act(() => root.render(<CloudWorkspace store={store} state={sessionState} onLogout={vi.fn()} />));
+    click('Open settings');
+    const providerToggle = host.querySelector('input[aria-label="Enable provider analysis"]') as HTMLInputElement;
+    act(() => { providerToggle.click(); });
+    click('none');
+    setTextField('Maximum recording length · seconds', '240');
+    click('Save provider and recording settings');
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(execute).toHaveBeenCalledExactlyOnceWith({ kind: 'settings.update', patch: {
+      mode: 'provider', speechEnabled: state.settings.speechEnabled, speechProvider: state.settings.speechProvider ?? 'azure',
+      speechEndpoint: state.settings.speechEndpoint ?? '', openRouterReasoningEffort: 'none', maxAudioSeconds: 240, audioRetention: state.settings.audioRetention,
+    } });
+    expect(host.textContent).toContain('Settings saved.');
+    expect(host.textContent).toContain('Mode · provider');
+  });
+
+  it('rejects an out-of-range recording duration before sending any settings command', async () => {
+    const { snapshot, store } = fixture();
+    act(() => root.render(<CloudWorkspace store={store} state={{ status: 'ready', snapshot, busy: false, refreshRequired: false }} onLogout={vi.fn()} />));
+    click('Open settings');
+    setTextField('Maximum recording length · seconds', '9');
+    click('Save provider and recording settings');
+    await act(async () => { await Promise.resolve(); });
+    expect(store.execute).not.toHaveBeenCalled();
+    expect(host.textContent).toContain('Maximum recording length must be a whole number from 10 to 600 seconds.');
+    expect((host.querySelector('textarea[aria-label="Maximum recording length · seconds"]') as HTMLTextAreaElement).value).toBe('9');
+  });
+
+  it('blocks saving when an editable setting changed elsewhere and only replaces the draft after explicit reload', async () => {
+    const { state } = fixture();
+    const snapshot = createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: 7 });
+    let latestSnapshot = snapshot;
+    const sessionState: CloudWorkspaceSessionState = { status: 'ready', snapshot, busy: false, refreshRequired: false };
+    const execute = vi.fn();
+    const refresh = vi.fn().mockRejectedValueOnce(new Error('network unavailable')).mockImplementation(async () => latestSnapshot);
+    const store = { getSnapshot: () => ({ ...sessionState, snapshot: latestSnapshot }), execute, inspect: vi.fn(), refresh };
+    act(() => root.render(<CloudWorkspace store={store} state={sessionState} onLogout={vi.fn()} />));
+    click('Open settings');
+    setTextField('Speech endpoint', 'https://draft.example.com');
+    state.settings.speechEndpoint = 'https://saved.example.com';
+    latestSnapshot = createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: 8 });
+    act(() => root.render(<CloudWorkspace store={store} state={sessionState} onLogout={vi.fn()} />));
+    expect(host.textContent).toContain('Saved settings changed after this form opened. Reload them before making another change.');
+    expect((host.querySelector('textarea[aria-label="Speech endpoint"]') as HTMLTextAreaElement).value).toBe('https://draft.example.com');
+    click('Save provider and recording settings');
+    expect(execute).not.toHaveBeenCalled();
+    click('Reload saved settings');
+    await act(async () => { await Promise.resolve(); });
+    expect((host.querySelector('textarea[aria-label="Speech endpoint"]') as HTMLTextAreaElement).value).toBe('https://draft.example.com');
+    expect(refresh).toHaveBeenCalledOnce();
+    click('Reload saved settings');
+    await act(async () => { await Promise.resolve(); });
+    expect(refresh).toHaveBeenCalledTimes(2);
+    expect((host.querySelector('textarea[aria-label="Speech endpoint"]') as HTMLTextAreaElement).value).toBe('https://saved.example.com');
+    expect(host.textContent).toContain('Loaded the saved workspace settings.');
+  });
+
+  it('suppresses a rejected save error when the live workspace privacy epoch changes while the form stays open', async () => {
+    const { state } = fixture();
+    const initialSnapshot = createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: 7 });
+    let latestSnapshot = initialSnapshot;
+    let sessionState: CloudWorkspaceSessionState = { status: 'ready', snapshot: latestSnapshot, busy: false, refreshRequired: false };
+    const pendingSave = deferred<WorkspaceCommandResponse>();
+    const execute = vi.fn(() => pendingSave.promise);
+    const store = { getSnapshot: () => sessionState, execute, inspect: vi.fn(), refresh: vi.fn(async () => latestSnapshot) };
+    act(() => root.render(<CloudWorkspace store={store} state={sessionState} onLogout={vi.fn()} />));
+    click('Open settings');
+    setTextField('Speech endpoint', 'https://draft.example.com');
+    click('Save provider and recording settings');
+
+    latestSnapshot = createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 4, revision: 8 });
+    sessionState = { ...sessionState, snapshot: latestSnapshot };
+    act(() => root.render(<CloudWorkspace store={store} state={sessionState} onLogout={vi.fn()} />));
+    await act(async () => { pendingSave.reject(new WorkspaceClientError('network', 'The workspace connection was interrupted.')); await pendingSave.promise.catch(() => undefined); });
+
+    expect(host.textContent).not.toContain('The workspace connection was interrupted.');
+    expect(host.textContent).toContain('Saved settings changed after this form opened. Reload them before making another change.');
+    expect((host.querySelector('textarea[aria-label="Speech endpoint"]') as HTMLTextAreaElement).value).toBe('https://draft.example.com');
+    expect(execute).toHaveBeenCalledOnce();
+  });
+
+  it('suppresses a rejected settings reload error when the live workspace privacy epoch changes', async () => {
+    const { state } = fixture();
+    const initialSnapshot = createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: 7 });
+    let latestSnapshot = initialSnapshot;
+    let sessionState: CloudWorkspaceSessionState = { status: 'ready', snapshot: latestSnapshot, busy: false, refreshRequired: false };
+    const pendingReload = deferred<typeof initialSnapshot>();
+    const refresh = vi.fn(() => pendingReload.promise);
+    const store = { getSnapshot: () => sessionState, execute: vi.fn(), inspect: vi.fn(), refresh };
+    act(() => root.render(<CloudWorkspace store={store} state={sessionState} onLogout={vi.fn()} />));
+    click('Open settings');
+    setTextField('Speech endpoint', 'https://draft.example.com');
+    state.settings.speechEndpoint = 'https://remote.example.com';
+    latestSnapshot = createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: 8 });
+    sessionState = { ...sessionState, snapshot: latestSnapshot };
+    act(() => root.render(<CloudWorkspace store={store} state={sessionState} onLogout={vi.fn()} />));
+    click('Reload saved settings');
+
+    latestSnapshot = createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 4, revision: 9 });
+    sessionState = { ...sessionState, snapshot: latestSnapshot };
+    act(() => root.render(<CloudWorkspace store={store} state={sessionState} onLogout={vi.fn()} />));
+    await act(async () => { pendingReload.reject(new WorkspaceClientError('network', 'The workspace connection was interrupted.')); await pendingReload.promise.catch(() => undefined); });
+
+    expect(refresh).toHaveBeenCalledOnce();
+    expect(host.textContent).not.toContain('The workspace connection was interrupted.');
+    expect(host.textContent).toContain('Saved settings changed after this form opened. Reload them before making another change.');
+    expect((host.querySelector('textarea[aria-label="Speech endpoint"]') as HTMLTextAreaElement).value).toBe('https://draft.example.com');
+  });
+
+  it('does not optimistically change displayed settings when a finished receipt has no snapshot', async () => {
+    const { snapshot } = fixture();
+    const commandId = '88888888-8888-4888-8888-888888888888';
+    const execute = vi.fn(async (): Promise<WorkspaceCommandResponse> => ({ schemaVersion: 1, commandId, status: 'finished', receipt: { schemaVersion: 1, commandId, kind: 'settings.update', objectId: 'workspace-settings' } }));
+    const store = { getSnapshot: () => ({ status: 'ready', snapshot, busy: false, refreshRequired: false } satisfies CloudWorkspaceSessionState), execute, inspect: vi.fn(), refresh: vi.fn(async () => snapshot) };
+    act(() => root.render(<CloudWorkspace store={store} state={store.getSnapshot()} onLogout={vi.fn()} />));
+    click('Open settings');
+    click('Save provider and recording settings');
+    await act(async () => { await Promise.resolve(); });
+    expect(execute).toHaveBeenCalledOnce();
+    expect(host.textContent).toContain('Settings were saved. Reload the saved settings to load the confirmed values.');
+    expect(host.textContent).toContain('Mode · preview');
+    expect([...host.querySelectorAll('button')].find((button) => button.textContent?.includes('Save provider and recording settings'))?.disabled).toBe(true);
+    click('Save provider and recording settings');
+    expect(execute).toHaveBeenCalledOnce();
+  });
+
+  it('holds a settings command after a lost acknowledgement and offers exact inspection without resubmitting', async () => {
+    const { snapshot } = fixture();
+    const commandId = '88888888-8888-4888-8888-888888888888';
+    let sessionState: CloudWorkspaceSessionState = { status: 'ready', snapshot, busy: false, refreshRequired: false };
+    const execute = vi.fn(async (command: WorkspaceCommand): Promise<WorkspaceCommandResponse> => {
+      sessionState = { ...sessionState, pendingCommand: { commandId, kind: command.kind } };
+      throw new WorkspaceClientError('network', 'The workspace connection was interrupted.');
+    });
+    const inspect = vi.fn(async (id: string): Promise<WorkspaceCommandResponse> => ({
+      schemaVersion: 1, commandId: id, status: 'finished',
+      receipt: { schemaVersion: 1, commandId: id, kind: 'settings.update', objectId: 'workspace-settings' },
+    }));
+    const store = { getSnapshot: () => sessionState, execute, inspect, refresh: vi.fn(async () => snapshot) };
+    act(() => root.render(<CloudWorkspace store={store} state={sessionState} onLogout={vi.fn()} />));
+    click('Open settings');
+    click('Save provider and recording settings');
+    await act(async () => { await Promise.resolve(); });
+    expect(execute).toHaveBeenCalledOnce();
+    act(() => root.render(<CloudWorkspace store={store} state={sessionState} onLogout={vi.fn()} />));
+    expect([...host.querySelectorAll('button')].find((button) => button.textContent?.includes('Save provider and recording settings'))?.disabled).toBe(true);
+    click('Inspect exact settings.update command');
+    await act(async () => { await Promise.resolve(); });
+    expect(inspect).toHaveBeenCalledExactlyOnceWith(commandId);
+    expect(execute).toHaveBeenCalledOnce();
+    expect(host.textContent).toContain('The exact settings.update receipt is confirmed.');
   });
 
   it('filters Cloud notes with the shared Library search and restores them when cleared', () => {
