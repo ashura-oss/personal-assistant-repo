@@ -13,10 +13,12 @@ function filesUnder(directory) {
   });
 }
 
-test('server package has no Expo or React Native runtime dependency boundary', () => {
+test('server package keeps provider verification dependencies server-only and has no Expo or React Native dependency', () => {
   const dependencies = { ...packageJson.dependencies, ...packageJson.devDependencies };
-  assert.deepEqual(Object.keys(packageJson.dependencies), ['better-sqlite3']);
+  assert.deepEqual(Object.keys(packageJson.dependencies), ['better-sqlite3', 'jose', 'openid-client']);
   assert.equal(packageJson.dependencies['better-sqlite3'], '13.0.3');
+  assert.equal(packageJson.dependencies.jose, '6.2.12');
+  assert.equal(packageJson.dependencies['openid-client'], '6.8.8');
   assert.equal(Object.keys(dependencies).some((name) => /^(expo|react-native|react|still-voice-assistant)/i.test(name)), false);
   const runtimeFiles = filesUnder(fileURLToPath(new URL('../dist', import.meta.url))).filter((path) => path.endsWith('.js'));
   for (const path of runtimeFiles) {
