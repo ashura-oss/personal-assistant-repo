@@ -39,6 +39,10 @@ export async function dispatchWorkspaceCommand(runtime: OwnedWorkspaceRuntime, a
   }
   const result = await runtime.executeCommand(commandInput, async (controller) => {
     switch (command.kind) {
+      case 'settings.update': {
+        await controller.saveSettings({ ...command.patch, llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
+        return receipt(envelope, command, { objectId: 'workspace-settings' });
+      }
       case 'tasks.complete': return receipt(envelope, command, { objectId: (await controller.completeTask(command.taskId)).id });
       case 'tasks.reopen': return receipt(envelope, command, { objectId: (await controller.reopenTask(command.taskId)).id });
       case 'chat.create': return receipt(envelope, command, { objectId: (await controller.createChatConversation(command.title)).id });
@@ -117,6 +121,7 @@ function receipt(envelope: WorkspaceCommandEnvelope, command: WorkspaceCommand, 
 
 function expectedReceipt(commandId: string, command: WorkspaceCommand) {
   switch (command.kind) {
+    case 'settings.update': return { commandId, kind: command.kind, objectId: 'workspace-settings' };
     case 'tasks.complete': case 'tasks.reopen': return { commandId, kind: command.kind, objectId: command.taskId };
     case 'chat.create': case 'notes.save': return { commandId, kind: command.kind };
     case 'notes.capture.adopt': return { commandId, kind: command.kind, objectId: command.captureId,

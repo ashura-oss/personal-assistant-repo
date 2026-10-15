@@ -57,8 +57,8 @@ function deferred<T>() {
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers(); });
 
 describe('same-origin web workspace command client', () => {
-  it('keeps the server projection map and browser history decoder on the same eleven public command kinds', () => {
-    expect(SERVER_HISTORY_KINDS).toEqual(['tasks.complete', 'tasks.reopen', 'chat.create', 'notes.save', 'notes.capture.adopt',
+  it('keeps the server projection map and browser history decoder on the same twelve public command kinds', () => {
+    expect(SERVER_HISTORY_KINDS).toEqual(['tasks.complete', 'tasks.reopen', 'chat.create', 'settings.update', 'notes.save', 'notes.capture.adopt',
       'notes.updateTranscript', 'assistant.batch.submitNote', 'assistant.batch.check', 'chat.submit', 'chat.refine', 'notes.transcribe']);
     expect(CLIENT_HISTORY_KINDS).toEqual(SERVER_HISTORY_KINDS);
     for (const kind of SERVER_HISTORY_KINDS) {
@@ -354,6 +354,28 @@ describe('same-origin web workspace command client', () => {
     expect(localStorage.removeItem).not.toHaveBeenCalled();
     client.dispose();
     expect(client.getPendingCommand()).toBeUndefined();
+  });
+
+  it('binds settings.update to the fixed receipt object and never resubmits after an unknown acknowledgement', async () => {
+    const dto = snapshot(1);
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(body(dto))
+      .mockRejectedValueOnce(new Error('connection lost after POST'))
+      .mockResolvedValueOnce(body({ schemaVersion: 1, commandId, status: 'finished', receipt: {
+        schemaVersion: 1, commandId, kind: 'settings.update', objectId: 'other-settings-object',
+      } }));
+    const client = createWebWorkspaceClient(session, { assertCurrent() {}, decodeSnapshot: () => dto,
+      fetcher: fetcher as never, makeCommandId: () => commandId });
+    await client.getSnapshot();
+    await expect(client.execute({ kind: 'settings.update', patch: { timezone: 'Asia/Singapore' } }))
+      .rejects.toBeInstanceOf(WorkspaceCommandUnknownError);
+    expect(client.getPendingCommand()?.commandId).toBe(commandId);
+    await expect(client.inspectCommand()).rejects.toMatchObject({ kind: 'malformed' });
+    expect(client.getPendingCommand()?.commandId).toBe(commandId);
+    expect(fetcher).toHaveBeenCalledTimes(3);
+    expect(fetcher.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1);
+    expect(fetcher.mock.calls[1]?.[1]).toMatchObject({ method: 'POST', credentials: 'same-origin' });
+    client.dispose();
   });
 
   it('keeps a command unresolved after a late authorization error and binds receipt ids without a held envelope', async () => {

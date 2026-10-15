@@ -2,7 +2,7 @@
 export const WORKSPACE_COMMAND_HISTORY_PAGE_SIZE = 50;
 
 export const WORKSPACE_COMMAND_HISTORY_KINDS = Object.freeze([
-  'tasks.complete', 'tasks.reopen', 'chat.create', 'notes.save', 'notes.capture.adopt',
+  'tasks.complete', 'tasks.reopen', 'chat.create', 'settings.update', 'notes.save', 'notes.capture.adopt',
   'notes.updateTranscript', 'assistant.batch.submitNote', 'assistant.batch.check', 'chat.submit', 'chat.refine',
   'notes.transcribe',
 ] as const);
@@ -26,7 +26,7 @@ export interface WorkspaceCommandHistoryPage {
 
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const JOURNAL_TO_PUBLIC: Readonly<Record<string, WorkspaceCommandHistoryKind>> = Object.freeze({
-  'tasks.complete': 'tasks.complete', 'tasks.reopen': 'tasks.reopen', 'chat.create': 'chat.create', 'notes.save': 'notes.save',
+  'tasks.complete': 'tasks.complete', 'tasks.reopen': 'tasks.reopen', 'chat.create': 'chat.create', 'settings.update': 'settings.update', 'notes.save': 'notes.save',
   'notes.capture.adopt': 'notes.capture.adopt', 'notes.updatetranscript': 'notes.updateTranscript',
   'assistant.batch.submitnote': 'assistant.batch.submitNote', 'assistant.batch.check': 'assistant.batch.check',
   'chat.submit': 'chat.submit', 'chat.refine': 'chat.refine',

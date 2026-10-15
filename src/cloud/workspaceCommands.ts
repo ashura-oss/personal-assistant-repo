@@ -1,5 +1,6 @@
 import type { AssistIntent } from '../core';
 import type { WorkspaceSnapshotDTO } from './workspaceDto';
+import { validateAzureEndpoint } from '../services/controllerRuntimeContracts';
 
 export const WORKSPACE_COMMAND_SCHEMA_VERSION = 1 as const;
 export const WORKSPACE_COMMAND_MAX_BYTES = 16 * 1024;
@@ -8,6 +9,7 @@ const MAX_ID_BYTES = 1024;
 const MAX_NESTING_DEPTH = 32;
 
 export type WorkspaceCommand =
+  | { readonly kind: 'settings.update'; readonly patch: WorkspaceSettingsPatch }
   | { readonly kind: 'tasks.complete'; readonly taskId: string }
   | { readonly kind: 'tasks.reopen'; readonly taskId: string }
   | { readonly kind: 'chat.create'; readonly title?: string }
@@ -21,6 +23,18 @@ export type WorkspaceCommand =
   | { readonly kind: 'chat.refine'; readonly conversationId: string; readonly parentTurnId: string; readonly effort: 'medium' | 'high' | 'max' };
 
 export type PublicKnowledgeSelection = readonly Readonly<{ kind: 'person' | 'project'; id: string }>[];
+
+/** Deliberately narrow public settings surface; provider credentials and request policy stay private. */
+export type WorkspaceSettingsPatch = Readonly<{
+  mode?: 'preview' | 'provider';
+  speechEnabled?: boolean;
+  speechProvider?: 'azure' | 'openrouter';
+  speechEndpoint?: string;
+  openRouterReasoningEffort?: 'none' | 'low';
+  maxAudioSeconds?: number;
+  audioRetention?: 'keep' | 'delete_after_transcription';
+  timezone?: string;
+}>;
 
 export interface WorkspaceCommandEnvelope {
   readonly schemaVersion: typeof WORKSPACE_COMMAND_SCHEMA_VERSION;
@@ -41,6 +55,7 @@ export type WorkspaceCommandReceipt =
   | WorkspaceCommandReceiptBase<'tasks.complete'>
   | WorkspaceCommandReceiptBase<'tasks.reopen'>
   | WorkspaceCommandReceiptBase<'chat.create'>
+  | WorkspaceCommandReceiptBase<'settings.update'>
   | WorkspaceCommandReceiptBase<'notes.save'>
   | (WorkspaceCommandReceiptBase<'notes.capture.adopt'> & Readonly<{ captureId: string; captureRevision: string }>)
   | WorkspaceCommandReceiptBase<'notes.updateTranscript'>
@@ -62,6 +77,7 @@ export interface WorkspaceCommandResponse {
 
 const ENVELOPE_KEYS = ['command', 'commandId', 'expectedPrivacyEpoch', 'expectedRevision', 'schemaVersion'];
 const COMMAND_KEYS: Record<WorkspaceCommand['kind'], readonly string[]> = {
+  'settings.update': ['kind', 'patch'],
   'tasks.complete': ['kind', 'taskId'], 'tasks.reopen': ['kind', 'taskId'], 'chat.create': ['kind', 'title'],
   'notes.save': ['kind', 'transcript'], 'notes.updateTranscript': ['kind', 'noteId', 'text', 'expectedNoteRevision'],
   'notes.capture.adopt': ['kind', 'captureId', 'captureRevision'],
@@ -205,8 +221,51 @@ function parseKnowledgeSelection(value: unknown): PublicKnowledgeSelection {
   return Object.freeze(result);
 }
 
+const SETTINGS_PATCH_KEYS = ['mode', 'speechEnabled', 'speechProvider', 'speechEndpoint', 'openRouterReasoningEffort', 'maxAudioSeconds', 'audioRetention', 'timezone'] as const;
+
+function validTimezone(value: string): boolean {
+  try { new Intl.DateTimeFormat('en', { timeZone: value }).format(0); return true; } catch { return false; }
+}
+
+function parseSettingsPatch(value: unknown): WorkspaceSettingsPatch {
+  if (!isRecord(value)) throw new Error('workspace_command_invalid');
+  const keys = Reflect.ownKeys(value);
+  if (keys.length === 0 || keys.some((key) => typeof key !== 'string' || !SETTINGS_PATCH_KEYS.includes(key as typeof SETTINGS_PATCH_KEYS[number]))) {
+    throw new Error('workspace_command_invalid');
+  }
+  assertPlainDataProperties(value);
+  const patch: Record<string, unknown> = {};
+  for (const key of SETTINGS_PATCH_KEYS) {
+    if (!Object.hasOwn(value, key)) continue;
+    const candidate = value[key];
+    switch (key) {
+      case 'mode': if (candidate !== 'preview' && candidate !== 'provider') throw new Error('workspace_command_invalid'); break;
+      case 'speechEnabled': if (typeof candidate !== 'boolean') throw new Error('workspace_command_invalid'); break;
+      case 'speechProvider': if (candidate !== 'azure' && candidate !== 'openrouter') throw new Error('workspace_command_invalid'); break;
+      case 'speechEndpoint':
+        if (typeof candidate !== 'string' || candidate.length > 2048 || CONTROL.test(candidate)) throw new Error('workspace_command_invalid');
+        if (candidate.length === 0) patch[key] = '';
+        else {
+          try { patch[key] = validateAzureEndpoint(candidate, 'speech'); }
+          catch { throw new Error('workspace_command_invalid'); }
+        }
+        continue;
+      case 'openRouterReasoningEffort': if (candidate !== 'none' && candidate !== 'low') throw new Error('workspace_command_invalid'); break;
+      case 'maxAudioSeconds': if (!Number.isSafeInteger(candidate) || (candidate as number) < 10 || (candidate as number) > 600) throw new Error('workspace_command_invalid'); break;
+      case 'audioRetention': if (candidate !== 'keep' && candidate !== 'delete_after_transcription') throw new Error('workspace_command_invalid'); break;
+      case 'timezone': if (typeof candidate !== 'string' || candidate.length > 128 || !validTimezone(candidate)) throw new Error('workspace_command_invalid'); break;
+    }
+    patch[key] = candidate;
+  }
+  return Object.freeze(patch) as WorkspaceSettingsPatch;
+}
+
 function freezeCommand(raw: Record<string, unknown>): WorkspaceCommand {
   const kind = raw.kind;
+  if (kind === 'settings.update') {
+    assertExactKeys(raw, COMMAND_KEYS[kind], COMMAND_KEYS[kind]);
+    return Object.freeze({ kind, patch: parseSettingsPatch(raw.patch) });
+  }
   if (kind === 'tasks.complete' || kind === 'tasks.reopen') {
     assertExactKeys(raw, COMMAND_KEYS[kind], COMMAND_KEYS[kind]);
     if (!boundedString(raw.taskId, MAX_ID_BYTES, { identifier: true })) throw new Error('workspace_command_invalid');
@@ -327,6 +386,7 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
   const kind = value.kind;
   if (typeof kind !== 'string' || !COMMAND_KINDS.includes(kind as WorkspaceCommand['kind'])) throw new Error('workspace_command_receipt_invalid');
   const keysByKind: Record<WorkspaceCommand['kind'], readonly string[]> = {
+    'settings.update': ['commandId', 'kind', 'objectId', 'schemaVersion'],
     'tasks.complete': ['commandId', 'kind', 'objectId', 'schemaVersion'],
     'tasks.reopen': ['commandId', 'kind', 'objectId', 'schemaVersion'],
     'chat.create': ['commandId', 'kind', 'objectId', 'schemaVersion'],
@@ -344,6 +404,7 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
   const uuidId = (candidate: unknown): candidate is string => typeof candidate === 'string' && UUID_V4.test(candidate);
   if (value.schemaVersion !== WORKSPACE_COMMAND_SCHEMA_VERSION || typeof value.commandId !== 'string' || !UUID_V4.test(value.commandId) ||
       !textId(value.objectId) || ((kind === 'chat.create' || kind === 'assistant.batch.check' || kind === 'chat.submit' || kind === 'chat.refine') && !uuidId(value.objectId)) ||
+      (kind === 'settings.update' && value.objectId !== 'workspace-settings') ||
       (Object.hasOwn(value, 'jobId') && !uuidId(value.jobId)) ||
       (Object.hasOwn(value, 'turnId') && !uuidId(value.turnId)) ||
       (Object.hasOwn(value, 'parentTurnId') && !uuidId(value.parentTurnId)) ||
@@ -367,6 +428,7 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
   };
   switch (kind) {
     case 'tasks.complete': case 'tasks.reopen': case 'chat.create': case 'notes.save': case 'notes.updateTranscript':
+    case 'settings.update':
     case 'assistant.batch.check':
       return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId });
     case 'notes.transcribe':

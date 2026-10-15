@@ -184,6 +184,94 @@ test('shared command envelope enforces exact keys, UUIDs, revision fences, and p
   assert.throws(() => parseWorkspaceCommandEnvelope(envelope({ kind: 'notes.save', transcript: `${escapedBoundaryText}a` })), /workspace_command_invalid/);
 });
 
+test('settings.update parser exposes only a nonempty closed settings patch and normalizes speech endpoints', () => {
+  const parsed = parseWorkspaceCommandEnvelope(envelope({ kind: 'settings.update', patch: {
+    speechEndpoint: 'https://Speech.Example.cognitiveservices.azure.com/path', timezone: 'Asia/Singapore', maxAudioSeconds: 600,
+  } }));
+  assert.deepEqual(parsed.command.patch, { speechEndpoint: 'https://speech.example.cognitiveservices.azure.com', timezone: 'Asia/Singapore', maxAudioSeconds: 600 });
+  assert.deepEqual(parseWorkspaceCommandEnvelope(envelope({ kind: 'settings.update', patch: { speechEndpoint: '' } })).command.patch,
+    { speechEndpoint: '' }, 'an empty endpoint explicitly clears the configured value');
+  const invalidPatches = [
+    {}, { password: 'secret' }, { monthlyBudgetUsd: 0 }, { maxContextTokens: 1 }, { model: 'arbitrary' },
+    { llmProvider: 'azure' }, { llmRequestContractVersion: 1 }, { backgroundMailRefreshEnabled: true },
+    { mode: 'invalid' }, { speechEnabled: 1 }, { speechProvider: 'other' }, { speechEndpoint: 'http://x.cognitiveservices.azure.com' },
+    { speechEndpoint: 'https://user:pass@x.cognitiveservices.azure.com' }, { speechEndpoint: 'https://x.cognitiveservices.azure.com\n' },
+    { speechEndpoint: 'https://x.cognitiveservices.azure.com', extra: true }, { speechEndpoint: 'x'.repeat(2049) },
+    { openRouterReasoningEffort: 'high' }, { maxAudioSeconds: 9 }, { maxAudioSeconds: 601 }, { maxAudioSeconds: 10.5 },
+    { audioRetention: 'archive' }, { timezone: 'Mars/Olympus' },
+  ];
+  for (const patch of invalidPatches) assert.throws(() => parseWorkspaceCommandEnvelope(envelope({ kind: 'settings.update', patch })), /workspace_command_invalid/);
+  let getterRuns = 0;
+  const accessorPatch = {};
+  Object.defineProperty(accessorPatch, 'mode', { enumerable: true, get() { getterRuns += 1; return 'preview'; } });
+  assert.throws(() => parseWorkspaceCommandEnvelope(envelope({ kind: 'settings.update', patch: accessorPatch })), /workspace_command_invalid/);
+  assert.equal(getterRuns, 0, 'patch accessors are rejected without executing caller code');
+  const commandId = randomUUID();
+  const receipt = { schemaVersion: 1, commandId, kind: 'settings.update', objectId: 'workspace-settings' };
+  assert.deepEqual(parseWorkspaceCommandReceipt(receipt, { commandId, kind: 'settings.update', objectId: 'workspace-settings' }), receipt);
+  assert.throws(() => parseWorkspaceCommandReceipt({ ...receipt, objectId: 'settings' }), /workspace_command_receipt_invalid/);
+});
+
+test('settings.update is journaled once, forces the Batch profile, and preserves uncertain outcomes for inspection', async () => {
+  const f = fixture();
+  try {
+    const initial = await f.runtime.getSnapshot(f.admission);
+    const invalid = envelope({ kind: 'settings.update', patch: { monthlyBudgetUsd: 0 } }, initial.revision, initial.privacyEpoch);
+    await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission, invalid), /workspace_command_invalid/);
+    assert.equal(inspectWorkspaceCommand(f.runtime, f.admission, invalid.commandId).status, 'unverified',
+      'an unsafe field is rejected before journal admission');
+    const accessorPatch = {};
+    Object.defineProperty(accessorPatch, 'mode', { enumerable: true, get() { throw new Error('getter must not run'); } });
+    const accessor = envelope({ kind: 'settings.update', patch: accessorPatch }, initial.revision, initial.privacyEpoch);
+    await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission, accessor), /workspace_command_invalid/);
+    assert.equal(inspectWorkspaceCommand(f.runtime, f.admission, accessor.commandId).status, 'unverified');
+
+    const command = envelope({ kind: 'settings.update', patch: { mode: 'provider', timezone: 'Asia/Singapore',
+      speechProvider: 'openrouter', speechEndpoint: 'https://Speech.Example.cognitiveservices.azure.com/path', maxAudioSeconds: 90 } },
+      initial.revision, initial.privacyEpoch);
+    const first = await dispatchWorkspaceCommand(f.runtime, f.admission, command);
+    assert.deepEqual(first.receipt, { schemaVersion: 1, commandId: command.commandId, kind: 'settings.update', objectId: 'workspace-settings' });
+    assert.deepEqual(Object.keys(first.receipt).sort(), ['commandId', 'kind', 'objectId', 'schemaVersion']);
+    assert.equal(first.snapshot.state.settings.speechEndpoint, 'https://speech.example.cognitiveservices.azure.com');
+    assert.equal(first.snapshot.state.settings.llmProvider, 'openrouter');
+    assert.equal(first.snapshot.state.settings.openRouterModel, 'openai/gpt-6-luna:batch');
+    const revisionAfterFirst = first.snapshot.revision;
+    const activityAfterFirst = first.snapshot.state.activity.length;
+    const historyLength = f.runtime.listCommandHistory(f.admission).entries.length;
+    const duplicate = await dispatchWorkspaceCommand(f.runtime, f.admission, command);
+    assert.deepEqual(duplicate.receipt, first.receipt);
+    assert.equal(duplicate.snapshot.revision, revisionAfterFirst);
+    assert.equal(duplicate.snapshot.state.activity.length, activityAfterFirst);
+    assert.equal(f.runtime.listCommandHistory(f.admission).entries.length, historyLength, 'an exact duplicate does not add another journal row');
+    assert.throws(() => parseWorkspaceCommandReceipt(first.receipt, { commandId: command.commandId, kind: 'settings.update', objectId: 'wrong' }),
+      /workspace_command_receipt_invalid/);
+
+    const uncertain = envelope({ kind: 'settings.update', patch: { audioRetention: 'delete_after_transcription' } },
+      first.snapshot.revision, first.snapshot.privacyEpoch);
+    f.loseNextWorkspaceCommitAck();
+    await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission, uncertain));
+    assert.equal(inspectWorkspaceCommand(f.runtime, f.admission, uncertain.commandId).status, 'inspect_required');
+    assert.equal(Object.hasOwn(inspectWorkspaceCommand(f.runtime, f.admission, uncertain.commandId), 'receipt'), false);
+    assert.equal(f.runtime.listCommandHistory(f.admission).entries.find((entry) => entry.commandId === uncertain.commandId)?.status, 'inspect_required');
+    const afterUncertainRefresh = await f.runtime.refreshSnapshot(f.admission);
+    const revisionBeforeRetry = f.kernel.getOwnedIdentity(f.admissionSession).revision;
+    const uncertainRetry = await dispatchWorkspaceCommand(f.runtime, f.admission, uncertain);
+    assert.equal(uncertainRetry.status, 'inspect_required');
+    assert.equal(Object.hasOwn(uncertainRetry, 'receipt'), false);
+    assert.equal(uncertainRetry.snapshot, undefined);
+    assert.equal(f.kernel.getOwnedIdentity(f.admissionSession).revision, revisionBeforeRetry);
+    assert.ok(afterUncertainRefresh.revision >= revisionBeforeRetry);
+    assert.equal(afterUncertainRefresh.state.settings.audioRetention, 'delete_after_transcription');
+    assert.equal(f.runtime.listCommandHistory(f.admission).entries.find((entry) => entry.commandId === uncertain.commandId)?.status, 'inspect_required',
+      'retrying an uncertain command after refresh does not repeat the settings save');
+    const staleRevision = envelope({ kind: 'settings.update', patch: { mode: 'preview' } }, first.snapshot.revision - 1, first.snapshot.privacyEpoch);
+    await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission, staleRevision));
+    const current = await f.runtime.refreshSnapshot(f.admission);
+    const staleEpoch = envelope({ kind: 'settings.update', patch: { mode: 'preview' } }, current.revision, current.privacyEpoch + 1);
+    await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission, staleEpoch));
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
 test('transcription command and receipt bind a strict note revision and generated attempt', () => {
   const commandId = randomUUID();
   const noteId = 'note-owned-id';
@@ -199,6 +287,47 @@ test('transcription command and receipt bind a strict note revision and generate
   assert.throws(() => parseWorkspaceCommandReceipt({ ...receipt, attemptId: 'not-a-uuid' }), /workspace_command_receipt_invalid/);
   assert.throws(() => parseWorkspaceCommandReceipt(receipt, { commandId, kind: 'notes.transcribe', objectId: noteId, sourceRevision: 4 }),
     /workspace_command_receipt_invalid/);
+});
+
+test('settings.update is rejected while an owned transcription command holds the workspace command lane', async () => {
+  const started = deferred();
+  const release = deferred();
+  const speechClient = {
+    async transcribe(note, _settings, _signal, onAttempt, beforeDispatch, onPrepared, leaseId) {
+      const prepared = { leaseId, platform: 'web', format: 'wav', mimeType: 'audio/wav', byteLength: 5,
+        sha256: 'b'.repeat(64), durationSeconds: note.durationSeconds, upload: { blob: new Blob(['voice']), fileName: 'clip.wav' } };
+      await onPrepared(prepared);
+      await onAttempt(prepared);
+      beforeDispatch(prepared);
+      started.resolve();
+      await release.promise;
+      return { transcript: 'Done.', durationMilliseconds: 1000, durationSeconds: 1, billedEstimateSeconds: 1,
+        attempts: 1, cleanupPromise: Promise.resolve() };
+    },
+    async releaseUploadLease() {}, disposeMemory() {},
+  };
+  const f = fixture({ speechClient, speechEnabled: true, withSpeechCleanup: true });
+  try {
+    const initial = await f.runtime.getSnapshot(f.admission);
+    const seeded = await f.runtime.executeCommand({ ...f.admission, expectedRevision: initial.revision,
+      expectedPrivacyEpoch: initial.privacyEpoch, idempotencyKey: randomUUID(), kind: 'test.seed-audio-note',
+      canonicalBody: '{"fixture":"busy-settings"}' }, (controller) => controller.saveNote({ transcript: 'Audio note.',
+        audioUri: 'file:///private/busy-settings.wav', durationSeconds: 2 }), (note) => ({ objectId: note.id }));
+    const transcription = envelope({ kind: 'notes.transcribe', noteId: seeded.result.id, expectedNoteRevision: seeded.result.revision },
+      seeded.snapshot.revision, seeded.snapshot.privacyEpoch);
+    const pendingTranscription = dispatchWorkspaceCommand(f.runtime, f.admission, transcription);
+    await started.promise;
+    await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'settings.update', patch: { timezone: 'Asia/Singapore' } }, seeded.snapshot.revision, seeded.snapshot.privacyEpoch)));
+    release.resolve();
+    const finished = await pendingTranscription;
+    assert.equal(finished.status, 'finished');
+    assert.equal(f.runtime.listCommandHistory(f.admission).entries.some((entry) => entry.kind === 'settings.update'), false,
+      'the busy rejection happens before settings command admission');
+  } finally {
+    release.resolve();
+    await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
 });
 
 test('large escaped-Unicode note save dispatches through the actual controller once and returns a safe exact receipt', async () => {
@@ -507,6 +636,13 @@ test('a duplicate note Batch command returns its exact receipt without a second 
     assert.equal(first.receipt.objectId, noteId);
     assert.ok(first.receipt.jobId);
     assert.equal(providerSubmissions, 1);
+    const jobBeforeSettingsUpdate = structuredClone(first.snapshot.state.assistantBatchJobs.find((job) => job.id === first.receipt.jobId));
+    const settingsUpdate = await dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'settings.update', patch: { mode: 'preview', timezone: 'Asia/Singapore' } },
+        first.snapshot.revision, first.snapshot.privacyEpoch));
+    const jobAfterSettingsUpdate = settingsUpdate.snapshot.state.assistantBatchJobs.find((job) => job.id === first.receipt.jobId);
+    assert.deepEqual(jobAfterSettingsUpdate, jobBeforeSettingsUpdate, 'an explicit settings save leaves the queued Batch request and captured settings unchanged');
+    assert.equal(providerSubmissions, 1, 'settings updates do not resubmit or rewrite queued Batch work');
     const replay = await dispatchWorkspaceCommand(f.runtime, f.admission, command);
     assert.deepEqual(replay.receipt, first.receipt);
     assert.equal(providerSubmissions, 1, 'the exact journal duplicate returns its receipt without repeating the paid provider POST');

@@ -472,6 +472,8 @@ export function createWebWorkspaceClient(session: AuthenticatedSession, options:
 function expectedReceiptFor(envelope: WorkspaceCommandEnvelope) {
   const { command } = envelope;
   switch (command.kind) {
+    case 'settings.update':
+      return { commandId: envelope.commandId, kind: command.kind, objectId: 'workspace-settings' };
     case 'tasks.complete': case 'tasks.reopen':
       return { commandId: envelope.commandId, kind: command.kind, objectId: command.taskId };
     case 'chat.create': case 'notes.save':
