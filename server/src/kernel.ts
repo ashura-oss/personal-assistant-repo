@@ -1,8 +1,7 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { mkdirSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
 import Database from 'better-sqlite3';
 import { isValidAccountId } from './accountIds.js';
+import { acquireApplicationOwnership, assertApplicationOwnership, bindApplicationDatabaseIdentity, type ApplicationOwnershipHandle } from './applicationOwnership.js';
 
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SHA256 = /^[0-9a-f]{64}$/i;
@@ -17,6 +16,8 @@ export interface KernelOptions {
   readonly databasePath: string;
   readonly validateSnapshot: (snapshot: unknown) => void;
   readonly now?: () => number;
+  /** Trusted in-process composition only; persistent kernels otherwise acquire their own guard. */
+  readonly applicationOwnership?: ApplicationOwnershipHandle;
 }
 
 export interface WorkspaceSnapshot {
@@ -121,6 +122,24 @@ export class KernelError extends Error {
     super(message);
     this.name = 'KernelError';
   }
+}
+
+export class KernelStartupCleanupError extends Error {
+  readonly #retryClose: () => void;
+
+  constructor(retryClose: () => void) {
+    super('Kernel startup cleanup is incomplete.');
+    this.name = 'KernelStartupCleanupError';
+    this.#retryClose = retryClose;
+  }
+
+  retryClose(): void { this.#retryClose(); }
+}
+
+function closeAfterFailedKernelConstruction(database: Database.Database | undefined, ownership: ApplicationOwnershipHandle | undefined,
+  ownsOwnership: boolean): void {
+  if (database?.open) database.close();
+  if (ownsOwnership) ownership?.release();
 }
 
 function fail(code: string, message: string): never {
@@ -283,22 +302,54 @@ interface AttemptRow {
 export class DurableKernel {
   private readonly db: Database.Database;
   private readonly now: () => number;
+  private readonly applicationOwnership?: ApplicationOwnershipHandle;
+  private readonly ownsApplicationOwnership: boolean;
   private closed = false;
 
   constructor(private readonly options: KernelOptions) {
     if (typeof options.validateSnapshot !== 'function') throw new TypeError('A trusted snapshot validator is required.');
-    if (!options.databasePath || options.databasePath === ':memory:') {
-      if (options.databasePath !== ':memory:') throw new TypeError('A database path is required.');
-    } else mkdirSync(dirname(resolve(options.databasePath)), { recursive: true });
+    if (!options.databasePath) throw new TypeError('A database path is required.');
     this.now = options.now ?? Date.now;
-    this.db = new Database(options.databasePath);
-    this.db.pragma('foreign_keys = ON');
-    this.db.pragma('synchronous = FULL');
-    this.db.pragma('busy_timeout = 5000');
-    this.db.pragma('journal_mode = WAL');
+    if (options.databasePath === ':memory:') {
+      if (options.applicationOwnership) throw new TypeError('In-memory kernels cannot receive persistent ownership.');
+      this.ownsApplicationOwnership = false;
+      this.db = new Database(':memory:');
+      this.db.pragma('foreign_keys = ON');
+      this.db.pragma('synchronous = FULL');
+      this.db.pragma('busy_timeout = 5000');
+      this.db.pragma('journal_mode = WAL');
+    } else {
+      const ownership = options.applicationOwnership ?? acquireApplicationOwnership(options.databasePath);
+      this.ownsApplicationOwnership = options.applicationOwnership === undefined;
+      this.applicationOwnership = ownership;
+      let database: Database.Database | undefined;
+      try {
+        const canonicalDatabasePath = assertApplicationOwnership(ownership, options.databasePath);
+        database = new Database(canonicalDatabasePath);
+        this.db = database;
+        bindApplicationDatabaseIdentity(ownership);
+        this.db.pragma('foreign_keys = ON');
+        this.db.pragma('synchronous = FULL');
+        this.db.pragma('busy_timeout = 5000');
+        this.db.pragma('journal_mode = WAL');
+      } catch (error) {
+        try {
+          if (database?.open) closeAfterFailedKernelConstruction(database, ownership, this.ownsApplicationOwnership);
+          else if (this.ownsApplicationOwnership) ownership.release();
+        } catch {
+          const retryClose = () => closeAfterFailedKernelConstruction(database, ownership, this.ownsApplicationOwnership);
+          throw new KernelStartupCleanupError(retryClose);
+        }
+        throw error;
+      }
+    }
     try { this.migrate(); }
     catch (error) {
-      this.db.close();
+      try { closeAfterFailedKernelConstruction(this.db, this.applicationOwnership, this.ownsApplicationOwnership); }
+      catch {
+        const retryClose = () => closeAfterFailedKernelConstruction(this.db, this.applicationOwnership, this.ownsApplicationOwnership);
+        throw new KernelStartupCleanupError(retryClose);
+      }
       throw error;
     }
   }
@@ -400,6 +451,7 @@ export class DurableKernel {
 
   private assertOpen(): void {
     if (this.closed) fail('closed', 'The persistence kernel is closed.');
+    if (this.applicationOwnership) assertApplicationOwnership(this.applicationOwnership, this.options.databasePath);
   }
 
   private authenticate(sessionToken: unknown): { tokenHash: string; session: SessionRow; workspace: WorkspaceRow; now: number } {
@@ -436,6 +488,7 @@ export class DurableKernel {
 
   /** Trusted bootstrap entry point. Future HTTP handlers must supply the authenticated principal, not a client workspace id. */
   createWorkspace(ownerId: string, initialSnapshot: unknown, schemaVersion = 1): { workspaceId: string; revision: number; privacyEpoch: number } {
+    this.assertOpen();
     requireUuid(ownerId, 'Owner id');
     requireInteger(schemaVersion, 'Schema version', 1);
     const { text } = this.validateSnapshot(initialSnapshot);
@@ -448,6 +501,7 @@ export class DurableKernel {
 
   /** Trusted session-issuance entry point; workspace ownership is verified before a session is minted. */
   createSession(workspaceId: string, authenticatedOwnerId: string, expiresAt: number): string {
+    this.assertOpen();
     requireUuid(workspaceId, 'Workspace id');
     requireUuid(authenticatedOwnerId, 'Owner id');
     requireInteger(expiresAt, 'Session expiry', 1);
@@ -747,7 +801,8 @@ export class DurableKernel {
 
   close(): void {
     if (this.closed) return;
-    this.db.close();
+    if (this.db.open) this.db.close();
+    if (this.ownsApplicationOwnership) this.applicationOwnership?.release();
     this.closed = true;
   }
 }

@@ -1,4 +1,5 @@
 import { AuthError, type AuthService } from './auth.js';
+import { ServerFoundationStartupCleanupError } from './bootstrap.js';
 
 export interface LocalCliRuntime {
   readonly auth: AuthService;
@@ -55,6 +56,7 @@ export async function runLocalCli(argv: readonly string[], dependencies: LocalCl
     dependencies.writeOut('Owner password reset.\n');
     return 0;
   } catch (error) {
+    if (error instanceof ServerFoundationStartupCleanupError) throw error;
     dependencies.writeError(`${error instanceof AuthError ? error.code : 'operation_failed'}\n`);
     return 1;
   } finally {

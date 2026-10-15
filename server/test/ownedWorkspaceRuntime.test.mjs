@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { createDurableKernel } from '../dist/index.js';
+import { acquireApplicationOwnership } from '../dist/applicationOwnership.js';
 import { NodeSpeechCleanupAdapter, OwnedWorkspaceRuntime } from '../dist/ownedWorkspaceRuntime.node.mjs';
 import { withCommandTicket } from '../dist/workspaceRuntime.js';
 import { createNodeProviderResponseLifetimeOwner } from '../dist/providerResponseLifetime.node.mjs';
@@ -22,7 +23,8 @@ function fixture(options = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'still-owned-runtime-'));
   const databasePath = join(directory, 'workspace.sqlite');
   const validateSnapshot = (value) => assert.ok(value && typeof value === 'object' && !Array.isArray(value));
-  const kernel = createDurableKernel({ databasePath, validateSnapshot });
+  const applicationOwnership = acquireApplicationOwnership(databasePath);
+  const kernel = createDurableKernel({ databasePath, validateSnapshot, applicationOwnership });
   const ownerId = randomUUID();
   const initial = createInitialWorkspaceState(randomUUID);
   const workspace = kernel.createWorkspace(ownerId, initial);
@@ -75,8 +77,16 @@ function fixture(options = {}) {
   const runtime = new OwnedWorkspaceRuntime({ ...ports, ...(options.afterSpeechCleanupCommitForTesting
     ? { afterSpeechCleanupCommitForTesting: options.afterSpeechCleanupCommitForTesting } : {}) });
   const admission = { sessionToken: admissionSession, assertCurrent: () => kernel.getOwnedIdentity(admissionSession) };
-  return { directory, databasePath, validateSnapshot, kernel, ownerId, workspace, admissionSession,
+  return { directory, databasePath, applicationOwnership, validateSnapshot, kernel, ownerId, workspace, admissionSession,
     otherAdmissionSession, runtimeSession, runtime, admission, ports, disposedSpeech: () => disposedSpeech };
+}
+
+function removeFixture(f) {
+  try { f.kernel.close(); }
+  finally {
+    f.applicationOwnership.release();
+    rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
 }
 
 function speechPrepared(leaseId, durationSeconds = 1) {
@@ -123,7 +133,7 @@ test('knowledge source and suggestion reads return current projections without j
     assert.equal(await f.runtime.getSnapshot(f.admission), beforeSnapshot, 'named reads must not publish a snapshot');
     await assert.rejects(f.runtime.readKnowledgeSourceChoices(f.admission, { expectedRevision: identity.revision + 1,
       expectedPrivacyEpoch: identity.privacyEpoch }), /workspace_read_stale/);
-  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); removeFixture(f); }
 });
 
 test('actual Node controller and response owner register speech cleanup before dispatch and settle after parent receipt', async () => {
@@ -168,7 +178,7 @@ test('actual Node controller and response owner register speech cleanup before d
     const refreshed = await f.runtime.refreshSnapshot(f.admission);
     assert.equal(refreshed.state.transcription.attempts.at(-1).outcome, 'completed');
     assert.equal(refreshed.state.notes.find((item) => item.id === note.id).transcript, 'A real controller transcript.');
-  } finally { cleanup.resolve(); await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+  } finally { cleanup.resolve(); await f.runtime.closeAfterDrain(); f.kernel.close(); removeFixture(f); }
 });
 
 test('new privacy epoch waits for old raw and audio cleanup, then retires without settling through the revoked actor', async () => {
@@ -223,7 +233,7 @@ test('new privacy epoch waits for old raw and audio cleanup, then retires withou
     const child = f.kernel.withTrustedDatabaseTransaction((db) => db.prepare('SELECT status FROM speech_cleanup_children').get());
     assert.notEqual(child.status, 'released', 'old child evidence remains inspection-only after revocation');
     await f.runtime.closeAfterDrain();
-  } finally { cleanup.resolve(); await f.runtime.closeAfterDrain().catch(() => undefined); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+  } finally { cleanup.resolve(); await f.runtime.closeAfterDrain().catch(() => undefined); f.kernel.close(); removeFixture(f); }
 });
 
 test('registry epoch replacement cannot bypass a sticky raw response owner before disposing the old controller', async () => {
@@ -270,7 +280,7 @@ test('registry epoch replacement cannot bypass a sticky raw response owner befor
     assert.equal(f.ports.responseLifetimeOwner.getPending()[0].id, pending[0].id);
     await assert.rejects(f.runtime.retryProviderResponseCleanup(nextAdmission, pending[0].id), /synthetic raw response cancellation failure/);
     assert.equal(fetches, 1, 'raw cleanup retry never repeats the provider request');
-  } finally { f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+  } finally { f.kernel.close(); removeFixture(f); }
 });
 
 test('a failed old-epoch audio release needs an exact physical-only retry under the newer owner before retirement', async () => {
@@ -338,7 +348,7 @@ test('a failed old-epoch audio release needs an exact physical-only retry under 
     assert.equal(f.kernel.getOwnedSnapshot(nextRuntimeSession).snapshot.transcription.cleanupLeases.at(-1).outcome, 'pending_cleanup',
       'physical cleanup retirement does not write the old lease through the new actor');
     await f.runtime.closeAfterDrain();
-  } finally { cleanup.resolve(); await f.runtime.closeAfterDrain().catch(() => undefined); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+  } finally { cleanup.resolve(); await f.runtime.closeAfterDrain().catch(() => undefined); f.kernel.close(); removeFixture(f); }
 });
 
 test('runtime shutdown retains the controller and private actor while the actual response owner has sticky body cleanup', async () => {
@@ -391,7 +401,7 @@ test('runtime shutdown retains the controller and private actor while the actual
     assert.equal(bodyCancelCalls, 1, 'a repeated cancellation that lacks underlying acknowledgement cannot clear the sticky hold');
   } finally {
     f.kernel.close();
-    rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    removeFixture(f);
   }
 });
 
@@ -454,7 +464,7 @@ test('lost cleanup settlement acknowledgement holds shutdown until exact refresh
     assert.equal(f.disposedSpeech(), 1, 'disposal proceeds only after the exact transition is acknowledged');
   } finally {
     f.kernel.close();
-    rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    removeFixture(f);
   }
 });
 
@@ -496,7 +506,7 @@ test('a failed terminal transcription checkpoint still marks its exact cleanup c
     await f.kernel.withTrustedDatabaseTransaction((db) => db.exec('DROP TRIGGER reject_terminal_transcription'));
     await f.runtime.refreshSnapshot(f.admission);
     assert.equal(initial.privacyEpoch, 0);
-  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); removeFixture(f); }
 });
 
 test('Node gateway uses the real controller, caches only matching loaded revisions, and durable duplicate commands do not rerun', async () => {
@@ -529,10 +539,11 @@ test('Node gateway uses the real controller, caches only matching loaded revisio
     assert.equal(operations, 1);
     assert.equal(duplicate.snapshot.revision, initial.revision + 1);
 
-    const reopened = createDurableKernel({ databasePath: f.databasePath, validateSnapshot: f.validateSnapshot });
+    const reopened = createDurableKernel({ databasePath: f.databasePath, validateSnapshot: f.validateSnapshot,
+      applicationOwnership: f.applicationOwnership });
     try { assert.equal(reopened.getOwnedSnapshot(f.runtimeSession).snapshot.notes[0].transcript, 'durable through Node runtime'); }
     finally { reopened.close(); }
-  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); removeFixture(f); }
 });
 
 test('cache reads are suppressed across an owned save and stale loaded state cannot be stamped with a newer DB revision', async () => {
@@ -563,7 +574,7 @@ test('cache reads are suppressed across an owned save and stale loaded state can
       receipt: { kind: 'external.advance' },
     }));
     await assert.rejects(f.runtime.getSnapshot(f.admission), /workspace_refresh_required/);
-  } finally { gate.resolve(); await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+  } finally { gate.resolve(); await f.runtime.closeAfterDrain(); f.kernel.close(); removeFixture(f); }
 });
 
 test('lost checkpoint acknowledgement invalidates cache until explicit refresh and never reruns the command', async () => {
@@ -600,7 +611,7 @@ test('lost checkpoint acknowledgement invalidates cache until explicit refresh a
     assert.equal(afterRefreshReplay.admission.fresh, false);
     assert.equal(afterRefreshReplay.admission.status, 'inspect_required');
     assert.equal(executions, 1);
-  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); removeFixture(f); }
 });
 
 test('post-save caller verification failure keeps the snapshot unavailable until an explicit reload', async () => {
@@ -636,7 +647,7 @@ test('post-save caller verification failure keeps the snapshot unavailable until
     assert.equal(refreshed.revision, f.kernel.getOwnedIdentity(f.admissionSession).revision);
     assert.equal(refreshed.state.notes[0].transcript, 'committed before caller check');
     assert.equal(executions, 1, 'refresh reloads committed state but never repeats the owned command');
-  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); removeFixture(f); }
 });
 
 test('controller privacy verification after a committed save cannot publish old state under the new DB revision', async () => {
@@ -675,7 +686,7 @@ test('controller privacy verification after a committed save cannot publish old 
     assert.equal(refreshed.revision, f.kernel.getOwnedIdentity(f.admissionSession).revision);
     assert.equal(refreshed.state.notes.some((note) => note.transcript === 'DB committed before controller privacy check'), true);
     assert.equal(executions, 1, 'explicit reload restores state without repeating the command');
-  } finally { failPostSave = false; await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+  } finally { failPostSave = false; await f.runtime.closeAfterDrain(); f.kernel.close(); removeFixture(f); }
 });
 
 test('browser revocation blocks new admission while an already-owned command can settle, and shutdown drains it before disposal', async () => {
@@ -704,7 +715,7 @@ test('browser revocation blocks new admission while an already-owned command can
     assert.equal(executions, 1);
     assert.equal(f.disposedSpeech(), 1);
     assert.equal(f.kernel.getOwnedSnapshot(f.runtimeSession).snapshot.notes[0].transcript, 'owned work settled after caller revoke');
-  } finally { release.resolve(); await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+  } finally { release.resolve(); await f.runtime.closeAfterDrain(); f.kernel.close(); removeFixture(f); }
 });
 
 test('stopAdmission closes only new work while closeAfterDrain still waits for admitted work', async () => {
@@ -730,7 +741,7 @@ test('stopAdmission closes only new work while closeAfterDrain still waits for a
     await closing;
     assert.equal(result.snapshot.state.notes[0].transcript, 'already admitted work drains');
     assert.equal(f.disposedSpeech(), 1);
-  } finally { gate.resolve(); await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+  } finally { gate.resolve(); await f.runtime.closeAfterDrain(); f.kernel.close(); removeFixture(f); }
 });
 
 test('caller authorization is rechecked after async registry lookup and before trusted operation invocation', async () => {
@@ -759,7 +770,7 @@ test('caller authorization is rechecked after async registry lookup and before t
     callerCurrent = true;
     const refreshed = await f.runtime.refreshSnapshot(f.admission);
     assert.equal(refreshed.revision, f.kernel.getOwnedIdentity(f.admissionSession).revision);
-  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); removeFixture(f); }
 });
 
 test('failed controller cleanup remains fenced and can be retried explicitly', async () => {
@@ -777,7 +788,7 @@ test('failed controller cleanup remains fenced and can be retried explicitly', a
     assert.equal(f.disposedSpeech(), 2, 'a second explicit shutdown retries the exact failed disposal');
     await f.runtime.closeAfterDrain();
     assert.equal(f.disposedSpeech(), 2, 'successful disposal remains idempotent');
-  } finally { await f.runtime.closeAfterDrain().catch(() => undefined); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+  } finally { await f.runtime.closeAfterDrain().catch(() => undefined); f.kernel.close(); removeFixture(f); }
 });
 
 test('runtime port factory is shared within an epoch and replaces only the old epoch ports', async () => {
@@ -830,7 +841,7 @@ test('runtime port factory is shared within an epoch and replaces only the old e
     assert.equal(unattachedCleanups, 0);
     assert.equal(made[0].disposed, 1);
     assert.equal(made[1].disposed, 1, 'shutdown disposes the current epoch provider exactly once');
-  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); removeFixture(f); }
 });
 
 test('runtime rejects missing, mixed, and malformed per-epoch port configuration before controller construction', async () => {
@@ -858,7 +869,7 @@ test('runtime rejects missing, mixed, and malformed per-epoch port configuration
     assert.equal(missingDisposerCalls, 1, 'returned resources without cleanup stay fenced instead of being forgotten');
     await assert.rejects(missingDisposer.retryFailedWorkspaceDisposal(f.admission, 0), /cleanup_unavailable/);
     await missingDisposer.closeAfterDrain().catch(() => undefined);
-  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); removeFixture(f); }
 });
 
 test('a controller whose attachment hook fails is retained through exact controller teardown', async () => {
@@ -877,7 +888,7 @@ test('a controller whose attachment hook fails is retained through exact control
     assert.equal(unattachedCleanupCalls, 0, 'factory-only cleanup is not run after controller ownership transferred');
     await runtime.closeAfterDrain();
     assert.equal(f.disposedSpeech(), 1, 'failed construction cleanup does not leave a controller for later duplicate disposal');
-  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); removeFixture(f); }
 });
 
 test('failed unattached-port cleanup fences epoch replacement until the caller explicitly retries the exact held epoch', async () => {
@@ -939,5 +950,5 @@ test('failed unattached-port cleanup fences epoch replacement until the caller e
     assert.equal(recovered.privacyEpoch, 1);
     assert.equal(factoryCalls, 2, 'replacement construction happens only after explicit cleanup and refresh');
     await runtime.closeAfterDrain();
-  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); removeFixture(f); }
 });

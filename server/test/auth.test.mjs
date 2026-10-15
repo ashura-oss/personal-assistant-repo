@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import Database from 'better-sqlite3';
 import { AuthError, AuthService, createDurableKernel, SecretVault } from '../dist/index.js';
+import { acquireApplicationOwnership } from '../dist/applicationOwnership.js';
 
 const authSecret = Buffer.from(Array.from({ length: 32 }, (_, index) => 255 - index));
 const vaultKey = Buffer.from(Array.from({ length: 32 }, (_, index) => index + 11));
@@ -21,16 +22,18 @@ function setup(options = {}) {
     if (rejectSnapshot) throw new Error('snapshot parser should not be called');
     assert.ok(snapshot && typeof snapshot === 'object' && !Array.isArray(snapshot));
   };
-  const kernel = createDurableKernel({ databasePath, validateSnapshot, now });
+  const applicationOwnership = acquireApplicationOwnership(databasePath);
+  const kernel = createDurableKernel({ databasePath, validateSnapshot, now, applicationOwnership });
   const auth = new AuthService(kernel, { canonicalOrigin: origin, authSecret, now, ...options });
   return { directory, databasePath, now, advance: (ms) => { time += ms; }, setTime: (value) => { time = value; },
     rejectSnapshotParsing: () => { rejectSnapshot = true; },
-    validateSnapshot, kernel, auth };
+    validateSnapshot, applicationOwnership, kernel, auth };
 }
 
 function cleanup(f, ...kernels) {
   f.auth?.close(); f.kernel?.close();
   for (const kernel of kernels) kernel?.close();
+  f.applicationOwnership.release();
   try { rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
   catch (error) { if (!['EPERM', 'EBUSY'].includes(error?.code)) throw error; }
 }
@@ -126,7 +129,8 @@ test('login challenges are exact-origin, CSRF-bound, expiring, one-use, and surv
 
     const replayChallenge = challenge(f);
     f.auth.close(); f.kernel.close();
-    reopenedKernel = createDurableKernel({ databasePath: f.databasePath, validateSnapshot: f.validateSnapshot, now: f.now });
+    reopenedKernel = createDurableKernel({ databasePath: f.databasePath, validateSnapshot: f.validateSnapshot, now: f.now,
+      applicationOwnership: f.applicationOwnership });
     reopenedAuth = new AuthService(reopenedKernel, { canonicalOrigin: origin, authSecret, now: f.now });
     assert.equal(reopenedAuth.getSession(loggedIn.sessionToken).authenticated, true);
     const afterRestart = await reopenedAuth.login(credentials(replayChallenge));
@@ -238,7 +242,8 @@ test('durable failure throttle counts five bad passwords, cools down for 60 seco
         (error) => error instanceof AuthError && error.code === 'unauthenticated');
     }
     f.auth.close(); f.kernel.close();
-    f.kernel = createDurableKernel({ databasePath: f.databasePath, validateSnapshot: f.validateSnapshot, now: f.now });
+    f.kernel = createDurableKernel({ databasePath: f.databasePath, validateSnapshot: f.validateSnapshot, now: f.now,
+      applicationOwnership: f.applicationOwnership });
     f.auth = new AuthService(f.kernel, { canonicalOrigin: origin, authSecret, now: f.now });
     const blockedChallenge = challenge(f);
     await assert.rejects(f.auth.login(credentials(blockedChallenge)),
@@ -300,7 +305,8 @@ test('password reset racing an in-flight login advances auth generation and prev
     beforeResetVault = new SecretVault(f.kernel, vaultKey);
     f.kernel.withOwnedTransaction(oldSession.sessionToken, 0, (context) =>
       beforeResetVault.setSecretWithinTransaction(context, { type: 'workspace' }, 'openrouter', 0, 'must-survive-password-reset'));
-    secondKernel = createDurableKernel({ databasePath: f.databasePath, validateSnapshot: f.validateSnapshot, now: f.now });
+    secondKernel = createDurableKernel({ databasePath: f.databasePath, validateSnapshot: f.validateSnapshot, now: f.now,
+      applicationOwnership: f.applicationOwnership });
     resetService = new AuthService(secondKernel, { canonicalOrigin: origin, authSecret, now: f.now });
     gateEnabled = true;
     const staleLogin = f.auth.login(credentials(challenge(f)));
@@ -359,7 +365,8 @@ test('closing during login hashing releases only its reservation and issues no s
     db.close();
     await assertAuthServiceClosed(f.auth);
 
-    reopenedKernel = createDurableKernel({ databasePath: f.databasePath, validateSnapshot: f.validateSnapshot, now: f.now });
+    reopenedKernel = createDurableKernel({ databasePath: f.databasePath, validateSnapshot: f.validateSnapshot, now: f.now,
+      applicationOwnership: f.applicationOwnership });
     reopenedAuth = new AuthService(reopenedKernel, { canonicalOrigin: origin, authSecret, now: f.now });
     const successful = await reopenedAuth.login(credentials(reopenedAuth.createLoginChallenge(origin)));
     assert.equal(reopenedAuth.getSession(successful.sessionToken).authenticated, true,
@@ -387,7 +394,8 @@ test('closing during password-reset hashing leaves the existing password and ses
     await assert.rejects(pending, (error) => error instanceof AuthError && error.code === 'auth_closed');
     await assertAuthServiceClosed(f.auth);
 
-    reopenedKernel = createDurableKernel({ databasePath: f.databasePath, validateSnapshot: f.validateSnapshot, now: f.now });
+    reopenedKernel = createDurableKernel({ databasePath: f.databasePath, validateSnapshot: f.validateSnapshot, now: f.now,
+      applicationOwnership: f.applicationOwnership });
     reopenedAuth = new AuthService(reopenedKernel, { canonicalOrigin: origin, authSecret, now: f.now });
     assert.equal(reopenedAuth.getSession(browser.sessionToken).authenticated, true,
       'an uncommitted reset does not revoke the existing browser session');

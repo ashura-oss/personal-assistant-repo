@@ -5,12 +5,15 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { createDurableKernel } from '../dist/index.js';
+import { acquireApplicationOwnership } from '../dist/applicationOwnership.js';
 import { AppControllerImpl } from '../dist/sharedControllerNode.mjs';
 import { CommandJournal, WorkspaceRegistry } from '../dist/workspaceRuntime.js';
 
 function fixture() {
   const directory = mkdtempSync(join(tmpdir(), 'still-workspace-registry-'));
-  const kernel = createDurableKernel({ databasePath: join(directory, 'workspace.sqlite'),
+  const databasePath = join(directory, 'workspace.sqlite');
+  const applicationOwnership = acquireApplicationOwnership(databasePath);
+  const kernel = createDurableKernel({ databasePath, applicationOwnership,
     validateSnapshot: (value) => assert.ok(value && typeof value === 'object' && !Array.isArray(value)) });
   const ownerId = randomUUID();
   const workspace = kernel.createWorkspace(ownerId, { notes: [], proposals: [], tasks: [], accounts: [], calendars: [], documents: [], activity: [] });
@@ -19,7 +22,15 @@ function fixture() {
   const admissionB = kernel.createSession(workspace.workspaceId, ownerId, expiry);
   const runtimeSession = kernel.createSession(workspace.workspaceId, ownerId, expiry);
   const journal = new CommandJournal(kernel);
-  return { directory, kernel, ownerId, workspace, admissionA, admissionB, runtimeSession, journal };
+  return { directory, databasePath, applicationOwnership, kernel, ownerId, workspace, admissionA, admissionB, runtimeSession, journal };
+}
+
+function removeFixture(f) {
+  try { f.kernel.close(); }
+  finally {
+    f.applicationOwnership.release();
+    rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
 }
 
 function createController({ store }) {
@@ -82,13 +93,14 @@ test('registry loads one real shared controller and durable note commands never 
     assert.equal(constructions, 1);
     assert.equal(loads, 1);
 
-    const reopened = createDurableKernel({ databasePath: join(f.directory, 'workspace.sqlite'),
+    const reopened = createDurableKernel({ databasePath: f.databasePath,
+      applicationOwnership: f.applicationOwnership,
       validateSnapshot: (value) => assert.ok(value && typeof value === 'object' && !Array.isArray(value)) });
     assert.equal(reopened.getOwnedSnapshot(f.runtimeSession).snapshot.notes[0].transcript, 'durable server note');
     reopened.close();
   } finally {
     f.kernel.close();
-    rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    removeFixture(f);
   }
 });
 
@@ -112,7 +124,7 @@ test('concurrent first lookups reserve one entry before invoking the controller 
     const [left, right] = await Promise.all([first, second]);
     assert.equal(left.controller, right.controller);
     assert.equal(factories, 1);
-  } finally { f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+  } finally { f.kernel.close(); removeFixture(f); }
 });
 
 test('a constructed controller is disposed after load failure and cleanup failure stays fenced for explicit retry', async () => {
@@ -150,7 +162,7 @@ test('a constructed controller is disposed after load failure and cleanup failur
     assert.equal(constructions, 2);
     assert.equal(loads, 2);
     assert.ok(replacement.controller);
-  } finally { f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+  } finally { f.kernel.close(); removeFixture(f); }
 });
 
 function deferred() {
@@ -204,7 +216,7 @@ test('concurrent new-epoch lookups share the exact old-entry disposal and one re
     assert.equal(lifecycle.factories(), 2);
     assert.equal(lifecycle.loads(), 2);
     assert.equal(registry.getRuntimeCount(), 1);
-  } finally { f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+  } finally { f.kernel.close(); removeFixture(f); }
 });
 
 test('command admission waits for an owned disposal to finish before creating a replacement runtime', async () => {
@@ -236,7 +248,7 @@ test('command admission waits for an owned disposal to finish before creating a 
     assert.equal(commandRuns, 1);
     assert.equal(lifecycle.factories(), 2);
     assert.equal(lifecycle.loads(), 2);
-  } finally { f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+  } finally { f.kernel.close(); removeFixture(f); }
 });
 
 test('disposeAll waits for every entry, keeps failed entries fenced, and retries only failed cleanup explicitly', async () => {
@@ -282,5 +294,5 @@ test('disposeAll waits for every entry, keeps failed entries fenced, and retries
     assert.equal(secondDisposeAttempts, 1, 'successfully disposed entries are not disposed twice');
     await registry.disposeAll();
     assert.equal(firstDisposeAttempts, 2, 'successful explicit retry is idempotent');
-  } finally { delayed.resolve(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+  } finally { delayed.resolve(); f.kernel.close(); removeFixture(f); }
 });

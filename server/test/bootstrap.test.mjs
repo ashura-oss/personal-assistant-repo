@@ -181,14 +181,16 @@ test('HTTP close promise settles when foundation cleanup throws', async () => {
   let closed = 0;
   const started = await startStillHttp(config, { auth: {}, credentialCommands: {}, close() {
     closed += 1;
-    throw new Error('foundation-close-sentinel');
+    if (closed === 1) throw new Error('foundation-close-sentinel');
   } }, port);
   try {
     await assert.rejects(started.close(), /foundation-close-sentinel/);
     assert.equal(started.server.listening, false);
     assert.equal(closed, 1);
-    await assert.rejects(started.close(), /foundation-close-sentinel/);
-    assert.equal(closed, 1);
+    await started.close();
+    assert.equal(closed, 2);
+    await started.close();
+    assert.equal(closed, 2);
   } finally {
     rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }

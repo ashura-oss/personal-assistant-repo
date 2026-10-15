@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import Database from 'better-sqlite3';
 import { createDurableKernel, KernelError } from '../dist/index.js';
+import { acquireApplicationOwnership } from '../dist/applicationOwnership.js';
 
 const hash = (text) => sha256('sha256').update(text).digest('hex');
 
@@ -20,11 +21,12 @@ function setup() {
     assert.ok(snapshot && typeof snapshot === 'object' && !Array.isArray(snapshot));
     assert.ok(Number.isSafeInteger(snapshot.count));
   };
-  const kernel = createDurableKernel({ databasePath, validateSnapshot, now });
+  const applicationOwnership = acquireApplicationOwnership(databasePath);
+  const kernel = createDurableKernel({ databasePath, validateSnapshot, now, applicationOwnership });
   const workspace = kernel.createWorkspace(ownerId, { count: 0, label: 'private' });
   const session = kernel.createSession(workspace.workspaceId, ownerId, now() + 600_000);
   return { directory, databasePath, now, advance: (milliseconds) => { time += milliseconds; }, ownerId, accountId,
-    validateSnapshot, kernel, workspace, session };
+    validateSnapshot, applicationOwnership, kernel, workspace, session };
 }
 
 function command(kernel, session, snapshot, { key = randomUUID(), expectedRevision = snapshot.revision,
@@ -36,13 +38,15 @@ function command(kernel, session, snapshot, { key = randomUUID(), expectedRevisi
 
 function closeAndRemove(fixture, ...kernels) {
   for (const kernel of kernels) kernel.close();
+  fixture.applicationOwnership.release();
   try { rmSync(fixture.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
   catch (error) { if (!['EPERM', 'EBUSY'].includes(error?.code)) throw error; }
 }
 
 test('separate SQLite handles racing the same revision allow one commit and roll back a failed mutator', async () => {
   const f = setup();
-  const second = createDurableKernel({ databasePath: f.databasePath, validateSnapshot: f.validateSnapshot, now: f.now });
+  const second = createDurableKernel({ databasePath: f.databasePath, validateSnapshot: f.validateSnapshot, now: f.now,
+    applicationOwnership: f.applicationOwnership });
   try {
     const snapshotA = f.kernel.getOwnedSnapshot(f.session);
     const snapshotB = second.getOwnedSnapshot(f.session);
@@ -94,7 +98,8 @@ test('same idempotency key replays the saved receipt after restart before checki
     const key = randomUUID();
     const committed = command(f.kernel, f.session, before, { key });
     f.kernel.close();
-    reopened = createDurableKernel({ databasePath: f.databasePath, validateSnapshot: f.validateSnapshot, now: f.now });
+    reopened = createDurableKernel({ databasePath: f.databasePath, validateSnapshot: f.validateSnapshot, now: f.now,
+      applicationOwnership: f.applicationOwnership });
     const replay = command(reopened, f.session, { ...before, revision: 0 }, { key });
     assert.deepEqual(replay, { ...committed, replayed: true });
     assert.throws(() => command(reopened, f.session, before, { key, request: { add: 2 } }),
@@ -113,7 +118,8 @@ test('one-use plans survive restart, bind server account generation and source h
     const plan = f.kernel.createOneUsePlan(f.session, { expectedRevision: current.revision, expectedPrivacyEpoch: current.privacyEpoch,
       accountId: f.accountId, sourceHash });
     f.kernel.close();
-    reopened = createDurableKernel({ databasePath: f.databasePath, validateSnapshot: f.validateSnapshot, now: f.now });
+    reopened = createDurableKernel({ databasePath: f.databasePath, validateSnapshot: f.validateSnapshot, now: f.now,
+      applicationOwnership: f.applicationOwnership });
     assert.equal(reopened.consumeOneUsePlan(f.session, plan.planId, sourceHash).planId, plan.planId);
     assert.throws(() => reopened.consumeOneUsePlan(f.session, plan.planId, sourceHash),
       (error) => error instanceof KernelError && error.code === 'plan_consumed');
@@ -175,7 +181,8 @@ test('external attempts are claimed once, remain pending after restart, and sett
     assert.equal(claimed.status, 'pending');
     assert.equal(claimed.permission, 'perform_once');
     f.kernel.close();
-    reopened = createDurableKernel({ databasePath: f.databasePath, validateSnapshot: f.validateSnapshot, now: f.now });
+    reopened = createDurableKernel({ databasePath: f.databasePath, validateSnapshot: f.validateSnapshot, now: f.now,
+      applicationOwnership: f.applicationOwnership });
     const duplicate = reopened.claimExternalAttempt(f.session, input);
     assert.equal(duplicate.status, 'pending');
     assert.equal(duplicate.replayed, true);
@@ -218,12 +225,14 @@ test('newer schemas and corrupt database files fail closed rather than being rew
     inspect.pragma('user_version = 999');
     inspect.close();
     f.kernel.close();
-    assert.throws(() => createDurableKernel({ databasePath: f.databasePath, validateSnapshot: f.validateSnapshot, now: f.now }),
+    assert.throws(() => createDurableKernel({ databasePath: f.databasePath, validateSnapshot: f.validateSnapshot, now: f.now,
+      applicationOwnership: f.applicationOwnership }),
       (error) => error instanceof KernelError && error.code === 'newer_schema');
     const brokenPath = join(f.directory, 'broken.sqlite');
     writeFileSync(brokenPath, 'not a SQLite database');
     assert.throws(() => createDurableKernel({ databasePath: brokenPath, validateSnapshot: f.validateSnapshot, now: f.now }));
   } finally {
+    f.applicationOwnership.release();
     try { rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
     catch (error) { if (!['EPERM', 'EBUSY'].includes(error?.code)) throw error; }
   }

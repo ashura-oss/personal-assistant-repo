@@ -3,9 +3,11 @@ import { AuthService } from './auth.js';
 import { ServerCredentialCommandService } from './credentialCommands.js';
 import { deriveAuthSecret, ensurePrivateDirectory, loadOrCreateVaultRootKey, type ServerConfig } from './config.js';
 import { createStillHttpServer } from './http.js';
-import { createDurableKernel, type DurableKernel } from './kernel.js';
+import { createDurableKernel, KernelStartupCleanupError, type DurableKernel } from './kernel.js';
 import { SecretVault } from './vault.js';
 import { createInitialWorkspaceState } from './sharedControllerNode.mjs';
+import { acquireApplicationOwnership, ApplicationOwnershipStartupCleanupError, type ApplicationOwnershipHandle } from './applicationOwnership.js';
+import { drainAcceptedHttpRequests } from './httpRequestDrain.js';
 
 export interface ServerFoundationOptions {
   readonly validateSnapshot?: (snapshot: unknown) => void;
@@ -31,6 +33,18 @@ export interface OpenedServerFoundation {
   readonly privateContext: PrivateServerFoundationContext;
 }
 
+export class ServerFoundationStartupCleanupError extends Error {
+  readonly #retryClose: () => void;
+
+  constructor(retryClose: () => void) {
+    super('Server foundation startup cleanup is incomplete.');
+    this.name = 'ServerFoundationStartupCleanupError';
+    this.#retryClose = retryClose;
+  }
+
+  retryClose(): void { this.#retryClose(); }
+}
+
 /** The physical kernel boundary: only JSON-compatible plain objects are workspace roots. */
 export function validatePhysicalWorkspaceSnapshot(snapshot: unknown): void {
   if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) throw new TypeError('invalid_snapshot_root');
@@ -52,24 +66,36 @@ function createBundledInitialWorkspaceSnapshot(): unknown {
 /** Composes the durable server services without opening a listener or running background work. */
 export function openServerFoundationInternal(config: ServerConfig, options: ServerFoundationOptions = {}): OpenedServerFoundation {
   ensurePrivateDirectory(config.dataDirectory);
+  let applicationOwnership: ApplicationOwnershipHandle | undefined;
   let rootKey: Buffer | undefined;
   let authSecret: Buffer | undefined;
   let kernel: DurableKernel | undefined;
   let vault: SecretVault | undefined;
   let auth: AuthService | undefined;
   let credentialCommands: ServerCredentialCommandService | undefined;
+  let kernelStartupCleanupRetry: (() => void) | undefined;
+  let kernelStartupCleanupComplete = false;
+  let authClosed = false;
+  let vaultClosed = false;
+  let kernelClosed = false;
+  let ownershipReleased = false;
   const closeConstructed = () => {
-    let firstFailure: unknown;
-    for (const close of [() => auth?.close(), () => vault?.close(), () => kernel?.close()]) {
-      try { close(); } catch (error) { firstFailure ??= error; }
+    if (auth && !authClosed) { auth.close(); authClosed = true; }
+    if (vault && !vaultClosed) { vault.close(); vaultClosed = true; }
+    if (kernel && !kernelClosed) { kernel.close(); kernelClosed = true; }
+    if (kernelStartupCleanupRetry && !kernelStartupCleanupComplete) {
+      kernelStartupCleanupRetry();
+      kernelStartupCleanupComplete = true;
     }
-    if (firstFailure !== undefined) throw firstFailure;
+    if (applicationOwnership && !ownershipReleased) { applicationOwnership.release(); ownershipReleased = true; }
   };
   try {
+    applicationOwnership = acquireApplicationOwnership(config.databasePath);
     rootKey = loadOrCreateVaultRootKey(config);
     authSecret = deriveAuthSecret(rootKey);
     kernel = createDurableKernel({ databasePath: config.databasePath,
-      validateSnapshot: options.validateSnapshot ?? validatePhysicalWorkspaceSnapshot });
+      validateSnapshot: options.validateSnapshot ?? validatePhysicalWorkspaceSnapshot,
+      applicationOwnership });
     auth = new AuthService(kernel, { canonicalOrigin: config.canonicalOrigin,
       ...(config.allowLocalHttp ? { allowLocalHttp: true } : {}), authSecret });
     vault = new SecretVault(kernel, rootKey);
@@ -78,9 +104,6 @@ export function openServerFoundationInternal(config: ServerConfig, options: Serv
     const activeVault = vault;
     const activeAuth = auth;
     const activeCredentialCommands = credentialCommands;
-    let authClosed = false;
-    let vaultClosed = false;
-    let kernelClosed = false;
     const foundation: ServerFoundation = Object.freeze({
       auth: activeAuth,
       credentialCommands: activeCredentialCommands,
@@ -88,14 +111,17 @@ export function openServerFoundationInternal(config: ServerConfig, options: Serv
       readStatus: () => Object.freeze({ enrolled: activeKernel.withTrustedDatabaseTransaction((db) =>
         Boolean(db.prepare('SELECT 1 AS present FROM auth_owner WHERE singleton=1').get())) }),
       close: () => {
-        if (!authClosed) { activeAuth.close(); authClosed = true; }
-        if (!vaultClosed) { activeVault.close(); vaultClosed = true; }
-        if (!kernelClosed) { activeKernel.close(); kernelClosed = true; }
+        try { closeConstructed(); }
+        catch { throw new ServerFoundationStartupCleanupError(closeConstructed); }
       },
     });
     return Object.freeze({ foundation, privateContext: Object.freeze({ kernel: activeKernel, vault: activeVault }) });
   } catch (error) {
-    try { closeConstructed(); } catch { /* Preserve the construction error after attempting every cleanup. */ }
+    if (error instanceof KernelStartupCleanupError || error instanceof ApplicationOwnershipStartupCleanupError) {
+      kernelStartupCleanupRetry = () => error.retryClose();
+    }
+    try { closeConstructed(); }
+    catch { throw new ServerFoundationStartupCleanupError(closeConstructed); }
     throw error;
   } finally {
     rootKey?.fill(0);
@@ -138,24 +164,32 @@ export async function startStillHttp(config: ServerConfig, foundation: ServerFou
       if (onError) server.off('error', onError);
       if (onListening) server.off('listening', onListening);
     }
-    try { foundation.close(); } catch { /* Preserve the listener construction/bind failure. */ }
+    try { foundation.close(); } catch (cleanupError) { throw cleanupError; }
     throw error;
   }
   let closing: Promise<void> | undefined;
+  let listenerStopped = false;
+  let foundationClosed = false;
   return Object.freeze({ server, close: () => {
+    if (foundationClosed) return Promise.resolve();
     if (closing) return closing;
-    closing = new Promise<void>((resolve, reject) => {
-      const settle = (error?: Error) => {
-        let cleanupError: unknown;
-        try { foundation.close(); } catch (closeError) { cleanupError = closeError; }
-        if (error) reject(error);
-        else if (cleanupError !== undefined) reject(cleanupError);
-        else resolve();
-      };
-      try { server.close(settle); }
-      catch (error) { settle(error instanceof Error ? error : new Error('server_close_failed')); }
-    });
-    return closing;
+    const attempt = (async () => {
+      if (!listenerStopped) {
+        if (server.listening) {
+          await new Promise<void>((resolve, reject) => {
+            try { server.close((error) => error ? reject(error) : resolve()); }
+            catch (error) { reject(error); }
+          });
+        }
+        await drainAcceptedHttpRequests(server);
+        if (server.listening) throw new Error('application_listener_still_accepting');
+        listenerStopped = true;
+      }
+      if (!foundationClosed) { foundation.close(); foundationClosed = true; }
+    })();
+    closing = attempt;
+    void attempt.catch(() => { if (closing === attempt) closing = undefined; });
+    return attempt;
   } });
 }
 

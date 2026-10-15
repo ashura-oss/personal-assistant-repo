@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { ApplicationHostStartupCleanupError } from '../dist/applicationHost.js';
+import { ServerFoundationStartupCleanupError } from '../dist/bootstrap.js';
 import { getStillServerCleanupStatus, retryStillServerCleanup, runStillServer } from '../scripts/still-server.mjs';
 
 const config = { canonicalOrigin: 'https://still.example.test', dataDirectory: 'C:/private/still', staticRoot: 'C:/private/static' };
@@ -42,5 +43,28 @@ test('CLI retains startup cleanup capability, blocks a new start, and permits ex
   assert.deepEqual(getStillServerCleanupStatus(), { state: 'cleanup_pending', heldCount: 1 });
   assert.equal(await retryStillServerCleanup(), true);
   assert.equal(cleanupAttempts, 3);
+  assert.deepEqual(getStillServerCleanupStatus(), { state: 'idle', heldCount: 0 });
+});
+
+test('CLI retains compatibility foundation cleanup before assignment and blocks other commands until retry', async () => {
+  let cleanupAttempts = 0;
+  let laterFoundationOpens = 0;
+  const errors = [];
+  const startupCleanup = new ServerFoundationStartupCleanupError(() => {
+    cleanupAttempts += 1;
+    if (cleanupAttempts === 1) throw new Error('private foundation cleanup detail');
+  });
+  assert.equal(await runStillServer(['start'], { installSignalHandlers: false, parsePort: () => 8125,
+    loadConfig: () => config, openFoundation: () => { throw startupCleanup; }, writeOut() {},
+    writeError(value) { errors.push(value); } }), 1);
+  assert.deepEqual(getStillServerCleanupStatus(), { state: 'cleanup_pending', heldCount: 1 });
+  assert.match(errors[0], /cleanup is incomplete/);
+  assert.equal(await runStillServer(['status'], { installSignalHandlers: false, loadConfig: () => config,
+    openFoundation() { laterFoundationOpens += 1; throw new Error('must not open another foundation'); }, writeOut() {}, writeError() {} }), 1);
+  assert.equal(laterFoundationOpens, 0);
+  await assert.rejects(retryStillServerCleanup(), /private foundation cleanup detail/);
+  assert.equal(cleanupAttempts, 1);
+  assert.equal(await retryStillServerCleanup(), true);
+  assert.equal(cleanupAttempts, 2);
   assert.deepEqual(getStillServerCleanupStatus(), { state: 'idle', heldCount: 0 });
 });

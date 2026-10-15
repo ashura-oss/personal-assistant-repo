@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { pathToFileURL } from 'node:url';
 import { loadServerConfig } from '../dist/config.js';
-import { openServerFoundation, parseStillPort, startStillHttp } from '../dist/bootstrap.js';
+import { openServerFoundation, parseStillPort, ServerFoundationStartupCleanupError, startStillHttp } from '../dist/bootstrap.js';
 import { ApplicationHostStartupCleanupError, startApplicationHost } from '../dist/applicationHost.js';
 import { createProductionApplicationRuntimeFactory } from '../dist/applicationHost.node.mjs';
 import { promptHidden, runLocalCli } from '../dist/cli.js';
@@ -51,27 +51,34 @@ export async function runStillServer(argv = process.argv.slice(2), dependencies 
     writeError('Usage: still-server <start|status|enroll|reset-password>\n');
     return 2;
   }
-  if (argv[0] !== 'start') {
-    return runLocalCli(argv, {
-      openRuntime: () => {
-        const config = (dependencies.loadConfig ?? loadServerConfig)();
-        const foundation = (dependencies.openFoundation ?? openServerFoundation)(config);
-        return {
-          auth: foundation.auth,
-          initialWorkspaceSnapshot: foundation.initialWorkspaceSnapshot,
-          readStatus: foundation.readStatus,
-          close: foundation.close,
-        };
-      },
-      promptHidden: dependencies.promptHidden ?? promptHidden,
-      writeOut,
-      writeError,
-    });
-  }
-
   if (retainedCleanup) {
-    writeError('still-server: cleanup is incomplete; retry the retained cleanup before starting another server.\n');
+    writeError('still-server: cleanup is incomplete; retry the retained cleanup before another command.\n');
     return 1;
+  }
+  if (argv[0] !== 'start') {
+    try {
+      return await runLocalCli(argv, {
+        openRuntime: () => {
+          const config = (dependencies.loadConfig ?? loadServerConfig)();
+          const foundation = (dependencies.openFoundation ?? openServerFoundation)(config);
+          return {
+            auth: foundation.auth,
+            initialWorkspaceSnapshot: foundation.initialWorkspaceSnapshot,
+            readStatus: foundation.readStatus,
+            close: foundation.close,
+          };
+        },
+        promptHidden: dependencies.promptHidden ?? promptHidden,
+        writeOut,
+        writeError,
+      });
+    } catch (error) {
+      if (!(error instanceof ServerFoundationStartupCleanupError)) throw error;
+      retainedCleanup = { state: 'cleanup_pending', retryClose: () => error.retryClose() };
+      if (dependencies.installSignalHandlers !== false) installCleanupRetrySignals();
+      writeError('still-server: CLI cleanup is incomplete; the retained owner can be retried in this process.\n');
+      return 1;
+    }
   }
 
   let foundation;
@@ -106,6 +113,9 @@ export async function runStillServer(argv = process.argv.slice(2), dependencies 
   } catch (error) {
     let cleanupIncomplete = false;
     if (error instanceof ApplicationHostStartupCleanupError) {
+      retainedCleanup = { state: 'cleanup_pending', retryClose: () => error.retryClose() };
+      cleanupIncomplete = true;
+    } else if (error instanceof ServerFoundationStartupCleanupError) {
       retainedCleanup = { state: 'cleanup_pending', retryClose: () => error.retryClose() };
       cleanupIncomplete = true;
     } else if (foundation) {

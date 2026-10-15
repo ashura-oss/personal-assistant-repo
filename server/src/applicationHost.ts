@@ -1,5 +1,5 @@
 import type { Server } from 'node:http';
-import { openServerFoundationInternal, type ServerFoundationOptions } from './bootstrap.js';
+import { openServerFoundationInternal, ServerFoundationStartupCleanupError, type ServerFoundationOptions } from './bootstrap.js';
 import type { ServerConfig } from './config.js';
 import { createStillHttpServer } from './http.js';
 import { drainAcceptedHttpRequests } from './httpRequestDrain.js';
@@ -196,7 +196,14 @@ export async function startApplicationHost(options: ApplicationHostOptions): Pro
       !Number.isSafeInteger(options.port) || options.port < 1 || options.port > 65535) {
     throw new TypeError('application_host_configuration_invalid');
   }
-  const opened = openServerFoundationInternal(options.config, options.foundation);
+  let opened: ReturnType<typeof openServerFoundationInternal>;
+  try { opened = openServerFoundationInternal(options.config, options.foundation); }
+  catch (error) {
+    if (error instanceof ServerFoundationStartupCleanupError) {
+      throw new ApplicationHostStartupCleanupError(async () => { error.retryClose(); });
+    }
+    throw error;
+  }
   const actors = new ProcessWorkspaceActors(opened.privateContext.kernel);
   const owner = new ApplicationHostOwner(opened.foundation, actors);
   try {
