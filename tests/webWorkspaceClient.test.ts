@@ -156,7 +156,8 @@ describe('same-origin web workspace command client', () => {
   it('keeps the server projection map and browser history decoder on the same public command kinds', () => {
     expect(SERVER_HISTORY_KINDS).toEqual(['tasks.complete', 'tasks.reopen', 'chat.create', 'chat.conversation.delete', 'notes.confirmImportedTimeZone',
       'chat.transcript.prepare', 'chat.transcript.cancel', 'chat.transcript.submit', 'settings.update', 'notes.save', 'notes.capture.adopt',
-      'notes.updateTranscript', 'assistant.batch.submitNote', 'assistant.batch.check', 'chat.submit', 'chat.refine', 'notes.transcribe', 'accounts.installOAuth',
+      'notes.updateTranscript', 'assistant.batch.submitNote', 'assistant.batch.check', 'chat.submit', 'chat.refine', 'notes.transcribe',
+      'assistant.periodSummary.moreCompute.prepare', 'assistant.periodSummary.moreCompute.submit', 'assistant.periodSummary.moreCompute.cancel', 'accounts.installOAuth',
       'accounts.syncCalendars', 'accounts.refreshMail', 'accounts.continueMailBackfill', 'accounts.disconnect', 'mail.source.loadText', 'mail.reply.create',
       'mail.reply.derive', 'mail.reply.promoteDraft', 'proposals.edit', 'proposals.approve', 'proposals.execute', 'proposals.dismiss', 'dispatch.reconcile', 'mail.replyBatch.submit', 'mail.replyBatch.check',
       'mail.replyBatch.review', 'mail.replyBatch.activate',

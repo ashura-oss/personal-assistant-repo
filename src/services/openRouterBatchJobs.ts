@@ -236,7 +236,7 @@ export interface AssistantBatchJobDTO {
   readonly proposalId?: string;
   /** Indicates a possible manual review; prepareMoreCompute revalidates current sources before returning a plan. */
   readonly canRecoverMoreCompute?: boolean;
-  readonly moreComputeEfforts?: readonly ('medium' | 'high' | 'max')[];
+  readonly moreComputeEfforts?: readonly ('low' | 'medium' | 'high' | 'max')[];
   readonly pendingRecoveryChildId?: string;
   readonly recoveredConversationId?: string;
   readonly recoveredTurnId?: string;

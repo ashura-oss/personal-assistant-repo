@@ -3,6 +3,7 @@ import { Text, View } from 'react-native';
 import { Button } from './primitives';
 import { C, s } from './theme';
 import { MoreComputeReview, type MoreComputeReviewActions } from './MoreComputeReview';
+import { PeriodSummaryWorkflow, type PeriodSummaryWorkflowActions } from './PeriodSummaryWorkflow';
 import type { WorkspaceAssistantBatchJobDisplay } from './workspaceChatDisplayTypes';
 import {
   assistantBatchStatusLabel,
@@ -23,6 +24,7 @@ type Props = {
   onCheck?: (jobId: string) => Promise<unknown> | unknown;
   onRetryCleanup?: (jobId: string) => Promise<unknown> | unknown;
   moreCompute?: MoreComputeReviewActions;
+  periodSummaryWorkflow?: PeriodSummaryWorkflowActions;
 };
 
 function dateLabel(value: string): string {
@@ -32,7 +34,7 @@ function dateLabel(value: string): string {
     : 'Time unavailable';
 }
 
-export function AssistantBatchJobCard({ job, chatContext, storageLocation = 'device', busy = false, blocked = false, onCheck, onRetryCleanup, moreCompute }: Props) {
+export function AssistantBatchJobCard({ job, chatContext, storageLocation = 'device', busy = false, blocked = false, onCheck, onRetryCleanup, moreCompute, periodSummaryWorkflow }: Props) {
   const [checking, setChecking] = useState(false);
   const [retryingCleanup, setRetryingCleanup] = useState(false);
   const [actionError, setActionError] = useState<string | undefined>();
@@ -42,7 +44,8 @@ export function AssistantBatchJobCard({ job, chatContext, storageLocation = 'dev
   const reportedCost = job.costStatus === 'reported'
     ? formatReportedBatchCost(job.providerReportedCostUsd)
     : undefined;
-  const title = job.kind === 'mail_reply' ? 'Mail reply'
+  const title = job.kind === 'period_summary' ? 'Period summary'
+    : job.kind === 'mail_reply' ? 'Mail reply'
     : chatContext === 'refinement' ? 'Answer refinement'
       : chatContext === 'chat' ? 'Chat message' : 'Note assistance';
 
@@ -119,7 +122,9 @@ export function AssistantBatchJobCard({ job, chatContext, storageLocation = 'dev
       ) : null}
       {tokenSummary ? <Text style={styles.meta}>Provider-reported tokens · {tokenSummary}</Text> : null}
       {actionError ? <Text accessibilityRole="alert" style={styles.warning}>{actionError}</Text> : null}
-      {moreCompute && job.canRecoverMoreCompute && !blocked && !moreCompute.blocked ? <MoreComputeReview key={moreCompute.ownerKey} job={job} {...moreCompute} blocked={false} /> : null}
+      {job.kind === 'period_summary' && periodSummaryWorkflow ? <PeriodSummaryWorkflow key={periodSummaryWorkflow.ownerKey}
+        job={job} actions={{ ...periodSummaryWorkflow, blocked: blocked || periodSummaryWorkflow.blocked }} /> :
+        moreCompute && job.canRecoverMoreCompute && !blocked && !moreCompute.blocked ? <MoreComputeReview key={moreCompute.ownerKey} job={job} {...moreCompute} blocked={false} /> : null}
       {canCheckBatchJob(job) && onCheck ? (
         <Button
           label={checking ? 'Checking status…' : batchCheckLabel(job)}

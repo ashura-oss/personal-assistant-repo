@@ -2,6 +2,7 @@ import React, { useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore
 import { Pressable, ScrollView, Text, View } from 'react-native';
 import type { WorkspaceCommand, WorkspaceCommandResponse, WorkspaceSettingsPatch } from '../cloud/workspaceCommands';
 import type { WorkspaceSettingsDTO } from '../cloud/workspaceDto';
+import type { PeriodSummaryMoreComputePlan, PeriodSummaryResultReview } from '../core';
 import type { CloudWorkspaceSessionState, CloudWorkspaceSessionStore, CloudWorkspaceVoiceActions } from './CloudWorkspaceSession';
 import { WorkspaceClientError, WorkspaceCommandNotStartedError, type WorkspaceCommandAdmission } from './workspaceClient';
 import { WorkspaceScreen, type WorkspaceTab } from '../ui/WorkspaceScreen';
@@ -38,7 +39,13 @@ export type CloudWorkspaceActions = Readonly<{
   tasks: Readonly<{ complete: (taskId: string) => Promise<WorkspaceCommandResponse>; reopen: (taskId: string) => Promise<WorkspaceCommandResponse> }>;
   notes: Readonly<{ save: (transcript: string) => Promise<WorkspaceCommandResponse>; updateTranscript: (noteId: string, text: string, expectedNoteRevision: number) => Promise<WorkspaceCommandResponse>; submitAssistance: (noteId: string, options: { intent: 'assist' | 'summarize' | 'answer' | 'extract'; question?: string; knowledgeSelection?: readonly { kind: 'person' | 'project'; id: string }[] }) => Promise<WorkspaceCommandResponse>; transcribe: (noteId: string, expectedNoteRevision: number, onAdmitted: (envelope: WorkspaceCommandAdmission) => void) => Promise<WorkspaceCommandResponse> }>;
   chat: Readonly<{ create: () => Promise<WorkspaceCommandResponse>; submit: (attempt: ChatSendAttempt) => Promise<WorkspaceCommandResponse>; refine: (conversationId: string, parentTurnId: string, effort: 'medium' | 'high' | 'max') => Promise<WorkspaceCommandResponse>; inspect: (commandId: string) => Promise<WorkspaceCommandResponse> }>;
-  batch: Readonly<{ check: (jobId: string) => Promise<WorkspaceCommandResponse> }>;
+  batch: Readonly<{
+    check: (jobId: string) => Promise<WorkspaceCommandResponse>;
+    prepareSummaryMoreCompute: (jobId: string, effort: 'low' | 'medium' | 'high' | 'max') => Promise<PeriodSummaryMoreComputePlan>;
+    submitSummaryMoreCompute: (planId: string, jobId: string) => Promise<Readonly<{ jobStatus: import('../services/openRouterBatchJobs').AssistantBatchJobDTO['status'] }>>;
+    cancelSummaryMoreCompute: (planId: string) => void;
+    readSummary: (jobId: string) => Promise<PeriodSummaryResultReview>;
+  }>;
 }>;
 
 export type CloudWorkspaceVoiceCapability = Readonly<{
@@ -108,7 +115,7 @@ function equalSettingsBaseline(left: WorkspaceSettingsBaseline, right: Workspace
     left.maxAudioSeconds === right.maxAudioSeconds && left.retention === right.retention;
 }
 
-export function CloudWorkspace({ store, state, onLogout, voiceCapability, credentials, oauthCoordinator, mailCoordinator, transcriptTransferCoordinator, backgroundPolicyCoordinator }: { store: Pick<CloudWorkspaceSessionStore, 'getSnapshot' | 'execute' | 'inspect' | 'refresh'> & Partial<Pick<CloudWorkspaceSessionStore, 'readKnowledgeSourceChoices' | 'readKnowledgeSuggestionReview'>>; state: CloudWorkspaceSessionState; onLogout: () => void; voiceCapability?: CloudWorkspaceVoiceCapability; credentials?: CloudCredentialController; oauthCoordinator?: CloudOAuthCoordinator; mailCoordinator?: CloudMailCoordinator; transcriptTransferCoordinator?: CloudTranscriptTransferCoordinator; backgroundPolicyCoordinator?: CloudBackgroundPolicyCoordinator }) {
+export function CloudWorkspace({ store, state, onLogout, voiceCapability, credentials, oauthCoordinator, mailCoordinator, transcriptTransferCoordinator, backgroundPolicyCoordinator }: { store: Pick<CloudWorkspaceSessionStore, 'getSnapshot' | 'execute' | 'inspect' | 'refresh'> & Partial<Pick<CloudWorkspaceSessionStore, 'readKnowledgeSourceChoices' | 'readKnowledgeSuggestionReview' | 'readPeriodSummaryResult'>>; state: CloudWorkspaceSessionState; onLogout: () => void; voiceCapability?: CloudWorkspaceVoiceCapability; credentials?: CloudCredentialController; oauthCoordinator?: CloudOAuthCoordinator; mailCoordinator?: CloudMailCoordinator; transcriptTransferCoordinator?: CloudTranscriptTransferCoordinator; backgroundPolicyCoordinator?: CloudBackgroundPolicyCoordinator }) {
   const oauthState = useCloudOAuth(oauthCoordinator);
   const transcriptTransferState = useSyncExternalStore(transcriptTransferCoordinator?.subscribe ?? EMPTY_TRANSCRIPT_SUBSCRIBE,
     transcriptTransferCoordinator?.getSnapshot ?? (() => EMPTY_TRANSCRIPT_TRANSFER),
@@ -259,7 +266,27 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
       refine: (conversationId, parentTurnId, effort) => store.execute({ kind: 'chat.refine', conversationId, parentTurnId, effort }),
       inspect: (commandId) => store.inspect(commandId),
     },
-    batch: { check: (jobId) => store.execute({ kind: 'assistant.batch.check', jobId }) },
+    batch: {
+      check: (jobId) => store.execute({ kind: 'assistant.batch.check', jobId }),
+      prepareSummaryMoreCompute: async (jobId: string, effort: 'low' | 'medium' | 'high' | 'max') => {
+        const response = await store.execute({ kind: 'assistant.periodSummary.moreCompute.prepare', jobId, effort });
+        if (response.status !== 'finished' || !response.receipt || response.receipt.kind !== 'assistant.periodSummary.moreCompute.prepare') throw new Error('summary_plan_unavailable');
+        return response.receipt.plan;
+      },
+      submitSummaryMoreCompute: async (planId: string, jobId: string) => {
+        const response = await store.execute({ kind: 'assistant.periodSummary.moreCompute.submit', planId, jobId });
+        if (response.status !== 'finished' || !response.receipt || response.receipt.kind !== 'assistant.periodSummary.moreCompute.submit') throw new Error('summary_submit_unknown');
+        return response.receipt;
+      },
+      cancelSummaryMoreCompute: (planId: string) => {
+        void store.execute({ kind: 'assistant.periodSummary.moreCompute.cancel', planId }).catch(() => undefined);
+      },
+      readSummary: (jobId: string) => {
+        const current = store.getSnapshot().snapshot;
+        if (!current || !store.readPeriodSummaryResult) throw new Error('summary_workspace_unavailable');
+        return store.readPeriodSummaryResult(jobId, current.revision);
+      },
+    },
   };
 
   const settingsOwnerKey = (workspaceSnapshot: NonNullable<CloudWorkspaceSessionState['snapshot']>) => `${workspaceSnapshot.workspaceId}:${workspaceSnapshot.privacyEpoch}`;
@@ -958,7 +985,11 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
         {inboxSection === 'history' ? <ScrollView contentContainerStyle={s.scroll}>
           <Text style={s.kicker}>HISTORY</Text><Text style={s.h1}>Saved requests</Text>
           {dto.assistantBatchJobs.map((job) => <AssistantBatchJobCard key={job.id} job={job} storageLocation="server" busy={state.busy}
-            blocked={state.refreshRequired || Boolean(dto.assistantBatchRecoveryStatus)} onCheck={(jobId) => actions.batch.check(jobId)} />)}
+            blocked={state.refreshRequired || Boolean(dto.assistantBatchRecoveryStatus)} onCheck={(jobId) => actions.batch.check(jobId)}
+            periodSummaryWorkflow={{ ownerKey: JSON.stringify([snapshot.workspaceId, snapshot.privacyEpoch, job.id, job.updatedAt, job.status]),
+              blocked: state.refreshRequired || Boolean(dto.assistantBatchRecoveryStatus),
+              onPrepare: actions.batch.prepareSummaryMoreCompute, onSubmit: actions.batch.submitSummaryMoreCompute,
+              onCancel: actions.batch.cancelSummaryMoreCompute, onRead: actions.batch.readSummary }} />)}
           {!dto.assistantBatchJobs.length ? <Text style={styles.meta}>No Batch requests have been saved.</Text> : null}
           <Text style={s.sectionTitle}>Saved dispatches</Text>
           {dto.dispatchRecords.map((record) => <View key={record.id} style={styles.card}><Text style={styles.cardTitle}>{record.title}</Text><Text style={styles.meta}>{record.operation} · {record.outcome} · {record.dispatchStartedAt}</Text>

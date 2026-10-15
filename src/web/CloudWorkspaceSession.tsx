@@ -4,6 +4,7 @@ import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import type { WorkspaceSnapshotDTO } from '../cloud/workspaceDto';
 import type { KnowledgeSourceChoicesDTO, KnowledgeSuggestionReviewDTO } from '../cloud/knowledgeHttpContracts';
 import type { WorkspaceCommand, WorkspaceCommandResponse } from '../cloud/workspaceCommands';
+import type { PeriodSummaryResultReview } from '../core';
 import type { DispatchReviewReadDto, MailReplyBatchReviewReadDto, MailReplySourceReadDto, MailReplyTextReadDto, ProposalReviewReadDto } from './mailWorkflowDtos';
 import type { ReplyBatchPlanRead } from './cloudMailClient';
 import { decodeWorkspaceSnapshotDTO } from '../cloud/workspaceSnapshotCodec';
@@ -418,6 +419,10 @@ export class CloudWorkspaceSessionStore {
 
   readReplyBatchReview(plan: ReplyBatchPlanRead, expectedRevision: number): Promise<MailReplyBatchReviewReadDto> {
     return this.readSavedMail(expectedRevision, (client) => client.readReplyBatchReview(plan, expectedRevision));
+  }
+
+  readPeriodSummaryResult(jobId: string, expectedRevision: number): Promise<PeriodSummaryResultReview> {
+    return this.readSavedMail(expectedRevision, (client) => client.readPeriodSummaryResult(jobId, expectedRevision));
   }
 
   async refresh(): Promise<WorkspaceSnapshotDTO | undefined> {

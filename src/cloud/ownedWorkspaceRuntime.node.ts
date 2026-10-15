@@ -351,6 +351,10 @@ export class OwnedWorkspaceRuntime {
     return this.readController(admission, input, (controller) => controller.getMailReplyBatchReviewForCommand(input));
   }
 
+  readPeriodSummaryResult(admission: OwnedWorkspaceAdmission, input: { jobId: string; expectedRevision: number; expectedPrivacyEpoch: number }) {
+    return this.readController(admission, input, (controller) => controller.readPeriodSummaryResult(input.jobId));
+  }
+
   /** Reads only safe source-choice projections and never publishes or caches a workspace snapshot. */
   readKnowledgeSourceChoices(admission: OwnedWorkspaceAdmission, input: Readonly<{ expectedRevision: number; expectedPrivacyEpoch: number }>): Promise<KnowledgeSourceChoicesDTO> {
     this.assertAdmission(admission);

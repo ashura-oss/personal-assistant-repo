@@ -10,6 +10,12 @@ const CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u;
 const LOCAL_DATE = /^(\d{4})-(\d{2})-(\d{2})$/;
 
 export type OpenRouterSummaryEffort = 'none' | 'low' | 'medium' | 'high' | 'max';
+export function higherOpenRouterPeriodSummaryEfforts(effort: OpenRouterSummaryEffort): readonly Exclude<OpenRouterSummaryEffort, 'none'>[] {
+  const order: readonly OpenRouterSummaryEffort[] = ['none', 'low', 'medium', 'high', 'max'];
+  const index = order.indexOf(effort);
+  if (index < 0) return Object.freeze([]);
+  return Object.freeze(order.slice(index + 1) as Exclude<OpenRouterSummaryEffort, 'none'>[]);
+}
 export type OpenRouterPeriodSummaryKind = 'daily' | 'weekly' | 'monthly' | 'yearly';
 export type OpenRouterPeriodSummarySourceKind = 'note' | 'chat' | 'task' | 'decision' | 'accepted_inference' |
   'mail' | 'calendar' | 'document' | 'person' | 'project';

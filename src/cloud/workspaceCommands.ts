@@ -1,4 +1,4 @@
-import type { AssistIntent, SavePersonInput, SaveProjectInput } from '../core';
+import type { AssistIntent, SavePersonInput, SaveProjectInput, PeriodSummaryMoreComputePlan } from '../core';
 import type { KnowledgeChange, KnowledgeEntityKind, KnowledgeEvidence } from '../knowledge/types';
 import { isCanonicalKnowledgeId, KNOWLEDGE_LIMITS } from '../knowledge';
 import { safeRelativeMarkdownPath } from '../privacy/eraseAdapter.shared';
@@ -71,6 +71,9 @@ export type WorkspaceCommand =
   | { readonly kind: 'notes.transcribe'; readonly noteId: string; readonly expectedNoteRevision: number }
   | { readonly kind: 'assistant.batch.submitNote'; readonly noteId: string; readonly intent?: AssistIntent; readonly question?: string; readonly knowledgeSelection?: PublicKnowledgeSelection }
   | { readonly kind: 'assistant.batch.check'; readonly jobId: string }
+  | { readonly kind: 'assistant.periodSummary.moreCompute.prepare'; readonly jobId: string; readonly effort: 'low' | 'medium' | 'high' | 'max' }
+  | { readonly kind: 'assistant.periodSummary.moreCompute.submit'; readonly planId: string; readonly jobId: string }
+  | { readonly kind: 'assistant.periodSummary.moreCompute.cancel'; readonly planId: string }
   | { readonly kind: 'chat.submit'; readonly conversationId: string; readonly text: string; readonly knowledgeSelection?: PublicKnowledgeSelection }
   | { readonly kind: 'chat.refine'; readonly conversationId: string; readonly parentTurnId: string; readonly effort: 'medium' | 'high' | 'max' };
 
@@ -148,6 +151,9 @@ export type WorkspaceCommandReceipt =
   | (WorkspaceCommandReceiptBase<'mail.replyBatch.check'> & Readonly<{ jobId: string; jobStatus: import('../services/openRouterBatchJobs').AssistantBatchJobDTO['status'] }> )
   | (WorkspaceCommandReceiptBase<'mail.replyBatch.review'> & Readonly<{ jobId: string; planId: string; expiresAt: string }> )
   | (WorkspaceCommandReceiptBase<'mail.replyBatch.activate'> & Readonly<{ jobId: string; proposalId: string }> )
+  | (WorkspaceCommandReceiptBase<'assistant.periodSummary.moreCompute.prepare'> & Readonly<{ jobId: string; plan: PeriodSummaryMoreComputePlan }> )
+  | (WorkspaceCommandReceiptBase<'assistant.periodSummary.moreCompute.submit'> & Readonly<{ jobId: string; jobStatus: import('../services/openRouterBatchJobs').AssistantBatchJobDTO['status'] }> )
+  | (WorkspaceCommandReceiptBase<'assistant.periodSummary.moreCompute.cancel'> & Readonly<{ planId: string }> )
   | (WorkspaceCommandReceiptBase<'documents.save'> & Readonly<{ documentRevision: number; entityKind?: KnowledgeEntityKind; entityId?: string; entityRevision?: number }>)
   | ((WorkspaceCommandReceiptBase<'knowledge.person.save'> | WorkspaceCommandReceiptBase<'knowledge.project.save'> |
       WorkspaceCommandReceiptBase<'knowledge.entity.archive'>) & Readonly<{ entityKind: KnowledgeEntityKind; entityRevision: number }>)
@@ -220,6 +226,9 @@ const COMMAND_KEYS: Record<WorkspaceCommand['kind'], readonly string[]> = {
   'notes.transcribe': ['kind', 'noteId', 'expectedNoteRevision'],
   'assistant.batch.submitNote': ['kind', 'noteId', 'intent', 'question', 'knowledgeSelection'],
   'assistant.batch.check': ['kind', 'jobId'], 'chat.submit': ['kind', 'conversationId', 'text', 'knowledgeSelection'],
+  'assistant.periodSummary.moreCompute.prepare': ['kind', 'jobId', 'effort'],
+  'assistant.periodSummary.moreCompute.submit': ['kind', 'planId', 'jobId'],
+  'assistant.periodSummary.moreCompute.cancel': ['kind', 'planId'],
   'chat.refine': ['kind', 'conversationId', 'parentTurnId', 'effort'],
 };
 const COMMAND_KINDS = Object.keys(COMMAND_KEYS) as WorkspaceCommand['kind'][];
@@ -828,6 +837,21 @@ function freezeCommand(raw: Record<string, unknown>): WorkspaceCommand {
       ...(Object.hasOwn(raw, 'question') ? { question: raw.question as string } : {}),
       ...(knowledgeSelection ? { knowledgeSelection } : {}) });
   }
+  if (kind === 'assistant.periodSummary.moreCompute.prepare') {
+    assertExactKeys(raw, COMMAND_KEYS[kind], COMMAND_KEYS[kind]);
+    if (!isUuidV4(raw.jobId) || !['low', 'medium', 'high', 'max'].includes(String(raw.effort))) throw new Error('workspace_command_invalid');
+    return Object.freeze({ kind, jobId: raw.jobId, effort: raw.effort as 'low' | 'medium' | 'high' | 'max' });
+  }
+  if (kind === 'assistant.periodSummary.moreCompute.submit') {
+    assertExactKeys(raw, COMMAND_KEYS[kind], COMMAND_KEYS[kind]);
+    if (!isUuidV4(raw.jobId) || !isUuidV4(raw.planId)) throw new Error('workspace_command_invalid');
+    return Object.freeze({ kind, planId: raw.planId, jobId: raw.jobId });
+  }
+  if (kind === 'assistant.periodSummary.moreCompute.cancel') {
+    assertExactKeys(raw, COMMAND_KEYS[kind], COMMAND_KEYS[kind]);
+    if (!isUuidV4(raw.planId)) throw new Error('workspace_command_invalid');
+    return Object.freeze({ kind, planId: raw.planId });
+  }
   if (kind === 'assistant.batch.check') {
     assertExactKeys(raw, COMMAND_KEYS[kind], COMMAND_KEYS[kind]);
     if (!isUuidV4(raw.jobId)) throw new Error('workspace_command_invalid');
@@ -884,6 +908,41 @@ export function canonicalWorkspaceCommand(envelope: WorkspaceCommandEnvelope): s
   return canonicalJson(parseWorkspaceCommandEnvelope(envelope));
 }
 
+function parsePeriodSummaryMoreComputePlan(value: unknown): PeriodSummaryMoreComputePlan {
+  if (!isRecord(value)) throw new Error('workspace_command_receipt_invalid');
+  const keys = ['planId', 'jobId', 'kind', 'period', 'timeZone', 'interval', 'preparedAt', 'destinationPath', 'priorEffort', 'requestedEffort', 'expiresAt',
+    'sourceCount', 'sourceLabels', 'priorAccounting', 'warning'];
+  assertExactKeys(value, keys, keys);
+  const row = value as Record<string, unknown>;
+  const interval = row.interval as Record<string, unknown> | null;
+  const accounting = row.priorAccounting as Record<string, unknown> | null;
+  if (interval && typeof interval === 'object') assertExactKeys(interval, ['start', 'end'], ['start', 'end']);
+  if (accounting && typeof accounting === 'object') assertExactKeys(accounting,
+    ['costStatus', 'providerReportedCostUsd', 'byok', 'promptTokens', 'completionTokens', 'totalTokens', 'unknownCharge'], ['costStatus', 'unknownCharge']);
+  const effortRank = (effort: unknown) => ['none', 'low', 'medium', 'high', 'max'].indexOf(String(effort));
+  if (!isUuidV4(row.planId) || !isUuidV4(row.jobId) || row.kind !== 'period_summary' ||
+      !['daily', 'weekly', 'monthly', 'yearly'].includes(String(row.period)) || typeof row.timeZone !== 'string' || row.timeZone.length > 128 ||
+      !Number.isFinite(Date.parse(row.preparedAt as string)) || new Date(row.preparedAt as string).toISOString() !== row.preparedAt || !interval ||
+      typeof interval.start !== 'string' || typeof interval.end !== 'string' ||
+      !/^\d{4}-\d{2}-\d{2}$/.test(interval.start) || !/^\d{4}-\d{2}-\d{2}$/.test(interval.end) ||
+      typeof row.destinationPath !== 'string' || !safeRelativeMarkdownPath(row.destinationPath) ||
+      effortRank(row.priorEffort) < 0 || effortRank(row.requestedEffort) < 1 || effortRank(row.requestedEffort) <= effortRank(row.priorEffort) ||
+      typeof row.expiresAt !== 'string' || !Number.isFinite(Date.parse(row.expiresAt)) || !Number.isSafeInteger(row.sourceCount) ||
+      (row.sourceCount as number) < 0 || !Array.isArray(row.sourceLabels) || row.sourceLabels.length !== row.sourceCount ||
+      row.sourceLabels.some((label) => typeof label !== 'string' || !boundedString(label, 512)) || !accounting ||
+      !['reported', 'unavailable'].includes(String(accounting.costStatus)) || typeof accounting.unknownCharge !== 'boolean' ||
+      (accounting.costStatus === 'reported' ? typeof accounting.providerReportedCostUsd !== 'number' || !Number.isFinite(accounting.providerReportedCostUsd) || accounting.providerReportedCostUsd < 0 :
+        Object.hasOwn(accounting, 'providerReportedCostUsd')) ||
+      (Object.hasOwn(accounting, 'byok') && typeof accounting.byok !== 'boolean') ||
+      ['promptTokens', 'completionTokens', 'totalTokens'].some((key) => Object.hasOwn(accounting, key) &&
+        (!Number.isSafeInteger(accounting[key]) || (accounting[key] as number) < 0)) ||
+      row.warning !== 'Submitting creates a new paid Batch request using the original frozen sources. The saved partial output is evidence only and is not included.') {
+    throw new Error('workspace_command_receipt_invalid');
+  }
+  return Object.freeze({ ...row, interval: Object.freeze({ start: interval.start, end: interval.end }),
+    sourceLabels: Object.freeze([...(row.sourceLabels as string[])]), priorAccounting: Object.freeze({ ...accounting }) }) as unknown as PeriodSummaryMoreComputePlan;
+}
+
 /** Validates a stored or returned receipt before any field is projected to a caller. */
 export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
   readonly commandId: string;
@@ -917,10 +976,10 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
   readonly operation?: 'draft' | 'send' | 'event';
   readonly recordId?: string;
   readonly jobStatus?: import('../services/openRouterBatchJobs').AssistantBatchJobDTO['status'];
+  readonly planId?: string;
   readonly noteId?: string;
   readonly noteRevision?: number;
   readonly timeZone?: string;
-  readonly planId?: string;
   readonly expiresAt?: string;
   readonly capturedAt?: string;
   readonly captureTimeZone?: string;
@@ -980,6 +1039,9 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
     'notes.transcribe': ['attemptId', 'commandId', 'kind', 'objectId', 'outcome', 'schemaVersion', 'sourceRevision'],
     'assistant.batch.submitNote': ['commandId', 'jobId', 'kind', 'objectId', 'schemaVersion'],
     'assistant.batch.check': ['commandId', 'kind', 'objectId', 'schemaVersion'],
+    'assistant.periodSummary.moreCompute.prepare': ['commandId', 'jobId', 'kind', 'objectId', 'plan', 'schemaVersion'],
+    'assistant.periodSummary.moreCompute.submit': ['commandId', 'jobId', 'jobStatus', 'kind', 'objectId', 'schemaVersion'],
+    'assistant.periodSummary.moreCompute.cancel': ['commandId', 'kind', 'objectId', 'planId', 'schemaVersion'],
     'chat.submit': ['commandId', 'jobId', 'kind', 'objectId', 'schemaVersion', 'turnId'],
     'chat.refine': ['commandId', 'jobId', 'kind', 'objectId', 'parentTurnId', 'schemaVersion', 'turnId'],
   };
@@ -1056,6 +1118,12 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
           'result_stale', 'result_invalid', 'result_truncated', 'result_not_retained', 'cleanup_pending', 'source_removed'].includes(value.jobStatus as string))) ||
       (kind === 'mail.replyBatch.review' && (!uuidId(value.jobId) || !textId(value.planId) || typeof value.expiresAt !== 'string' || !Number.isFinite(Date.parse(value.expiresAt)))) ||
       (kind === 'mail.replyBatch.activate' && (!uuidId(value.jobId) || !textId(value.proposalId))) ||
+      (kind === 'assistant.periodSummary.moreCompute.prepare' && (!uuidId(value.jobId) || value.jobId !== value.objectId ||
+        parsePeriodSummaryMoreComputePlan(value.plan).jobId !== value.jobId)) ||
+      (kind === 'assistant.periodSummary.moreCompute.submit' && (!uuidId(value.jobId) || value.jobId !== value.objectId ||
+        !['preparing', 'submitting', 'submission_unknown', 'queued', 'processing', 'completed', 'failed', 'expired', 'cancelled',
+          'result_stale', 'result_invalid', 'result_truncated', 'result_not_retained', 'cleanup_pending', 'source_removed'].includes(value.jobStatus as string))) ||
+      (kind === 'assistant.periodSummary.moreCompute.cancel' && (!uuidId(value.planId) || value.objectId !== value.planId)) ||
       (kind === 'documents.save' && (() => {
         const parent = canonicalKnowledgeDocumentParent(value.objectId);
         const hasParent = Object.hasOwn(value, 'entityKind') || Object.hasOwn(value, 'entityId') || Object.hasOwn(value, 'entityRevision');
@@ -1101,6 +1169,7 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
         (expected.draftDispatchRecordId !== undefined && value.draftDispatchRecordId !== expected.draftDispatchRecordId) ||
         (expected.recordId !== undefined && value.recordId !== expected.recordId) ||
         (expected.jobStatus !== undefined && value.jobStatus !== expected.jobStatus) ||
+        (expected.planId !== undefined && value.planId !== expected.planId) ||
         (expected.noteId !== undefined && value.noteId !== expected.noteId) ||
         (expected.noteRevision !== undefined && value.noteRevision !== expected.noteRevision) ||
         (expected.timeZone !== undefined && value.timeZone !== expected.timeZone) ||
@@ -1202,6 +1271,14 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
         planId: textId(value.planId) ? value.planId : (() => { throw new Error('workspace_command_receipt_invalid'); })(), expiresAt: value.expiresAt as string });
     case 'mail.replyBatch.activate':
       return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId, jobId: jobId(value.jobId), proposalId: value.proposalId as string });
+    case 'assistant.periodSummary.moreCompute.prepare':
+      return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId,
+        jobId: jobId(value.jobId), plan: parsePeriodSummaryMoreComputePlan(value.plan) });
+    case 'assistant.periodSummary.moreCompute.submit':
+      return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId,
+        jobId: jobId(value.jobId), jobStatus: value.jobStatus as import('../services/openRouterBatchJobs').AssistantBatchJobDTO['status'] });
+    case 'assistant.periodSummary.moreCompute.cancel':
+      return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId, planId: jobId(value.planId) });
     case 'documents.save': {
       const parent = canonicalKnowledgeDocumentParent(objectId);
       return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId,

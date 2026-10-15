@@ -307,6 +307,18 @@ export async function dispatchWorkspaceCommand(runtime: OwnedWorkspaceRuntime, a
         await controller.refreshAssistantBatch(command.jobId);
         return receipt(envelope, command, { objectId: command.jobId });
       }
+      case 'assistant.periodSummary.moreCompute.prepare': {
+        const plan = await controller.preparePeriodSummaryMoreCompute({ jobId: command.jobId, effort: command.effort });
+        return receipt(envelope, command, { objectId: command.jobId, jobId: command.jobId, plan });
+      }
+      case 'assistant.periodSummary.moreCompute.submit': {
+        const job = await controller.submitPeriodSummaryMoreCompute({ planId: command.planId, jobId: command.jobId });
+        return receipt(envelope, command, { objectId: command.jobId, jobId: command.jobId, jobStatus: job.status });
+      }
+      case 'assistant.periodSummary.moreCompute.cancel': {
+        controller.cancelPeriodSummaryMoreCompute(command.planId);
+        return receipt(envelope, command, { objectId: command.planId, planId: command.planId });
+      }
       case 'chat.submit': {
         const accepted = await controller.submitChatTurn({ conversationId: command.conversationId, text: command.text,
           knowledgeSelection: command.knowledgeSelection?.map(({ kind, id }) => ({ kind, id })) });
@@ -375,6 +387,7 @@ function receipt(envelope: WorkspaceCommandEnvelope, command: WorkspaceCommand, 
   readonly noteId?: string; readonly noteRevision?: number; readonly timeZone?: string; readonly capturedAt?: string;
   readonly captureTimeZone?: string; readonly conversationId?: string;
   readonly outcome?: 'submitted' | 'not_submitted'; readonly reason?: 'plan_unavailable';
+  readonly plan?: import('../core').PeriodSummaryMoreComputePlan;
 }) {
   return parseWorkspaceCommandReceipt({ schemaVersion: 1, commandId: envelope.commandId, kind: command.kind, ...fields },
     expectedReceipt(envelope.commandId, command));
@@ -442,6 +455,9 @@ function expectedReceipt(commandId: string, command: WorkspaceCommand) {
     case 'notes.transcribe': return { commandId, kind: command.kind, objectId: command.noteId, sourceRevision: command.expectedNoteRevision };
     case 'assistant.batch.submitNote': return { commandId, kind: command.kind, objectId: command.noteId };
     case 'assistant.batch.check': return { commandId, kind: command.kind, objectId: command.jobId };
+    case 'assistant.periodSummary.moreCompute.prepare': return { commandId, kind: command.kind, objectId: command.jobId, jobId: command.jobId };
+    case 'assistant.periodSummary.moreCompute.submit': return { commandId, kind: command.kind, objectId: command.jobId, jobId: command.jobId };
+    case 'assistant.periodSummary.moreCompute.cancel': return { commandId, kind: command.kind, objectId: command.planId, planId: command.planId };
     case 'chat.submit': return { commandId, kind: command.kind, objectId: command.conversationId };
     case 'chat.refine': return { commandId, kind: command.kind, objectId: command.conversationId, parentTurnId: command.parentTurnId };
     default: return assertNever(command);

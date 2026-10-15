@@ -116,6 +116,12 @@ export function createWorkspaceHttpApi(runtime: OwnedWorkspaceRuntime, backgroun
       return serializeWorkflowRead({ ...readEnvelope(value), ...(value.value ? { plan: { ...value.value.plan, accountId: value.value.accountId,
         connectionGeneration: value.value.connectionGeneration } } : {}) });
     },
+    async readPeriodSummaryResult(admission: WorkspaceHttpAdmission, input: { jobId: string; expectedRevision: number; expectedPrivacyEpoch: number }) {
+      admission.assertCurrent();
+      const value = await runtime.readPeriodSummaryResult(admission, input);
+      admission.assertCurrent();
+      return serializeWorkflowRead({ ...readEnvelope(value), ...(value.value ? { review: value.value } : {}) });
+    },
     inspectCommand(admission: WorkspaceHttpAdmission, commandId: string): JsonValue {
       return serializeCommandResponse(inspectWorkspaceCommand(runtime, admission, commandId));
     },

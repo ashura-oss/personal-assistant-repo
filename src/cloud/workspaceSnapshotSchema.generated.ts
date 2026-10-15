@@ -647,6 +647,10 @@ export const workspaceSnapshotSchema = {
               },
               {
                 "kind": "literal",
+                "value": "low"
+              },
+              {
+                "kind": "literal",
                 "value": "max"
               },
               {

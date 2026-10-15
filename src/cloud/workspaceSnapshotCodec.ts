@@ -184,6 +184,17 @@ function validateSemantics(snapshot: Record<string, unknown>): void {
     if (audio.mediaId !== undefined && (typeof audio.mediaId !== 'string' || !UUID_V4.test(audio.mediaId))) invalid(`state.notes[${index}].audio.mediaId`);
     if (audio.byteLength !== undefined && (!Number.isSafeInteger(audio.byteLength) || (audio.byteLength as number) < 0)) invalid(`state.notes[${index}].audio.byteLength`);
   }
+  const assistantBatchJobs = state.assistantBatchJobs as Record<string, unknown>[];
+  const effortOrder = ['none', 'low', 'medium', 'high', 'max'];
+  for (const [index, job] of assistantBatchJobs.entries()) {
+    const available = job.moreComputeEfforts as string[] | undefined;
+    if (!available) continue;
+    const current = effortOrder.indexOf(String(job.effort));
+    if (available.some((effort) => effort === 'low' && job.kind !== 'period_summary' ||
+        effortOrder.indexOf(effort) <= current || !['low', 'medium', 'high', 'max'].includes(effort))) {
+      invalid(`state.assistantBatchJobs[${index}].moreComputeEfforts`);
+    }
+  }
   const visit = (value: unknown, path: string): void => {
     if (Array.isArray(value)) { value.forEach((item, index) => visit(item, `${path}[${index}]`)); return; }
     if (!value || typeof value !== 'object') return;

@@ -808,6 +808,42 @@ export interface AssistantBatchMoreComputePlan {
   }>;
 }
 
+export interface PeriodSummaryMoreComputePlan {
+  readonly planId: string;
+  readonly jobId: string;
+  readonly kind: 'period_summary';
+  readonly period: 'daily' | 'weekly' | 'monthly' | 'yearly';
+  readonly timeZone: string;
+  readonly interval: Readonly<{ start: string; end: string }>;
+  readonly preparedAt: string;
+  readonly destinationPath: string;
+  readonly priorEffort: 'none' | 'low' | 'medium' | 'high' | 'max';
+  readonly requestedEffort: 'low' | 'medium' | 'high' | 'max';
+  readonly expiresAt: string;
+  readonly sourceCount: number;
+  readonly sourceLabels: readonly string[];
+  readonly priorAccounting: Readonly<{
+    readonly costStatus: 'reported' | 'unavailable';
+    readonly providerReportedCostUsd?: number;
+    readonly byok?: boolean;
+    readonly promptTokens?: number;
+    readonly completionTokens?: number;
+    readonly totalTokens?: number;
+    readonly unknownCharge: boolean;
+  }>;
+  readonly warning: 'Submitting creates a new paid Batch request using the original frozen sources. The saved partial output is evidence only and is not included.';
+}
+
+export interface PeriodSummaryResultReview {
+  readonly jobId: string;
+  readonly period: 'daily' | 'weekly' | 'monthly' | 'yearly';
+  readonly timeZone: string;
+  readonly interval: Readonly<{ start: string; end: string }>;
+  readonly preparedAt: string;
+  readonly markdown: string;
+  readonly sourceReferences: readonly string[];
+}
+
 export interface AppState {
   notes: Note[];
   proposals: Proposal[];
@@ -1051,6 +1087,10 @@ export interface AppController {
   prepareMoreCompute(input: { jobId: string; effort: 'medium' | 'high' | 'max' }): Promise<AssistantBatchMoreComputePlan>;
   cancelMoreCompute(planId: string): void;
   submitMoreCompute(input: { planId: string }): Promise<import('../services/openRouterBatchJobs').AssistantBatchJobDTO & { recoveredConversationId?: string; recoveredTurnId?: string }>;
+  preparePeriodSummaryMoreCompute(input: { jobId: string; effort: 'low' | 'medium' | 'high' | 'max' }): Promise<PeriodSummaryMoreComputePlan>;
+  cancelPeriodSummaryMoreCompute(planId: string): void;
+  submitPeriodSummaryMoreCompute(input: { planId: string; jobId: string }): Promise<import('../services/openRouterBatchJobs').AssistantBatchJobDTO>;
+  readPeriodSummaryResult(jobId: string): Promise<PeriodSummaryResultReview | undefined>;
   submitMailReplyBatch(input: Omit<MailReplyTextGenerationInput, 'forceRefresh'>): Promise<import('../services/openRouterBatchJobs').AssistantBatchJobDTO>;
   submitMailReplyBatchForCommand(input: Omit<MailReplyTextGenerationInput, 'forceRefresh'> & { accountId: string; expectedConnectionGeneration: number }): Promise<import('../services/openRouterBatchJobs').AssistantBatchJobDTO>;
   reviewMailReplyBatch(jobId: string, options?: { operation?: 'draft' | 'send' }): Promise<MailReplyBatchReviewPlan>;

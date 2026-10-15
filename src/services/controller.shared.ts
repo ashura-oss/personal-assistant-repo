@@ -98,7 +98,8 @@ import {
   OpenRouterBatchRequestBuilder, isOpenRouterBatchRequestProfile, buildMoreComputeRequestBody, higherOpenRouterRecoveryEfforts, type OpenRouterBatchBaseOperation, type OpenRouterBatchInspection, type OpenRouterBatchSubmitInput, type PreparedOpenRouterAnalysis,
 } from './openRouter';
 import { parseOpenRouterPeriodSummaryResult, isOpenRouterPeriodSummaryRequestBody, isOpenRouterPeriodSummaryRecoveryRequestBody,
-  validateOpenRouterPeriodSummarySubmission } from './openRouterPeriodSummary';
+  validateOpenRouterPeriodSummarySubmission, buildOpenRouterPeriodSummaryRecoveryRequest, higherOpenRouterPeriodSummaryEfforts,
+  type OpenRouterPeriodSummaryBinding, type OpenRouterSummaryEffort, type OpenRouterTruncatedPeriodSummaryJob } from './openRouterPeriodSummary';
 import type { OpenRouterSpeechAdapterPort } from './openRouterSpeechAdapter.shared';
 import { emptyChatLedger, selectCompletedChatContext, validateChatLedger } from '../chat/ledger';
 import type { ChatConversation, ChatConversationDTO, ChatReplySnapshot, ChatTranscriptTransferPlan, ReadonlyChatLedger } from '../chat/types';
@@ -1570,6 +1571,15 @@ interface MoreComputePlanState {
   readonly preparedAtMs: number;
 }
 
+interface PeriodSummaryMoreComputePlanState {
+  readonly publicPlan: import('../core').PeriodSummaryMoreComputePlan;
+  readonly parent: OpenRouterBatchJob;
+  readonly capturedState: AppState;
+  readonly bootstrapGeneration: number;
+  readonly privacyEpoch?: string;
+  readonly preparedAtMs: number;
+}
+
 class MailReplyContextRefreshRequiredError extends Error {
   constructor() { super('Refresh the selected conversation sources before approving this reply.'); this.name = 'MailReplyContextRefreshRequiredError'; }
 }
@@ -1686,6 +1696,7 @@ export class AppControllerImpl implements AppController {
     readonly bootstrapGeneration: number; readonly privacyEpoch?: string; readonly preparedAtMs: number;
   }>();
   private readonly moreComputePlans = new Map<string, MoreComputePlanState>();
+  private readonly periodSummaryMoreComputePlans = new Map<string, PeriodSummaryMoreComputePlanState>();
   private readonly preparingMoreComputeParents = new Map<string, object>();
   private readonly activeMoreComputeParents = new Set<string>();
   private readonly activeMailReplyBatchReviews = new Set<string>();
@@ -1842,6 +1853,7 @@ export class AppControllerImpl implements AppController {
     this.chatTranscriptTransferPlans.clear();
     this.mailReplyBatchReviewPlans.clear();
     this.moreComputePlans.clear();
+    this.periodSummaryMoreComputePlans.clear();
     this.preparingMoreComputeParents.clear();
     this.activeMailReplyBatchReviews.clear();
     this.mailReplyContextSessions.clear();
@@ -1903,6 +1915,7 @@ export class AppControllerImpl implements AppController {
     this.chatTranscriptTransferPlans.clear();
     this.mailReplyBatchReviewPlans.clear();
     this.moreComputePlans.clear();
+    this.periodSummaryMoreComputePlans.clear();
     // Stop new provider-side admissions while retaining jobs and their leases
     // until each underlying request actually settles.
     for (const job of this.transcriptionJobs.values()) job.controller.abort();
@@ -6137,8 +6150,16 @@ export class AppControllerImpl implements AppController {
       this.mailReplyJobUsesMessage(job, binding.source.accountId, undefined, providerMessageId));
     const affectedJobIds = new Set(affectedJobs.map((job) => job.id));
     const ownActiveMailReviewJobId = affectedJobs.find((job) => this.activeMailReplyBatchReviews.has(job.id))?.id;
-    const sourceRemoval = this.sourceRemovalCommit((job) => isOpenRouterMailReplyContentJob(job) && affectedJobIds.has(job.id),
-      { ...(ownActiveMailReviewJobId ? { ownActiveMailReviewJobId } : {}), retainUncertainMailObservation: true });
+    const sourceIdentity = binding.source.identity;
+    const sourceIdentityKey = [sourceIdentity.providerNamespace, sourceIdentity.clientId, sourceIdentity.subject, sourceIdentity.resourceUserId ?? ''].join(':');
+    const deletedSummarySourceId = observation?.kind === 'deleted'
+      ? `mail:${encodeURIComponent(sourceIdentityKey)}:${encodeURIComponent(providerMessageId)}` : undefined;
+    const sourceRemoval = this.sourceRemovalCommit((job) => {
+      if (isOpenRouterMailReplyContentJob(job)) return affectedJobIds.has(job.id);
+      return Boolean(deletedSummarySourceId && job.kind === 'period_summary' && !job.sourceRemoved && job.summaryBinding?.sources.some((source) =>
+        source.kind === 'mail' && source.id === deletedSummarySourceId));
+    }, { ...(ownActiveMailReviewJobId ? { ownActiveMailReviewJobId } : {}), retainUncertainMailObservation: true,
+      ...(observation?.kind === 'deleted' ? { includePeriodSummaries: true as const } : {}) });
     await this.mutate((state) => {
       guard?.();
       const account = state.accounts.find((item) => item.id === binding.source.accountId);
@@ -7157,6 +7178,8 @@ export class AppControllerImpl implements AppController {
     if (this.activeChatConversationSubmissions.has(id)) throw new Error('Wait for the current chat submission to settle before deleting this conversation.');
     const noteIds = new Set(conversation.turns.map((turn) => turn.noteId));
     const jobIds = new Set(conversation.turns.map((turn) => turn.jobId));
+    const sourceRemoval = this.sourceRemovalCommit((job) => jobIds.has(job.id) ||
+      [...noteIds].some((noteId) => job.sourceVersions?.[`note:${encodeURIComponent(noteId)}`] !== undefined), { includePeriodSummaries: true });
     if (conversation.turns.some((turn) => this.activeBatchJobInspections.has(turn.jobId)) || [...noteIds].some((noteId) => this.activeBatchNoteOperations.has(noteId))) {
       throw new Error('Wait for the current chat request to settle before deleting this conversation.');
     }
@@ -7178,8 +7201,7 @@ export class AppControllerImpl implements AppController {
       draft.knowledge.suggestions = draft.knowledge.suggestions.filter((suggestion) =>
         !noteIds.has(suggestion.sourceNoteId ?? '') || suggestion.status !== 'pending');
     }, undefined,
-    () => validateOpenRouterBatchLedger({ version: 1, jobs: this.assistantBatchLedger.jobs.map((job) =>
-      jobIds.has(job.id) ? tombstoneOpenRouterBatchJob(job, now(), true) : job) }),
+    (draft) => sourceRemoval.batch(draft),
     () => validateChatLedger({ version: 1, conversations: this.assistantChatLedger.conversations.filter((item) => item.id !== id) }));
     await this.reconcileReminderAlerts();
   }
@@ -7385,7 +7407,7 @@ export class AppControllerImpl implements AppController {
   }
 
   private moreComputeChild(parentJobId: string): OpenRouterBatchJob | undefined {
-    return this.assistantBatchLedger.jobs.find((job) => job.recoveryBinding?.parentJobId === parentJobId &&
+    return this.assistantBatchLedger.jobs.find((job) => (job.recoveryBinding?.parentJobId === parentJobId || job.summaryRecoveryBinding?.parentJobId === parentJobId) &&
       ['preparing', 'submitting', 'submission_unknown', 'queued', 'processing', 'cleanup_pending'].includes(job.status));
   }
 
@@ -7395,6 +7417,11 @@ export class AppControllerImpl implements AppController {
       if (at < plan.preparedAtMs || at >= Date.parse(plan.publicPlan.expiresAt) ||
           plan.bootstrapGeneration !== this.bootstrapGeneration || plan.capturedState !== this.state ||
           plan.privacyEpoch !== this.integration.privacySession?.epoch) this.moreComputePlans.delete(planId);
+    }
+    for (const [planId, plan] of this.periodSummaryMoreComputePlans) {
+      if (at < plan.preparedAtMs || at >= Date.parse(plan.publicPlan.expiresAt) ||
+          plan.bootstrapGeneration !== this.bootstrapGeneration || plan.capturedState !== this.state ||
+          plan.privacyEpoch !== this.integration.privacySession?.epoch) this.periodSummaryMoreComputePlans.delete(planId);
     }
   }
 
@@ -7407,8 +7434,9 @@ export class AppControllerImpl implements AppController {
     const child = this.moreComputeChild(job.id);
     const retainedCutoff = job.kind !== 'period_summary' || (typeof job.truncatedResultText === 'string' && typeof job.truncatedResultSha256 === 'string');
     const available = job.status === 'result_truncated' && !job.sourceRemoved && !this.assistantBatchLedgerMalformed && !child && retainedCutoff;
-    return Object.freeze({ ...dto, canRecoverMoreCompute: available && this.moreComputeEfforts(job).length > 0,
-      moreComputeEfforts: this.moreComputeEfforts(job), ...(child ? { pendingRecoveryChildId: child.id } : {}) });
+    const efforts = job.kind === 'period_summary' ? higherOpenRouterPeriodSummaryEfforts(job.effort) : this.moreComputeEfforts(job);
+    return Object.freeze({ ...dto, canRecoverMoreCompute: available && efforts.length > 0,
+      moreComputeEfforts: efforts, ...(child ? { pendingRecoveryChildId: child.id } : {}) });
   }
 
   private withBatchEffort(body: string, effort: 'none' | 'low' | 'medium' | 'high' | 'max'): string {
@@ -7680,6 +7708,279 @@ export class AppControllerImpl implements AppController {
     } finally {
       if (this.preparingMoreComputeParents.get(parent.id) === preparationTicket) this.preparingMoreComputeParents.delete(parent.id);
     }
+  }
+
+  private async verifyPeriodSummaryCutoff(job: OpenRouterBatchJob): Promise<OpenRouterTruncatedPeriodSummaryJob> {
+    if (job.kind !== 'period_summary' || job.status !== 'result_truncated' || job.sourceRemoved || !job.batchId ||
+        !job.summaryBinding || typeof job.requestBody !== 'string' || typeof job.truncatedResultText !== 'string' ||
+        typeof job.truncatedResultSha256 !== 'string' || !job.requestSha256) {
+      throw new Error('This period summary has no intact cutoff evidence to recover.');
+    }
+    const [requestDigest, cutoffDigest] = await Promise.all([
+      this.crypto.sha256(job.requestBody), this.crypto.sha256(job.truncatedResultText),
+    ]);
+    const requestValid = requestDigest === job.requestSha256 && (job.summaryRecoveryBinding
+      ? await isOpenRouterPeriodSummaryRecoveryRequestBody(job.requestBody, job.summaryBinding, job.summaryRecoveryBinding,
+        job.id, job.customId, (value) => this.crypto.sha256(value))
+      : await isOpenRouterPeriodSummaryRequestBody(job.requestBody, job.summaryBinding, (value) => this.crypto.sha256(value)));
+    if (!requestValid || cutoffDigest !== job.truncatedResultSha256) throw new Error('The saved cutoff or frozen request failed integrity validation.');
+    return Object.freeze({ id: job.id, customId: job.customId, status: 'result_truncated', failureCode: 'result_truncated',
+      requestProfileVersion: 6, operation: 'period_summary', effort: job.effort as OpenRouterSummaryEffort, requestBody: job.requestBody,
+      requestSha256: job.requestSha256, resultText: job.truncatedResultText, resultSha256: job.truncatedResultSha256,
+      binding: job.summaryBinding, ...(job.summaryRecoveryBinding ? { recoveryBinding: job.summaryRecoveryBinding } : {}) });
+  }
+
+  /** Proves every captured profile-6 locator still maps to a live typed source before paid recovery. */
+  private periodSummaryRecoverySourcesArePresent(binding: OpenRouterPeriodSummaryBinding, state: AppState): boolean {
+    if (!binding.sources.length) return false;
+    const decodeSegment = (value: string): string | undefined => {
+      try { const decoded = decodeURIComponent(value); return encodeURIComponent(decoded) === value ? decoded : undefined; }
+      catch { return undefined; }
+    };
+    return binding.sources.every((source) => {
+      if (source.kind === 'note') {
+        const match = /^note:([^:]+)$/.exec(source.id); const id = match && decodeSegment(match[1]!);
+        if (!id) return false;
+        return state.notes.some((item) => item.id === id);
+      }
+      if (source.kind === 'task') {
+        // Aggregate task snapshots do not retain exact membership, so a deleted
+        // task could remain embedded in the frozen text without a typed locator.
+        if (source.id === 'task:index') return false;
+        const match = /^task:([^:]+)$/.exec(source.id); const id = match && decodeSegment(match[1]!);
+        return Boolean(id && state.tasks.some((item) => item.id === id));
+      }
+      if (source.kind === 'document') {
+        const path = source.id.startsWith('doc:') ? source.id.slice(4) : '';
+        if (!path || path !== source.documentPath || path.startsWith('/') || path.includes('\\') || path.split('/').some((part) => !part || part === '.' || part === '..')) return false;
+        return state.documents.some((item) => item.path === path);
+      }
+      if (source.kind === 'person' || source.kind === 'project') {
+        const prefix = `knowledge:${source.kind}:`;
+        const id = source.id.startsWith(prefix) ? source.id.slice(prefix.length) : '';
+        return Boolean(id && getKnowledgeEntity(state.knowledge, source.kind, id));
+      }
+      if (source.kind === 'mail') {
+        const match = /^mail:([^:]+):([^:]+)$/.exec(source.id);
+        const identity = match && decodeSegment(match[1]!); const providerMessageId = match && decodeSegment(match[2]!);
+        if (!identity || !providerMessageId) return false;
+        const message = state.mailbox.find((item) => item.providerMessageId === providerMessageId && item.identityKey === `${identity}:${providerMessageId}` &&
+          item.verifiedIdentityKey === identity && !item.providerDeletedAt);
+        return Boolean(message && state.accounts.some((account) => account.id === message.accountId && account.connected && account.authStatus === 'connected' &&
+          identityKey(account) === identity && (account.connectionGeneration ?? 0) === (message.connectionGeneration ?? 0) && account.capabilities?.includes('mail.read')));
+      }
+      if (source.kind === 'calendar') {
+        const eventMatch = /^calendar-event:([^:]+):([^:]+):([^:]+)$/.exec(source.id);
+        if (eventMatch) {
+          const identity = decodeSegment(eventMatch[1]!); const providerCalendarId = decodeSegment(eventMatch[2]!); const providerEventId = decodeSegment(eventMatch[3]!);
+          if (!identity || !providerCalendarId || !providerEventId) return false;
+          return state.calendarEvents.some((event) => event.providerEventId === providerEventId && event.verifiedIdentityKey === identity && !event.providerDeletedAt &&
+            state.calendars.some((calendar) => calendar.id === event.calendarId && calendar.accountId === event.accountId && calendar.connected &&
+              (calendar.providerId ?? calendar.id) === providerCalendarId && state.accounts.some((account) => account.id === calendar.accountId && account.connected &&
+                account.authStatus === 'connected' && identityKey(account) === identity && (account.connectionGeneration ?? 0) === (event.connectionGeneration ?? 0) &&
+                account.capabilities?.includes('calendar.read'))));
+        }
+        const calendarMatch = /^calendar:([^:]+):([^:]+)$/.exec(source.id);
+        if (calendarMatch) {
+          const identity = decodeSegment(calendarMatch[1]!); const providerId = decodeSegment(calendarMatch[2]!);
+          if (!identity || !providerId) return false;
+          return state.calendars.some((calendar) => calendar.connected && (calendar.providerId ?? calendar.id) === providerId &&
+            state.accounts.some((account) => account.id === calendar.accountId && account.connected && account.authStatus === 'connected' && identityKey(account) === identity));
+        }
+        // Calendar snapshots aggregate events; calendar presence alone does not
+        // prove that every event represented by the frozen snapshot remains live.
+        if (source.id.startsWith('calendar:index:')) return false;
+        const deviceMatch = /^device_calendar_event:([^:]+):([^:]+):([^:]+):([^:]+)$/.exec(source.id);
+        if (deviceMatch) {
+          const installationId = decodeSegment(deviceMatch[1]!); const calendarId = decodeSegment(deviceMatch[2]!);
+          const nativeEventId = decodeSegment(deviceMatch[3]!); const occurrenceStart = decodeSegment(deviceMatch[4]!);
+          const device = state.deviceCalendars;
+          return Boolean(installationId && calendarId && nativeEventId && occurrenceStart && device.enabled && state.deviceCalendarAccess.status === 'full_access' &&
+            device.selectedCalendarIds.includes(calendarId) && this.deviceCalendarGenerationIsCurrent(state, device.generation, installationId) &&
+            device.events.some((event) => event.calendarId === calendarId && event.nativeEventId === nativeEventId && event.occurrenceStart === occurrenceStart &&
+              event.generation === device.generation && !event.cancelled));
+        }
+      }
+      // In particular, device_calendar:index and unsupported source kinds fail
+      // closed until their producer carries a typed membership proof.
+      return false;
+    });
+  }
+
+  async preparePeriodSummaryMoreCompute(input: { jobId: string; effort: 'low' | 'medium' | 'high' | 'max' }): Promise<import('../core').PeriodSummaryMoreComputePlan> {
+    if (!hasExactPlainDataKeys(input, ['jobId', 'effort']) || typeof input.jobId !== 'string' || !input.jobId ||
+        !['low', 'medium', 'high', 'max'].includes(input.effort)) throw new Error('Choose a supported higher reasoning effort.');
+    const jobId = input.jobId;
+    const effort = input.effort;
+    const initialState = this.state;
+    const generation = this.bootstrapGeneration;
+    const privacyEpoch = this.integration.privacySession?.epoch;
+    this.pruneMoreComputePlans();
+    await this.transactionQueue;
+    await this.assertPrivacySessionCurrent();
+    if (this.state !== initialState || this.bootstrapGeneration !== generation || this.integration.privacySession?.epoch !== privacyEpoch) {
+      throw new Error('The cutoff summary or workspace changed. Review it again.');
+    }
+    if (!this.loaded || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired || this.assistantBatchLedgerMalformed) {
+      throw new Error('Refresh local data before reviewing this cutoff summary.');
+    }
+    const capturedState = initialState;
+    if (this.store.assertCurrent) await this.store.assertCurrent();
+    const parent = this.assistantBatchLedger.jobs.find((job) => job.id === jobId);
+    if (!parent || parent.kind !== 'period_summary' || parent.status !== 'result_truncated' || parent.sourceRemoved ||
+        this.moreComputeChild(parent.id) || this.activeMoreComputeParents.has(parent.id)) throw new Error('This cutoff summary is not available for another request.');
+    if (!parent.summaryBinding || !this.periodSummaryRecoverySourcesArePresent(parent.summaryBinding, this.state)) {
+      throw new Error('A captured source is no longer available for paid recovery.');
+    }
+    if (!higherOpenRouterPeriodSummaryEfforts(parent.effort as OpenRouterSummaryEffort).includes(effort)) {
+      throw new Error('Choose a strictly higher supported reasoning effort.');
+    }
+    const ticket = {};
+    this.preparingMoreComputeParents.set(parent.id, ticket);
+    for (const [planId, plan] of this.periodSummaryMoreComputePlans) if (plan.parent.id === parent.id) this.periodSummaryMoreComputePlans.delete(planId);
+    try {
+      const cutoff = await this.verifyPeriodSummaryCutoff(parent);
+      await this.assertPrivacySessionCurrent();
+      if (this.store.assertCurrent) await this.store.assertCurrent();
+      if (!this.loaded || this.state !== capturedState || this.bootstrapGeneration !== generation || this.integration.privacySession?.epoch !== privacyEpoch ||
+          this.mailAlertRefreshRequired || this.assistantBatchLedger.jobs.find((job) => job.id === parent.id) !== parent ||
+          this.moreComputeChild(parent.id) || this.preparingMoreComputeParents.get(parent.id) !== ticket ||
+          !this.periodSummaryRecoverySourcesArePresent(parent.summaryBinding!, this.state)) {
+        throw new Error('The cutoff summary or workspace changed. Review it again.');
+      }
+      const preparedAtMs = Date.now();
+      const planId = this.newId();
+      const expiresAt = new Date(preparedAtMs + 5 * 60_000).toISOString();
+      const binding = parent.summaryBinding!;
+      const plan: import('../core').PeriodSummaryMoreComputePlan = Object.freeze({ planId, jobId: parent.id, kind: 'period_summary',
+        period: binding.period, timeZone: binding.timeZone, interval: Object.freeze({ ...binding.localInterval }), preparedAt: binding.preparedAt,
+        destinationPath: binding.destination.path,
+        priorEffort: parent.effort as OpenRouterSummaryEffort, requestedEffort: effort, expiresAt,
+        sourceCount: binding.sources.length, sourceLabels: Object.freeze(binding.sources.map((source) =>
+          `${source.role.replaceAll('_', ' ')} · ${source.kind.replaceAll('_', ' ')} · ${source.effectiveAt.slice(0, 10)}`)),
+        priorAccounting: Object.freeze({ costStatus: parent.accounting?.providerReportedCostUsd !== undefined ? 'reported' : 'unavailable',
+          ...(parent.accounting?.providerReportedCostUsd !== undefined ? { providerReportedCostUsd: parent.accounting.providerReportedCostUsd } : {}),
+          ...(parent.accounting?.byok !== undefined ? { byok: parent.accounting.byok } : {}),
+          ...(parent.accounting?.promptTokens !== undefined ? { promptTokens: parent.accounting.promptTokens } : {}),
+          ...(parent.accounting?.completionTokens !== undefined ? { completionTokens: parent.accounting.completionTokens } : {}),
+          ...(parent.accounting?.totalTokens !== undefined ? { totalTokens: parent.accounting.totalTokens } : {}), unknownCharge: parent.unknownCharge }),
+        warning: 'Submitting creates a new paid Batch request using the original frozen sources. The saved partial output is evidence only and is not included.' });
+      await this.assertPrivacySessionCurrent();
+      if (this.store.assertCurrent) await this.store.assertCurrent();
+      if (!this.loaded || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired || this.assistantBatchLedgerMalformed ||
+          this.state !== capturedState || this.bootstrapGeneration !== generation || this.integration.privacySession?.epoch !== privacyEpoch ||
+          this.assistantBatchLedger.jobs.find((job) => job.id === parent.id) !== parent || this.moreComputeChild(parent.id) ||
+          this.preparingMoreComputeParents.get(parent.id) !== ticket || !this.periodSummaryRecoverySourcesArePresent(parent.summaryBinding!, this.state) ||
+          Date.now() < preparedAtMs || Date.now() >= Date.parse(expiresAt)) {
+        throw new Error('The cutoff summary or workspace changed. Review it again.');
+      }
+      this.periodSummaryMoreComputePlans.set(planId, { publicPlan: plan, parent, capturedState, bootstrapGeneration: generation,
+        ...(privacyEpoch ? { privacyEpoch } : {}), preparedAtMs });
+      void cutoff;
+      return plan;
+    } finally {
+      if (this.preparingMoreComputeParents.get(parent.id) === ticket) this.preparingMoreComputeParents.delete(parent.id);
+    }
+  }
+
+  cancelPeriodSummaryMoreCompute(planId: string): void { this.periodSummaryMoreComputePlans.delete(planId); }
+
+  async submitPeriodSummaryMoreCompute(input: { planId: string; jobId: string }): Promise<AssistantBatchJobDTO> {
+    if (!hasExactPlainDataKeys(input, ['planId', 'jobId']) || typeof input.planId !== 'string' || !input.planId ||
+        typeof input.jobId !== 'string' || !input.jobId) throw new Error('The summary review is no longer current. Prepare a new review.');
+    const planId = input.planId;
+    const jobId = input.jobId;
+    const initialState = this.state;
+    const initialGeneration = this.bootstrapGeneration;
+    const initialPrivacyEpoch = this.integration.privacySession?.epoch;
+    this.pruneMoreComputePlans();
+    const plan = this.periodSummaryMoreComputePlans.get(planId);
+    if (!plan || plan.parent.id !== jobId || this.activeMoreComputeParents.has(plan.parent.id)) throw new Error('The summary review is no longer current. Prepare a new review.');
+    const at = Date.now();
+    if (at < plan.preparedAtMs || at >= Date.parse(plan.publicPlan.expiresAt)) {
+      this.periodSummaryMoreComputePlans.delete(planId);
+      throw new Error('The summary review expired. Prepare a new review.');
+    }
+    this.periodSummaryMoreComputePlans.delete(planId);
+    this.activeMoreComputeParents.add(plan.parent.id);
+    try {
+      await this.transactionQueue;
+      await this.assertPrivacySessionCurrent();
+      if (!this.loaded || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired || this.assistantBatchLedgerMalformed ||
+          this.state !== initialState || this.bootstrapGeneration !== initialGeneration || this.integration.privacySession?.epoch !== initialPrivacyEpoch ||
+          this.state !== plan.capturedState || this.bootstrapGeneration !== plan.bootstrapGeneration || this.integration.privacySession?.epoch !== plan.privacyEpoch) {
+        throw new Error('The workspace changed. Prepare a fresh summary review.');
+      }
+      const parent = this.assistantBatchLedger.jobs.find((job) => job.id === plan.parent.id);
+      if (parent !== plan.parent || parent.kind !== 'period_summary' || parent.status !== 'result_truncated' || parent.sourceRemoved || this.moreComputeChild(parent.id) ||
+          !parent.summaryBinding || !this.periodSummaryRecoverySourcesArePresent(parent.summaryBinding, this.state)) {
+        throw new Error('The cutoff summary changed. Prepare a fresh review.');
+      }
+      const cutoff = await this.verifyPeriodSummaryCutoff(parent);
+      const childId = this.newId();
+      const built = await buildOpenRouterPeriodSummaryRecoveryRequest({ parent: cutoff, destination: parent.summaryBinding!.destination,
+        childId, childCustomId: childId, effort: plan.publicPlan.requestedEffort,
+        regenerationInstructions: 'Generate a complete replacement summary from the original frozen sources. Do not reuse or continue the saved cutoff text.' },
+      (value) => this.crypto.sha256(value));
+      await this.assertPrivacySessionCurrent();
+      if (!this.loaded || this.state !== plan.capturedState || this.bootstrapGeneration !== plan.bootstrapGeneration ||
+          this.integration.privacySession?.epoch !== plan.privacyEpoch || Date.now() < plan.preparedAtMs || Date.now() >= Date.parse(plan.publicPlan.expiresAt) ||
+          this.assistantBatchLedger.jobs.find((job) => job.id === parent.id) !== parent || this.moreComputeChild(parent.id) ||
+          !this.periodSummaryRecoverySourcesArePresent(parent.summaryBinding!, this.state)) {
+        throw new Error('The cutoff summary or workspace changed. Prepare a fresh review.');
+      }
+      const timestamp = now();
+      const childDraft: PeriodSummaryContentJob = Object.freeze({ id: childId, customId: childId, kind: 'period_summary', status: 'preparing',
+        createdAt: timestamp, updatedAt: timestamp, model: OPENROUTER_BATCH_MODEL, effort: plan.publicPlan.requestedEffort,
+        requestSha256: built.recoveryBinding.requestSha256, unknownCharge: false, operation: 'period_summary', requestProfileVersion: 6,
+        inputPolicyVersion: 2, outputPolicyVersion: 2, requestBytes: built.requestBytes, requestBody: built.body,
+        summaryBinding: built.binding, summaryRecoveryBinding: built.recoveryBinding });
+      await this.mutate(() => {
+        if (!this.loaded || this.state !== plan.capturedState || this.bootstrapGeneration !== plan.bootstrapGeneration ||
+            this.integration.privacySession?.epoch !== plan.privacyEpoch || Date.now() < plan.preparedAtMs || Date.now() >= Date.parse(plan.publicPlan.expiresAt) ||
+            this.assistantBatchLedger.jobs.find((job) => job.id === parent.id) !== parent || this.moreComputeChild(parent.id)) {
+          throw new Error('The cutoff summary changed before the new request could be saved.');
+        }
+        return undefined;
+      }, undefined, () => validateOpenRouterBatchLedger({ version: 1, jobs: [...this.assistantBatchLedger.jobs, childDraft] }));
+      const retained = this.assistantBatchLedger.jobs.find((job) => job.id === childId);
+      if (!retained || retained.kind !== 'period_summary' || retained.status !== 'preparing') throw new Error('The new summary request could not be retained.');
+      return await this.dispatchPreparedBatch(retained as PeriodSummaryContentJob, plan.bootstrapGeneration, this.state);
+    } finally { this.activeMoreComputeParents.delete(plan.parent.id); }
+  }
+
+  async readPeriodSummaryResult(jobId: string): Promise<import('../core').PeriodSummaryResultReview | undefined> {
+    if (typeof jobId !== 'string' || !jobId) throw new Error('A saved summary job is required.');
+    const capturedJobId = jobId;
+    const initialState = this.state;
+    const generation = this.bootstrapGeneration;
+    const privacyEpoch = this.integration.privacySession?.epoch;
+    await this.transactionQueue;
+    await this.assertPrivacySessionCurrent();
+    if (this.state !== initialState || this.bootstrapGeneration !== generation || this.integration.privacySession?.epoch !== privacyEpoch) {
+      throw new Error('The saved summary changed. Refresh the review.');
+    }
+    if (!this.loaded || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired || this.assistantBatchLedgerMalformed) {
+      throw new Error('Refresh local data before reviewing a saved summary.');
+    }
+    const capturedState = initialState;
+    const job = this.assistantBatchLedger.jobs.find((candidate) => candidate.id === capturedJobId);
+    if (!job || job.kind !== 'period_summary' || job.sourceRemoved || job.status !== 'completed' || !job.summaryBinding ||
+        typeof job.resultText !== 'string' || typeof job.resultSha256 !== 'string') return undefined;
+    const [requestDigest, resultDigest] = await Promise.all([this.crypto.sha256(job.requestBody!), this.crypto.sha256(job.resultText)]);
+    const requestValid = requestDigest === job.requestSha256 && (job.summaryRecoveryBinding
+      ? await isOpenRouterPeriodSummaryRecoveryRequestBody(job.requestBody, job.summaryBinding, job.summaryRecoveryBinding,
+        job.id, job.customId, (value) => this.crypto.sha256(value))
+      : await isOpenRouterPeriodSummaryRequestBody(job.requestBody, job.summaryBinding, (value) => this.crypto.sha256(value)));
+    if (!requestValid || resultDigest !== job.resultSha256) throw new Error('The saved summary failed integrity validation.');
+    const result = parseOpenRouterPeriodSummaryResult(job.resultText, job.summaryBinding);
+    if (!this.loaded || this.state !== capturedState || this.bootstrapGeneration !== generation || this.integration.privacySession?.epoch !== privacyEpoch ||
+        this.assistantBatchLedger.jobs.find((candidate) => candidate.id === job.id) !== job) throw new Error('The saved summary changed. Refresh the review.');
+    const refs = new Map(job.summaryBinding.sources.map((source) => [source.id,
+      `${source.kind.replaceAll('_', ' ')} · ${source.effectiveAt.slice(0, 10)}`]));
+    return Object.freeze({ jobId: job.id, period: job.summaryBinding.period, timeZone: job.summaryBinding.timeZone,
+      interval: Object.freeze({ ...job.summaryBinding.localInterval }), preparedAt: job.summaryBinding.preparedAt, markdown: result.markdown,
+      sourceReferences: Object.freeze(result.sourceReferences.map((id) => refs.get(id) ?? 'Saved source')) });
   }
 
   private async moreComputePreview(job: OpenRouterBatchJob, state: AppState, prepared?: PreparedOpenRouterAnalysis): Promise<AssistantBatchMoreComputePlan['preview']> {
@@ -8263,6 +8564,7 @@ export class AppControllerImpl implements AppController {
   private sourceRemovalCommit(predicate: (job: OpenRouterBatchJob) => boolean, options: {
     ownActiveMailReviewJobId?: string;
     retainUncertainMailObservation?: true;
+    includePeriodSummaries?: true;
   } = {}): {
     batch: (draft: AppState) => OpenRouterBatchLedger | undefined;
     chat: () => ReadonlyChatLedger | undefined;
@@ -8271,8 +8573,26 @@ export class AppControllerImpl implements AppController {
     return {
       batch: (draft) => {
         this.assertBatchLedgerCanDropContent();
+        const summaryJobAffected = (job: OpenRouterBatchJob): boolean => {
+          if (job.kind !== 'period_summary' || job.sourceRemoved || !job.summaryBinding) return false;
+          const sourceVersions: Record<string, string> = {};
+          for (const source of job.summaryBinding.sources) {
+            const version = source.version ?? String(source.revision ?? 0);
+            sourceVersions[source.id] = version;
+            // Legacy note-deletion predicates use the decoded note ID, while
+            // profile-6 bindings retain the canonical encoded locator.
+            if (source.kind === 'note') {
+              const match = /^note:([^:]+)$/.exec(source.id);
+              if (match) {
+                try { sourceVersions[`note:${decodeURIComponent(match[1]!)}`] = version; } catch { /* invalid locator cannot match */ }
+              }
+            }
+          }
+          return predicate({ ...job, sourceVersions } as OpenRouterBatchJob);
+        };
         const directlyAffected = this.assistantBatchLedger.jobs.filter((job) =>
-          (isOpenRouterBatchContentJob(job) || isOpenRouterMailReplyContentJob(job)) && predicate(job));
+          ((isOpenRouterBatchContentJob(job) || isOpenRouterMailReplyContentJob(job)) && predicate(job)) ||
+          (options.includePeriodSummaries === true && summaryJobAffected(job)));
         if (!directlyAffected.length) return undefined;
         const affectedJobIds = new Set(directlyAffected.map((job) => job.id));
         const affectedTurnIds = new Set<string>();
@@ -8287,8 +8607,11 @@ export class AppControllerImpl implements AppController {
         while (expanded) {
           expanded = false;
           for (const job of this.assistantBatchLedger.jobs) {
-            if (affectedJobIds.has(job.id) || !(isOpenRouterBatchContentJob(job) || isOpenRouterMailReplyContentJob(job))) continue;
-            const recoveryParentAffected = job.recoveryBinding && affectedJobIds.has(job.recoveryBinding.parentJobId);
+            const summaryContentJob = job.kind === 'period_summary' && !job.sourceRemoved && job.status !== 'source_removed' &&
+              Boolean(job.summaryBinding) && typeof job.requestBody === 'string';
+            if (affectedJobIds.has(job.id) || !(isOpenRouterBatchContentJob(job) || isOpenRouterMailReplyContentJob(job) || summaryContentJob)) continue;
+            const recoveryParentAffected = (job.recoveryBinding && affectedJobIds.has(job.recoveryBinding.parentJobId)) ||
+              (job.kind === 'period_summary' && job.summaryRecoveryBinding && affectedJobIds.has(job.summaryRecoveryBinding.parentJobId));
             const chatParentAffected = isOpenRouterBatchContentJob(job) && job.chatBinding &&
               (Boolean(job.chatBinding.recoveryParentTurnId && affectedTurnIds.has(job.chatBinding.recoveryParentTurnId)) ||
                 job.chatBinding.context.some((reference) => affectedTurnIds.has(reference.turnId)) ||
@@ -8301,6 +8624,9 @@ export class AppControllerImpl implements AppController {
           }
         }
         const affectedJobs = this.assistantBatchLedger.jobs.filter((job) => affectedJobIds.has(job.id));
+        for (const [planId, plan] of this.periodSummaryMoreComputePlans) {
+          if (affectedJobIds.has(plan.parent.id)) this.periodSummaryMoreComputePlans.delete(planId);
+        }
         const affectedMailJobs = affectedJobs.filter(isOpenRouterMailReplyContentJob);
         for (const job of affectedMailJobs) this.mailReplyContextProofs.delete(job.id);
         if (affectedMailJobs.length && this.hasUnresolvedDispatchRecoveryEvidence() && !options.retainUncertainMailObservation) {
@@ -11090,7 +11416,10 @@ export class AppControllerImpl implements AppController {
     this.assertKnowledgeWritable();
     if (this.activeBatchNoteOperations.size) throw new Error('A Batch request is still using saved context. Try again after it finishes.');
     let removesCapturedKnowledge = false;
-    const sourceRemoval = this.sourceRemovalCommit((job) => job.sourceVersions?.[`knowledge:${command.entityKind}:${command.entityId}`] !== undefined);
+    const sourceRemoval = this.sourceRemovalCommit(
+      (job) => job.sourceVersions?.[`knowledge:${command.entityKind}:${command.entityId}`] !== undefined,
+      removesSource ? { includePeriodSummaries: true } : {},
+    );
     return this.mutate((state) => {
       this.assertKnowledgeWritable();
       if (this.activeBatchNoteOperations.size) throw new Error('A Batch request is still using saved context. Try again after it finishes.');
@@ -12949,6 +13278,7 @@ export class AppControllerImpl implements AppController {
         }
       };
       const changedReplySourceIds = new Set<string>();
+      const deletedReplySourceIds = new Set<string>();
       const contextSourcesByProviderId = new Map<string, MailReplySourceSnapshot[]>();
       for (const job of this.assistantBatchLedger.jobs) if (isOpenRouterMailReplyContentJob(job) && job.mailReplyBinding.version === 2 &&
           job.mailReplyBinding.source.accountId === accountId) {
@@ -12961,11 +13291,22 @@ export class AppControllerImpl implements AppController {
         }
       }
       const sourceRemoval = this.sourceRemovalCommit(
-        (job) => isOpenRouterMailReplyContentJob(job) && Boolean(job.mailReplyBinding &&
-          (changedReplySourceIds.has(job.mailReplyBinding.messageId) || this.mailReplyJobUsesMessage(job, accountId,
-            undefined, [...changedReplySourceIds].find((id) => id === job.mailReplyBinding.source.providerMessageId ||
-              job.mailReplyBinding.context?.some((member) => member.source.providerMessageId === id))))),
-        { retainUncertainMailObservation: true });
+        (job) => {
+          if (isOpenRouterMailReplyContentJob(job)) return Boolean(job.mailReplyBinding &&
+            (changedReplySourceIds.has(job.mailReplyBinding.messageId) || this.mailReplyJobUsesMessage(job, accountId,
+              undefined, [...changedReplySourceIds].find((id) => id === job.mailReplyBinding.source.providerMessageId ||
+                job.mailReplyBinding.context?.some((member) => member.source.providerMessageId === id)))));
+          if (job.kind !== 'period_summary' || job.sourceRemoved || !job.summaryBinding) return false;
+          return job.summaryBinding.sources.some((source) => {
+            if (source.kind !== 'mail') return false;
+            const parts = /^mail:([^:]+):([^:]+)$/.exec(source.id);
+            if (!parts) return false;
+            try {
+              return decodeURIComponent(parts[1]!) === identityKey(immutableAccount) && deletedReplySourceIds.has(decodeURIComponent(parts[2]!));
+            } catch { return false; }
+          });
+        },
+        { retainUncertainMailObservation: true, includePeriodSummaries: true });
       const persistPage = async (items: MessageSummary[], cursor: string | undefined, metadata: MessageWindowPageMetadata) => this.mutate((state) => {
         ensureCurrent(state);
         if (metadata.window.from !== immutableWindow.from || metadata.window.to !== immutableWindow.through || metadata.queryFingerprint !== immutableWindow.queryFingerprint) {
@@ -13000,6 +13341,7 @@ export class AppControllerImpl implements AppController {
         let unavailableCount = 0;
         for (const id of metadata.unavailableIds) {
           if (!id) continue;
+          deletedReplySourceIds.add(id);
           const identityKeyValue = `${key}:${id}`;
           const prior = state.mailbox.find((entry) => entry.accountId === accountId && entry.identityKey === identityKeyValue);
           const deletedAt = prior?.providerDeletedAt ?? timestamp;
@@ -13768,7 +14110,8 @@ export class AppControllerImpl implements AppController {
     if (this.activeBatchNoteOperations.has(id)) throw new Error('A Batch request is still using this note. Try again after it finishes.');
     const audioUri = this.snapshot.notes.find((note) => note.id === id)?.audioUri;
     const sourceRemoval = this.sourceRemovalCommit((job) => job.noteId === id || job.sourceVersions?.[`note:${id}`] !== undefined ||
-      job.chatBinding?.transcriptSource?.noteId === id || job.mailReplyBinding?.note?.id === id);
+      job.sourceVersions?.[`note:${encodeURIComponent(id)}`] !== undefined ||
+      job.chatBinding?.transcriptSource?.noteId === id || job.mailReplyBinding?.note?.id === id, { includePeriodSummaries: true });
     await this.mutate(async (state) => {
       if (this.activeBatchNoteOperations.has(id)) throw new Error('A Batch request is still using this note. Try again after it finishes.');
       if (state.proposals.some((proposal) => proposal.noteId === id && (proposal.kind !== 'reminder' && ['dispatching', 'unknown'].includes(proposal.status)))) throw new Error('Wait for the in-progress external action result before deleting this note.');
