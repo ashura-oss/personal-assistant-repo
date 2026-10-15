@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import {
   assistantBatchJobDTO, isOpenRouterBatchContentJob, tombstoneOpenRouterBatchJob,
@@ -5,6 +6,7 @@ import {
 } from '../src/services/openRouterBatchJobs';
 import { OPENROUTER_BATCH_MODEL } from '../src/services/openRouter';
 import { assistantChatRefinementSchemaV2, assistantResponseSchema, assistantResponseSchemaV2, assistantResponseSchemaV3 } from '../src/assistant';
+import { buildOpenRouterPeriodSummaryRequest, createOpenRouterPeriodSummaryBinding } from '../src/services/openRouterPeriodSummary';
 
 const operationId = '20000000-0000-4000-8000-000000000001';
 function bodyFor(version: 1 | 2 | 5): string {
@@ -31,7 +33,59 @@ function contentJob(overrides: Partial<OpenRouterBatchJob> = {}): OpenRouterBatc
   };
 }
 
+async function summaryJob(): Promise<OpenRouterBatchJob> {
+  const digest = async (value: string) => createHash('sha256').update(value, 'utf8').digest('hex');
+  const sourceText = 'Private source content for the ledger contract test.';
+  const binding = await createOpenRouterPeriodSummaryBinding({
+    version: 1, requestProfileVersion: 6, operation: 'period_summary', policyId: '11111111-1111-4111-8111-111111111111',
+    policyRevision: 1, policyDigest: 'a'.repeat(64), occurrenceId: '22222222-2222-4222-8222-222222222222',
+    period: 'daily', timeZone: 'UTC', localInterval: { start: '2026-06-30', end: '2026-07-01' },
+    startUtc: '2026-06-30T00:00:00.000Z', endUtc: '2026-07-01T00:00:00.000Z', preparedAt: '2026-07-01T01:00:00.000Z',
+    sources: [{ id: 'event-1', role: 'event', kind: 'note', revision: 1, content: sourceText, contentSha256: await digest(sourceText),
+      effectiveAt: '2026-06-30T12:00:00.000Z', observedAt: '2026-07-01T01:00:00.000Z' }],
+    destination: { kind: 'absent', documentId: null, path: 'reports/daily.md', expectedRevision: null, expectedAbsenceGeneration: 0 },
+    instructions: 'Summarize supplied events.', effort: 'low',
+  }, digest);
+  const prepared = await buildOpenRouterPeriodSummaryRequest(binding, digest);
+  const id = '30000000-0000-4000-8000-000000000001';
+  return { id, customId: id, kind: 'period_summary', status: 'queued', createdAt: at, updatedAt: at, model: OPENROUTER_BATCH_MODEL,
+    effort: 'low', requestSha256: await digest(prepared.body), unknownCharge: true, batchId: 'batch_summary_fixture', operation: 'period_summary',
+    requestProfileVersion: 6, inputPolicyVersion: 2, outputPolicyVersion: 2, requestBytes: prepared.requestBytes,
+    requestBody: prepared.body, summaryBinding: binding };
+}
+
 describe('private OpenRouter Batch ledger receipts', () => {
+  it('retains profile-6 summary lineage privately and exposes only period metadata through DTO and tombstone', async () => {
+    const job = await summaryJob();
+    const validated = validateOpenRouterBatchLedger({ version: 1, jobs: [job] });
+    expect(validated.jobs[0]).toMatchObject({ kind: 'period_summary', requestProfileVersion: 6, inputPolicyVersion: 2, outputPolicyVersion: 2, operation: 'period_summary' });
+    const dto = assistantBatchJobDTO(validated.jobs[0]!);
+    expect(dto).toMatchObject({ kind: 'period_summary', periodSummary: { period: 'daily', timeZone: 'UTC' } });
+    expect(JSON.stringify(dto)).not.toContain('Private source content');
+    expect(JSON.stringify(dto)).not.toContain('sourceManifestSha256');
+
+    const removed = tombstoneOpenRouterBatchJob(validated.jobs[0]!, at);
+    const roundTrip = validateOpenRouterBatchLedger({ version: 1, jobs: [removed] });
+    expect(roundTrip.jobs[0]).toMatchObject({ kind: 'period_summary', status: 'source_removed', requestProfileVersion: 6,
+      inputPolicyVersion: 2, outputPolicyVersion: 2, operation: 'period_summary' });
+    expect(roundTrip.jobs[0]).not.toHaveProperty('requestBody');
+    expect(roundTrip.jobs[0]).not.toHaveProperty('summaryBinding');
+    expect(JSON.stringify(roundTrip)).not.toContain('Private source content');
+  });
+
+  it('requires the exact deterministic profile-6 body and Unicode-safe frozen source content', async () => {
+    const job = await summaryJob();
+    const alteredBody = JSON.parse(job.requestBody!) as Record<string, any>;
+    alteredBody.messages[1].content = 'A different prompt with the same schema and effort.';
+    const requestBody = JSON.stringify(alteredBody);
+    expect(() => validateOpenRouterBatchLedger({ version: 1, jobs: [{ ...job, requestBody,
+      requestBytes: new TextEncoder().encode(requestBody).byteLength }] })).toThrow(/integrity validation/i);
+
+    const binding = JSON.parse(JSON.stringify(job.summaryBinding)) as Record<string, any>;
+    binding.sources[0].content = '\ud800';
+    expect(() => validateOpenRouterBatchLedger({ version: 1, jobs: [{ ...job, summaryBinding: binding }] })).toThrow(/integrity validation/i);
+  });
+
   it('replaces deleted source content with a verifiable content-free billing receipt', () => {
     const job = contentJob();
     const tombstone = tombstoneOpenRouterBatchJob(job, at) as OpenRouterBatchJob;

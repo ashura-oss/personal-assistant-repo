@@ -38,6 +38,7 @@ export type OpenRouterPeriodSummaryDestination = Readonly<{
   documentId: null;
   path: string;
   expectedRevision: null;
+  expectedAbsenceGeneration: number;
 }>;
 
 export interface OpenRouterPeriodSummaryBinding {
@@ -117,6 +118,16 @@ export interface PreparedOpenRouterPeriodSummaryRecovery {
   readonly recoveryBinding: OpenRouterPeriodSummaryRecoveryBinding;
 }
 
+export interface OpenRouterPeriodSummarySubmission {
+  readonly operationId: string;
+  readonly requestProfileVersion: typeof OPENROUTER_PERIOD_SUMMARY_REQUEST_PROFILE_VERSION;
+  readonly operation: typeof OPENROUTER_PERIOD_SUMMARY_OPERATION;
+  readonly requestBody: string;
+  readonly requestSha256: string;
+  readonly summaryBinding: OpenRouterPeriodSummaryBinding;
+  readonly summaryRecoveryBinding?: OpenRouterPeriodSummaryRecoveryBinding;
+}
+
 export interface OpenRouterPeriodSummaryResult {
   readonly kind: 'inert_period_summary';
   readonly markdown: string;
@@ -170,7 +181,7 @@ function captureJson<T>(value: T): T {
       clone = values;
     } else {
       if (!plainRecord(item)) return fail('period_summary_non_json_input');
-      const record: Record<string, unknown> = {};
+      const record: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
       for (const key of Object.keys(item)) record[key] = copy(Object.getOwnPropertyDescriptor(item, key)!.value);
       clone = record;
     }
@@ -181,6 +192,11 @@ function captureJson<T>(value: T): T {
 }
 function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
   return Reflect.ownKeys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+}
+function exactKeysWithOptional(value: Record<string, unknown>, required: readonly string[], optional: readonly string[] = []): boolean {
+  const keys = Reflect.ownKeys(value);
+  return required.every((key) => Object.hasOwn(value, key)) &&
+    keys.every((key) => typeof key === 'string' && (required.includes(key) || optional.includes(key)));
 }
 function validUnicodeText(value: unknown): value is string {
   if (typeof value !== 'string' || CONTROL.test(value)) return false;
@@ -260,9 +276,11 @@ function validateDestination(value: unknown): OpenRouterPeriodSummaryDestination
       validIdentifier(value.documentId) && Number.isSafeInteger(value.expectedRevision) && Number(value.expectedRevision) >= 1 && validDocumentPath(value.path)) {
     return Object.freeze({ kind: 'existing', documentId: value.documentId, path: value.path, expectedRevision: value.expectedRevision as number });
   }
-  if (value.kind === 'absent' && exactKeys(value, ['kind', 'documentId', 'path', 'expectedRevision']) &&
-      value.documentId === null && value.expectedRevision === null && validDocumentPath(value.path)) {
-    return Object.freeze({ kind: 'absent', documentId: null, path: value.path, expectedRevision: null });
+  if (value.kind === 'absent' && exactKeys(value, ['kind', 'documentId', 'path', 'expectedRevision', 'expectedAbsenceGeneration']) &&
+      value.documentId === null && value.expectedRevision === null && validDocumentPath(value.path) &&
+      Number.isSafeInteger(value.expectedAbsenceGeneration) && Number(value.expectedAbsenceGeneration) >= 0) {
+    return Object.freeze({ kind: 'absent', documentId: null, path: value.path, expectedRevision: null,
+      expectedAbsenceGeneration: value.expectedAbsenceGeneration as number });
   }
   return fail('period_summary_destination_invalid');
 }
@@ -331,11 +349,13 @@ async function normalizeBinding(value: unknown, digest: Sha256Text, allowRecover
   const manifestProjection = sources.map(({ content: _content, ...entry }) => entry);
   const expectedManifestDigest = await digestText(digest, canonicalJson(manifestProjection));
   if (expectedManifestDigest !== value.sourceManifestSha256) return fail('period_summary_manifest_digest_mismatch');
-  return freezeDeep({ version: 1, requestProfileVersion: 6, operation: 'period_summary', policyId: value.policyId as string,
+  const normalized = freezeDeep({ version: 1 as const, requestProfileVersion: 6 as const, operation: 'period_summary' as const, policyId: value.policyId as string,
     policyRevision: value.policyRevision as number, policyDigest: value.policyDigest, occurrenceId: value.occurrenceId as string,
     period: value.period as OpenRouterPeriodSummaryKind, timeZone: value.timeZone, localInterval: Object.freeze({ start: value.localInterval.start, end: value.localInterval.end }),
     startUtc: value.startUtc, endUtc: value.endUtc, preparedAt: value.preparedAt, sources: Object.freeze(sources),
     sourceManifestSha256: expectedManifestDigest, destination, instructions: value.instructions, effort: value.effort as OpenRouterSummaryEffort });
+  if (!isOpenRouterPeriodSummaryBindingShape(normalized, allowRecoveryEffort)) return fail('period_summary_binding_invalid');
+  return normalized;
 }
 
 export async function createOpenRouterPeriodSummaryBinding(
@@ -440,7 +460,7 @@ async function validateRecoveryProof(
   if (proof.parentRecoveryBinding !== null && recoveryAncestorIds(proof.parentRecoveryBinding as unknown as OpenRouterPeriodSummaryRecoveryBinding).has(jobId)) {
     return fail('period_summary_recovery_proof_invalid');
   }
-  return freezeDeep({ version: 1, kind: 'period_summary_recovery', parentJobId: proof.parentJobId as string,
+  const normalized = freezeDeep({ version: 1 as const, kind: 'period_summary_recovery' as const, parentJobId: proof.parentJobId as string,
     parentRequestSha256: proof.parentRequestSha256, truncatedResultSha256: proof.truncatedResultSha256,
     parentEffort: proof.parentEffort as OpenRouterSummaryEffort,
     parentRecoveryBinding: proof.parentRecoveryBinding === null ? null : freezeDeep(proof.parentRecoveryBinding as unknown as OpenRouterPeriodSummaryRecoveryBinding),
@@ -449,6 +469,8 @@ async function validateRecoveryProof(
     sourceManifestSha256: proof.sourceManifestSha256, destination: validateDestination(proof.destination),
     childId: proof.childId as string, childCustomId: proof.childCustomId as string, requestSha256: proof.requestSha256,
     effort: proof.effort as OpenRouterSummaryEffort, regenerationInstructions: proof.regenerationInstructions as string });
+  if (!isOpenRouterPeriodSummaryRecoveryBindingShape(normalized, binding, jobId)) return fail('period_summary_recovery_proof_invalid');
+  return normalized;
 }
 
 function recoveryAncestorIds(value: OpenRouterPeriodSummaryRecoveryBinding | null): Set<string> {
@@ -563,5 +585,147 @@ export async function isOpenRouterPeriodSummaryRecoveryRequestBody(
     const binding = await normalizeBinding(captured.binding, digest, true);
     const proof = await validateRecoveryProof(captured.recoveryBinding, binding, captured.jobId, captured.customId, captured.body, digest);
     return captured.body === buildRequestBody(binding, proof.regenerationInstructions);
+  } catch { return false; }
+}
+
+/** Captures and cryptographically validates all profile-6 data before client admission/credentials. */
+export async function validateOpenRouterPeriodSummarySubmission(
+  value: unknown, digest: Sha256Text,
+): Promise<OpenRouterPeriodSummarySubmission> {
+  const captured = captureJson(value);
+  if (!plainRecord(captured) || !exactKeysWithOptional(captured,
+    ['operationId', 'requestProfileVersion', 'operation', 'requestBody', 'requestSha256', 'summaryBinding'], ['summaryRecoveryBinding']) ||
+      captured.requestProfileVersion !== 6 || captured.operation !== 'period_summary' || !UUID_V4.test(String(captured.operationId)) ||
+      typeof captured.requestBody !== 'string' || !validDigest(captured.requestSha256) ||
+      new TextEncoder().encode(captured.requestBody).byteLength > OPENROUTER_PERIOD_SUMMARY_REQUEST_MAX_BYTES) {
+    return fail('period_summary_submission_invalid');
+  }
+  const summaryBinding = await normalizeBinding(captured.summaryBinding, digest, captured.summaryRecoveryBinding !== undefined);
+  const summaryRecoveryBinding = captured.summaryRecoveryBinding;
+  if (summaryRecoveryBinding === undefined) {
+    if (summaryBinding.effort !== 'none' && summaryBinding.effort !== 'low' ||
+        captured.requestBody !== buildRequestBody(summaryBinding)) return fail('period_summary_submission_invalid');
+  } else {
+    if (!plainRecord(summaryRecoveryBinding)) return fail('period_summary_submission_invalid');
+    const recoveryBinding = await validateRecoveryProof(summaryRecoveryBinding, summaryBinding,
+      captured.operationId as string, captured.operationId as string, captured.requestBody, digest);
+    if (captured.requestBody !== buildRequestBody(summaryBinding, recoveryBinding.regenerationInstructions)) {
+      return fail('period_summary_submission_invalid');
+    }
+  }
+  if (await digestText(digest, captured.requestBody) !== captured.requestSha256 ||
+      (summaryRecoveryBinding !== undefined && (!plainRecord(summaryRecoveryBinding) || summaryRecoveryBinding.requestSha256 !== captured.requestSha256))) {
+    return fail('period_summary_submission_digest_mismatch');
+  }
+  return freezeDeep({ operationId: captured.operationId as string, requestProfileVersion: 6, operation: 'period_summary',
+    requestBody: captured.requestBody, requestSha256: captured.requestSha256, summaryBinding,
+    ...(summaryRecoveryBinding !== undefined ? { summaryRecoveryBinding: summaryRecoveryBinding as unknown as OpenRouterPeriodSummaryRecoveryBinding } : {}) });
+}
+
+/** Synchronous structural ledger guard; submission still requires the asynchronous digest validator. */
+export function isOpenRouterPeriodSummaryBindingShape(value: unknown, allowRecoveryEffort = false): value is OpenRouterPeriodSummaryBinding {
+  try {
+    const row = captureJson(value);
+    const fields = ['version', 'requestProfileVersion', 'operation', 'policyId', 'policyRevision', 'policyDigest', 'occurrenceId',
+      'period', 'timeZone', 'localInterval', 'startUtc', 'endUtc', 'preparedAt', 'sources', 'sourceManifestSha256', 'destination', 'instructions', 'effort'];
+    if (!plainRecord(row) || !exactKeys(row, fields) || row.version !== 1 || row.requestProfileVersion !== 6 || row.operation !== 'period_summary' ||
+        !UUID_V4.test(String(row.policyId)) || !Number.isSafeInteger(row.policyRevision) || Number(row.policyRevision) < 1 || !validDigest(row.policyDigest) ||
+        !UUID_V4.test(String(row.occurrenceId)) || !['daily', 'weekly', 'monthly', 'yearly'].includes(String(row.period)) ||
+        typeof row.timeZone !== 'string' || row.timeZone.length < 1 || row.timeZone.length > 128 || /^[+-]/.test(row.timeZone) || !canonicalUtc(row.startUtc) ||
+        !canonicalUtc(row.endUtc) || Date.parse(row.endUtc) <= Date.parse(row.startUtc) || !canonicalUtc(row.preparedAt) ||
+        Date.parse(row.preparedAt) < Date.parse(row.endUtc) || !validUnicodeText(row.instructions) || !Array.isArray(row.sources) ||
+        !validDigest(row.sourceManifestSha256) || !EFFORTS.includes(row.effort as OpenRouterSummaryEffort) ||
+        (!(allowRecoveryEffort) && row.effort !== 'none' && row.effort !== 'low')) return false;
+    try { new Intl.DateTimeFormat('en', { timeZone: row.timeZone }).format(0); } catch { return false; }
+    const destination = validateDestination(row.destination);
+    if (!plainRecord(row.localInterval) || !exactKeys(row.localInterval, ['start', 'end']) ||
+        typeof row.localInterval.start !== 'string' || typeof row.localInterval.end !== 'string' ||
+        !isPeriodStart(row.period as OpenRouterPeriodSummaryKind, row.localInterval.start) ||
+        row.localInterval.end !== nextLocalStart(row.period as OpenRouterPeriodSummaryKind, row.localInterval.start)) return false;
+    let prior = '';
+    let hasEvent = false;
+    for (const candidate of row.sources) {
+      if (!plainRecord(candidate) || !exactKeysWithOptional(candidate,
+        ['id', 'role', 'kind', 'content', 'contentSha256', 'effectiveAt', 'observedAt'], ['revision', 'version', 'documentPath']) ||
+          !validIdentifier(candidate.id) || candidate.id <= prior || !['event', 'context'].includes(String(candidate.role)) ||
+          !['note', 'chat', 'task', 'decision', 'accepted_inference', 'mail', 'calendar', 'document', 'person', 'project'].includes(String(candidate.kind)) ||
+          !validUnicodeText(candidate.content) || candidate.content.trim().length === 0 || !validDigest(candidate.contentSha256) ||
+          !canonicalUtc(candidate.effectiveAt) || !canonicalUtc(candidate.observedAt) || Date.parse(candidate.effectiveAt) > Date.parse(row.preparedAt) ||
+          Date.parse(candidate.observedAt) > Date.parse(row.preparedAt) ||
+          ((candidate.revision === undefined) === (candidate.version === undefined)) ||
+          (candidate.revision !== undefined && (!Number.isSafeInteger(candidate.revision) || Number(candidate.revision) < 1)) ||
+          (candidate.version !== undefined && !validIdentifier(candidate.version)) ||
+          (candidate.documentPath !== undefined && (!validDocumentPath(candidate.documentPath) || candidate.kind !== 'document')) ||
+          (candidate.kind === 'document' && candidate.documentPath === undefined) ||
+          (candidate.role === 'event' && (!['note', 'chat', 'task', 'decision', 'accepted_inference', 'mail', 'calendar'].includes(String(candidate.kind)) ||
+            Date.parse(candidate.effectiveAt) < Date.parse(row.startUtc) || Date.parse(candidate.effectiveAt) >= Date.parse(row.endUtc))) ||
+          (candidate.role === 'context' && (!['document', 'person', 'project'].includes(String(candidate.kind)) ||
+            Date.parse(candidate.effectiveAt) > Date.parse(row.preparedAt))) ||
+          candidate.id === destination.documentId || candidate.id === destination.path || candidate.documentPath === destination.path) return false;
+      if (candidate.role === 'event') hasEvent = true;
+      prior = candidate.id as string;
+    }
+    return hasEvent;
+  } catch { return false; }
+}
+
+export function isOpenRouterPeriodSummaryRecoveryBindingShape(value: unknown, binding: unknown, jobId: unknown): value is OpenRouterPeriodSummaryRecoveryBinding {
+  try {
+    const proof = captureJson(value);
+    const capturedBinding = captureJson(binding);
+    const validProof = (candidate: unknown, candidateBinding: unknown, expectedJobId: unknown, ancestors: Set<string>): boolean => {
+      const current = candidate as Record<string, unknown>;
+      const currentBinding = candidateBinding as OpenRouterPeriodSummaryBinding;
+      if (!plainRecord(current) || !exactKeys(current, RECOVERY_FIELDS) ||
+          !isOpenRouterPeriodSummaryBindingShape(currentBinding, true) ||
+          current.version !== 1 || current.kind !== 'period_summary_recovery' || current.childId !== expectedJobId || current.childCustomId !== expectedJobId ||
+          !UUID_V4.test(String(current.parentJobId)) || !UUID_V4.test(String(current.rootJobId)) || !UUID_V4.test(String(expectedJobId)) ||
+          !validDigest(current.parentRequestSha256) || !validDigest(current.truncatedResultSha256) || !validDigest(current.rootRequestSha256) ||
+          !validDigest(current.requestSha256) || !validDigest(current.sourceManifestSha256) ||
+          !EFFORTS.includes(current.parentEffort as OpenRouterSummaryEffort) || !EFFORTS.includes(current.rootEffort as OpenRouterSummaryEffort) ||
+          !EFFORTS.includes(current.effort as OpenRouterSummaryEffort) || !validUnicodeText(current.regenerationInstructions) ||
+          current.effort !== currentBinding.effort || current.sourceManifestSha256 !== currentBinding.sourceManifestSha256 ||
+          !sameDestination(validateDestination(current.destination), validateDestination(currentBinding.destination)) ||
+          effortRank(current.effort as OpenRouterSummaryEffort) <= effortRank(current.parentEffort as OpenRouterSummaryEffort) ||
+          effortRank(current.parentEffort as OpenRouterSummaryEffort) < effortRank(current.rootEffort as OpenRouterSummaryEffort) ||
+          current.childId === current.parentJobId || current.childId === current.rootJobId || ancestors.has(current.childId as string) ||
+          (current.parentJobId === current.rootJobId) !== (current.parentRecoveryBinding === null)) return false;
+      if (current.parentJobId === current.rootJobId) {
+        return current.parentRequestSha256 === current.rootRequestSha256 && current.parentEffort === current.rootEffort &&
+          (current.rootEffort === 'none' || current.rootEffort === 'low');
+      }
+      const nested = current.parentRecoveryBinding;
+      if (!plainRecord(nested)) return false;
+      const nextAncestors = new Set(ancestors);
+      nextAncestors.add(current.childId as string);
+      const nestedBinding = { ...currentBinding, effort: current.parentEffort };
+      return validProof(nested, nestedBinding, current.parentJobId, nextAncestors) &&
+        nested.requestSha256 === current.parentRequestSha256 && nested.effort === current.parentEffort &&
+        nested.rootJobId === current.rootJobId && nested.rootRequestSha256 === current.rootRequestSha256 && nested.rootEffort === current.rootEffort;
+    };
+    return validProof(proof, capturedBinding, jobId, new Set());
+  } catch { return false; }
+}
+
+/** Synchronous non-hash profile-6 contract for persisted ledger validation. */
+export function isOpenRouterPeriodSummaryRequestBodyShape(
+  body: unknown, binding: unknown, recoveryBinding: unknown, jobId: unknown, requestSha256: unknown,
+): boolean {
+  try {
+    if (typeof body !== 'string' || typeof jobId !== 'string' || !UUID_V4.test(jobId) || !validDigest(requestSha256) ||
+        new TextEncoder().encode(body).byteLength > OPENROUTER_PERIOD_SUMMARY_REQUEST_MAX_BYTES ||
+        !isOpenRouterPeriodSummaryBindingShape(binding, recoveryBinding !== undefined)) return false;
+    const captured = captureJson(binding);
+    const regeneration = recoveryBinding === undefined ? undefined : (() => {
+      if (!isOpenRouterPeriodSummaryRecoveryBindingShape(recoveryBinding, captured, jobId)) return null;
+      const proof = captureJson(recoveryBinding) as OpenRouterPeriodSummaryRecoveryBinding;
+      return proof.requestSha256 === requestSha256 ? proof.regenerationInstructions : null;
+    })();
+    if (regeneration === null) return false;
+    if (recoveryBinding !== undefined) {
+      const proof = captureJson(recoveryBinding) as OpenRouterPeriodSummaryRecoveryBinding;
+      if (proof.requestSha256 !== requestSha256) return false;
+    }
+    return body === buildRequestBody(captured as OpenRouterPeriodSummaryBinding, regeneration);
   } catch { return false; }
 }

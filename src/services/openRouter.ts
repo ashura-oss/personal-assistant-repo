@@ -14,12 +14,15 @@ export const OPENROUTER_BATCH_LEGACY_REQUEST_PROFILE_VERSION = 1 as const;
 export const OPENROUTER_BATCH_REQUEST_PROFILE_VERSION = 1 as const;
 export const OPENROUTER_BATCH_NOTE_RESPONSE_PROFILE_VERSION = 2 as const;
 export type OpenRouterBatchRequestProfileVersion = 1 | 2 | 3 | 4 | 5;
+export type OpenRouterBatchLegacyRequestProfileVersion = OpenRouterBatchRequestProfileVersion;
+export type OpenRouterBatchPersistedRequestProfileVersion = OpenRouterBatchRequestProfileVersion | 6;
 export type OpenRouterBatchOutputPolicyVersion = 1 | 2;
 export const OPENROUTER_BATCH_CURRENT_OUTPUT_POLICY_VERSION = 2 as const;
 export type OpenRouterBatchInputPolicyVersion = 1 | 2;
 export const OPENROUTER_BATCH_CURRENT_INPUT_POLICY_VERSION = 2 as const;
-export type OpenRouterBatchOperation = 'note_assistance' | 'chat_refinement' | 'mail_reply_context';
-export type OpenRouterBatchBaseOperation = OpenRouterBatchOperation | 'mail_reply_body';
+export type OpenRouterBatchOperation = 'note_assistance' | 'chat_refinement' | 'mail_reply_context' | 'period_summary';
+export type OpenRouterBatchLegacyOperation = Exclude<OpenRouterBatchOperation, 'period_summary'>;
+export type OpenRouterBatchBaseOperation = OpenRouterBatchLegacyOperation | 'mail_reply_body';
 export type OpenRouterChatRefinementEffort = 'medium' | 'high' | 'max';
 export type OpenRouterRecoveryEffort = 'medium' | 'high' | 'max';
 export const OPENROUTER_CHAT_COMPLETIONS_PATH = '/v1/chat/completions' as const;
@@ -62,11 +65,29 @@ export interface OpenRouterBatchClientDependencies {
   readonly assertCredentialGeneration: (expected: number) => void;
   /** Synchronous current source/intent fence immediately before the transport starts. */
   readonly assertBeforeStart: () => void;
+  /** Used only by the dedicated profile-6 summary contract before any credential or provider work. */
+  readonly sha256Text?: (value: string) => Promise<string>;
 }
+
+export type OpenRouterBatchSubmitInput = Readonly<{
+  operationId: string;
+  requestBody: string;
+  requestProfileVersion?: OpenRouterBatchLegacyRequestProfileVersion;
+  operation?: OpenRouterBatchLegacyOperation;
+}> | Readonly<{
+  operationId: string;
+  requestBody: string;
+  requestSha256: string;
+  requestProfileVersion: 6;
+  operation: 'period_summary';
+  summaryBinding: import('./openRouterPeriodSummary').OpenRouterPeriodSummaryBinding;
+  summaryRecoveryBinding?: import('./openRouterPeriodSummary').OpenRouterPeriodSummaryRecoveryBinding;
+}>;
 
 /** Exact persisted-wire validator shared by submit and future saved-job inspection. */
 export function isOpenRouterBatchRequestProfile(value: unknown, profileVersion: OpenRouterBatchRequestProfileVersion = OPENROUTER_BATCH_REQUEST_PROFILE_VERSION, operation: OpenRouterBatchOperation = 'note_assistance', recoveryBase?: { profileVersion: 1 | 2 | 3 | 5; operation: OpenRouterBatchBaseOperation }): value is OpenRouterBatchRequest {
   if (profileVersion !== 1 && profileVersion !== 2 && profileVersion !== 3 && profileVersion !== 4 && profileVersion !== 5) return false;
+  if (operation === 'period_summary') return false;
   if ((profileVersion === 4) !== Boolean(recoveryBase) || (recoveryBase &&
       ((recoveryBase.profileVersion !== 1 && recoveryBase.profileVersion !== 2 && recoveryBase.profileVersion !== 3 && recoveryBase.profileVersion !== 5) ||
        !['note_assistance', 'chat_refinement', 'mail_reply_context', 'mail_reply_body'].includes(recoveryBase.operation)))) return false;
@@ -509,26 +530,60 @@ export class OpenRouterBatchClient {
   }
 
   async submit(
-    input: { operationId: string; requestBody: string; requestProfileVersion?: OpenRouterBatchRequestProfileVersion; operation?: OpenRouterBatchOperation },
+    input: OpenRouterBatchSubmitInput,
     onBeforeDispatch: () => Promise<void>,
     assertBeforeStart: () => void = this.dependencies.assertBeforeStart,
   ): Promise<OpenRouterBatchAck> {
-    if (!isCanonicalUuidV4(input.operationId)) throw new OpenRouterBatchDispatchError('pre_dispatch', 'The Batch operation identifier is invalid.');
-    let requestBody: unknown;
-    try { requestBody = JSON.parse(input.requestBody) as unknown; }
-    catch { throw new OpenRouterBatchDispatchError('pre_dispatch', 'The prepared Batch request was invalid.'); }
-    const body = safeObject(requestBody);
-    const profileVersion = input.requestProfileVersion ?? OPENROUTER_BATCH_LEGACY_REQUEST_PROFILE_VERSION;
-    const operation = input.operation ?? 'note_assistance';
-    if (!body || !isOpenRouterBatchRequestProfile(requestBody, profileVersion, operation)) {
-      throw new OpenRouterBatchDispatchError('pre_dispatch', 'The prepared Batch request did not match the fixed request profile.');
+    // Own every caller value before the dynamic summary-module import or any digest
+    // promise can yield. A frozen clone prevents later caller mutation from
+    // substituting a different operation, body, digest, or source binding.
+    let capturedInput: OpenRouterBatchSubmitInput;
+    try { capturedInput = captureBatchJson(input) as OpenRouterBatchSubmitInput; }
+    catch { throw new OpenRouterBatchDispatchError('pre_dispatch', 'The prepared Batch request was not immutable JSON data.'); }
+    input = capturedInput;
+    let operationId: string;
+    let requestBody: Record<string, unknown>;
+    const profileDescriptor = Object.getOwnPropertyDescriptor(input, 'requestProfileVersion');
+    const operationDescriptor = Object.getOwnPropertyDescriptor(input, 'operation');
+    const profileValue = profileDescriptor && Object.hasOwn(profileDescriptor, 'value') ? profileDescriptor.value : undefined;
+    const operationValue = operationDescriptor && Object.hasOwn(operationDescriptor, 'value') ? operationDescriptor.value : undefined;
+    if (profileValue === 6 || operationValue === 'period_summary') {
+      try {
+        if (profileValue !== 6 || operationValue !== 'period_summary') throw new Error('The summary profile discriminator is invalid.');
+        const digest = this.dependencies.sha256Text ?? (async (value: string) => {
+          const subtle = globalThis.crypto?.subtle;
+          if (!subtle) throw new Error('Cryptographic digest is unavailable.');
+          const bytes = new TextEncoder().encode(value);
+          const result = await subtle.digest('SHA-256', bytes);
+          return Array.from(new Uint8Array(result), (byte) => byte.toString(16).padStart(2, '0')).join('');
+        });
+        const { validateOpenRouterPeriodSummarySubmission } = await import('./openRouterPeriodSummary');
+        const validated = await validateOpenRouterPeriodSummarySubmission(input, digest);
+        operationId = validated.operationId;
+        requestBody = JSON.parse(validated.requestBody) as Record<string, unknown>;
+      } catch {
+        throw new OpenRouterBatchDispatchError('pre_dispatch', 'The prepared period summary request did not match its frozen profile-6 binding.');
+      }
+    } else {
+      if (!isCanonicalUuidV4(input.operationId)) throw new OpenRouterBatchDispatchError('pre_dispatch', 'The Batch operation identifier is invalid.');
+      let parsed: unknown;
+      try { parsed = JSON.parse(input.requestBody) as unknown; }
+      catch { throw new OpenRouterBatchDispatchError('pre_dispatch', 'The prepared Batch request was invalid.'); }
+      const body = safeObject(parsed);
+      const profileVersion = (input.requestProfileVersion ?? OPENROUTER_BATCH_LEGACY_REQUEST_PROFILE_VERSION) as OpenRouterBatchRequestProfileVersion;
+      const operation = (input.operation ?? 'note_assistance') as OpenRouterBatchLegacyOperation;
+      if (!body || !isOpenRouterBatchRequestProfile(parsed, profileVersion, operation)) {
+        throw new OpenRouterBatchDispatchError('pre_dispatch', 'The prepared Batch request did not match the fixed request profile.');
+      }
+      operationId = input.operationId;
+      requestBody = body;
     }
     const batchPayload = JSON.stringify({
       endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH,
       model: OPENROUTER_BATCH_BODY_MODEL,
       provider: { only: [OPENROUTER_BATCH_PROVIDER], allow_fallbacks: false },
       completion_window: OPENROUTER_BATCH_COMPLETION_WINDOW,
-      requests: [{ custom_id: input.operationId, body }],
+      requests: [{ custom_id: operationId, body: requestBody }],
     });
     if (byteLength(batchPayload) > 1024 * 1024) throw new OpenRouterBatchDispatchError('pre_dispatch', 'The Batch request exceeds the 1 MiB safety limit.');
 
@@ -557,7 +612,7 @@ export class OpenRouterBatchClient {
           const parsed = await readBoundedJson(response);
           if (!response.ok || response.status !== 202) throw new Error('The OpenRouter Batch submission was not accepted.');
           return parseAck(parsed);
-        }, input.operationId, beforeStart);
+        }, operationId, beforeStart);
       });
     } catch (error) {
       if (error instanceof OpenRouterBatchDispatchError) throw error;
@@ -599,4 +654,43 @@ export class OpenRouterBatchClient {
       }, customId, beforeStart);
     });
   }
+}
+
+function captureBatchJson<T>(value: T): T {
+  const active = new WeakSet<object>();
+  const copy = (item: unknown): unknown => {
+    if (item === null || typeof item === 'string' || typeof item === 'boolean') return item;
+    if (typeof item === 'number' && Number.isFinite(item)) return item;
+    if (typeof item !== 'object') throw new TypeError('non_json');
+    if (active.has(item)) throw new TypeError('cyclic');
+    active.add(item);
+    let result: unknown;
+    if (Array.isArray(item)) {
+      if (Object.getPrototypeOf(item) !== Array.prototype) throw new TypeError('non_json');
+      const keys = Reflect.ownKeys(item);
+      if (keys.some((key) => typeof key !== 'string' || (key !== 'length' && !/^(0|[1-9]\d*)$/.test(key)))) throw new TypeError('non_json');
+      const values: unknown[] = [];
+      for (let index = 0; index < item.length; index += 1) {
+        const descriptor = Object.getOwnPropertyDescriptor(item, String(index));
+        if (!descriptor?.enumerable || !Object.hasOwn(descriptor, 'value')) throw new TypeError('non_json');
+        values.push(copy(descriptor.value));
+      }
+      if (keys.length !== item.length + 1) throw new TypeError('non_json');
+      result = values;
+    } else {
+      const prototype = Object.getPrototypeOf(item);
+      if (prototype !== Object.prototype && prototype !== null) throw new TypeError('non_json');
+      const clone: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+      for (const key of Reflect.ownKeys(item)) {
+        if (typeof key !== 'string') throw new TypeError('non_json');
+        const descriptor = Object.getOwnPropertyDescriptor(item, key);
+        if (!descriptor?.enumerable || !Object.hasOwn(descriptor, 'value')) throw new TypeError('non_json');
+        clone[key] = copy(descriptor.value);
+      }
+      result = clone;
+    }
+    active.delete(item);
+    return Object.freeze(result);
+  };
+  return copy(value) as T;
 }

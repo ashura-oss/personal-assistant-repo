@@ -1,8 +1,10 @@
 import type { AssistIntent, KnowledgeSelection } from '../core';
-import { higherOpenRouterRecoveryEfforts, type OpenRouterBatchBaseOperation, type OpenRouterBatchInspection, type OpenRouterBatchOutputPolicyVersion, type OpenRouterBatchRequestProfileVersion, type OpenRouterChatRefinementEffort } from './openRouter';
+import { higherOpenRouterRecoveryEfforts, type OpenRouterBatchBaseOperation, type OpenRouterBatchInspection, type OpenRouterBatchOutputPolicyVersion, type OpenRouterBatchPersistedRequestProfileVersion, type OpenRouterBatchRequestProfileVersion, type OpenRouterChatRefinementEffort } from './openRouter';
 import { validOpenRouterMailReplyBinding, type OpenRouterMailReplyBinding } from './openRouterMailReply';
 import { validReplyText } from './openRouterMailReply';
 import { isOpenRouterBatchRequestProfile, OPENROUTER_BATCH_MODEL } from './openRouter';
+import { isOpenRouterPeriodSummaryBindingShape, isOpenRouterPeriodSummaryRecoveryBindingShape, isOpenRouterPeriodSummaryRequestBodyShape, parseOpenRouterPeriodSummaryResult,
+  type OpenRouterPeriodSummaryBinding, type OpenRouterPeriodSummaryKind, type OpenRouterPeriodSummaryRecoveryBinding } from './openRouterPeriodSummary';
 
 export const OPENROUTER_BATCH_LEDGER_VERSION = 1 as const;
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -12,7 +14,7 @@ const STATUSES = new Set([
   'failed', 'expired', 'cancelled', 'result_stale', 'result_invalid', 'result_truncated', 'result_not_retained', 'cleanup_pending', 'source_removed',
 ]);
 
-export type AssistantBatchKind = 'note_assistance' | 'mail_reply';
+export type AssistantBatchKind = 'note_assistance' | 'mail_reply' | 'period_summary';
 export type AssistantBatchStatus =
   | 'preparing' | 'submitting' | 'submission_unknown' | 'queued' | 'processing' | 'completed'
   | 'failed' | 'expired' | 'cancelled' | 'result_stale' | 'result_invalid' | 'result_truncated' | 'result_not_retained' | 'cleanup_pending' | 'source_removed';
@@ -20,7 +22,7 @@ export type AssistantBatchStatus =
 export interface OpenRouterBatchRecoveryBinding {
   readonly version: 1;
   readonly parentJobId: string;
-  readonly parentKind: AssistantBatchKind;
+  readonly parentKind: 'note_assistance' | 'mail_reply';
   readonly parentRequestProfileVersion: OpenRouterBatchRequestProfileVersion;
   readonly parentOperation?: 'chat_refinement' | 'mail_reply_context';
   readonly parentEffort: OpenRouterBatchJob['effort'];
@@ -80,7 +82,7 @@ export interface OpenRouterBatchJob {
   readonly id: string;
   readonly customId: string;
   readonly kind: AssistantBatchKind;
-  readonly operation?: 'chat_refinement' | 'mail_reply_context';
+  readonly operation?: 'chat_refinement' | 'mail_reply_context' | 'period_summary';
   readonly reasoningEffort?: OpenRouterChatRefinementEffort;
   readonly status: AssistantBatchStatus;
   readonly parentTurnId?: string;
@@ -105,7 +107,7 @@ export interface OpenRouterBatchJob {
   readonly answeredAsOf?: string;
   readonly settingsFingerprint?: string;
   readonly sourceFingerprint?: string;
-  readonly requestProfileVersion?: OpenRouterBatchRequestProfileVersion;
+  readonly requestProfileVersion?: OpenRouterBatchPersistedRequestProfileVersion;
   /** Private input-selection policy captured when this Batch request was first built. Missing is legacy v1. */
   readonly inputPolicyVersion?: 1 | 2;
   /** Generated-output contract captured at submission; missing legacy jobs mean policy 1. */
@@ -124,7 +126,38 @@ export interface OpenRouterBatchJob {
   readonly proposalId?: string;
   /** Explicit operation for the permanently linked proposal; absent legacy jobs mean draft. */
   readonly mailReplyActivationOperation?: 'draft' | 'send';
+  /** Closed frozen source contract for the dedicated profile-6 period-summary operation. */
+  readonly summaryBinding?: OpenRouterPeriodSummaryBinding;
+  /** Present only for explicit higher-effort regeneration children. */
+  readonly summaryRecoveryBinding?: OpenRouterPeriodSummaryRecoveryBinding;
+  /** Content-free period metadata retained after source removal. */
+  readonly summaryMetadata?: OpenRouterPeriodSummaryMetadata;
+  /** Content-free parent/root identifiers retained after source removal. */
+  readonly summaryRecoveryLineage?: OpenRouterPeriodSummaryLineage;
 }
+
+export interface OpenRouterPeriodSummaryMetadata {
+  readonly period: OpenRouterPeriodSummaryKind;
+  readonly timeZone: string;
+  readonly localInterval: Readonly<{ start: string; end: string }>;
+}
+
+export interface OpenRouterPeriodSummaryLineage {
+  readonly parentJobId: string | null;
+  readonly rootJobId: string;
+  readonly ancestorJobIds: readonly string[];
+}
+
+export type OpenRouterPeriodSummaryContentJob = OpenRouterBatchJob & {
+  readonly kind: 'period_summary';
+  readonly status: Exclude<AssistantBatchStatus, 'source_removed'>;
+  readonly requestProfileVersion: 6;
+  readonly operation: 'period_summary';
+  readonly inputPolicyVersion: 2;
+  readonly outputPolicyVersion: 2;
+  readonly summaryBinding: OpenRouterPeriodSummaryBinding;
+  readonly sourceRemoved?: undefined;
+};
 
 export type OpenRouterBatchContentJob = OpenRouterBatchJob & {
   readonly sourceRemoved?: undefined;
@@ -161,7 +194,7 @@ export interface AssistantBatchJobDTO {
   readonly noteRevision?: number;
   readonly model: typeof OPENROUTER_BATCH_MODEL;
   readonly effort: 'none' | 'low' | OpenRouterChatRefinementEffort;
-  readonly operation?: 'chat_refinement' | 'mail_reply_context';
+  readonly operation?: 'chat_refinement' | 'mail_reply_context' | 'period_summary';
   readonly reasoningEffort?: OpenRouterChatRefinementEffort;
   readonly parentTurnId?: string;
   readonly recoveryParentTurnId?: string;
@@ -188,6 +221,8 @@ export interface AssistantBatchJobDTO {
   readonly pendingRecoveryChildId?: string;
   readonly recoveredConversationId?: string;
   readonly recoveredTurnId?: string;
+  readonly periodSummary?: OpenRouterPeriodSummaryMetadata;
+  readonly summaryLineage?: OpenRouterPeriodSummaryLineage;
 }
 
 export function emptyOpenRouterBatchLedger(): OpenRouterBatchLedger {
@@ -321,8 +356,74 @@ function validChatBinding(value: unknown): value is OpenRouterChatBinding {
   });
 }
 
+function validSummaryMetadata(value: unknown): value is OpenRouterPeriodSummaryMetadata {
+  const row = record(value);
+  const interval = record(row?.localInterval);
+  if (!row || !exactKeys(row, ['period', 'timeZone', 'localInterval']) ||
+      !['daily', 'weekly', 'monthly', 'yearly'].includes(String(row.period)) ||
+      typeof row.timeZone !== 'string' || !row.timeZone || row.timeZone.length > 128 ||
+      !interval || !exactKeys(interval, ['start', 'end']) || typeof interval.start !== 'string' || typeof interval.end !== 'string' ||
+      !/^\d{4}-\d{2}-\d{2}$/.test(interval.start) || !/^\d{4}-\d{2}-\d{2}$/.test(interval.end)) return false;
+  try { new Intl.DateTimeFormat('en', { timeZone: row.timeZone }).format(0); return true; } catch { return false; }
+}
+
+function validSummaryLineage(value: unknown, jobId: string): value is OpenRouterPeriodSummaryLineage {
+  const row = record(value);
+  if (!row || !exactKeys(row, ['parentJobId', 'rootJobId', 'ancestorJobIds']) ||
+      (row.parentJobId !== null && (typeof row.parentJobId !== 'string' || !UUID_V4.test(row.parentJobId))) ||
+      typeof row.rootJobId !== 'string' || !UUID_V4.test(row.rootJobId) || !Array.isArray(row.ancestorJobIds) ||
+      row.ancestorJobIds.some((id) => typeof id !== 'string' || !UUID_V4.test(id)) ||
+      new Set(row.ancestorJobIds).size !== row.ancestorJobIds.length || row.ancestorJobIds.includes(jobId)) return false;
+  if (row.parentJobId === null) return row.rootJobId === jobId && row.ancestorJobIds.length === 0;
+  return row.ancestorJobIds[0] === row.parentJobId && row.ancestorJobIds.includes(row.rootJobId);
+}
+
+function validPeriodSummaryJob(row: Record<string, unknown>): boolean {
+  const commonRequired = ['id', 'customId', 'kind', 'status', 'createdAt', 'updatedAt', 'model', 'effort', 'requestSha256', 'unknownCharge'];
+  const commonOptional = ['batchId', 'accounting', 'failureCode', 'providerObservation'];
+  if (typeof row.id !== 'string' || !UUID_V4.test(row.id) || row.customId !== row.id || row.kind !== 'period_summary' ||
+      typeof row.status !== 'string' || !STATUSES.has(row.status) || !canonicalIso(row.createdAt) || !canonicalIso(row.updatedAt) ||
+      row.model !== OPENROUTER_BATCH_MODEL || !['none', 'low', 'medium', 'high', 'max'].includes(String(row.effort)) ||
+      typeof row.requestSha256 !== 'string' || !SHA256.test(row.requestSha256) || typeof row.unknownCharge !== 'boolean' ||
+      (row.batchId !== undefined && (typeof row.batchId !== 'string' || row.batchId.length < 1 || row.batchId.length > 256 || /[^A-Za-z0-9_-]/.test(row.batchId))) ||
+      (row.accounting !== undefined && !validAccounting(row.accounting)) ||
+      (row.failureCode !== undefined && !['not_submitted', 'provider_failed', 'expired', 'invalid_result', 'stale_result', 'result_truncated', 'result_not_retained'].includes(String(row.failureCode))) ||
+      ((row.status === 'result_not_retained') !== (row.failureCode === 'result_not_retained')) ||
+      ((row.status === 'result_truncated') !== (row.failureCode === 'result_truncated')) ||
+      (row.providerObservation !== undefined && !validProviderObservation(row.providerObservation, row.status))) return false;
+
+  if (row.sourceRemoved === true) {
+    const removedFields = [...commonRequired, 'sourceRemoved', 'operation', 'requestProfileVersion', 'inputPolicyVersion', 'outputPolicyVersion', 'summaryMetadata', 'summaryRecoveryLineage'];
+    return row.status === 'source_removed' && row.operation === 'period_summary' && row.requestProfileVersion === 6 &&
+      row.inputPolicyVersion === 2 && row.outputPolicyVersion === 2 && validSummaryMetadata(row.summaryMetadata) &&
+      validSummaryLineage(row.summaryRecoveryLineage, row.id as string) && exactKeys(row, removedFields, commonOptional);
+  }
+  const required = [...commonRequired, 'operation', 'requestProfileVersion', 'inputPolicyVersion', 'outputPolicyVersion', 'requestBytes', 'requestBody', 'summaryBinding'];
+  const optional = [...commonOptional, 'summaryRecoveryBinding', 'resultText', 'resultSha256'];
+  if (row.sourceRemoved !== undefined || row.status === 'source_removed' || !exactKeys(row, required, optional) ||
+      row.operation !== 'period_summary' || row.requestProfileVersion !== 6 || row.inputPolicyVersion !== 2 || row.outputPolicyVersion !== 2 ||
+      !Number.isSafeInteger(row.requestBytes) || (row.requestBytes as number) < 1 || (row.requestBytes as number) > 1024 * 1024 ||
+      typeof row.requestBody !== 'string' || new TextEncoder().encode(row.requestBody).byteLength !== row.requestBytes ||
+      new TextEncoder().encode(row.requestBody).byteLength > 1024 * 1024 ||
+      !isOpenRouterPeriodSummaryBindingShape(row.summaryBinding, row.summaryRecoveryBinding !== undefined) || row.summaryBinding.effort !== row.effort) return false;
+  if (row.summaryRecoveryBinding === undefined) {
+    if (row.effort !== 'none' && row.effort !== 'low') return false;
+  } else if (!isOpenRouterPeriodSummaryRecoveryBindingShape(row.summaryRecoveryBinding, row.summaryBinding, row.id)) return false;
+  if (!isOpenRouterPeriodSummaryRequestBodyShape(row.requestBody, row.summaryBinding, row.summaryRecoveryBinding, row.id, row.requestSha256)) return false;
+  const resultPair = row.resultText !== undefined || row.resultSha256 !== undefined;
+  if (resultPair) {
+    if (typeof row.resultText !== 'string' || typeof row.resultSha256 !== 'string' || !SHA256.test(row.resultSha256)) return false;
+    try { parseOpenRouterPeriodSummaryResult(row.resultText, row.summaryBinding); } catch { return false; }
+  }
+  if ((row.status === 'completed') !== resultPair || (row.status === 'result_truncated' && resultPair)) return false;
+  if (['queued', 'processing', 'completed', 'expired', 'cancelled', 'result_stale', 'result_invalid', 'result_truncated', 'result_not_retained'].includes(String(row.status)) && !row.batchId) return false;
+  if (row.status === 'failed' && !row.batchId && !(row.failureCode === 'not_submitted' && row.unknownCharge === false)) return false;
+  return true;
+}
+
 function validJob(value: unknown): value is OpenRouterBatchJob {
   const row = record(value);
+  if (row?.kind === 'period_summary') return validPeriodSummaryJob(row);
   if (row?.kind === 'mail_reply') return validMailReplyJob(row);
   const commonRequired = ['id', 'customId', 'kind', 'status', 'createdAt', 'updatedAt', 'model', 'effort', 'requestSha256', 'unknownCharge'];
   const commonOptional = ['batchId', 'accounting', 'failureCode', 'providerObservation'];
@@ -489,10 +590,24 @@ export function validateOpenRouterBatchLedger(value: unknown): OpenRouterBatchLe
     byId.set(job.id, job);
   }
   for (const job of jobs) {
+    if (job.kind === 'period_summary') {
+      const summaryRecovery = job.summaryRecoveryBinding;
+      if (!summaryRecovery || job.sourceRemoved) continue;
+      const parent = byId.get(summaryRecovery.parentJobId);
+      if (!parent || parent.kind !== 'period_summary' || parent.sourceRemoved || parent.status !== 'result_truncated' ||
+          parent.requestSha256 !== summaryRecovery.parentRequestSha256 || parent.effort !== summaryRecovery.parentEffort ||
+          parent.summaryBinding?.sourceManifestSha256 !== summaryRecovery.sourceManifestSha256 ||
+          JSON.stringify(parent.summaryBinding?.destination) !== JSON.stringify(summaryRecovery.destination) ||
+          JSON.stringify(parent.summaryRecoveryBinding ?? null) !== JSON.stringify(summaryRecovery.parentRecoveryBinding) ||
+          ['none', 'low', 'medium', 'high', 'max'].indexOf(job.effort) <= ['none', 'low', 'medium', 'high', 'max'].indexOf(parent.effort)) {
+        throw new Error('OpenRouter period summary recovery lineage failed integrity validation.');
+      }
+      continue;
+    }
     const recovery = job.recoveryBinding;
     if (!recovery) continue;
     const parent = byId.get(recovery.parentJobId);
-    if (!parent || parent.kind !== recovery.parentKind || parent.requestProfileVersion !== recovery.parentRequestProfileVersion ||
+    if (!parent || parent.kind === 'period_summary' || parent.kind !== recovery.parentKind || parent.requestProfileVersion !== recovery.parentRequestProfileVersion ||
         (parent.inputPolicyVersion ?? 1) !== (job.inputPolicyVersion ?? 1) || (parent.outputPolicyVersion ?? 1) !== (job.outputPolicyVersion ?? 1) ||
         parent.effort !== recovery.parentEffort || (parent.operation ?? undefined) !== (recovery.parentOperation ?? undefined) ||
         parent.requestSha256 !== recovery.parentRequestSha256 || (!parent.sourceRemoved && parent.sourceFingerprint !== recovery.parentSourceFingerprint) ||
@@ -572,7 +687,21 @@ export function assistantBatchJobDTO(job: OpenRouterBatchJob, cleanupPending = f
     ...(job.kind === 'mail_reply' && job.mailReplyActivationOperation ? { mailReplyActivationOperation: job.mailReplyActivationOperation } : {}),
     ...(job.kind === 'mail_reply' && job.proposalId ? { proposalId: job.proposalId } : {}),
     ...(job.recoveryBinding && job.chatBinding ? { recoveredConversationId: job.chatBinding.conversationId, recoveredTurnId: job.chatBinding.turnId } : {}),
+    ...(job.kind === 'period_summary' ? { periodSummary: job.summaryBinding ? Object.freeze({ period: job.summaryBinding.period,
+      timeZone: job.summaryBinding.timeZone, localInterval: Object.freeze({ ...job.summaryBinding.localInterval }) }) : job.summaryMetadata } : {}),
+    ...(job.kind === 'period_summary' && job.summaryRecoveryBinding ? { summaryLineage: summaryLineageFromProof(job.summaryRecoveryBinding) } : {}),
+    ...(job.kind === 'period_summary' && job.summaryRecoveryLineage ? { summaryLineage: job.summaryRecoveryLineage } : {}),
   });
+}
+
+function summaryLineageFromProof(proof: OpenRouterPeriodSummaryRecoveryBinding): OpenRouterPeriodSummaryLineage {
+  const ancestorJobIds: string[] = [];
+  let cursor: OpenRouterPeriodSummaryRecoveryBinding | null = proof;
+  while (cursor) {
+    if (!ancestorJobIds.includes(cursor.parentJobId)) ancestorJobIds.push(cursor.parentJobId);
+    cursor = cursor.parentRecoveryBinding;
+  }
+  return Object.freeze({ parentJobId: proof.parentJobId, rootJobId: proof.rootJobId, ancestorJobIds: Object.freeze(ancestorJobIds) });
 }
 
 export function isOpenRouterBatchContentJob(job: OpenRouterBatchJob): job is OpenRouterBatchContentJob {
@@ -605,6 +734,17 @@ export function tombstoneOpenRouterBatchJob(job: OpenRouterBatchJob, updatedAt: 
     if (!stripChatBinding || (!job.chatBinding && job.parentTurnId === undefined)) return job as OpenRouterBatchTombstone;
     const { chatBinding: _chatBinding, parentTurnId: _parentTurnId, ...contentFreeReceipt } = job;
     return Object.freeze(contentFreeReceipt) as OpenRouterBatchTombstone;
+  }
+  if (job.kind === 'period_summary') {
+    const metadata = job.summaryBinding ? Object.freeze({ period: job.summaryBinding.period, timeZone: job.summaryBinding.timeZone,
+      localInterval: Object.freeze({ ...job.summaryBinding.localInterval }) }) : job.summaryMetadata;
+    const lineage = job.summaryRecoveryBinding ? summaryLineageFromProof(job.summaryRecoveryBinding) :
+      Object.freeze({ parentJobId: null, rootJobId: job.id, ancestorJobIds: Object.freeze([]) });
+    return Object.freeze({ id: job.id, customId: job.customId, kind: job.kind, sourceRemoved: true, status: 'source_removed',
+      createdAt: job.createdAt, updatedAt, model: job.model, effort: job.effort, operation: 'period_summary',
+      requestProfileVersion: 6, inputPolicyVersion: 2, outputPolicyVersion: 2, requestSha256: job.requestSha256,
+      ...(job.batchId ? { batchId: job.batchId } : {}), unknownCharge: job.unknownCharge,
+      ...(job.accounting ? { accounting: job.accounting } : {}), summaryMetadata: metadata, summaryRecoveryLineage: lineage });
   }
   return Object.freeze({
     id: job.id, customId: job.customId, kind: job.kind, sourceRemoved: true,

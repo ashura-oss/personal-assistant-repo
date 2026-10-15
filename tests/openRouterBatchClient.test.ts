@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import {
   OPENROUTER_BATCH_BODY_MODEL,
@@ -14,6 +15,7 @@ import type { PrivacyControlState, PrivacyControlStore, PrivacyEraseAdapter, Pri
 import type { AppSettings, Note } from '../src/core';
 import { AppControllerImpl } from '../src/services/controller';
 import { createProviderCleanupRegistry, createTrackedProviderResponseLifetime } from '../src/services/providerResponseLifetime';
+import { buildOpenRouterPeriodSummaryRequest, createOpenRouterPeriodSummaryBinding } from '../src/services/openRouterPeriodSummary';
 
 vi.mock('expo', () => ({ requireOptionalNativeModule: () => null }));
 
@@ -38,7 +40,7 @@ function acceptedBatch(batchId = 'batch_fixture_1') {
   }), { status: 202 });
 }
 
-function makeClient(fetcher: typeof fetch, options: { key?: string | null; beforeFetch?: () => Promise<void>; ownership?: <T>(work: () => Promise<T>) => Promise<T> } = {}) {
+function makeClient(fetcher: typeof fetch, options: { key?: string | null; beforeFetch?: () => Promise<void>; ownership?: <T>(work: () => Promise<T>) => Promise<T>; sha256Text?: (value: string) => Promise<string> } = {}) {
   const events: string[] = [];
   const client = new OpenRouterBatchClient({
     fetcher,
@@ -46,11 +48,99 @@ function makeClient(fetcher: typeof fetch, options: { key?: string | null; befor
     readCredentialSnapshot: async () => ({ key: options.key === undefined ? 'fictional-key' : options.key, generation: 3 }),
     assertCredentialGeneration: (expected) => { if (expected !== 3) throw new Error('stale'); },
     assertBeforeStart: () => undefined,
+    sha256Text: options.sha256Text,
   });
   return { client, events };
 }
 
 describe('OpenRouter Batch client', () => {
+  it('submits a fully validated profile-6 summary through the one-POST path and rejects a tampered binding before side effects', async () => {
+    const digest = async (value: string) => createHash('sha256').update(value, 'utf8').digest('hex');
+    const content = 'A fictional event captured for the period-summary client test.';
+    const binding = await createOpenRouterPeriodSummaryBinding({
+      version: 1, requestProfileVersion: 6, operation: 'period_summary', policyId: '11111111-1111-4111-8111-111111111111',
+      policyRevision: 1, policyDigest: 'a'.repeat(64), occurrenceId: '22222222-2222-4222-8222-222222222222',
+      period: 'daily', timeZone: 'UTC', localInterval: { start: '2026-06-30', end: '2026-07-01' },
+      startUtc: '2026-06-30T00:00:00.000Z', endUtc: '2026-07-01T00:00:00.000Z', preparedAt: '2026-07-01T01:00:00.000Z',
+      sources: [{ id: 'event-1', role: 'event', kind: 'note', revision: 1, content, contentSha256: await digest(content),
+        effectiveAt: '2026-06-30T12:00:00.000Z', observedAt: '2026-07-01T01:00:00.000Z' }],
+      destination: { kind: 'absent', documentId: null, path: 'reports/daily.md', expectedRevision: null, expectedAbsenceGeneration: 0 },
+      instructions: 'Summarize supplied events.', effort: 'low',
+    }, digest);
+    const prepared = await buildOpenRouterPeriodSummaryRequest(binding, digest);
+    const fetcher = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => acceptedBatch('batch_period_summary'));
+    const reservation = vi.fn(async () => undefined);
+    const { client } = makeClient(fetcher as unknown as typeof fetch, { sha256Text: digest });
+    await expect(client.submit({ operationId, requestProfileVersion: 6, operation: 'period_summary', requestBody: prepared.body,
+      requestSha256: await digest(prepared.body), summaryBinding: binding }, reservation)).resolves.toMatchObject({ batchId: 'batch_period_summary' });
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(reservation).toHaveBeenCalledOnce();
+    const payload = JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body)) as { requests: { custom_id: string; body: { response_format: { json_schema: { name: string } } } }[] };
+    expect(payload.requests[0]).toMatchObject({ custom_id: operationId, body: { response_format: { json_schema: { name: 'period_summary' } } } });
+
+    const rejectedFetch = vi.fn(async () => acceptedBatch());
+    const rejectedReservation = vi.fn(async () => undefined);
+    const { client: rejectedClient } = makeClient(rejectedFetch as unknown as typeof fetch, { sha256Text: digest });
+    await expect(rejectedClient.submit({ operationId, requestProfileVersion: 6, operation: 'period_summary', requestBody: prepared.body,
+      requestSha256: await digest(prepared.body), summaryBinding: { ...binding,
+        sources: binding.sources.map((source) => ({ ...source, content: 'Tampered source bytes.' })) } }, rejectedReservation)).rejects.toMatchObject({ phase: 'pre_dispatch' });
+    expect(rejectedReservation).not.toHaveBeenCalled();
+    expect(rejectedFetch).not.toHaveBeenCalled();
+
+    const legacyFetch = vi.fn(async () => acceptedBatch());
+    const legacyReservation = vi.fn(async () => undefined);
+    const { client: legacyClient } = makeClient(legacyFetch as unknown as typeof fetch, { sha256Text: digest });
+    await expect(legacyClient.submit({ operationId, requestProfileVersion: 5, operation: 'period_summary' as never, requestBody: prepared.body }, legacyReservation))
+      .rejects.toMatchObject({ phase: 'pre_dispatch' });
+    expect(legacyReservation).not.toHaveBeenCalled();
+    expect(legacyFetch).not.toHaveBeenCalled();
+  });
+
+  it('owns the full profile-6 operation synchronously before digest or credential barriers', async () => {
+    const digest = async (value: string) => createHash('sha256').update(value, 'utf8').digest('hex');
+    const content = 'A fictional event captured for the immutable submission test.';
+    const binding = await createOpenRouterPeriodSummaryBinding({
+      version: 1, requestProfileVersion: 6, operation: 'period_summary', policyId: '11111111-1111-4111-8111-111111111111',
+      policyRevision: 1, policyDigest: 'a'.repeat(64), occurrenceId: '22222222-2222-4222-8222-222222222222',
+      period: 'daily', timeZone: 'UTC', localInterval: { start: '2026-06-30', end: '2026-07-01' },
+      startUtc: '2026-06-30T00:00:00.000Z', endUtc: '2026-07-01T00:00:00.000Z', preparedAt: '2026-07-01T01:00:00.000Z',
+      sources: [{ id: 'event-1', role: 'event', kind: 'note', revision: 1, content, contentSha256: await digest(content),
+        effectiveAt: '2026-06-30T12:00:00.000Z', observedAt: '2026-07-01T01:00:00.000Z' }],
+      destination: { kind: 'absent', documentId: null, path: 'reports/daily.md', expectedRevision: null, expectedAbsenceGeneration: 0 },
+      instructions: 'Summarize supplied events.', effort: 'low',
+    }, digest);
+    const prepared = await buildOpenRouterPeriodSummaryRequest(binding, digest);
+    const fetcher = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => acceptedBatch('batch_immutable_summary'));
+    const { client } = makeClient(fetcher as unknown as typeof fetch, { sha256Text: digest });
+    const submission = { operationId, requestProfileVersion: 6, operation: 'period_summary', requestBody: prepared.body,
+      requestSha256: await digest(prepared.body), summaryBinding: JSON.parse(JSON.stringify(binding)) } as {
+        operationId: string; requestProfileVersion: number; operation: string; requestBody: string; requestSha256: string;
+        summaryBinding: Record<string, any>;
+      };
+    const pending = client.submit(submission as never, async () => undefined);
+    submission.operationId = '99999999-9999-4999-8999-999999999999';
+    submission.requestBody = '{}';
+    submission.requestSha256 = 'f'.repeat(64);
+    submission.summaryBinding.policyId = '99999999-9999-4999-8999-999999999999';
+    submission.summaryBinding.sources[0].content = 'substituted after submit';
+    await expect(pending).resolves.toMatchObject({ batchId: 'batch_immutable_summary' });
+    const payload = JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body)) as { requests: { custom_id: string; body: unknown }[] };
+    expect(payload.requests[0]?.custom_id).toBe(operationId);
+    expect(payload.requests[0]?.body).toEqual(JSON.parse(prepared.body));
+  });
+
+  it('rejects accessor-bearing profile-6 input before reservation or provider I/O', async () => {
+    const fetcher = vi.fn(async () => acceptedBatch());
+    const reserve = vi.fn(async () => undefined);
+    const { client } = makeClient(fetcher as unknown as typeof fetch);
+    const input = { operationId, requestProfileVersion: 6, operation: 'period_summary', requestBody: '{}',
+      requestSha256: 'a'.repeat(64), summaryBinding: {} } as Record<string, unknown>;
+    Object.defineProperty(input, 'operationId', { enumerable: true, get: () => operationId });
+    await expect(client.submit(input as never, reserve)).rejects.toMatchObject({ phase: 'pre_dispatch' });
+    expect(reserve).not.toHaveBeenCalled();
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
   it('writes the fixed ordered Batch envelope and performs exactly one POST after durable admission', async () => {
     const seen: { url: string; init?: RequestInit }[] = [];
     const events: string[] = [];

@@ -592,7 +592,7 @@ function projectReminderState(value: ReminderState): WorkspaceReminderStateDTO {
 }
 
 function projectBatchJob(value: AssistantBatchJobDTO): AssistantBatchJobDTO {
-  return pick(value, ['id', 'kind', 'status', 'sourceRemoved', 'canCheck', 'createdAt', 'updatedAt', 'resultObservedAt', 'noteId', 'noteRevision', 'model', 'effort', 'operation', 'reasoningEffort', 'parentTurnId', 'recoveryParentTurnId', 'requestBytes', 'omittedSourceCount', 'unknownCharge', 'costStatus', 'billingScope', 'providerReportedCostUsd', 'byok', 'promptTokens', 'completionTokens', 'totalTokens', 'failureCode', 'mailMessageId', 'hasMailReplyResult', 'canReviewMailReply', 'mailReplyContextCount', 'mailReplyActivationOperation', 'proposalId', 'canRecoverMoreCompute', 'moreComputeEfforts', 'pendingRecoveryChildId', 'recoveredConversationId', 'recoveredTurnId']) as AssistantBatchJobDTO;
+  return pick(value, ['id', 'kind', 'status', 'sourceRemoved', 'canCheck', 'createdAt', 'updatedAt', 'resultObservedAt', 'noteId', 'noteRevision', 'model', 'effort', 'operation', 'reasoningEffort', 'parentTurnId', 'recoveryParentTurnId', 'requestBytes', 'omittedSourceCount', 'unknownCharge', 'costStatus', 'billingScope', 'providerReportedCostUsd', 'byok', 'promptTokens', 'completionTokens', 'totalTokens', 'failureCode', 'mailMessageId', 'hasMailReplyResult', 'canReviewMailReply', 'mailReplyContextCount', 'mailReplyActivationOperation', 'proposalId', 'canRecoverMoreCompute', 'moreComputeEfforts', 'pendingRecoveryChildId', 'recoveredConversationId', 'recoveredTurnId', 'periodSummary', 'summaryLineage']) as AssistantBatchJobDTO;
 }
 function projectChatTurn(value: ChatTurnDTO): ChatTurnDTO {
   return { id: value.id, noteId: value.noteId, userText: value.userText, createdAt: value.createdAt,

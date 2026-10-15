@@ -30,7 +30,7 @@ async function binding(sources: readonly OpenRouterPeriodSummarySource[] = [even
     occurrenceId: '22222222-2222-4222-8222-222222222222', period: 'daily' as const, timeZone: 'UTC',
     localInterval: { start: '2026-06-30', end: '2026-07-01' }, startUtc: '2026-06-30T00:00:00.000Z',
     endUtc: '2026-07-01T00:00:00.000Z', preparedAt: '2026-07-01T02:00:00.000Z', sources: [...sources].sort((left, right) => left.id.localeCompare(right.id)),
-    destination: { kind: 'absent' as const, documentId: null, path: 'reports/summary-2026-06-30.md', expectedRevision: null },
+    destination: { kind: 'absent' as const, documentId: null, path: 'reports/summary-2026-06-30.md', expectedRevision: null, expectedAbsenceGeneration: 0 },
     instructions: 'Summarize the events and cite only supplied source IDs.', effort: 'low' as const,
     ...overrides,
   };

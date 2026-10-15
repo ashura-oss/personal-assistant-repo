@@ -7233,6 +7233,9 @@ export class AppControllerImpl implements AppController {
   }
 
   private async dispatchPreparedBatch(staged: OpenRouterBatchContentJob | OpenRouterMailReplyContentJob, capturedBootstrapGeneration: number, preparedState: AppState, beforePersistSubmitting?: () => Promise<void>): Promise<AssistantBatchJobDTO> {
+    if (staged.kind === 'period_summary' || staged.operation === 'period_summary') {
+      throw new Error('summary_submission_unavailable');
+    }
     if (!this.openRouterBatchClient) throw new Error('The OpenRouter Batch service is unavailable in this workspace.');
     const capturedPrivacyEpoch = this.integration.privacySession?.epoch;
     let submittingState: AppState | undefined;
@@ -7386,6 +7389,9 @@ export class AppControllerImpl implements AppController {
   }
 
   private async verifyMoreComputeParent(job: OpenRouterBatchJob, state: AppState): Promise<PreparedOpenRouterAnalysis | undefined> {
+    if (job.kind === 'period_summary' || job.requestProfileVersion === 6 || job.operation === 'period_summary') {
+      throw new Error('summary_more_compute_unavailable');
+    }
     if (job.status !== 'result_truncated' || job.sourceRemoved || !job.batchId || this.assistantBatchLedgerMalformed ||
         !job.requestBody || !job.requestProfileVersion || !job.requestSha256 || !job.sourceFingerprint) throw new Error('This job has no intact cutoff result to recover.');
     if (job.kind === 'mail_reply') {
@@ -7420,6 +7426,9 @@ export class AppControllerImpl implements AppController {
     job: OpenRouterBatchContentJob | OpenRouterMailReplyContentJob; conversationId?: string; turnId?: string; docs: ContextDocument[]; stagedState: AppState;
   }> {
     const parent = plan.parent;
+    if (parent.kind === 'period_summary' || parent.requestProfileVersion === 6 || parent.operation === 'period_summary') {
+      throw new Error('summary_more_compute_unavailable');
+    }
     const timestamp = now();
     const jobId = this.newId();
     const recoveryBase = parent.recoveryBinding;
@@ -7553,6 +7562,9 @@ export class AppControllerImpl implements AppController {
     const privacyEpoch = this.integration.privacySession?.epoch;
     if (this.store.assertCurrent) await this.store.assertCurrent();
     const parent = this.assistantBatchLedger.jobs.find((job) => job.id === input.jobId);
+    if (parent?.kind === 'period_summary' || parent?.requestProfileVersion === 6 || parent?.operation === 'period_summary') {
+      throw new Error('summary_more_compute_unavailable');
+    }
     if (!parent || parent.status !== 'result_truncated' || parent.sourceRemoved || this.moreComputeChild(parent.id) || this.activeMoreComputeParents.has(parent.id)) throw new Error('This cutoff request is not available for another attempt.');
     if (!this.moreComputeEfforts(parent).includes(input.effort)) throw new Error('Choose a higher supported reasoning effort.');
     const preparationTicket = {};
@@ -7712,6 +7724,7 @@ export class AppControllerImpl implements AppController {
     if (this.assistantBatchLedgerMalformed) throw new Error('Saved Batch history could not be validated. Refresh local data before continuing.');
     const job = this.assistantBatchLedger.jobs.find((candidate) => candidate.id === jobId);
     if (!job) throw new Error('The saved Batch job was not found.');
+    if (job.kind === 'period_summary' && !job.sourceRemoved) throw new Error('summary_result_processing_unavailable');
     if (!isOpenRouterBatchContentJob(job) && !isOpenRouterMailReplyContentJob(job)) {
       if (!job.batchId || (!onProviderStatus && job.accounting?.providerReportedCostUsd !== undefined) || !this.openRouterBatchClient || this.assistantBatchCleanupRetries.has(job.id)) return this.batchDTO(job.id);
       const capturedState = this.state;
