@@ -1,6 +1,7 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import { AuthError, AuthService } from './auth.js';
+import { isValidAccountId } from './accountIds.js';
 import type { DurableKernel, OwnedTransactionContext } from './kernel.js';
 import { SecretVault, type OAuthStageBinding, type StageCiphertext } from './vault.js';
 
@@ -229,7 +230,7 @@ function normalizeReconnectIdentity(value: unknown, provider: OAuthStageProvider
 
 function normalizeReconnect(value: unknown, provider: OAuthStageProvider, code: string): OAuthReconnectLifecycle {
   const fields = closedFields(value, ['accountId', 'connectionGeneration', 'connected', 'authStatus'], ['tokenRef', 'identity'], code);
-  if (!safeText(fields.accountId, 128) ||
+  if (!isValidAccountId(fields.accountId) ||
       typeof fields.connectionGeneration !== 'number' || !Number.isSafeInteger(fields.connectionGeneration) || fields.connectionGeneration < 0 ||
       fields.tokenRef !== undefined && !safeText(fields.tokenRef, 128) || typeof fields.connected !== 'boolean' ||
       !['configured', 'connected', 'reauth_required', 'revoked'].includes(fields.authStatus as string)) {

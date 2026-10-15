@@ -3,8 +3,10 @@ import { constants, fstatSync, lstatSync, openSync, readSync, closeSync } from '
 import { isAbsolute } from 'node:path';
 import type Database from 'better-sqlite3';
 import type { DurableKernel, OwnedTransactionContext } from './kernel.js';
+import { isValidAccountId } from './accountIds.js';
 
 const VAULT_FORMAT_VERSION = 1;
+const VAULT_SCHEMA_VERSION = 2;
 const KEY_BYTES = 32;
 const NONCE_BYTES = 12;
 const TAG_BYTES = 16;
@@ -66,7 +68,7 @@ interface NormalizedScope {
 function validScope(scope: VaultScope): NormalizedScope {
   if (!scope || typeof scope !== 'object') return reject('invalid_scope', 'The credential scope is invalid.');
   if (scope.type === 'workspace' && Object.keys(scope).length === 1) return { type: 'workspace', id: '', accountGeneration: 0 };
-  if (scope.type === 'account' && Object.keys(scope).length === 3 && typeof scope.accountId === 'string' && UUID_V4.test(scope.accountId)) {
+  if (scope.type === 'account' && Object.keys(scope).length === 3 && isValidAccountId(scope.accountId)) {
     validGeneration(scope.expectedAccountGeneration);
     return { type: 'account', id: scope.accountId, accountGeneration: scope.expectedAccountGeneration };
   }
@@ -282,53 +284,88 @@ export class SecretVault {
           format_version INTEGER NOT NULL,
           verifier BLOB NOT NULL CHECK (length(verifier) = 32)
         ) STRICT;
-        CREATE TABLE vault_metadata (
-          workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-          scope_type TEXT NOT NULL CHECK (scope_type IN ('workspace', 'account')),
-          scope_id TEXT NOT NULL,
-          purpose TEXT NOT NULL CHECK (purpose IN ('openrouter', 'azureSpeech', 'googleOAuth', 'microsoftOAuth')),
-          generation INTEGER NOT NULL CHECK (generation >= 0),
-          configured INTEGER NOT NULL CHECK (configured IN (0, 1)),
-          PRIMARY KEY (workspace_id, scope_type, scope_id, purpose),
-          CHECK ((scope_type = 'workspace' AND scope_id = '') OR (scope_type = 'account' AND length(scope_id) = 36))
-        ) STRICT;
-        CREATE TABLE vault_ciphertexts (
-          workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-          scope_type TEXT NOT NULL CHECK (scope_type IN ('workspace', 'account')),
-          scope_id TEXT NOT NULL,
-          purpose TEXT NOT NULL CHECK (purpose IN ('openrouter', 'azureSpeech', 'googleOAuth', 'microsoftOAuth')),
-          generation INTEGER NOT NULL CHECK (generation > 0),
-          account_generation INTEGER NOT NULL CHECK (account_generation >= 0),
-          key_version INTEGER NOT NULL CHECK (key_version = 1),
-          nonce BLOB NOT NULL CHECK (length(nonce) = 12),
-          tag BLOB NOT NULL CHECK (length(tag) = 16),
-          ciphertext BLOB NOT NULL CHECK (length(ciphertext) > 0),
-          PRIMARY KEY (workspace_id, scope_type, scope_id, purpose)
-        ) STRICT;
-        INSERT INTO vault_schema (singleton, version) VALUES (1, ${VAULT_FORMAT_VERSION});
       `);
+      this.createMetadataTable(db, 'vault_metadata', true);
+      this.createCiphertextTable(db);
+      db.prepare('INSERT INTO vault_key_check (singleton, format_version, verifier) VALUES (1, ?, ?)')
+        .run(VAULT_FORMAT_VERSION, keyVerifier(this.#key));
+      db.prepare('INSERT INTO vault_schema (singleton, version) VALUES (1, ?)').run(VAULT_SCHEMA_VERSION);
+      return;
     } else {
       if (!tableExists('vault_key_check') || !tableExists('vault_metadata') || !tableExists('vault_ciphertexts')) {
         reject('vault_schema_corrupt', 'The vault schema is incomplete.');
       }
       const version = db.prepare('SELECT version FROM vault_schema WHERE singleton = 1').get() as { version: number } | undefined;
       if (!version || !Number.isSafeInteger(version.version) || version.version < 1) reject('vault_schema_corrupt', 'The vault schema version is invalid.');
-      if (version.version > VAULT_FORMAT_VERSION) reject('vault_newer_schema', 'This server cannot read a newer vault format.');
-      if (version.version !== VAULT_FORMAT_VERSION) reject('vault_migration_required', 'No migration is available for this vault format.');
+      if (version.version > VAULT_SCHEMA_VERSION) reject('vault_newer_schema', 'This server cannot read a newer vault schema.');
+      if (version.version !== 1 && version.version !== VAULT_SCHEMA_VERSION) reject('vault_migration_required', 'No migration is available for this vault schema.');
     }
 
     const saved = db.prepare('SELECT format_version, verifier FROM vault_key_check WHERE singleton = 1').get() as
       { format_version: number; verifier: Buffer } | undefined;
     if (!saved) {
-      if (hasVersionTable) reject('vault_schema_corrupt', 'The vault key verifier is missing.');
-      db.prepare('INSERT INTO vault_key_check (singleton, format_version, verifier) VALUES (1, ?, ?)')
-        .run(VAULT_FORMAT_VERSION, keyVerifier(this.#key));
-      return;
+      reject('vault_schema_corrupt', 'The vault key verifier is missing.');
     }
     if (saved.format_version !== VAULT_FORMAT_VERSION || !Buffer.isBuffer(saved.verifier) || saved.verifier.length !== 32) {
       reject('vault_schema_corrupt', 'The vault key verifier metadata is invalid.');
     }
     if (!timingSafeEqual(saved.verifier, keyVerifier(this.#key))) reject('vault_wrong_root_key', 'The configured vault root key does not match this database.');
+    const version = db.prepare('SELECT version FROM vault_schema WHERE singleton = 1').get() as { version: number };
+    if (version.version === 1) this.migrateMetadataToSchemaV2(db);
+  }
+
+  private createMetadataTable(db: Database.Database, tableName: string, opaqueAccountIds: boolean): void {
+    if (!['vault_metadata', 'vault_metadata_v2'].includes(tableName)) reject('vault_schema_corrupt', 'The vault metadata table name is invalid.');
+    const accountConstraint = opaqueAccountIds
+      ? 'length(CAST(scope_id AS BLOB)) BETWEEN 1 AND 1024'
+      : 'length(scope_id) = 36';
+    db.exec(`CREATE TABLE ${tableName} (
+      workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+      scope_type TEXT NOT NULL CHECK (scope_type IN ('workspace', 'account')),
+      scope_id TEXT NOT NULL,
+      purpose TEXT NOT NULL CHECK (purpose IN ('openrouter', 'azureSpeech', 'googleOAuth', 'microsoftOAuth')),
+      generation INTEGER NOT NULL CHECK (generation >= 0),
+      configured INTEGER NOT NULL CHECK (configured IN (0, 1)),
+      PRIMARY KEY (workspace_id, scope_type, scope_id, purpose),
+      CHECK ((scope_type = 'workspace' AND scope_id = '') OR (scope_type = 'account' AND ${accountConstraint}))
+    ) STRICT;`);
+  }
+
+  private createCiphertextTable(db: Database.Database): void {
+    db.exec(`CREATE TABLE vault_ciphertexts (
+      workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+      scope_type TEXT NOT NULL CHECK (scope_type IN ('workspace', 'account')),
+      scope_id TEXT NOT NULL,
+      purpose TEXT NOT NULL CHECK (purpose IN ('openrouter', 'azureSpeech', 'googleOAuth', 'microsoftOAuth')),
+      generation INTEGER NOT NULL CHECK (generation > 0),
+      account_generation INTEGER NOT NULL CHECK (account_generation >= 0),
+      key_version INTEGER NOT NULL CHECK (key_version = 1),
+      nonce BLOB NOT NULL CHECK (length(nonce) = 12),
+      tag BLOB NOT NULL CHECK (length(tag) = 16),
+      ciphertext BLOB NOT NULL CHECK (length(ciphertext) > 0),
+      PRIMARY KEY (workspace_id, scope_type, scope_id, purpose)
+    ) STRICT;`);
+  }
+
+  private migrateMetadataToSchemaV2(db: Database.Database): void {
+    const rows = db.prepare('SELECT workspace_id,scope_type,scope_id,purpose,generation,configured FROM vault_metadata')
+      .all() as Array<{ workspace_id: string; scope_type: 'workspace' | 'account'; scope_id: string;
+        purpose: string; generation: number; configured: number }>;
+    for (const row of rows) {
+      if (typeof row.workspace_id !== 'string' || !UUID_V4.test(row.workspace_id) ||
+          row.scope_type !== 'workspace' && row.scope_type !== 'account' ||
+          row.scope_type === 'workspace' && row.scope_id !== '' ||
+          row.scope_type === 'account' && !isValidAccountId(row.scope_id) ||
+          !PURPOSES.has(row.purpose) || !Number.isSafeInteger(row.generation) || row.generation < 0 ||
+          row.configured !== 0 && row.configured !== 1) {
+        reject('vault_schema_corrupt', 'The existing vault metadata is invalid.');
+      }
+    }
+    this.createMetadataTable(db, 'vault_metadata_v2', true);
+    const insert = db.prepare('INSERT INTO vault_metadata_v2 (workspace_id,scope_type,scope_id,purpose,generation,configured) VALUES (?,?,?,?,?,?)');
+    for (const row of rows) insert.run(row.workspace_id, row.scope_type, row.scope_id, row.purpose, row.generation, row.configured);
+    db.exec('DROP TABLE vault_metadata; ALTER TABLE vault_metadata_v2 RENAME TO vault_metadata;');
+    db.prepare('UPDATE vault_schema SET version=? WHERE singleton=1').run(VAULT_SCHEMA_VERSION);
   }
 
   getMetadataWithinTransaction(context: OwnedTransactionContext, scope: VaultScope, purpose: VaultPurpose): VaultCredentialMetadata {
@@ -473,7 +510,7 @@ export class SecretVault {
     readonly expectedCredentialGeneration: number;
   }): boolean {
     checkContext(this.#db, context);
-    if (!input || typeof input !== 'object' || !UUID_V4.test(input.accountId) ||
+    if (!input || typeof input !== 'object' || !isValidAccountId(input.accountId) ||
         (input.purpose !== 'googleOAuth' && input.purpose !== 'microsoftOAuth')) {
       reject('invalid_scope', 'The credential scope is invalid.');
     }

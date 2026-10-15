@@ -2,6 +2,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import Database from 'better-sqlite3';
+import { isValidAccountId } from './accountIds.js';
 
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SHA256 = /^[0-9a-f]{64}$/i;
@@ -128,6 +129,10 @@ function fail(code: string, message: string): never {
 
 function requireUuid(value: unknown, label: string): asserts value is string {
   if (typeof value !== 'string' || !UUID_V4.test(value)) fail('invalid_id', `${label} must be a UUIDv4.`);
+}
+
+function requireAccountId(value: unknown, label: string): asserts value is string {
+  if (!isValidAccountId(value)) fail('invalid_id', `${label} is invalid.`);
 }
 
 function requireInteger(value: unknown, label: string, minimum = 0): asserts value is number {
@@ -576,7 +581,7 @@ export class DurableKernel {
           fail('invalid_mutator', 'Account generation updates must be a plain map.');
         }
         for (const [accountId, generation] of Object.entries(mutation.accountGenerations)) {
-          requireUuid(accountId, 'Account id');
+          requireAccountId(accountId, 'Account id');
           requireInteger(generation, 'Account generation');
           const old = this.db.prepare('SELECT generation FROM account_generations WHERE workspace_id = ? AND account_id = ?')
             .get(workspace.id, accountId) as { generation: number } | undefined;
@@ -601,7 +606,7 @@ export class DurableKernel {
   createOneUsePlan(sessionToken: string, input: PlanInput): OneUsePlan {
     requireInteger(input?.expectedRevision, 'Expected revision');
     requireInteger(input?.expectedPrivacyEpoch, 'Expected privacy epoch');
-    requireUuid(input?.accountId, 'Account id');
+    requireAccountId(input?.accountId, 'Account id');
     if (typeof input?.sourceHash !== 'string' || !SHA256.test(input.sourceHash)) fail('invalid_input', 'Source hash must be a SHA-256 hex digest.');
     const create = this.db.transaction((): OneUsePlan => {
       const { tokenHash, session, workspace, now } = this.authenticate(sessionToken);
@@ -686,7 +691,7 @@ export class DurableKernel {
   }
 
   recordAccountGeneration(sessionToken: string, accountId: string, verifiedGeneration: number): void {
-    requireUuid(accountId, 'Account id');
+    requireAccountId(accountId, 'Account id');
     requireInteger(verifiedGeneration, 'Verified account generation');
     this.db.transaction(() => {
       const { workspace, now } = this.authenticate(sessionToken);

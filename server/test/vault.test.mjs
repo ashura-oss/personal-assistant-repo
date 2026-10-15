@@ -291,7 +291,7 @@ test('wrong root keys and newer vault formats fail without changing vault metada
     assert.deepEqual(readFileSync(f.databasePath), beforeWrongKey);
 
     const tamper = new Database(f.databasePath);
-    tamper.prepare('UPDATE vault_schema SET version = 2 WHERE singleton = 1').run();
+    tamper.prepare('UPDATE vault_schema SET version = 3 WHERE singleton = 1').run();
     tamper.close();
     const beforeNewerFormat = readFileSync(f.databasePath);
     const newerKernel = createDurableKernel({ databasePath: f.databasePath, validateSnapshot: f.validateSnapshot, now: f.now });
