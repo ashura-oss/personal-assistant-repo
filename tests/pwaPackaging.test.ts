@@ -159,6 +159,7 @@ describe('PWA export packaging', () => {
     const manifest = JSON.parse(await readFile(path.join(root, 'manifest.webmanifest'), 'utf8'));
     const worker = await readFile(path.join(root, 'sw.js'), 'utf8');
     const copiedIcon = await readFile(path.join(root, 'assets', 'still-icon.png'));
+    expect(html).toMatch(/<meta\s+name="viewport"\s+content="[^"]*viewport-fit=cover[^"]*">/i);
     expect(html).toContain('<link rel="manifest" href="/manifest.webmanifest">');
     expect(html).toContain('<link rel="apple-touch-icon" href="/assets/still-icon.png">');
     const registration = html.match(/<script defer src="(\/pwa-register-[a-f\d]{16}\.js)"><\/script>/i)?.[1];

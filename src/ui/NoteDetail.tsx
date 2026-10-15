@@ -81,6 +81,7 @@ export function canUseSavedTranscriptInChat(note: Pick<NoteDetailDisplayNote, "t
 }
 
 export type NoteDetailProps = {
+  storageLocation?: 'device' | 'server';
   note: NoteDetailDisplayNote;
   recordingAvailable: boolean;
   importedAudioMissing?: boolean;
@@ -156,6 +157,7 @@ const intents: { key: AssistIntent; label: string }[] = [
 ];
 
 export function NoteDetail({
+  storageLocation = 'device',
   note,
   recordingAvailable,
   importedAudioMissing = false,
@@ -476,6 +478,7 @@ export function NoteDetail({
             <AssistantBatchJobCard
               key={job.id}
               job={job}
+              storageLocation={storageLocation}
               busy={busy}
               blocked={assistantBatchActionsBlocked}
               onCheck={onCheckAssistantBatch}

@@ -17,6 +17,7 @@ import {
 type Props = {
   job: WorkspaceAssistantBatchJobDisplay;
   chatContext?: 'chat' | 'refinement';
+  storageLocation?: 'device' | 'server';
   busy?: boolean;
   blocked?: boolean;
   onCheck?: (jobId: string) => Promise<unknown> | unknown;
@@ -31,7 +32,7 @@ function dateLabel(value: string): string {
     : 'Time unavailable';
 }
 
-export function AssistantBatchJobCard({ job, chatContext, busy = false, blocked = false, onCheck, onRetryCleanup, moreCompute }: Props) {
+export function AssistantBatchJobCard({ job, chatContext, storageLocation = 'device', busy = false, blocked = false, onCheck, onRetryCleanup, moreCompute }: Props) {
   const [checking, setChecking] = useState(false);
   const [retryingCleanup, setRetryingCleanup] = useState(false);
   const [actionError, setActionError] = useState<string | undefined>();
@@ -85,12 +86,14 @@ export function AssistantBatchJobCard({ job, chatContext, busy = false, blocked 
           ? job.proposalId
             ? 'A draft from this reply is available for normal review in the inbox.'
             : job.hasMailReplyResult
-              ? 'A completed reply is saved on this device. Open the saved message reply composer to review it.'
+              ? storageLocation === 'server'
+                ? 'A completed reply is saved in this workspace. Open the saved message reply composer to review it.'
+                : 'A completed reply is saved on this device. Open the saved message reply composer to review it.'
               : 'The completed reply is unavailable for review.'
-          : 'The validated reply was saved on this device.'}</Text>
+          : storageLocation === 'server' ? 'The validated reply was saved in this workspace.' : 'The validated reply was saved on this device.'}</Text>
       ) : null}
       {job.status === 'result_not_retained' ? (
-        <Text style={styles.helper}>The reply did not fit in local saved data. Reported usage is still shown.</Text>
+        <Text style={styles.helper}>{storageLocation === 'server' ? 'The reply did not fit in saved workspace data. Reported usage is still shown.' : 'The reply did not fit in local saved data. Reported usage is still shown.'}</Text>
       ) : null}
       {job.status === 'result_truncated' && job.pendingRecoveryChildId ? <Text style={styles.helper}>A higher-reasoning request is already saved. Check its status in Batch history.</Text> : null}
       {job.status === 'result_truncated' && hasNoHigherSupportedReasoning(job) ? <Text style={styles.helper}>No higher supported reasoning setting is available for this response.</Text> : null}

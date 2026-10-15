@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
-import { ActivityIndicator, Text, View } from 'react-native';
+import { ActivityIndicator, Pressable, Text, View } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import type { WorkspaceSnapshotDTO } from '../cloud/workspaceDto';
 import type { WorkspaceCommand, WorkspaceCommandResponse } from '../cloud/workspaceCommands';
@@ -306,7 +306,16 @@ export function CloudWorkspaceSession({ session, onLogout }: { session: Authenti
   const getCapture = useCallback(() => captureRef.current, []);
   const [store] = useState(() => new CloudWorkspaceSessionStore(session));
   const state = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
+  const initialRetryLock = useRef(false);
   useEffect(() => store.start(getCapture), [store, getCapture]);
+
+  const retryWorkspace = async () => {
+    if (initialRetryLock.current || state.busy) return;
+    initialRetryLock.current = true;
+    try { await store.refresh(); }
+    catch { /* refresh publishes its safe error; this also catches synchronous disposed/busy failures. */ }
+    finally { initialRetryLock.current = false; }
+  };
 
   if (!state.snapshot) {
     return (
@@ -315,7 +324,15 @@ export function CloudWorkspaceSession({ session, onLogout }: { session: Authenti
           <View style={[s.viewport, { alignItems: 'center', justifyContent: 'center', gap: 12 }]}>
             {state.status === 'loading' ? <ActivityIndicator color={C.sage} /> : null}
             <Text style={s.accountSub}>{state.error ?? 'Opening your saved workspace…'}</Text>
-            {state.status === 'error' ? <Text style={s.accountSub}>Check session or reload this workspace to continue.</Text> : null}
+            {state.status === 'error' ? <>
+              <Text style={s.accountSub}>Your workspace could not be loaded. Retry this session or sign out to check your session again.</Text>
+              <Pressable accessibilityRole="button" accessibilityLabel="Retry workspace" disabled={state.busy} onPress={() => { void retryWorkspace(); }} style={recoveryStyles.primary}>
+                <Text style={recoveryStyles.primaryText}>{state.busy ? 'Retrying…' : 'Retry workspace'}</Text>
+              </Pressable>
+              <Pressable accessibilityRole="button" accessibilityLabel="Sign out" disabled={state.busy} onPress={() => { store.invalidate(); onLogout(); }} style={recoveryStyles.secondary}>
+                <Text style={recoveryStyles.secondaryText}>Sign out</Text>
+              </Pressable>
+            </> : null}
           </View>
         </SafeAreaView>
       </SafeAreaProvider>
@@ -332,3 +349,10 @@ export function CloudWorkspaceSession({ session, onLogout }: { session: Authenti
     cancelTranscription: (commandId) => store.cancelTranscription(commandId),
   } : { available: false, reason: 'Browser recording is not ready in this workspace session.' }} />;
 }
+
+const recoveryStyles = {
+  primary: { minHeight: 44, paddingHorizontal: 18, borderRadius: 12, backgroundColor: C.sage, alignItems: 'center' as const, justifyContent: 'center' as const },
+  primaryText: { color: C.bg, fontSize: 15, fontWeight: '700' as const },
+  secondary: { minHeight: 44, paddingHorizontal: 18, borderRadius: 12, borderWidth: 1, borderColor: C.border, alignItems: 'center' as const, justifyContent: 'center' as const },
+  secondaryText: { color: C.text, fontSize: 15, fontWeight: '600' as const },
+};

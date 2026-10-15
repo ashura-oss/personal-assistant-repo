@@ -588,6 +588,7 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
         busy={state.busy || state.refreshRequired || Boolean(state.pendingCommand) || settingsSaving} onClose={closeSettings}
       /> : tab === 'chat' ? (
         <ChatSection
+          storageLocation="server"
           conversations={conversations}
           selectedConversationId={selectedConversationId}
           turns={selectedConversation?.turns ?? []}
@@ -670,6 +671,7 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
           />
           {selectedNote ? <WorkspaceModals
             key={`${selectedNote.id}:${selectedNote.revision}`}
+            storageLocation="server"
             note={noteDetailDisplayNote(selectedNote)}
             recordingAvailable={selectedNote.audio?.available === true}
             importedAudioMissing={selectedNote.importOrigin?.audioMissing === true}
@@ -762,7 +764,7 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
               onGetCandidateSource={{ available: false, reason: 'Source rechecks are not connected to the server workspace yet.' }}
               onClearChatFilter={() => setNotice(undefined)} />
             <Text style={s.sectionTitle}>Batch history</Text>
-            {dto.assistantBatchJobs.map((job) => <AssistantBatchJobCard key={job.id} job={job} busy={state.busy} blocked={state.refreshRequired} onCheck={(id) => actions.batch.check(id)} />)}
+            {dto.assistantBatchJobs.map((job) => <AssistantBatchJobCard key={job.id} job={job} storageLocation="server" busy={state.busy} blocked={state.refreshRequired} onCheck={(id) => actions.batch.check(id)} />)}
           </> : null}
           {inboxSection === 'activity' ? <>
             <Text style={s.sectionTitle}>Activity</Text>

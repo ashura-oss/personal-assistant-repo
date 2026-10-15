@@ -1,6 +1,7 @@
 /** @vitest-environment jsdom */
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
+import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createInitialWorkspaceState } from '../src/services/controller.shared';
 import { createWorkspaceSnapshotDTO } from '../src/cloud/workspaceDto';
@@ -8,6 +9,7 @@ import type { Account, LocalTask, MailboxSnapshotMessage, Note, Proposal } from 
 import type { CloudWorkspaceSessionState, CloudWorkspaceVoiceActions } from '../src/web/CloudWorkspaceSession';
 import { CloudWorkspace } from '../src/web/CloudWorkspace';
 import { CloudWorkspaceSession } from '../src/web/CloudWorkspaceSession';
+import AppWeb from '../App.web';
 import { ServerRecordingPanel } from '../src/ui/ServerRecordingPanel';
 import { WorkspaceDocumentEditor } from '../src/ui/WorkspaceDocumentEditor';
 import type { CloudVoiceCoordinatorState, CloudVoicePhase } from '../src/web/cloudVoiceCoordinator';
@@ -45,7 +47,14 @@ vi.mock('react-native', async () => {
 });
 vi.mock('react-native-safe-area-context', async () => {
   const ReactModule = await import('react');
-  return { SafeAreaProvider: ({ children }: { children?: React.ReactNode }) => ReactModule.createElement('div', null, children), SafeAreaView: ({ children }: { children?: React.ReactNode }) => ReactModule.createElement('div', null, children) };
+  const context = ReactModule.createContext(false);
+  return {
+    SafeAreaProvider: ({ children }: { children?: React.ReactNode }) => ReactModule.createElement(context.Provider, { value: true }, ReactModule.createElement('div', { 'data-safe-area-provider': 'true' }, children)),
+    SafeAreaView: ({ children }: { children?: React.ReactNode }) => {
+      if (!ReactModule.useContext(context)) throw new Error('SafeAreaView requires its provider ancestor.');
+      return ReactModule.createElement('div', { 'data-safe-area-view': 'true' }, children);
+    },
+  };
 });
 vi.mock('@expo/vector-icons/Ionicons', async () => {
   const ReactModule = await import('react');
@@ -149,6 +158,70 @@ function deferred<T>() {
 }
 
 describe('CloudWorkspace safe DTO presentation', () => {
+  it('mounts the real web entry through StrictMode from guest sign-in to workspace and confirmed logout', async () => {
+    const state = createInitialWorkspaceState(() => '11111111-1111-4111-8111-111111111111');
+    const snapshot = createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: 7 });
+    const guest = { authenticated: false, csrfToken: 'guest-csrf' };
+    const signedIn = { authenticated: true, workspaceId, privacyEpoch: 3, csrfToken: 'session-csrf' };
+    const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const path = String(input);
+      if (path === '/auth/session') return { ok: true, status: 200, json: async () => guest };
+      if (path === '/auth/login') return { ok: true, status: 200, json: async () => signedIn };
+      if (path === '/auth/logout') return { ok: true, status: 200, json: async () => guest };
+      if (path === '/api/credentials') return { ok: true, status: 200, json: async () => credentialMetadata() };
+      if (path === '/api/workspace/snapshot') return { ok: true, status: 200, json: async () => snapshot };
+      throw new Error(`Unexpected PWA request: ${init?.method ?? 'GET'} ${path}`);
+    });
+    const storageRead = vi.spyOn(Storage.prototype, 'getItem');
+    const storageWrite = vi.spyOn(Storage.prototype, 'setItem');
+    const storageRemove = vi.spyOn(Storage.prototype, 'removeItem');
+    vi.stubGlobal('fetch', fetcher);
+    await act(async () => { root.render(<React.StrictMode><AppWeb /></React.StrictMode>); await new Promise((resolve) => setTimeout(resolve, 0)); });
+    expect(host.querySelector('[data-safe-area-provider="true"]')).not.toBeNull();
+    expect(host.querySelector('input[aria-label="Workspace password"]')).not.toBeNull();
+    setTextField('Workspace password', 'private test password');
+    await act(async () => { click('Sign in'); await new Promise((resolve) => setTimeout(resolve, 0)); await new Promise((resolve) => setTimeout(resolve, 0)); });
+    expect(host.textContent).toContain('Sign out');
+    expect(host.textContent).not.toContain('Workspace password');
+    expect(fetcher.mock.calls.some(([path]) => String(path) === '/api/workspace/snapshot')).toBe(true);
+    const snapshotReadCount = fetcher.mock.calls.filter(([path]) => String(path) === '/api/workspace/snapshot').length;
+    await act(async () => { click('Sign out'); await new Promise((resolve) => setTimeout(resolve, 0)); });
+    expect(host.querySelector('input[aria-label="Workspace password"]')).not.toBeNull();
+    expect(fetcher.mock.calls.some(([path]) => String(path) === '/auth/logout')).toBe(true);
+    expect(fetcher.mock.calls.filter(([path]) => String(path) === '/api/workspace/snapshot')).toHaveLength(snapshotReadCount);
+    expect(storageRead).not.toHaveBeenCalled();
+    expect(storageWrite).not.toHaveBeenCalled();
+    expect(storageRemove).not.toHaveBeenCalled();
+  });
+
+  it('offers an explicit retry after the first workspace snapshot fails', async () => {
+    const state = createInitialWorkspaceState(() => '11111111-1111-4111-8111-111111111111');
+    const snapshot = createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: 7 });
+    const signedIn = { authenticated: true, workspaceId, privacyEpoch: 3, csrfToken: 'session-csrf' };
+    let snapshotReads = 0;
+    const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const path = String(input);
+      if (path === '/auth/session') return { ok: true, status: 200, json: async () => signedIn };
+      if (path === '/api/credentials') return { ok: true, status: 200, json: async () => credentialMetadata() };
+      if (path === '/api/workspace/snapshot') {
+        snapshotReads += 1;
+        return { ok: false, status: 503, json: async () => ({}) };
+      }
+      if (path === '/api/workspace/refresh' && init?.method === 'POST') return { ok: true, status: 200, json: async () => snapshot };
+      throw new Error(`Unexpected retry request: ${init?.method ?? 'GET'} ${path}`);
+    });
+    vi.stubGlobal('fetch', fetcher);
+    await act(async () => { root.render(<AppWeb />); await new Promise((resolve) => setTimeout(resolve, 0)); });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); await new Promise((resolve) => setTimeout(resolve, 0)); });
+    expect(host.textContent).toContain('Retry workspace');
+    expect(snapshotReads).toBe(1);
+    await act(async () => { clickTwice('Retry workspace'); await new Promise((resolve) => setTimeout(resolve, 0)); await new Promise((resolve) => setTimeout(resolve, 0)); });
+    expect(host.textContent).toContain('Sign out');
+    expect(snapshotReads).toBe(1);
+    expect(fetcher.mock.calls.filter(([path, init]) => String(path) === '/api/workspace/refresh' && init?.method === 'POST')).toHaveLength(1);
+    expect(fetcher.mock.calls.some(([path]) => String(path).startsWith('/api/workspace/commands'))).toBe(false);
+  });
+
   it('keeps session credential service across Settings close and reopen, clears drafts, and sends only one explicit key mutation', async () => {
     const { state } = fixture();
     const requests: { path: string; method: string; body?: string }[] = [];
@@ -1456,8 +1529,8 @@ describe('CloudWorkspace safe DTO presentation', () => {
     let latest = [first];
     const response = deferred<{ revision: number; snapshotUpdated: boolean }>();
     const save = vi.fn(() => response.promise);
-    const renderEditor = () => <WorkspaceDocumentEditor visible document={first} currentDocuments={latest} busy={false}
-      saveAction={{ available: true, action: save }} onClose={vi.fn()} />;
+    const renderEditor = () => <SafeAreaProvider><WorkspaceDocumentEditor visible document={first} currentDocuments={latest} busy={false}
+      saveAction={{ available: true, action: save }} onClose={vi.fn()} /></SafeAreaProvider>;
     act(() => root.render(renderEditor()));
     setTextField('Document content', 'Draft I want to keep');
     latest = [{ path: first.path, content: 'Changed elsewhere', revision: 2 }];
@@ -1482,8 +1555,8 @@ describe('CloudWorkspace safe DTO presentation', () => {
     const first = { path: 'notes/one.md', content: 'First', revision: 1 };
     const second = { path: 'notes/two.md', content: 'Second', revision: 4 };
     const currentDocuments = [first, second];
-    const renderEditor = (visible: boolean, document: typeof first) => <WorkspaceDocumentEditor key={`${visible}:${document.path}`} visible={visible} document={document}
-      currentDocuments={currentDocuments} busy={false} saveAction={{ available: true, action: save }} onClose={vi.fn()} />;
+    const renderEditor = (visible: boolean, document: typeof first) => <SafeAreaProvider><WorkspaceDocumentEditor key={`${visible}:${document.path}`} visible={visible} document={document}
+      currentDocuments={currentDocuments} busy={false} saveAction={{ available: true, action: save }} onClose={vi.fn()} /></SafeAreaProvider>;
     act(() => root.render(renderEditor(true, first)));
     setTextField('Document content', 'First edited');
     click('Save');

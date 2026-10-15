@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { CaptureStillActiveError } from '../privacy/audioBoundary';
+import { CaptureStillActiveError } from './captureErrors';
 import type { PrivacyAudioBoundary, PrivacyCaptureSession } from '../privacy/audioBoundary';
 import type { AudioCapture, AudioCaptureStopResult } from './types';
 import type { PendingCaptureJournalPort } from './pendingCaptureService.types';

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CaptureStillActiveError, createPrivacyAudioBoundary, createPrivacyBoundNativeSpeechAudioIO, createPrivacyBoundRecordingRecoveryService } from '../src/privacy/audioBoundary';
+import { CaptureStillActiveError as BrowserCaptureStillActiveError } from '../src/audio/captureErrors';
 import { createPrivacyService } from '../src/privacy/service';
 import type { PrivacyService, PrivacyWorkspaceSession } from '../src/privacy/service';
 import type { PrivacyControlState, PrivacyControlStore, PrivacyOwner, PrivacyWriterDescriptor, PrivacyWriterLease, PrivacyWriterScope } from '../src/privacy/types';
@@ -9,6 +10,11 @@ import type { NativeSpeechAudioIO } from '../src/audio/speechUpload.types';
 
 vi.mock('expo', () => ({ requireOptionalNativeModule: () => undefined }));
 afterEach(() => vi.unstubAllGlobals());
+
+it('re-exports the shared capture error class used by browser and native capture', () => {
+  expect(CaptureStillActiveError).toBe(BrowserCaptureStillActiveError);
+  expect(new BrowserCaptureStillActiveError()).toBeInstanceOf(CaptureStillActiveError);
+});
 
 function deferred<T = void>() {
   let resolvePromise!: (value: T | PromiseLike<T>) => void;

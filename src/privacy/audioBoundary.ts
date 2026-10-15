@@ -1,8 +1,11 @@
 import type { PrivacyService, PrivacyWorkspaceSession } from './service';
 import type { PrivacyNamespace, PrivacyWriterScope } from './types';
 import type { RecordingRecoveryService, StagedRecording, AudioRecoveryMetadata } from '../audio/recovery.types';
+import { CaptureStillActiveError } from '../audio/captureErrors';
 import { Platform } from 'react-native';
 import type { NativeSpeechAudioIO, SpeechAudioService } from '../audio/speechUpload.types';
+
+export { CaptureStillActiveError };
 
 export type AudioCaptureNamespace = 'browser_audio' | 'native_recordings';
 
@@ -19,14 +22,6 @@ export interface PrivacyCaptureSession {
   runAction<T>(work: (scope: PrivacyWriterScope) => Promise<T>): Promise<T>;
   /** The writer lease remains held through the actual stop, persistence, and mode reset. */
   stop<T>(actualStopAndReset: (scope: PrivacyWriterScope) => Promise<T>): Promise<T>;
-}
-
-/** Throw when stop has not been proven to finish; the lease remains held for a retry. */
-export class CaptureStillActiveError extends Error {
-  constructor(message = 'The recorder may still be active. Retry stop or cancel before leaving this screen.') {
-    super(message);
-    this.name = 'CaptureStillActiveError';
-  }
 }
 
 export interface PrivacyAudioBoundary {

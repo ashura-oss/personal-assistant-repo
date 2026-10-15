@@ -21,6 +21,7 @@ type ChatRefinementRequest = Readonly<{
 type ChatRefinementReview = ChatRefinementRequest & Readonly<{ generation: number }>;
 
 export type ChatSectionProps = {
+  storageLocation?: 'device' | 'server';
   conversations: readonly ChatConversation[];
   selectedConversationId?: string;
   focusTurnId?: string;
@@ -126,6 +127,7 @@ function SuggestedActionsButton({
 }
 
 export function ChatSection({
+  storageLocation = 'device',
   conversations,
   selectedConversationId,
   focusTurnId,
@@ -607,6 +609,7 @@ export function ChatSection({
               {turn.job ? (
                 <AssistantBatchJobCard
                   job={turn.job}
+                  storageLocation={storageLocation}
                   chatContext={turn.operation === 'chat_refinement' ? 'refinement' : 'chat'}
                   busy={busy}
                   blocked={Boolean(recoveryMessage)}

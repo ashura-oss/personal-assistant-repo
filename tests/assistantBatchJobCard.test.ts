@@ -39,6 +39,20 @@ const queuedJob = (overrides: Partial<AssistantBatchJobDTO> = {}): AssistantBatc
 });
 
 describe('AssistantBatchJobCard action ownership', () => {
+  it('uses workspace-owned storage copy for server-backed batch results and keeps native copy by default', () => {
+    const completed = queuedJob({ status: 'completed', canCheck: false });
+    act(() => root.render(React.createElement(AssistantBatchJobCard, { job: completed })));
+    expect(host.textContent).toContain('The validated reply was saved on this device.');
+    act(() => root.render(React.createElement(AssistantBatchJobCard, { job: completed, storageLocation: 'server' })));
+    expect(host.textContent).toContain('The validated reply was saved in this workspace.');
+    expect(host.textContent).not.toContain('saved on this device');
+
+    act(() => root.render(React.createElement(AssistantBatchJobCard, { job: queuedJob({ kind: 'mail_reply', status: 'completed', canCheck: false, hasMailReplyResult: true }), storageLocation: 'server' })));
+    expect(host.textContent).toContain('A completed reply is saved in this workspace.');
+    act(() => root.render(React.createElement(AssistantBatchJobCard, { job: queuedJob({ status: 'result_not_retained', canCheck: false }), storageLocation: 'server' })));
+    expect(host.textContent).toContain('The reply did not fit in saved workspace data.');
+  });
+
   it('shows terminal cutoff and no-higher-effort copy without offering another paid action', () => {
     act(() => root.render(React.createElement(AssistantBatchJobCard, { job: queuedJob({
       status: 'result_truncated', canCheck: false, effort: 'max', canRecoverMoreCompute: false, moreComputeEfforts: [],

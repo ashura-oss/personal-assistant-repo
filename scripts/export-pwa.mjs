@@ -50,6 +50,20 @@ function pwaRegistrationAsset() {
   return { source, path: `/pwa-register-${digest}.js` };
 }
 
+function ensureViewportFitCover(html) {
+  const match = html.match(/<meta\b(?=[^>]*\bname=["']viewport["'])[^>]*>/i);
+  if (!match) return html.replace(/<head\b[^>]*>/i, (head) => `${head}\n    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">`);
+  const tag = match[0];
+  const content = tag.match(/\bcontent=(["'])(.*?)\1/i);
+  if (!content) {
+    return html.replace(tag, tag.replace(/\s*\/?>$/, (suffix) => ` content="width=device-width, initial-scale=1, viewport-fit=cover"${suffix}`));
+  }
+  const directives = content[2].split(',').map((value) => value.trim()).filter((value) => value && !/^viewport-fit\s*=/i.test(value));
+  directives.push('viewport-fit=cover');
+  const replacement = tag.replace(content[0], `content=${content[1]}${directives.join(', ')}${content[1]}`);
+  return html.replace(tag, replacement);
+}
+
 function isAllowedRegistrationPath(urlPath, registrationPath) {
   return Boolean(registrationPath && urlPath === registrationPath && /^\/pwa-register-[a-f\d]{16}\.js$/i.test(urlPath));
 }
@@ -195,7 +209,7 @@ export async function finalizePwaExport(outputDirectory, iconSource = ICON_SOURC
     `<script defer src="${registration.path}"></script>`,
   ].join('\n    ');
   if (!/<head\b[^>]*>/i.test(html) || !/<\/head>/i.test(html)) throw new Error('Expo HTML has no complete head element.');
-  const updatedHtml = html.replace(/<head\b([^>]*)>/i, (head) => `${head}\n    ${metadata}`);
+  const updatedHtml = ensureViewportFitCover(html.replace(/<head\b([^>]*)>/i, (head) => `${head}\n    ${metadata}`));
   const paths = await collectCacheableAssetPaths(outputRoot, updatedHtml, registration.path);
   const hash = createHash('sha256');
   for (const webPath of paths) {
