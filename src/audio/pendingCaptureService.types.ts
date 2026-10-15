@@ -5,6 +5,43 @@ import type { PendingCaptureNativeIO } from './pendingCaptureNativeIO.types';
 
 export type PendingCaptureReceipt = Readonly<{ id: string; revision: string }>;
 
+export type ServerPendingCapture = Readonly<{
+  id: string;
+  revision: string;
+  capturedAt: string;
+  captureTimeZone: string;
+  durationSeconds: number;
+  media: Readonly<{
+    uploadId: string;
+    mediaId: string;
+    sha256: string;
+    byteLength: number;
+    format: 'm4a' | 'mp3' | 'wav' | 'webm' | 'ogg';
+    mimeType: string;
+  }>;
+}>;
+
+export type ServerPendingCaptureAdoption = Readonly<{
+  kind: 'server';
+  capture: ServerPendingCapture;
+  uri: `still-media:${string}`;
+}>;
+
+export type ServerPendingCaptureConsumption = Readonly<{
+  id: string;
+  revision: string;
+  noteId: string;
+  uploadId: string;
+  mediaId: string;
+  sha256: string;
+  byteLength: number;
+  format: ServerPendingCapture['media']['format'];
+  mimeType: string;
+  durationSeconds: number;
+  capturedAt: string;
+  captureTimeZone: string;
+}>;
+
 export type PendingCaptureSafeStatus =
   | Readonly<{ kind: 'empty' }>
   | Readonly<{ kind: 'blocked'; reason: 'unsupported' | 'unreadable' | 'unavailable' | 'cleanup_required' }>
@@ -17,7 +54,10 @@ export type PendingCaptureSafeStatus =
 export type PendingCapturePrepareInput = Readonly<{ uri: string; capturedAt: string; captureTimeZone: string }>;
 export type PendingCaptureObservation = Readonly<{ replacementUris?: readonly string[]; replacementOverflow?: boolean }>;
 export type PendingCaptureInspectionReceipt = Readonly<{ receipt: PendingCaptureReceipt; status: PendingCaptureSafeStatus }>;
-export type PendingCaptureAdoption = Readonly<{ capture: PendingCaptureRecord; uri: string }>;
+export type PendingCaptureAdoption = Readonly<
+  | { kind: 'native'; capture: PendingCaptureRecord; uri: string }
+  | ServerPendingCaptureAdoption
+>;
 export type PendingCaptureJournalPort = Readonly<{
   getStatus(scope?: PrivacyWriterScope): Promise<PendingCaptureSafeStatus>;
   prepare(scope: PrivacyWriterScope, input: PendingCapturePrepareInput): Promise<PendingCaptureReceipt>;

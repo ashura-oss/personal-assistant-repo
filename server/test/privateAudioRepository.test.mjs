@@ -191,6 +191,26 @@ test('private audio schema refuses unsupported versions and a corrupted table sh
   } finally { cleanup(f); }
 });
 
+test('private audio schema upgrades an exact v1 marker and preserves existing ready media rows', async () => {
+  const f = setup();
+  try {
+    const bytes = wavFixture();
+    const original = await f.repository.ingest(chunks(bytes), { fileName: 'legacy.wav', mimeType: 'audio/wav' });
+    f.kernel.withTrustedDatabaseTransaction((db) => {
+      db.exec('DROP TRIGGER private_audio_consumed_capture_immutable');
+      db.exec('DROP TABLE private_audio_capture_uploads');
+      db.prepare('UPDATE private_audio_schema SET version=1 WHERE singleton=1').run();
+    });
+    const migrated = new PrivateAudioRepository({ kernel: f.kernel, actorSessionToken: f.actorSessionToken, privateRoot: f.privateRoot,
+      processId: f.processId, resolveAttachedMedia: () => undefined });
+    const marker = f.kernel.withTrustedDatabaseTransaction((db) => db.prepare('SELECT version FROM private_audio_schema WHERE singleton=1').get().version);
+    assert.equal(marker, 2);
+    assert.equal(migrated.getRecord(original.mediaId).status, 'ready');
+    assert.equal(migrated.getRecord(original.mediaId).sha256, original.sha256);
+    assert.equal(migrated.getRecord(original.mediaId).byteLength, bytes.length);
+  } finally { cleanup(f); }
+});
+
 test('constructing another workspace repository never deletes a live reader owned by a different process', async () => {
   const f = setup();
   try {
@@ -267,6 +287,204 @@ test('failed close-event row deletion is contained and an exact explicit retry d
   } finally { cleanup(f); }
 });
 
+test('ingest close failure retains the exact handle and active ownership until an explicit close retry succeeds', async () => {
+  let failNext = false;
+  let failures = 0;
+  const f = setup({ async closeUploadHandle(handle) {
+    if (failNext && failures < 2) { failures += 1; throw new Error('simulated file close failure'); }
+    await handle.close();
+  } });
+  try {
+    const bytes = wavFixture();
+    const other = await f.repository.ingest(chunks(bytes), { fileName: 'other.wav', mimeType: 'audio/wav' });
+    failNext = true;
+    const uploadId = randomUUID();
+    await assert.rejects(f.repository.uploadCapture(chunks(bytes), { uploadId, captureId: randomUUID(),
+      capturedAt: '2026-10-15T00:00:00.000Z', timeZone: 'Asia/Singapore', mimeType: 'audio/wav', expectedByteLength: bytes.length }), /close failure/);
+    assert.equal(failures, 1, 'the failed close is not hidden by a second automatic attempt');
+    await assert.rejects(f.repository.drain(), /audio_cleanup_required/);
+    await assert.rejects(f.repository.retryUploadCleanup(uploadId), /close failure/);
+    await assert.rejects(f.repository.drain(), /audio_cleanup_required/);
+    await f.repository.retryUploadCleanup(uploadId);
+    await f.repository.drain();
+    assert.equal(f.repository.getRecord(other.mediaId).status, 'ready', 'retry is scoped to the exact failed upload');
+    assert.equal(f.repository.inspectCaptureUpload(uploadId).status, 'inspect_required');
+  } finally { cleanup(f); }
+});
+
+test('replacement retirement retries a closed pending upload physically without mutating its historical rows', async () => {
+  let failClose = false;
+  let closeCalls = 0;
+  const f = setup({ async closeUploadHandle(handle) {
+    closeCalls += 1;
+    if (failClose) { failClose = false; throw new Error('simulated close failure'); }
+    await handle.close();
+  } });
+  try {
+    const bytes = wavFixture();
+    const uploadId = randomUUID();
+    failClose = true;
+    await assert.rejects(f.repository.uploadCapture(chunks(bytes), { uploadId, captureId: randomUUID(),
+      capturedAt: '2026-10-15T00:00:00.000Z', timeZone: 'Asia/Singapore', mimeType: 'audio/wav', expectedByteLength: bytes.length }), /close failure/);
+    const before = f.kernel.getOwnedSnapshot(f.actorSessionToken);
+    f.kernel.runLocalCommand(f.actorSessionToken, { expectedRevision: before.revision, expectedPrivacyEpoch: before.privacyEpoch,
+      idempotencyKey: randomUUID(), type: 'workspace.privacy.erase', canonicalRequest: '{"erase":true}' }, () => ({
+      snapshot: before.snapshot, receipt: { kind: 'privacy_erased' }, privacyEpoch: before.privacyEpoch + 1,
+    }));
+    const replacementSession = f.kernel.createSession(f.workspace.workspaceId, f.ownerId, Date.now() + 60 * 60_000);
+    const replacement = { identity: f.kernel.getOwnedIdentity(replacementSession), admissionSessionToken: replacementSession };
+
+    await assert.rejects(f.repository.retryUploadCleanup(uploadId), /session|epoch|auth/i,
+      'same-epoch metadata retry fails after physically closing the exact handle');
+    assert.equal(closeCalls, 2);
+    assert.equal(readdirSync(join(f.privateRoot, f.workspace.workspaceId)).includes(`${uploadId}.part`), true,
+      'the pending file remains until a retirement with newer authority removes it');
+    await f.repository.drain(replacement);
+    assert.equal(closeCalls, 2, 'replacement retirement reuses the close proof and never closes another time');
+    assert.deepEqual(readdirSync(join(f.privateRoot, f.workspace.workspaceId)), [], 'only the exact owned temporary file is removed');
+    const rows = f.kernel.withTrustedDatabaseTransaction((db) => ({
+      upload: db.prepare('SELECT status,privacy_epoch FROM private_audio_uploads WHERE upload_id=?').get(uploadId),
+      receipt: db.prepare('SELECT status,privacy_epoch FROM private_audio_capture_uploads WHERE upload_id=?').get(uploadId),
+    }));
+    assert.deepEqual(rows, { upload: { status: 'receiving', privacy_epoch: before.privacyEpoch },
+      receipt: { status: 'inspect_required', privacy_epoch: before.privacyEpoch } }, 'replacement cleanup preserves the old rows as evidence');
+  } finally { cleanup(f); }
+});
+
+test('reader opened before failed DB registration retains its exact file handle for explicit close retry', async () => {
+  const f = setup();
+  try {
+    const bytes = wavFixture();
+    const record = await f.repository.ingest(chunks(bytes), { fileName: 'clip.wav', mimeType: 'audio/wav' });
+    const noteId = 'reader-row-failure-note';
+    f.setAttached({ mediaId: record.mediaId, noteId, noteRevision: 1 });
+    let readerId;
+    let openedHandle;
+    let closeAttempts = 0;
+    const repository = new PrivateAudioRepository({ kernel: f.kernel, actorSessionToken: f.actorSessionToken,
+      privateRoot: f.privateRoot, processId: f.processId,
+      resolveAttachedMedia: ({ noteId: candidate, noteRevision }) => candidate === noteId && noteRevision === 1
+        ? { mediaId: record.mediaId, noteId, noteRevision: 1 } : undefined,
+      afterReaderHandleOpenForTesting(id, handle) { readerId = id; openedHandle = handle; },
+      async closeReaderHandle(handle) {
+        assert.equal(handle, openedHandle, 'retry owns the original FD opened before DB registration');
+        closeAttempts += 1;
+        if (closeAttempts === 1) throw new Error('simulated FD close failure');
+        await handle.close();
+      } });
+    f.kernel.withTrustedDatabaseTransaction((db) => db.exec(`CREATE TRIGGER reject_reader_insert BEFORE INSERT ON private_audio_readers BEGIN SELECT RAISE(FAIL, 'simulated reader row failure'); END`));
+    await assert.rejects(repository.openAttachedMedia({ noteId, noteRevision: 1 }), /simulated reader row failure/);
+    assert.ok(readerId);
+    assert.equal(closeAttempts, 1);
+    assert.equal(f.kernel.withTrustedDatabaseTransaction((db) => db.prepare('SELECT count(*) AS count FROM private_audio_readers WHERE reader_id=?')
+      .get(readerId).count), 0, 'there was no registered row to delete or claim as acknowledged');
+    f.kernel.withTrustedDatabaseTransaction((db) => db.exec('DROP TRIGGER reject_reader_insert'));
+    await repository.retryReaderCleanup(readerId);
+    assert.equal(closeAttempts, 2);
+    assert.equal(f.kernel.withTrustedDatabaseTransaction((db) => db.prepare('SELECT count(*) AS count FROM private_audio_readers WHERE reader_id=?')
+      .get(readerId).count), 0);
+    await assert.rejects(repository.retryReaderCleanup(readerId), /cleanup_unavailable/);
+  } finally { cleanup(f); }
+});
+
+test('speech read close failures retain the exact FD and block lease release, erase, and drain until explicit retry', async () => {
+  let closeAttempts = 0;
+  let openedHandle;
+  const f = setup({ async closeSpeechLeaseHandle(handle) {
+    openedHandle ??= handle;
+    assert.equal(handle, openedHandle, 'every attempt must close the same opened FD');
+    closeAttempts += 1;
+    if (closeAttempts <= 2) throw new Error('simulated speech FD close failure');
+    await handle.close();
+  } });
+  try {
+    const bytes = wavFixture();
+    const record = await f.repository.ingest(chunks(bytes), { fileName: 'clip.wav', mimeType: 'audio/wav' });
+    const other = await f.repository.ingest(chunks(bytes), { fileName: 'other.wav', mimeType: 'audio/wav' });
+    const noteId = 'speech-fd-cleanup-note';
+    f.setAttached({ mediaId: record.mediaId, noteId, noteRevision: 2, sha256: record.sha256, byteLength: record.byteLength });
+    const lease = await f.repository.createSpeechLease({ noteId, noteRevision: 2 });
+    await assert.rejects(f.repository.readSpeechLease(lease.leaseId), /speech FD close failure/);
+    assert.equal(closeAttempts, 1);
+    const leaseCount = () => f.kernel.withTrustedDatabaseTransaction((db) => db.prepare('SELECT count(*) AS count FROM private_audio_speech_leases WHERE lease_id=?')
+      .get(lease.leaseId).count);
+    assert.equal(leaseCount(), 1, 'failed close retains the durable lease');
+    await assert.rejects(f.repository.drain(), /audio_cleanup_required/);
+    await assert.rejects(f.repository.eraseOwnedMedia(record.mediaId), /audio_cleanup_required/);
+    assert.equal(f.repository.getRecord(record.mediaId).status, 'deletion_pending', 'erase intent remains held while the descriptor is unconfirmed');
+    await assert.rejects(f.repository.releaseSpeechLease(lease.leaseId), /speech FD close failure/);
+    assert.equal(closeAttempts, 2);
+    assert.equal(leaseCount(), 1, 'retry failure cannot delete the lease row');
+    await assert.rejects(f.repository.drain(), /audio_cleanup_required/);
+
+    await f.repository.releaseSpeechLease(lease.leaseId);
+    assert.equal(closeAttempts, 3);
+    assert.equal(leaseCount(), 0, 'metadata release follows exact physical close acknowledgement');
+    assert.equal((await f.repository.eraseOwnedMedia(record.mediaId)).status, 'unavailable');
+    assert.equal(f.repository.getRecord(other.mediaId).status, 'ready', 'retry affects only the exact leased recording');
+    await f.repository.drain();
+  } finally { cleanup(f); }
+});
+
+test('speech verification hash retains its exact read handle when close acknowledgement fails', async () => {
+  let closeAttempts = 0;
+  let openedHandle;
+  const f = setup({ async closeSpeechLeaseHandle(handle) {
+    openedHandle ??= handle;
+    assert.equal(handle, openedHandle);
+    closeAttempts += 1;
+    if (closeAttempts === 1) throw new Error('hash FD close failure');
+    await handle.close();
+  } });
+  try {
+    const bytes = wavFixture();
+    const record = await f.repository.ingest(chunks(bytes), { fileName: 'clip.wav', mimeType: 'audio/wav' });
+    const noteId = 'speech-hash-close-note';
+    f.setAttached({ mediaId: record.mediaId, noteId, noteRevision: 1, sha256: record.sha256, byteLength: record.byteLength });
+    const lease = await f.repository.createSpeechLease({ noteId, noteRevision: 1 });
+    await assert.rejects(f.repository.verifySpeechLease(lease.leaseId), /hash FD close failure/);
+    await assert.rejects(f.repository.drain(), /audio_cleanup_required/);
+    await f.repository.releaseSpeechLease(lease.leaseId);
+    assert.equal(closeAttempts, 2, 'release retries the exact descriptor without reopening or hashing again');
+    await f.repository.drain();
+  } finally { cleanup(f); }
+});
+
+test('verified newer-epoch retirement closes a failed speech-read FD without deleting its historical lease row', async () => {
+  let cleanupId;
+  let closeAttempts = 0;
+  let openedHandle;
+  const f = setup({ afterSpeechFileHandleOpenForTesting(id, handle) { cleanupId = id; openedHandle = handle; },
+    async closeSpeechLeaseHandle(handle) {
+      assert.equal(handle, openedHandle);
+      closeAttempts += 1;
+      if (closeAttempts === 1) throw new Error('retired speech FD close failure');
+      await handle.close();
+    } });
+  try {
+    const bytes = wavFixture();
+    const record = await f.repository.ingest(chunks(bytes), { fileName: 'clip.wav', mimeType: 'audio/wav' });
+    const noteId = 'retired-speech-fd-note';
+    f.setAttached({ mediaId: record.mediaId, noteId, noteRevision: 1, sha256: record.sha256, byteLength: record.byteLength });
+    const lease = await f.repository.createSpeechLease({ noteId, noteRevision: 1 });
+    await assert.rejects(f.repository.readSpeechLease(lease.leaseId), /retired speech FD close failure/);
+    const before = f.kernel.getOwnedSnapshot(f.actorSessionToken);
+    f.kernel.runLocalCommand(f.actorSessionToken, { expectedRevision: before.revision, expectedPrivacyEpoch: before.privacyEpoch,
+      idempotencyKey: randomUUID(), type: 'workspace.privacy.erase', canonicalRequest: '{"erase":true}' }, () => ({
+      snapshot: before.snapshot, receipt: { kind: 'privacy_erased' }, privacyEpoch: before.privacyEpoch + 1,
+    }));
+    const replacementSession = f.kernel.createSession(f.workspace.workspaceId, f.ownerId, Date.now() + 60 * 60_000);
+    const replacement = { identity: f.kernel.getOwnedIdentity(replacementSession), admissionSessionToken: replacementSession };
+    await assert.rejects(f.repository.drain(replacement), /audio_cleanup_required/);
+    await f.repository.retryPrivateFileClose(cleanupId);
+    await f.repository.drain(replacement);
+    const retained = f.kernel.withTrustedDatabaseTransaction((db) => db.prepare('SELECT privacy_epoch,media_id FROM private_audio_speech_leases WHERE lease_id=?')
+      .get(lease.leaseId));
+    assert.deepEqual(retained, { privacy_epoch: before.privacyEpoch, media_id: record.mediaId });
+    assert.equal(closeAttempts, 2);
+  } finally { cleanup(f); }
+});
+
 test('stream creation failure retains the exact opened handle until an explicit close retry succeeds', async () => {
   const f = setup();
   try {
@@ -340,5 +558,38 @@ test('an explicit reader cleanup retry cannot close or release a healthy active 
     assert.deepEqual(Buffer.concat(received), bytes);
     assert.equal(f.kernel.withTrustedDatabaseTransaction((db) => db.prepare('SELECT count(*) AS count FROM private_audio_readers WHERE reader_id=?')
       .get(readerId).count), 0);
+  } finally { cleanup(f); }
+});
+
+test('a verified newer privacy epoch drains actual file handles while preserving the retired epoch holder rows', async () => {
+  const f = setup();
+  try {
+    const bytes = wavFixture();
+    const record = await f.repository.ingest(chunks(bytes), { fileName: 'clip.wav', mimeType: 'audio/wav' });
+    const noteId = 'retired-epoch-note';
+    f.setAttached({ mediaId: record.mediaId, noteId, noteRevision: 1, sha256: record.sha256, byteLength: record.byteLength });
+    const lease = await f.repository.createSpeechLease({ noteId, noteRevision: 1 });
+    const reader = await f.repository.openAttachedMedia({ noteId, noteRevision: 1 });
+    const readerId = f.kernel.withTrustedDatabaseTransaction((db) => db.prepare('SELECT reader_id FROM private_audio_readers WHERE media_id=?')
+      .get(record.mediaId).reader_id);
+    const before = f.kernel.getOwnedSnapshot(f.actorSessionToken);
+    f.kernel.runLocalCommand(f.actorSessionToken, { expectedRevision: before.revision, expectedPrivacyEpoch: before.privacyEpoch,
+      idempotencyKey: randomUUID(), type: 'workspace.privacy.erase', canonicalRequest: '{"erase":true}' }, () => ({
+      snapshot: before.snapshot, receipt: { kind: 'privacy_erased' }, privacyEpoch: before.privacyEpoch + 1,
+    }));
+    const replacementSession = f.kernel.createSession(f.workspace.workspaceId, f.ownerId, Date.now() + 60 * 60_000);
+    const replacementIdentity = f.kernel.getOwnedIdentity(replacementSession);
+    const drain = f.repository.drain({ identity: replacementIdentity, admissionSessionToken: replacementSession });
+    let settled = false;
+    void drain.then(() => { settled = true; });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(settled, false, 'replacement drain waits for actual old file-handle close');
+    reader.body.destroy();
+    await drain;
+    const holders = f.kernel.withTrustedDatabaseTransaction((db) => ({
+      reader: db.prepare('SELECT count(*) AS count FROM private_audio_readers WHERE reader_id=?').get(readerId).count,
+      lease: db.prepare('SELECT count(*) AS count FROM private_audio_speech_leases WHERE lease_id=?').get(lease.leaseId).count,
+    }));
+    assert.deepEqual(holders, { reader: 1, lease: 1 }, 'retiring old authority preserves historical ownership rows instead of deleting them');
   } finally { cleanup(f); }
 });

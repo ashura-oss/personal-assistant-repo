@@ -13,6 +13,7 @@ import { RUNTIME_ACTOR_EXPIRES_AT } from '../dist/runtimeActors.js';
 import { OwnedWorkspaceRuntime } from '../dist/ownedWorkspaceRuntime.node.mjs';
 import { createInitialWorkspaceState } from '../dist/sharedControllerNode.mjs';
 import { createWorkspaceHttpApi } from '../dist/workspaceHttp.node.mjs';
+import { PrivateAudioRepository } from '../dist/privateAudioRepository.js';
 
 const authSecret = Buffer.from(Array.from({ length: 32 }, (_, index) => index + 61));
 
@@ -31,7 +32,7 @@ async function freePort() {
   throw new Error('unable_to_allocate_fetch_compatible_port');
 }
 
-async function fixture({ withWorkspaceApi = true, wrapWorkspaceApi } = {}) {
+async function fixture({ withWorkspaceApi = true, wrapWorkspaceApi, withAudioApi = false } = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'still-workspace-http-'));
   const staticRoot = join(directory, 'public');
   mkdirSync(join(staticRoot, 'assets'), { recursive: true });
@@ -51,7 +52,55 @@ async function fixture({ withWorkspaceApi = true, wrapWorkspaceApi } = {}) {
   const enrolled = await auth.enrollOwner('correct horse battery staple', state);
   const runtimeSession = kernel.createSession(enrolled.workspaceId, enrolled.ownerId, RUNTIME_ACTOR_EXPIRES_AT);
   const unavailable = async () => 'unavailable';
-  const runtime = new OwnedWorkspaceRuntime({ kernel, runtimeSessionFor: () => runtimeSession,
+  let runtime;
+  let attachedMedia;
+  let audioUploadId;
+  const audioRepository = withAudioApi ? new PrivateAudioRepository({ kernel, actorSessionToken: runtimeSession,
+    privateRoot: join(directory, 'private-audio'), processId: randomUUID(),
+    resolveAttachedMedia: ({ noteId, noteRevision }) => attachedMedia?.noteId === noteId && attachedMedia.noteRevision === noteRevision
+      ? attachedMedia : undefined }) : undefined;
+  const projectAudioReceipt = (receipt) => ({ schemaVersion: 1, uploadId: receipt.uploadId, status: receipt.status,
+    capture: receipt.capture, ...(receipt.consumption ? { consumption: receipt.consumption } : {}), ...(receipt.media ? { media: receipt.media } : {}) });
+  const directAudioApi = audioRepository ? Object.freeze({
+    async upload(admission, input) {
+      const receipt = await audioRepository.uploadCapture(input.source, { uploadId: input.uploadId, captureId: input.capture.id,
+        capturedAt: input.capture.capturedAt, timeZone: input.capture.timeZone, mimeType: input.mimeType,
+        ...(input.expectedByteLength === undefined ? {} : { expectedByteLength: input.expectedByteLength }) });
+      audioUploadId = input.uploadId;
+      return projectAudioReceipt(receipt);
+    },
+    async inspectUpload(_admission, uploadId) { return projectAudioReceipt(audioRepository.inspectCaptureUpload(uploadId)); },
+    async openMedia(admission, mediaId, input) {
+      if (!audioUploadId) throw new Error('audio_unavailable');
+      const receipt = audioRepository.inspectCaptureUpload(audioUploadId);
+      const noteId = receipt.status === 'consumed' && receipt.consumption?.noteId;
+      const noteRevision = receipt.status === 'consumed' && receipt.consumption?.noteRevision;
+      if (!receipt.media || receipt.media.mediaId.slice('still-media:'.length) !== mediaId || !noteId || !noteRevision) throw new Error('audio_unavailable');
+      const record = audioRepository.getRecord(mediaId);
+      if (record.status !== 'ready') throw new Error('audio_unavailable');
+      attachedMedia = { mediaId, noteId, noteRevision, sha256: record.sha256, byteLength: record.byteLength };
+      return audioRepository.openAttachedMedia({ noteId, noteRevision, method: input.method,
+        ...(input.range ? { range: input.range } : {}), ...(input.signal ? { signal: input.signal } : {}) });
+    },
+  }) : undefined;
+  const pendingCapture = audioRepository ? Object.freeze({
+    async getStatus() { return Object.freeze({ kind: 'empty' }); },
+    async inspect() { return Object.freeze({ kind: 'empty' }); },
+    async export() { throw new Error('unsupported'); },
+    async discard() { throw new Error('unsupported'); },
+    async retryPendingCaptureSourceRelease() { return Object.freeze({ kind: 'empty' }); },
+    async readForAdoption({ id, revision }) {
+      const receipt = audioRepository.readCaptureForAdoption(id, revision);
+      if (!receipt.media) throw new Error('capture media missing');
+      return Object.freeze({ kind: 'server', uri: receipt.media.mediaId, capture: Object.freeze({
+        id, revision, capturedAt: receipt.capture.capturedAt, captureTimeZone: receipt.capture.timeZone,
+        durationSeconds: receipt.media.durationSeconds, media: Object.freeze({ uploadId: receipt.uploadId,
+          mediaId: receipt.media.mediaId.slice('still-media:'.length), sha256: receipt.media.sha256,
+          byteLength: receipt.media.byteLength, format: receipt.media.format, mimeType: receipt.media.mimeType }) }) });
+    },
+    async readConsumedEvidence(id) { return audioRepository.readConsumedCaptureEvidence(id); },
+  }) : undefined;
+  runtime = new OwnedWorkspaceRuntime({ kernel, runtimeSessionFor: () => runtimeSession,
     crypto: { randomUUID, async sha256(value) { return createHash('sha256').update(value).digest('hex'); } },
     providers: { speech: { async transcribe() { throw new Error('unexpected provider call'); }, async releaseUploadLease() {}, disposeMemory() {} },
       openAi: { async prepare() { throw new Error('unexpected provider call'); }, async analyze() { throw new Error('unexpected provider call'); },
@@ -67,14 +116,19 @@ async function fixture({ withWorkspaceApi = true, wrapWorkspaceApi } = {}) {
       async writeDocument() {}, async removeAudio() {},
       async loadRecordingRecovery() { return { async pickAndStage() { return null; }, async inspect() { throw new Error('unsupported'); }, async remove() {} }; },
       bindRecordingRecovery(service) { return service; },
-    } });
+    }, ...(directAudioApi ? { audioHttpApi: directAudioApi, pendingCapture,
+      mediaResolver: { resolveMediaId(_note, uri) {
+        const match = /^still-media:([0-9a-f-]{36})$/i.exec(uri);
+        if (!match) return undefined;
+        return audioRepository.getRecord(match[1]).status === 'ready' ? match[1] : undefined;
+      } } } : {}) });
   const actualWorkspaceApi = withWorkspaceApi ? createWorkspaceHttpApi(runtime) : undefined;
   const workspaceApi = actualWorkspaceApi ? (wrapWorkspaceApi ? wrapWorkspaceApi(actualWorkspaceApi) : actualWorkspaceApi) : undefined;
   const server = createStillHttpServer({ auth, canonicalOrigin, allowLocalHttp: true, staticRoot,
-    ...(workspaceApi ? { workspaceApi } : {}) });
+    ...(workspaceApi ? { workspaceApi } : {}), ...(directAudioApi ? { audioApi: runtime.createAudioHttpApi() } : {}) });
   await new Promise((resolve, reject) => server.listen(port, '127.0.0.1', (error) => error ? reject(error) : resolve()));
   const request = (path, init = {}) => fetch(`${canonicalOrigin}${path}`, init);
-  return { directory, canonicalOrigin, enrolled, kernel, auth, runtime, server, request, workspaceApi,
+  return { directory, canonicalOrigin, enrolled, kernel, auth, runtime, server, request, workspaceApi, audioRepository,
     setTime(value) { now = value; },
     async close() {
       await new Promise((resolve) => server.close(() => resolve()));
@@ -105,6 +159,18 @@ async function login(f) {
 
 function mutationHeaders(f, auth, { origin = f.canonicalOrigin, csrf = auth.csrf } = {}) {
   return { Origin: origin, Cookie: auth.cookie, 'X-Still-CSRF': csrf, 'Content-Type': 'application/json' };
+}
+
+function wavFixture() {
+  const sampleRate = 8000;
+  const data = Buffer.alloc(1600, 128);
+  const bytes = Buffer.alloc(44 + data.length);
+  bytes.write('RIFF', 0, 'ascii'); bytes.writeUInt32LE(bytes.length - 8, 4); bytes.write('WAVE', 8, 'ascii');
+  bytes.write('fmt ', 12, 'ascii'); bytes.writeUInt32LE(16, 16); bytes.writeUInt16LE(1, 20);
+  bytes.writeUInt16LE(1, 22); bytes.writeUInt32LE(sampleRate, 24); bytes.writeUInt32LE(sampleRate, 28);
+  bytes.writeUInt16LE(1, 32); bytes.writeUInt16LE(8, 34); bytes.write('data', 36, 'ascii');
+  bytes.writeUInt32LE(data.length, 40); data.copy(bytes, 44);
+  return bytes;
 }
 
 function deferred() {
@@ -159,6 +225,67 @@ test('authenticated workspace snapshot, refresh, command dispatch, and receipt i
   } finally { await f.close(); }
 });
 
+test('authenticated raw audio upload, inspect, adoption and range playback use the runtime HTTP bridge', async () => {
+  const f = await fixture({ withAudioApi: true });
+  try {
+    const bytes = wavFixture();
+    const uploadId = randomUUID();
+    const captureId = randomUUID();
+    const capture = { id: captureId, capturedAt: '2026-10-15T00:00:00.000Z', timeZone: 'Asia/Singapore' };
+    assert.equal((await f.request('/api/audio/uploads', { method: 'POST', headers: {
+      Origin: f.canonicalOrigin, 'X-Still-Upload-ID': uploadId, 'X-Still-Capture': JSON.stringify(capture), 'Content-Type': 'audio/wav',
+    }, body: bytes })).status, 401, 'raw upload is behind session authentication and CSRF admission');
+
+    const auth = await login(f);
+    const uploadResponse = await f.request('/api/audio/uploads', { method: 'POST', headers: {
+      ...mutationHeaders(f, auth), 'X-Still-Upload-ID': uploadId, 'X-Still-Capture': JSON.stringify(capture), 'Content-Type': 'audio/wav',
+    }, body: bytes });
+    assert.equal(uploadResponse.status, 201, await uploadResponse.clone().text());
+    assert.equal(uploadResponse.headers.get('cache-control'), 'no-store');
+    const uploaded = await uploadResponse.json();
+    assert.equal(uploaded.status, 'ready');
+    assert.equal(uploaded.capture.id, captureId);
+    assert.equal(uploaded.media.byteLength, bytes.length);
+    assert.equal('privateRoot' in uploaded, false);
+
+    const inspection = await f.request(`/api/audio/uploads/${uploadId}`, { headers: { Cookie: auth.cookie } });
+    assert.equal(inspection.status, 200);
+    assert.equal((await inspection.json()).media.sha256, uploaded.media.sha256);
+
+    const snapshot = await (await f.request('/api/workspace/snapshot', { headers: { Cookie: auth.cookie } })).json();
+    const commandId = randomUUID();
+    const command = { schemaVersion: 1, commandId, expectedRevision: snapshot.revision, expectedPrivacyEpoch: snapshot.privacyEpoch,
+      command: { kind: 'notes.capture.adopt', captureId, captureRevision: uploaded.capture.revision } };
+    const adoptedResponse = await f.request('/api/workspace/commands', { method: 'POST', headers: mutationHeaders(f, auth), body: JSON.stringify(command) });
+    assert.equal(adoptedResponse.status, 200);
+    const adopted = await adoptedResponse.json();
+    assert.equal(adopted.status, 'finished');
+    assert.equal(adopted.receipt.captureId, captureId);
+    const note = adopted.snapshot.state.notes.find((item) => item.id === captureId);
+    assert.equal(note.audio.available, true);
+    assert.equal(note.audio.mediaId, uploaded.media.mediaId.slice('still-media:'.length));
+    const duplicate = await f.request('/api/workspace/commands', { method: 'POST', headers: mutationHeaders(f, auth), body: JSON.stringify(command) });
+    assert.equal(duplicate.status, 200);
+    assert.deepEqual((await duplicate.json()).receipt, adopted.receipt);
+    const consumedInspection = await f.request(`/api/audio/uploads/${uploadId}`, { headers: { Cookie: auth.cookie } });
+    assert.equal(consumedInspection.status, 200);
+    const consumedReceipt = await consumedInspection.json();
+    assert.equal(consumedReceipt.status, 'consumed');
+    assert.deepEqual(consumedReceipt.consumption, { commandId, noteId: captureId, noteRevision: 1 });
+
+    const rawMediaId = uploaded.media.mediaId.slice('still-media:'.length);
+    const mediaResponse = await f.request(`/api/audio/${rawMediaId}`, { headers: { Cookie: auth.cookie, Range: 'bytes=0-15' } });
+    assert.equal(mediaResponse.status, 206, await mediaResponse.clone().text());
+    assert.equal(mediaResponse.headers.get('content-range'), `bytes 0-15/${bytes.length}`);
+    assert.deepEqual(Buffer.from(await mediaResponse.arrayBuffer()), bytes.subarray(0, 16));
+    const head = await f.request(`/api/audio/${rawMediaId}`, { method: 'HEAD', headers: { Cookie: auth.cookie, Range: 'bytes=4-7' } });
+    assert.equal(head.status, 206);
+    assert.equal(head.headers.get('content-length'), '4');
+    assert.equal((await head.arrayBuffer()).byteLength, 0);
+    assert.equal((await f.request(`/api/audio/${rawMediaId}`)).status, 401);
+  } finally { await f.close(); }
+});
+
 test('workspace command route accepts text payloads above the ordinary 16 KiB body limit', async () => {
   const f = await fixture();
   try {
@@ -178,10 +305,12 @@ test('workspace command route accepts text payloads above the ordinary 16 KiB bo
     const oversized = { ...command, commandId: randomUUID(), command: { kind: 'notes.save', transcript: 'x'.repeat(1024 * 1024) } };
     const tooLarge = await f.request('/api/workspace/commands', { method: 'POST', headers: mutationHeaders(f, auth), body: JSON.stringify(oversized) });
     assert.equal(tooLarge.status, 413, 'the widened text-command allowance still has a strict 1 MiB envelope ceiling');
+    assert.match(await tooLarge.text(), /request_too_large/i, 'consume the complete rejection body before reusing the keep-alive connection');
 
     const malformedKind = { ...command, commandId: randomUUID(), command: { kind: ['chat.submit'], text: 'x'.repeat(17 * 1024) } };
     const malformedLarge = await f.request('/api/workspace/commands', { method: 'POST', headers: mutationHeaders(f, auth), body: JSON.stringify(malformedKind) });
     assert.equal(malformedLarge.status, 413, 'a non-string kind cannot opt malformed input into the text-command body allowance');
+    assert.match(await malformedLarge.text(), /request_too_large/i);
   } finally { await f.close(); }
 });
 

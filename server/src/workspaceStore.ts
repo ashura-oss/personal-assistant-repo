@@ -13,6 +13,12 @@ export interface ServerWorkspaceStoreOptions {
   readonly afterCommitForTesting?: () => void | Promise<void>;
 }
 
+interface ServerCaptureConsumption {
+  readonly id: string; readonly revision: string; readonly noteId: string; readonly uploadId: string; readonly mediaId: string;
+  readonly sha256: string; readonly byteLength: number; readonly format: 'm4a' | 'mp3' | 'wav' | 'webm' | 'ogg';
+  readonly mimeType: string; readonly durationSeconds: number; readonly capturedAt: string; readonly captureTimeZone: string;
+}
+
 interface LoadedWorkspace {
   workspaceId: string;
   ownerId: string;
@@ -63,10 +69,11 @@ export class ServerWorkspaceStore<TState extends object = Record<string, unknown
     return Object.freeze({ raw: snapshot.raw, schemaVersion: snapshot.schemaVersion });
   }
 
-  async save(state: TState, options?: { consumePendingCapture: Readonly<{ id: string; revision: string; noteId: string }> }): Promise<void> {
+  async save(state: TState, options?: { consumePendingCapture?: Readonly<{ id: string; revision: string; noteId: string }>;
+    consumeServerPendingCapture?: ServerCaptureConsumption }): Promise<void> {
     const loaded = this.requireLoaded();
     this.assertNotAckBlocked();
-    if (options?.consumePendingCapture) throw new Error('Server-side pending capture has not been connected to the workspace journal.');
+    if (options?.consumePendingCapture && options.consumeServerPendingCapture) throw new Error('A workspace save cannot consume two capture sources.');
     const serialized = canonicalSnapshot(state);
     const accountGenerations = accountGenerationProjection(state);
     const ticket = currentCommandTicket();
@@ -74,9 +81,15 @@ export class ServerWorkspaceStore<TState extends object = Record<string, unknown
       let committedRevision: number;
       if (ticket) {
         if (!this.options.journal) throw new Error('An asynchronous command cannot checkpoint without its durable command journal.');
-        committedRevision = this.options.journal.checkpoint(ticket,
-          { workspaceId: loaded.workspaceId, revision: loaded.revision, privacyEpoch: loaded.privacyEpoch }, serialized, accountGenerations);
+        const fence = { workspaceId: loaded.workspaceId, revision: loaded.revision, privacyEpoch: loaded.privacyEpoch };
+        if (options?.consumeServerPendingCapture) {
+          committedRevision = this.options.journal.checkpointCapture(ticket, fence, serialized, accountGenerations, options.consumeServerPendingCapture);
+        } else {
+          if (options?.consumePendingCapture) throw new Error('Native pending capture cannot be consumed by a server workspace store.');
+          committedRevision = this.options.journal.checkpoint(ticket, fence, serialized, accountGenerations);
+        }
       } else {
+        if (options?.consumePendingCapture || options?.consumeServerPendingCapture) throw new Error('A pending capture requires an active journal command.');
         committedRevision = this.commitSnapshot(loaded, serialized, accountGenerations);
       }
       await this.options.afterCommitForTesting?.();

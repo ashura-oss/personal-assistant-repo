@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createInitialWorkspaceState } from '../src/services/controller.shared';
 import { createWorkspaceSnapshotDTO, type WorkspaceSnapshotDTO } from '../src/cloud/workspaceDto';
 import { parseWorkspaceCommandEnvelope } from '../src/cloud/workspaceCommands';
-import { createWebWorkspaceClient, WorkspaceClientError, WorkspaceCommandUnknownError } from '../src/web/workspaceClient';
+import { createWebWorkspaceClient, WorkspaceClientError, WorkspaceCommandNotStartedError, WorkspaceCommandUnknownError } from '../src/web/workspaceClient';
 import type { AuthenticatedSession } from '../src/web/authClient';
 
 const workspaceId = '7b906fca-65c1-4bd2-b18e-1b56cc6f48a8';
@@ -54,6 +54,40 @@ function deferred<T>() {
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers(); });
 
 describe('same-origin web workspace command client', () => {
+  it('binds capture adoption receipts to the exact capture revision and reports only pre-fetch admission failures as not started', async () => {
+    const dto = snapshot(1);
+    const captureId = conversationId;
+    const captureRevision = parentTurnId;
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(body(dto))
+      .mockResolvedValueOnce(body({ schemaVersion: 1, commandId, status: 'finished', receipt: {
+        schemaVersion: 1, commandId, kind: 'notes.capture.adopt', objectId: captureId, captureId, captureRevision,
+      } }));
+    const client = createWebWorkspaceClient(session, {
+      assertCurrent: () => undefined,
+      decodeSnapshot: (value) => { if (JSON.stringify(value) !== JSON.stringify(dto)) throw new Error('bad DTO'); return dto; },
+      fetcher,
+      makeCommandId: () => commandId,
+    });
+    await client.getSnapshot();
+    const admitted = vi.fn();
+    await expect(client.execute({ kind: 'notes.capture.adopt', captureId, captureRevision }, admitted)).resolves.toMatchObject({ status: 'finished' });
+    expect(admitted).toHaveBeenCalledOnce();
+    expect(admitted.mock.calls[0]?.[0]).toMatchObject({ commandId, command: { kind: 'notes.capture.adopt', captureId, captureRevision } });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    client.dispose();
+
+    const predispatch = createWebWorkspaceClient(session, {
+      assertCurrent: () => undefined,
+      decodeSnapshot: (value) => { if (JSON.stringify(value) !== JSON.stringify(dto)) throw new Error('bad DTO'); return dto; },
+      fetcher: vi.fn().mockResolvedValue(body(dto)),
+    });
+    await predispatch.getSnapshot();
+    await expect(predispatch.execute({ kind: 'chat.create' }, () => { throw new Error('owner binding rejected'); })).rejects.toBeInstanceOf(WorkspaceCommandNotStartedError);
+    expect(predispatch.getPendingCommand()).toBeUndefined();
+    predispatch.dispose();
+  });
+
   it('uses relative endpoints, strict command envelopes, CSRF, and the injected full DTO decoder', async () => {
     const dto = snapshot(1);
     const updatedDto = snapshot(2);

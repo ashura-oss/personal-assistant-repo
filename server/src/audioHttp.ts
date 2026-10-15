@@ -1,0 +1,52 @@
+import type { Readable } from 'node:stream';
+import type { WorkspaceHttpAdmission } from './workspaceHttp.js';
+
+export interface AudioUploadCaptureHeader {
+  readonly id: string;
+  readonly capturedAt: string;
+  readonly timeZone: string;
+}
+
+export interface AudioUploadReceiptDTO {
+  readonly schemaVersion: 1;
+  readonly uploadId: string;
+  readonly status: 'receiving' | 'ready' | 'failed' | 'inspect_required' | 'consumed' | 'discarded';
+  readonly capture: Readonly<{
+    id: string;
+    revision: string;
+    capturedAt: string;
+    timeZone: string;
+  }>;
+  readonly consumption?: Readonly<{ commandId: string; noteId: string; noteRevision: number }>;
+  readonly media?: Readonly<{
+    mediaId: `still-media:${string}`;
+    sha256: string;
+    byteLength: number;
+    durationSeconds: number;
+    format: 'm4a' | 'mp3' | 'wav' | 'webm' | 'ogg';
+    mimeType: string;
+  }>;
+}
+
+export interface AudioHttpMediaResponse {
+  readonly status: 200 | 206 | 416;
+  readonly headers: Readonly<Record<string, string>>;
+  readonly body?: Readable;
+}
+
+/** Trusted server-to-runtime bridge. It accepts only authenticated admissions and opaque media IDs. */
+export interface AudioHttpApi {
+  upload(admission: WorkspaceHttpAdmission, input: Readonly<{
+    uploadId: string;
+    capture: AudioUploadCaptureHeader;
+    mimeType: string;
+    expectedByteLength?: number;
+    source: AsyncIterable<Uint8Array>;
+  }>): Promise<AudioUploadReceiptDTO>;
+  inspectUpload(admission: WorkspaceHttpAdmission, uploadId: string): Promise<AudioUploadReceiptDTO>;
+  openMedia(admission: WorkspaceHttpAdmission, mediaId: string, input: Readonly<{
+    method: 'GET' | 'HEAD';
+    range?: string;
+    signal?: AbortSignal;
+  }>): Promise<AudioHttpMediaResponse>;
+}

@@ -16,6 +16,13 @@ export interface ServerConfig {
   readonly staticRoot: string;
   readonly host: '127.0.0.1';
   readonly allowLocalHttp: boolean;
+  readonly googleClientId?: string;
+  readonly microsoftClientId?: string;
+  readonly microsoftAuthority?: string;
+  readonly ffmpegPath: string;
+  readonly ffprobePath: string;
+  readonly googleRedirectUri: string;
+  readonly microsoftRedirectUri: string;
 }
 
 export interface ServerConfigOptions {
@@ -36,6 +43,15 @@ function requiredAbsolute(env: NodeJS.ProcessEnv, name: 'STILL_DATA_DIR' | 'STIL
   const value = env[name];
   if (typeof value !== 'string' || value.length === 0 || !isAbsolute(value) || value.includes('\0')) {
     fail('invalid_config', `${name} must be an absolute path.`);
+  }
+  return resolve(value);
+}
+
+function optionalExecutablePath(env: NodeJS.ProcessEnv, name: 'STILL_FFMPEG_PATH' | 'STILL_FFPROBE_PATH', fallback: string): string {
+  const value = env[name];
+  if (value === undefined || value === '') return fallback;
+  if (typeof value !== 'string' || !isAbsolute(value) || value.includes('\0') || /[\r\n]/.test(value)) {
+    fail('invalid_config', `${name} must be an absolute executable path.`);
   }
   return resolve(value);
 }
@@ -96,9 +112,32 @@ function validOrigin(value: unknown, allowLocalHttp: boolean): string {
   return value;
 }
 
+function optionalClientId(value: unknown, name: string): string | undefined {
+  if (value === undefined || value === '') return undefined;
+  if (typeof value !== 'string' || value.length > 512 || /[\u0000-\u0020\u007f]/.test(value)) {
+    fail('invalid_config', `${name} is invalid.`);
+  }
+  return value;
+}
+
+function optionalMicrosoftAuthority(value: unknown): string | undefined {
+  if (value === undefined || value === '') return undefined;
+  if (typeof value !== 'string' || value.length > 128 || /[\u0000-\u0020\u007f]/.test(value) ||
+      !['common', 'organizations', 'consumers'].includes(value) &&
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)) {
+    fail('invalid_config', 'STILL_MICROSOFT_AUTHORITY is invalid.');
+  }
+  return value;
+}
+
 export function loadServerConfig(env: NodeJS.ProcessEnv = process.env, options: ServerConfigOptions = {}): ServerConfig {
   const allowLocalHttp = options.allowLocalHttp === true;
   const canonicalOrigin = validOrigin(env.STILL_ORIGIN, allowLocalHttp);
+  const googleClientId = optionalClientId(env.STILL_GOOGLE_CLIENT_ID, 'STILL_GOOGLE_CLIENT_ID');
+  const microsoftClientId = optionalClientId(env.STILL_MICROSOFT_CLIENT_ID, 'STILL_MICROSOFT_CLIENT_ID');
+  const microsoftAuthority = optionalMicrosoftAuthority(env.STILL_MICROSOFT_AUTHORITY);
+  const ffmpegPath = optionalExecutablePath(env, 'STILL_FFMPEG_PATH', '/usr/bin/ffmpeg');
+  const ffprobePath = optionalExecutablePath(env, 'STILL_FFPROBE_PATH', '/usr/bin/ffprobe');
   const dataDirectory = requiredAbsolute(env, 'STILL_DATA_DIR');
   const vaultKeyFile = requiredAbsolute(env, 'STILL_VAULT_KEY_FILE');
   const staticRootCandidate = options.staticRoot ?? DEFAULT_STATIC_ROOT;
@@ -122,7 +161,13 @@ export function loadServerConfig(env: NodeJS.ProcessEnv = process.env, options: 
     fail('invalid_config', 'Private data and the vault key must be outside the public static root, with the key outside the database directory.');
   }
   return Object.freeze({ canonicalOrigin, dataDirectory, databasePath: join(dataDirectory, 'still.sqlite'),
-    vaultKeyFile, staticRoot, host: '127.0.0.1', allowLocalHttp });
+    vaultKeyFile, staticRoot, host: '127.0.0.1', allowLocalHttp,
+    ...(googleClientId ? { googleClientId } : {}), ...(microsoftClientId ? { microsoftClientId } : {}),
+    ...(microsoftAuthority ? { microsoftAuthority } : {}),
+    ffmpegPath, ffprobePath,
+    googleRedirectUri: `${canonicalOrigin}/api/oauth/google/callback`,
+    microsoftRedirectUri: `${canonicalOrigin}/api/oauth/microsoft/callback`,
+  });
 }
 
 /** Creates private directories for trusted local setup; does not open or replace existing data. */

@@ -37,7 +37,10 @@ export function bindWorkspaceStorage(
       const consumePendingCapture: ConsumePendingCapture | undefined = options?.consumePendingCapture
         ? Object.freeze({ ...options.consumePendingCapture })
         : undefined;
-      return withStateWriter(() => store.save(state, consumePendingCapture ? { consumePendingCapture } : undefined));
+      const consumeServerPendingCapture = options?.consumeServerPendingCapture;
+      return withStateWriter(() => store.save(state, consumePendingCapture || consumeServerPendingCapture
+        ? { ...(consumePendingCapture ? { consumePendingCapture } : {}), ...(consumeServerPendingCapture ? { consumeServerPendingCapture } : {}) }
+        : undefined));
     },
     clear: () => withStateWriter(() => store.clear()),
     ...(store.assertCurrent ? { assertCurrent: () => withStateWriter(() => store.assertCurrent!()) } : {}),
@@ -63,8 +66,9 @@ export function bindExistingWorkspaceWriter(
   const save = store.save.bind(store);
   const assertCurrent = store.assertCurrent?.bind(store);
   const copyState = (state: Parameters<StateStore['save']>[0]) => cloneState(state);
-  const copyOptions = (options: Parameters<StateStore['save']>[1]) => options?.consumePendingCapture
-    ? { consumePendingCapture: { ...options.consumePendingCapture } }
+  const copyOptions = (options: Parameters<StateStore['save']>[1]) => options?.consumePendingCapture || options?.consumeServerPendingCapture
+    ? { ...(options.consumePendingCapture ? { consumePendingCapture: { ...options.consumePendingCapture } } : {}),
+      ...(options.consumeServerPendingCapture ? { consumeServerPendingCapture: { ...options.consumeServerPendingCapture } } : {}) }
     : undefined;
   const withChild = <T>(actualIO: () => Promise<T>) => privacy.withExistingWriter(
     capturedScope,

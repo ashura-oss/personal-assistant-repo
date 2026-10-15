@@ -766,7 +766,11 @@ export class ConnectorClient {
     let response: Response;
     const requestHeaders = account.provider === 'microsoft' && kind === 'mail' ? graphImmutableHeaders(init) : new Headers(init.headers);
     requestHeaders.set('authorization', `Bearer ${token.accessToken}`);
-    try { response = await this.boundedFetch(url.toString(), { ...init, redirect: 'error', headers: requestHeaders }, guard, onDispatched, beforeDispatch, signal, responseByteLimit); }
+    const finalGuard = () => {
+      guard?.();
+      this.assertConnectionCurrent(account);
+    };
+    try { response = await this.boundedFetch(url.toString(), { ...init, redirect: 'error', headers: requestHeaders }, finalGuard, onDispatched, beforeDispatch, signal, responseByteLimit); }
     catch (error) { throw error; }
     if (response.status !== 401 || !retryAuth) return response;
     // A non-idempotent request is never repeated after an ambiguous response.
@@ -777,7 +781,7 @@ export class ConnectorClient {
     if (!allowTokenRefresh) throw new ProviderAccessTokenUnavailableError();
     if (!token.refreshToken) return this.reauth(account, 'reauth_required', 'Provider rejected the access token.');
     const refreshed = await this.refreshSingleflight(account, token, guard, true, signal);
-    return this.requestWithToken(url, refreshed, init, guard, signal, account.provider === 'microsoft' && kind === 'mail', responseByteLimit);
+    return this.requestWithToken(account, url, refreshed, init, guard, signal, account.provider === 'microsoft' && kind === 'mail', responseByteLimit);
   }
 
   private async refreshSingleflight(account: Account, token: StoredOAuthToken, guard?: RequestGuard, force = false, signal?: AbortSignal): Promise<StoredOAuthToken> {
@@ -800,15 +804,19 @@ export class ConnectorClient {
     finally { if (locks.get(lockKey) === operation) locks.delete(lockKey); }
   }
 
-  private async requestWithToken(url: URL, token: StoredOAuthToken, init: RequestInit, guard?: RequestGuard, signal?: AbortSignal, immutableMailId = false, responseByteLimit?: number): Promise<Response> {
+  private async requestWithToken(account: Account, url: URL, token: StoredOAuthToken, init: RequestInit, guard?: RequestGuard, signal?: AbortSignal, immutableMailId = false, responseByteLimit?: number): Promise<Response> {
+    const finalGuard = () => {
+      guard?.();
+      this.assertConnectionCurrent(account);
+    };
     const headers = new Headers(init.headers);
     if (immutableMailId && url.origin === new URL(GRAPH_API).origin) {
       const immutable = graphImmutableHeaders({ ...init, headers });
       immutable.set('authorization', `Bearer ${token.accessToken}`);
-      return this.boundedFetch(url.toString(), { ...init, redirect: 'error', headers: immutable }, guard, undefined, undefined, signal, responseByteLimit);
+      return this.boundedFetch(url.toString(), { ...init, redirect: 'error', headers: immutable }, finalGuard, undefined, undefined, signal, responseByteLimit);
     }
     headers.set('authorization', `Bearer ${token.accessToken}`);
-    return this.boundedFetch(url.toString(), { ...init, redirect: 'error', headers }, guard, undefined, undefined, signal, responseByteLimit);
+    return this.boundedFetch(url.toString(), { ...init, redirect: 'error', headers }, finalGuard, undefined, undefined, signal, responseByteLimit);
   }
 
   private async json<T>(account: Account, url: string, kind: 'mail' | 'calendar', init?: RequestInit, guard?: RequestGuard, signal?: AbortSignal, allowTokenRefresh = true): Promise<T> {

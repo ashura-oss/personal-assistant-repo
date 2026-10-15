@@ -66,6 +66,7 @@ export class WorkspaceRegistry<C extends WorkspaceController, TState extends obj
     private readonly runtimeSessionFor: RuntimeSessionResolver,
     private readonly createController: WorkspaceControllerFactory<C, TState>,
     private readonly teardownController?: WorkspaceControllerTeardown<C>,
+    private readonly afterWorkspaceCommitForTesting?: () => void | Promise<void>,
   ) {
   }
 
@@ -95,7 +96,8 @@ export class WorkspaceRegistry<C extends WorkspaceController, TState extends obj
         continue;
       }
       if (!entry) {
-        const store = new ServerWorkspaceStore<TState>({ kernel: this.kernel, sessionToken: runtimeSessionToken, journal: this.journal });
+        const store = new ServerWorkspaceStore<TState>({ kernel: this.kernel, sessionToken: runtimeSessionToken, journal: this.journal,
+          ...(this.afterWorkspaceCommitForTesting ? { afterCommitForTesting: this.afterWorkspaceCommitForTesting } : {}) });
         const identityBinding = Object.freeze({ workspaceId: identity.workspaceId, ownerId: identity.ownerId, privacyEpoch: identity.privacyEpoch });
         const pending = {} as WorkspaceEntry<C, TState>;
         // Reserve the entry before invoking user-supplied factory code. Concurrent

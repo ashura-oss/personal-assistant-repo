@@ -83,7 +83,8 @@ import { OPENROUTER_SPEECH_DEFAULT_MODEL, OPENROUTER_SPEECH_DEFAULT_PROFILE_VERS
 import type { PreparedSpeechAudio, SpeechAudioService } from '../audio/speechUpload.types';
 import type { ExistingWorkspaceWriterStore } from '../privacy/workspaceStorage';
 import type { PrivacyWriterScope } from '../privacy/types';
-import type { PendingCaptureControllerPort, PendingCaptureReceipt, PendingCaptureSafeStatus } from '../audio/pendingCaptureService.types';
+import type { PendingCaptureControllerPort, PendingCaptureReceipt, PendingCaptureSafeStatus,
+  ServerPendingCaptureConsumption } from '../audio/pendingCaptureService.types';
 
 import type { PrivacyAudioBoundary } from '../privacy/audioBoundary';
 import type { ProviderCredentialService } from './credentials';
@@ -218,6 +219,24 @@ function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map((item) => stableJson(item)).join(',')}]`;
   if (value && typeof value === 'object') return `{${Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`).join(',')}}`;
   return JSON.stringify(value) ?? 'null';
+}
+function canonicalPersistedJson(value: unknown): string {
+  let serialized: string | undefined;
+  try { serialized = JSON.stringify(value); }
+  catch { throw new Error('The workspace snapshot is not JSON serializable.'); }
+  if (serialized === undefined) throw new Error('The workspace snapshot is not JSON serializable.');
+  return canonicalPersistedValue(JSON.parse(serialized) as unknown);
+}
+function canonicalPersistedValue(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalPersistedValue(item)).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    const keys = Object.keys(record).sort();
+    return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalPersistedValue(record[key])}`).join(',')}}`;
+  }
+  const serialized = JSON.stringify(value);
+  if (serialized === undefined) throw new Error('The workspace snapshot is not JSON serializable.');
+  return serialized;
 }
 
 function transcriptionSourceProjection(note: Note, settings: AppSettings): TranscriptionAttempt['source'] {
@@ -4946,12 +4965,12 @@ export class AppControllerImpl implements AppController {
         throw new Error('Pending recording recovery is not available. Refresh local data before continuing.');
       }
       const raw = await this.store.load();
-      if (capturedBootstrapGeneration !== this.bootstrapGeneration || !this.mailAlertRefreshRequired || !raw || JSON.stringify(raw) !== expectedJson) {
+      if (capturedBootstrapGeneration !== this.bootstrapGeneration || !this.mailAlertRefreshRequired || !raw || canonicalPersistedJson(raw) !== expectedJson) {
         throw new Error('The pending recording save could not be verified. Refresh local data before continuing.');
       }
       const expectedNote = expectedDraft.notes.find((item) => item.id === receipt.id);
       const rawNote = raw.notes.find((item) => item.id === receipt.id);
-      if (!expectedNote || !rawNote || !this.validConsumedPendingNote(rawNote, receipt.id) ||
+      if (!expectedNote || !rawNote || !this.validConsumedPendingNote(rawNote, receipt.id, expectedNote.audioUri?.startsWith('still-media:') === true) ||
           stableJson(rawNote) !== stableJson(expectedNote) || !await this.pendingCapture.readConsumedEvidence(receipt.id)) {
         throw new Error('The pending recording save could not be verified. Refresh local data before continuing.');
       }
@@ -4981,9 +5000,11 @@ export class AppControllerImpl implements AppController {
     return reconcile;
   }
 
-  private validConsumedPendingNote(note: Note | undefined, captureId: string): note is Note {
+  private validConsumedPendingNote(note: Note | undefined, captureId: string, serverMedia = false): note is Note {
     if (!note || note.id !== captureId || note.status !== 'recorded' || note.revision !== 1 || note.transcript !== '' ||
-        typeof note.audioUri !== 'string' || !/^file:\/\/[^\u0000-\u0020?#]+\/ExpoAudio\/recording-[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.m4a$/i.test(note.audioUri) ||
+        typeof note.audioUri !== 'string' || (serverMedia
+          ? !/^still-media:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(note.audioUri)
+          : !/^file:\/\/[^\u0000-\u0020?#]+\/ExpoAudio\/recording-[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.m4a$/i.test(note.audioUri)) ||
         !Number.isFinite(note.durationSeconds) || note.durationSeconds <= 0 || note.durationSeconds > 600) return false;
     if (typeof note.capturedAt !== 'string') return false;
     const capturedAt = Date.parse(note.capturedAt);
@@ -5007,7 +5028,8 @@ export class AppControllerImpl implements AppController {
         adoption = await this.pendingCapture!.readForAdoption(receipt);
         const capture = adoption.capture;
         if (state.notes.some((note) => note.id === capture.id)) throw new Error('This recording is already in saved data.');
-        const durationSeconds = capture.inspection?.outcome === 'known' ? capture.inspection.durationSeconds : undefined;
+        const durationSeconds = adoption.kind === 'server' ? adoption.capture.durationSeconds
+          : adoption.capture.inspection?.outcome === 'known' ? adoption.capture.inspection.durationSeconds : undefined;
         if (durationSeconds === undefined || durationSeconds <= 0 || durationSeconds > 600) throw new Error('This recording is not eligible to save. Inspect it first.');
         const note: Note = {
           id: capture.id, title: 'Audio note', transcript: '', audioUri: adoption.uri, durationSeconds,
@@ -5024,8 +5046,17 @@ export class AppControllerImpl implements AppController {
         // recovery path below may adopt it only if the consumed slot and the
         // complete persisted snapshot both prove that exact commit.
         consumedDraft = clone(draft);
-        consumedJson = JSON.stringify(this.persistedState(draft));
-        if (!consumedJson) throw new Error('The pending recording save could not be verified.');
+        consumedJson = canonicalPersistedJson(this.persistedState(draft));
+        if (adoption?.kind === 'server') {
+          const capture = adoption.capture;
+          const serverCapture: ServerPendingCaptureConsumption = Object.freeze({
+            id: capture.id, revision: capture.revision, noteId: capture.id, uploadId: capture.media.uploadId,
+            mediaId: capture.media.mediaId, sha256: capture.media.sha256, byteLength: capture.media.byteLength,
+            format: capture.media.format, mimeType: capture.media.mimeType, durationSeconds: capture.durationSeconds,
+            capturedAt: capture.capturedAt, captureTimeZone: capture.captureTimeZone,
+          });
+          return { consumeServerPendingCapture: serverCapture };
+        }
         return { consumePendingCapture: { id: receipt.id, revision: receipt.revision, noteId: receipt.id } };
       });
       await Promise.all(result.docs.map((document) => this.mirrorDocument(document)));
@@ -5033,7 +5064,7 @@ export class AppControllerImpl implements AppController {
     } catch {
       if (!consumeWriteStarted) {
         const existing = this.state.notes.find((item) => item.id === receipt.id);
-        if (existing && this.validConsumedPendingNote(existing, receipt.id)) {
+        if (existing && this.validConsumedPendingNote(existing, receipt.id, adoption?.kind === 'server')) {
           try {
             if (await this.pendingCapture.readConsumedEvidence(receipt.id)) return clone(existing);
           } catch { /* A held source-cleanup lease fails fast; it is not a reason to reload workspace state. */ }

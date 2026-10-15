@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { Buffer } from 'node:buffer';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import test from 'node:test';
 import { deriveAuthSecret, loadOrCreateVaultRootKey, loadServerConfig, ServerConfigError } from '../dist/config.js';
 
@@ -33,6 +33,22 @@ test('server config accepts only canonical origins and private absolute paths', 
     assert.throws(() => loadServerConfig({ ...f.env, STILL_DATA_DIR: 'relative' }, { staticRoot: f.staticRoot }), ServerConfigError);
     assert.throws(() => loadServerConfig({ ...f.env, STILL_VAULT_KEY_FILE: join(f.dataDirectory, 'key') }, { staticRoot: f.staticRoot }), ServerConfigError);
     assert.throws(() => loadServerConfig({ ...f.env, STILL_DATA_DIR: join(f.staticRoot, 'private') }, { staticRoot: f.staticRoot }), ServerConfigError);
+  } finally { f.close(); }
+});
+
+test('optional codec executables are absolute validated paths with documented Linux defaults', () => {
+  const f = fixture();
+  try {
+    const defaults = loadServerConfig(f.env, { staticRoot: f.staticRoot });
+    assert.equal(defaults.ffmpegPath, '/usr/bin/ffmpeg');
+    assert.equal(defaults.ffprobePath, '/usr/bin/ffprobe');
+    const configured = loadServerConfig({ ...f.env, STILL_FFMPEG_PATH: '/opt/media/bin/ffmpeg',
+      STILL_FFPROBE_PATH: '/opt/media/bin/ffprobe' }, { staticRoot: f.staticRoot });
+    assert.equal(configured.ffmpegPath, resolve('/opt/media/bin/ffmpeg'));
+    assert.equal(configured.ffprobePath, resolve('/opt/media/bin/ffprobe'));
+    for (const [name, value] of [['STILL_FFMPEG_PATH', 'ffmpeg'], ['STILL_FFPROBE_PATH', '/bin/probe\nextra']]) {
+      assert.throws(() => loadServerConfig({ ...f.env, [name]: value }, { staticRoot: f.staticRoot }), ServerConfigError);
+    }
   } finally { f.close(); }
 });
 

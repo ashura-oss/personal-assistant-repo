@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { Buffer } from 'node:buffer';
 import Database from 'better-sqlite3';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -8,6 +9,7 @@ import test from 'node:test';
 import { createDurableKernel } from '../dist/index.js';
 import { CommandJournal } from '../dist/workspaceRuntime.js';
 import { OwnedWorkspaceRuntime } from '../dist/ownedWorkspaceRuntime.node.mjs';
+import { PrivateAudioRepository } from '../dist/privateAudioRepository.js';
 import { RUNTIME_ACTOR_EXPIRES_AT } from '../dist/runtimeActors.js';
 import { createInitialWorkspaceState } from '../dist/sharedControllerNode.mjs';
 import {
@@ -17,7 +19,7 @@ import {
   parseWorkspaceCommandEnvelope,
 } from '../dist/workspaceCommands.node.mjs';
 
-function fixture({ providerBatchClient } = {}) {
+function fixture({ providerBatchClient, withAudio = false } = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'still-workspace-commands-'));
   const kernel = createDurableKernel({ databasePath: join(directory, 'workspace.sqlite'),
     validateSnapshot: (value) => assert.ok(value && typeof value === 'object' && !Array.isArray(value)) });
@@ -34,7 +36,46 @@ function fixture({ providerBatchClient } = {}) {
   const admissionSession = kernel.createSession(workspace.workspaceId, ownerId, Date.now() + 60 * 60_000);
   const runtimeSession = kernel.createSession(workspace.workspaceId, ownerId, RUNTIME_ACTOR_EXPIRES_AT);
   const unavailable = async () => 'unavailable';
+  let attachedSnapshot;
+  let failNextWorkspaceCommitAck = false;
+  const audioRepository = withAudio ? new PrivateAudioRepository({ kernel, actorSessionToken: runtimeSession,
+    privateRoot: join(directory, 'private-audio'), processId: randomUUID(),
+    resolveAttachedMedia: ({ noteId, noteRevision }) => {
+      const note = attachedSnapshot?.notes.find((item) => item.id === noteId && item.revision === noteRevision);
+      const mediaId = note?.audio?.available ? note.audio.mediaId : undefined;
+      if (!mediaId) return undefined;
+      const record = audioRepository?.getRecord(mediaId);
+      return record?.status === 'ready' ? { mediaId, noteId, noteRevision, sha256: record.sha256, byteLength: record.byteLength } : undefined;
+    } }) : undefined;
+  const pendingCapture = audioRepository ? Object.freeze({
+    async getStatus() { return Object.freeze({ kind: 'empty' }); },
+    async inspect() { return Object.freeze({ kind: 'empty' }); },
+    async export() { throw new Error('unsupported'); },
+    async discard() { throw new Error('unsupported'); },
+    async retryPendingCaptureSourceRelease() { return Object.freeze({ kind: 'empty' }); },
+    async readForAdoption({ id, revision }) {
+      const uploaded = audioRepository.readCaptureForAdoption(id, revision);
+      if (!uploaded.media) throw new Error('capture media missing');
+      return Object.freeze({ kind: 'server', uri: uploaded.media.mediaId, capture: Object.freeze({
+        id, revision, capturedAt: uploaded.capture.capturedAt, captureTimeZone: uploaded.capture.timeZone,
+        durationSeconds: uploaded.media.durationSeconds, media: Object.freeze({
+          uploadId: uploaded.uploadId, mediaId: uploaded.media.mediaId.slice('still-media:'.length),
+          sha256: uploaded.media.sha256, byteLength: uploaded.media.byteLength,
+          format: uploaded.media.format, mimeType: uploaded.media.mimeType,
+        }),
+      }) });
+    },
+    async readConsumedEvidence(id) { return audioRepository.readConsumedCaptureEvidence(id); },
+  }) : undefined;
   const runtime = new OwnedWorkspaceRuntime({ kernel, runtimeSessionFor: () => runtimeSession,
+    afterWorkspaceCommitForTesting() {
+      if (failNextWorkspaceCommitAck) { failNextWorkspaceCommitAck = false; throw new Error('simulated post-commit acknowledgement loss'); }
+    },
+    ...(audioRepository ? { mediaResolver: { resolveMediaId(_note, uri) {
+      const match = /^still-media:([0-9a-f-]{36})$/i.exec(uri);
+      if (!match) return undefined;
+      return audioRepository.getRecord(match[1]).status === 'ready' ? match[1] : undefined;
+    } } } : {}),
     crypto: { randomUUID, async sha256(value) { return createHash('sha256').update(value).digest('hex'); } },
     providers: { speech: { async transcribe() { throw new Error('provider must not run'); }, async releaseUploadLease() {}, disposeMemory() {} },
       openAi: { async prepare() { throw new Error('provider must not run'); }, async analyze() { throw new Error('provider must not run'); }, async generateReply() { throw new Error('provider must not run'); } } },
@@ -50,9 +91,10 @@ function fixture({ providerBatchClient } = {}) {
       async loadRecordingRecovery() { return { async pickAndStage() { return null; }, async inspect() { throw new Error('unsupported'); }, async remove() {} }; },
       bindRecordingRecovery(service) { return service; },
       ...(providerBatchClient ? { openRouterBatchClient: providerBatchClient } : {}),
-    } });
+    }, ...(pendingCapture ? { pendingCapture } : {}) });
   const admission = { sessionToken: admissionSession, assertCurrent() { kernel.getOwnedIdentity(admissionSession); } };
-  return { directory, kernel, ownerId, workspace, admissionSession, runtimeSession, runtime, admission };
+  return { directory, kernel, ownerId, workspace, admissionSession, runtimeSession, runtime, admission, audioRepository,
+    setAttachedSnapshot(value) { attachedSnapshot = value; }, loseNextWorkspaceCommitAck() { failNextWorkspaceCommitAck = true; } };
 }
 
 function deferred() {
@@ -65,6 +107,19 @@ function deferred() {
 function envelope(command, expectedRevision = 0, expectedPrivacyEpoch = 0, commandId = randomUUID()) {
   return { schemaVersion: 1, commandId, expectedRevision, expectedPrivacyEpoch, command };
 }
+
+function wavFixture() {
+  const sampleRate = 8000;
+  const data = Buffer.alloc(1600, 128);
+  const bytes = Buffer.alloc(44 + data.length);
+  bytes.write('RIFF', 0, 'ascii'); bytes.writeUInt32LE(bytes.length - 8, 4); bytes.write('WAVE', 8, 'ascii');
+  bytes.write('fmt ', 12, 'ascii'); bytes.writeUInt32LE(16, 16); bytes.writeUInt16LE(1, 20);
+  bytes.writeUInt16LE(1, 22); bytes.writeUInt32LE(sampleRate, 24); bytes.writeUInt32LE(sampleRate, 28);
+  bytes.writeUInt16LE(1, 32); bytes.writeUInt16LE(8, 34); bytes.write('data', 36, 'ascii');
+  bytes.writeUInt32LE(data.length, 40); data.copy(bytes, 44);
+  return bytes;
+}
+async function* byteChunks(bytes) { yield bytes.subarray(0, 17); yield bytes.subarray(17, 900); yield bytes.subarray(900); }
 
 test('shared command envelope enforces exact keys, UUIDs, revision fences, and physical text bounds', () => {
   const valid = envelope({ kind: 'tasks.complete', taskId: 'legacy task: 1' });
@@ -132,6 +187,56 @@ test('large escaped-Unicode note save dispatches through the actual controller o
     assert.equal(replay.snapshot.state.notes.filter((note) => note.transcript === transcript).length, 1);
     assert.equal(replay.snapshot.state.activity.filter((item) => item.noteId === first.receipt.objectId && item.type === 'note_saved').length, 1,
       'the exact duplicate receipt avoids a second controller save');
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test('actual runtime adopts one ready upload atomically, recovers a lost checkpoint acknowledgement, and replays the exact receipt', async () => {
+  const f = fixture({ withAudio: true });
+  try {
+    const initial = await f.runtime.getSnapshot(f.admission);
+    const bytes = wavFixture();
+    const uploadId = randomUUID();
+    const captureId = randomUUID();
+    const uploaded = await f.audioRepository.uploadCapture(byteChunks(bytes), { uploadId, captureId,
+      capturedAt: '2026-10-15T00:00:00.000Z', timeZone: 'Asia/Singapore', mimeType: 'audio/wav', expectedByteLength: bytes.length });
+    assert.equal(uploaded.status, 'ready');
+    assert.equal(uploaded.media.byteLength, bytes.length);
+
+    const command = envelope({ kind: 'notes.capture.adopt', captureId, captureRevision: uploaded.capture.revision },
+      initial.revision, initial.privacyEpoch);
+    f.loseNextWorkspaceCommitAck();
+    const adopted = await dispatchWorkspaceCommand(f.runtime, f.admission, command);
+    assert.equal(adopted.status, 'finished');
+    assert.equal(adopted.receipt.kind, 'notes.capture.adopt');
+    assert.equal(adopted.receipt.objectId, captureId);
+    assert.equal(adopted.receipt.captureId, captureId);
+    assert.equal(adopted.receipt.captureRevision, uploaded.capture.revision);
+    const saved = adopted.snapshot.state.notes.filter((note) => note.id === captureId);
+    assert.equal(saved.length, 1, 'the real AppController stored one attached note');
+    assert.equal(saved[0].audio.available, true);
+    assert.equal(saved[0].audio.mediaId, uploaded.media.mediaId.slice('still-media:'.length));
+    assert.equal(saved[0].revision, 1);
+    f.setAttachedSnapshot(adopted.snapshot.state);
+
+    const reloaded = await f.runtime.refreshSnapshot(f.admission);
+    assert.ok(reloaded.revision >= adopted.snapshot.revision);
+    assert.equal(reloaded.state.notes.filter((note) => note.id === captureId).length, 1);
+    assert.equal(reloaded.state.notes.find((note) => note.id === captureId).audio.mediaId,
+      uploaded.media.mediaId.slice('still-media:'.length), 'reload preserves only the safe attached media ID');
+
+    const attached = await f.audioRepository.openAttachedMedia({ noteId: captureId, noteRevision: 1 });
+    const parts = [];
+    for await (const part of attached.body) parts.push(part);
+    assert.deepEqual(Buffer.concat(parts), bytes, 'the adopted note resolves only its verified original bytes');
+    assert.equal(f.audioRepository.inspectCaptureUpload(uploadId).status, 'consumed');
+
+    const replay = await dispatchWorkspaceCommand(f.runtime, f.admission, command);
+    assert.deepEqual(replay.receipt, adopted.receipt);
+    assert.equal(replay.snapshot.state.notes.filter((note) => note.id === captureId).length, 1);
+    assert.equal(f.audioRepository.inspectCaptureUpload(uploadId).status, 'consumed');
+    const inspection = inspectWorkspaceCommand(f.runtime, f.admission, command.commandId);
+    assert.deepEqual(inspection.receipt, adopted.receipt);
+    assert.equal(inspection.status, 'finished');
   } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 

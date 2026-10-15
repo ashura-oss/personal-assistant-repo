@@ -1,13 +1,17 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { ApplicationRuntimeFactory } from '../../server/src/applicationHost.js';
 import type { SecretVault } from '../../server/src/vault.js';
-import { OwnedWorkspaceRuntime, type OwnedWorkspaceFactoryPorts } from './ownedWorkspaceRuntime.node';
+import { OwnedWorkspaceRuntime, type OwnedWorkspaceFactoryContext, type OwnedWorkspaceFactoryPorts } from './ownedWorkspaceRuntime.node';
 import { createWorkspaceHttpApi } from './workspaceHttp.node';
-import type { WorkspaceRuntimeContext } from '../../server/src/workspaceRegistry.js';
-import type { AppState } from '../core';
+import type { DurableKernel } from '../../server/src/kernel.js';
+import type { ServerConfig } from '../../server/src/config.js';
+import { createProductionWorkspacePortsFor, type ProductionWorkspacePortsOptions } from './productionWorkspacePorts.node';
+
+export { NodeVaultOAuthTokenStore } from './nodeOAuthTokenStore.node';
+export { createProductionWorkspacePortsFor } from './productionWorkspacePorts.node';
 
 export type ApplicationWorkspacePortsFactory =
-  (context: WorkspaceRuntimeContext<AppState>, vault: SecretVault) => OwnedWorkspaceFactoryPorts | Promise<OwnedWorkspaceFactoryPorts>;
+  (context: OwnedWorkspaceFactoryContext, vault: SecretVault, kernel: DurableKernel) => OwnedWorkspaceFactoryPorts | Promise<OwnedWorkspaceFactoryPorts>;
 
 export interface CloudApplicationRuntimeOptions {
   /** Required concrete per-workspace provider/integration composition. */
@@ -25,12 +29,32 @@ export function createCloudApplicationRuntimeFactory(options: CloudApplicationRu
         randomUUID,
         async sha256(value) { return createHash('sha256').update(value).digest('hex'); },
       },
-      workspacePortsFor: (context) => options.workspacePortsFor(context, vault),
+      workspacePortsFor: (context) => options.workspacePortsFor(context, vault, kernel),
     });
-    return Object.freeze({ workspaceApi: createWorkspaceHttpApi(runtime),
+    return Object.freeze({ workspaceApi: createWorkspaceHttpApi(runtime), audioHttpApi: runtime.createAudioHttpApi(),
       stopAdmission: () => runtime.stopAdmission(),
       drainAndDispose: () => runtime.closeAfterDrain(),
     });
   };
   return factory;
+}
+
+/** Real Node per-epoch composition; external adapters remain injectable for closed-network tests. */
+export function createProductionApplicationRuntimeFactory(config: ServerConfig,
+  adapters: Pick<ProductionWorkspacePortsOptions, 'ffmpegPath' | 'ffprobePath' | 'fetcher' | 'documentFileOperations'> = {}): ApplicationRuntimeFactory {
+  if (!config || typeof config !== 'object' || typeof config.dataDirectory !== 'string') {
+    throw new TypeError('production_application_config_required');
+  }
+  const makeWorkspacePorts = createProductionWorkspacePortsFor({ dataDirectory: config.dataDirectory,
+      ...(config.googleClientId ? { googleClientId: config.googleClientId } : {}),
+      ...(config.microsoftClientId ? { microsoftClientId: config.microsoftClientId } : {}),
+      ...(config.microsoftAuthority ? { microsoftAuthority: config.microsoftAuthority } : {}) }, {
+        ffmpegPath: adapters.ffmpegPath ?? config.ffmpegPath,
+        ffprobePath: adapters.ffprobePath ?? config.ffprobePath,
+        ...(adapters.fetcher ? { fetcher: adapters.fetcher } : {}),
+        ...(adapters.documentFileOperations ? { documentFileOperations: adapters.documentFileOperations } : {}),
+      });
+  return ({ kernel, vault, runtimeSessionFor }) => createCloudApplicationRuntimeFactory({
+    workspacePortsFor: (context) => makeWorkspacePorts(context, vault, kernel),
+  })({ kernel, vault, runtimeSessionFor });
 }

@@ -305,6 +305,38 @@ export class SecretVault {
     return Object.freeze({ configured: false, generation: nextGeneration });
   }
 
+  /**
+   * Deletes an obsolete account credential only when both generations still
+   * identify the exact ciphertext captured by its durable token binding.
+   * A newer account credential shares the same vault slot, so ordinary
+   * deleteSecretWithinTransaction must never be authorized by a stale token
+   * reference.
+   */
+  deleteAccountSecretForExactBindingWithinTransaction(context: OwnedTransactionContext, input: {
+    readonly accountId: string;
+    readonly expectedAccountGeneration: number;
+    readonly purpose: 'googleOAuth' | 'microsoftOAuth';
+    readonly expectedCredentialGeneration: number;
+  }): boolean {
+    checkContext(this.#db, context);
+    if (!input || typeof input !== 'object' || !UUID_V4.test(input.accountId) ||
+        (input.purpose !== 'googleOAuth' && input.purpose !== 'microsoftOAuth')) {
+      reject('invalid_scope', 'The credential scope is invalid.');
+    }
+    validGeneration(input.expectedAccountGeneration);
+    validGeneration(input.expectedCredentialGeneration);
+    const metadata = this.readMetadata(context.workspaceId, 'account', input.accountId, input.purpose);
+    if (!metadata || metadata.generation !== input.expectedCredentialGeneration) return false;
+    const row = context.db.prepare(`SELECT generation, account_generation FROM vault_ciphertexts
+      WHERE workspace_id=? AND scope_type='account' AND scope_id=? AND purpose=?`)
+      .get(context.workspaceId, input.accountId, input.purpose) as { generation: number; account_generation: number } | undefined;
+    if (!row || row.generation !== input.expectedCredentialGeneration || row.account_generation !== input.expectedAccountGeneration) return false;
+    const nextGeneration = this.increment(metadata.generation);
+    this.writeGeneration(context, 'account', input.accountId, input.purpose, nextGeneration,
+      input.expectedAccountGeneration, false);
+    return true;
+  }
+
   /** Erases all credential bytes for this workspace while preserving generation tombstones. */
   eraseWithinTransaction(context: OwnedTransactionContext): void {
     checkContext(this.#db, context);

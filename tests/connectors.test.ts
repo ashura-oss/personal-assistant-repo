@@ -1026,6 +1026,32 @@ describe('provider connector clients', () => {
     expect(fetcherMock.mock.calls.some(([url]) => String(url).includes('/users/me/calendarList'))).toBe(false);
   });
 
+  it('rechecks the account connection in the final transport pre-start guard', async () => {
+    let current = true;
+    let releaseLifetime!: () => void;
+    let lifetimeStarted!: () => void;
+    const started = new Promise<void>((resolve) => { lifetimeStarted = resolve; });
+    const gate = new Promise<void>((resolve) => { releaseLifetime = resolve; });
+    const fetcherMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => response({ value: [] }));
+    const client = new ConnectorClient({
+      tokenStore: { get: async () => token(), set: async () => {} },
+      fetcher: fetcherMock as typeof fetch,
+      isConnectionCurrent: () => current,
+      withResponseLifetime: async (input, init, consume, _onCancel, beforeStart) => {
+        lifetimeStarted();
+        await gate;
+        beforeStart?.();
+        return consume(await fetcherMock(input, init));
+      },
+    });
+    const request = client.listCalendars(account);
+    await started;
+    current = false;
+    releaseLifetime();
+    await expect(request).rejects.toThrow(/connection changed/i);
+    expect(fetcherMock).not.toHaveBeenCalled();
+  });
+
   it('preserves Graph event time zone and blocks attendee invitations when policy is none', async () => {
     const fetcherMock = vi.fn(async (_url: RequestInfo | URL, _init?: RequestInit) => response({ id: 'event-1' }));
     const { client } = fixture({ fetcher: fetcherMock as typeof fetch, token: token({ identity: microsoftIdentity }) });

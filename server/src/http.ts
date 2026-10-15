@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { pipeline } from 'node:stream/promises';
 import { constants, lstatSync, openSync, closeSync, fstatSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
 import { extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { AuthError, type AuthService } from './auth.js';
@@ -6,6 +7,7 @@ import { KernelError } from './kernel.js';
 import { VaultError } from './vault.js';
 import type { SafeCredentialMetadataSnapshot, ServerCredentialCommandService } from './credentialCommands.js';
 import type { WorkspaceHttpAdmission, WorkspaceHttpApi } from './workspaceHttp.js';
+import type { AudioHttpApi, AudioUploadCaptureHeader } from './audioHttp.js';
 import { registerAcceptedHttpServer, trackAcceptedHttpRequest } from './httpRequestDrain.js';
 
 const BODY_LIMIT = 16 * 1024;
@@ -36,6 +38,7 @@ export interface StillHttpOptions {
   readonly allowLocalHttp?: boolean;
   readonly credentialCommands?: ServerCredentialCommandService;
   readonly workspaceApi?: WorkspaceHttpApi;
+  readonly audioApi?: AudioHttpApi;
   /** Trusted host lifecycle fence checked at request admission and after awaited request bodies. */
   readonly admissionOpen?: () => boolean;
 }
@@ -257,6 +260,55 @@ function exactObject(value: unknown, keys: string[]): Record<string, unknown> {
     throw problem(400, 'bad_request');
   }
   return object;
+}
+
+function parseAudioCaptureHeader(value: string | undefined): AudioUploadCaptureHeader {
+  if (!value || value.length > 2048) throw problem(400, 'bad_request');
+  let parsed: unknown;
+  try { parsed = JSON.parse(value) as unknown; } catch { throw problem(400, 'bad_request'); }
+  const capture = exactObject(parsed, ['id', 'capturedAt', 'timeZone']);
+  if (typeof capture.id !== 'string' || !COMMAND_ID_RE.test(capture.id) ||
+      typeof capture.capturedAt !== 'string' || capture.capturedAt.length > 40 ||
+      !Number.isFinite(Date.parse(capture.capturedAt)) || new Date(Date.parse(capture.capturedAt)).toISOString() !== capture.capturedAt ||
+      typeof capture.timeZone !== 'string' || capture.timeZone.length < 1 || capture.timeZone.length > 100 || /[\u0000-\u001f\u007f]/.test(capture.timeZone)) {
+    throw problem(400, 'bad_request');
+  }
+  try { new Intl.DateTimeFormat('en-US', { timeZone: capture.timeZone }).format(0); }
+  catch { throw problem(400, 'bad_request'); }
+  return Object.freeze({ id: capture.id, capturedAt: capture.capturedAt, timeZone: capture.timeZone });
+}
+
+function audioUploadLength(request: IncomingMessage): number | undefined {
+  const value = uniqueHeader(request, 'content-length');
+  if (value === undefined) return undefined;
+  const size = Number(value);
+  if (!/^\d+$/.test(value) || !Number.isSafeInteger(size) || size <= 0 || size > 40 * 1024 * 1024) {
+    throw problem(413, 'request_too_large');
+  }
+  return size;
+}
+
+function parseAudioContentType(value: string | undefined): string {
+  if (typeof value !== 'string' || value.length > 128) throw problem(415, 'unsupported_media_type');
+  const parts = value.split(';').map((part) => part.trim().toLowerCase());
+  const base = parts[0];
+  const allowedCodecs: Readonly<Record<string, readonly string[]>> = {
+    'audio/mp4': ['codecs=mp4a.40.2', 'codecs="mp4a.40.2"'],
+    'audio/webm': ['codecs=opus', 'codecs="opus"'],
+    'audio/ogg': ['codecs=opus', 'codecs="opus"'],
+  };
+  if (!base || !['audio/mp4', 'audio/mpeg', 'audio/wav', 'audio/webm', 'audio/ogg'].includes(base) ||
+      parts.length > 2 || (parts.length === 2 && !allowedCodecs[base]?.includes(parts[1]!))) {
+    throw problem(415, 'unsupported_media_type');
+  }
+  return base;
+}
+
+function assertSafeAudioHeaders(headers: Readonly<Record<string, string>>): void {
+  const allowed = new Set(['accept-ranges', 'cache-control', 'content-type', 'content-disposition', 'content-length', 'content-range']);
+  for (const [name, value] of Object.entries(headers)) {
+    if (!allowed.has(name.toLowerCase()) || /[\r\n\0]/.test(value)) throw problem(503, 'service_unavailable');
+  }
 }
 
 function credentialObject(value: unknown, keys: readonly string[]): Record<string, unknown> {
@@ -515,7 +567,7 @@ export function createStillHttpServer(options: StillHttpOptions): Server {
   server = createServer((request, response) => {
     securityHeaders(response);
     const handled = Promise.resolve().then(() => handleRequest(request, response, options.auth, origin, realRoot, paths, index, options.credentialCommands,
-      options.workspaceApi, options.admissionOpen)).catch((error: unknown) => {
+      options.workspaceApi, options.audioApi, options.admissionOpen)).catch((error: unknown) => {
       if (response.headersSent) { response.destroy(); return; }
       if (isHttpProblem(error)) { sendError(response, error.status, error.code); return; }
       if (error instanceof AuthError) { sendError(response, authStatus(error), error.code); return; }
@@ -533,7 +585,7 @@ export function createStillHttpServer(options: StillHttpOptions): Server {
 
 async function handleRequest(request: IncomingMessage, response: ServerResponse, auth: AuthService, canonicalOrigin: URL,
   staticRoot: string, staticPaths: Set<string>, index: Buffer, credentialCommands?: ServerCredentialCommandService,
-  workspaceApi?: WorkspaceHttpApi, admissionOpen?: () => boolean): Promise<void> {
+  workspaceApi?: WorkspaceHttpApi, audioApi?: AudioHttpApi, admissionOpen?: () => boolean): Promise<void> {
   if (admissionOpen && !admissionOpen()) throw problem(503, 'service_unavailable');
   const host = uniqueHeader(request, 'host', true);
   if (!host || host.toLowerCase() !== canonicalOrigin.host.toLowerCase()) throw problem(403, 'host_rejected');
@@ -672,6 +724,74 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
       admission.assertCurrent();
       if (!response.destroyed) sendJson(response, 200, result);
     } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
+    return;
+  }
+  if (pathname === '/api/audio/uploads') {
+    if (request.method !== 'POST') { response.setHeader('Allow', 'POST'); throw problem(405, 'method_not_allowed'); }
+    if (hasQuery) throw problem(400, 'bad_request');
+    if (!audioApi) throw problem(503, 'service_unavailable');
+    // Authenticate and verify CSRF before the server reserves metadata or reads file bytes.
+    const admission = workspaceMutationAdmission(request, auth, canonicalOrigin);
+    const uploadId = uniqueHeader(request, 'x-still-upload-id', true);
+    if (!uploadId || !COMMAND_ID_RE.test(uploadId)) throw problem(400, 'bad_request');
+    const capture = parseAudioCaptureHeader(uniqueHeader(request, 'x-still-capture', true));
+    const mimeType = parseAudioContentType(uniqueHeader(request, 'content-type', true));
+    const contentEncoding = uniqueHeader(request, 'content-encoding');
+    if (contentEncoding !== undefined && contentEncoding.toLowerCase() !== 'identity') throw problem(415, 'unsupported_media_type');
+    const expectedByteLength = audioUploadLength(request);
+    try {
+      admission.assertCurrent();
+      if (admissionOpen && !admissionOpen()) throw problem(503, 'service_unavailable');
+      const receipt = await audioApi.upload(admission, { uploadId, capture, mimeType,
+        ...(expectedByteLength === undefined ? {} : { expectedByteLength }), source: request });
+      admission.assertCurrent();
+      if (!response.destroyed) sendJson(response, receipt.status === 'ready' ? 201 : 202, receipt);
+    } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
+    return;
+  }
+  const uploadInspectMatch = /^\/api\/audio\/uploads\/([0-9a-f-]{36})$/i.exec(pathname);
+  if (uploadInspectMatch) {
+    if (request.method !== 'GET') { response.setHeader('Allow', 'GET'); throw problem(405, 'method_not_allowed'); }
+    if (hasQuery) throw problem(400, 'bad_request');
+    if (!audioApi) throw problem(503, 'service_unavailable');
+    if (!COMMAND_ID_RE.test(uploadInspectMatch[1]!)) throw problem(400, 'bad_request');
+    const admission = workspaceReadAdmission(request, auth, canonicalOrigin);
+    try {
+      admission.assertCurrent();
+      const receipt = await audioApi.inspectUpload(admission, uploadInspectMatch[1]!);
+      admission.assertCurrent();
+      if (!response.destroyed) sendJson(response, 200, receipt);
+    } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
+    return;
+  }
+  const mediaMatch = /^\/api\/audio\/([0-9a-f-]{36})$/i.exec(pathname);
+  if (mediaMatch) {
+    if (request.method !== 'GET' && request.method !== 'HEAD') { response.setHeader('Allow', 'GET, HEAD'); throw problem(405, 'method_not_allowed'); }
+    if (hasQuery) throw problem(400, 'bad_request');
+    if (!audioApi) throw problem(503, 'service_unavailable');
+    if (!COMMAND_ID_RE.test(mediaMatch[1]!)) throw problem(400, 'bad_request');
+    const admission = workspaceReadAdmission(request, auth, canonicalOrigin);
+    const abort = new AbortController();
+    const onClientClose = () => { if (!response.writableEnded) abort.abort(); };
+    request.once('aborted', onClientClose);
+    response.once('close', onClientClose);
+    let openedMedia: Awaited<ReturnType<AudioHttpApi['openMedia']>> | undefined;
+    try {
+      admission.assertCurrent();
+      const range = uniqueHeader(request, 'range');
+      const media = openedMedia = await audioApi.openMedia(admission, mediaMatch[1]!, { method: request.method,
+        ...(range === undefined ? {} : { range }), signal: abort.signal });
+      admission.assertCurrent();
+      assertSafeAudioHeaders(media.headers);
+      response.writeHead(media.status, media.headers);
+      if (request.method === 'HEAD' || media.status === 416 || !media.body) { response.end(); return; }
+      await pipeline(media.body, response);
+    } catch (error) {
+      openedMedia?.body?.destroy();
+      if (!response.destroyed && !response.headersSent) sendWorkspaceFailure(response, error);
+      else if (!response.destroyed) response.destroy();
+    }
+    finally { request.off('aborted', onClientClose); response.off('close', onClientClose); }
     return;
   }
   if (pathname === '/api/credentials') {

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { Buffer } from 'node:buffer';
 import { mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -225,5 +226,5 @@ test('executable module import is inert and startup failures do not disclose err
     startHttp: async () => { throw new Error('private-startup-detail'); },
     writeOut: (value) => out.push(value), writeError: (value) => errors.push(value), installSignalHandlers: false }), 1);
   assert.equal(out.join(''), '');
-  assert.deepEqual(errors, ['still-server: startup failed. Check the private server configuration and logs.\n']);
+  assert.deepEqual(errors, ['still-server: startup failed and cleanup is incomplete; the retained owner can be retried in this process.\n']);
 });

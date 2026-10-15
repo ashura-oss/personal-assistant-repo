@@ -134,7 +134,10 @@ async function verifyWav(filePath: string, size: number): Promise<number> {
     const durationSeconds = dataBytes / format.byteRate;
     if (!Number.isFinite(durationSeconds) || durationSeconds <= 0 || durationSeconds > MAX_AUDIO_SECONDS) throw new AudioVerificationError('unsupported_format');
     return durationSeconds;
-  } finally { stream.destroy(); }
+  } finally {
+    if (!stream.destroyed) stream.destroy();
+    if (!stream.closed) await new Promise<void>((resolve) => stream.once('close', resolve));
+  }
 }
 
 let codecTail: Promise<void> = Promise.resolve();

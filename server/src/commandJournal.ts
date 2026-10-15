@@ -45,6 +45,21 @@ export interface CommandTicketContext extends CommandTicket {
   readonly runtimeSessionToken: string;
 }
 
+export interface CaptureAdoptionCheckpoint {
+  readonly id: string;
+  readonly revision: string;
+  readonly noteId: string;
+  readonly uploadId: string;
+  readonly mediaId: string;
+  readonly sha256: string;
+  readonly byteLength: number;
+  readonly format: 'm4a' | 'mp3' | 'wav' | 'webm' | 'ogg';
+  readonly mimeType: string;
+  readonly durationSeconds: number;
+  readonly capturedAt: string;
+  readonly captureTimeZone: string;
+}
+
 const currentTicket = new AsyncLocalStorage<CommandTicketContext>();
 
 export function currentCommandTicket(): CommandTicketContext | undefined {
@@ -222,6 +237,80 @@ export class CommandJournal {
         .run(this.clock(), receipt.revision, snapshotDigest, ids.text, ticket.workspaceId, ticket.idempotencyKey, ticket.ticketId, digest(ticket.capability));
       if (update.changes !== 1) throw new Error('The command checkpoint could not be recorded.');
       return receipt.revision;
+    });
+  }
+
+  /** Atomically adopts one ready server capture, writes the workspace snapshot, and finishes its command receipt. */
+  checkpointCapture(ticket: CommandTicketContext, stateFence: { workspaceId: string; revision: number; privacyEpoch: number },
+    serializedSnapshot: string, accountGenerations: Readonly<Record<string, number>>, capture: CaptureAdoptionCheckpoint): number {
+    if (ticket.kind !== 'notes.capture.adopt' || currentTicket.getStore() !== ticket || capture.id !== capture.noteId ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(capture.id) ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(capture.revision) ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(capture.uploadId) ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(capture.mediaId) ||
+        !/^[a-f0-9]{64}$/i.test(capture.sha256) || !Number.isSafeInteger(capture.byteLength) || capture.byteLength <= 0 ||
+        !Number.isFinite(capture.durationSeconds) || capture.durationSeconds <= 0) throw new Error('capture_adoption_invalid');
+    const parsed = parseCanonical(serializedSnapshot, 16 * 1024 * 1024);
+    const snapshotDigest = digest(parsed.text);
+    const ids = canonical(this.projectOwnedObjectIds(parsed.value), 1024 * 1024);
+    const value = parsed.value as { notes?: unknown };
+    if (!Array.isArray(value.notes)) throw new Error('capture_candidate_invalid');
+    const matches = value.notes.filter((note) => note && typeof note === 'object' && !Array.isArray(note) &&
+      (note as { id?: unknown }).id === capture.noteId) as Record<string, unknown>[];
+    if (matches.length !== 1) throw new Error('capture_candidate_invalid');
+    const note = matches[0]!;
+    if (note.audioUri !== `still-media:${capture.mediaId}` || note.status !== 'recorded' || note.revision !== 1 || note.transcript !== '' ||
+        note.durationSeconds !== capture.durationSeconds || note.capturedAt !== capture.capturedAt || note.captureTimeZone !== capture.captureTimeZone) {
+      throw new Error('capture_candidate_invalid');
+    }
+    const receiptValue = { schemaVersion: 1, commandId: ticket.idempotencyKey, kind: 'notes.capture.adopt', objectId: capture.noteId,
+      captureId: capture.id, captureRevision: capture.revision };
+    const receipt = canonical(receiptValue, MAX_RECEIPT_BYTES);
+    return this.kernel.withOwnedTransaction(ticket.runtimeSessionToken, ticket.privacyEpoch, (context) => {
+      if (stateFence.workspaceId !== ticket.workspaceId || stateFence.revision !== context.revision ||
+          stateFence.privacyEpoch !== context.privacyEpoch || context.workspaceId !== ticket.workspaceId || context.ownerId !== ticket.ownerId ||
+          context.privacyEpoch !== ticket.privacyEpoch) throw new Error('capture_workspace_changed');
+      const row = this.getTicketRow(context, ticket);
+      if (row.status !== 'claimed' || row.command_kind !== 'notes.capture.adopt') throw new Error('capture_ticket_invalid');
+      const exactRequest = canonical({ schemaVersion: 1, commandId: ticket.idempotencyKey, expectedRevision: stateFence.revision,
+        expectedPrivacyEpoch: ticket.privacyEpoch, command: { kind: 'notes.capture.adopt', captureId: capture.id, captureRevision: capture.revision } }, 16 * 1024);
+      if (digest(`${ticket.kind}\0${exactRequest.text}`) !== row.request_digest) throw new Error('capture_command_binding_mismatch');
+      const priorSnapshot = context.db.prepare('SELECT snapshot_json FROM workspaces WHERE id=? AND revision=? AND privacy_epoch=?')
+        .get(context.workspaceId, context.revision, context.privacyEpoch) as { snapshot_json: string } | undefined;
+      if (!priorSnapshot) throw new Error('capture_workspace_changed');
+      const prior = parseCanonical(priorSnapshot.snapshot_json, 16 * 1024 * 1024).value as { notes?: unknown };
+      if (Array.isArray(prior.notes) && prior.notes.some((entry) => entry && typeof entry === 'object' && !Array.isArray(entry) &&
+        (entry as { id?: unknown }).id === capture.noteId)) throw new Error('capture_already_attached');
+      const upload = context.db.prepare(`SELECT c.*,u.status AS audio_status,u.media_id AS audio_media_id,u.sha256 AS audio_sha256,
+        u.byte_length AS audio_byte_length,u.duration_seconds AS audio_duration,u.format AS audio_format,u.mime_type AS audio_mime
+        FROM private_audio_capture_uploads c JOIN private_audio_uploads u ON u.upload_id=c.upload_id
+        WHERE c.capture_id=? AND c.capture_revision=? AND c.workspace_id=? AND c.owner_id=? AND c.privacy_epoch=?`)
+        .get(capture.id, capture.revision, context.workspaceId, context.ownerId, context.privacyEpoch) as {
+          upload_id: string; media_id: string; format: string; sha256: string | null; byte_length: number | null; duration_seconds: number | null;
+          mime_type: string; status: string; workspace_id: string; owner_id: string; privacy_epoch: number; captured_at: string; time_zone: string;
+          audio_status: string; audio_media_id: string; audio_sha256: string | null; audio_byte_length: number | null; audio_duration: number | null;
+          audio_format: string; audio_mime: string;
+        } | undefined;
+      if (!upload || upload.status !== 'ready' || upload.audio_status !== 'ready' || upload.upload_id !== capture.uploadId ||
+          upload.media_id !== capture.mediaId || upload.audio_media_id !== capture.mediaId || upload.sha256 !== capture.sha256 || upload.audio_sha256 !== capture.sha256 ||
+          upload.byte_length !== capture.byteLength || upload.audio_byte_length !== capture.byteLength || upload.duration_seconds !== capture.durationSeconds ||
+          upload.audio_duration !== capture.durationSeconds || upload.format !== capture.format || upload.audio_format !== capture.format ||
+          upload.mime_type !== capture.mimeType || upload.audio_mime !== capture.mimeType || upload.captured_at !== capture.capturedAt ||
+          upload.time_zone !== capture.captureTimeZone) throw new Error('capture_upload_unavailable');
+      const idempotencyKey = randomUUID();
+      const result = this.kernel.runLocalCommand(ticket.runtimeSessionToken, {
+        expectedRevision: context.revision, expectedPrivacyEpoch: context.privacyEpoch, idempotencyKey, type: 'workspace.snapshot.write',
+        canonicalRequest: canonical({ command: ticket.idempotencyKey, snapshotDigest }).text,
+      }, () => ({ snapshot: parsed.value, receipt: { kind: 'workspace_snapshot_capture_adoption', snapshotDigest }, accountGenerations }));
+      const consumed = context.db.prepare(`UPDATE private_audio_capture_uploads SET status='consumed',consumed_command_id=?,note_id=?,note_revision=1,updated_at=?
+        WHERE upload_id=? AND capture_id=? AND capture_revision=? AND status='ready' AND workspace_id=? AND owner_id=? AND privacy_epoch=?`)
+        .run(ticket.idempotencyKey, capture.noteId, this.clock(), capture.uploadId, capture.id, capture.revision, context.workspaceId, context.ownerId, context.privacyEpoch);
+      if (consumed.changes !== 1) throw new Error('capture_consume_conflict');
+      const updated = context.db.prepare(`UPDATE async_command_journal SET status='finished',updated_at=?,checkpoint_revision=?,snapshot_digest=?,owned_object_ids_json=?,receipt_json=?
+        WHERE workspace_id=? AND idempotency_key=? AND ticket_id=? AND ticket_digest=? AND status='claimed'`)
+        .run(this.clock(), result.revision, snapshotDigest, ids.text, receipt.text, ticket.workspaceId, ticket.idempotencyKey, ticket.ticketId, digest(ticket.capability));
+      if (updated.changes !== 1) throw new Error('capture_command_receipt_conflict');
+      return result.revision;
     });
   }
 

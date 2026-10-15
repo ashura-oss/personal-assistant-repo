@@ -1,4 +1,5 @@
 import type { AppState } from '../core';
+import type { ServerPendingCaptureConsumption } from '../audio/pendingCaptureService.types';
 import { STATE_SNAPSHOT_READ_MAX_BYTES, STORAGE_KEY, type StateStore } from './contracts';
 import {
   PENDING_CAPTURE_STORAGE_KEY, assertPendingCaptureConsumption, assertPendingCaptureTransition,
@@ -444,7 +445,8 @@ export class IndexedDbStateStore implements StateStore {
     }));
   }
 
-  async save(state: AppState, options?: { consumePendingCapture: ConsumePendingCapture }): Promise<void> {
+  async save(state: AppState, options?: { consumePendingCapture?: ConsumePendingCapture; consumeServerPendingCapture?: ServerPendingCaptureConsumption }): Promise<void> {
+    if (options?.consumeServerPendingCapture) throw new Error('Server pending recordings are unavailable in browser storage.');
     const rawSnapshot = JSON.stringify(state);
     const stateSnapshot = JSON.parse(rawSnapshot) as AppState;
     const consume = options?.consumePendingCapture

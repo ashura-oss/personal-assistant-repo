@@ -3,6 +3,7 @@ import { openServerFoundationInternal, type ServerFoundationOptions } from './bo
 import type { ServerConfig } from './config.js';
 import { createStillHttpServer } from './http.js';
 import { drainAcceptedHttpRequests } from './httpRequestDrain.js';
+import type { AudioHttpApi } from './audioHttp.js';
 import type { DurableKernel, OwnedWorkspaceIdentity } from './kernel.js';
 import { ProcessWorkspaceActors } from './runtimeActors.js';
 import type { SecretVault } from './vault.js';
@@ -12,6 +13,8 @@ import type { WorkspaceHttpApi } from './workspaceHttp.js';
 /** Trusted runtime owner contract. It contains no caller supplied workspace authority. */
 export interface ApplicationRuntime {
   readonly workspaceApi: WorkspaceHttpApi;
+  /** Optional authenticated audio bridge supplied by a real workspace runtime. */
+  readonly audioHttpApi?: AudioHttpApi;
   stopAdmission(): void;
   drainAndDispose(): Promise<void>;
 }
@@ -205,6 +208,7 @@ export async function startApplicationHost(options: ApplicationHostOptions): Pro
     }
     const server = createStillHttpServer({ auth: opened.foundation.auth,
       credentialCommands: opened.foundation.credentialCommands, workspaceApi: runtime.workspaceApi,
+      ...(runtime.audioHttpApi ? { audioApi: runtime.audioHttpApi } : {}),
       canonicalOrigin: options.config.canonicalOrigin, staticRoot: options.config.staticRoot,
       ...(options.config.allowLocalHttp ? { allowLocalHttp: true } : {}),
       admissionOpen: () => owner.isAccepting(),

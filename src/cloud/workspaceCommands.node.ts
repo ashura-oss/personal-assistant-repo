@@ -28,6 +28,10 @@ export async function dispatchWorkspaceCommand(runtime: OwnedWorkspaceRuntime, a
       case 'tasks.reopen': return receipt(envelope, command, { objectId: (await controller.reopenTask(command.taskId)).id });
       case 'chat.create': return receipt(envelope, command, { objectId: (await controller.createChatConversation(command.title)).id });
       case 'notes.save': return receipt(envelope, command, { objectId: (await controller.saveNote({ transcript: command.transcript })).id });
+      case 'notes.capture.adopt': return receipt(envelope, command, {
+        objectId: (await controller.savePendingCapture({ id: command.captureId, revision: command.captureRevision })).id,
+        captureId: command.captureId, captureRevision: command.captureRevision,
+      });
       case 'notes.updateTranscript': return receipt(envelope, command, {
         objectId: (await controller.updateTranscript(command.noteId, command.text, { expectedRevision: command.expectedNoteRevision })).id,
       });
@@ -54,7 +58,8 @@ export async function dispatchWorkspaceCommand(runtime: OwnedWorkspaceRuntime, a
     }
   }, (value): JsonValue => ({ schemaVersion: value.schemaVersion, commandId: value.commandId, kind: value.kind,
     objectId: value.objectId, ...('jobId' in value ? { jobId: value.jobId } : {}), ...('turnId' in value ? { turnId: value.turnId } : {}),
-    ...('parentTurnId' in value ? { parentTurnId: value.parentTurnId } : {}) }));
+    ...('parentTurnId' in value ? { parentTurnId: value.parentTurnId } : {}),
+    ...('captureId' in value ? { captureId: value.captureId } : {}), ...('captureRevision' in value ? { captureRevision: value.captureRevision } : {}) }));
 
   const expectation = expectedReceipt(envelope.commandId, command);
   if (result.admission.fresh) {
@@ -87,6 +92,7 @@ export function inspectWorkspaceCommand(runtime: OwnedWorkspaceRuntime, admissio
 
 function receipt(envelope: WorkspaceCommandEnvelope, command: WorkspaceCommand, fields: {
   readonly objectId: string; readonly jobId?: string; readonly turnId?: string; readonly parentTurnId?: string;
+  readonly captureId?: string; readonly captureRevision?: string;
 }) {
   return parseWorkspaceCommandReceipt({ schemaVersion: 1, commandId: envelope.commandId, kind: command.kind, ...fields },
     expectedReceipt(envelope.commandId, command));
@@ -96,6 +102,8 @@ function expectedReceipt(commandId: string, command: WorkspaceCommand) {
   switch (command.kind) {
     case 'tasks.complete': case 'tasks.reopen': return { commandId, kind: command.kind, objectId: command.taskId };
     case 'chat.create': case 'notes.save': return { commandId, kind: command.kind };
+    case 'notes.capture.adopt': return { commandId, kind: command.kind, objectId: command.captureId,
+      captureId: command.captureId, captureRevision: command.captureRevision };
     case 'notes.updateTranscript': return { commandId, kind: command.kind, objectId: command.noteId };
     case 'assistant.batch.submitNote': return { commandId, kind: command.kind, objectId: command.noteId };
     case 'assistant.batch.check': return { commandId, kind: command.kind, objectId: command.jobId };

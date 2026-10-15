@@ -825,6 +825,25 @@ test('runtime rejects missing, mixed, and malformed per-epoch port configuration
   } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
+test('a controller whose attachment hook fails is retained through exact controller teardown', async () => {
+  const f = fixture();
+  try {
+    let unattachedCleanupCalls = 0;
+    const { providers, integration, responseLifetimeOwner, ...base } = f.ports;
+    const runtime = new OwnedWorkspaceRuntime({ ...base, workspacePortsFor() {
+      return { providers, integration, responseLifetimeOwner,
+        attachController() { throw new Error('synthetic controller attach failure'); },
+        disposeUnattached() { unattachedCleanupCalls += 1; } };
+    } });
+
+    await assert.rejects(runtime.getSnapshot(f.admission), /synthetic controller attach failure/);
+    assert.equal(f.disposedSpeech(), 1, 'the constructed controller disposes the resources it already owns');
+    assert.equal(unattachedCleanupCalls, 0, 'factory-only cleanup is not run after controller ownership transferred');
+    await runtime.closeAfterDrain();
+    assert.equal(f.disposedSpeech(), 1, 'failed construction cleanup does not leave a controller for later duplicate disposal');
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
 test('failed unattached-port cleanup fences epoch replacement until the caller explicitly retries the exact held epoch', async () => {
   const f = fixture();
   try {

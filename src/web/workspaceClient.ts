@@ -27,10 +27,12 @@ export type PendingWorkspaceCommand = Readonly<{
   command: WorkspaceCommand;
 }>;
 
+export type WorkspaceCommandAdmission = WorkspaceCommandEnvelope;
+
 export type WorkspaceClient = Readonly<{
   getSnapshot(): Promise<WorkspaceSnapshotDTO>;
   refresh(): Promise<WorkspaceSnapshotDTO>;
-  execute(command: WorkspaceCommand): Promise<WorkspaceCommandResponse>;
+  execute(command: WorkspaceCommand, onAdmitted?: (envelope: WorkspaceCommandAdmission) => void): Promise<WorkspaceCommandResponse>;
   inspectCommand(commandId?: string): Promise<WorkspaceCommandResponse>;
   getPendingCommand(): PendingWorkspaceCommand | undefined;
   dispose(): void;
@@ -53,6 +55,12 @@ export class WorkspaceCommandUnknownError extends Error {
   constructor(readonly commandId: string, readonly reason: 'network' | 'timeout' | 'invalid_acknowledgement' | 'server_error') {
     super('The workspace command outcome is unknown. Check its receipt before trying another action.');
   }
+}
+
+/** The allowlist/envelope was rejected before the command entered fetch. */
+export class WorkspaceCommandNotStartedError extends Error {
+  readonly name = 'WorkspaceCommandNotStartedError';
+  constructor(message = 'The command was not sent. Review the workspace and try again.') { super(message); }
 }
 
 type SafeResponse = Pick<Response, 'ok' | 'status' | 'json'>;
@@ -163,6 +171,7 @@ export function createWebWorkspaceClient(session: AuthenticatedSession, options:
       timeoutReject(new WorkspaceClientError('timeout', 'The workspace request timed out.'));
     }, timeoutMs);
     try {
+      onDispatch?.();
       const responsePromise = fetcher(path, {
         ...init,
         credentials: 'same-origin',
@@ -170,7 +179,6 @@ export function createWebWorkspaceClient(session: AuthenticatedSession, options:
         cache: 'no-store',
         signal: controller.signal,
       });
-      onDispatch?.();
       const response = await Promise.race([responsePromise, timeoutPromise]);
       assertOperation(ticket);
       if (!response.ok) {
@@ -266,7 +274,7 @@ export function createWebWorkspaceClient(session: AuthenticatedSession, options:
     });
   }
 
-  async function execute(command: WorkspaceCommand): Promise<WorkspaceCommandResponse> {
+  async function execute(command: WorkspaceCommand, onAdmitted?: (envelope: WorkspaceCommandAdmission) => void): Promise<WorkspaceCommandResponse> {
     assertUsable();
     if (pending) throw new WorkspaceClientError('busy', 'Check the pending workspace command receipt before another action.');
     if (!snapshot) throw new WorkspaceClientError('snapshot_required', 'Refresh the workspace before making a change.');
@@ -282,9 +290,13 @@ export function createWebWorkspaceClient(session: AuthenticatedSession, options:
         command,
       });
     } catch {
-      throw new WorkspaceClientError('malformed', 'The workspace action could not be prepared.');
+      throw new WorkspaceCommandNotStartedError('The workspace action could not be prepared, so it was not sent.');
     }
-
+    try {
+      onAdmitted?.(envelope);
+    } catch {
+      throw new WorkspaceCommandNotStartedError('The chat request could not be bound to its original message, so it was not sent.');
+    }
     pending = Object.freeze({ envelope });
     let dispatched = false;
     try {
@@ -381,6 +393,9 @@ function expectedReceiptFor(envelope: WorkspaceCommandEnvelope) {
       return { commandId: envelope.commandId, kind: command.kind, objectId: command.taskId };
     case 'chat.create': case 'notes.save':
       return { commandId: envelope.commandId, kind: command.kind };
+    case 'notes.capture.adopt':
+      return { commandId: envelope.commandId, kind: command.kind, objectId: command.captureId,
+        captureId: command.captureId, captureRevision: command.captureRevision };
     case 'notes.updateTranscript':
       return { commandId: envelope.commandId, kind: command.kind, objectId: command.noteId };
     case 'assistant.batch.submitNote':

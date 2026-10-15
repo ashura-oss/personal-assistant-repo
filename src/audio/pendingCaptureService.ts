@@ -348,7 +348,7 @@ export function createPendingCaptureService(dependencies: PendingCaptureServiceD
         const status = safeStatus(current);
         if (status.kind !== 'pending' || !status.canSave || current.capture.inspection?.outcome !== 'known') throw new Error('This pending recording is not ready to save. Inspect it or remove extra files first.');
         if (await nativeIO.exists(nativeIO.toUri(current.capture.originalPath)) !== true) throw new Error('The pending recording file is missing.');
-        return Object.freeze({ capture: current.capture, uri: nativeIO.toUri(current.capture.originalPath) });
+        return Object.freeze({ kind: 'native' as const, capture: current.capture, uri: nativeIO.toUri(current.capture.originalPath) });
       }));
     },
     async readConsumedEvidence(idValue: string) {

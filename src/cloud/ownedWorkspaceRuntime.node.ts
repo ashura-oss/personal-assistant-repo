@@ -1,5 +1,8 @@
 import type { AppState } from '../core';
 import { AppControllerImpl, type ControllerCryptoPort, type ControllerRuntimePorts } from '../services/controller.shared';
+import type { PendingCaptureControllerPort } from '../audio/pendingCaptureService.types';
+import type { AudioHttpApi, AudioHttpMediaResponse, AudioUploadCaptureHeader, AudioUploadReceiptDTO } from '../../server/src/audioHttp.js';
+import type { WorkspaceHttpAdmission } from '../../server/src/workspaceHttp.js';
 import { createWorkspaceSnapshotDTO, type WorkspaceMediaResolver, type WorkspaceSnapshotDTO } from './workspaceDto';
 import { NodeSpeechCleanupAdapter } from './speechCleanupAdapter.node';
 import type { NodeProviderResponseLifetimeOwner } from './providerResponseLifetime.node';
@@ -13,6 +16,8 @@ import type { LoadedWorkspaceIdentity } from '../../server/src/workspaceStore.js
 
 export type OwnedWorkspaceFactoryContext = WorkspaceRuntimeContext<AppState> & {
   readonly speechCleanupChildren: SpeechCleanupChildren;
+  /** Stable only for this host process; private audio repositories use it for lease ownership. */
+  readonly processInstanceId: string;
 };
 
 export interface OwnedWorkspaceAdmission {
@@ -26,6 +31,15 @@ export interface OwnedWorkspaceRuntimePorts {
   readonly providers: ControllerRuntimePorts['providers'];
   readonly integration: ControllerRuntimePorts['integration'];
   readonly mediaResolver?: WorkspaceMediaResolver;
+  readonly pendingCapture?: PendingCaptureControllerPort;
+  /** Per-entry bridge; the runtime never exposes its backing repository/controller. */
+  readonly audioHttpApi?: AudioHttpApi;
+  readonly attachController?: (controller: AppControllerImpl) => void;
+  readonly attachedLifecycle?: Readonly<{
+    stopAdmission(): void;
+    drain(replacement?: { readonly identity: OwnedWorkspaceIdentity; readonly admissionSessionToken: string }): Promise<void>;
+    dispose(): Promise<void>;
+  }>;
   /** When supplied, this exact owner must also be used by the speech provider. */
   readonly responseLifetimeOwner?: NodeProviderResponseLifetimeOwner;
 }
@@ -42,6 +56,8 @@ interface OwnedWorkspaceRuntimeCommonOptions {
   readonly crypto: ControllerCryptoPort;
   /** Test-only fault injection for the child receipt's post-commit acknowledgement boundary. */
   readonly afterSpeechCleanupCommitForTesting?: () => void;
+  /** Test-only fault injection after an atomic workspace checkpoint has committed. */
+  readonly afterWorkspaceCommitForTesting?: () => void | Promise<void>;
 }
 
 export type OwnedWorkspaceRuntimeOptions = OwnedWorkspaceRuntimeCommonOptions & (
@@ -79,6 +95,8 @@ export class OwnedWorkspaceRuntime {
   private readonly registry: WorkspaceRegistry<AppControllerImpl, AppState>;
   private readonly cache = new Map<string, CachedWorkspaceSnapshot>();
   private readonly mediaResolvers = new WeakMap<AppControllerImpl, WorkspaceMediaResolver>();
+  private readonly audioApis = new WeakMap<AppControllerImpl, AudioHttpApi>();
+  private readonly attachedLifecycles = new WeakMap<AppControllerImpl, NonNullable<OwnedWorkspaceRuntimePorts['attachedLifecycle']>>();
   private readonly speechAdapters = new WeakMap<AppControllerImpl, NodeSpeechCleanupAdapter>();
   private readonly speechAdapterByWorkspace = new Map<string, NodeSpeechCleanupAdapter>();
   private readonly allSpeechAdapters = new Set<NodeSpeechCleanupAdapter>();
@@ -113,24 +131,61 @@ export class OwnedWorkspaceRuntime {
           validateRuntimePorts(options);
           const adapter = options.responseLifetimeOwner ? makeAdapter(options.responseLifetimeOwner) : undefined;
           const controller = new AppControllerImpl({ store: context.store, crypto: options.crypto,
-            providers: options.providers, integration: options.integration, ...(adapter ? { speechCleanup: adapter.controllerPort } : {}) });
+            providers: options.providers, integration: options.integration, ...(adapter ? { speechCleanup: adapter.controllerPort } : {}),
+            ...(options.pendingCapture ? { pendingCapture: options.pendingCapture } : {}) });
           if (options.mediaResolver) this.mediaResolvers.set(controller, options.mediaResolver);
+          if (options.audioHttpApi) this.audioApis.set(controller, options.audioHttpApi);
           this.attachController(controller, adapter, context.identity.workspaceId, options.responseLifetimeOwner);
           return controller;
         }
-        const factoryContext: OwnedWorkspaceFactoryContext = Object.freeze({ ...context, speechCleanupChildren: children });
+        const factoryContext: OwnedWorkspaceFactoryContext = Object.freeze({ ...context, speechCleanupChildren: children,
+          processInstanceId: this.processInstanceId });
         const returned = await options.workspacePortsFor(factoryContext);
-        const cleanup = returned && typeof returned.disposeUnattached === 'function'
-          ? () => returned.disposeUnattached()
-          : () => { throw new Error('workspace_runtime_port_cleanup_unavailable'); };
+        let controller: AppControllerImpl | undefined;
+        let unattachedDisposed = false;
+        let controllerDisposed = false;
+        let lifecycleDisposed = false;
+        let responseDrained = false;
+        let lifecycleDrained = false;
+        const cleanup = async () => {
+          if (!returned || typeof returned.disposeUnattached !== 'function') throw new Error('workspace_runtime_port_cleanup_unavailable');
+          if (!controller) {
+            if (unattachedDisposed) return;
+            await returned.disposeUnattached();
+            unattachedDisposed = true;
+            return;
+          }
+          controller.stopActiveTranscriptions();
+          returned.responseLifetimeOwner.stopAdmission();
+          returned.attachedLifecycle?.stopAdmission();
+          if (!responseDrained) {
+            await returned.responseLifetimeOwner.drain();
+            responseDrained = true;
+          }
+          if (returned.attachedLifecycle && !lifecycleDrained) {
+            await returned.attachedLifecycle.drain();
+            lifecycleDrained = true;
+          }
+          if (!controllerDisposed) {
+            await controller.disposeForPrivacy();
+            controllerDisposed = true;
+          }
+          if (returned.attachedLifecycle && !lifecycleDisposed) {
+            await returned.attachedLifecycle.dispose();
+            lifecycleDisposed = true;
+          }
+        };
         try {
           if (!returned || typeof returned.disposeUnattached !== 'function') throw new TypeError('owned_workspace_runtime_ports_required');
           validateRuntimePorts(returned);
           validateResponseLifetimeOwner(returned.responseLifetimeOwner);
           const adapter = makeAdapter(returned.responseLifetimeOwner);
-          const controller = new AppControllerImpl({ store: context.store, crypto: options.crypto,
-            providers: returned.providers, integration: returned.integration, speechCleanup: adapter.controllerPort });
+          controller = new AppControllerImpl({ store: context.store, crypto: options.crypto,
+            providers: returned.providers, integration: returned.integration, speechCleanup: adapter.controllerPort, pendingCapture: returned.pendingCapture });
+          returned.attachController?.(controller);
           if (returned.mediaResolver) this.mediaResolvers.set(controller, returned.mediaResolver);
+          if (returned.audioHttpApi) this.audioApis.set(controller, returned.audioHttpApi);
+          if (returned.attachedLifecycle) this.attachedLifecycles.set(controller, returned.attachedLifecycle);
           this.attachController(controller, adapter, context.identity.workspaceId, returned.responseLifetimeOwner);
           return controller;
         } catch (error) {
@@ -138,7 +193,45 @@ export class OwnedWorkspaceRuntime {
           catch { throw new WorkspaceControllerFactoryInitializationError('workspace_runtime_port_cleanup_failed', cleanup); }
           throw error;
         }
-      }, (controller, teardown) => this.teardownWorkspaceController(controller, teardown));
+      }, (controller, teardown) => this.teardownWorkspaceController(controller, teardown), options.afterWorkspaceCommitForTesting);
+  }
+
+  /** Authenticated audio routes resolve the exact loaded per-workspace owner entry. */
+  createAudioHttpApi(): AudioHttpApi {
+    const invoke = async <T>(admission: WorkspaceHttpAdmission, operation: (api: AudioHttpApi) => Promise<T>,
+      cleanupIfPostcheckFails?: (result: T) => Promise<void>): Promise<T> => {
+      this.assertAdmission(admission);
+      const initial = this.options.kernel.getOwnedIdentity(admission.sessionToken);
+      return this.track(initial.workspaceId, () => undefined, async () => {
+        const entry = await this.registry.get(admission.sessionToken);
+        admission.assertCurrent();
+        const current = this.options.kernel.getOwnedIdentity(admission.sessionToken);
+        if (current.workspaceId !== initial.workspaceId || current.ownerId !== initial.ownerId ||
+            current.privacyEpoch !== initial.privacyEpoch) throw new Error('workspace_ownership_changed');
+        const api = this.audioApis.get(entry.controller);
+        if (!api) throw new Error('Audio storage is unavailable for this workspace.');
+        const result = await operation(api);
+        try {
+          admission.assertCurrent();
+          const after = this.options.kernel.getOwnedIdentity(admission.sessionToken);
+          if (after.workspaceId !== initial.workspaceId || after.ownerId !== initial.ownerId ||
+              after.privacyEpoch !== initial.privacyEpoch) throw new Error('workspace_ownership_changed');
+          return result;
+        } catch (error) {
+          await cleanupIfPostcheckFails?.(result);
+          throw error;
+        }
+      });
+    };
+    return Object.freeze({
+      upload: (admission: WorkspaceHttpAdmission, input: Readonly<{ uploadId: string; capture: AudioUploadCaptureHeader;
+        mimeType: string; expectedByteLength?: number; source: AsyncIterable<Uint8Array> }>): Promise<AudioUploadReceiptDTO> =>
+        invoke(admission, (api) => api.upload(admission, input)),
+      inspectUpload: (admission: WorkspaceHttpAdmission, uploadId: string): Promise<AudioUploadReceiptDTO> =>
+        invoke(admission, (api) => api.inspectUpload(admission, uploadId)),
+      openMedia: (admission: WorkspaceHttpAdmission, mediaId: string, input: Readonly<{ method: 'GET' | 'HEAD'; range?: string; signal?: AbortSignal }>): Promise<AudioHttpMediaResponse> =>
+        invoke(admission, (api) => api.openMedia(admission, mediaId, input), closeOpenedMediaResponse),
+    });
   }
 
   getSnapshot(admission: OwnedWorkspaceAdmission): Promise<WorkspaceSnapshotDTO> {
@@ -411,8 +504,10 @@ export class OwnedWorkspaceRuntime {
   }): Promise<void> {
     controller.stopActiveTranscriptions();
     const adapter = this.speechAdapters.get(controller);
+    const attachedLifecycle = this.attachedLifecycles.get(controller);
     const owner = this.responseOwnerByController.get(controller);
     owner?.stopAdmission();
+    attachedLifecycle?.stopAdmission();
     if (owner) await owner.drain();
 
     if (input.replacement) {
@@ -423,14 +518,17 @@ export class OwnedWorkspaceRuntime {
       if (currentBeforeDispose.workspaceId !== expected.workspaceId || currentBeforeDispose.ownerId !== expected.ownerId ||
           currentBeforeDispose.privacyEpoch !== expected.privacyEpoch) throw new Error('workspace_old_epoch_retirement_unverified');
       await adapter?.drainPhysicalCleanupForRetirement();
+      await attachedLifecycle?.drain(input.replacement);
       const currentAfterDrain = this.options.kernel.getOwnedIdentity(input.replacement.admissionSessionToken);
       if (currentAfterDrain.workspaceId !== expected.workspaceId || currentAfterDrain.ownerId !== expected.ownerId ||
           currentAfterDrain.privacyEpoch !== expected.privacyEpoch) throw new Error('workspace_old_epoch_retirement_unverified');
     } else {
       await adapter?.drain();
+      await attachedLifecycle?.drain();
     }
 
     await controller.disposeForPrivacy();
+    await attachedLifecycle?.dispose();
     this.controllers.delete(controller);
     if (adapter) {
       this.allSpeechAdapters.delete(adapter);
@@ -440,6 +538,8 @@ export class OwnedWorkspaceRuntime {
       this.responseOwners.delete(owner);
       if (this.responseOwnerByWorkspace.get(input.identity.workspaceId) === owner) this.responseOwnerByWorkspace.delete(input.identity.workspaceId);
     }
+    this.audioApis.delete(controller);
+    this.attachedLifecycles.delete(controller);
     this.cache.delete(input.identity.workspaceId);
   }
 
@@ -511,6 +611,27 @@ export class OwnedWorkspaceRuntime {
   }
 }
 
+async function closeOpenedMediaResponse(response: AudioHttpMediaResponse): Promise<void> {
+  const body = response.body;
+  if (!body || body.closed) return;
+  await new Promise<void>((resolve, reject) => {
+    let done = false;
+    const finish = (error?: unknown) => {
+      if (done) return;
+      if (error !== undefined && !body.closed) { done = true; cleanup(); reject(error); return; }
+      if (!body.closed) return;
+      done = true; cleanup(); resolve();
+    };
+    const onClose = () => finish();
+    const onError = (_error: Error) => { /* Wait for the actual close acknowledgement. */ };
+    const cleanup = () => { body.off('close', onClose); body.off('error', onError); };
+    body.once('close', onClose);
+    body.on('error', onError);
+    if (!body.destroyed) body.destroy();
+    if (body.closed) finish();
+  });
+}
+
 /** Internal Node test/integration seam; never exported by the HTTP adapter. */
 export { NodeSpeechCleanupAdapter };
 
@@ -523,7 +644,8 @@ function validateRuntimeConfiguration(options: OwnedWorkspaceRuntimeOptions): vo
   const hasFactory = Object.prototype.hasOwnProperty.call(options, 'workspacePortsFor');
   const hasStaticPorts = Object.prototype.hasOwnProperty.call(options, 'providers') ||
     Object.prototype.hasOwnProperty.call(options, 'integration') || Object.prototype.hasOwnProperty.call(options, 'mediaResolver') ||
-    Object.prototype.hasOwnProperty.call(options, 'responseLifetimeOwner');
+    Object.prototype.hasOwnProperty.call(options, 'responseLifetimeOwner') || Object.prototype.hasOwnProperty.call(options, 'pendingCapture') ||
+    Object.prototype.hasOwnProperty.call(options, 'audioHttpApi') || Object.prototype.hasOwnProperty.call(options, 'attachedLifecycle');
   if (hasFactory) {
     if (hasStaticPorts || typeof options.workspacePortsFor !== 'function') throw new TypeError('owned_workspace_runtime_ports_required');
     return;

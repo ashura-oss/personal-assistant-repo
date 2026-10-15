@@ -119,4 +119,33 @@ describe('server speech upload adapter', () => {
     await service.release(externalLeaseId);
     expect(releaseSpeechLease.mock.calls).toEqual([[repositoryLeaseId], [repositoryLeaseId]]);
   });
+
+  it('retains the repository lease after a read-FD close failure and retries only exact cleanup', async () => {
+    const mediaId = randomUUID();
+    const repositoryLeaseId = randomUUID();
+    const externalLeaseId = randomUUID();
+    let releaseAttempts = 0;
+    const repository = {
+      createSpeechLease: vi.fn(async () => ({ leaseId: repositoryLeaseId, mediaId, sha256: 'c'.repeat(64), byteLength: 100,
+        durationSeconds: 0.2, fileName: 'recording.wav', format: 'wav' as const, mimeType: 'audio/wav' })),
+      readSpeechLease: vi.fn(async () => { throw new Error('speech FD close acknowledgement failed'); }),
+      verifySpeechLease: vi.fn(async () => undefined),
+      releaseSpeechLease: vi.fn(async (leaseId: string) => {
+        expect(leaseId).toBe(repositoryLeaseId);
+        releaseAttempts += 1;
+        if (releaseAttempts === 1) throw new Error('speech FD close acknowledgement failed');
+      }),
+    };
+    const service = createNodeSpeechAudioService(repository);
+    const note = { id: 'legacy-note-id', title: '', transcript: '', audioUri: `still-media:${mediaId}`, durationSeconds: 0.2,
+      createdAt: '2026-10-15T00:00:00.000Z', status: 'recorded', revision: 1 } as Note;
+    await expect(service.prepare(note, { leaseId: externalLeaseId, maxDurationSeconds: 600, maxAudioBytes: 1024 }))
+      .rejects.toThrow('speech FD close acknowledgement failed');
+    expect(repository.readSpeechLease).toHaveBeenCalledTimes(1);
+    await expect(service.release(externalLeaseId)).rejects.toThrow('speech FD close acknowledgement failed');
+    await service.release(externalLeaseId);
+    expect(repository.createSpeechLease).toHaveBeenCalledTimes(1);
+    expect(repository.readSpeechLease).toHaveBeenCalledTimes(1);
+    expect(repository.releaseSpeechLease.mock.calls).toEqual([[repositoryLeaseId], [repositoryLeaseId]]);
+  });
 });
