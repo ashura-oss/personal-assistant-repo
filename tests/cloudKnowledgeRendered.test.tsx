@@ -68,6 +68,7 @@ describe('cloud knowledge rendered session flow', () => {
     let sourceChoiceReads = 0;
     const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input); const method = init?.method ?? 'GET';
+      if (url === '/api/workspace/erase/status' && method === 'GET') return body({ schemaVersion: 1, status: 'none' });
       if (url === '/api/workspace/snapshot' && method === 'GET') return body(snapshot());
       if (url.startsWith('/api/workspace/knowledge/source-choices?') && method === 'GET') {
         sourceChoiceReads += 1;
@@ -149,6 +150,7 @@ describe('cloud knowledge rendered session flow', () => {
     let releaseEditResponse: (() => void) | undefined;
     const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input); const method = init?.method ?? 'GET';
+      if (url === '/api/workspace/erase/status' && method === 'GET') return body({ schemaVersion: 1, status: 'none' });
       if (url === '/api/workspace/snapshot' && method === 'GET') return body(snapshot());
       if (url.startsWith('/api/workspace/knowledge/suggestion-review?') && method === 'GET') return body({ schemaVersion: 1, workspaceId, privacyEpoch, revision: workspaceRevision,
         review: { suggestion: projectKnowledgeSuggestionForHttp(suggestion), canEdit: true, canAccept: true } });
@@ -230,6 +232,7 @@ describe('cloud knowledge rendered session flow', () => {
     const commands: Record<string, unknown>[] = [];
     const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input); const method = init?.method ?? 'GET';
+      if (url === '/api/workspace/erase/status' && method === 'GET') return body({ schemaVersion: 1, status: 'none' });
       if ((url === '/api/workspace/snapshot' || url === '/api/workspace/refresh') && (method === 'GET' || method === 'POST')) return body(snapshot());
       if (url.startsWith('/api/workspace/knowledge/suggestion-review?') && method === 'GET') return body({ schemaVersion: 1, workspaceId, privacyEpoch, revision: workspaceRevision,
         review: { suggestion: projectKnowledgeSuggestionForHttp(suggestion), canEdit: false, canAccept: false, reason: 'The target is archived.' } });
@@ -268,6 +271,7 @@ describe('cloud knowledge rendered session flow', () => {
     const commands: unknown[] = [];
     const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input); const method = init?.method ?? 'GET';
+      if (url === '/api/workspace/erase/status' && method === 'GET') return body({ schemaVersion: 1, status: 'none' });
       if ((url === '/api/workspace/snapshot' && method === 'GET') || (url === '/api/workspace/refresh' && method === 'POST')) return body(snapshot());
       if (url === '/api/workspace/commands' && method === 'POST') { commands.push(JSON.parse(String(init?.body))); throw new Error('Unexpected command should not be sent'); }
       throw new Error(`Unexpected request ${method} ${url}`);

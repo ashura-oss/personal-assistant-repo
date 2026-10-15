@@ -9,7 +9,8 @@ import type { CloudVoiceCapturePort } from '../src/web/cloudVoiceCoordinator';
 import type { AuthenticatedSession } from '../src/web/authClient';
 
 const mockSessionStoreRef = vi.hoisted(() => ({ current: null as unknown }));
-vi.mock('react-native', () => ({ ActivityIndicator: () => null, Text: () => null, View: () => null }));
+vi.mock('react-native', () => ({ ActivityIndicator: () => null, ScrollView: () => null, Text: () => null, View: () => null }));
+vi.mock('../src/web/WorkspaceErasePanel', () => ({ WorkspaceErasePanel: () => null }));
 vi.mock('react-native-safe-area-context', () => ({ SafeAreaProvider: ({ children }: { children: unknown }) => children,
   SafeAreaView: ({ children }: { children: unknown }) => children }));
 vi.mock('../src/web/CloudWorkspace', () => ({ CloudWorkspace: ({ store }: { store: unknown }) => {
@@ -51,6 +52,7 @@ function fakeCapture(overrides: Partial<CloudVoiceCapturePort> = {}) {
 
 function installFetch(fetcher: (...args: [string, RequestInit]) => Promise<ReturnType<typeof body>>) {
   const mock = vi.fn((path: string, init: RequestInit) => {
+    if (path === '/api/workspace/erase/status' && (init.method ?? 'GET') === 'GET') return Promise.resolve(body({ schemaVersion: 1, status: 'none' }));
     if (path === '/api/credentials' && (init.method ?? 'GET') === 'GET') return Promise.resolve(body({
       workspaceId,
       privacyEpoch: session.privacyEpoch,

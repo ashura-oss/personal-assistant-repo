@@ -105,6 +105,7 @@ describe('OAuth rendered through the authenticated browser session', () => {
     let refreshes = 0;
     const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const path = String(input);
+      if (path === '/api/workspace/erase/status') return json({ schemaVersion: 1, status: 'none' });
       if (path === '/api/workspace/snapshot') return json(initial);
       if (path === '/api/credentials') return json(credentials());
       if (path === '/api/oauth/availability') return json({ google: true, microsoft: false });
@@ -179,6 +180,7 @@ describe('OAuth rendered through the authenticated browser session', () => {
     const inspected: string[] = [];
     const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const path = String(input);
+      if (path === '/api/workspace/erase/status') return json({ schemaVersion: 1, status: 'none' });
       if (path === '/api/workspace/snapshot') return json(snapshot());
       if (path === '/api/credentials') return json(credentials());
       if (path === '/api/oauth/availability') return json({ google: true, microsoft: false });
@@ -227,6 +229,7 @@ describe('OAuth rendered through the authenticated browser session', () => {
     let refreshes = 0;
     const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const path = String(input);
+      if (path === '/api/workspace/erase/status') return json({ schemaVersion: 1, status: 'none' });
       if (path === '/api/workspace/snapshot') return json(snapshot());
       if (path === '/api/credentials') return json(credentials());
       if (path === '/api/oauth/availability') return json({ google: true, microsoft: false });
@@ -287,6 +290,7 @@ describe('OAuth rendered through the authenticated browser session', () => {
     let installPosts = 0;
     const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const path = String(input);
+      if (path === '/api/workspace/erase/status') return json({ schemaVersion: 1, status: 'none' });
       if (path === '/api/workspace/snapshot') return json(initial);
       if (path === '/api/credentials') return json(credentials());
       if (path === '/api/oauth/availability') return json({ google: true, microsoft: false });
@@ -360,6 +364,7 @@ describe('OAuth rendered through the authenticated browser session', () => {
     const pendingStart = new Promise<Response>((resolve) => { resolveStart = resolve; });
     const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const path = String(input);
+      if (path === '/api/workspace/erase/status') return json({ schemaVersion: 1, status: 'none' });
       const owner = currentOwner;
       if (path === '/api/workspace/snapshot') return json(snapshot(owner, owner === workspaceId ? 3 : 4));
       if (path === '/api/credentials') return json(credentials(owner, owner === workspaceId ? 3 : 4));
