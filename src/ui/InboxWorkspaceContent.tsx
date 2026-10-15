@@ -10,7 +10,7 @@ import { Button } from './primitives';
 import { s } from './theme';
 import type { WorkspaceActionCapability } from './workspaceCapabilities';
 
-export type InboxAccountDisplay = Readonly<Pick<Account, 'id' | 'provider' | 'displayName' | 'email' | 'connected' | 'authStatus' | 'identity' | 'capabilities' | 'connectionGeneration'>>;
+export type InboxAccountDisplay = Readonly<Pick<Account, 'id' | 'provider' | 'displayName' | 'email' | 'connected' | 'authStatus' | 'connectionGeneration'>>;
 export type InboxDeviceCalendarDisplay = Readonly<{
   installationId: string; generation: number; selectionRevision: number; enabled: boolean; selectedCalendarIds: readonly string[];
   calendars: readonly Readonly<{ localId: string; title: string; timeZone?: string }>[];
@@ -18,10 +18,9 @@ export type InboxDeviceCalendarDisplay = Readonly<{
   readRun?: Readonly<{ generation: number; selectionRevision: number; selectedCalendarIds: readonly string[] }>;
 }>;
 
-export function inboxAccountDisplay(account: Account): InboxAccountDisplay {
+export function inboxAccountDisplay(account: Pick<Account, 'id' | 'provider' | 'displayName' | 'email' | 'connected' | 'authStatus' | 'connectionGeneration'>): InboxAccountDisplay {
   return { id: account.id, provider: account.provider, displayName: account.displayName, email: account.email, connected: account.connected,
-    authStatus: account.authStatus, ...(account.identity ? { identity: { ...account.identity } } : {}),
-    ...(account.capabilities ? { capabilities: [...account.capabilities] } : {}), ...(account.connectionGeneration !== undefined ? { connectionGeneration: account.connectionGeneration } : {}) };
+    authStatus: account.authStatus, ...(account.connectionGeneration !== undefined ? { connectionGeneration: account.connectionGeneration } : {}) };
 }
 
 export function inboxDeviceCalendarDisplay(value: DeviceCalendarState): InboxDeviceCalendarDisplay {

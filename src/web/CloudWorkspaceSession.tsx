@@ -4,6 +4,8 @@ import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import type { WorkspaceSnapshotDTO } from '../cloud/workspaceDto';
 import type { KnowledgeSourceChoicesDTO, KnowledgeSuggestionReviewDTO } from '../cloud/knowledgeHttpContracts';
 import type { WorkspaceCommand, WorkspaceCommandResponse } from '../cloud/workspaceCommands';
+import type { DispatchReviewReadDto, MailReplyBatchReviewReadDto, MailReplySourceReadDto, MailReplyTextReadDto, ProposalReviewReadDto } from './mailWorkflowDtos';
+import type { ReplyBatchPlanRead } from './cloudMailClient';
 import { decodeWorkspaceSnapshotDTO } from '../cloud/workspaceSnapshotCodec';
 import { WorkspaceClientError, WorkspaceCommandNotStartedError, createWebWorkspaceClient, type WorkspaceClient, type WorkspaceCommandAdmission } from './workspaceClient';
 import type { AuthenticatedSession } from './authClient';
@@ -14,6 +16,7 @@ import { useCloudAudioCapture } from './useCloudAudioCapture';
 import { C, s } from '../ui/theme';
 import { useCloudCredentials } from './useCloudCredentials';
 import { CloudOAuthCoordinator, type CloudOAuthState } from './cloudOAuthCoordinator';
+import { CloudMailCoordinator, type CloudMailCoordinatorState } from './cloudMailCoordinator';
 
 export type CloudWorkspaceSessionState = Readonly<{
   status: 'loading' | 'ready' | 'error';
@@ -22,6 +25,7 @@ export type CloudWorkspaceSessionState = Readonly<{
   pendingCommand?: Readonly<{ commandId: string; kind: WorkspaceCommand['kind'] }>;
   voice?: CloudVoiceCoordinatorState;
   oauth?: CloudOAuthState;
+  mail?: CloudMailCoordinatorState;
   refreshRequired: boolean;
   error?: string;
 }>;
@@ -38,6 +42,8 @@ export class CloudWorkspaceSessionStore {
   private unsubscribeVoice?: () => void;
   private oauthCoordinator?: CloudOAuthCoordinator;
   private unsubscribeOAuth?: () => void;
+  private mailCoordinator?: CloudMailCoordinator;
+  private unsubscribeMail?: () => void;
   private ownerGeneration = 0;
   private active = false;
   private operationInFlight = false;
@@ -70,13 +76,15 @@ export class CloudWorkspaceSessionStore {
   };
 
   private publish(next: CloudWorkspaceSessionState): void {
-    const { voice: _callerVoice, oauth: _callerOAuth, ...withoutCallerOwnedState } = next;
+    const { voice: _callerVoice, oauth: _callerOAuth, mail: _callerMail, ...withoutCallerOwnedState } = next;
     void _callerVoice;
     void _callerOAuth;
+    void _callerMail;
     const coordinator = this.active ? this.voiceCoordinator : undefined;
     const voice = coordinator?.getSnapshot();
     const oauth = this.active ? this.oauthCoordinator?.getSnapshot() : undefined;
-    this.value = Object.freeze({ ...withoutCallerOwnedState, ...(voice ? { voice } : {}), ...(oauth ? { oauth } : {}) });
+    const mail = this.active ? this.mailCoordinator?.getSnapshot() : undefined;
+    this.value = Object.freeze({ ...withoutCallerOwnedState, ...(voice ? { voice } : {}), ...(oauth ? { oauth } : {}), ...(mail ? { mail } : {}) });
     for (const listener of this.listeners) listener();
   }
 
@@ -117,6 +125,23 @@ export class CloudWorkspaceSessionStore {
     this.unsubscribeOAuth = oauthCoordinator.subscribe(() => {
       if (this.isCurrent(owner) && this.oauthCoordinator === oauthCoordinator) this.publish({ ...this.value, oauth: oauthCoordinator.getSnapshot() });
     });
+    const mailCoordinator = new CloudMailCoordinator({
+      readSnapshot: () => this.isCurrent(owner) ? this.value.snapshot : undefined,
+      readOperation: () => ({ busy: this.value.busy, pending: Boolean(this.value.pendingCommand), refreshRequired: this.value.refreshRequired,
+        ...(this.value.pendingCommand ? { pendingCommandId: this.value.pendingCommand.commandId } : {}) }),
+      readMailReplySource: (messageId, expectedRevision) => this.readMailReplySource(messageId, expectedRevision),
+      readMailReplyText: (messageId, expectedRevision, source) => this.readMailReplyText(messageId, expectedRevision, source),
+      readProposalReview: (proposalId, expectedRevision) => this.readProposalReview(proposalId, expectedRevision),
+      readDispatchReview: (recordId, expectedRevision) => this.readDispatchReview(recordId, expectedRevision),
+      readReplyBatchReview: (plan, expectedRevision) => this.readReplyBatchReview(plan, expectedRevision),
+      execute: (command, onAdmitted) => this.execute(command, onAdmitted),
+      inspect: (commandId) => this.inspect(commandId),
+      refresh: () => this.refresh(),
+    });
+    this.mailCoordinator = mailCoordinator;
+    this.unsubscribeMail = mailCoordinator.subscribe(() => {
+      if (this.isCurrent(owner) && this.mailCoordinator === mailCoordinator) this.publish({ ...this.value, mail: mailCoordinator.getSnapshot() });
+    });
     if (getCapture) {
       this.audioClient = createWebAudioUploadClient(this.session, {
         assertCurrent: () => { if (!this.isCurrent(owner)) throw new Error('Cloud workspace owner changed.'); },
@@ -156,6 +181,10 @@ export class CloudWorkspaceSessionStore {
   }
 
   private disposeResources(): void {
+    this.unsubscribeMail?.();
+    this.unsubscribeMail = undefined;
+    this.mailCoordinator?.dispose();
+    this.mailCoordinator = undefined;
     this.unsubscribeVoice?.();
     this.unsubscribeVoice = undefined;
     this.unsubscribeOAuth?.();
@@ -185,6 +214,11 @@ export class CloudWorkspaceSessionStore {
   getOAuthCoordinator(): CloudOAuthCoordinator | undefined {
     if (!this.active) return undefined;
     return this.oauthCoordinator;
+  }
+
+  getMailCoordinator(): CloudMailCoordinator | undefined {
+    if (!this.active) return undefined;
+    return this.mailCoordinator;
   }
 
   async cancelTranscription(commandId: string): Promise<'cancellation_requested' | 'not_running'> {
@@ -254,6 +288,47 @@ export class CloudWorkspaceSessionStore {
     } finally {
       this.finishOperation(operation, owner);
     }
+  }
+
+  private async readSavedMail<T>(expectedRevision: number, read: (client: WorkspaceClient) => Promise<T>): Promise<T> {
+    const owner = this.ownerGeneration;
+    const client = this.currentClient();
+    const current = this.value.snapshot;
+    if (!current || current.workspaceId !== this.session.workspaceId || current.privacyEpoch !== this.session.privacyEpoch || current.revision !== expectedRevision) {
+      throw new WorkspaceClientError('stale', 'The workspace changed. Refresh it before opening saved mail or proposal details.');
+    }
+    const operation = this.beginOperation();
+    this.publish({ ...this.value, busy: true, error: undefined });
+    try {
+      const result = await read(client);
+      const latest = this.value.snapshot;
+      if (!this.isCurrent(owner) || !latest || latest.workspaceId !== current.workspaceId || latest.privacyEpoch !== current.privacyEpoch || latest.revision !== expectedRevision) {
+        throw new WorkspaceClientError('stale', 'The workspace changed while saved details were loading. Refresh before continuing.');
+      }
+      return result;
+    } finally {
+      this.finishOperation(operation, owner);
+    }
+  }
+
+  readMailReplySource(messageId: string, expectedRevision: number): Promise<MailReplySourceReadDto> {
+    return this.readSavedMail(expectedRevision, (client) => client.readMailReplySource(messageId, expectedRevision));
+  }
+
+  readMailReplyText(messageId: string, expectedRevision: number, source: NonNullable<MailReplySourceReadDto['source']>): Promise<MailReplyTextReadDto> {
+    return this.readSavedMail(expectedRevision, (client) => client.readMailReplyText(messageId, expectedRevision, source));
+  }
+
+  readProposalReview(proposalId: string, expectedRevision: number): Promise<ProposalReviewReadDto> {
+    return this.readSavedMail(expectedRevision, (client) => client.readProposalReview(proposalId, expectedRevision));
+  }
+
+  readDispatchReview(recordId: string, expectedRevision: number): Promise<DispatchReviewReadDto> {
+    return this.readSavedMail(expectedRevision, (client) => client.readDispatchReview(recordId, expectedRevision));
+  }
+
+  readReplyBatchReview(plan: ReplyBatchPlanRead, expectedRevision: number): Promise<MailReplyBatchReviewReadDto> {
+    return this.readSavedMail(expectedRevision, (client) => client.readReplyBatchReview(plan, expectedRevision));
   }
 
   async refresh(): Promise<WorkspaceSnapshotDTO | undefined> {
@@ -408,7 +483,7 @@ export function CloudWorkspaceSession({ session, onLogout }: { session: Authenti
     );
   }
 
-  return <CloudWorkspace store={store} state={state} onLogout={() => { store.invalidate(); onLogout(); }} credentials={credentials} oauthCoordinator={store.getOAuthCoordinator()} voiceCapability={state.voice ? {
+  return <CloudWorkspace store={store} state={state} onLogout={() => { store.invalidate(); onLogout(); }} credentials={credentials} oauthCoordinator={store.getOAuthCoordinator()} mailCoordinator={store.getMailCoordinator()} voiceCapability={state.voice ? {
     available: true,
     capture: { status: capture.status, canResume: capture.canResume, durationSeconds: capture.durationSeconds,
       meter: capture.meter, hasPending: capture.hasPending, ...(capture.statusLabel ? { statusLabel: capture.statusLabel } : {}),

@@ -19,7 +19,7 @@ export function MailboxSection({
     (account) =>
       account.connected &&
       account.authStatus === "connected" &&
-      account.identity,
+      account.connectionGeneration !== undefined,
   );
   const recent = [...messages]
     .filter((message) => {

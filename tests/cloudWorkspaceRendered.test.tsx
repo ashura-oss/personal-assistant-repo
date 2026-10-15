@@ -1,13 +1,15 @@
 /** @vitest-environment jsdom */
-import React, { act } from 'react';
+import React, { act, useSyncExternalStore } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createInitialWorkspaceState } from '../src/services/controller.shared';
 import { createWorkspaceSnapshotDTO } from '../src/cloud/workspaceDto';
 import type { Account, LocalTask, MailboxSnapshotMessage, Note, Proposal } from '../src/core';
-import type { CloudWorkspaceSessionState, CloudWorkspaceVoiceActions } from '../src/web/CloudWorkspaceSession';
+import { CloudWorkspaceSessionStore, type CloudWorkspaceSessionState, type CloudWorkspaceVoiceActions } from '../src/web/CloudWorkspaceSession';
 import { CloudWorkspace } from '../src/web/CloudWorkspace';
+import { CloudMailWorkspace } from '../src/web/CloudMailWorkspace';
+import { CloudMailCoordinator, type CloudMailWorkspacePort } from '../src/web/cloudMailCoordinator';
 import { CloudWorkspaceSession } from '../src/web/CloudWorkspaceSession';
 import AppWeb from '../App.web';
 import { ServerRecordingPanel } from '../src/ui/ServerRecordingPanel';
@@ -158,6 +160,224 @@ function deferred<T>() {
 }
 
 describe('CloudWorkspace safe DTO presentation', () => {
+  it('uses saved-only reply reads in sequence and requires explicit rebinding when source metadata changes', async () => {
+    const state = createInitialWorkspaceState(() => '11111111-1111-4111-8111-111111111111');
+    const accountId = '22222222-2222-4222-8222-222222222222';
+    const messageId = '66666666-6666-4666-8666-666666666666';
+    state.accounts.push({ id: accountId, provider: 'google', displayName: 'Mail account', email: 'me@example.test', connected: true,
+      authStatus: 'connected', identity: { providerNamespace: 'google', subject: 'fixture-subject' }, capabilities: ['mail.read', 'mail.draft'], connectionGeneration: 4 } satisfies Account);
+    state.mailbox.push({ id: messageId, accountId, providerMessageId: 'provider-message', identityKey: 'safe-key', verifiedIdentityKey: 'safe-key', connectionGeneration: 4,
+      idFormat: 'gmail', internetMessageId: '<saved@example.test>', replyMetadataComplete: true, subject: 'Saved subject', from: 'sender@example.test', snippet: 'Saved excerpt',
+      observedAt: '2026-10-15T10:00:00.000Z', receivedAt: '2026-10-15T09:00:00.000Z' } satisfies MailboxSnapshotMessage);
+    const initialSnapshot = createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: 7 });
+    const requests: { path: string; method: string; body?: string }[] = [];
+    let sourceReads = 0;
+    let commandPosts = 0;
+    const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const path = String(input); const method = init?.method ?? 'GET';
+      requests.push({ path, method, ...(init?.body ? { body: String(init.body) } : {}) });
+      if (path === '/api/credentials' && method === 'GET') return { ok: true, status: 200, json: async () => credentialMetadata() };
+      if (path === '/api/workspace/snapshot' && method === 'GET') return { ok: true, status: 200, json: async () => initialSnapshot };
+      if (path.startsWith('/api/workspace/mail/source?') && method === 'GET') {
+        sourceReads += 1;
+        const sourceDigest = sourceReads === 1 ? 'a'.repeat(64) : 'b'.repeat(64);
+        return { ok: true, status: 200, json: async () => ({ schemaVersion: 1, workspaceId, privacyEpoch: 3, revision: 7, status: 'current',
+          source: { accountId, connectionGeneration: 4, localMessageId: messageId, providerMessageId: 'provider-message', idFormat: 'gmail', internetMessageId: '<saved@example.test>',
+            subject: sourceReads === 1 ? 'Saved subject' : 'Changed saved subject', from: 'sender@example.test', senderEmail: 'sender@example.test', to: ['me@example.test'], cc: [],
+            observedAt: '2026-10-15T10:00:00.000Z', sourceDigest },
+          defaults: { reply: { to: ['sender@example.test'], cc: [] }, reply_all: { to: ['sender@example.test', 'team@example.test'], cc: [] } },
+          bodyCache: { status: 'current', textDigest: 'c'.repeat(64), bytes: 11, completeness: 'complete_text', representation: 'plain', checkedAt: '2026-10-15T10:00:00.000Z' } }) };
+      }
+      if (path.startsWith('/api/workspace/mail/source-text?') && method === 'GET') {
+        const sourceDigest = sourceReads === 1 ? 'a'.repeat(64) : 'b'.repeat(64);
+        const text = 'Cached reply context';
+        return { ok: true, status: 200, json: async () => ({ schemaVersion: 1, workspaceId, privacyEpoch: 3, revision: 7, status: 'current', snapshot: {
+          messageId, accountId, connectionGeneration: 4, sourceDigest, checkedAt: '2026-10-15T10:01:00.000Z', text, textDigest: 'c'.repeat(64),
+          bytes: new TextEncoder().encode(text).byteLength, extractionVersion: 'mail-text-v2', representation: 'plain', completeness: 'complete_text', omissionReasons: [],
+        } }) };
+      }
+      if (path === '/api/workspace/commands' && method === 'POST') {
+        commandPosts += 1;
+        const envelope = JSON.parse(String(init?.body)) as { commandId: string; command: WorkspaceCommand };
+        expect(envelope.command.kind).toBe('mail.reply.create');
+        if (envelope.command.kind === 'mail.reply.create') expect(envelope.command).toMatchObject({ messageId, accountId, expectedConnectionGeneration: 4,
+          sourceDigest: 'b'.repeat(64), to: ['sender@example.test'], text: 'Draft reply text' });
+        const proposalId = '77777777-7777-4777-8777-777777777777';
+        return { ok: true, status: 200, json: async () => ({ schemaVersion: 1, commandId: envelope.commandId, status: 'finished', receipt: {
+          schemaVersion: 1, commandId: envelope.commandId, kind: 'mail.reply.create', objectId: proposalId, proposalId, proposalRevision: 1,
+        } }) };
+      }
+      throw new Error(`Unexpected cloud mail request: ${method} ${path}`);
+    });
+    vi.stubGlobal('fetch', fetcher);
+    try {
+      await act(async () => { root.render(<CloudWorkspaceSession session={{ authenticated: true, workspaceId, privacyEpoch: 3, csrfToken: 'mail-csrf' }} onLogout={vi.fn()} />); await new Promise((resolve) => setTimeout(resolve, 0)); });
+      click('Mail and calendar section');
+      click('Use Mail account');
+      click('Reply');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(requests.filter((item) => item.method === 'GET' && item.path.includes('/api/workspace/mail/')) .map((item) => item.path.split('?')[0]))
+        .toEqual(['/api/workspace/mail/source', '/api/workspace/mail/source-text']);
+      setTextField('Reply text', 'Draft reply text');
+      click('Close reply');
+      click('Reply');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(host.textContent).toContain('The saved message changed since this draft was opened.');
+      expect((host.querySelector('textarea[aria-label="Reply text"]') as HTMLTextAreaElement).value).toBe('Draft reply text');
+      expect((host.querySelector('button') as HTMLButtonElement)).not.toBeNull();
+      const saveButton = [...host.querySelectorAll('button')].find((button) => button.textContent?.includes('Save reply for review'));
+      expect(saveButton?.disabled).toBe(true);
+      expect(commandPosts).toBe(0);
+      click('Use current message and recipients');
+      const reboundSave = [...host.querySelectorAll('button')].find((button) => button.textContent?.includes('Save reply for review'));
+      expect(reboundSave?.disabled).toBe(false);
+      click('Save reply for review');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(commandPosts).toBe(1);
+      expect(requests.filter((item) => item.method === 'POST' && item.path === '/api/workspace/commands')).toHaveLength(1);
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it('retains proposal drafts across mail-tab unmount and preserves text typed while a confirmed save is pending', async () => {
+    const state = createInitialWorkspaceState(() => '11111111-1111-4111-8111-111111111111');
+    const accountId = '22222222-2222-4222-8222-222222222222';
+    const proposalId = '77777777-7777-4777-8777-777777777777';
+    state.accounts.push({ id: accountId, provider: 'google', displayName: 'Work account', email: 'me@example.test', connected: true,
+      authStatus: 'connected', identity: { providerNamespace: 'google', subject: 'private-subject' }, capabilities: ['mail.read', 'mail.draft'], connectionGeneration: 4 } satisfies Account);
+    const proposal: Proposal = { id: proposalId, kind: 'email', title: 'Editable proposal', body: 'Saved body', status: 'draft', revision: 1,
+      accountId, recipients: ['to@example.test'], evidence: [], email: { operation: 'draft', to: ['to@example.test'], cc: [], bcc: [], subject: 'Saved subject', text: 'Original text', attachments: [] } };
+    state.proposals.push(proposal);
+    let revision = 7;
+    const snapshot = () => createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision });
+    const post = deferred<Awaited<ReturnType<typeof fetch>>>();
+    let markPostStarted!: () => void;
+    const postStarted = new Promise<void>((resolve) => { markPostStarted = resolve; });
+    let editCommandId = '';
+    let editPosts = 0;
+    const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const path = String(input); const method = init?.method ?? 'GET';
+      if (path === '/api/workspace/snapshot' && method === 'GET') return { ok: true, status: 200, json: async () => snapshot() };
+      if (path.startsWith('/api/workspace/proposals/review?') && method === 'GET') {
+        return { ok: true, status: 200, json: async () => ({ schemaVersion: 1, workspaceId, privacyEpoch: 3,
+          revision: Number(new URL(path, 'http://test').searchParams.get('expectedRevision')),
+          proposal: { editPolicy: 'email_fields', id: proposal.id, kind: 'email', title: proposal.title, body: proposal.body, status: proposal.status,
+            revision: proposal.revision, accountId, recipients: proposal.recipients, email: { operation: proposal.email!.operation, to: proposal.email!.to, cc: proposal.email!.cc,
+              bcc: proposal.email!.bcc, subject: proposal.email!.subject, text: proposal.email!.text, attachments: [] } } }) };
+      }
+      if (path === '/api/workspace/commands' && method === 'POST') {
+        editPosts += 1;
+        const envelope = JSON.parse(String(init?.body)) as { commandId: string; command: WorkspaceCommand };
+        editCommandId = envelope.commandId;
+        if (envelope.command.kind !== 'proposals.edit' || envelope.command.edit.kind !== 'email') throw new Error(`Unexpected command ${envelope.command.kind}`);
+        proposal.email = { ...proposal.email!, operation: envelope.command.edit.operation, to: [...envelope.command.edit.to], cc: [...envelope.command.edit.cc],
+          bcc: [...envelope.command.edit.bcc], subject: envelope.command.edit.subject, text: envelope.command.edit.text };
+        proposal.revision += 1;
+        revision += 1;
+        markPostStarted();
+        return post.promise;
+      }
+      throw new Error(`Unexpected session workflow request ${method} ${path}`);
+    });
+    vi.stubGlobal('fetch', fetcher);
+    const session = Object.freeze({ authenticated: true, workspaceId, privacyEpoch: 3, csrfToken: 'proposal-csrf' });
+    const store = new CloudWorkspaceSessionStore(session);
+    const stop = store.start();
+    function MailRoute() {
+      const current = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
+      if (!current.snapshot) return React.createElement('div', null, current.status);
+      return React.createElement(CloudMailWorkspace, { coordinator: store.getMailCoordinator(), snapshot: current.snapshot,
+        busy: current.busy, blocked: current.refreshRequired || Boolean(current.pendingCommand) });
+    }
+    try {
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      const coordinator = store.getMailCoordinator();
+      expect(coordinator).toBeDefined();
+      await act(async () => { await coordinator!.openProposal(proposalId); });
+      await act(async () => root.render(React.createElement(MailRoute)));
+      setTextField('Message', 'Submitted text');
+      click('Save proposal changes');
+      await postStarted;
+      expect(editPosts).toBe(1);
+      setTextField('Message', 'Typed while the save is waiting');
+
+      await act(async () => root.render(React.createElement('div', null, 'Settings')));
+      expect(host.textContent).toBe('Settings');
+      post.resolve({ ok: true, status: 200, json: async () => ({ schemaVersion: 1, commandId: editCommandId, status: 'finished',
+        receipt: { schemaVersion: 1, commandId: editCommandId, kind: 'proposals.edit', objectId: proposalId, proposalId, proposalRevision: proposal.revision, proposalStatus: 'draft' },
+        snapshot: snapshot() }) } as Awaited<ReturnType<typeof fetch>>);
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); await new Promise((resolve) => setTimeout(resolve, 0)); });
+      await act(async () => root.render(React.createElement(MailRoute)));
+      expect((host.querySelector('textarea[aria-label="Message"]') as HTMLTextAreaElement).value).toBe('Typed while the save is waiting');
+      expect(host.textContent).toContain('These fields have unsaved changes. Save them before approval or execution.');
+      expect([...host.querySelectorAll('button')].find((button) => button.textContent === 'Approve this revision')?.disabled).toBe(true);
+      expect(editPosts).toBe(1);
+      expect(store.getSnapshot().snapshot?.revision).toBe(8);
+    } finally { stop(); vi.unstubAllGlobals(); }
+  });
+
+  it('keeps a lost proposal edit command across a Mail/settings unmount and inspects its original ID without resending', async () => {
+    const state = createInitialWorkspaceState(() => '11111111-1111-4111-8111-111111111111');
+    const accountId = '22222222-2222-4222-8222-222222222222';
+    const proposalId = '77777777-7777-4777-8777-777777777777';
+    state.accounts.push({ id: accountId, provider: 'google', displayName: 'Work account', email: 'me@example.test', connected: true,
+      authStatus: 'connected', identity: { providerNamespace: 'google', subject: 'private-subject' }, capabilities: ['mail.read', 'mail.draft'], connectionGeneration: 4 } satisfies Account);
+    const proposal: Proposal = { id: proposalId, kind: 'email', title: 'Editable proposal', body: 'Saved body', status: 'draft', revision: 1,
+      accountId, recipients: ['to@example.test'], evidence: [], email: { operation: 'draft', to: ['to@example.test'], cc: [], bcc: [], subject: 'Saved subject', text: 'Original text', attachments: [] } };
+    state.proposals.push(proposal);
+    const snapshot = createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: 7 });
+    let commandId = '';
+    let posts = 0;
+    const inspected: string[] = [];
+    const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const path = String(input); const method = init?.method ?? 'GET';
+      if (path === '/api/workspace/snapshot' && method === 'GET') return { ok: true, status: 200, json: async () => snapshot };
+      if (path.startsWith('/api/workspace/proposals/review?') && method === 'GET') return { ok: true, status: 200, json: async () => ({ schemaVersion: 1, workspaceId, privacyEpoch: 3,
+        revision: 7, proposal: { editPolicy: 'email_fields', id: proposal.id, kind: 'email', title: proposal.title, body: proposal.body, status: proposal.status,
+          revision: proposal.revision, accountId, recipients: proposal.recipients, email: { operation: proposal.email!.operation, to: proposal.email!.to, cc: proposal.email!.cc,
+            bcc: proposal.email!.bcc, subject: proposal.email!.subject, text: proposal.email!.text, attachments: [] } } }) };
+      if (path === '/api/workspace/commands' && method === 'POST') {
+        posts += 1;
+        const envelope = JSON.parse(String(init?.body)) as { commandId: string; command: WorkspaceCommand };
+        commandId = envelope.commandId;
+        return Promise.reject(new TypeError('connection lost after dispatch'));
+      }
+      if (path === `/api/workspace/commands/${commandId}` && method === 'GET') {
+        inspected.push(path);
+        return { ok: true, status: 200, json: async () => ({ schemaVersion: 1, commandId, status: 'finished', receipt: {
+          schemaVersion: 1, commandId, kind: 'proposals.edit', objectId: proposalId, proposalId, proposalRevision: 2, proposalStatus: 'draft' } }) };
+      }
+      throw new Error(`Unexpected request ${method} ${path}`);
+    });
+    vi.stubGlobal('fetch', fetcher);
+    const store = new CloudWorkspaceSessionStore(Object.freeze({ authenticated: true, workspaceId, privacyEpoch: 3, csrfToken: 'proposal-csrf' }));
+    const stop = store.start();
+    function MailRoute() {
+      const current = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
+      return current.snapshot ? React.createElement(CloudMailWorkspace, { coordinator: store.getMailCoordinator(), snapshot: current.snapshot,
+        busy: current.busy, blocked: current.refreshRequired || Boolean(current.pendingCommand) }) : null;
+    }
+    try {
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      const coordinator = store.getMailCoordinator()!;
+      await act(async () => { await coordinator.openProposal(proposalId); });
+      await act(async () => root.render(React.createElement(MailRoute)));
+      setTextField('Message', 'Changed once');
+      click('Save proposal changes');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(posts).toBe(1);
+      expect(store.getSnapshot().pendingCommand?.commandId).toBe(commandId);
+      await act(async () => root.render(React.createElement('div', null, 'Settings')));
+      await act(async () => root.render(React.createElement(MailRoute)));
+      expect(host.textContent).toContain('Inspect exact mail command');
+      click('Inspect exact mail command');
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(inspected).toEqual([`/api/workspace/commands/${commandId}`]);
+      expect(posts).toBe(1);
+      expect(host.textContent).toContain('The exact receipt is confirmed. Refresh the workspace to review the saved result.');
+      expect(localStorage.length).toBe(0);
+    } finally { stop(); vi.unstubAllGlobals(); }
+  });
+
   it('mounts the real web entry through StrictMode from guest sign-in to workspace and confirmed logout', async () => {
     const state = createInitialWorkspaceState(() => '11111111-1111-4111-8111-111111111111');
     const snapshot = createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: 7 });
@@ -554,13 +774,255 @@ describe('CloudWorkspace safe DTO presentation', () => {
     expect(host.textContent).toContain('Review the draft');
     click('Inbox');
     expect(host.textContent).toContain('Review, when ready.');
+    expect(host.textContent).toContain('Recent saved mail');
     expect(host.textContent).toContain('A proposal from the snapshot');
-    expect(host.textContent).toContain('Proposal review actions are not connected to the server workspace yet.');
-    expect(host.textContent).toContain('Saved mail snapshot');
-    expect(host.textContent).toContain('A short saved preview.');
-    const reply = [...host.querySelectorAll('button')].find((button) => button.textContent?.includes('Reply'));
-    expect(reply?.disabled).toBe(true);
-    expect(host.textContent).toContain('Mail reply actions are not connected to the server workspace yet.');
+    click('Activity section');
+    expect(host.textContent).toContain('Workspace activity');
+    click('History section');
+    expect(host.textContent).toContain('Saved requests');
+    expect(host.textContent).toContain('Saved dispatches');
+    click('Mail and calendar section');
+    expect(host.textContent).toContain('Saved mail is checked only when you ask.');
+    expect(host.textContent).toContain('Choose an account above to see its saved mail and calendars.');
+    expect(host.textContent).not.toContain('Saved mail snapshot');
+  });
+
+  it('keeps approval unavailable while a reviewed proposal has unsaved field edits', async () => {
+    const { state } = fixture();
+    state.accounts[0].connectionGeneration = 4;
+    for (let index = 0; index < 12; index += 1) state.mailbox.push({ id: `saved-${index}`, accountId: state.accounts[0].id,
+      providerMessageId: `provider-${index}`, identityKey: `identity-${index}`, verifiedIdentityKey: `verified-${index}`, connectionGeneration: 4,
+      subject: `Saved message ${index}`, observedAt: `2026-10-15T00:${String(index).padStart(2, '0')}:00.000Z` } satisfies MailboxSnapshotMessage);
+    const snapshot = createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: 7 });
+    const proposalId = '55555555-5555-4555-8555-555555555555';
+    const execute = vi.fn(async (): Promise<WorkspaceCommandResponse> => { throw new Error('dirty proposal must not dispatch'); });
+    const port: CloudMailWorkspacePort = {
+      readSnapshot: () => snapshot,
+      readOperation: () => ({ busy: false, pending: false, refreshRequired: false }),
+      readMailReplySource: vi.fn(async () => ({ schemaVersion: 1 as const, workspaceId, privacyEpoch: 3, revision: 7, status: 'current' as const,
+        source: { accountId: state.accounts[0].id, connectionGeneration: 4, localMessageId: 'saved-0', providerMessageId: 'provider-0', idFormat: 'gmail' as const,
+          internetMessageId: '<saved-0@example.test>', subject: 'Saved message 0', observedAt: '2026-10-15T00:00:00.000Z', sourceDigest: 'mail-source-digest' },
+        defaults: { reply: { to: ['sender@example.test'], cc: [] }, reply_all: { to: ['sender@example.test'], cc: ['team@example.test'] } },
+        bodyCache: { status: 'current' as const, completeness: 'unavailable' as const, representation: 'none' as const } })),
+      readMailReplyText: vi.fn(async () => ({ schemaVersion: 1 as const, workspaceId, privacyEpoch: 3, revision: 7, status: 'current' as const })),
+      readProposalReview: vi.fn(async () => ({ schemaVersion: 1 as const, workspaceId, privacyEpoch: 3, revision: 7, proposal: {
+        editPolicy: 'email_fields' as const, id: proposalId, kind: 'email' as const, title: 'Editable proposal', body: 'Saved body', status: 'draft' as const, revision: 1,
+        accountId: '22222222-2222-4222-8222-222222222222', recipients: ['person@example.test'],
+        email: { operation: 'draft' as const, to: ['person@example.test'], cc: [], bcc: [], subject: 'Saved subject', text: 'Saved text', attachments: [] },
+      } })),
+      readDispatchReview: vi.fn(async () => ({ schemaVersion: 1 as const, workspaceId, privacyEpoch: 3, revision: 7 })),
+      readReplyBatchReview: vi.fn(async (plan) => ({ schemaVersion: 1 as const, workspaceId, privacyEpoch: 3, revision: 7, plan: {
+        planId: plan.planId, jobId: plan.jobId, messageId: 'saved-0', accountId: plan.accountId, connectionGeneration: plan.expectedConnectionGeneration,
+        mode: 'reply_all' as const, operation: 'draft' as const, subject: 'Reviewed reply', to: ['sender@example.test'], cc: ['team@example.test'],
+        text: 'A reviewed delayed result', expiresAt: '2099-01-01T00:00:00.000Z',
+      } })),
+      execute,
+      inspect: vi.fn(async () => { throw new Error('not used'); }),
+      refresh: vi.fn(async () => snapshot),
+    };
+    const coordinator = new CloudMailCoordinator(port);
+    coordinator.selectAccount(state.accounts[0].id);
+    await coordinator.openReply('saved-0');
+    await coordinator.reviewBatchPlan({ planId: '99999999-9999-4999-8999-999999999999', jobId: '88888888-8888-4888-8888-888888888888',
+      accountId: state.accounts[0].id, expectedConnectionGeneration: 4 });
+    await act(async () => { await coordinator.openProposal(proposalId); });
+    act(() => root.render(<CloudMailWorkspace coordinator={coordinator} snapshot={snapshot} busy={false} blocked={false} />));
+    expect(host.textContent).toContain('Show more saved mail (2 remaining)');
+    click('Show more saved mail');
+    expect(host.textContent).toContain('Saved message 11');
+    expect(host.textContent).toContain('Review delayed reply result');
+    expect(host.textContent).toContain('A reviewed delayed result');
+    const message = host.querySelector('textarea[aria-label="Message"]');
+    expect(message).not.toBeNull();
+    act(() => {
+      const input = message as HTMLTextAreaElement;
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set?.call(input, 'Edited but not saved');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    const approve = [...host.querySelectorAll('button')].find((button) => button.textContent === 'Approve this revision');
+    expect(approve?.disabled).toBe(true);
+    expect(host.textContent).toContain('These fields have unsaved changes. Save them before approval or execution.');
+    expect(execute).not.toHaveBeenCalled();
+    coordinator.dispose();
+  });
+
+  it('shows the complete saved task proposal from Inbox before sending a separate approval command', async () => {
+    const { state } = fixture();
+    const proposalId = '99999999-9999-4999-8999-999999999999';
+    const proposal: Proposal = { id: proposalId, noteId: '33333333-3333-4333-8333-333333333333', kind: 'task',
+      title: 'Prepare launch checklist', body: 'Confirm owners and delivery dates before the review.', status: 'draft', revision: 2,
+      recipients: [], sourceRevision: 1, dueAt: '2026-10-20T09:30:00.000Z', evidence: [{ quote: 'We should confirm the launch owners.', source: 'Planning notes' }] };
+    state.proposals.splice(0, state.proposals.length, proposal);
+    state.proposals.push({ id: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee', kind: 'memory', title: 'Approved memory proposal',
+      body: 'This still needs its separate execution step.', status: 'approved', revision: 1, recipients: [], evidence: [] },
+    { id: 'ffffffff-ffff-4fff-8fff-ffffffffffff', kind: 'memory', title: 'Dismissed memory proposal',
+      body: 'This has left the review queue.', status: 'dismissed', revision: 1, recipients: [], evidence: [] });
+    const snapshot = createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: 7 });
+    let reviewStatus: 'draft' | 'approved' = 'draft';
+    const commandId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const execute = vi.fn(async (command: WorkspaceCommand): Promise<WorkspaceCommandResponse> => {
+      if (command.kind !== 'proposals.approve') throw new Error(`Unexpected command ${command.kind}`);
+      reviewStatus = 'approved';
+      return { schemaVersion: 1, commandId, status: 'finished', receipt: { schemaVersion: 1, commandId, kind: 'proposals.approve',
+        objectId: proposalId, proposalId, proposalRevision: 2, proposalStatus: 'approved' } };
+    });
+    const mailCoordinator = new CloudMailCoordinator({
+      readSnapshot: () => snapshot, readOperation: () => ({ busy: false, pending: false, refreshRequired: false }),
+      readMailReplySource: vi.fn(async () => { throw new Error('not used'); }), readMailReplyText: vi.fn(async () => { throw new Error('not used'); }),
+      readProposalReview: vi.fn(async () => ({ schemaVersion: 1 as const, workspaceId, privacyEpoch: 3, revision: 7, proposal: {
+        editPolicy: 'read_only' as const, id: proposalId, kind: 'task' as const, title: proposal.title, body: proposal.body, status: reviewStatus,
+        revision: proposal.revision, recipients: [], dueAt: proposal.dueAt,
+      } })),
+      readDispatchReview: vi.fn(async () => ({ schemaVersion: 1 as const, workspaceId, privacyEpoch: 3, revision: 7 })),
+      readReplyBatchReview: vi.fn(async () => ({ schemaVersion: 1 as const, workspaceId, privacyEpoch: 3, revision: 7 })),
+      execute, inspect: vi.fn(async () => { throw new Error('not used'); }), refresh: vi.fn(async () => snapshot),
+    });
+    const store = { getSnapshot: () => ({ status: 'ready', snapshot, busy: false, refreshRequired: false } satisfies CloudWorkspaceSessionState),
+      execute: vi.fn(async () => { throw new Error('workspace action should use the exact proposal capability'); }),
+      inspect: vi.fn(async () => { throw new Error('not used'); }), refresh: vi.fn(async () => snapshot) };
+    act(() => root.render(<CloudWorkspace store={store} state={store.getSnapshot()} onLogout={vi.fn()} mailCoordinator={mailCoordinator} />));
+    click('Inbox');
+    expect(host.textContent).toContain('Prepare launch checklist');
+    expect(host.textContent).toContain('Approved memory proposal');
+    expect(host.textContent).not.toContain('Dismissed memory proposal');
+    click('Saved actions');
+    expect(host.textContent).toContain('Dismissed memory proposal');
+    expect(host.textContent).not.toContain('Prepare launch checklist');
+    expect(host.textContent).not.toContain('Approved memory proposal');
+    click('To review proposals');
+    expect(host.textContent).toContain('Prepare launch checklist');
+    expect(host.textContent).toContain('Approved memory proposal');
+    expect(host.textContent).not.toContain('Dismissed memory proposal');
+    click('Review details');
+    await act(async () => { await Promise.resolve(); });
+    expect(host.textContent).toContain('Confirm owners and delivery dates before the review.');
+    expect(host.textContent).toContain('Due ·');
+    expect(host.textContent).toContain('Source note · A saved DTO note · revision 1');
+    expect(host.textContent).toContain('Saved supporting details');
+    expect(host.textContent).toContain('We should confirm the launch owners. · Planning notes');
+    expect(host.textContent).toContain('Approve this revision');
+    expect(execute).not.toHaveBeenCalled();
+
+    click('Approve this revision');
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(execute.mock.calls[0]?.[0]).toEqual({ kind: 'proposals.approve', proposalId, expectedProposalRevision: 2 });
+    expect(execute.mock.calls[0]?.[0].kind).toBe('proposals.approve');
+    expect(host.textContent).toContain('Execute approved action');
+    expect(execute.mock.calls.every(([command]) => command.kind === 'proposals.approve')).toBe(true);
+    mailCoordinator.dispose();
+  });
+
+  it('does not publish a saved proposal review after its real workspace session is replaced', async () => {
+    const oldState = createInitialWorkspaceState(() => '11111111-1111-4111-8111-111111111111');
+    const oldProposalId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    oldState.proposals.push({ id: oldProposalId, kind: 'task', title: 'Old workspace proposal', body: 'Must not appear after logout.',
+      status: 'draft', revision: 1, recipients: [], evidence: [] });
+    const newState = createInitialWorkspaceState(() => '22222222-2222-4222-8222-222222222222');
+    const sessionA = { authenticated: true as const, workspaceId, privacyEpoch: 3, csrfToken: 'mail-owner-a' };
+    const sessionB = { authenticated: true as const, workspaceId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', privacyEpoch: 4, csrfToken: 'mail-owner-b' };
+    const delayedReview = deferred<{ ok: boolean; status: number; json: () => Promise<unknown> }>();
+    let snapshotCount = 0;
+    let credentialsCount = 0;
+    const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const path = String(input); const method = init?.method ?? 'GET';
+      if (path === '/api/credentials' && method === 'GET') {
+        const index = credentialsCount++;
+        const session = index === 0 ? sessionA : sessionB;
+        return { ok: true, status: 200, json: async () => credentialMetadata(false, false, session.privacyEpoch, session.workspaceId) };
+      }
+      if (path === '/api/workspace/snapshot' && method === 'GET') {
+        const index = snapshotCount++;
+        const session = index === 0 ? sessionA : sessionB;
+        return { ok: true, status: 200, json: async () => createWorkspaceSnapshotDTO({ getSnapshot: () => index === 0 ? oldState : newState }, {
+          workspaceId: session.workspaceId, privacyEpoch: session.privacyEpoch, revision: index === 0 ? 7 : 1,
+        }) };
+      }
+      if (path.startsWith('/api/workspace/proposals/review?') && method === 'GET') return delayedReview.promise;
+      throw new Error(`Unexpected request during review-owner test: ${method} ${path}`);
+    });
+    vi.stubGlobal('fetch', fetcher);
+    try {
+      await act(async () => { root.render(<CloudWorkspaceSession key="mail-session-a" session={sessionA} onLogout={vi.fn()} />); await new Promise((resolve) => setTimeout(resolve, 0)); });
+      click('Inbox');
+      click('Review details');
+      await act(async () => { await Promise.resolve(); });
+      expect(fetcher.mock.calls.some(([path]) => String(path).startsWith('/api/workspace/proposals/review?'))).toBe(true);
+
+      await act(async () => { root.render(<CloudWorkspaceSession key="mail-session-b" session={sessionB} onLogout={vi.fn()} />); await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(host.textContent).not.toContain('Old workspace proposal');
+      delayedReview.resolve({ ok: true, status: 200, json: async () => ({ schemaVersion: 1, workspaceId: sessionA.workspaceId, privacyEpoch: sessionA.privacyEpoch,
+        revision: 7, proposal: { editPolicy: 'read_only', id: oldProposalId, kind: 'task', title: 'Old workspace proposal',
+          body: 'Must not appear after logout.', status: 'draft', revision: 1, recipients: [] } }) });
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(host.textContent).not.toContain('Old workspace proposal');
+      expect(fetcher.mock.calls.filter(([path, init]) => String(path) === '/api/workspace/commands' && init?.method === 'POST')).toHaveLength(0);
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it('renders an immutable saved Batch reply for review without exposing editable fields', async () => {
+    const { snapshot, state } = fixture();
+    const proposalId = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+    const coordinator = new CloudMailCoordinator({
+      readSnapshot: () => snapshot, readOperation: () => ({ busy: false, pending: false, refreshRequired: false }),
+      readMailReplySource: vi.fn(async () => { throw new Error('not used'); }), readMailReplyText: vi.fn(async () => { throw new Error('not used'); }),
+      readProposalReview: vi.fn(async () => ({ schemaVersion: 1 as const, workspaceId, privacyEpoch: 3, revision: 7, proposal: {
+        editPolicy: 'read_only' as const, id: proposalId, kind: 'email' as const, title: 'Batch reply for review', body: 'A fixed server-generated reply.',
+        status: 'draft' as const, revision: 3, accountId: state.accounts[0].id, recipients: ['sender@example.test'],
+        email: { operation: 'draft' as const, to: ['sender@example.test'], cc: [], bcc: [], subject: 'Re: Planning', text: 'We can meet Tuesday.',
+          attachments: [{ fileName: 'agenda.pdf', mimeType: 'application/pdf', sizeBytes: 128 }] },
+      } })),
+      readDispatchReview: vi.fn(async () => ({ schemaVersion: 1 as const, workspaceId, privacyEpoch: 3, revision: 7 })),
+      readReplyBatchReview: vi.fn(async () => ({ schemaVersion: 1 as const, workspaceId, privacyEpoch: 3, revision: 7 })),
+      execute: vi.fn(async () => { throw new Error('reviewing a Batch reply must not dispatch a mutation'); }),
+      inspect: vi.fn(async () => { throw new Error('not used'); }), refresh: vi.fn(async () => snapshot),
+    });
+    await act(async () => { await coordinator.openProposal(proposalId); });
+    act(() => root.render(<CloudMailWorkspace coordinator={coordinator} snapshot={snapshot} busy={false} blocked={false} />));
+    expect(host.textContent).toContain('This saved reply cannot be edited.');
+    expect(host.textContent).toContain('Re: Planning');
+    expect(host.textContent).toContain('We can meet Tuesday.');
+    expect(host.textContent).toContain('Attachment · agenda.pdf · application/pdf · 128 bytes');
+    expect(host.querySelector('[aria-label="Message"]')).toBeNull();
+    expect(host.querySelector('[aria-label="Subject"]')).toBeNull();
+    expect([...host.querySelectorAll('button')].some((button) => button.textContent === 'Approve this revision')).toBe(true);
+    expect([...host.querySelectorAll('button')].some((button) => button.textContent === 'Execute approved action')).toBe(false);
+    coordinator.dispose();
+  });
+
+  it('offers explicit writable calendar choices for the proposal account', async () => {
+    const { state } = fixture();
+    state.accounts[0].connectionGeneration = 4;
+    state.calendars.push({ id: 'calendar-a', accountId: state.accounts[0].id, name: 'Main calendar', connected: true, writable: true, providerId: 'provider-a' },
+      { id: 'calendar-b', accountId: state.accounts[0].id, name: 'Planning calendar', connected: true, writable: true, providerId: 'provider-b' },
+      { id: 'calendar-readonly', accountId: state.accounts[0].id, name: 'Read-only calendar', connected: true, writable: false, providerId: 'provider-ro' });
+    const snapshot = createWorkspaceSnapshotDTO({ getSnapshot: () => state }, { workspaceId, privacyEpoch: 3, revision: 7 });
+    const proposalId = '55555555-5555-4555-8555-555555555555';
+    const port: CloudMailWorkspacePort = {
+      readSnapshot: () => snapshot, readOperation: () => ({ busy: false, pending: false, refreshRequired: false }),
+      readMailReplySource: vi.fn(async () => { throw new Error('not used'); }), readMailReplyText: vi.fn(async () => { throw new Error('not used'); }),
+      readProposalReview: vi.fn(async () => ({ schemaVersion: 1 as const, workspaceId, privacyEpoch: 3, revision: 7, proposal: {
+        editPolicy: 'event_fields' as const, id: proposalId, kind: 'event' as const, title: 'Planning session', body: 'Review schedule', status: 'draft' as const, revision: 1,
+        accountId: state.accounts[0].id, calendarId: 'calendar-a', recipients: [],
+        event: { title: 'Planning session', description: 'Review schedule', start: '2026-10-20T10:00:00Z', end: '2026-10-20T11:00:00Z',
+          timeZone: 'Asia/Singapore', attendees: [], invitePolicy: 'none' as const },
+      } })),
+      readDispatchReview: vi.fn(async () => ({ schemaVersion: 1 as const, workspaceId, privacyEpoch: 3, revision: 7 })),
+      readReplyBatchReview: vi.fn(async () => ({ schemaVersion: 1 as const, workspaceId, privacyEpoch: 3, revision: 7 })),
+      execute: vi.fn(async () => { throw new Error('not used'); }), inspect: vi.fn(async () => { throw new Error('not used'); }), refresh: vi.fn(async () => snapshot),
+    };
+    const coordinator = new CloudMailCoordinator(port);
+    await act(async () => { await coordinator.openProposal(proposalId); });
+    act(() => root.render(<CloudMailWorkspace coordinator={coordinator} snapshot={snapshot} busy={false} blocked={false} />));
+    expect(host.textContent).toContain('Main calendar');
+    expect(host.textContent).toContain('Planning calendar');
+    expect(host.textContent).not.toContain('Read-only calendar');
+    const alternate = [...host.querySelectorAll('button')].find((button) => button.textContent === 'Planning calendar');
+    expect(alternate?.disabled).toBe(false);
+    click('Planning calendar');
+    expect([...host.querySelectorAll('button')].find((button) => button.textContent === 'Planning calendar')?.disabled).toBe(true);
+    coordinator.dispose();
   });
 
   it('keeps server settings and reported usage values display-only in the shared settings surface', () => {

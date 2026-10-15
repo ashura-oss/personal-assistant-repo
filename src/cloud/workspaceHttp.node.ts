@@ -116,7 +116,12 @@ function safeMailSource(value: import('../core').MailReplySourceSnapshot) {
     observedAt: value.observedAt, sourceDigest: value.sourceDigest };
 }
 function safeProposal(value: import('../core').Proposal) {
-  return { id: value.id, kind: value.kind, title: value.title, body: value.body, status: value.status, revision: value.revision,
+  const editableStatus = value.status === 'draft' || value.status === 'failed' || value.status === 'approved';
+  const editPolicy = !editableStatus ? 'read_only' : value.kind === 'event' ? 'event_fields' : value.kind !== 'email' ? 'read_only'
+    : value.provenance?.version === 2 && value.provenance.kind === 'mail_reply'
+      ? value.provenance.batchJobId ? 'read_only' : 'source_reply_fields'
+      : 'email_fields';
+  return { editPolicy, id: value.id, kind: value.kind, title: value.title, body: value.body, status: value.status, revision: value.revision,
     ...(value.approvedRevision !== undefined ? { approvedRevision: value.approvedRevision } : {}), ...(value.lastError ? { lastError: value.lastError } : {}),
     ...(value.accountId ? { accountId: value.accountId } : {}), recipients: value.recipients, ...(value.calendarId ? { calendarId: value.calendarId } : {}),
     ...(value.dueAt ? { dueAt: value.dueAt } : {}), ...(value.email ? { email: { operation: value.email.operation, to: value.email.to, cc: value.email.cc,

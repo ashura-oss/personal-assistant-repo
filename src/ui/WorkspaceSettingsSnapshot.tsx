@@ -7,6 +7,7 @@ import { WorkspaceSettingsPreferences, type WorkspaceSettingsDraft, type Workspa
 import type { CloudCredentialController } from '../web/useCloudCredentials';
 import { CloudCredentialsPanel } from './CloudCredentialsPanel';
 import { CloudConnectionsPanel, type CloudConnectionsCapability } from './CloudConnectionsPanel';
+import type { WorkspaceAccountDTO, WorkspaceSyncStateDTO } from '../cloud/workspaceDto';
 
 export type WorkspaceSettingsDisplay = WorkspaceSnapshotDTO['state'];
 export type WorkspaceSettingsAction = Readonly<{ available: true; action: () => void | Promise<void> }> | Readonly<{ available: false; reason: string }>;
@@ -19,6 +20,9 @@ export type WorkspaceSettingsActions = Readonly<{
 }>;
 export type WorkspaceSettingsCredentialCapability = Readonly<{ available: true; controller: CloudCredentialController }> | Readonly<{ available: false; reason: string }>;
 export type WorkspaceSettingsConnectionCapability = CloudConnectionsCapability;
+export type WorkspaceSettingsMailCapability = Readonly<{ available: true; accounts: readonly Readonly<Pick<WorkspaceAccountDTO, 'id' | 'provider' | 'displayName' | 'email' | 'connected' | 'authStatus' | 'connectionGeneration'>>[];
+  syncStates: Readonly<Record<string, WorkspaceSyncStateDTO>>; busy: boolean; onAction: (accountId: string, action: 'accounts.refreshMail' | 'accounts.continueMailBackfill' | 'accounts.syncCalendars' | 'accounts.disconnect') => void }> |
+  Readonly<{ available: false; reason: string }>;
 
 function Unavailable({ capability }: { capability: WorkspaceSettingsAction }) {
   return capability.available ? null : <Text style={styles.meta}>{capability.reason}</Text>;
@@ -30,7 +34,7 @@ function CapabilityButton({ label, capability, busy }: { label: string; capabili
     : <Unavailable capability={capability} />;
 }
 
-export function WorkspaceSettingsScreen({ display, actions, busy, onClose, preferencesDraft, preferencesMessage, onReloadPreferences, credentials, connectionCapability }: { display: WorkspaceSettingsDisplay; actions: WorkspaceSettingsActions; busy: boolean; onClose: () => void; preferencesDraft?: WorkspaceSettingsDraft; preferencesMessage?: string; onReloadPreferences?: () => void; credentials?: WorkspaceSettingsCredentialCapability; connectionCapability?: WorkspaceSettingsConnectionCapability }) {
+export function WorkspaceSettingsScreen({ display, actions, busy, onClose, preferencesDraft, preferencesMessage, onReloadPreferences, credentials, connectionCapability, mailCapability }: { display: WorkspaceSettingsDisplay; actions: WorkspaceSettingsActions; busy: boolean; onClose: () => void; preferencesDraft?: WorkspaceSettingsDraft; preferencesMessage?: string; onReloadPreferences?: () => void; credentials?: WorkspaceSettingsCredentialCapability; connectionCapability?: WorkspaceSettingsConnectionCapability; mailCapability?: WorkspaceSettingsMailCapability }) {
   const settings = display.settings;
   const activeRules = display.proactive.rules.filter((rule) => rule.enabled).length;
   const pendingSuggestions = display.knowledge.suggestions.filter((suggestion) => suggestion.status === 'pending').length;
@@ -72,6 +76,20 @@ export function WorkspaceSettingsScreen({ display, actions, busy, onClose, prefe
       <Text style={styles.meta}>{display.usage.requests} requests · {display.usage.attemptsToday} attempts today · {display.usage.attempts} recorded attempts</Text>
     </View>
     <Text style={s.sectionTitle}>Connections</Text>
+    {mailCapability ? <View style={styles.card}>
+      <Text style={styles.title}>Saved mail and calendars</Text>
+      {mailCapability.available ? mailCapability.accounts.map((account) => <View key={account.id} style={styles.mailAccount}>
+        <Text style={styles.title}>{account.displayName || account.provider}</Text>
+        <Text style={styles.meta}>{account.email || 'Email not provided'} · {account.connected && account.authStatus === 'connected' ? 'Connected' : account.authStatus}</Text>
+        <Text style={styles.meta}>Mail sync · {mailCapability.syncStates[account.id]?.status ?? 'not checked'}{mailCapability.syncStates[account.id]?.mailHead.status === 'partial' ? ' · some recent mail may be missing' : ''}{mailCapability.syncStates[account.id]?.mailBackfill.status === 'partial' ? ' · older mail scan is partial' : ''}</Text>
+        <View style={styles.mailActions}>
+          <Button label="Check recent mail" tone="quiet" disabled={busy || !account.connected || account.authStatus !== 'connected'} onPress={() => mailCapability.onAction(account.id, 'accounts.refreshMail')} />
+          <Button label="Continue older mail" tone="quiet" disabled={busy || !account.connected || account.authStatus !== 'connected'} onPress={() => mailCapability.onAction(account.id, 'accounts.continueMailBackfill')} />
+          <Button label="Sync calendars" tone="quiet" disabled={busy || !account.connected || account.authStatus !== 'connected'} onPress={() => mailCapability.onAction(account.id, 'accounts.syncCalendars')} />
+          <Button label="Disconnect" tone="danger" disabled={busy || !account.connected || account.authStatus !== 'connected'} onPress={() => mailCapability.onAction(account.id, 'accounts.disconnect')} />
+        </View>
+      </View>) : <Text style={styles.meta}>{mailCapability.reason}</Text>}
+    </View> : null}
     {connectionCapability ? <CloudConnectionsPanel capability={connectionCapability} busy={busy} /> : <>
     {display.accounts.map((account) => <View key={account.id} style={styles.card}>
       <Text style={styles.title}>{account.displayName}</Text>
@@ -150,4 +168,6 @@ const styles = {
   title: { color: C.text, fontSize: 15, fontWeight: '600' as const },
   meta: { color: C.muted, fontSize: 12, lineHeight: 18 },
   credentials: { marginBottom: 10 },
+  mailAccount: { gap: 6, paddingVertical: 9, borderTopWidth: 1, borderTopColor: C.border },
+  mailActions: { flexDirection: 'row' as const, flexWrap: 'wrap' as const, gap: 7 },
 };

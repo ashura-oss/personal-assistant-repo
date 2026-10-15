@@ -14,6 +14,10 @@ import {
 import type { AuthenticatedSession } from './authClient';
 import { parseWorkspaceCommandHistoryPage, type WorkspaceCommandHistoryEntry, type WorkspaceCommandHistoryKind,
   type WorkspaceCommandHistoryPage } from '../cloud/workspaceCommandHistory';
+import { cloudDispatchReviewPath, cloudMailReadPath, cloudProposalReviewPath, cloudReplyBatchReviewPath,
+  parseCloudDispatchReview, parseCloudMailReplySource, parseCloudMailReplyText, parseCloudProposalReview, parseCloudReplyBatchReview,
+  type ReplyBatchPlanRead } from './cloudMailClient';
+import type { DispatchReviewReadDto, MailReplyBatchReviewReadDto, MailReplySourceReadDto, MailReplyTextReadDto, ProposalReviewReadDto } from './mailWorkflowDtos';
 
 export const WORKSPACE_REQUEST_TIMEOUT_MS = 30_000;
 
@@ -39,6 +43,11 @@ export type WorkspaceClient = Readonly<{
   refresh(): Promise<WorkspaceSnapshotDTO>;
   readKnowledgeSourceChoices(expectedRevision: number): Promise<KnowledgeSourceChoicesDTO>;
   readKnowledgeSuggestionReview(input: Readonly<{ suggestionId: string; expectedSuggestionRevision: number; expectedRevision: number }>): Promise<KnowledgeSuggestionReviewDTO>;
+  readMailReplySource(messageId: string, expectedRevision: number): Promise<MailReplySourceReadDto>;
+  readMailReplyText(messageId: string, expectedRevision: number, source: NonNullable<MailReplySourceReadDto['source']>): Promise<MailReplyTextReadDto>;
+  readProposalReview(proposalId: string, expectedRevision: number): Promise<ProposalReviewReadDto>;
+  readDispatchReview(recordId: string, expectedRevision: number): Promise<DispatchReviewReadDto>;
+  readReplyBatchReview(plan: ReplyBatchPlanRead, expectedRevision: number): Promise<MailReplyBatchReviewReadDto>;
   execute(command: WorkspaceCommand, onAdmitted?: (envelope: WorkspaceCommandAdmission) => void): Promise<WorkspaceCommandResponse>;
   inspectCommand(commandId?: string): Promise<WorkspaceCommandResponse>;
   inspectRecoveredCommand(entry: WorkspaceCommandHistoryEntry): Promise<WorkspaceCommandResponse>;
@@ -269,6 +278,57 @@ export function createWebWorkspaceClient(session: AuthenticatedSession, options:
     }
   }
 
+  function assertSavedReadRevision(expectedRevision: number): void {
+    assertUsable();
+    if (!isGeneration(expectedRevision) || !snapshot || snapshot.workspaceId !== workspaceId || snapshot.privacyEpoch !== privacyEpoch || snapshot.revision !== expectedRevision) {
+      throw new WorkspaceClientError('stale', 'The workspace changed. Refresh it before opening saved mail or proposal details.');
+    }
+  }
+
+  async function readSavedWorkflow<T>(path: string, expectedRevision: number, parse: (raw: unknown) => T, label: string): Promise<T> {
+    assertSavedReadRevision(expectedRevision);
+    const ticket = beginOperation();
+    const raw = await request(path, { method: 'GET' }, ticket);
+    assertOperation(ticket);
+    try { return parse(raw); }
+    catch (error) {
+      if (error instanceof Error && error.message === 'mail_workflow_response_stale') {
+        throw new WorkspaceClientError('stale', 'The workspace changed while those saved details were loading. Refresh before continuing.');
+      }
+      throw new WorkspaceClientError('malformed', `${label} could not be confirmed.`);
+    }
+  }
+
+  function readMailReplySource(messageId: string, expectedRevision: number): Promise<MailReplySourceReadDto> {
+    assertSavedReadRevision(expectedRevision);
+    return readSavedWorkflow(cloudMailReadPath('source', messageId, { expectedRevision, expectedPrivacyEpoch: privacyEpoch }), expectedRevision,
+      (raw) => parseCloudMailReplySource(raw, { workspaceId, privacyEpoch, revision: expectedRevision }, messageId), 'Saved reply details');
+  }
+
+  function readMailReplyText(messageId: string, expectedRevision: number, source: NonNullable<MailReplySourceReadDto['source']>): Promise<MailReplyTextReadDto> {
+    assertSavedReadRevision(expectedRevision);
+    return readSavedWorkflow(cloudMailReadPath('source-text', messageId, { expectedRevision, expectedPrivacyEpoch: privacyEpoch }), expectedRevision,
+      (raw) => parseCloudMailReplyText(raw, { workspaceId, privacyEpoch, revision: expectedRevision }, messageId, source), 'Saved message text');
+  }
+
+  function readProposalReview(proposalId: string, expectedRevision: number): Promise<ProposalReviewReadDto> {
+    assertSavedReadRevision(expectedRevision);
+    return readSavedWorkflow(cloudProposalReviewPath(proposalId, { expectedRevision, expectedPrivacyEpoch: privacyEpoch }), expectedRevision,
+      (raw) => parseCloudProposalReview(raw, { workspaceId, privacyEpoch, revision: expectedRevision }, proposalId), 'Proposal details');
+  }
+
+  function readDispatchReview(recordId: string, expectedRevision: number): Promise<DispatchReviewReadDto> {
+    assertSavedReadRevision(expectedRevision);
+    return readSavedWorkflow(cloudDispatchReviewPath(recordId, { expectedRevision, expectedPrivacyEpoch: privacyEpoch }), expectedRevision,
+      (raw) => parseCloudDispatchReview(raw, { workspaceId, privacyEpoch, revision: expectedRevision }, recordId), 'Dispatch details');
+  }
+
+  function readReplyBatchReview(plan: ReplyBatchPlanRead, expectedRevision: number): Promise<MailReplyBatchReviewReadDto> {
+    assertSavedReadRevision(expectedRevision);
+    return readSavedWorkflow(cloudReplyBatchReviewPath(plan, { expectedRevision, expectedPrivacyEpoch: privacyEpoch }), expectedRevision,
+      (raw) => parseCloudReplyBatchReview(raw, { workspaceId, privacyEpoch, revision: expectedRevision }, plan), 'Reply review');
+  }
+
   function parseResponse(value: unknown, expectedCommand?: WorkspaceCommandEnvelope, expectedHistoryKind?: WorkspaceCommandHistoryKind): WorkspaceCommandResponse {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       throw new WorkspaceClientError('malformed', 'The workspace command receipt could not be confirmed.');
@@ -491,6 +551,11 @@ export function createWebWorkspaceClient(session: AuthenticatedSession, options:
     refresh: () => readSnapshot('/api/workspace/refresh', 'POST'),
     readKnowledgeSourceChoices,
     readKnowledgeSuggestionReview,
+    readMailReplySource,
+    readMailReplyText,
+    readProposalReview,
+    readDispatchReview,
+    readReplyBatchReview,
     execute,
     inspectCommand,
     inspectRecoveredCommand,

@@ -5,7 +5,6 @@ import type { WorkspaceSettingsDTO } from '../cloud/workspaceDto';
 import type { CloudWorkspaceSessionState, CloudWorkspaceSessionStore, CloudWorkspaceVoiceActions } from './CloudWorkspaceSession';
 import { WorkspaceClientError, WorkspaceCommandNotStartedError, type WorkspaceCommandAdmission } from './workspaceClient';
 import { WorkspaceScreen, type WorkspaceTab } from '../ui/WorkspaceScreen';
-import { InboxWorkspaceContent } from '../ui/InboxWorkspaceContent';
 import { ManualNoteComposer, RecordWorkspaceContent, workspaceNoteCardDisplay, workspaceProposalCardDisplay } from '../ui/WorkspaceContent';
 import { LibraryScreen } from '../ui/LibraryScreen';
 import { projectKnowledgeDisplay } from '../ui/libraryDisplay';
@@ -18,7 +17,6 @@ import type { ServerRecordingPresentation } from '../ui/ServerRecordingPanel';
 import type { WorkspaceRecordDisplay } from '../ui/WorkspaceContent';
 import type { WorkspaceSettingsDraft } from '../ui/WorkspaceSettingsPreferences';
 import { ChatSection } from '../ui/ChatSection';
-import { AssistantBatchJobCard } from '../ui/AssistantBatchJobCard';
 import { projectChatKnowledgeChoices } from '../ui/workspaceChatDisplayTypes';
 import { ChatSubmissionNotStartedError, type ChatSendAttempt, type ChatSendInspectionResult } from '../ui/chatSubmission';
 import { Button } from '../ui/primitives';
@@ -29,6 +27,10 @@ import type { CloudVoiceCoordinatorState } from './cloudVoiceCoordinator';
 import type { CloudCredentialController } from './useCloudCredentials';
 import { useCloudOAuth } from './useCloudOAuth';
 import type { CloudOAuthCoordinator } from './cloudOAuthCoordinator';
+import type { CloudMailCoordinator } from './cloudMailCoordinator';
+import { CloudMailWorkspace } from './CloudMailWorkspace';
+import { InboxWorkspaceContent, inboxAccountDisplay } from '../ui/InboxWorkspaceContent';
+import { AssistantBatchJobCard } from '../ui/AssistantBatchJobCard';
 
 export type CloudWorkspaceActions = Readonly<{
   tasks: Readonly<{ complete: (taskId: string) => Promise<WorkspaceCommandResponse>; reopen: (taskId: string) => Promise<WorkspaceCommandResponse> }>;
@@ -101,7 +103,7 @@ function equalSettingsBaseline(left: WorkspaceSettingsBaseline, right: Workspace
     left.maxAudioSeconds === right.maxAudioSeconds && left.retention === right.retention;
 }
 
-export function CloudWorkspace({ store, state, onLogout, voiceCapability, credentials, oauthCoordinator }: { store: Pick<CloudWorkspaceSessionStore, 'getSnapshot' | 'execute' | 'inspect' | 'refresh'> & Partial<Pick<CloudWorkspaceSessionStore, 'readKnowledgeSourceChoices' | 'readKnowledgeSuggestionReview'>>; state: CloudWorkspaceSessionState; onLogout: () => void; voiceCapability?: CloudWorkspaceVoiceCapability; credentials?: CloudCredentialController; oauthCoordinator?: CloudOAuthCoordinator }) {
+export function CloudWorkspace({ store, state, onLogout, voiceCapability, credentials, oauthCoordinator, mailCoordinator }: { store: Pick<CloudWorkspaceSessionStore, 'getSnapshot' | 'execute' | 'inspect' | 'refresh'> & Partial<Pick<CloudWorkspaceSessionStore, 'readKnowledgeSourceChoices' | 'readKnowledgeSuggestionReview'>>; state: CloudWorkspaceSessionState; onLogout: () => void; voiceCapability?: CloudWorkspaceVoiceCapability; credentials?: CloudCredentialController; oauthCoordinator?: CloudOAuthCoordinator; mailCoordinator?: CloudMailCoordinator }) {
   const oauthState = useCloudOAuth(oauthCoordinator);
   const snapshot = state.snapshot!;
   const dto = snapshot.state;
@@ -109,6 +111,8 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
     [snapshot.privacyEpoch, snapshot.workspaceId, store]);
   const cloudKnowledgeEntityActions = libraryMutationActions.entities.available ? libraryMutationActions.entities.action : undefined;
   const [tab, setTab] = useState<WorkspaceTab>('inbox');
+  const [inboxFilter, setInboxFilter] = useState<'pending' | 'done'>('pending');
+  const [inboxSection, setInboxSection] = useState<'inbox' | 'activity' | 'history' | 'mail'>('inbox');
   const [, setDraft] = useState('');
   const [selectedNoteId, setSelectedNoteId] = useState<string>();
   const [selectedConversationId, setSelectedConversationId] = useState<string>();
@@ -122,8 +126,6 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
   const [settingsNeedsReload, setSettingsNeedsReload] = useState(false);
   const settingsFormGeneration = useRef(0);
   const settingsOperationLock = useRef<object | undefined>(undefined);
-  const [inboxSection, setInboxSection] = useState<'inbox' | 'activity' | 'history'>('inbox');
-  const [proposalFilter, setProposalFilter] = useState<'pending' | 'done'>('pending');
   const [libraryQuery, setLibraryQuery] = useState('');
   const [notice, setNotice] = useState<string>();
   const [voiceActionBusy, setVoiceActionBusy] = useState(false);
@@ -341,6 +343,14 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
       inspectInstall: () => oauthCoordinator.inspectInstall(),
     },
   } : undefined;
+  const settingsMailCapability = mailCoordinator ? {
+    available: true as const,
+    accounts: dto.accounts.map((account) => ({ id: account.id, provider: account.provider, displayName: account.displayName, email: account.email,
+      connected: account.connected, authStatus: account.authStatus, connectionGeneration: account.connectionGeneration })),
+    syncStates: dto.syncStates,
+    busy: state.busy || state.refreshRequired,
+    onAction: (accountId: string, action: 'accounts.refreshMail' | 'accounts.continueMailBackfill' | 'accounts.syncCalendars' | 'accounts.disconnect') => { void mailCoordinator.runAccountAction(accountId, action); },
+  } : { available: false as const, reason: 'Mail and calendar actions are not available in this workspace session.' };
   const saveSettings = async () => {
     const draft = settingsDraft;
     const baseline = settingsBaseline;
@@ -607,6 +617,7 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
         preferencesDraft={settingsDraft ?? settingsDraftFrom(latestSettingsSnapshot.state.settings)}
         preferencesMessage={settingsFormMessage ?? (settingsConflict ? settingsUnavailableReason : settingsSaving ? 'Saving settings…' : undefined)}
         connectionCapability={connectionCapability}
+        mailCapability={settingsMailCapability}
         credentials={credentials
           ? { available: true, controller: credentials }
           : { available: false, reason: 'Provider credentials are unavailable in this workspace view.' } satisfies WorkspaceSettingsCredentialCapability}
@@ -759,7 +770,7 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
               }).catch((error) => { if (selectedNoteOwner.current === owner) setNotice(errText(error)); });
             }}
             onCreateMemorySuggestion={async () => { throw new Error('Saving a memory suggestion is not connected to a server command.'); }}
-            onOpenProposals={() => { setSelectedNoteId(undefined); setTab('inbox'); setInboxSection('inbox'); setProposalFilter('pending'); }}
+            onOpenProposals={() => { setSelectedNoteId(undefined); setTab('inbox'); }}
             onTranscribe={(expectedRevision) => void transcribeNote(selectedNote, expectedRevision)}
             onCancelTranscription={() => setNotice('Native transcription attempt cancellation is unavailable without its native attempt mapping.')}
             transcriptionCommandCancellation={pendingTranscriptionCancellation}
@@ -773,36 +784,48 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
             onDelete={() => setNotice('Note deletion is not connected to a server command.')}
           /> : null}
         </>
-      ) : (
-        <ScrollView contentContainerStyle={s.scroll}>
-          <SectionPicker values={['inbox', 'activity', 'history']} selected={inboxSection} onSelect={setInboxSection} />
-          {inboxSection === 'inbox' ? <>
-            <InboxWorkspaceContent proposals={dto.proposals.filter((proposal) => proposalFilter === 'pending'
-              ? ['draft', 'approved', 'dispatching', 'failed'].includes(proposal.status)
-              : ['accepted', 'executed', 'dismissed', 'simulated', 'unknown'].includes(proposal.status)).map(workspaceProposalCardDisplay)}
-              accounts={dto.accounts} mailbox={dto.mailbox} proactive={dto.proactive} deviceCalendarAccess={dto.deviceCalendarAccess.status}
-              filter={proposalFilter} setFilter={setProposalFilter} mode={dto.settings.mode} busy={state.busy || state.refreshRequired}
-              onOpen={{ available: false, reason: 'Proposal review actions are not connected to the server workspace yet.' }}
-              onReplyMessage={{ available: false, reason: 'Mail reply actions are not connected to the server workspace yet.' }}
-              onDismissCandidate={{ available: false, reason: 'Attention item actions are not connected to the server workspace yet.' }}
-              onSnoozeCandidate={{ available: false, reason: 'Attention item actions are not connected to the server workspace yet.' }}
-              onRemindCandidate={{ available: false, reason: 'Reminder actions are not connected to the server workspace yet.' }}
-              onGetCandidateSource={{ available: false, reason: 'Source rechecks are not connected to the server workspace yet.' }}
-              onClearChatFilter={() => setNotice(undefined)} />
-            <Text style={s.sectionTitle}>Batch history</Text>
-            {dto.assistantBatchJobs.map((job) => <AssistantBatchJobCard key={job.id} job={job} storageLocation="server" busy={state.busy} blocked={state.refreshRequired} onCheck={(id) => actions.batch.check(id)} />)}
-          </> : null}
-          {inboxSection === 'activity' ? <>
-            <Text style={s.sectionTitle}>Activity</Text>
-            {dto.activity.map((item) => <View key={item.id} style={styles.card}><Text style={styles.cardTitle}>{item.message}</Text><Text style={styles.meta}>{item.type} · {new Date(item.createdAt).toLocaleString()}</Text></View>)}
-          </> : null}
-          {inboxSection === 'history' ? <>
-            <Text style={s.sectionTitle}>Dispatch history</Text>
-            <Text style={styles.meta}>Frozen payloads and outcomes are shown for review. Reconciliation actions are unavailable in this browser workspace.</Text>
-            {dto.dispatchRecords.map((record) => <View key={record.id} style={styles.card}><Text style={styles.cardTitle}>{record.title}</Text><Text style={styles.body}>{record.body}</Text><Text style={styles.meta}>{record.operation} · {record.outcome} · {record.dispatchStartedAt}</Text><Text style={styles.meta}>Approved payload digest · {record.payloadDigest}</Text>{record.payload.kind === 'email' ? <><Text style={styles.meta}>To · {record.payload.email.to.join(', ')}</Text>{record.payload.email.cc.length ? <Text style={styles.meta}>Cc · {record.payload.email.cc.join(', ')}</Text> : null}{record.payload.email.bcc.length ? <Text style={styles.meta}>Bcc · {record.payload.email.bcc.join(', ')}</Text> : null}<Text style={styles.body}>{record.payload.email.text}</Text></> : <Text style={styles.meta}>{record.payload.event.start} – {record.payload.event.end} · {record.payload.event.timeZone}</Text>}</View>)}
-          </> : null}
-        </ScrollView>
-      )}
+      ) : <View style={{ flex: 1 }}>
+        <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 7, paddingHorizontal: 16, paddingBottom: 8 }} accessibilityRole="tablist">
+          {([['inbox', 'Inbox'], ['activity', 'Activity'], ['history', 'History'], ['mail', 'Mail and calendar']] as const).map(([section, label]) => <Pressable key={section}
+            accessibilityRole="tab" accessibilityLabel={`${label} section`} accessibilityState={{ selected: inboxSection === section }} onPress={() => setInboxSection(section)}
+            style={{ paddingVertical: 8, paddingHorizontal: 11, borderRadius: 14, borderWidth: 1, borderColor: inboxSection === section ? C.sage : C.border, backgroundColor: inboxSection === section ? '#222821' : C.card }}>
+            <Text style={{ color: inboxSection === section ? C.text : C.muted, fontSize: 12 }}>{label}</Text>
+          </Pressable>)}
+        </View>
+        {inboxSection === 'inbox' ? <InboxWorkspaceContent
+          proposals={dto.proposals.filter((proposal) => inboxFilter === 'pending'
+            ? ['draft', 'approved', 'dispatching', 'failed'].includes(proposal.status)
+            : ['accepted', 'executed', 'dismissed', 'simulated', 'unknown'].includes(proposal.status)).map(workspaceProposalCardDisplay)}
+          accounts={dto.accounts.map(inboxAccountDisplay)} mailbox={dto.mailbox}
+          deviceCalendarAccess="unavailable"
+          onReplyMessage={mailCoordinator ? { available: true, action: (messageId) => { setInboxSection('mail'); void mailCoordinator.openReply(messageId); } } : { available: false, reason: 'Mail actions are unavailable until the browser workspace is ready.' }}
+          proactive={dto.proactive} filter={inboxFilter} setFilter={setInboxFilter} mode={dto.settings.mode}
+          onOpen={mailCoordinator ? { available: true, action: (proposalId) => { setInboxSection('mail'); void mailCoordinator.openProposal(proposalId); } } : { available: false, reason: 'Proposal review is unavailable until the browser workspace is ready.' }}
+          busy={state.busy || state.refreshRequired}
+          onDismissCandidate={{ available: false, reason: 'Proactive item actions are not connected to this browser workspace yet.' }}
+          onSnoozeCandidate={{ available: false, reason: 'Proactive item actions are not connected to this browser workspace yet.' }}
+          onRemindCandidate={{ available: false, reason: 'Proactive reminders are not connected to this browser workspace yet.' }}
+          onGetCandidateSource={{ available: false, reason: 'Proactive source inspection is not connected to this browser workspace yet.' }}
+          onClearChatFilter={() => undefined} /> : null}
+        {inboxSection === 'activity' ? <ScrollView contentContainerStyle={s.scroll}>
+          <Text style={s.kicker}>ACTIVITY</Text><Text style={s.h1}>Workspace activity</Text>
+          {dto.activity.slice().reverse().map((item) => <View key={item.id} style={styles.card}><Text style={styles.body}>{item.message}</Text><Text style={styles.meta}>{new Date(item.createdAt).toLocaleString()}</Text></View>)}
+          {!dto.activity.length ? <Text style={styles.meta}>No activity has been saved yet.</Text> : null}
+        </ScrollView> : null}
+        {inboxSection === 'history' ? <ScrollView contentContainerStyle={s.scroll}>
+          <Text style={s.kicker}>HISTORY</Text><Text style={s.h1}>Saved requests</Text>
+          {dto.assistantBatchJobs.map((job) => <AssistantBatchJobCard key={job.id} job={job} storageLocation="server" busy={state.busy}
+            blocked={state.refreshRequired || Boolean(dto.assistantBatchRecoveryStatus)} onCheck={(jobId) => actions.batch.check(jobId)} />)}
+          {!dto.assistantBatchJobs.length ? <Text style={styles.meta}>No Batch requests have been saved.</Text> : null}
+          <Text style={s.sectionTitle}>Saved dispatches</Text>
+          {dto.dispatchRecords.map((record) => <View key={record.id} style={styles.card}><Text style={styles.cardTitle}>{record.title}</Text><Text style={styles.meta}>{record.operation} · {record.outcome} · {record.dispatchStartedAt}</Text>
+            <Button label="Inspect saved dispatch" tone="quiet" disabled={!mailCoordinator || state.busy} onPress={() => { setInboxSection('mail'); void mailCoordinator?.openDispatch(record.id); }} /></View>)}
+          {!dto.dispatchRecords.length ? <Text style={styles.meta}>No saved dispatches have been recorded.</Text> : null}
+        </ScrollView> : null}
+        {inboxSection === 'mail' ? <ScrollView contentContainerStyle={s.scroll}>
+          <CloudMailWorkspace coordinator={mailCoordinator} snapshot={snapshot} busy={state.busy} blocked={state.refreshRequired || Boolean(state.pendingCommand)} />
+        </ScrollView> : null}
+      </View>}
     </WorkspaceScreen>
   );
 }
@@ -816,13 +839,4 @@ const styles = {
   divider: { height: 1, backgroundColor: C.border, marginVertical: 16 },
   detail: { gap: 10, marginTop: 18, padding: 14, borderWidth: 1, borderColor: C.border, borderRadius: 18, backgroundColor: '#101113' },
   actions: { flexDirection: 'row' as const, flexWrap: 'wrap' as const, gap: 8 },
-  sectionPicker: { flexDirection: 'row' as const, flexWrap: 'wrap' as const, gap: 7, marginBottom: 12 },
-  sectionChip: { borderWidth: 1, borderColor: C.border, borderRadius: 20, paddingVertical: 7, paddingHorizontal: 11 },
-  sectionChipSelected: { borderColor: C.sage, backgroundColor: C.card },
-  sectionChipText: { color: C.muted, fontSize: 12 },
-  sectionChipTextSelected: { color: C.text },
 };
-
-function SectionPicker<T extends string>({ values, selected, onSelect }: { values: readonly T[]; selected: T; onSelect: (value: T) => void }) {
-  return <View style={styles.sectionPicker} accessibilityRole="tablist">{values.map((value) => <Pressable key={value} accessibilityRole="tab" accessibilityState={{ selected: value === selected }} onPress={() => onSelect(value)} style={[styles.sectionChip, value === selected && styles.sectionChipSelected]}><Text style={[styles.sectionChipText, value === selected && styles.sectionChipTextSelected]}>{value[0]!.toUpperCase()}{value.slice(1)}</Text></Pressable>)}</View>;
-}
