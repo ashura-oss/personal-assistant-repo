@@ -129,6 +129,14 @@ test('Web Push HTTP status, explicit key provisioning, subscription registration
     assert.equal(safeJson.includes(supplied.endpoint), false);
     assert.equal(safeJson.includes(supplied.keys.p256dh), false);
     assert.equal(safeJson.includes(supplied.keys.auth), false);
+    const reconciliation = await f.request('/api/web-push/subscriptions/reconcile', { method: 'POST', headers: mutationHeaders(f),
+      body: JSON.stringify({ expectedPrivacyEpoch: 0, deviceId, subscription: supplied }) });
+    assert.equal(reconciliation.status, 200);
+    assert.deepEqual(await reconciliation.json(), { schemaVersion: 1, privacyEpoch: 0, deviceId, status: 'matched',
+      generation: 1, keyId: provision.result.keyId, publicKey: provision.result.publicKey });
+    const mismatch = await f.request('/api/web-push/subscriptions/reconcile', { method: 'POST', headers: mutationHeaders(f),
+      body: JSON.stringify({ expectedPrivacyEpoch: 0, deviceId, subscription: { ...supplied, endpoint: `${supplied.endpoint}/changed` } }) });
+    assert.equal((await mismatch.json()).status, 'unmatched');
     const inspected = await f.request(`/api/web-push/commands/${registerCommand}`, { headers: { Cookie: f.cookie } });
     assert.equal(inspected.status, 200);
     assert.deepEqual(await inspected.json(), registered);

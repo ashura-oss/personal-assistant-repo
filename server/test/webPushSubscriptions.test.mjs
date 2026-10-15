@@ -131,6 +131,11 @@ test('explicit provisioning and key rotation are idempotent, inspectable, and bi
     assert.equal(JSON.stringify(registered).includes(subscriptionInput.keys.p256dh), false);
     assert.equal(JSON.stringify(registered).includes(subscriptionInput.keys.auth), false);
     assert.deepEqual(f.service.register(admission, registerRequest), registered);
+    assert.deepEqual(f.service.reconcileSubscription(admission, { expectedPrivacyEpoch: 0, deviceId, subscription: subscriptionInput }),
+      { schemaVersion: 1, privacyEpoch: 0, deviceId, status: 'matched', generation: 1, keyId: second.result.keyId, publicKey: second.result.publicKey });
+    assert.equal(f.service.reconcileSubscription(admission, { expectedPrivacyEpoch: 0, deviceId: randomUUID(), subscription: subscriptionInput }).status, 'missing');
+    assert.equal(f.service.reconcileSubscription(admission, { expectedPrivacyEpoch: 0, deviceId,
+      subscription: { ...subscriptionInput, endpoint: `${subscriptionInput.endpoint}/changed` } }).status, 'unmatched');
     assert.deepEqual(f.service.listSubscriptions(admission).subscriptions, [{ deviceId, generation: 1, status: 'active',
       keyId: second.result.keyId, updatedAt: registered.result.updatedAt }]);
 
@@ -148,6 +153,8 @@ test('explicit provisioning and key rotation are idempotent, inspectable, and bi
     const revokeRequest = { commandId: randomUUID(), expectedPrivacyEpoch: 0, deviceId, expectedGeneration: 1 };
     const revoked = f.service.revoke(admission, revokeRequest);
     assert.equal(revoked.result.status, 'revoked');
+    assert.deepEqual(f.service.reconcileSubscription(admission, { expectedPrivacyEpoch: 0, deviceId, subscription: subscriptionInput }),
+      { schemaVersion: 1, privacyEpoch: 0, deviceId, status: 'revoked', generation: 1, keyId: second.result.keyId });
     assert.deepEqual(f.service.revoke(admission, revokeRequest), revoked);
     assert.throws(() => f.service.revoke(admission, { ...revokeRequest, commandId: randomUUID() }),
       (error) => error instanceof WebPushRegistryError && error.code === 'web_push_stale_generation');

@@ -166,6 +166,8 @@ export function createServiceWorker(cacheName, staticPaths, registrationPath) {
 `function isProtectedPath(pathname) { return /^\\/(?:api|auth|oauth|callback)(?:\\/|$)/i.test(pathname); }\n` +
 `self.addEventListener('install', (event) => { event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.addAll([...STATIC_PATHS]))); });\n` +
 `self.addEventListener('activate', (event) => { event.waitUntil(caches.keys().then((keys) => Promise.all(keys.filter((key) => key.startsWith('still-shell-') && key !== CACHE_NAME).map((key) => caches.delete(key))))); });\n` +
+`self.addEventListener('push', (event) => { event.waitUntil(self.registration.showNotification('Reminder', { body: 'You have a reminder.', icon: '/assets/still-icon.png', data: { schemaVersion: 1, type: 'reminder' } })); });\n` +
+`self.addEventListener('notificationclick', (event) => { event.notification.close(); event.waitUntil(self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((windows) => { const sameOrigin = windows.find((client) => { try { return new URL(client.url).origin === self.location.origin; } catch { return false; } }); return sameOrigin ? sameOrigin.navigate('/').then((client) => client ? client.focus() : self.clients.openWindow('/')) : self.clients.openWindow('/'); })); });\n` +
 `self.addEventListener('fetch', (event) => {\n` +
 `  const request = event.request; if (request.method !== 'GET') return;\n` +
 `  const url = new URL(request.url); if (url.origin !== self.location.origin || url.search || isProtectedPath(url.pathname)) return;\n` +

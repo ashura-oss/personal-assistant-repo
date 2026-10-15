@@ -152,6 +152,50 @@ describe('PWA export packaging', () => {
     expect(networkCalls).toBe(before);
   });
 
+  it('shows only fixed generic reminders and opens the same-origin inbox on notification click', async () => {
+    const listeners = new Map<string, (event: any) => void>();
+    const shown: unknown[] = [];
+    const opened: string[] = [];
+    let focused = 0;
+    let navigated = '';
+    const existingClient = { url: 'https://still.example/private/path', navigate: async (url: string) => { navigated = url; return existingClient; },
+      focus: async () => { focused += 1; } };
+    const serviceWorkerScope = {
+      location: { origin: 'https://still.example' },
+      registration: { showNotification: async (...args: unknown[]) => { shown.push(args); } },
+      clients: { matchAll: async () => [existingClient], openWindow: async (url: string) => { opened.push(url); } },
+      addEventListener: (type: string, listener: (event: any) => void) => listeners.set(type, listener),
+    };
+    runInNewContext(createServiceWorker('still-shell-0123456789abcdef', ['/']), { self: serviceWorkerScope, URL, Promise });
+    let pushWork: Promise<unknown> | undefined;
+    listeners.get('push')?.({ data: { json: () => { throw new Error('payload must not be read'); } }, waitUntil: (work: Promise<unknown>) => { pushWork = work; } });
+    await pushWork;
+    expect(shown).toEqual([['Reminder', { body: 'You have a reminder.', icon: '/assets/still-icon.png', data: { schemaVersion: 1, type: 'reminder' } }]]);
+
+    let clickWork: Promise<unknown> | undefined;
+    let closed = false;
+    listeners.get('notificationclick')?.({ notification: { close: () => { closed = true; }, data: { url: 'https://attacker.invalid/' } },
+      waitUntil: (work: Promise<unknown>) => { clickWork = work; } });
+    await clickWork;
+    expect(closed).toBe(true);
+    expect(navigated).toBe('/');
+    expect(focused).toBe(1);
+    expect(opened).toEqual([]);
+  });
+
+  it('opens only the fixed same-origin inbox when no same-origin client exists', async () => {
+    const listeners = new Map<string, (event: any) => void>();
+    const opened: string[] = [];
+    const serviceWorkerScope = { location: { origin: 'https://still.example' },
+      clients: { matchAll: async () => [{ url: 'https://attacker.invalid/', focus: async () => undefined }], openWindow: async (url: string) => { opened.push(url); } },
+      registration: { showNotification: async () => undefined }, addEventListener: (type: string, listener: (event: any) => void) => listeners.set(type, listener) };
+    runInNewContext(createServiceWorker('still-shell-0123456789abcdef', ['/']), { self: serviceWorkerScope, URL, Promise });
+    let clickWork: Promise<unknown> | undefined;
+    listeners.get('notificationclick')?.({ notification: { close: () => undefined, data: { url: '/evil' } }, waitUntil: (work: Promise<unknown>) => { clickWork = work; } });
+    await clickWork;
+    expect(opened).toEqual(['/']);
+  });
+
   it('postprocesses an actual export-shaped directory with the existing icon and hashed local registration', async () => {
     const root = await makeFixture();
     const result = await finalizePwaExport(root);

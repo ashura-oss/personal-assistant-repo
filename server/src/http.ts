@@ -1318,6 +1318,21 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
       } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
       return;
     }
+    if (pathname === '/api/web-push/subscriptions/reconcile') {
+      if (request.method !== 'POST') { response.setHeader('Allow', 'POST'); throw problem(405, 'method_not_allowed'); }
+      if (hasQuery) throw problem(400, 'bad_request');
+      const admission = workspaceMutationAdmission(request, auth, canonicalOrigin);
+      try {
+        const input = await readJsonBody(request, response, BODY_LIMIT);
+        admission.assertCurrent();
+        if (admissionOpen && !admissionOpen()) throw problem(503, 'service_unavailable');
+        workspaceApi?.assertWorkspaceAdmission?.(admission);
+        const result = webPushApi.reconcileSubscription(admission, input);
+        admission.assertCurrent();
+        if (!response.destroyed) sendJson(response, 200, result);
+      } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
+      return;
+    }
     if (pathname === '/api/web-push/subscriptions') {
       if (request.method !== 'GET') { response.setHeader('Allow', 'GET'); throw problem(405, 'method_not_allowed'); }
       let cursor: string | undefined;

@@ -36,6 +36,7 @@ import { CloudMailWorkspace } from './CloudMailWorkspace';
 import { InboxWorkspaceContent, inboxAccountDisplay } from '../ui/InboxWorkspaceContent';
 import { AssistantBatchJobCard } from '../ui/AssistantBatchJobCard';
 import type { WorkspaceEraseActions } from './WorkspaceErasePanel';
+import type { WebPushBrowserCoordinator } from './webPushBrowser';
 
 export type CloudWorkspaceActions = Readonly<{
   tasks: Readonly<{ complete: (taskId: string) => Promise<WorkspaceCommandResponse>; reopen: (taskId: string) => Promise<WorkspaceCommandResponse> }>;
@@ -93,6 +94,7 @@ type CloudWorkspaceEraseStoreMethods = 'discoverWorkspaceErase' | 'prepareWorksp
   'cancelWorkspaceErase' | 'retryWorkspaceEraseReview' | 'retryWorkspaceEraseCleanup';
 type CloudWorkspaceStorePort = Pick<CloudWorkspaceSessionStore, 'getSnapshot' | 'execute' | 'inspect' | 'refresh'> &
   Partial<Pick<CloudWorkspaceSessionStore, 'readKnowledgeSourceChoices' | 'readKnowledgeSuggestionReview' | 'readPeriodSummaryResult' | 'readPeriodSummaryApplicationPreview'>> &
+  Partial<Pick<CloudWorkspaceSessionStore, 'getWebPushCoordinator'>> &
   Partial<Pick<CloudWorkspaceSessionStore, CloudWorkspaceEraseStoreMethods>>;
 
 function projectSettingsBaseline(settings: WorkspaceSettingsDTO): WorkspaceSettingsBaseline {
@@ -438,6 +440,7 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
     available: true as const, coordinator: backgroundPolicyCoordinator, state: state.backgroundPolicies ?? backgroundPolicyCoordinator.getSnapshot(),
     accounts: dto.accounts, busy: state.busy, blocked: Boolean(state.pendingCommand || state.refreshRequired),
   } : { available: false as const, reason: 'Background policy controls are unavailable in this workspace session.' };
+  const webPushCoordinator = store.getWebPushCoordinator?.();
   const saveSettings = async () => {
     const draft = settingsDraft;
     const baseline = settingsBaseline;
@@ -802,6 +805,9 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
         connectionCapability={connectionCapability}
         mailCapability={settingsMailCapability}
         backgroundPolicyCapability={settingsBackgroundPolicyCapability}
+        webPushCapability={webPushCoordinator ? { available: true, coordinator: webPushCoordinator,
+          state: state.webPush ?? webPushCoordinator.getSnapshot(), blocked: state.busy || state.refreshRequired || Boolean(state.pendingCommand) } :
+          { available: false, reason: 'Browser notification controls are unavailable in this workspace session.' }}
         workspaceEraseCapability={{ status: state.eraseStatus, busy: state.busy, error: state.error, actions: eraseActions,
           ownerKey: `${snapshot.workspaceId}:${snapshot.privacyEpoch}` }}
         credentials={credentials

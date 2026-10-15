@@ -23,6 +23,7 @@ import { CloudOAuthCoordinator, type CloudOAuthState } from './cloudOAuthCoordin
 import { CloudMailCoordinator, type CloudMailCoordinatorState } from './cloudMailCoordinator';
 import { CloudTranscriptTransferCoordinator, type CloudTranscriptTransferState } from './cloudTranscriptTransferCoordinator';
 import { CloudBackgroundPolicyCoordinator, type CloudBackgroundPolicyState } from './cloudBackgroundPolicyCoordinator';
+import { createWebPushBrowserCoordinator, type WebPushBrowserCoordinator, type WebPushBrowserState } from './webPushBrowser';
 
 export type CloudWorkspaceSessionState = Readonly<{
   status: 'loading' | 'ready' | 'error';
@@ -36,6 +37,7 @@ export type CloudWorkspaceSessionState = Readonly<{
   mail?: CloudMailCoordinatorState;
   transcriptTransfer?: CloudTranscriptTransferState;
   backgroundPolicies?: CloudBackgroundPolicyState;
+  webPush?: WebPushBrowserState;
   refreshRequired: boolean;
   error?: string;
 }>;
@@ -58,6 +60,8 @@ export class CloudWorkspaceSessionStore {
   private unsubscribeTranscriptTransfer?: () => void;
   private backgroundPolicyCoordinator?: CloudBackgroundPolicyCoordinator;
   private unsubscribeBackgroundPolicies?: () => void;
+  private webPushCoordinator?: WebPushBrowserCoordinator;
+  private unsubscribeWebPush?: () => void;
   private ownerGeneration = 0;
   private active = false;
   private operationInFlight = false;
@@ -91,20 +95,23 @@ export class CloudWorkspaceSessionStore {
 
   private publish(next: CloudWorkspaceSessionState): void {
     const { voice: _callerVoice, oauth: _callerOAuth, mail: _callerMail, transcriptTransfer: _callerTranscriptTransfer,
-      backgroundPolicies: _callerBackgroundPolicies, ...withoutCallerOwnedState } = next;
+      backgroundPolicies: _callerBackgroundPolicies, webPush: _callerWebPush, ...withoutCallerOwnedState } = next;
     void _callerVoice;
     void _callerOAuth;
     void _callerMail;
     void _callerTranscriptTransfer;
     void _callerBackgroundPolicies;
+    void _callerWebPush;
     const coordinator = this.active ? this.voiceCoordinator : undefined;
     const voice = coordinator?.getSnapshot();
     const oauth = this.active ? this.oauthCoordinator?.getSnapshot() : undefined;
     const mail = this.active ? this.mailCoordinator?.getSnapshot() : undefined;
     const transcriptTransfer = this.active ? this.transcriptTransferCoordinator?.getSnapshot() : undefined;
     const backgroundPolicies = this.active ? this.backgroundPolicyCoordinator?.getSnapshot() : undefined;
+    const webPush = this.active ? this.webPushCoordinator?.getSnapshot() : undefined;
     this.value = Object.freeze({ ...withoutCallerOwnedState, ...(voice ? { voice } : {}), ...(oauth ? { oauth } : {}), ...(mail ? { mail } : {}),
-      ...(transcriptTransfer ? { transcriptTransfer } : {}), ...(backgroundPolicies ? { backgroundPolicies } : {}) });
+      ...(transcriptTransfer ? { transcriptTransfer } : {}), ...(backgroundPolicies ? { backgroundPolicies } : {}),
+      ...(webPush ? { webPush } : {}) });
     for (const listener of this.listeners) listener();
   }
 
@@ -133,6 +140,15 @@ export class CloudWorkspaceSessionStore {
     this.client = createWebWorkspaceClient(this.session, {
       decodeSnapshot: decodeWorkspaceSnapshotDTO,
       assertCurrent: () => { if (!this.isCurrent(owner)) throw new Error('Cloud workspace owner changed.'); },
+    });
+    const webPushCoordinator = createWebPushBrowserCoordinator(this.session, {
+      assertCurrent: () => { if (!this.isCurrent(owner)) throw new Error('Cloud workspace owner changed.'); },
+    });
+    this.webPushCoordinator = webPushCoordinator;
+    this.unsubscribeWebPush = webPushCoordinator.subscribe(() => {
+      if (this.isCurrent(owner) && this.webPushCoordinator === webPushCoordinator) {
+        this.publish({ ...this.value, webPush: webPushCoordinator.getSnapshot() });
+      }
     });
     const oauthCoordinator = new CloudOAuthCoordinator(this.session, { workspace: {
       readSnapshot: () => this.isCurrent(owner) ? this.value.snapshot : undefined,
@@ -236,6 +252,10 @@ export class CloudWorkspaceSessionStore {
     this.unsubscribeBackgroundPolicies = undefined;
     this.backgroundPolicyCoordinator?.dispose();
     this.backgroundPolicyCoordinator = undefined;
+    this.unsubscribeWebPush?.();
+    this.unsubscribeWebPush = undefined;
+    this.webPushCoordinator?.dispose();
+    this.webPushCoordinator = undefined;
     this.unsubscribeMail?.();
     this.unsubscribeMail = undefined;
     this.mailCoordinator?.dispose();
@@ -316,6 +336,11 @@ export class CloudWorkspaceSessionStore {
     return this.backgroundPolicyCoordinator;
   }
 
+  getWebPushCoordinator(): WebPushBrowserCoordinator | undefined {
+    if (!this.active) return undefined;
+    return this.webPushCoordinator;
+  }
+
   async cancelTranscription(commandId: string): Promise<'cancellation_requested' | 'not_running'> {
     const owner = this.ownerGeneration;
     const client = this.currentClient();
@@ -336,6 +361,7 @@ export class CloudWorkspaceSessionStore {
       const snapshot = await client.getSnapshot();
       if (!this.isCurrent(owner)) return;
       this.publish({ status: 'ready', snapshot, busy: false, refreshRequired: false, eraseStatus });
+      void this.webPushCoordinator?.start();
     } catch (error) {
       if (!this.isCurrent(owner)) return;
       this.publish({ status: 'error', busy: false, refreshRequired: true, error: this.message(error) });

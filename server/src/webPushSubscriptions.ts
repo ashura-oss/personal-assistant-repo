@@ -1,9 +1,9 @@
-import { ECDH, createECDH, createHash, randomUUID } from 'node:crypto';
+import { ECDH, createECDH, createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import webPush from 'web-push';
 import type { DurableKernel, OwnedTransactionContext } from './kernel.js';
 import type { SecretVault, WebPushSecretCiphertext } from './vault.js';
 import type { WorkspaceHttpAdmission } from './workspaceHttp.js';
-import type { WebPushCommandReceipt, WebPushHttpApi, WebPushSafeStatus, WebPushSubscriptionPage } from './webPushHttp.js';
+import type { WebPushCommandReceipt, WebPushHttpApi, WebPushSafeStatus, WebPushSubscriptionPage, WebPushSubscriptionReconciliation } from './webPushHttp.js';
 import { registerWorkspaceEraseDeleteGuard } from './workspaceErase.js';
 
 const SCHEMA_VERSION = 1;
@@ -138,6 +138,12 @@ export interface WebPushRevokeRequest extends WebPushProvisionRequest {
   readonly expectedGeneration: number;
 }
 
+export interface WebPushReconcileRequest {
+  readonly expectedPrivacyEpoch: number;
+  readonly deviceId: string;
+  readonly subscription: Readonly<{ endpoint: string; keys: Readonly<{ p256dh: string; auth: string }> }>;
+}
+
 /** Owned-workspace Web Push keyring and subscription registry. It performs no network requests. */
 export class WebPushSubscriptions implements WebPushHttpApi {
   readonly #kernel: DurableKernel;
@@ -202,6 +208,46 @@ export class WebPushSubscriptions implements WebPushHttpApi {
         subscriptions: Object.freeze(page.map((row) => Object.freeze({ deviceId: row.device_id,
           generation: row.generation, status: row.status, keyId: row.key_id, updatedAt: new Date(row.updated_at).toISOString() }))),
         ...(hasMore && last ? { nextCursor: last } : {}) });
+    });
+  }
+
+  reconcileSubscription(admission: WorkspaceHttpAdmission, input: unknown): WebPushSubscriptionReconciliation {
+    const request = parseReconcile(input);
+    const identity = this.#identity(admission);
+    if (identity.privacyEpoch !== request.expectedPrivacyEpoch) fail('web_push_stale_epoch');
+    this.#assertWorkspaceAdmission(admission);
+    return this.#kernel.withOwnedTransaction(admission.sessionToken, request.expectedPrivacyEpoch, (context) => {
+      activeContext(this.#kernel, context);
+      this.#assertWorkspaceAdmission(admission);
+      const head = context.db.prepare(`SELECT generation,status,key_id FROM web_push_subscription_heads
+        WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND device_id=?`)
+        .get(context.workspaceId, context.ownerId, context.privacyEpoch, request.deviceId) as
+        { generation: number; status: 'active' | 'revoked'; key_id: string } | undefined;
+      if (!head) return Object.freeze({ schemaVersion: 1, privacyEpoch: context.privacyEpoch,
+        deviceId: request.deviceId, status: 'missing' });
+      if (head.status === 'revoked') return Object.freeze({ schemaVersion: 1, privacyEpoch: context.privacyEpoch,
+        deviceId: request.deviceId, status: 'revoked', generation: head.generation, keyId: head.key_id });
+      const row = context.db.prepare(`SELECT s.key_version,s.nonce,s.tag,s.ciphertext,k.public_key
+        FROM web_push_subscriptions s JOIN web_push_vapid_keys k ON k.workspace_id=s.workspace_id AND k.owner_id=s.owner_id
+          AND k.privacy_epoch=s.privacy_epoch AND k.key_id=s.key_id
+        WHERE s.workspace_id=? AND s.owner_id=? AND s.privacy_epoch=? AND s.device_id=? AND s.generation=? AND s.key_id=?`)
+        .get(context.workspaceId, context.ownerId, context.privacyEpoch, request.deviceId, head.generation, head.key_id) as
+        { key_version: number; nonce: Buffer; tag: Buffer; ciphertext: Buffer; public_key: string } | undefined;
+      if (!row || row.key_version !== SECRET_FORMAT) fail('web_push_registry_corrupt');
+      const cleartext = this.#vault.openWebPushSecretWithinTransaction(context,
+        { kind: 'subscription', deviceId: request.deviceId, generation: head.generation, keyId: head.key_id },
+        { format: row.key_version, nonce: row.nonce, tag: row.tag, ciphertext: row.ciphertext });
+      let matches = false;
+      try {
+        const parsed = JSON.parse(cleartext.toString('utf8')) as unknown;
+        const secret = closedFields(parsed, ['endpoint', 'p256dh', 'auth']);
+        matches = constantTextEqual(secret.endpoint, request.subscription.endpoint) &&
+          constantTextEqual(secret.p256dh, request.subscription.keys.p256dh) &&
+          constantTextEqual(secret.auth, request.subscription.keys.auth);
+      } catch { fail('web_push_registry_corrupt'); }
+      finally { cleartext.fill(0); }
+      return Object.freeze({ schemaVersion: 1, privacyEpoch: context.privacyEpoch, deviceId: request.deviceId,
+        status: matches ? 'matched' : 'unmatched', generation: head.generation, keyId: head.key_id, publicKey: row.public_key });
     });
   }
 
@@ -402,6 +448,25 @@ function parseRevoke(value: unknown): WebPushRevokeRequest {
   const f = closedFields(value, ['commandId', 'expectedPrivacyEpoch', 'deviceId', 'expectedGeneration']);
   return Object.freeze({ commandId: uuid(f.commandId), expectedPrivacyEpoch: safeInteger(f.expectedPrivacyEpoch),
     deviceId: uuid(f.deviceId), expectedGeneration: safeInteger(f.expectedGeneration, 1) });
+}
+
+function parseReconcile(value: unknown): WebPushReconcileRequest {
+  const f = closedFields(value, ['expectedPrivacyEpoch', 'deviceId', 'subscription']);
+  const subscription = closedFields(f.subscription, ['endpoint', 'keys']);
+  const keys = closedFields(subscription.keys, ['p256dh', 'auth']);
+  const p256dh = canonicalBase64Url(keys.p256dh, 65);
+  if (!validP256Point(p256dh)) fail('web_push_invalid_subscription');
+  return Object.freeze({ expectedPrivacyEpoch: safeInteger(f.expectedPrivacyEpoch), deviceId: uuid(f.deviceId),
+    subscription: Object.freeze({ endpoint: endpoint(subscription.endpoint), keys: Object.freeze({ p256dh,
+      auth: canonicalBase64Url(keys.auth, 16) }) }) });
+}
+
+function constantTextEqual(left: unknown, right: unknown): boolean {
+  if (typeof left !== 'string' || typeof right !== 'string') return false;
+  const a = Buffer.from(left, 'utf8');
+  const b = Buffer.from(right, 'utf8');
+  try { return a.length === b.length && timingSafeEqual(a, b); }
+  finally { a.fill(0); b.fill(0); }
 }
 
 function decodeReceipt(commandId: string, operation: WebPushCommandReceipt['operation'], json: string, createdAt: number): WebPushCommandReceipt {

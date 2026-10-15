@@ -19,6 +19,11 @@ export interface WebPushSubscriptionPage {
   readonly nextCursor?: string;
 }
 
+export type WebPushSubscriptionReconciliation = Readonly<{ schemaVersion: 1; privacyEpoch: number; deviceId: string; status: 'missing' }> |
+  Readonly<{ schemaVersion: 1; privacyEpoch: number; deviceId: string; status: 'revoked'; generation: number; keyId: string }> |
+  Readonly<{ schemaVersion: 1; privacyEpoch: number; deviceId: string; status: 'matched' | 'unmatched'; generation: number;
+    keyId: string; publicKey: string }>;
+
 export type WebPushCommandReceipt = Readonly<{
   schemaVersion: 1;
   commandId: string;
@@ -38,6 +43,7 @@ export interface WebPushHttpApi {
   getPublicKey(admission: WorkspaceHttpAdmission): Readonly<{ schemaVersion: 1; privacyEpoch: number; provisioned: boolean;
     keyId?: string; publicKey?: string; createdAt?: string }>;
   listSubscriptions(admission: WorkspaceHttpAdmission, cursor?: string): WebPushSubscriptionPage;
+  reconcileSubscription(admission: WorkspaceHttpAdmission, input: unknown): WebPushSubscriptionReconciliation;
   provision(admission: WorkspaceHttpAdmission, input: unknown): WebPushCommandReceipt;
   rotate(admission: WorkspaceHttpAdmission, input: unknown): WebPushCommandReceipt;
   register(admission: WorkspaceHttpAdmission, input: unknown): WebPushCommandReceipt;

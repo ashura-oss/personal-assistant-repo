@@ -12,6 +12,8 @@ import { CloudBackgroundPolicies, type CloudBackgroundPolicyAccount } from '../w
 import type { CloudBackgroundPolicyCoordinator, CloudBackgroundPolicyState } from '../web/cloudBackgroundPolicyCoordinator';
 import { WorkspaceErasePanel, type WorkspaceEraseActions } from '../web/WorkspaceErasePanel';
 import type { WorkspaceEraseStatus } from '../cloud/workspaceEraseContracts';
+import type { WebPushBrowserCoordinator, WebPushBrowserState } from '../web/webPushBrowser';
+import { WebPushSubscriptionPanel } from '../web/WebPushSubscriptionPanel';
 
 export type WorkspaceSettingsDisplay = WorkspaceSnapshotDTO['state'];
 export type WorkspaceSettingsAction = Readonly<{ available: true; action: () => void | Promise<void> }> | Readonly<{ available: false; reason: string }>;
@@ -29,6 +31,8 @@ export type WorkspaceSettingsMailCapability = Readonly<{ available: true; accoun
   Readonly<{ available: false; reason: string }>;
 export type WorkspaceSettingsBackgroundPolicyCapability = Readonly<{ available: true; coordinator: CloudBackgroundPolicyCoordinator;
   state: CloudBackgroundPolicyState; accounts: readonly CloudBackgroundPolicyAccount[]; busy: boolean; blocked: boolean }> | Readonly<{ available: false; reason: string }>;
+export type WorkspaceSettingsWebPushCapability = Readonly<{ available: true; coordinator: WebPushBrowserCoordinator; state: WebPushBrowserState; blocked: boolean }> |
+  Readonly<{ available: false; reason: string }>;
 
 function Unavailable({ capability }: { capability: WorkspaceSettingsAction }) {
   return capability.available ? null : <Text style={styles.meta}>{capability.reason}</Text>;
@@ -40,7 +44,7 @@ function CapabilityButton({ label, capability, busy }: { label: string; capabili
     : <Unavailable capability={capability} />;
 }
 
-export function WorkspaceSettingsScreen({ display, actions, busy, onClose, preferencesDraft, preferencesMessage, onReloadPreferences, credentials, connectionCapability, mailCapability, backgroundPolicyCapability, workspaceEraseCapability, allowCloseWhileBusy }: { display: WorkspaceSettingsDisplay; actions: WorkspaceSettingsActions; busy: boolean; onClose: () => void; preferencesDraft?: WorkspaceSettingsDraft; preferencesMessage?: string; onReloadPreferences?: () => void; credentials?: WorkspaceSettingsCredentialCapability; connectionCapability?: WorkspaceSettingsConnectionCapability; mailCapability?: WorkspaceSettingsMailCapability; backgroundPolicyCapability?: WorkspaceSettingsBackgroundPolicyCapability; workspaceEraseCapability?: Readonly<{ status?: WorkspaceEraseStatus; busy: boolean; error?: string; actions: WorkspaceEraseActions; ownerKey: string }>; allowCloseWhileBusy?: boolean }) {
+export function WorkspaceSettingsScreen({ display, actions, busy, onClose, preferencesDraft, preferencesMessage, onReloadPreferences, credentials, connectionCapability, mailCapability, backgroundPolicyCapability, webPushCapability, workspaceEraseCapability, allowCloseWhileBusy }: { display: WorkspaceSettingsDisplay; actions: WorkspaceSettingsActions; busy: boolean; onClose: () => void; preferencesDraft?: WorkspaceSettingsDraft; preferencesMessage?: string; onReloadPreferences?: () => void; credentials?: WorkspaceSettingsCredentialCapability; connectionCapability?: WorkspaceSettingsConnectionCapability; mailCapability?: WorkspaceSettingsMailCapability; backgroundPolicyCapability?: WorkspaceSettingsBackgroundPolicyCapability; webPushCapability?: WorkspaceSettingsWebPushCapability; workspaceEraseCapability?: Readonly<{ status?: WorkspaceEraseStatus; busy: boolean; error?: string; actions: WorkspaceEraseActions; ownerKey: string }>; allowCloseWhileBusy?: boolean }) {
   const settings = display.settings;
   const activeRules = display.proactive.rules.filter((rule) => rule.enabled).length;
   const pendingSuggestions = display.knowledge.suggestions.filter((suggestion) => suggestion.status === 'pending').length;
@@ -127,6 +131,9 @@ export function WorkspaceSettingsScreen({ display, actions, busy, onClose, prefe
       <Unavailable capability={actions.calendars} />
     </View>
     <Text style={s.sectionTitle}>Attention and reminders</Text>
+    {webPushCapability ? webPushCapability.available
+      ? <WebPushSubscriptionPanel coordinator={webPushCapability.coordinator} state={webPushCapability.state} blocked={busy || webPushCapability.blocked} />
+      : <View style={styles.card}><Text style={styles.title}>Browser notifications</Text><Text style={styles.meta}>{webPushCapability.reason}</Text></View> : null}
     <View style={styles.card}>
       <Text style={styles.title}>Proactive review</Text>
       <Text style={styles.meta}>{activeRules} enabled rules · {display.proactive.candidates.length} saved candidates</Text>
