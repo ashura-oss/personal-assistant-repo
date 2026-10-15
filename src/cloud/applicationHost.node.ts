@@ -34,10 +34,10 @@ export function createCloudApplicationRuntimeFactory(options: CloudApplicationRu
   if (!options || typeof options !== 'object' || typeof options.workspacePortsFor !== 'function') {
     throw new TypeError('application_workspace_ports_factory_required');
   }
-  const factory: ApplicationRuntimeFactory = ({ kernel, vault, auth, runtimeSessionFor }) => {
+  const factory: ApplicationRuntimeFactory = ({ kernel, vault, auth, runtimeSessionFor, processInstanceId }) => {
     const oauthStages = new OAuthInstallStages(kernel, vault, auth);
     const oauthBindings = new ServerOAuthTokenBindings(kernel);
-    const runtime = new OwnedWorkspaceRuntime({ kernel, runtimeSessionFor, oauthInstall: { auth, vault, stages: oauthStages, bindings: oauthBindings },
+    const runtime = new OwnedWorkspaceRuntime({ kernel, runtimeSessionFor, processInstanceId, oauthInstall: { auth, vault, stages: oauthStages, bindings: oauthBindings },
       crypto: {
         randomUUID,
         async sha256(value) { return createHash('sha256').update(value).digest('hex'); },
@@ -76,7 +76,7 @@ export function createProductionApplicationRuntimeFactory(config: ServerConfig,
         ...(adapters.fetcher ? { fetcher: adapters.fetcher } : {}),
         ...(adapters.documentFileOperations ? { documentFileOperations: adapters.documentFileOperations } : {}),
       });
-  return ({ kernel, vault, auth, runtimeSessionFor }) => {
+  return ({ kernel, vault, auth, runtimeSessionFor, processInstanceId }) => {
     const fetcher = adapters.fetcher ?? globalThis.fetch;
     const responseLifetimeOwner = createNodeProviderResponseLifetimeOwner({ fetcher, createId: randomUUID });
     const registrations = [
@@ -90,6 +90,6 @@ export function createProductionApplicationRuntimeFactory(config: ServerConfig,
     return createCloudApplicationRuntimeFactory({
       workspacePortsFor: (context) => makeWorkspacePorts(context, vault, kernel),
       oauth: { provider, responseLifetimeOwner, config },
-    })({ kernel, vault, auth, runtimeSessionFor });
+    })({ kernel, vault, auth, runtimeSessionFor, processInstanceId });
   };
 }

@@ -49,6 +49,8 @@ export interface ProductionWorkspacePortsOptions {
   readonly fetcher?: typeof fetch;
   /** Narrow filesystem fault-injection port for private-document ownership tests. */
   readonly documentFileOperations?: PrivateDocumentFileOperations;
+  /** Test-only crash window after audio unlink and before its durable completion row. */
+  readonly beforePrivateAudioCleanupCompleteForTesting?: (intentId: string) => void;
 }
 
 export interface PrivateDocumentFileHandle {
@@ -128,7 +130,8 @@ class PrivateDocumentFileOwner {
 /** Build the real Node providers for one authoritative owner/epoch entry. */
 export function createProductionWorkspacePortsFor(config: Pick<ServerConfig,
   'dataDirectory' | 'googleClientId' | 'googleClientSecret' | 'microsoftClientId' | 'microsoftClientSecret' | 'microsoftAuthority'>,
-  options: Pick<ProductionWorkspacePortsOptions, 'fetcher' | 'ffmpegPath' | 'ffprobePath' | 'documentFileOperations'> = {}) {
+  options: Pick<ProductionWorkspacePortsOptions, 'fetcher' | 'ffmpegPath' | 'ffprobePath' | 'documentFileOperations' |
+    'beforePrivateAudioCleanupCompleteForTesting'> = {}) {
   if (!config || typeof config.dataDirectory !== 'string' || !config.dataDirectory || config.dataDirectory.includes('\0')) {
     throw new TypeError('production_workspace_data_directory_required');
   }
@@ -233,13 +236,12 @@ export function createProductionWorkspacePortsFor(config: Pick<ServerConfig,
     };
     audioRepo = new PrivateAudioRepository({ kernel, actorSessionToken: actorToken,
       privateRoot: join(config.dataDirectory, 'private-audio'), processId: context.processInstanceId,
+      ...(options.beforePrivateAudioCleanupCompleteForTesting
+        ? { beforeCleanupCompleteForTesting: options.beforePrivateAudioCleanupCompleteForTesting } : {}),
       ...(options.ffmpegPath ? { ffmpegPath: options.ffmpegPath } : {}), ...(options.ffprobePath ? { ffprobePath: options.ffprobePath } : {}),
       resolveAttachedMedia: resolveCurrentAttachedMedia,
     });
     context.store.installSnapshotCommitParticipant(audioRepo.createSnapshotCommitParticipant());
-    // This workspace/epoch is reached only after the application owner is held. Other workspace
-    // epochs remain lazy and are recovered when their authoritative runtime is first constructed.
-    await audioRepo.resumePendingSnapshotCleanup({ exclusiveOwnerStartup: true });
     const speechAudio = createNodeSpeechAudioService(audioRepo);
     const azureSpeech = new SharedAzureSpeechClient({ fetcher, audio: speechAudio,
       readKeySnapshot: async (capturedGeneration) => {

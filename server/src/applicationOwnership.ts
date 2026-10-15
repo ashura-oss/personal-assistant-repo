@@ -36,9 +36,90 @@ interface OwnershipState {
   readonly lockIdentity: FileIdentity;
   databaseIdentity?: FileIdentity;
   released: boolean;
+  startupClaimed?: boolean;
+  startupKernel?: object;
+  startupKernels?: Set<object>;
+  startupHostReserved?: boolean;
+  startupProcessId?: string;
+  startupPhase?: 'initializing' | 'recovering' | 'sealed' | 'closed';
+  startupReservation?: object;
+}
+
+export type ApplicationStartupPhase = 'initializing' | 'recovering' | 'sealed' | 'closed';
+
+export interface ApplicationStartupBinding {
+  readonly databasePath: string;
+  readonly processInstanceId: string;
 }
 
 const ownershipStates = new WeakMap<object, OwnershipState>();
+const startupReservations = new WeakMap<object, ApplicationOwnershipHandle>();
+
+export type ApplicationStartupReservation = object;
+
+/** One-shot host-only authority to construct the kernel before cold recovery. */
+export function reserveApplicationStartup(handle: ApplicationOwnershipHandle): ApplicationStartupReservation {
+  const state = stateFor(handle);
+  if (state.startupClaimed || state.startupReservation) throw new ApplicationOwnershipError('application_owner_unavailable');
+  const reservation = Object.freeze({});
+  state.startupReservation = reservation;
+  startupReservations.set(reservation, handle);
+  return reservation;
+}
+
+/** Kernels without the host reservation consume startup at construction and are sealed directly. */
+export function consumeApplicationStartupReservation(handle: ApplicationOwnershipHandle, kernel: object,
+  reservation?: ApplicationStartupReservation): void {
+  const state = stateFor(handle);
+  if (!kernel || typeof kernel !== 'object') throw new ApplicationOwnershipError('application_owner_unavailable');
+  if (reservation !== undefined) {
+    if (state.startupClaimed || state.startupReservation !== reservation || startupReservations.get(reservation) !== handle) throw new ApplicationOwnershipError('application_owner_unavailable');
+    startupReservations.delete(reservation);
+    delete state.startupReservation;
+    state.startupClaimed = true;
+    state.startupHostReserved = true;
+    state.startupKernel = kernel;
+    state.startupKernels = new Set([kernel]);
+    state.startupPhase = 'initializing';
+  } else {
+    if (state.startupReservation || (state.startupClaimed && (state.startupHostReserved || state.startupPhase !== 'sealed'))) {
+      throw new ApplicationOwnershipError('application_owner_unavailable');
+    }
+    if (state.startupClaimed) {
+      state.startupKernels?.add(kernel);
+      return;
+    }
+    state.startupClaimed = true;
+    state.startupKernel = kernel;
+    state.startupKernels = new Set([kernel]);
+    state.startupHostReserved = false;
+    state.startupPhase = 'sealed';
+  }
+}
+
+export function closeFailedApplicationStartup(handle: ApplicationOwnershipHandle, kernel: object): void {
+  const state = cleanupStateFor(handle);
+  if (!state.startupKernels?.has(kernel)) return;
+  state.startupKernels.delete(kernel);
+  if (state.startupHostReserved && state.startupKernel === kernel && state.startupPhase !== 'closed') state.startupPhase = 'closed';
+  else if (!state.startupKernels.size) state.startupPhase = 'closed';
+}
+
+/** Closes a successfully sealed kernel without permitting an unfinished host recovery to release its guard. */
+export function closeSealedApplicationStartup(handle: ApplicationOwnershipHandle, kernel: object): void {
+  const state = cleanupStateFor(handle);
+  if (!state.startupKernels?.has(kernel)) throw new ApplicationOwnershipError('application_owner_unavailable');
+  if (state.startupPhase === 'closed') { state.startupKernels.delete(kernel); return; }
+  if (state.startupPhase !== 'sealed') throw new ApplicationOwnershipError('application_owner_unavailable');
+  if (state.startupHostReserved) {
+    if (state.startupKernel !== kernel) throw new ApplicationOwnershipError('application_owner_unavailable');
+    state.startupPhase = 'closed';
+    state.startupKernels.delete(kernel);
+  } else {
+    state.startupKernels.delete(kernel);
+    if (!state.startupKernels.size) state.startupPhase = 'closed';
+  }
+}
 
 function sameIdentity(left: FileIdentity, right: FileIdentity): boolean { return left.dev === right.dev && left.ino === right.ino; }
 function isMissing(error: unknown): boolean { return typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT'; }
@@ -133,6 +214,13 @@ function stateFor(handle: ApplicationOwnershipHandle, checkDatabase = true): Own
   return state;
 }
 
+/** Cleanup after an explicit direct-owner release uses only already-held identity state. */
+function cleanupStateFor(handle: ApplicationOwnershipHandle): OwnershipState {
+  const state = handle && typeof handle === 'object' ? ownershipStates.get(handle as object) : undefined;
+  if (!state) throw new ApplicationOwnershipError('application_owner_path_unsafe');
+  return state;
+}
+
 /** Records and checks the database inode after SQLite has safely opened it. */
 export function bindApplicationDatabaseIdentity(handle: ApplicationOwnershipHandle): void {
   const state = stateFor(handle);
@@ -147,6 +235,52 @@ export function assertApplicationOwnership(handle: ApplicationOwnershipHandle, d
   const canonical = canonicalDatabasePath(databasePath, false);
   if (canonical !== state.databasePath) throw new ApplicationOwnershipError('application_owner_path_unsafe');
   return state.databasePath;
+}
+
+/** Internal one-shot binding used only by the private host startup composition. */
+export function claimApplicationStartup(handle: ApplicationOwnershipHandle, kernel: object,
+  databasePath: string, processInstanceId: string): ApplicationStartupBinding {
+  const state = stateFor(handle);
+  if (!kernel || typeof kernel !== 'object' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(processInstanceId) ||
+      assertApplicationOwnership(handle, databasePath) !== state.databasePath || !state.startupClaimed || state.startupKernel !== kernel ||
+      state.startupPhase !== 'initializing' || state.startupProcessId) {
+    throw new ApplicationOwnershipError('application_owner_path_unsafe');
+  }
+  state.startupProcessId = processInstanceId;
+  return Object.freeze({ databasePath: state.databasePath, processInstanceId });
+}
+
+/** Advances the owner-shared startup seal; another kernel sharing this owner cannot claim it. */
+export function transitionApplicationStartup(handle: ApplicationOwnershipHandle, kernel: object,
+  phase: ApplicationStartupPhase): void {
+  const state = stateFor(handle);
+  if (!state.startupClaimed || state.startupKernel !== kernel || !state.startupPhase) {
+    throw new ApplicationOwnershipError('application_owner_path_unsafe');
+  }
+  const allowed = state.startupPhase === 'initializing' && (phase === 'recovering' || phase === 'sealed') ||
+    state.startupPhase === 'recovering' && phase === 'sealed' || state.startupPhase === 'sealed' && phase === 'closed';
+  if (!allowed) throw new ApplicationOwnershipError('application_owner_path_unsafe');
+  state.startupPhase = phase;
+}
+
+export function assertApplicationStartupBinding(handle: ApplicationOwnershipHandle, kernel: object,
+  databasePath: string, processInstanceId: string, phase?: ApplicationStartupPhase): ApplicationStartupPhase {
+  const state = stateFor(handle);
+  if (!state.startupClaimed || state.startupKernel !== kernel || state.startupProcessId !== processInstanceId ||
+      state.databasePath !== canonicalDatabasePath(databasePath, false) || !state.startupPhase ||
+      (phase !== undefined && state.startupPhase !== phase)) {
+    throw new ApplicationOwnershipError('application_owner_path_unsafe');
+  }
+  return state.startupPhase;
+}
+
+/** Shared-owner seal check also rejects a second kernel that did not receive the host binding. */
+export function assertApplicationOwnerRuntimeSealed(handle: ApplicationOwnershipHandle, kernel: object): void {
+  const state = stateFor(handle);
+  if (state.startupClaimed && (state.startupPhase !== 'sealed' || !state.startupKernels?.has(kernel) ||
+      (state.startupHostReserved && state.startupKernel !== kernel))) {
+    throw new ApplicationOwnershipError('application_owner_unavailable');
+  }
 }
 
 /** Acquires the persistent database's non-expiring SQLite OS lock without touching the user database. */
@@ -173,6 +307,10 @@ export function acquireApplicationOwnership(databasePath: string): ApplicationOw
       release: () => {
         if (state.released) return;
         stateFor(handle, false);
+        if (state.startupReservation || (state.startupHostReserved && state.startupClaimed &&
+            (state.startupPhase !== 'closed' || Boolean(state.startupKernels?.size)))) {
+          throw new ApplicationOwnershipError('application_owner_unavailable');
+        }
         lock!.close();
         state.released = true;
       },

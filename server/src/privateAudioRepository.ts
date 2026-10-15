@@ -9,9 +9,13 @@ import type { SnapshotCommitParticipant, SnapshotCommitParticipantInput } from '
 import { ensurePrivateDirectory } from './config.js';
 import { currentCommandTicket } from './commandJournal.js';
 import { AudioVerificationError, verifyPrivateAudioFile, type PrivateAudioFormat } from './audioVerification.js';
+import { PRIVATE_AUDIO_SCHEMA_VERSION, assertPrivateAudioSchema, assertPrivateAudioSchemaVersion, isUnsupportedDirectorySyncError,
+  privateAudioStoragePath, privateAudioWorkspaceRoot, readPrivateAudioSchemaVersion } from './privateAudioStorage.js';
+export { PRIVATE_AUDIO_SCHEMA_VERSION, assertPrivateAudioSchema, assertPrivateAudioSchemaVersion, isUnsupportedDirectorySyncError,
+  privateAudioStoragePath, privateAudioWorkspaceRoot, readPrivateAudioSchemaVersion } from './privateAudioStorage.js';
 
 const MAX_AUDIO_BYTES = 40 * 1024 * 1024;
-const AUDIO_SCHEMA_VERSION = 4;
+const AUDIO_SCHEMA_VERSION = PRIVATE_AUDIO_SCHEMA_VERSION;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SHA256 = /^[a-f0-9]{64}$/i;
 const MIME: Readonly<Record<PrivateAudioFormat, string>> = Object.freeze({
@@ -184,15 +188,6 @@ function syncDirectory(path: string): void {
   }
   finally { if (handle !== undefined) closeSync(handle); }
 }
-export function isUnsupportedDirectorySyncError(platform: NodeJS.Platform, code: unknown): boolean {
-  return platform === 'win32' && ['EINVAL', 'ENOTSUP', 'EISDIR', 'EPERM', 'EACCES'].includes(String(code));
-}
-function pathInside(root: string, name: string): string {
-  if (!/^[0-9a-f-]{36}\.(?:part|audio)$/i.test(name)) throw new Error('audio_path_invalid');
-  const path = resolve(root, name);
-  if (dirname(path) !== root) throw new Error('audio_path_invalid');
-  return path;
-}
 function expectedMime(format: PrivateAudioFormat): string { return MIME[format]; }
 
 export class PrivateAudioRepository {
@@ -230,10 +225,11 @@ export class PrivateAudioRepository {
   constructor(options: PrivateAudioRepositoryOptions) {
     if (!isAbsolute(options.privateRoot) || options.privateRoot.includes('\0')) throw new Error('audio_root_invalid');
     this.#kernel = options.kernel;
+    if (typeof options.kernel.assertRuntimeStartupSealed === 'function') options.kernel.assertRuntimeStartupSealed();
     this.#actorToken = options.actorSessionToken;
     const identity = options.kernel.getOwnedIdentity(options.actorSessionToken);
     this.#identity = Object.freeze({ workspaceId: identity.workspaceId, ownerId: identity.ownerId, privacyEpoch: identity.privacyEpoch });
-    this.#root = resolve(options.privateRoot, identity.workspaceId);
+    this.#root = privateAudioWorkspaceRoot(options.privateRoot, identity.workspaceId);
     this.#ffmpegPath = options.ffmpegPath;
     this.#ffprobePath = options.ffprobePath;
     this.#processId = options.processId;
@@ -347,47 +343,8 @@ export class PrivateAudioRepository {
           UPDATE private_audio_schema SET version=${AUDIO_SCHEMA_VERSION} WHERE singleton=1 AND version=3;`);
         }
       }
-      const expectedColumns: Record<string, readonly { name: string; type: string; notnull: number; pk: number }[]> = {
-        private_audio_schema: [{ name: 'singleton', type: 'INTEGER', notnull: 0, pk: 1 }, { name: 'version', type: 'INTEGER', notnull: 1, pk: 0 }],
-        private_audio_uploads: [
-          ['upload_id', 'TEXT', 1, 1], ['media_id', 'TEXT', 1, 0], ['workspace_id', 'TEXT', 1, 0], ['owner_id', 'TEXT', 1, 0],
-          ['privacy_epoch', 'INTEGER', 1, 0], ['status', 'TEXT', 1, 0], ['temp_name', 'TEXT', 1, 0], ['final_name', 'TEXT', 1, 0],
-          ['file_name', 'TEXT', 1, 0], ['format', 'TEXT', 1, 0], ['mime_type', 'TEXT', 1, 0], ['expected_bytes', 'INTEGER', 0, 0],
-          ['sha256', 'TEXT', 0, 0], ['byte_length', 'INTEGER', 0, 0], ['duration_seconds', 'REAL', 0, 0], ['process_id', 'TEXT', 1, 0],
-          ['created_at', 'INTEGER', 1, 0], ['updated_at', 'INTEGER', 1, 0],
-        ].map(([name, type, notnull, pk]) => ({ name: String(name), type: String(type), notnull: Number(notnull), pk: Number(pk) })),
-        private_audio_speech_leases: [
-          ['lease_id', 'TEXT', 1, 1], ['upload_id', 'TEXT', 1, 0], ['media_id', 'TEXT', 1, 0], ['workspace_id', 'TEXT', 1, 0],
-          ['owner_id', 'TEXT', 1, 0], ['privacy_epoch', 'INTEGER', 1, 0], ['note_id', 'TEXT', 1, 0], ['note_revision', 'INTEGER', 1, 0],
-          ['sha256', 'TEXT', 1, 0], ['byte_length', 'INTEGER', 1, 0], ['duration_seconds', 'REAL', 1, 0], ['process_id', 'TEXT', 1, 0], ['created_at', 'INTEGER', 1, 0],
-        ].map(([name, type, notnull, pk]) => ({ name: String(name), type: String(type), notnull: Number(notnull), pk: Number(pk) })),
-        private_audio_readers: [
-          ['reader_id', 'TEXT', 1, 1], ['media_id', 'TEXT', 1, 0], ['workspace_id', 'TEXT', 1, 0], ['owner_id', 'TEXT', 1, 0],
-          ['privacy_epoch', 'INTEGER', 1, 0], ['process_id', 'TEXT', 1, 0], ['created_at', 'INTEGER', 1, 0],
-        ].map(([name, type, notnull, pk]) => ({ name: String(name), type: String(type), notnull: Number(notnull), pk: Number(pk) })),
-        private_audio_capture_uploads: [
-          ['upload_id', 'TEXT', 1, 1], ['capture_id', 'TEXT', 1, 0], ['capture_revision', 'TEXT', 1, 0], ['workspace_id', 'TEXT', 1, 0],
-          ['owner_id', 'TEXT', 1, 0], ['privacy_epoch', 'INTEGER', 1, 0], ['captured_at', 'TEXT', 1, 0], ['time_zone', 'TEXT', 1, 0],
-          ['mime_type', 'TEXT', 1, 0], ['expected_bytes', 'INTEGER', 0, 0], ['media_id', 'TEXT', 1, 0], ['format', 'TEXT', 1, 0],
-          ['sha256', 'TEXT', 0, 0], ['byte_length', 'INTEGER', 0, 0], ['duration_seconds', 'REAL', 0, 0], ['status', 'TEXT', 1, 0], ['failure_code', 'TEXT', 0, 0],
-          ['consumed_command_id', 'TEXT', 0, 0], ['note_id', 'TEXT', 0, 0], ['note_revision', 'INTEGER', 0, 0],
-          ['created_at', 'INTEGER', 1, 0], ['updated_at', 'INTEGER', 1, 0],
-        ].map(([name, type, notnull, pk]) => ({ name: String(name), type: String(type), notnull: Number(notnull), pk: Number(pk) })),
-        private_audio_cleanup_intents: [
-          ['intent_id', 'TEXT', 1, 1], ['workspace_id', 'TEXT', 1, 0], ['owner_id', 'TEXT', 1, 0], ['privacy_epoch', 'INTEGER', 1, 0],
-          ['media_id', 'TEXT', 1, 0], ['source_note_id', 'TEXT', 1, 0], ['snapshot_revision', 'INTEGER', 1, 0], ['command_id', 'TEXT', 0, 0],
-          ['status', 'TEXT', 1, 0], ['created_at', 'INTEGER', 1, 0], ['updated_at', 'INTEGER', 1, 0],
-        ].map(([name, type, notnull, pk]) => ({ name: String(name), type: String(type), notnull: Number(notnull), pk: Number(pk) })),
-      };
-      for (const [table, expected] of Object.entries(expectedColumns)) {
-        const columns = db.pragma(`table_info(${table})`) as { name: string; type: string; notnull: number; pk: number }[];
-        if (columns.length !== expected.length || columns.some((column, index) => {
-          const target = expected[index]!;
-          return column.name !== target.name || column.type.toUpperCase() !== target.type || column.notnull !== target.notnull || column.pk !== target.pk;
-        })) throw new Error(`audio_schema_invalid:${table}`);
-        const listed = db.prepare('SELECT strict FROM pragma_table_list WHERE name=?').get(table) as { strict: number } | undefined;
-        if (!listed || listed.strict !== 1) throw new Error('audio_schema_invalid');
-      }
+      assertPrivateAudioSchemaVersion(db);
+      assertPrivateAudioSchema(db);
     });
   }
 
@@ -692,7 +649,7 @@ export class PrivateAudioRepository {
     });
   }
   #directory(): string { return this.#root; }
-  #safePath(name: string): string { return pathInside(this.#directory(), name); }
+  #safePath(name: string): string { return privateAudioStoragePath(this.#directory(), name); }
   #rowByMedia(context: OwnedTransactionContext, mediaId: string): AudioRow | undefined {
     return context.db.prepare('SELECT * FROM private_audio_uploads WHERE media_id=? AND workspace_id=? AND owner_id=? AND privacy_epoch=?')
       .get(mediaId, context.workspaceId, context.ownerId, context.privacyEpoch) as AudioRow | undefined;

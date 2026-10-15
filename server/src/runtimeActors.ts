@@ -49,7 +49,9 @@ export class ProcessWorkspaceActors {
   private accepting = true;
   private closePromise: Promise<void> | undefined;
 
-  constructor(private readonly kernel: DurableKernel) {}
+  constructor(private readonly kernel: DurableKernel) {
+    if (typeof kernel.assertRuntimeStartupSealed === 'function') kernel.assertRuntimeStartupSealed();
+  }
 
   /** Resolver callback intended only for the trusted WorkspaceRegistry composition. */
   sessionForRegistry(identity: OwnedWorkspaceIdentity): string {

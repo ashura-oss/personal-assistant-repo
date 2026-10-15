@@ -65,6 +65,8 @@ export interface OwnedWorkspaceFactoryPorts extends OwnedWorkspaceRuntimePorts {
 interface OwnedWorkspaceRuntimeCommonOptions {
   readonly kernel: DurableKernel;
   readonly runtimeSessionFor: RuntimeSessionResolver;
+  /** Host-wide identity supplied by the private startup composition. */
+  readonly processInstanceId?: string;
   readonly crypto: ControllerCryptoPort;
   /** Test-only fault injection for the child receipt's post-commit acknowledgement boundary. */
   readonly afterSpeechCleanupCommitForTesting?: () => void;
@@ -136,12 +138,17 @@ export class OwnedWorkspaceRuntime {
   private readonly idleWaiters = new Map<string, Set<() => void>>();
   private readonly continuationQueues = new Map<string, Promise<void>>();
   private readonly inFlight = new Set<Promise<unknown>>();
-  private readonly processInstanceId = randomUUID();
+  private readonly processInstanceId: string;
   private closing = false;
   private closePromise?: Promise<void>;
 
   constructor(private readonly options: OwnedWorkspaceRuntimeOptions) {
     validateRuntimeConfiguration(options);
+    if (typeof options.kernel.assertRuntimeStartupSealed === 'function') options.kernel.assertRuntimeStartupSealed();
+    this.processInstanceId = options.processInstanceId ?? randomUUID();
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(this.processInstanceId)) {
+      throw new TypeError('runtime_process_instance_invalid');
+    }
     this.journal = new CommandJournal(options.kernel, options.oauthInstall ? { oauthInstall: options.oauthInstall } : {});
     this.registry = new WorkspaceRegistry<AppControllerImpl, AppState>(options.kernel, this.journal,
       options.runtimeSessionFor, async (context) => {

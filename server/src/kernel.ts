@@ -1,7 +1,12 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import Database from 'better-sqlite3';
 import { isValidAccountId } from './accountIds.js';
-import { acquireApplicationOwnership, assertApplicationOwnership, bindApplicationDatabaseIdentity, type ApplicationOwnershipHandle } from './applicationOwnership.js';
+import { acquireApplicationOwnership, assertApplicationOwnerRuntimeSealed, assertApplicationOwnership, bindApplicationDatabaseIdentity,
+  consumeApplicationStartupReservation, closeFailedApplicationStartup, closeSealedApplicationStartup,
+  type ApplicationOwnershipHandle, type ApplicationStartupReservation } from './applicationOwnership.js';
+import { assertApplicationRuntimeStartupSealed, assertApplicationStartupCapability, createApplicationStartupCursor,
+  readApplicationStartupCursor, readApplicationStartupIntentCursor, createApplicationStartupIntentCursor,
+  type ApplicationStartupCapability, type ApplicationStartupCursor } from './applicationStartup.js';
 
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SHA256 = /^[0-9a-f]{64}$/i;
@@ -18,6 +23,8 @@ export interface KernelOptions {
   readonly now?: () => number;
   /** Trusted in-process composition only; persistent kernels otherwise acquire their own guard. */
   readonly applicationOwnership?: ApplicationOwnershipHandle;
+  /** Private host-only one-shot reservation; ordinary callers must omit it. */
+  readonly startupReservation?: ApplicationStartupReservation;
 }
 
 export interface WorkspaceSnapshot {
@@ -137,8 +144,9 @@ export class KernelStartupCleanupError extends Error {
 }
 
 function closeAfterFailedKernelConstruction(database: Database.Database | undefined, ownership: ApplicationOwnershipHandle | undefined,
-  ownsOwnership: boolean): void {
+  ownsOwnership: boolean, kernel?: object): void {
   if (database?.open) database.close();
+  if (ownership && kernel) closeFailedApplicationStartup(ownership, kernel);
   if (ownsOwnership) ownership?.release();
 }
 
@@ -306,12 +314,116 @@ export class DurableKernel {
   private readonly ownsApplicationOwnership: boolean;
   private closed = false;
 
+  /** Internal identity check used when the host binds its one-shot startup capability. */
+  assertApplicationStartupBinding(ownership: ApplicationOwnershipHandle, canonicalPath: string): void {
+    if (this.applicationOwnership !== ownership || this.options.databasePath === ':memory:' ||
+        assertApplicationOwnership(ownership, this.options.databasePath) !== canonicalPath) {
+      throw new TypeError('application_startup_kernel_binding_invalid');
+    }
+  }
+
+  assertRuntimeStartupSealed(): void {
+    assertApplicationRuntimeStartupSealed(this);
+  }
+
+  /** Called by applicationStartup for kernels absent from its host-start binding map. */
+  assertOwnedStartupStateSealed(): void {
+    if (this.applicationOwnership) assertApplicationOwnerRuntimeSealed(this.applicationOwnership, this);
+  }
+
+  /** Narrow cold-start metadata page; pending-intent workspaces without an owner remain visible. */
+  listColdStartWorkspacePage(capability: ApplicationStartupCapability, cursor: ApplicationStartupCursor, limit: number): Readonly<{
+    readonly entries: readonly Readonly<{ workspaceId: string; ownerId?: string; privacyEpoch?: number; revision?: number }>[];
+    readonly nextCursor?: ApplicationStartupCursor;
+  }> {
+    assertApplicationStartupCapability(capability, this);
+    const afterWorkspaceId = readApplicationStartupCursor(capability, cursor);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) {
+      throw new TypeError('application_startup_page_invalid');
+    }
+    return this.withTrustedDatabaseTransaction((db) => {
+      const audioSchema = db.prepare("SELECT 1 AS present FROM sqlite_master WHERE type='table' AND name='private_audio_cleanup_intents'").get();
+      const rows = audioSchema
+        ? db.prepare(`WITH candidate AS (
+            SELECT id AS workspace_id,owner_id,privacy_epoch,revision FROM workspaces WHERE id>?
+            UNION ALL
+            SELECT i.workspace_id,NULL AS owner_id,NULL AS privacy_epoch,NULL AS revision
+              FROM private_audio_cleanup_intents i LEFT JOIN workspaces w ON w.id=i.workspace_id
+              WHERE i.status='pending' AND w.id IS NULL AND i.workspace_id>?
+          ) SELECT workspace_id,MIN(owner_id) AS owner_id,MIN(privacy_epoch) AS privacy_epoch,MIN(revision) AS revision
+            FROM candidate GROUP BY workspace_id ORDER BY workspace_id LIMIT ?`)
+          .all(afterWorkspaceId, afterWorkspaceId, limit + 1) as { workspace_id: unknown; owner_id: unknown; privacy_epoch: unknown; revision: unknown }[]
+        : db.prepare('SELECT id AS workspace_id,owner_id,privacy_epoch,revision FROM workspaces WHERE id>? ORDER BY id LIMIT ?')
+          .all(afterWorkspaceId, limit + 1) as { workspace_id: unknown; owner_id: unknown; privacy_epoch: unknown; revision: unknown }[];
+      const hasMore = rows.length > limit;
+      const entries = Object.freeze(rows.slice(0, limit).map((row) => Object.freeze({ workspaceId: row.workspace_id as string,
+        ...(row.owner_id === null ? {} : { ownerId: row.owner_id as string }),
+        ...(row.privacy_epoch === null ? {} : { privacyEpoch: row.privacy_epoch as number }),
+        ...(row.revision === null ? {} : { revision: row.revision as number }) })));
+      const last = entries[entries.length - 1]?.workspaceId;
+      return Object.freeze({ entries, ...(hasMore && last ? { nextCursor: createApplicationStartupCursor(capability, last) } : {}) });
+    });
+  }
+
+  listColdStartIntentPage(capability: ApplicationStartupCapability, workspaceId: string, cursor: ApplicationStartupCursor, limit: number): Readonly<{
+    readonly entries: readonly Readonly<{ intent_id: unknown; workspace_id: unknown; owner_id: unknown; privacy_epoch: unknown; media_id: unknown;
+      source_note_id: unknown; snapshot_revision: unknown; command_id: unknown; status: unknown; created_at: unknown; updated_at: unknown }>[];
+    readonly nextCursor?: ApplicationStartupCursor;
+  }> {
+    assertApplicationStartupCapability(capability, this);
+    const afterIntentId = readApplicationStartupIntentCursor(capability, cursor, workspaceId);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) throw new TypeError('application_startup_page_invalid');
+    return this.withTrustedDatabaseTransaction((db) => {
+      if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='private_audio_cleanup_intents'").get()) {
+        return Object.freeze({ entries: Object.freeze([]) });
+      }
+      const rows = db.prepare(`SELECT intent_id,workspace_id,owner_id,privacy_epoch,media_id,source_note_id,snapshot_revision,command_id,status,created_at,updated_at
+        FROM private_audio_cleanup_intents WHERE workspace_id=? AND status='pending' AND intent_id>? ORDER BY intent_id LIMIT ?`)
+        .all(workspaceId, afterIntentId, limit + 1) as { intent_id: unknown; workspace_id: unknown; owner_id: unknown; privacy_epoch: unknown; media_id: unknown;
+          source_note_id: unknown; snapshot_revision: unknown; command_id: unknown; status: unknown; created_at: unknown; updated_at: unknown }[];
+      const hasMore = rows.length > limit;
+      const entries = Object.freeze(rows.slice(0, limit).map((row) => Object.freeze(row)));
+      const last = entries[entries.length - 1]?.intent_id;
+      return Object.freeze({ entries, ...(hasMore && typeof last === 'string'
+        ? { nextCursor: createApplicationStartupIntentCursor(capability, workspaceId, last) } : {}) });
+    });
+  }
+
+  readColdStartWorkspace(capability: ApplicationStartupCapability, workspaceId: string): Readonly<{
+    workspaceId: string; ownerId: string; privacyEpoch: number; revision: number; schemaVersion: number; snapshot: JsonValue;
+  }> | undefined {
+    assertApplicationStartupCapability(capability, this);
+    return this.withTrustedDatabaseTransaction((db) => {
+      const row = db.prepare('SELECT id,owner_id,privacy_epoch,revision,schema_version,snapshot_json FROM workspaces WHERE id=?')
+        .get(workspaceId) as { id: unknown; owner_id: unknown; privacy_epoch: unknown; revision: unknown; schema_version: unknown; snapshot_json: unknown } | undefined;
+      if (!row) return undefined;
+      if (typeof row.snapshot_json !== 'string' || !Number.isSafeInteger(row.revision) || !Number.isSafeInteger(row.privacy_epoch) ||
+          !Number.isSafeInteger(row.schema_version)) throw new TypeError('application_startup_workspace_invalid');
+      const snapshot = parseStoredJson(row.snapshot_json);
+      this.options.validateSnapshot(snapshot);
+      return Object.freeze({ workspaceId: row.id as string, ownerId: row.owner_id as string, privacyEpoch: row.privacy_epoch as number,
+        revision: row.revision as number, schemaVersion: row.schema_version as number, snapshot });
+    });
+  }
+
+  validateColdStartSnapshot(capability: ApplicationStartupCapability, snapshot: unknown): void {
+    assertApplicationStartupCapability(capability, this);
+    this.options.validateSnapshot(snapshot);
+  }
+
+  /** Trusted startup-only synchronous transaction; the capability is never returned by this kernel. */
+  withColdStartDatabaseTransaction<T>(capability: ApplicationStartupCapability,
+    callback: (db: Database.Database) => T): T {
+    assertApplicationStartupCapability(capability, this);
+    return this.withTrustedDatabaseTransaction(callback);
+  }
+
   constructor(private readonly options: KernelOptions) {
     if (typeof options.validateSnapshot !== 'function') throw new TypeError('A trusted snapshot validator is required.');
     if (!options.databasePath) throw new TypeError('A database path is required.');
     this.now = options.now ?? Date.now;
     if (options.databasePath === ':memory:') {
-      if (options.applicationOwnership) throw new TypeError('In-memory kernels cannot receive persistent ownership.');
+      if (options.applicationOwnership || options.startupReservation) throw new TypeError('In-memory kernels cannot receive persistent ownership.');
       this.ownsApplicationOwnership = false;
       this.db = new Database(':memory:');
       this.db.pragma('foreign_keys = ON');
@@ -325,6 +437,7 @@ export class DurableKernel {
       let database: Database.Database | undefined;
       try {
         const canonicalDatabasePath = assertApplicationOwnership(ownership, options.databasePath);
+        consumeApplicationStartupReservation(ownership, this, options.startupReservation);
         database = new Database(canonicalDatabasePath);
         this.db = database;
         bindApplicationDatabaseIdentity(ownership);
@@ -334,10 +447,9 @@ export class DurableKernel {
         this.db.pragma('journal_mode = WAL');
       } catch (error) {
         try {
-          if (database?.open) closeAfterFailedKernelConstruction(database, ownership, this.ownsApplicationOwnership);
-          else if (this.ownsApplicationOwnership) ownership.release();
+          closeAfterFailedKernelConstruction(database, ownership, this.ownsApplicationOwnership, this);
         } catch {
-          const retryClose = () => closeAfterFailedKernelConstruction(database, ownership, this.ownsApplicationOwnership);
+          const retryClose = () => closeAfterFailedKernelConstruction(database, ownership, this.ownsApplicationOwnership, this);
           throw new KernelStartupCleanupError(retryClose);
         }
         throw error;
@@ -345,9 +457,9 @@ export class DurableKernel {
     }
     try { this.migrate(); }
     catch (error) {
-      try { closeAfterFailedKernelConstruction(this.db, this.applicationOwnership, this.ownsApplicationOwnership); }
+      try { closeAfterFailedKernelConstruction(this.db, this.applicationOwnership, this.ownsApplicationOwnership, this); }
       catch {
-        const retryClose = () => closeAfterFailedKernelConstruction(this.db, this.applicationOwnership, this.ownsApplicationOwnership);
+        const retryClose = () => closeAfterFailedKernelConstruction(this.db, this.applicationOwnership, this.ownsApplicationOwnership, this);
         throw new KernelStartupCleanupError(retryClose);
       }
       throw error;
@@ -802,6 +914,7 @@ export class DurableKernel {
   close(): void {
     if (this.closed) return;
     if (this.db.open) this.db.close();
+    if (this.applicationOwnership) closeSealedApplicationStartup(this.applicationOwnership, this);
     if (this.ownsApplicationOwnership) this.applicationOwnership?.release();
     this.closed = true;
   }

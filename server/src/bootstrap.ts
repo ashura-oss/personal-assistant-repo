@@ -8,6 +8,8 @@ import { SecretVault } from './vault.js';
 import { createInitialWorkspaceState } from './sharedControllerNode.mjs';
 import { acquireApplicationOwnership, ApplicationOwnershipStartupCleanupError, type ApplicationOwnershipHandle } from './applicationOwnership.js';
 import { drainAcceptedHttpRequests } from './httpRequestDrain.js';
+import { registerApplicationStartup, type ApplicationStartup } from './applicationStartup.js';
+import { reserveApplicationStartup } from './applicationOwnership.js';
 
 export interface ServerFoundationOptions {
   readonly validateSnapshot?: (snapshot: unknown) => void;
@@ -26,6 +28,8 @@ export interface ServerFoundation {
 export interface PrivateServerFoundationContext {
   readonly kernel: DurableKernel;
   readonly vault: SecretVault;
+  readonly startup: ApplicationStartup;
+  readonly processInstanceId: string;
 }
 
 export interface OpenedServerFoundation {
@@ -73,6 +77,7 @@ export function openServerFoundationInternal(config: ServerConfig, options: Serv
   let vault: SecretVault | undefined;
   let auth: AuthService | undefined;
   let credentialCommands: ServerCredentialCommandService | undefined;
+  let startup: ApplicationStartup | undefined;
   let kernelStartupCleanupRetry: (() => void) | undefined;
   let kernelStartupCleanupComplete = false;
   let authClosed = false;
@@ -80,6 +85,7 @@ export function openServerFoundationInternal(config: ServerConfig, options: Serv
   let kernelClosed = false;
   let ownershipReleased = false;
   const closeConstructed = () => {
+    if (startup) startup.close();
     if (auth && !authClosed) { auth.close(); authClosed = true; }
     if (vault && !vaultClosed) { vault.close(); vaultClosed = true; }
     if (kernel && !kernelClosed) { kernel.close(); kernelClosed = true; }
@@ -93,9 +99,12 @@ export function openServerFoundationInternal(config: ServerConfig, options: Serv
     applicationOwnership = acquireApplicationOwnership(config.databasePath);
     rootKey = loadOrCreateVaultRootKey(config);
     authSecret = deriveAuthSecret(rootKey);
+    const startupReservation = reserveApplicationStartup(applicationOwnership);
     kernel = createDurableKernel({ databasePath: config.databasePath,
       validateSnapshot: options.validateSnapshot ?? validatePhysicalWorkspaceSnapshot,
-      applicationOwnership });
+      applicationOwnership, startupReservation });
+    const processInstanceId = randomUUID();
+    startup = registerApplicationStartup(kernel, applicationOwnership, config.databasePath, processInstanceId);
     auth = new AuthService(kernel, { canonicalOrigin: config.canonicalOrigin,
       ...(config.allowLocalHttp ? { allowLocalHttp: true } : {}), authSecret });
     vault = new SecretVault(kernel, rootKey);
@@ -115,7 +124,8 @@ export function openServerFoundationInternal(config: ServerConfig, options: Serv
         catch { throw new ServerFoundationStartupCleanupError(closeConstructed); }
       },
     });
-    return Object.freeze({ foundation, privateContext: Object.freeze({ kernel: activeKernel, vault: activeVault }) });
+    return Object.freeze({ foundation, privateContext: Object.freeze({ kernel: activeKernel, vault: activeVault,
+      startup, processInstanceId }) });
   } catch (error) {
     if (error instanceof KernelStartupCleanupError || error instanceof ApplicationOwnershipStartupCleanupError) {
       kernelStartupCleanupRetry = () => error.retryClose();
@@ -131,7 +141,10 @@ export function openServerFoundationInternal(config: ServerConfig, options: Serv
 
 /** Opens the provider-free local foundation without returning internal composition handles. */
 export function openServerFoundation(config: ServerConfig, options: ServerFoundationOptions = {}): ServerFoundation {
-  return openServerFoundationInternal(config, options).foundation;
+  const opened = openServerFoundationInternal(config, options);
+  opened.privateContext.startup.beginRecovery();
+  opened.privateContext.startup.seal();
+  return opened.foundation;
 }
 
 /** Binds only after explicit start and closes the HTTP listener before its foundation. */

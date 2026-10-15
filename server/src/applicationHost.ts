@@ -11,6 +11,8 @@ import type { AuthService } from './auth.js';
 import type { RuntimeSessionResolver } from './workspaceRegistry.js';
 import type { WorkspaceHttpApi } from './workspaceHttp.js';
 import type { OAuthHttpApi } from './oauthHttp.js';
+import { AudioColdStartRecovery } from './audioColdStartRecovery.js';
+import { join } from 'node:path';
 
 /** Trusted runtime owner contract. It contains no caller supplied workspace authority. */
 export interface ApplicationRuntime {
@@ -28,6 +30,8 @@ export interface ApplicationRuntimeFactoryContext {
   readonly vault: SecretVault;
   readonly auth: AuthService;
   readonly runtimeSessionFor: RuntimeSessionResolver;
+  /** One UUID shared by every private media runtime in this host process. */
+  readonly processInstanceId: string;
 }
 
 export type ApplicationRuntimeFactory =
@@ -204,6 +208,32 @@ export async function startApplicationHost(options: ApplicationHostOptions): Pro
     }
     throw error;
   }
+  const startup = opened.privateContext.startup;
+  let recovery: AudioColdStartRecovery | undefined;
+  let recoverySettled = false;
+  try {
+    startup.beginRecovery();
+    recovery = new AudioColdStartRecovery({ kernel: opened.privateContext.kernel,
+      capability: startup.capability, privateRoot: join(options.config.dataDirectory, 'private-audio'),
+      processInstanceId: opened.privateContext.processInstanceId });
+    await recovery.run();
+    recoverySettled = true;
+  } catch (error) {
+    try { await recovery?.retryCloseOwnedDescriptors(); }
+    catch {
+      throw new ApplicationHostStartupCleanupError(async () => {
+        await recovery?.retryCloseOwnedDescriptors();
+        startup.seal();
+        opened.foundation.close();
+      });
+    }
+    try { startup.seal(); opened.foundation.close(); }
+    catch { throw new ApplicationHostStartupCleanupError(async () => { startup.seal(); opened.foundation.close(); }); }
+    throw new ApplicationHostStartError();
+  } finally {
+    // Recovery's run() has settled all per-workspace file operations before this seal.
+    if (recoverySettled) startup.seal();
+  }
   const actors = new ProcessWorkspaceActors(opened.privateContext.kernel);
   const owner = new ApplicationHostOwner(opened.foundation, actors);
   try {
@@ -212,6 +242,7 @@ export async function startApplicationHost(options: ApplicationHostOptions): Pro
       vault: opened.privateContext.vault,
       auth: opened.foundation.auth,
       runtimeSessionFor: (identity: OwnedWorkspaceIdentity) => actors.sessionForRegistry(identity),
+      processInstanceId: opened.privateContext.processInstanceId,
     }));
     if (runtime && typeof runtime === 'object' && typeof runtime.stopAdmission === 'function' &&
         typeof runtime.drainAndDispose === 'function') owner.attachRuntime(runtime);
