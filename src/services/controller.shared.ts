@@ -77,7 +77,7 @@ import type { MailAlertNotificationBackend } from './mailAlertNotificationBacken
 import { canonicalMailReplySource, createMailReplySource, defaultReplyRecipients, replyReferences, validateMailReplySource, validateReplyBinding } from '../mailReply';
 import { emptyKnowledgeState, getKnowledgeEntity, knowledgeContextSources, validateKnowledgeState, validateKnowledgeSuggestion } from '../knowledge';
 import type { ContactClaim, KnowledgeChange, KnowledgeEntityKind, KnowledgeEvidence, KnowledgeFact, KnowledgeReference, KnowledgeSourceLink, KnowledgeSuggestion, Person, Project, ProjectMember } from '../knowledge';
-import { BACKUP_LIMITS, PORTABLE_BACKUP_FORMAT, canonicalPortableContent, legacyCanonicalPortableContentV2, legacyCanonicalPortableContentV3, createPortableBackup, parsePortableBackup, summarizePortableBackup, validatePortableDocumentPath, validateImportedBackupArchive } from '../backup';
+import { BACKUP_LIMITS, PORTABLE_BACKUP_FORMAT, PORTABLE_BACKUP_V5_FORMAT, canonicalPortableContent, legacyCanonicalPortableContentV2, legacyCanonicalPortableContentV3, createPortableBackup, parsePortableBackup, summarizePortableBackup, validatePortableDocumentPath, validateImportedBackupArchive } from '../backup';
 import type { ImportedBackupArchive, PortableBackup, PortableKnowledgeCohort } from '../backup';
 import { createPortableChatHistory, materializeInertChatHistory } from '../chat/portable';
 import { SpeechTranscriptionError, validateTranscriptionState, validateSpeechAudioSnapshot } from '../transcription';
