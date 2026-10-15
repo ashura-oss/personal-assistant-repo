@@ -13295,12 +13295,13 @@ export class AppControllerImpl implements AppController {
       const created: ImportedBackupArchive = currentArchive ?? {
         id: session.archiveId, contentHash: session.preview.contentHash, fileHash: session.preview.fileHash,
         sourceFormat: session.preview.sourceFormat, exportedAt: backup.exportedAt, importedAt: now(),
-        noteLinks: [], taskLinks: [], documents: [], history: [], ...(session.preview.sourceFormat === PORTABLE_BACKUP_FORMAT ? { chatHistory: clone(session.chatHistory) } : {}),
+        noteLinks: [], taskLinks: [], documents: [], history: [], ...((session.preview.sourceFormat === PORTABLE_BACKUP_FORMAT || session.preview.sourceFormat === PORTABLE_BACKUP_V5_FORMAT) ? { chatHistory: clone(session.chatHistory) } : {}),
       };
       if (currentArchive) {
         currentArchive.noteLinks = noteLinks;
         currentArchive.taskLinks = taskLinks;
-        if (session.preview.sourceFormat === PORTABLE_BACKUP_FORMAT && currentArchive.sourceFormat === PORTABLE_BACKUP_FORMAT && !currentArchive.chatHistory) {
+        if ((session.preview.sourceFormat === PORTABLE_BACKUP_FORMAT || session.preview.sourceFormat === PORTABLE_BACKUP_V5_FORMAT) &&
+            (currentArchive.sourceFormat === PORTABLE_BACKUP_FORMAT || currentArchive.sourceFormat === PORTABLE_BACKUP_V5_FORMAT) && !currentArchive.chatHistory) {
           currentArchive.chatHistory = clone(session.chatHistory);
         }
       } else {

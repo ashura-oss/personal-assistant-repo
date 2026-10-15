@@ -1,6 +1,6 @@
 import type { AppState, NoteAssistResult, Proposal } from '../core';
 import { emptyKnowledgeState, renderKnowledgeMarkdown, validateKnowledgeState, type KnowledgeState } from '../knowledge';
-import { PORTABLE_CHAT_HISTORY_VERSION, projectInertImportedChatHistory, validateInertImportedChatHistory, validatePortableChatHistory,
+import { PORTABLE_CHAT_HISTORY_VERSION, PORTABLE_CHAT_HISTORY_V2, projectInertImportedChatHistory, validateInertImportedChatHistory, validatePortableChatHistory,
   type InertImportedChatConversation, type PortableChatHistory } from '../chat/portable';
 
 export const PORTABLE_BACKUP_FORMAT = 'still-backup-v4' as const;
@@ -880,9 +880,15 @@ export function createPortableBackup(state: AppState, metadata: PortableBackupMe
   const stateDocuments = (state as AppState & { documents: PortableDocument[] }).documents;
   const importedChatConversations = projectInertImportedChatHistory((state.importedBackups ?? []).flatMap((archive) => archive.chatHistory ?? [])).conversations;
   const liveChat = validatePortableChatHistory(liveChatHistory ?? { version: PORTABLE_CHAT_HISTORY_VERSION, conversations: [] });
+  // The merged export must retain the strict history version required by any
+  // policy marker already present in either source. Never downgrade validated
+  // content into the legacy v1 schema.
+  const chatHistoryVersion = liveChat.version === PORTABLE_CHAT_HISTORY_V2 || importedChatConversations.some((conversation) =>
+    conversation.turns.some((turn) => turn.reply && Object.prototype.hasOwnProperty.call(turn.reply, 'outputPolicyVersion')))
+    ? PORTABLE_CHAT_HISTORY_V2 : PORTABLE_CHAT_HISTORY_VERSION;
   const backup: PortableBackupV4 = {
     format: PORTABLE_BACKUP_FORMAT, schemaVersion: PORTABLE_BACKUP_SCHEMA_VERSION,
-    chatHistory: validatePortableChatHistory({ version: PORTABLE_CHAT_HISTORY_VERSION,
+    chatHistory: validatePortableChatHistory({ version: chatHistoryVersion,
       conversations: [...liveChat.conversations, ...importedChatConversations] }),
     exportId: validateId(metadata.exportId, 'Backup export ID'), exportedAt: validateDate(metadata.exportedAt, 'Backup export time'), audioIncluded: false,
     notes: portableNotes.map((note) => {
@@ -966,7 +972,7 @@ export function createPortableBackup(state: AppState, metadata: PortableBackupMe
         return { path: entity?.narrativePath ?? '', content: narrative.content, revision: narrative.revision, updatedAt: narrative.updatedAt };
       }), true) });
   }
-  const outputPolicyMarker = history.some((item) => item.outputPolicyVersion === 2) || containsOutputPolicyMarker(backup.knowledge.state) ||
+  const outputPolicyMarker = backup.chatHistory.version === PORTABLE_CHAT_HISTORY_V2 || history.some((item) => item.outputPolicyVersion === 2) || containsOutputPolicyMarker(backup.knowledge.state) ||
     backup.archivedKnowledge.some((cohort) => containsOutputPolicyMarker(cohort.knowledge.state)) ||
     backup.chatHistory.conversations.some((conversation) => conversation.turns.some((turn) => turn.reply?.outputPolicyVersion !== undefined));
   if (outputPolicyMarker) return normalizeV5({ ...backup, format: PORTABLE_BACKUP_V5_FORMAT, schemaVersion: PORTABLE_BACKUP_V5_SCHEMA_VERSION });

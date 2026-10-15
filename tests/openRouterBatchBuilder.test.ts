@@ -76,7 +76,7 @@ describe('OpenRouter Batch local request builder', () => {
     expect(prepared.includedSourceIds).toContain('chat_refinement_parent:parent');
     await expect(new OpenRouterBatchRequestBuilder().prepareAnalysis(note, [], settings, {
       intent: 'answer', chatMode: true, operation: 'chat_refinement', chatRefinement: true,
-    }, 2)).rejects.toThrow(/profile-2 request and explicit reasoning effort/i);
+    }, 2)).rejects.toThrow(/explicit request profile and reasoning effort/i);
     await expect(new OpenRouterBatchRequestBuilder().prepareAnalysis(note, [], settings, {
       intent: 'answer', reasoningEffortOverride: 'high',
     }, 2)).rejects.toThrow(/reserved for explicit chat refinement/i);

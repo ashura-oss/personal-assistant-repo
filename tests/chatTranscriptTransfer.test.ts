@@ -206,7 +206,10 @@ describe('saved transcript to Chat transfer', () => {
     expect(sourceApp.getSnapshot().assistantChatConversations?.[0]?.turns[0]?.messageOrigin).toBe('saved_transcript');
 
     const liveExport = await sourceApp.exportData();
-    const strictLiveBackup = parsePortableBackup(liveExport).backup;
+    const parsedLiveBackup = parsePortableBackup(liveExport);
+    const strictLiveBackup = parsedLiveBackup.backup;
+    expect(parsedLiveBackup.sourceFormat).toBe('still-backup-v5');
+    expect(strictLiveBackup.chatHistory.version).toBe(2);
     const liveHistory = JSON.stringify(strictLiveBackup.chatHistory);
     expect(strictLiveBackup.chatHistory.conversations[0]?.turns[0]?.messageOrigin).toBe('saved_transcript');
     expect(liveHistory).not.toContain(original.id);
@@ -220,6 +223,7 @@ describe('saved transcript to Chat transfer', () => {
     await importedApp.load();
     const preview = await importedApp.prepareBackupImport(liveExport);
     const archive = await importedApp.applyBackupImport({ sessionId: preview.sessionId, planHash: preview.planHash });
+    expect(archive.chatHistory).toHaveLength(1);
     const importedHistory = importedApp.getSnapshot().importedBackups.find((item) => item.id === archive.id)?.chatHistory;
     expect(importedHistory?.[0]?.turns[0]).toMatchObject({ messageOrigin: 'saved_transcript', origin: 'portable_backup_unverified' });
     expect(importedHistory?.[0]?.turns[0]).not.toHaveProperty('noteId');

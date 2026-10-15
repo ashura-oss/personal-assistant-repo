@@ -53,6 +53,28 @@ function knowledgeWithProviderReference() {
 }
 
 describe('portable backup schema', () => {
+  it('preserves declared v2 Chat history for an empty history without policy markers', () => {
+    const backup = createPortableBackup(emptyState(), { exportId: 'empty-v2-chat', exportedAt: at }, { version: 2, conversations: [] });
+
+    expect(backup.format).toBe(PORTABLE_BACKUP_V5_FORMAT);
+    expect(backup.chatHistory).toEqual({ version: 2, conversations: [] });
+    expect(parsePortableBackup(JSON.stringify(backup)).sourceFormat).toBe(PORTABLE_BACKUP_V5_FORMAT);
+  });
+
+  it('preserves declared v2 Chat history for marker-free conversations', () => {
+    const backup = createPortableBackup(emptyState(), { exportId: 'marker-free-v2-chat', exportedAt: at }, {
+      version: 2,
+      conversations: [{ title: 'No reply yet', createdAt: at, updatedAt: at, turns: [{
+        userText: 'Keep this saved transcript history.', createdAt: at, capturedAt: at, captureTimeZone: 'UTC',
+      }] }],
+    });
+
+    expect(backup.format).toBe(PORTABLE_BACKUP_V5_FORMAT);
+    expect(backup.chatHistory.version).toBe(2);
+    expect(parsePortableBackup(JSON.stringify(backup)).backup.chatHistory.conversations[0]?.turns[0]?.userText)
+      .toBe('Keep this saved transcript history.');
+  });
+
   it('omits Chat content while preserving unrelated orphaned note history', () => {
     const state = emptyState();
     state.notes.push({ id: 'chat-note', title: 'Chat message', transcript: 'CHAT_PRIVATE_SENTENCE', durationSeconds: 0,
