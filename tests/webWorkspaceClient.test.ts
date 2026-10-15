@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createInitialWorkspaceState } from '../src/services/controller.shared';
 import { createWorkspaceSnapshotDTO, type WorkspaceSnapshotDTO } from '../src/cloud/workspaceDto';
-import { parseWorkspaceCommandEnvelope } from '../src/cloud/workspaceCommands';
+import { parseWorkspaceCommandEnvelope, parseWorkspaceCommandReceipt } from '../src/cloud/workspaceCommands';
 import { createWebWorkspaceClient, WorkspaceClientError, WorkspaceCommandNotStartedError, WorkspaceCommandUnknownError } from '../src/web/workspaceClient';
 import { parseWorkspaceCommandHistoryPage } from '../src/cloud/workspaceCommandHistory';
 import { WORKSPACE_COMMAND_HISTORY_KINDS as SERVER_HISTORY_KINDS, workspaceCommandKindFromJournal as serverJournalKind } from '../server/src/workspaceCommandHistory';
@@ -57,9 +57,11 @@ function deferred<T>() {
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers(); });
 
 describe('same-origin web workspace command client', () => {
-  it('keeps the server projection map and browser history decoder on the same thirteen public command kinds', () => {
+  it('keeps the server projection map and browser history decoder on the same public command kinds', () => {
     expect(SERVER_HISTORY_KINDS).toEqual(['tasks.complete', 'tasks.reopen', 'chat.create', 'settings.update', 'notes.save', 'notes.capture.adopt',
-      'notes.updateTranscript', 'assistant.batch.submitNote', 'assistant.batch.check', 'chat.submit', 'chat.refine', 'notes.transcribe', 'accounts.installOAuth']);
+      'notes.updateTranscript', 'assistant.batch.submitNote', 'assistant.batch.check', 'chat.submit', 'chat.refine', 'notes.transcribe', 'accounts.installOAuth',
+      'documents.save', 'knowledge.person.save', 'knowledge.project.save', 'knowledge.entity.archive', 'knowledge.fact.save', 'knowledge.fact.remove',
+      'knowledge.contact.save', 'knowledge.contact.remove', 'knowledge.member.save', 'knowledge.member.remove']);
     expect(CLIENT_HISTORY_KINDS).toEqual(SERVER_HISTORY_KINDS);
     for (const kind of SERVER_HISTORY_KINDS) {
       expect(serverJournalKind(kind.toLowerCase())).toBe(kind);
@@ -67,6 +69,45 @@ describe('same-origin web workspace command client', () => {
     }
     expect(parseWorkspaceCommandHistoryPage({ entries: [{ updatedAt: 2, createdAt: 1, status: 'finished',
       kind: 'tasks.complete', commandId }], schemaVersion: 1 }).entries[0]?.commandId).toBe(commandId);
+  });
+
+  it('validates closed document and knowledge editor commands before they can be admitted', () => {
+    const personId = '20000000-0000-4000-8000-000000000001';
+    const validDocument = { kind: 'documents.save', path: `people/${personId}.md`, content: 'Narrative', expectedRevision: null,
+      expectedEntityRevision: 2 } as const;
+    expect(parseWorkspaceCommandEnvelope({ schemaVersion: 1, commandId, expectedRevision: 1, expectedPrivacyEpoch: 3,
+      command: validDocument }).command).toEqual(validDocument);
+    const personCreate = { kind: 'knowledge.person.save', operation: 'create',
+      input: { name: 'Ada', aliases: ['A.'], narrative: 'Notes' } } as const;
+    expect(parseWorkspaceCommandEnvelope({ schemaVersion: 1, commandId, expectedRevision: 1, expectedPrivacyEpoch: 3,
+      command: personCreate }).command).toMatchObject(personCreate);
+
+    for (const command of [
+      { ...validDocument, path: '../outside.md' },
+      { ...validDocument, path: `people/${personId}.md`, expectedEntityRevision: undefined },
+      { kind: 'documents.save', path: 'notes/readme.md', content: 'x', expectedRevision: null, expectedEntityRevision: 1 },
+      { kind: 'knowledge.person.save', operation: 'create', input: { name: 'Ada', aliases: [], narrative: '', id: personId } },
+      { kind: 'knowledge.person.save', operation: 'update', input: { id: personId, expectedRevision: 1, name: 'Ada', aliases: [], narrative: '' } },
+      { kind: 'knowledge.contact.remove', entityKind: 'project', entityId: personId, expectedEntityRevision: 1, itemId: personId },
+      { kind: 'knowledge.member.save', entityKind: 'project', entityId: personId, expectedEntityRevision: 1, personId, personRevision: 0, role: 'lead' },
+    ]) {
+      expect(() => parseWorkspaceCommandEnvelope({ schemaVersion: 1, commandId, expectedRevision: 1, expectedPrivacyEpoch: 3, command })).toThrow('workspace_command_invalid');
+    }
+  });
+
+  it('binds metadata receipts to exact document parents, entity kinds, and known item IDs', () => {
+    const personId = '20000000-0000-4000-8000-000000000001';
+    const itemId = '20000000-0000-4000-8000-000000000002';
+    const documentReceipt = { schemaVersion: 1, commandId, kind: 'documents.save', objectId: `people/${personId}.md`, documentRevision: 3,
+      entityKind: 'person', entityId: personId, entityRevision: 4 };
+    expect(parseWorkspaceCommandReceipt(documentReceipt, { commandId, kind: 'documents.save', objectId: documentReceipt.objectId,
+      entityKind: 'person', entityId: personId })).toMatchObject(documentReceipt);
+    expect(() => parseWorkspaceCommandReceipt({ ...documentReceipt, entityId: itemId }, { commandId, kind: 'documents.save' })).toThrow('workspace_command_receipt_invalid');
+    expect(parseWorkspaceCommandReceipt({ schemaVersion: 1, commandId, kind: 'knowledge.contact.remove', objectId: personId,
+      entityKind: 'person', entityRevision: 5, itemId }, { commandId, kind: 'knowledge.contact.remove', objectId: personId,
+      entityKind: 'person', itemId })).toMatchObject({ entityRevision: 5, itemId });
+    expect(() => parseWorkspaceCommandReceipt({ schemaVersion: 1, commandId, kind: 'knowledge.contact.remove', objectId: personId,
+      entityKind: 'project', entityRevision: 5, itemId }, { commandId, kind: 'knowledge.contact.remove' })).toThrow('workspace_command_receipt_invalid');
   });
 
   it('signals cancellation independently while a command POST remains pending', async () => {

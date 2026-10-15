@@ -4,6 +4,7 @@ import {
   parseWorkspaceCommandEnvelope,
   parseWorkspaceCommandId,
   parseWorkspaceCommandReceipt,
+  canonicalKnowledgeDocumentParent,
   type WorkspaceCommand,
   type WorkspaceCommandEnvelope,
   type WorkspaceCommandResponse,
@@ -483,6 +484,25 @@ function expectedReceiptFor(envelope: WorkspaceCommandEnvelope) {
         captureId: command.captureId, captureRevision: command.captureRevision };
     case 'accounts.installOAuth':
       return { commandId: envelope.commandId, kind: command.kind, stageId: command.stageId };
+    case 'documents.save': {
+      const parent = canonicalKnowledgeDocumentParent(command.path);
+      return { commandId: envelope.commandId, kind: command.kind, objectId: command.path,
+        ...(parent ? { entityKind: parent.entityKind, entityId: parent.entityId } : {}) };
+    }
+    case 'knowledge.person.save': return { commandId: envelope.commandId, kind: command.kind, entityKind: 'person' as const,
+      ...(command.operation === 'update' ? { objectId: command.input.id } : {}) };
+    case 'knowledge.project.save': return { commandId: envelope.commandId, kind: command.kind, entityKind: 'project' as const,
+      ...(command.operation === 'update' ? { objectId: command.input.id } : {}) };
+    case 'knowledge.entity.archive': return { commandId: envelope.commandId, kind: command.kind, objectId: command.id, entityKind: command.entityKind };
+    case 'knowledge.fact.save': return { commandId: envelope.commandId, kind: command.kind, objectId: command.entityId, entityKind: command.entityKind,
+      ...(command.itemId ? { itemId: command.itemId } : {}) };
+    case 'knowledge.fact.remove': return { commandId: envelope.commandId, kind: command.kind, objectId: command.entityId, entityKind: command.entityKind, itemId: command.itemId };
+    case 'knowledge.contact.save': return { commandId: envelope.commandId, kind: command.kind, objectId: command.entityId, entityKind: 'person' as const,
+      ...(command.itemId ? { itemId: command.itemId } : {}) };
+    case 'knowledge.contact.remove': return { commandId: envelope.commandId, kind: command.kind, objectId: command.entityId, entityKind: 'person' as const, itemId: command.itemId };
+    case 'knowledge.member.save': return { commandId: envelope.commandId, kind: command.kind, objectId: command.entityId, entityKind: 'project' as const,
+      ...(command.itemId ? { itemId: command.itemId } : {}) };
+    case 'knowledge.member.remove': return { commandId: envelope.commandId, kind: command.kind, objectId: command.entityId, entityKind: 'project' as const, itemId: command.itemId };
     case 'notes.updateTranscript':
       return { commandId: envelope.commandId, kind: command.kind, objectId: command.noteId };
     case 'notes.transcribe':

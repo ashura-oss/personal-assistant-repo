@@ -40,9 +40,10 @@ function string(value: unknown, label: string, maxBytes: number, maxChars = maxB
   return value;
 }
 function id(value: unknown, label: string): string {
-  if (typeof value !== 'string' || !UUID.test(value)) fail(`${label} must be a canonical UUID.`);
+  if (!isCanonicalKnowledgeId(value)) fail(`${label} must be a canonical UUID.`);
   return value;
 }
+export function isCanonicalKnowledgeId(value: unknown): value is string { return typeof value === 'string' && UUID.test(value); }
 function revision(value: unknown, label: string): number {
   if (!Number.isSafeInteger(value) || (value as number) < 1) fail(`${label} is invalid.`);
   return value as number;

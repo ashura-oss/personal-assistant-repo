@@ -20,7 +20,8 @@ import {
   parseWorkspaceCommandReceipt,
 } from '../dist/workspaceCommands.node.mjs';
 
-function fixture({ providerBatchClient, withAudio = false, speechClient, speechEnabled = false, withSpeechCleanup = false, initialNoteId } = {}) {
+function fixture({ providerBatchClient, withAudio = false, speechClient, speechEnabled = false, withSpeechCleanup = false,
+  initialNoteId, initialKnowledge, initialDocuments = [], writeDocument } = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'still-workspace-commands-'));
   const kernel = createDurableKernel({ databasePath: join(directory, 'workspace.sqlite'),
     validateSnapshot: (value) => assert.ok(value && typeof value === 'object' && !Array.isArray(value)) });
@@ -33,6 +34,8 @@ function fixture({ providerBatchClient, withAudio = false, speechClient, speechE
   if (initialNoteId) state.notes.push({ id: initialNoteId, title: 'Imported audio note', transcript: 'Original transcript.',
     audioUri: 'file:///private/imported.wav', durationSeconds: 2, createdAt: '2026-10-15T00:00:00.000Z',
     status: 'recorded', revision: 1 });
+  if (initialKnowledge) state.knowledge = structuredClone(initialKnowledge);
+  state.documents.push(...structuredClone(initialDocuments));
   if (providerBatchClient) {
     state.settings.mode = 'provider';
     state.settings.llmProvider = 'openrouter';
@@ -97,7 +100,7 @@ function fixture({ providerBatchClient, withAudio = false, speechClient, speechE
       deviceCalendarBackend: { platform: 'web', getPermission: unavailable, requestFullPermission: unavailable,
         async listCalendars() { return []; }, async getCalendar() { return undefined; }, async readEvents() { return []; },
         async createApprovedEvent() { throw new Error('unsupported'); }, async lookupRecord() { return undefined; } },
-      async writeDocument() {}, async removeAudio() {},
+      async writeDocument(path, content) { await writeDocument?.(path, content); }, async removeAudio() {},
       async loadRecordingRecovery() { return { async pickAndStage() { return null; }, async inspect() { throw new Error('unsupported'); }, async remove() {} }; },
       bindRecordingRecovery(service) { return service; },
       ...(providerBatchClient ? { openRouterBatchClient: providerBatchClient } : {}),
@@ -210,6 +213,289 @@ test('settings.update parser exposes only a nonempty closed settings patch and n
   const receipt = { schemaVersion: 1, commandId, kind: 'settings.update', objectId: 'workspace-settings' };
   assert.deepEqual(parseWorkspaceCommandReceipt(receipt, { commandId, kind: 'settings.update', objectId: 'workspace-settings' }), receipt);
   assert.throws(() => parseWorkspaceCommandReceipt({ ...receipt, objectId: 'settings' }), /workspace_command_receipt_invalid/);
+});
+
+test('real command dispatch creates and edits documents, people, projects, facts, contacts, members, and archives with exact metadata receipts', async () => {
+  const f = fixture();
+  try {
+    let head = await f.runtime.getSnapshot(f.admission);
+    const execute = async (command) => {
+      const admitted = envelope(command, head.revision, head.privacyEpoch);
+      const result = await dispatchWorkspaceCommand(f.runtime, f.admission, admitted);
+      assert.equal(result.status, 'finished', command.kind);
+      head = result.snapshot;
+      return { admitted, result };
+    };
+    const createdPerson = await execute({ kind: 'knowledge.person.save', operation: 'create',
+      input: { name: 'Ada Example', aliases: ['Ada'], narrative: 'First note.' } });
+    const personId = createdPerson.result.receipt.objectId;
+    assert.equal(createdPerson.result.receipt.entityKind, 'person');
+    assert.equal(createdPerson.result.receipt.entityRevision, 1);
+    assert.deepEqual(Object.keys(createdPerson.result.receipt).sort(), ['commandId', 'entityKind', 'entityRevision', 'kind', 'objectId', 'schemaVersion']);
+    const personDocument = head.state.documents.find((document) => document.path === `people/${personId}.md`);
+    assert.equal(personDocument.revision, 1);
+
+    const updatedPerson = await execute({ kind: 'knowledge.person.save', operation: 'update', input: {
+      id: personId, expectedRevision: 1, expectedDocumentRevision: 1, name: 'Ada Lovelace', aliases: ['Ada'], narrative: 'Second note.',
+    } });
+    assert.equal(updatedPerson.result.receipt.entityRevision, 2);
+    assert.equal(head.state.documents.find((document) => document.path === personDocument.path).revision, 2);
+
+    const editedDocument = await execute({ kind: 'documents.save', path: personDocument.path, content: 'Third note.',
+      expectedRevision: 2, expectedEntityRevision: 2 });
+    assert.deepEqual(editedDocument.result.receipt, { schemaVersion: 1, commandId: editedDocument.admitted.commandId,
+      kind: 'documents.save', objectId: personDocument.path, documentRevision: 3, entityKind: 'person', entityId: personId, entityRevision: 3 });
+
+    const person = head.state.knowledge.people.find((entity) => entity.id === personId);
+    const factSaved = await execute({ kind: 'knowledge.fact.save', entityKind: 'person', entityId: personId,
+      expectedEntityRevision: person.revision, statement: 'Works on analytical engines.' });
+    const factId = factSaved.result.receipt.itemId;
+    assert.equal(factSaved.result.receipt.entityRevision, person.revision + 1);
+    const updatedPersonState = head.state.knowledge.people.find((entity) => entity.id === personId);
+    const factUpdated = await execute({ kind: 'knowledge.fact.save', entityKind: 'person', entityId: personId,
+      expectedEntityRevision: updatedPersonState.revision, itemId: factId, statement: 'Designed an analytical engine.' });
+    assert.equal(factUpdated.result.receipt.itemId, factId);
+    const afterFactUpdate = head.state.knowledge.people.find((entity) => entity.id === personId);
+    const factRemoved = await execute({ kind: 'knowledge.fact.remove', entityKind: 'person', entityId: personId,
+      expectedEntityRevision: afterFactUpdate.revision, itemId: factId });
+    assert.equal(factRemoved.result.receipt.itemId, factId);
+
+    const personForContact = head.state.knowledge.people.find((entity) => entity.id === personId);
+    const contactSaved = await execute({ kind: 'knowledge.contact.save', entityKind: 'person', entityId: personId,
+      expectedEntityRevision: personForContact.revision, address: 'ada@example.test', label: 'email' });
+    const contactId = contactSaved.result.receipt.itemId;
+    const personForContactRemoval = head.state.knowledge.people.find((entity) => entity.id === personId);
+    const contactRemoved = await execute({ kind: 'knowledge.contact.remove', entityKind: 'person', entityId: personId,
+      expectedEntityRevision: personForContactRemoval.revision, itemId: contactId });
+    assert.equal(contactRemoved.result.receipt.itemId, contactId);
+
+    const createdProject = await execute({ kind: 'knowledge.project.save', operation: 'create', input: {
+      name: 'Analytical engine', aliases: [], narrative: 'Build plan.', status: 'active', goal: 'Construct a prototype.',
+    } });
+    const projectId = createdProject.result.receipt.objectId;
+    assert.equal(createdProject.result.receipt.entityKind, 'project');
+    const project = head.state.knowledge.projects.find((entity) => entity.id === projectId);
+    const memberSaved = await execute({ kind: 'knowledge.member.save', entityKind: 'project', entityId: projectId,
+      expectedEntityRevision: project.revision, personId, personRevision: head.state.knowledge.people.find((entity) => entity.id === personId).revision,
+      role: 'designer' });
+    const memberId = memberSaved.result.receipt.itemId;
+    const projectAfterMember = head.state.knowledge.projects.find((entity) => entity.id === projectId);
+    const memberRemoved = await execute({ kind: 'knowledge.member.remove', entityKind: 'project', entityId: projectId,
+      expectedEntityRevision: projectAfterMember.revision, itemId: memberId });
+    assert.equal(memberRemoved.result.receipt.itemId, memberId);
+
+    const archived = await execute({ kind: 'knowledge.entity.archive', entityKind: 'project', id: projectId,
+      expectedRevision: head.state.knowledge.projects.find((entity) => entity.id === projectId).revision, archived: true });
+    assert.equal(archived.result.receipt.entityRevision, 4);
+    const restored = await execute({ kind: 'knowledge.entity.archive', entityKind: 'project', id: projectId,
+      expectedRevision: head.state.knowledge.projects.find((entity) => entity.id === projectId).revision, archived: false });
+    assert.equal(restored.result.receipt.entityRevision, 5);
+    assert.equal(head.state.knowledge.projects.find((entity) => entity.id === projectId).archivedAt, undefined);
+    assert.equal(await f.runtime.getSnapshot(f.admission).then((fresh) => fresh.revision), head.revision);
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test('knowledge entity mirror failure keeps canonical content durable and returns a receipt only after the side effect settles', async () => {
+  const writes = [];
+  const f = fixture({ writeDocument: async (path, content) => { writes.push({ path, content }); throw new Error('synthetic mirror unavailable'); } });
+  try {
+    const initial = await f.runtime.getSnapshot(f.admission);
+    const command = envelope({ kind: 'knowledge.person.save', operation: 'create',
+      input: { name: 'Mirrored Person', aliases: [], narrative: 'Canonical narrative.' } }, initial.revision, initial.privacyEpoch);
+    const result = await dispatchWorkspaceCommand(f.runtime, f.admission, command);
+    assert.equal(result.status, 'finished');
+    const matchingWrites = writes.filter((write) => write.content === 'Canonical narrative.');
+    assert.equal(matchingWrites.length, 1);
+    const mirroredWrite = matchingWrites[0];
+    assert.match(mirroredWrite.path, /^people\/[0-9a-f-]+\.md$/);
+    assert.equal(mirroredWrite.content, 'Canonical narrative.');
+    assert.equal(result.snapshot.state.documents.find((document) => document.path === mirroredWrite.path).content, mirroredWrite.content);
+    assert.ok(result.snapshot.state.activity.some((item) => item.type === 'error' && item.message.includes('Local document mirror')));
+    assert.equal(inspectWorkspaceCommand(f.runtime, f.admission, command.commandId).status, 'finished');
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test('reserved knowledge document path variants reject before journal admission or mutation', async () => {
+  const f = fixture();
+  try {
+    const initial = await f.runtime.getSnapshot(f.admission);
+    const id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const paths = [`PEOPLE/${id}.md`, `people/${id.toUpperCase()}.md`, `projects/${id.toUpperCase()}.md`, `people/${id}.MD`];
+    for (const path of paths) {
+      const command = envelope({ kind: 'documents.save', path, content: 'Must not be committed.', expectedRevision: null },
+        initial.revision, initial.privacyEpoch);
+      await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission, command), /workspace_command_invalid/);
+      assert.equal(inspectWorkspaceCommand(f.runtime, f.admission, command.commandId).status, 'unverified', path);
+    }
+    const current = await f.runtime.refreshSnapshot(f.admission);
+    assert.equal(current.state.documents.length, initial.state.documents.length);
+    assert.equal(current.state.documents.some((document) => paths.includes(document.path)), false);
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test('canonical v7 knowledge IDs remain editable with exact document and item receipts after reload', async () => {
+  const personId = '018f47d2-6b1a-7c34-8b9d-1234567890ab';
+  const person = { id: personId, revision: 1, name: 'Imported v7 Person', aliases: [], narrativePath: `people/${personId}.md`,
+    createdAt: '2026-10-15T00:00:00.000Z', updatedAt: '2026-10-15T00:00:00.000Z', facts: [], sourceLinks: [], contacts: [] };
+  const f = fixture({ initialKnowledge: { schemaVersion: 1, people: [person], projects: [], suggestions: [] },
+    initialDocuments: [{ path: person.narrativePath, content: 'Legacy narrative.', revision: 1, updatedAt: person.updatedAt }] });
+  try {
+    let head = await f.runtime.getSnapshot(f.admission);
+    const update = envelope({ kind: 'knowledge.person.save', operation: 'update', input: {
+      id: personId, expectedRevision: 1, expectedDocumentRevision: 1, name: 'Imported v7 Person Updated', aliases: [], narrative: 'Updated v7 narrative.',
+    } }, head.revision, head.privacyEpoch);
+    const saved = await dispatchWorkspaceCommand(f.runtime, f.admission, update);
+    assert.equal(saved.receipt.objectId, personId);
+    assert.equal(saved.receipt.entityRevision, 2);
+    head = saved.snapshot;
+    const fact = await dispatchWorkspaceCommand(f.runtime, f.admission, envelope({ kind: 'knowledge.fact.save', entityKind: 'person',
+      entityId: personId, expectedEntityRevision: 2, statement: 'A fact on the imported entity.' }, head.revision, head.privacyEpoch));
+    assert.equal(fact.receipt.objectId, personId);
+    assert.equal(fact.receipt.entityRevision, 3);
+    assert.ok(fact.receipt.itemId);
+    const reloaded = await f.runtime.refreshSnapshot(f.admission);
+    assert.equal(reloaded.state.knowledge.people.find((row) => row.id === personId).revision, 3);
+    assert.equal(reloaded.state.documents.find((row) => row.path === person.narrativePath).content, 'Updated v7 narrative.');
+    assert.equal(reloaded.state.knowledge.people.find((row) => row.id === personId).facts[0].id, fact.receipt.itemId);
+
+    const uppercaseId = personId.toUpperCase();
+    const invalid = envelope({ kind: 'knowledge.person.save', operation: 'update', input: {
+      id: uppercaseId, expectedRevision: 3, expectedDocumentRevision: 2, name: 'Wrong case', aliases: [], narrative: 'Must reject.',
+    } }, reloaded.revision, reloaded.privacyEpoch);
+    await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission, invalid), /workspace_command_invalid/);
+    assert.equal(inspectWorkspaceCommand(f.runtime, f.admission, invalid.commandId).status, 'unverified');
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test('stale entity, document, member, and cross-parent item revisions never alter canonical knowledge', async () => {
+  const f = fixture();
+  try {
+    let head = await f.runtime.getSnapshot(f.admission);
+    const execute = async (command) => {
+      const result = await dispatchWorkspaceCommand(f.runtime, f.admission, envelope(command, head.revision, head.privacyEpoch));
+      head = result.snapshot;
+      return result;
+    };
+    const first = await execute({ kind: 'knowledge.person.save', operation: 'create',
+      input: { name: 'First Person', aliases: [], narrative: 'One.' } });
+    const firstId = first.receipt.objectId;
+    const second = await execute({ kind: 'knowledge.person.save', operation: 'create',
+      input: { name: 'Second Person', aliases: [], narrative: 'Two.' } });
+    const secondId = second.receipt.objectId;
+    await execute({ kind: 'knowledge.person.save', operation: 'update', input: {
+      id: firstId, expectedRevision: 1, expectedDocumentRevision: 1, name: 'First Updated', aliases: [], narrative: 'One updated.',
+    } });
+    const firstCurrent = head.state.knowledge.people.find((person) => person.id === firstId);
+    const firstDoc = head.state.documents.find((document) => document.path === `people/${firstId}.md`);
+    const revisionBeforeStale = head.revision;
+
+    const staleEntity = envelope({ kind: 'knowledge.person.save', operation: 'update', input: {
+      id: firstId, expectedRevision: 1, expectedDocumentRevision: firstDoc.revision,
+      name: 'Stale Entity', aliases: [], narrative: 'Must not replace.',
+    } }, head.revision, head.privacyEpoch);
+    await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission, staleEntity));
+    head = await f.runtime.refreshSnapshot(f.admission);
+    const staleDocument = envelope({ kind: 'documents.save', path: firstDoc.path, content: 'Stale document.',
+      expectedRevision: 1, expectedEntityRevision: firstCurrent.revision }, head.revision, head.privacyEpoch);
+    await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission, staleDocument));
+    head = await f.runtime.refreshSnapshot(f.admission);
+
+    const fact = await execute({ kind: 'knowledge.fact.save', entityKind: 'person', entityId: firstId,
+      expectedEntityRevision: firstCurrent.revision, statement: 'Belongs to first person.' });
+    const factId = fact.receipt.itemId;
+    const secondCurrent = head.state.knowledge.people.find((person) => person.id === secondId);
+    const crossParent = envelope({ kind: 'knowledge.fact.save', entityKind: 'person', entityId: secondId,
+      expectedEntityRevision: secondCurrent.revision, itemId: factId, statement: 'Must not move between people.' },
+    head.revision, head.privacyEpoch);
+    await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission, crossParent));
+    head = await f.runtime.refreshSnapshot(f.admission);
+
+    const project = await execute({ kind: 'knowledge.project.save', operation: 'create', input: {
+      name: 'Stale member project', aliases: [], narrative: '', status: 'active', goal: '',
+    } });
+    const projectId = project.receipt.objectId;
+    const beforeMemberAttempt = head.state.knowledge.projects.find((row) => row.id === projectId);
+    const personRevision = head.state.knowledge.people.find((row) => row.id === firstId).revision;
+    const member = await execute({ kind: 'knowledge.member.save', entityKind: 'project', entityId: projectId,
+      expectedEntityRevision: beforeMemberAttempt.revision, personId: firstId, personRevision, role: 'reviewer' });
+    assert.ok(member.receipt.itemId);
+    const afterMember = head.state.knowledge.projects.find((row) => row.id === projectId);
+    await execute({ kind: 'knowledge.person.save', operation: 'update', input: {
+      id: secondId, expectedRevision: 1, expectedDocumentRevision: 1, name: 'Second Updated', aliases: [], narrative: 'Two updated.',
+    } });
+    const staleMember = envelope({ kind: 'knowledge.member.save', entityKind: 'project', entityId: projectId,
+      expectedEntityRevision: afterMember.revision, personId: secondId, personRevision: 1, role: 'stale' }, head.revision, head.privacyEpoch);
+    await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission, staleMember));
+
+    const current = await f.runtime.refreshSnapshot(f.admission);
+    assert.equal(current.state.knowledge.people.find((row) => row.id === firstId).name, 'First Updated');
+    assert.equal(current.state.documents.find((row) => row.path === firstDoc.path).content, 'One updated.');
+    assert.equal(current.state.knowledge.people.find((row) => row.id === firstId).facts[0].id, factId);
+    assert.equal(current.state.knowledge.people.find((row) => row.id === secondId).facts.length, 0);
+    assert.equal(current.state.knowledge.projects.find((row) => row.id === projectId).revision, afterMember.revision);
+    assert.ok(current.revision > revisionBeforeStale);
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test('lost entity-save acknowledgement stays inspect-only and an exact duplicate never reapplies the mutation', async () => {
+  const writes = [];
+  const f = fixture({ writeDocument: async (path, content) => { writes.push({ path, content }); } });
+  try {
+    const initial = await f.runtime.getSnapshot(f.admission);
+    const command = envelope({ kind: 'knowledge.person.save', operation: 'create',
+      input: { name: 'One admission', aliases: [], narrative: 'One canonical write.' } }, initial.revision, initial.privacyEpoch);
+    f.loseNextWorkspaceCommitAck();
+    await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission, command), /acknowledgement|simulated|commit/i);
+    const inspection = inspectWorkspaceCommand(f.runtime, f.admission, command.commandId);
+    assert.equal(inspection.status, 'inspect_required');
+    assert.equal(Object.hasOwn(inspection, 'receipt'), false);
+    const afterCommit = await f.runtime.refreshSnapshot(f.admission);
+    const person = afterCommit.state.knowledge.people.find((row) => row.name === 'One admission');
+    assert.ok(person);
+    const writesForCommand = writes.filter((write) => write.content === 'One canonical write.');
+    assert.ok(writesForCommand.length > 0);
+    assert.equal(inspectWorkspaceCommand(f.runtime, f.admission, command.commandId).status, 'inspect_required');
+
+    const replay = await dispatchWorkspaceCommand(f.runtime, f.admission, command);
+    assert.equal(replay.status, 'inspect_required');
+    assert.equal(Object.hasOwn(replay, 'receipt'), false);
+    const afterReplay = await f.runtime.refreshSnapshot(f.admission);
+    const matchingPeople = afterReplay.state.knowledge.people.filter((row) => row.name === 'One admission');
+    assert.equal(matchingPeople.length, 1, 'the exact unknown-outcome retry does not create a second entity');
+    assert.equal(matchingPeople[0].revision, 1, 'the exact unknown-outcome retry does not apply the entity mutation twice');
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test('editing a selected knowledge entity invalidates the Batch job that captured its source revision', async () => {
+  let providerSubmissions = 0;
+  const f = fixture({ providerBatchClient: { async submit(_input, onBeforeDispatch) {
+    providerSubmissions += 1;
+    await onBeforeDispatch();
+    return { batchId: `fixture-knowledge-batch-${providerSubmissions}` };
+  }, async inspect() { throw new Error('No result inspection is needed for source invalidation.'); } } });
+  try {
+    let head = await f.runtime.getSnapshot(f.admission);
+    const personResult = await dispatchWorkspaceCommand(f.runtime, f.admission, envelope({ kind: 'knowledge.person.save', operation: 'create',
+      input: { name: 'Captured source', aliases: [], narrative: 'Original source.' } }, head.revision, head.privacyEpoch));
+    head = personResult.snapshot;
+    const personId = personResult.receipt.objectId;
+    const note = await dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'notes.save', transcript: 'Use the selected person as context.' }, head.revision, head.privacyEpoch));
+    head = note.snapshot;
+    const submitted = await dispatchWorkspaceCommand(f.runtime, f.admission, envelope({ kind: 'assistant.batch.submitNote',
+      noteId: note.receipt.objectId, knowledgeSelection: [{ kind: 'person', id: personId }] }, head.revision, head.privacyEpoch));
+    const job = submitted.snapshot.state.assistantBatchJobs.find((row) => row.id === submitted.receipt.jobId);
+    assert.ok(job);
+    assert.equal(providerSubmissions, 1);
+
+    const updated = await dispatchWorkspaceCommand(f.runtime, f.admission, envelope({ kind: 'knowledge.person.save', operation: 'update', input: {
+      id: personId, expectedRevision: 1, expectedDocumentRevision: 1, name: 'Captured source edited', aliases: [], narrative: 'Replacement source.',
+    } }, submitted.snapshot.revision, submitted.snapshot.privacyEpoch));
+    const invalidated = updated.snapshot.state.assistantBatchJobs.find((row) => row.id === job.id);
+    assert.equal(invalidated.status, 'source_removed');
+    assert.equal(invalidated.sourceRemoved, true);
+    assert.equal(providerSubmissions, 1, 'source invalidation does not resubmit the captured Batch request');
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test('settings.update is journaled once, forces the Batch profile, and preserves uncertain outcomes for inspection', async () => {

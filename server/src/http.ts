@@ -719,7 +719,8 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
       const envelope = await readJsonBody(request, response, WORKSPACE_COMMAND_TEXT_BODY_LIMIT, (value) => {
         const command = value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>).command : undefined;
         const kind = command && typeof command === 'object' && !Array.isArray(command) ? (command as Record<string, unknown>).kind : undefined;
-        return typeof kind === 'string' && ['notes.save', 'notes.updateTranscript', 'assistant.batch.submitNote', 'chat.submit'].includes(kind)
+        return typeof kind === 'string' && ['notes.save', 'notes.updateTranscript', 'assistant.batch.submitNote', 'chat.submit',
+          'documents.save', 'knowledge.person.save', 'knowledge.project.save'].includes(kind)
           ? WORKSPACE_COMMAND_TEXT_BODY_LIMIT : BODY_LIMIT;
       });
       admission.assertCurrent();

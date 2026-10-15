@@ -426,6 +426,18 @@ test('workspace command route accepts text payloads above the ordinary 16 KiB bo
     assert.equal(result.receipt.kind, 'notes.save');
     assert.equal(result.snapshot.state.notes.find((note) => note.id === result.receipt.objectId).transcript, transcript);
 
+    const narrative = '\n'.repeat(9_000);
+    const personCommand = { schemaVersion: 1, commandId: randomUUID(), expectedRevision: result.snapshot.revision,
+      expectedPrivacyEpoch: result.snapshot.privacyEpoch, command: { kind: 'knowledge.person.save', operation: 'create',
+        input: { name: 'Long narrative', aliases: [], narrative } } };
+    assert.ok(Buffer.byteLength(JSON.stringify(personCommand)) > 16 * 1024, 'escaped narrative expands past the ordinary body limit');
+    const personResponse = await f.request('/api/workspace/commands', { method: 'POST', headers: mutationHeaders(f, auth), body: JSON.stringify(personCommand) });
+    assert.equal(personResponse.status, 200, await personResponse.clone().text());
+    const personResult = await personResponse.json();
+    assert.equal(personResult.status, 'finished');
+    const person = personResult.snapshot.state.knowledge.people.find((row) => row.id === personResult.receipt.objectId);
+    assert.equal(personResult.snapshot.state.documents.find((document) => document.path === person.narrativePath).content, narrative);
+
     const oversized = { ...command, commandId: randomUUID(), command: { kind: 'notes.save', transcript: 'x'.repeat(1024 * 1024) } };
     const tooLarge = await f.request('/api/workspace/commands', { method: 'POST', headers: mutationHeaders(f, auth), body: JSON.stringify(oversized) });
     assert.equal(tooLarge.status, 413, 'the widened text-command allowance still has a strict 1 MiB envelope ceiling');
