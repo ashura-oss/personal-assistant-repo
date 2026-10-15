@@ -7683,13 +7683,37 @@ export class AppControllerImpl implements AppController {
     }
   }
 
-  private async refreshAssistantBatchInternal(jobId: string): Promise<AssistantBatchJobDTO> {
+  /** Node scheduler bridge. Reports only the provider GET status; public refresh keeps its existing DTO. */
+  async refreshAssistantBatchForObservation(jobId: string): Promise<Readonly<{ job: AssistantBatchJobDTO; providerTerminal: boolean; retryAfterAt?: number }>> {
+    if (this.activeBatchJobInspections.has(jobId)) throw new Error('A Batch status check for this job is already settling. Try again after it finishes.');
+    const initial = this.assistantBatchLedger.jobs.find((candidate) => candidate.id === jobId);
+    const noteId = initial && isOpenRouterBatchContentJob(initial) ? initial.noteId : undefined;
+    if (noteId && this.activeBatchNoteOperations.has(noteId)) throw new Error('A Batch request for this note is still settling. Try again after it finishes.');
+    this.activeBatchJobInspections.add(jobId);
+    if (noteId) this.activeBatchNoteOperations.add(noteId);
+    let providerTerminal = false;
+    let retryAfterAt: number | undefined;
+    try {
+      const job = await this.refreshAssistantBatchInternal(jobId, (status) => {
+        providerTerminal = ['completed', 'failed', 'expired', 'cancelled'].includes(status);
+      }, (retryAt) => {
+        retryAfterAt = retryAt;
+      });
+      return Object.freeze({ job, providerTerminal, ...(retryAfterAt === undefined ? {} : { retryAfterAt }) });
+    } finally {
+      this.activeBatchJobInspections.delete(jobId);
+      if (noteId) this.activeBatchNoteOperations.delete(noteId);
+    }
+  }
+
+  private async refreshAssistantBatchInternal(jobId: string, onProviderStatus?: (status: OpenRouterBatchInspection['status']) => void,
+    onRetryAfter?: (notBeforeAt: number) => void): Promise<AssistantBatchJobDTO> {
     if (!this.openRouterBatchClient) throw new Error('The OpenRouter Batch service is unavailable in this workspace.');
     if (this.assistantBatchLedgerMalformed) throw new Error('Saved Batch history could not be validated. Refresh local data before continuing.');
     const job = this.assistantBatchLedger.jobs.find((candidate) => candidate.id === jobId);
     if (!job) throw new Error('The saved Batch job was not found.');
     if (!isOpenRouterBatchContentJob(job) && !isOpenRouterMailReplyContentJob(job)) {
-      if (!job.batchId || job.accounting?.providerReportedCostUsd !== undefined || !this.openRouterBatchClient || this.assistantBatchCleanupRetries.has(job.id)) return this.batchDTO(job.id);
+      if (!job.batchId || (!onProviderStatus && job.accounting?.providerReportedCostUsd !== undefined) || !this.openRouterBatchClient || this.assistantBatchCleanupRetries.has(job.id)) return this.batchDTO(job.id);
       const capturedState = this.state;
       const capturedGeneration = this.bootstrapGeneration;
       const inspection = await this.openRouterBatchClient.inspect(job.batchId, job.customId, () => {
@@ -7697,6 +7721,8 @@ export class AppControllerImpl implements AppController {
           throw new Error('The saved Batch receipt changed before inspection.');
         }
       });
+      onProviderStatus?.(inspection.status);
+      if (inspection.retryAfterMs !== undefined) onRetryAfter?.(inspection.retryAfterMs);
       if (this.state !== capturedState || this.bootstrapGeneration !== capturedGeneration) throw new Error('The saved Batch receipt changed during inspection.');
       const accounting = this.mergeBatchAccounting(job.accounting, accountingFromInspection(inspection));
       return this.updateOpenRouterBatchJob(job.id, (current) => ({
@@ -7743,6 +7769,8 @@ export class AppControllerImpl implements AppController {
       if (this.assistantBatchCleanupRetries.has(job.id) && this.state === capturedState && this.bootstrapGeneration === capturedGeneration) return this.batchDTO(job.id);
       throw error;
     }
+    onProviderStatus?.(inspection.status);
+    if (inspection.retryAfterMs !== undefined) onRetryAfter?.(inspection.retryAfterMs);
     requireInspectionContext();
     if (job.providerObservation && (inspection.status !== 'completed' || inspection.metadataValidation !== 'valid' || inspection.resultValidation !== 'valid')) {
       return this.batchDTO(job.id);

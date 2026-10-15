@@ -9,6 +9,9 @@ import type { DurableKernel, OwnedWorkspaceIdentity } from '../../server/src/ker
 import type { ServerConfig } from '../../server/src/config.js';
 import { ServerProviderCredentialService } from '../../server/src/providerCredentials.js';
 import { PrivateAudioRepository } from '../../server/src/privateAudioRepository.js';
+import { BatchObservationIndex } from '../../server/src/batchObservationIndex.js';
+import { composeSnapshotCommitParticipants } from '../../server/src/workspaceStore.js';
+import { createBatchObservationSnapshotParticipant } from './batchObservationProjection.node';
 import { ensurePrivateDirectory } from '../../server/src/config.js';
 import { createNodeProviderResponseLifetimeOwner } from './providerResponseLifetime.node';
 import { createNodeSpeechAudioService } from '../audio/speechUpload.node';
@@ -241,7 +244,10 @@ export function createProductionWorkspacePortsFor(config: Pick<ServerConfig,
       ...(options.ffmpegPath ? { ffmpegPath: options.ffmpegPath } : {}), ...(options.ffprobePath ? { ffprobePath: options.ffprobePath } : {}),
       resolveAttachedMedia: resolveCurrentAttachedMedia,
     });
-    context.store.installSnapshotCommitParticipant(audioRepo.createSnapshotCommitParticipant());
+    context.store.installSnapshotCommitParticipant(composeSnapshotCommitParticipants([
+      { name: 'audio', participant: audioRepo.createSnapshotCommitParticipant() },
+      { name: 'batch_observation', participant: createBatchObservationSnapshotParticipant(new BatchObservationIndex(), Date.now) },
+    ]));
     const speechAudio = createNodeSpeechAudioService(audioRepo);
     const azureSpeech = new SharedAzureSpeechClient({ fetcher, audio: speechAudio,
       readKeySnapshot: async (capturedGeneration) => {

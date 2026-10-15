@@ -8,6 +8,9 @@ import type { WorkspaceActorMetadata } from '../../server/src/runtimeActors.js';
 import type { RuntimeSessionResolver } from '../../server/src/workspaceRegistry.js';
 import type { OwnedWorkspaceRuntime } from './ownedWorkspaceRuntime.node';
 import { ProductionBackgroundBindingResolver } from './backgroundBindingResolver.node';
+import { BatchObservationIndex, type BatchObservationAttempt } from '../../server/src/batchObservationIndex.js';
+import { projectBatchObservationLedger } from './batchObservationProjection.node';
+import { OpenRouterBatchInspectionReadError } from '../services/openRouter';
 
 const PAGE = 100;
 const MINUTE = 60_000;
@@ -20,6 +23,11 @@ interface OwnedClaim {
   /** Immutable occurrence linkage only; suspension still revalidates the current policy head in its own transaction. */
   readonly policyId: string;
   readonly policyRevision: number;
+}
+interface OwnedBatchClaim {
+  readonly attempt: BatchObservationAttempt;
+  readonly identity: Readonly<{ workspaceId: string; ownerId: string; privacyEpoch: number }>;
+  readonly actor: string;
 }
 
 function parseWorkId(value: string): readonly [string, string, number] {
@@ -44,6 +52,9 @@ export class BackgroundRuntimeOwner {
   readonly #metadataPage: (afterWorkspaceId?: string, limit?: number) => readonly WorkspaceActorMetadata[];
   readonly #resolver: ProductionBackgroundBindingResolver;
   readonly #claims = new WeakMap<object, OwnedClaim>();
+  readonly #batchClaims = new WeakMap<object, OwnedBatchClaim>();
+  readonly #batchFinalizations = new WeakMap<object, Readonly<{ readonly final: { readonly kind: 'deferred' | 'completed' | 'inspect_required'; readonly code: string; readonly nextDueAt: number; readonly terminal: boolean }; readonly settledAt: number }>>();
+  readonly #batchIndex = new BatchObservationIndex();
   #stopped = false;
 
   constructor(input: Readonly<{ kernel: DurableKernel; auth: AuthService; runtime: OwnedWorkspaceRuntime;
@@ -61,6 +72,10 @@ export class BackgroundRuntimeOwner {
       setTimeout: (callback, delay) => setTimeout(callback, delay),
       clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
     } });
+    // Cold startup backfills content-free Batch metadata once before arming the
+    // scheduler. Subsequent timer scans read only this index; snapshot writes
+    // maintain it through the composed commit participant.
+    this.#forEachMetadata((metadata) => { this.#batchDue(metadata, Date.now()); });
     this.#scheduler.start();
   }
 
@@ -78,6 +93,18 @@ export class BackgroundRuntimeOwner {
 
   #occurrences(metadata: WorkspaceActorMetadata): BackgroundOccurrenceStore {
     return new BackgroundOccurrenceStore({ kernel: this.#kernel, actorSessionToken: this.#actor(metadata), resolver: this.#resolver });
+  }
+
+  #batchDue(metadata: WorkspaceActorMetadata, now: number): number | null {
+    const actor = this.#actor(metadata);
+    return this.#kernel.withOwnedTransaction(actor, metadata.privacyEpoch, (context) => {
+      if (!this.#batchIndex.hasWorkspaceScope(context, metadata.privacyEpoch)) {
+        const current = this.#kernel.readOwnedSnapshotWithinTransaction(context);
+        if (current.workspaceId !== metadata.workspaceId || context.ownerId !== metadata.ownerId || current.privacyEpoch !== metadata.privacyEpoch) return null;
+        this.#batchIndex.reconcile(context, projectBatchObservationLedger(current.snapshot), now);
+      }
+      return this.#batchIndex.readNextDueAt(context, metadata.privacyEpoch);
+    });
   }
 
   #forEachMetadata(visitor: (metadata: WorkspaceActorMetadata) => boolean | void, afterWorkspaceId?: string): void {
@@ -154,6 +181,8 @@ export class BackgroundRuntimeOwner {
             const store = this.#ensureOccurrences(metadata, now);
             const due = store.readNextDueAt(metadata.privacyEpoch);
             if (due !== null && (earliest === null || due < earliest)) earliest = due;
+            const batchDue = this.#batchDue(metadata, now);
+            if (batchDue !== null && (earliest === null || batchDue < earliest)) earliest = batchDue;
           } catch (error) {
             if (error instanceof Error && ['unauthenticated', 'stale_epoch', 'workspace_binding_rejected'].includes(error.message)) return;
             throw error;
@@ -167,7 +196,8 @@ export class BackgroundRuntimeOwner {
           if (afterWorkspaceId && item.workspaceId <= afterWorkspaceId) return;
           try {
             const store = this.#ensureOccurrences(item, now);
-            if (store.listDueAccountSyncWork(item.privacyEpoch, now, undefined, 1).length) found.push(item.workspaceId);
+            const batchDue = this.#batchDue(item, now);
+            if (store.listDueAccountSyncWork(item.privacyEpoch, now, undefined, 1).length || batchDue !== null && batchDue <= now) found.push(item.workspaceId);
           } catch (error) {
             if (error instanceof Error && ['unauthenticated', 'stale_epoch', 'workspace_binding_rejected'].includes(error.message)) return;
             throw error;
@@ -179,19 +209,43 @@ export class BackgroundRuntimeOwner {
       listDueLanes: async ({ workspaceId, now }) => {
         const metadata = this.#findMetadata(workspaceId);
         if (!metadata) return Object.freeze([]);
-        try { return this.#occurrences(metadata).listDueAccountSyncWork(metadata.privacyEpoch, now, undefined, 1).length ? Object.freeze(['account_sync' as const]) : Object.freeze([]); }
+        try {
+          const lanes: ('account_sync' | 'batch_observation')[] = [];
+          const batchDue = this.#batchDue(metadata, now);
+          if (this.#occurrences(metadata).listDueAccountSyncWork(metadata.privacyEpoch, now, undefined, 1).length) lanes.push('account_sync');
+          if (batchDue !== null && batchDue <= now) lanes.push('batch_observation');
+          return Object.freeze(lanes);
+        }
         catch (error) { if (error instanceof Error && ['unauthenticated', 'stale_epoch'].includes(error.message)) return Object.freeze([]); throw error; }
       },
       listDueOccurrences: async ({ workspaceId, now, afterWorkId, limit, lane }) => {
-        if (lane !== 'account_sync') return Object.freeze([]);
         const metadata = this.#findMetadata(workspaceId);
         if (!metadata) return Object.freeze([]);
+        if (lane === 'batch_observation') return this.#kernel.withOwnedTransaction(this.#actor(metadata), metadata.privacyEpoch, (context) => {
+          return Object.freeze(this.#batchIndex.listDue(context, metadata.privacyEpoch, now, afterWorkId, limit)
+            .map((item) => Object.freeze({ workspaceId, workId: item.job_id, lane, dueAt: item.next_due_at })));
+        });
+        if (lane !== 'account_sync') return Object.freeze([]);
         return this.#occurrences(metadata).listDueAccountSyncWork(metadata.privacyEpoch, now, afterWorkId, limit)
           .map((item) => Object.freeze({ workspaceId, workId: item.workId, lane, dueAt: item.dueAt }));
       },
       claimOccurrence: async ({ work, now }) => {
         const metadata = this.#findMetadata(work.workspaceId);
-        if (!metadata || work.lane !== 'account_sync') return undefined;
+        if (!metadata) return undefined;
+        if (work.lane === 'batch_observation') {
+          const actor = this.#actor(metadata);
+          const attempt = this.#kernel.withOwnedTransaction(actor, metadata.privacyEpoch, (context) => {
+            const current = this.#kernel.readOwnedSnapshotWithinTransaction(context);
+            this.#batchIndex.reconcile(context, projectBatchObservationLedger(current.snapshot), now);
+            return this.#batchIndex.claim(context, metadata.privacyEpoch, work.workId, now);
+          });
+          if (!attempt) return undefined;
+          const opaque = Object.freeze({}) as BackgroundSchedulerClaim;
+          const identity = Object.freeze({ workspaceId: metadata.workspaceId, ownerId: metadata.ownerId, privacyEpoch: metadata.privacyEpoch });
+          this.#batchClaims.set(opaque as object, Object.freeze({ attempt, identity, actor }));
+          return opaque;
+        }
+        if (work.lane !== 'account_sync') return undefined;
     const [occurrenceId, targetId, generation] = parseWorkId(work.workId);
         const store = this.#occurrences(metadata);
         const owned = store.claim({ expectedPrivacyEpoch: metadata.privacyEpoch, occurrenceId, targetId, targetGeneration: generation });
@@ -203,6 +257,25 @@ export class BackgroundRuntimeOwner {
         return opaque;
       },
       executeClaim: async (opaque) => {
+        const batch = this.#batchClaims.get(opaque as object);
+        if (batch) {
+          try {
+            const result = await this.#runtime.executeScheduledBatchObservation({ sessionToken: batch.actor, ownerId: batch.identity.ownerId,
+              privacyEpoch: batch.identity.privacyEpoch, attempt: batch.attempt, index: this.#batchIndex });
+            if (result.providerTerminal) return Object.freeze({ kind: 'terminal', code: 'provider_terminal' });
+            return Object.freeze({ kind: 'deferred', code: 'provider_pending', nextDueAt: Math.max(Date.now() + MINUTE, result.retryAfterAt ?? 0) });
+          } catch (error) {
+            const code = error instanceof Error && /^[a-z][a-z0-9_:-]{0,95}$/.test(error.message) ? error.message : 'batch_observation_failed';
+            if (error instanceof Error && error.message === 'The workspace runtime is busy.') return Object.freeze({ kind: 'deferred', code: 'foreground_busy', nextDueAt: Date.now() + MINUTE });
+            if (error instanceof OpenRouterBatchInspectionReadError && error.retryable) {
+              const now = Date.now();
+              const nextDueAt = this.#kernel.withOwnedTransaction(batch.actor, batch.identity.privacyEpoch, (context) =>
+                this.#batchIndex.nextRetryAt(context, batch.attempt, now, error.retryAfterMs));
+              return Object.freeze({ kind: 'deferred', code: 'provider_get_retry', nextDueAt });
+            }
+            return Object.freeze({ kind: 'inspect_required', code });
+          }
+        }
         const owned = claimFor(opaque);
         try {
           const outcome = await this.#runtime.executeScheduledAccountSync({ sessionToken: owned.actor, ownerId: owned.identity.ownerId,
@@ -225,6 +298,26 @@ export class BackgroundRuntimeOwner {
         }
       },
       recordOutcome: async (opaque, outcome: BackgroundSchedulerOutcome) => {
+        const batch = this.#batchClaims.get(opaque as object);
+        if (batch) {
+          let pending = this.#batchFinalizations.get(opaque as object);
+          if (!pending) {
+            const now = Date.now();
+            const final = outcome.kind === 'deferred'
+              ? { kind: 'deferred' as const, code: outcome.code, nextDueAt: outcome.nextDueAt ?? now + MINUTE, terminal: false }
+              : outcome.kind === 'held'
+                ? { kind: 'deferred' as const, code: outcome.reason, nextDueAt: now + MINUTE, terminal: false }
+                : outcome.kind === 'inspect_required'
+                  ? { kind: 'inspect_required' as const, code: outcome.code, nextDueAt: Number.MAX_SAFE_INTEGER, terminal: false }
+                  : { kind: 'completed' as const, code: outcome.code, nextDueAt: Number.MAX_SAFE_INTEGER, terminal: true };
+            pending = Object.freeze({ final: Object.freeze(final), settledAt: now });
+            this.#batchFinalizations.set(opaque as object, pending);
+          }
+          this.#kernel.withOwnedTransaction(batch.actor, batch.identity.privacyEpoch, (context) => {
+            this.#batchIndex.settle(context, batch.attempt, pending!.final, pending!.settledAt);
+          });
+          return;
+        }
         const owned = claimFor(opaque);
         if (outcome.kind === 'deferred') {
           owned.occurrences.deferClaimBeforeDispatch(owned.claim, owned.identity.privacyEpoch, outcome.code, outcome.nextDueAt);
@@ -239,11 +332,30 @@ export class BackgroundRuntimeOwner {
           accounting: { status: 'not_applicable' }, resultCode: outcome.code });
       },
       reconcileAmbiguousClaim: async (opaque) => {
+        const batch = this.#batchClaims.get(opaque as object);
+        if (batch) {
+          const now = Date.now();
+          this.#kernel.withOwnedTransaction(batch.actor, batch.identity.privacyEpoch, (context) => {
+            this.#batchIndex.settle(context, batch.attempt, { kind: 'inspect_required', code: 'execution_outcome_unknown',
+              nextDueAt: Number.MAX_SAFE_INTEGER, terminal: false }, now);
+          });
+          return;
+        }
         const owned = claimFor(opaque);
         owned.occurrences.inspectClaimForRecovery(owned.claim, owned.identity.privacyEpoch, 'execution_outcome_unknown');
       },
       reconcileUnacknowledgedClaim: async (work) => {
         const metadata = this.#findMetadata(work.workspaceId);
+        if (metadata && work.lane === 'batch_observation') {
+          // An unacknowledged claim may have committed. Never mint a replacement GET attempt here.
+          const now = Date.now();
+          this.#kernel.withOwnedTransaction(this.#actor(metadata), metadata.privacyEpoch, (context) => {
+            const current = this.#kernel.readOwnedSnapshotWithinTransaction(context);
+            this.#batchIndex.reconcile(context, projectBatchObservationLedger(current.snapshot), now);
+            this.#batchIndex.holdUnacknowledged(context, metadata.privacyEpoch, work.workId, now);
+          });
+          return;
+        }
         if (!metadata || work.lane !== 'account_sync') return;
         const [occurrenceId, targetId, generation] = parseWorkId(work.workId);
         this.#occurrences(metadata).inspectUnacknowledgedAccountSyncWork(metadata.privacyEpoch, occurrenceId, targetId, generation);

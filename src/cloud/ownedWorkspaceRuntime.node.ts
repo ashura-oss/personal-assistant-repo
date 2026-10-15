@@ -26,6 +26,9 @@ import type { BackgroundClaim, BackgroundOccurrenceStore } from '../../server/sr
 import { projectKnowledgeSourceChoiceReference } from '../knowledge/sourceChoices';
 import { projectKnowledgeSuggestionForHttp, type KnowledgeSourceChoicesDTO, type KnowledgeSuggestionReviewDTO } from './knowledgeHttpContracts';
 import { buildCloudKnowledgeSourceChoiceOptions, knowledgeSourceChoiceId } from './knowledgeSourceChoices.node';
+import type { BatchObservationAttempt, BatchObservationIndex } from '../../server/src/batchObservationIndex.js';
+import { projectBatchObservationLedger } from './batchObservationProjection.node';
+import { OpenRouterBatchInspectionReadError } from '../services/openRouter';
 
 export type OwnedWorkspaceFactoryContext = WorkspaceRuntimeContext<AppState> & {
   readonly speechCleanupChildren: SpeechCleanupChildren;
@@ -135,6 +138,8 @@ export class OwnedWorkspaceRuntime {
   private readonly activeTranscriptionCommands = new Map<string, ActiveTranscriptionCommand>();
   private readonly controllers = new Set<AppControllerImpl>();
   private readonly refreshRequired = new Set<string>();
+  /** Exact scheduler attempt that introduced a refresh fence while holding the workspace reservation. */
+  private readonly batchRefreshFence = new Map<string, Readonly<{ attemptId: string; token: object }>>();
   private readonly busy = new Set<string>();
   private readonly idleWaiters = new Map<string, Set<() => void>>();
   private readonly continuationQueues = new Map<string, Promise<void>>();
@@ -637,6 +642,95 @@ export class OwnedWorkspaceRuntime {
     return fullyComplete
       ? Object.freeze({ status: 'completed', commandId: input.claim.attemptId, code: 'sync_complete' })
       : Object.freeze({ status: 'inspect_required', commandId: input.claim.attemptId, code: 'sync_incomplete' });
+  }
+
+  /** GET-only Batch observation through the existing command journal and workspace reservation. */
+  async executeScheduledBatchObservation(input: Readonly<{ sessionToken: string; ownerId: string; privacyEpoch: number;
+    attempt: BatchObservationAttempt; index: BatchObservationIndex }>): Promise<Readonly<{ providerTerminal: boolean; commandId: string; retryAfterAt?: number }>> {
+    const initialIdentity = this.options.kernel.getOwnedIdentity(input.sessionToken);
+    if (initialIdentity.ownerId !== input.ownerId || initialIdentity.privacyEpoch !== input.privacyEpoch ||
+        input.attempt.workspaceId !== initialIdentity.workspaceId || input.attempt.ownerId !== input.ownerId ||
+        input.attempt.privacyEpoch !== input.privacyEpoch || input.attempt.commandId !== input.attempt.attemptId) throw new Error('background_execution_stale');
+    if (this.busy.has(initialIdentity.workspaceId)) throw new Error('The workspace runtime is busy.');
+    if (this.refreshRequired.has(initialIdentity.workspaceId)) throw new Error('workspace_refresh_required');
+    const admission: OwnedWorkspaceAdmission = Object.freeze({ sessionToken: input.sessionToken,
+      assertCurrent: () => {
+        const current = this.options.kernel.getOwnedIdentity(input.sessionToken);
+        if (current.workspaceId !== initialIdentity.workspaceId || current.ownerId !== input.ownerId || current.privacyEpoch !== input.privacyEpoch) {
+          throw new Error('workspace_ownership_changed');
+        }
+      } });
+    const fenceToken = Object.freeze({});
+    const fence = Object.freeze({ attemptId: input.attempt.attemptId, token: fenceToken });
+    const result = await this.track(initialIdentity.workspaceId, () => {
+      this.cache.delete(initialIdentity.workspaceId);
+      this.refreshRequired.add(initialIdentity.workspaceId);
+      this.batchRefreshFence.set(initialIdentity.workspaceId, fence);
+    }, async () => {
+      this.assertAdmission(admission);
+      const runtime = await this.registry.get(input.sessionToken);
+      this.assertAdmission(admission);
+      const loaded = runtime.store.getLoadedIdentity();
+      const currentIdentity = this.options.kernel.getOwnedIdentity(input.sessionToken);
+      this.assertStillCurrent(admission, initialIdentity, loaded, currentIdentity);
+      if (loaded.revision !== currentIdentity.revision) throw new Error('workspace_loaded_revision_mismatch');
+      this.options.kernel.withOwnedTransaction(input.sessionToken, input.privacyEpoch, (context) => {
+        const owned = this.options.kernel.readOwnedSnapshotWithinTransaction(context);
+        if (owned.workspaceId !== input.attempt.workspaceId || context.ownerId !== input.ownerId || owned.privacyEpoch !== input.privacyEpoch ||
+            owned.revision !== currentIdentity.revision) throw new Error('background_execution_stale');
+        input.index.reconcile(context, projectBatchObservationLedger(owned.snapshot), Date.now());
+        input.index.assertClaimMatchesCurrentLedger(context, input.attempt, projectBatchObservationLedger(owned.snapshot));
+        input.index.markDispatched(context, input.attempt, Date.now());
+      });
+      const envelope: WorkspaceCommandEnvelope = Object.freeze({ schemaVersion: 1, commandId: input.attempt.commandId,
+        expectedRevision: currentIdentity.revision, expectedPrivacyEpoch: currentIdentity.privacyEpoch,
+        command: Object.freeze({ kind: 'assistant.batch.check', jobId: input.attempt.jobId }) });
+      const commandInput: OwnedWorkspaceCommandInput = { ...admission, expectedRevision: currentIdentity.revision,
+        expectedPrivacyEpoch: currentIdentity.privacyEpoch, idempotencyKey: input.attempt.commandId,
+        kind: 'assistant.batch.check', canonicalBody: canonicalWorkspaceCommand(envelope) };
+      let committed: OwnedWorkspaceCommandResult<{ readonly providerTerminal: boolean; readonly retryAfterAt?: number }>;
+      try {
+        committed = await this.executeWithinReservedWorkspace(commandInput, currentIdentity, async (controller) => {
+          const observed = await controller.refreshAssistantBatchForObservation(input.attempt.jobId);
+          return Object.freeze({ providerTerminal: observed.providerTerminal, ...(observed.retryAfterAt === undefined ? {} : { retryAfterAt: observed.retryAfterAt }) });
+        }, (): JsonValue => ({ schemaVersion: 1, commandId: input.attempt.commandId, kind: 'assistant.batch.check', objectId: input.attempt.jobId }));
+      } catch (error) {
+        if (!(error instanceof OpenRouterBatchInspectionReadError) || !error.retryable) throw error;
+        // A failed read makes its command inspect-required. It may be retried only after the
+        // exact failed command is proven non-finished and the persisted workspace is reloaded,
+        // all while this same reservation remains held. No old command is replayed.
+        const admissionResult = this.journal.inspect(input.sessionToken, input.attempt.commandId);
+        if (admissionResult.status !== 'inspect_required' || admissionResult.commandKind !== 'assistant.batch.check' ||
+            this.batchRefreshFence.get(initialIdentity.workspaceId) !== fence) throw new Error('background_batch_read_retry_unproven');
+        await runtime.controller.refreshPersistedWorkspace();
+        this.assertAdmission(admission);
+        const reloaded = runtime.store.getLoadedIdentity();
+        const afterReload = this.options.kernel.getOwnedIdentity(input.sessionToken);
+        this.assertStillCurrent(admission, initialIdentity, reloaded, afterReload);
+        this.options.kernel.withOwnedTransaction(input.sessionToken, input.privacyEpoch, (context) => {
+          const owned = this.options.kernel.readOwnedSnapshotWithinTransaction(context);
+          if (owned.revision !== afterReload.revision) throw new Error('background_execution_stale');
+          input.index.reconcile(context, projectBatchObservationLedger(owned.snapshot), Date.now());
+          input.index.assertClaimMatchesCurrentLedger(context, input.attempt, projectBatchObservationLedger(owned.snapshot));
+          if (this.batchRefreshFence.get(initialIdentity.workspaceId) !== fence) throw new Error('background_batch_read_retry_unproven');
+        });
+        this.projectAndCache(admission, initialIdentity, runtime.controller, reloaded);
+        this.batchRefreshFence.delete(initialIdentity.workspaceId);
+        throw error;
+      }
+      if (this.batchRefreshFence.get(initialIdentity.workspaceId) === fence) this.batchRefreshFence.delete(initialIdentity.workspaceId);
+      const receipt = parseWorkspaceCommandReceipt(committed.result?.providerTerminal === undefined
+        ? committed.admission.receipt
+        : { schemaVersion: 1, commandId: input.attempt.commandId, kind: 'assistant.batch.check', objectId: input.attempt.jobId },
+      { commandId: input.attempt.commandId, kind: 'assistant.batch.check', objectId: input.attempt.jobId });
+      if (receipt.kind !== 'assistant.batch.check' || receipt.commandId !== input.attempt.commandId || receipt.objectId !== input.attempt.jobId) {
+        throw new Error('background_batch_command_receipt_invalid');
+      }
+      if (committed.result?.providerTerminal === undefined) throw new Error('background_batch_command_replay_requires_inspection');
+      return Object.freeze({ providerTerminal: committed.result.providerTerminal, commandId: input.attempt.commandId,
+        ...(committed.result.retryAfterAt === undefined ? {} : { retryAfterAt: committed.result.retryAfterAt }) });
+    });
+    return result;
   }
 
   /** Named journal path for cloud transcription; duplicates only replay their stored receipt. */

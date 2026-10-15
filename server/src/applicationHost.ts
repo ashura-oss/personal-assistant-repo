@@ -13,6 +13,7 @@ import type { WorkspaceHttpApi } from './workspaceHttp.js';
 import type { OAuthHttpApi } from './oauthHttp.js';
 import { AudioColdStartRecovery } from './audioColdStartRecovery.js';
 import { markInterruptedBackgroundWorkForInspection } from './backgroundOccurrences.js';
+import { recoverInterruptedBatchObservations } from './batchObservationIndex.js';
 import { join } from 'node:path';
 
 /** Trusted runtime owner contract. It contains no caller supplied workspace authority. */
@@ -221,6 +222,7 @@ export async function startApplicationHost(options: ApplicationHostOptions): Pro
       processInstanceId: opened.privateContext.processInstanceId });
     await recovery.run();
     markInterruptedBackgroundWorkForInspection(opened.privateContext.kernel, startup.capability);
+    recoverInterruptedBatchObservations(opened.privateContext.kernel, startup.capability);
     recoverySettled = true;
   } catch (error) {
     try { await recovery?.retryCloseOwnedDescriptors(); }

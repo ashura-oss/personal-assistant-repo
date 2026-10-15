@@ -157,8 +157,29 @@ export interface OpenRouterBatchInspection {
   readonly metadataValidation: 'valid' | 'invalid';
   readonly resultValidation: 'valid' | 'truncated' | 'invalid' | 'unavailable';
   readonly usage?: Readonly<{ cost?: number; isByok?: boolean; promptTokens?: number; completionTokens?: number; totalTokens?: number }>;
+  /** Internal GET-only scheduling hint. Never projected into browser state or command receipts. */
+  readonly retryAfterMs?: number;
   /** Private result evidence for the controller's strict schema/provenance validator; never UI state. */
   readonly result?: Readonly<{ customId: string; statusCode: number; finishReason?: string; responseBody?: unknown; errorPresent?: true }>;
+}
+
+export class OpenRouterBatchInspectionReadError extends Error {
+  readonly name = 'OpenRouterBatchInspectionReadError';
+  constructor(readonly retryable: boolean, readonly retryAfterMs?: number) { super('openrouter_batch_inspection_read_failed'); }
+}
+
+export function parseOpenRouterRetryAfter(value: string | null, now = Date.now()): number | undefined {
+  if (value === null || !Number.isSafeInteger(now) || now < 0) return undefined;
+  const trimmed = value.trim();
+  if (/^\d{1,12}$/.test(trimmed)) {
+    const seconds = Number(trimmed);
+    const milliseconds = seconds * 1_000;
+    return Number.isSafeInteger(milliseconds) && Number.isSafeInteger(now + milliseconds) ? now + milliseconds : undefined;
+  }
+  const parsed = Date.parse(trimmed);
+  if (!Number.isFinite(parsed)) return undefined;
+  const epoch = Math.ceil(parsed);
+  return Number.isSafeInteger(epoch) ? Math.max(now, epoch) : undefined;
 }
 
 export class OpenRouterBatchDispatchError extends Error {
@@ -564,9 +585,17 @@ export class OpenRouterBatchClient {
         redirect: 'error',
         headers: { Authorization: `Bearer ${credential.key}` },
       }, async (response) => {
+        const retryAfterMs = parseOpenRouterRetryAfter(response.headers.get('Retry-After'));
+        if (!response.ok) {
+          // In production, throwing through the owned response lifetime cancels/drains the
+          // unread body and awaits its cleanup before this typed GET failure escapes.
+          if (!this.dependencies.withResponseLifetime) await response.body?.cancel();
+          throw new OpenRouterBatchInspectionReadError(response.status === 408 || response.status === 429 ||
+            response.status >= 500 && response.status < 600, retryAfterMs);
+        }
         const parsed = await readBoundedJson(response);
-        if (!response.ok) throw new Error('The OpenRouter Batch status could not be read.');
-        return parseInspection(parsed, batchId, customId);
+        const inspection = parseInspection(parsed, batchId, customId);
+        return retryAfterMs === undefined ? inspection : Object.freeze({ ...inspection, retryAfterMs });
       }, customId, beforeStart);
     });
   }

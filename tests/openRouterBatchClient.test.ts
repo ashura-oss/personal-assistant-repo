@@ -6,7 +6,9 @@ import {
   OPENROUTER_CHAT_COMPLETIONS_PATH,
   OpenRouterBatchClient,
   OpenRouterBatchDispatchError,
+  OpenRouterBatchInspectionReadError,
   OpenRouterBatchRequestBuilder,
+  parseOpenRouterRetryAfter,
 } from '../src/services/openRouter';
 import type { PrivacyControlState, PrivacyControlStore, PrivacyEraseAdapter, PrivacyOwner } from '../src/privacy/types';
 import type { AppSettings, Note } from '../src/core';
@@ -408,6 +410,34 @@ describe('OpenRouter Batch client', () => {
     });
     expect(calls).toHaveLength(1);
     expect(calls[0]?.method).toBe('GET');
+  });
+
+  it('preserves safe Retry-After hints for GET polling and classifies transient HTTP responses without shortening them', async () => {
+    const now = Date.parse('2026-10-15T00:00:00.000Z');
+    expect(parseOpenRouterRetryAfter('90000', now)).toBe(now + 90_000_000);
+    expect(parseOpenRouterRetryAfter('not-a-date', now)).toBeUndefined();
+    const date = 'Wed, 21 Oct 2026 07:28:00 GMT';
+    const client = makeClient(async () => new Response(JSON.stringify({ id: 'batch_fixture_1', object: 'batch',
+      endpoint: OPENROUTER_CHAT_COMPLETIONS_PATH, model: OPENROUTER_BATCH_BODY_MODEL, completion_window: '24h',
+      status: 'in_progress', request_counts: { total: 1, completed: 0, failed: 0 } }), { status: 200, headers: { 'Retry-After': date } })).client;
+    await expect(client.inspect('batch_fixture_1', operationId)).resolves.toMatchObject({ retryAfterMs: Date.parse(date) });
+    const throttled = makeClient(async () => new Response('{}', { status: 429, headers: { 'Retry-After': '7200' } })).client;
+    await expect(throttled.inspect('batch_fixture_1', operationId)).rejects.toMatchObject<Partial<OpenRouterBatchInspectionReadError>>({
+      retryable: true, retryAfterMs: expect.any(Number),
+    });
+    for (const [response, seconds] of [
+      [new Response('<html>busy</html>', { status: 429, headers: { 'content-type': 'text/html', 'Retry-After': '90' } }), 90],
+      [new Response(null, { status: 503, headers: { 'Retry-After': '120' } }), 120],
+    ] as const) {
+      const before = Date.now();
+      const client = makeClient(async () => response).client;
+      const error = await client.inspect('batch_fixture_1', operationId).catch((value: unknown) => value);
+      expect(error).toBeInstanceOf(OpenRouterBatchInspectionReadError);
+      expect(error).toMatchObject({ retryable: true });
+      expect((error as OpenRouterBatchInspectionReadError).retryAfterMs).toBeGreaterThanOrEqual(before + seconds * 1_000);
+    }
+    const denied = makeClient(async () => new Response('{}', { status: 401 })).client;
+    await expect(denied.inspect('batch_fixture_1', operationId)).rejects.toMatchObject<Partial<OpenRouterBatchInspectionReadError>>({ retryable: false });
   });
 
   it('retains accounting for the owned batch when its model metadata is invalid, without exposing that model or result', async () => {
