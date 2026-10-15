@@ -19,6 +19,7 @@ type Props = {
   onCreateConversation: (expectedPlanId: string) => Promise<ChatConversationDTO | undefined>;
   onSend: (expectedPlanId: string, conversationId: string) => Promise<unknown>;
   onCancel: (expectedPlanId: string) => void;
+  pendingCommand?: Readonly<{ label: string; onInspect: () => void }>;
 };
 
 function capturedLabel(capturedAt: string, timeZone: string) {
@@ -42,6 +43,7 @@ export function VoiceChatTransferReview({
   onCreateConversation,
   onSend,
   onCancel,
+  pendingCommand,
 }: Props) {
   const [creating, setCreating] = useState(false);
   const [sending, setSending] = useState(false);
@@ -105,6 +107,10 @@ export function VoiceChatTransferReview({
           <View style={styles.card}>
             <Text style={styles.title}>Use saved transcript in Chat</Text>
             <Text style={styles.copy}>Creates a saved Chat message. Deleting the recording note won’t delete that message.</Text>
+            {pendingCommand ? <View style={styles.pendingBox}>
+              <Text style={styles.meta}>{pendingCommand.label}</Text>
+              <Button label="Inspect exact transcript command" tone="quiet" disabled={busy} onPress={pendingCommand.onInspect} />
+            </View> : null}
             <Text style={styles.meta}>{capturedLabel(plan.capturedAt, plan.captureTimeZone)}</Text>
             <ScrollView style={styles.transcriptBox} contentContainerStyle={styles.transcriptContent}>
               <Text selectable style={styles.transcript}>{plan.transcript}</Text>
@@ -116,7 +122,7 @@ export function VoiceChatTransferReview({
                   key={conversation.id}
                   accessibilityRole="button"
                   accessibilityState={{ selected: selectedConversationId === conversation.id }}
-                  disabled={blocked || busy || creating || sending}
+                  disabled={blocked || busy || Boolean(pendingCommand) || creating || sending}
                   onPress={() => { if (!blocked && !busy && !actionLock.current) onSelectConversation(conversation.id); }}
                   style={[styles.conversation, selectedConversationId === conversation.id && styles.selected]}
                 >
@@ -124,11 +130,11 @@ export function VoiceChatTransferReview({
                 </Pressable>
               ))}
             </ScrollView>
-            <Button label={creating ? 'Creating conversation…' : 'Create new conversation'} tone="quiet" disabled={blocked || busy || creating || sending} onPress={() => { void createConversation(); }} />
+            <Button label={creating ? 'Creating conversation…' : 'Create new conversation'} tone="quiet" disabled={blocked || busy || Boolean(pendingCommand) || creating || sending} onPress={() => { void createConversation(); }} />
             {!providerReady ? <Text style={styles.meta}>Choose OpenRouter in Provider mode and save its key before sending.</Text> : null}
             {error ? <Text accessibilityRole="alert" style={styles.error}>{error}</Text> : null}
-            <Button label={sending ? 'Sending…' : 'Send saved transcript'} disabled={blocked || busy || creating || sending || !providerReady || !selectedConversationId} onPress={() => { void send(); }} />
-            <Button label="Cancel" tone="quiet" disabled={blocked || creating || sending} onPress={close} />
+            <Button label={sending ? 'Sending…' : 'Send saved transcript'} disabled={blocked || busy || Boolean(pendingCommand) || creating || sending || !providerReady || !selectedConversationId} onPress={() => { void send(); }} />
+            <Button label="Cancel" tone="quiet" disabled={blocked || busy || Boolean(pendingCommand) || creating || sending} onPress={close} />
           </View>
         </SafeAreaView>
       </SafeAreaProvider>
@@ -147,6 +153,7 @@ const styles = {
   transcript: { color: C.text, fontSize: 14, lineHeight: 21 },
   sectionTitle: { color: C.text, fontSize: 14, fontWeight: '600' as const },
   conversations: { maxHeight: 125 },
+  pendingBox: { gap: 7, padding: 10, borderRadius: 10, borderWidth: 1, borderColor: C.border, backgroundColor: '#191a1c' },
   conversationList: { gap: 7 },
   conversation: { minHeight: 46, justifyContent: 'center' as const, paddingHorizontal: 12, borderRadius: 11, borderWidth: 1, borderColor: C.border, backgroundColor: C.input },
   selected: { borderColor: C.sage },

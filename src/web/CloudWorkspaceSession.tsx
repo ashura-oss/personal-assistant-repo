@@ -17,6 +17,7 @@ import { C, s } from '../ui/theme';
 import { useCloudCredentials } from './useCloudCredentials';
 import { CloudOAuthCoordinator, type CloudOAuthState } from './cloudOAuthCoordinator';
 import { CloudMailCoordinator, type CloudMailCoordinatorState } from './cloudMailCoordinator';
+import { CloudTranscriptTransferCoordinator, type CloudTranscriptTransferState } from './cloudTranscriptTransferCoordinator';
 
 export type CloudWorkspaceSessionState = Readonly<{
   status: 'loading' | 'ready' | 'error';
@@ -26,6 +27,7 @@ export type CloudWorkspaceSessionState = Readonly<{
   voice?: CloudVoiceCoordinatorState;
   oauth?: CloudOAuthState;
   mail?: CloudMailCoordinatorState;
+  transcriptTransfer?: CloudTranscriptTransferState;
   refreshRequired: boolean;
   error?: string;
 }>;
@@ -44,6 +46,8 @@ export class CloudWorkspaceSessionStore {
   private unsubscribeOAuth?: () => void;
   private mailCoordinator?: CloudMailCoordinator;
   private unsubscribeMail?: () => void;
+  private transcriptTransferCoordinator?: CloudTranscriptTransferCoordinator;
+  private unsubscribeTranscriptTransfer?: () => void;
   private ownerGeneration = 0;
   private active = false;
   private operationInFlight = false;
@@ -76,15 +80,17 @@ export class CloudWorkspaceSessionStore {
   };
 
   private publish(next: CloudWorkspaceSessionState): void {
-    const { voice: _callerVoice, oauth: _callerOAuth, mail: _callerMail, ...withoutCallerOwnedState } = next;
+    const { voice: _callerVoice, oauth: _callerOAuth, mail: _callerMail, transcriptTransfer: _callerTranscriptTransfer, ...withoutCallerOwnedState } = next;
     void _callerVoice;
     void _callerOAuth;
     void _callerMail;
+    void _callerTranscriptTransfer;
     const coordinator = this.active ? this.voiceCoordinator : undefined;
     const voice = coordinator?.getSnapshot();
     const oauth = this.active ? this.oauthCoordinator?.getSnapshot() : undefined;
     const mail = this.active ? this.mailCoordinator?.getSnapshot() : undefined;
-    this.value = Object.freeze({ ...withoutCallerOwnedState, ...(voice ? { voice } : {}), ...(oauth ? { oauth } : {}), ...(mail ? { mail } : {}) });
+    const transcriptTransfer = this.active ? this.transcriptTransferCoordinator?.getSnapshot() : undefined;
+    this.value = Object.freeze({ ...withoutCallerOwnedState, ...(voice ? { voice } : {}), ...(oauth ? { oauth } : {}), ...(mail ? { mail } : {}), ...(transcriptTransfer ? { transcriptTransfer } : {}) });
     for (const listener of this.listeners) listener();
   }
 
@@ -142,6 +148,20 @@ export class CloudWorkspaceSessionStore {
     this.unsubscribeMail = mailCoordinator.subscribe(() => {
       if (this.isCurrent(owner) && this.mailCoordinator === mailCoordinator) this.publish({ ...this.value, mail: mailCoordinator.getSnapshot() });
     });
+    const transcriptTransferCoordinator = new CloudTranscriptTransferCoordinator({
+      readSnapshot: () => this.isCurrent(owner) ? this.value.snapshot : undefined,
+      readOperation: () => ({ busy: this.value.busy, pending: Boolean(this.value.pendingCommand), refreshRequired: this.value.refreshRequired,
+        ...(this.value.pendingCommand ? { pendingCommandId: this.value.pendingCommand.commandId } : {}) }),
+      execute: (command, onAdmitted) => this.execute(command, (envelope) => onAdmitted?.(envelope.commandId)),
+      inspect: (commandId) => this.inspect(commandId),
+      refresh: () => this.refresh(),
+    });
+    this.transcriptTransferCoordinator = transcriptTransferCoordinator;
+    this.unsubscribeTranscriptTransfer = transcriptTransferCoordinator.subscribe(() => {
+      if (this.isCurrent(owner) && this.transcriptTransferCoordinator === transcriptTransferCoordinator) {
+        this.publish({ ...this.value, transcriptTransfer: transcriptTransferCoordinator.getSnapshot() });
+      }
+    });
     if (getCapture) {
       this.audioClient = createWebAudioUploadClient(this.session, {
         assertCurrent: () => { if (!this.isCurrent(owner)) throw new Error('Cloud workspace owner changed.'); },
@@ -185,6 +205,10 @@ export class CloudWorkspaceSessionStore {
     this.unsubscribeMail = undefined;
     this.mailCoordinator?.dispose();
     this.mailCoordinator = undefined;
+    this.unsubscribeTranscriptTransfer?.();
+    this.unsubscribeTranscriptTransfer = undefined;
+    this.transcriptTransferCoordinator?.dispose();
+    this.transcriptTransferCoordinator = undefined;
     this.unsubscribeVoice?.();
     this.unsubscribeVoice = undefined;
     this.unsubscribeOAuth?.();
@@ -219,6 +243,11 @@ export class CloudWorkspaceSessionStore {
   getMailCoordinator(): CloudMailCoordinator | undefined {
     if (!this.active) return undefined;
     return this.mailCoordinator;
+  }
+
+  getTranscriptTransferCoordinator(): CloudTranscriptTransferCoordinator | undefined {
+    if (!this.active) return undefined;
+    return this.transcriptTransferCoordinator;
   }
 
   async cancelTranscription(commandId: string): Promise<'cancellation_requested' | 'not_running'> {
@@ -483,7 +512,7 @@ export function CloudWorkspaceSession({ session, onLogout }: { session: Authenti
     );
   }
 
-  return <CloudWorkspace store={store} state={state} onLogout={() => { store.invalidate(); onLogout(); }} credentials={credentials} oauthCoordinator={store.getOAuthCoordinator()} mailCoordinator={store.getMailCoordinator()} voiceCapability={state.voice ? {
+  return <CloudWorkspace store={store} state={state} onLogout={() => { store.invalidate(); onLogout(); }} credentials={credentials} oauthCoordinator={store.getOAuthCoordinator()} mailCoordinator={store.getMailCoordinator()} transcriptTransferCoordinator={store.getTranscriptTransferCoordinator()} voiceCapability={state.voice ? {
     available: true,
     capture: { status: capture.status, canResume: capture.canResume, durationSeconds: capture.durationSeconds,
       meter: capture.meter, hasPending: capture.hasPending, ...(capture.statusLabel ? { statusLabel: capture.statusLabel } : {}),

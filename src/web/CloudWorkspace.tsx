@@ -1,4 +1,4 @@
-import React, { useLayoutEffect, useMemo, useRef, useState } from 'react';
+import React, { useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { Pressable, ScrollView, Text, View } from 'react-native';
 import type { WorkspaceCommand, WorkspaceCommandResponse, WorkspaceSettingsPatch } from '../cloud/workspaceCommands';
 import type { WorkspaceSettingsDTO } from '../cloud/workspaceDto';
@@ -28,6 +28,7 @@ import type { CloudCredentialController } from './useCloudCredentials';
 import { useCloudOAuth } from './useCloudOAuth';
 import type { CloudOAuthCoordinator } from './cloudOAuthCoordinator';
 import type { CloudMailCoordinator } from './cloudMailCoordinator';
+import type { CloudTranscriptTransferCoordinator, CloudTranscriptTransferState } from './cloudTranscriptTransferCoordinator';
 import { CloudMailWorkspace } from './CloudMailWorkspace';
 import { InboxWorkspaceContent, inboxAccountDisplay } from '../ui/InboxWorkspaceContent';
 import { AssistantBatchJobCard } from '../ui/AssistantBatchJobCard';
@@ -59,6 +60,9 @@ function receiptFor(response: WorkspaceCommandResponse, kind: WorkspaceCommand['
 function errText(error: unknown) {
   return error instanceof WorkspaceClientError || error instanceof WorkspaceCommandNotStartedError ? error.message : 'The workspace action could not be confirmed.';
 }
+
+const EMPTY_TRANSCRIPT_TRANSFER: CloudTranscriptTransferState = Object.freeze({ busy: false });
+const EMPTY_TRANSCRIPT_SUBSCRIBE = (_listener: () => void) => () => undefined;
 
 type WorkspaceSettingsBaseline = Readonly<{
   mode: WorkspaceSettingsDTO['mode'];
@@ -103,8 +107,11 @@ function equalSettingsBaseline(left: WorkspaceSettingsBaseline, right: Workspace
     left.maxAudioSeconds === right.maxAudioSeconds && left.retention === right.retention;
 }
 
-export function CloudWorkspace({ store, state, onLogout, voiceCapability, credentials, oauthCoordinator, mailCoordinator }: { store: Pick<CloudWorkspaceSessionStore, 'getSnapshot' | 'execute' | 'inspect' | 'refresh'> & Partial<Pick<CloudWorkspaceSessionStore, 'readKnowledgeSourceChoices' | 'readKnowledgeSuggestionReview'>>; state: CloudWorkspaceSessionState; onLogout: () => void; voiceCapability?: CloudWorkspaceVoiceCapability; credentials?: CloudCredentialController; oauthCoordinator?: CloudOAuthCoordinator; mailCoordinator?: CloudMailCoordinator }) {
+export function CloudWorkspace({ store, state, onLogout, voiceCapability, credentials, oauthCoordinator, mailCoordinator, transcriptTransferCoordinator }: { store: Pick<CloudWorkspaceSessionStore, 'getSnapshot' | 'execute' | 'inspect' | 'refresh'> & Partial<Pick<CloudWorkspaceSessionStore, 'readKnowledgeSourceChoices' | 'readKnowledgeSuggestionReview'>>; state: CloudWorkspaceSessionState; onLogout: () => void; voiceCapability?: CloudWorkspaceVoiceCapability; credentials?: CloudCredentialController; oauthCoordinator?: CloudOAuthCoordinator; mailCoordinator?: CloudMailCoordinator; transcriptTransferCoordinator?: CloudTranscriptTransferCoordinator }) {
   const oauthState = useCloudOAuth(oauthCoordinator);
+  const transcriptTransferState = useSyncExternalStore(transcriptTransferCoordinator?.subscribe ?? EMPTY_TRANSCRIPT_SUBSCRIBE,
+    transcriptTransferCoordinator?.getSnapshot ?? (() => EMPTY_TRANSCRIPT_TRANSFER),
+    transcriptTransferCoordinator?.getSnapshot ?? (() => EMPTY_TRANSCRIPT_TRANSFER));
   const snapshot = state.snapshot!;
   const dto = snapshot.state;
   const libraryMutationActions = useMemo(() => createCloudKnowledgeActions(store, { workspaceId: snapshot.workspaceId, privacyEpoch: snapshot.privacyEpoch }),
@@ -116,6 +123,11 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
   const [, setDraft] = useState('');
   const [selectedNoteId, setSelectedNoteId] = useState<string>();
   const [selectedConversationId, setSelectedConversationId] = useState<string>();
+  const transcriptTransferPlan = transcriptTransferState.plan;
+  const transcriptTransferCommand = transcriptTransferState.held;
+  const deleteReviewOwner = useRef<Readonly<{ workspaceId: string; privacyEpoch: number; revision: number; conversationId: string }> | undefined>(undefined);
+  const deleteCommandOwner = useRef<Readonly<{ commandId: string; workspaceId: string; privacyEpoch: number; revision: number; conversationId: string }> | undefined>(undefined);
+  const timeZoneCommandOwner = useRef<Readonly<{ commandId: string; workspaceId: string; privacyEpoch: number; noteId: string; noteRevision: number; timeZone: string }> | undefined>(undefined);
   const [manualOpen, setManualOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsDraft, setSettingsDraft] = useState<WorkspaceSettingsDraft>();
@@ -128,6 +140,7 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
   const settingsOperationLock = useRef<object | undefined>(undefined);
   const [libraryQuery, setLibraryQuery] = useState('');
   const [notice, setNotice] = useState<string>();
+  const displayedNotice = notice ?? transcriptTransferState.notice;
   const [voiceActionBusy, setVoiceActionBusy] = useState(false);
   const voiceActionLock = useRef<object | undefined>(undefined);
   const [cancelingTranscriptionCommandId, setCancelingTranscriptionCommandId] = useState<string>();
@@ -562,9 +575,73 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
 
   const refresh = async () => { await store.refresh(); };
 
+  const workspaceOwner = `${snapshot.workspaceId}:${snapshot.privacyEpoch}`;
+  const prepareTranscriptTransfer = (note: NonNullable<typeof selectedNote>) => { void transcriptTransferCoordinator?.prepare(note.id, note.revision); };
+  const cancelTranscriptTransfer = (planId: string) => { void transcriptTransferCoordinator?.cancel(planId); };
+  const submitTranscriptTransfer = (planId: string, conversationId: string) => transcriptTransferCoordinator
+    ? transcriptTransferCoordinator.submit(planId, conversationId) : Promise.resolve(undefined);
+
+  const confirmImportedTimeZone = async (note: NonNullable<typeof selectedNote>, timeZone: string, expectedRevision: number) => {
+    const current = store.getSnapshot();
+    const currentSnapshot = current.snapshot;
+    const latestNote = currentSnapshot?.state.notes.find((item) => item.id === note.id);
+    if (!currentSnapshot || `${currentSnapshot.workspaceId}:${currentSnapshot.privacyEpoch}` !== workspaceOwner || current.busy ||
+        current.pendingCommand || current.refreshRequired || expectedRevision !== note.revision || latestNote?.revision !== expectedRevision ||
+        note.importOrigin?.originalTimeZoneUnknown !== true || timeZone.trim() !== timeZone) {
+      setNotice('The imported note changed. Refresh it before confirming its capture time zone.');
+      return;
+    }
+    try {
+      const response = await store.execute({ kind: 'notes.confirmImportedTimeZone', noteId: note.id, expectedNoteRevision: expectedRevision, timeZone }, (envelope) => {
+        if (envelope.command.kind === 'notes.confirmImportedTimeZone') timeZoneCommandOwner.current = Object.freeze({ commandId: envelope.commandId,
+          workspaceId: snapshot.workspaceId, privacyEpoch: snapshot.privacyEpoch, noteId: note.id, noteRevision: expectedRevision, timeZone });
+      });
+      const receipt = receiptFor(response, 'notes.confirmImportedTimeZone');
+      if (receipt?.kind === 'notes.confirmImportedTimeZone' && receipt.noteId === note.id && receipt.noteRevision > expectedRevision && receipt.timeZone === timeZone) {
+        timeZoneCommandOwner.current = undefined;
+        setNotice('Capture time zone confirmed. Date-sensitive assistance can now use this imported note.');
+        if (!response.snapshot) void store.refresh().catch((error) => setNotice(errText(error)));
+      } else setNotice('The exact time zone confirmation is still being checked. No other note was changed.');
+    } catch (error) { setNotice(errText(error)); }
+  };
+
+  const deleteChatConversation = async (conversationId: string) => {
+    const review = deleteReviewOwner.current;
+    const current = store.getSnapshot();
+    const currentSnapshot = current.snapshot;
+    if (!review || review.conversationId !== conversationId || !currentSnapshot || currentSnapshot.workspaceId !== review.workspaceId ||
+        currentSnapshot.privacyEpoch !== review.privacyEpoch || currentSnapshot.revision !== review.revision || current.busy ||
+        current.pendingCommand || current.refreshRequired || !currentSnapshot.state.assistantChatConversations.some((item) => item.id === conversationId)) {
+      const message = 'The workspace or conversation changed while deletion was under review. Reopen the confirmation before trying again.';
+      if (review && currentSnapshot && currentSnapshot.workspaceId === review.workspaceId && currentSnapshot.privacyEpoch === review.privacyEpoch) setNotice(message);
+      throw new Error(message);
+    }
+    const response = await store.execute({ kind: 'chat.conversation.delete', conversationId }, (envelope) => {
+      if (envelope.command.kind === 'chat.conversation.delete') deleteCommandOwner.current = Object.freeze({ commandId: envelope.commandId,
+        workspaceId: review.workspaceId, privacyEpoch: review.privacyEpoch, revision: review.revision, conversationId });
+    });
+    const receipt = receiptFor(response, 'chat.conversation.delete');
+    if (!receipt || receipt.kind !== 'chat.conversation.delete' || receipt.conversationId !== conversationId || receipt.objectId !== conversationId) {
+      setNotice('Conversation deletion has no confirmed receipt yet. Inspect the exact command before continuing.');
+      throw new Error('The exact conversation deletion is still being checked.');
+    }
+    const latest = store.getSnapshot().snapshot;
+    if (!latest || latest.workspaceId !== review.workspaceId || latest.privacyEpoch !== review.privacyEpoch) return;
+    deleteCommandOwner.current = undefined;
+    setSelectedConversationId(undefined);
+    setNotice('Conversation removed from this workspace. No provider account or external data was changed.');
+    if (!response.snapshot) void store.refresh().catch((error) => setNotice(errText(error)));
+  };
+
   const inspectPendingCommand = async () => {
     const pending = store.getSnapshot().pendingCommand;
     if (!pending || state.busy) return;
+    if (transcriptTransferCommand?.commandId === pending.commandId && transcriptTransferCommand.kind === pending.kind) {
+      setNotice(undefined);
+      const result = await transcriptTransferCoordinator?.inspect(pending.commandId);
+      if (result?.kind === 'accepted') { setSelectedConversationId(result.conversationId); setTab('chat'); }
+      return;
+    }
     setNotice(undefined);
     try {
       const response = await store.inspect(pending.commandId);
@@ -572,6 +649,32 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
       if (response.commandId !== pending.commandId || response.status !== 'finished' || !receipt ||
           receipt.commandId !== pending.commandId || receipt.kind !== pending.kind) {
         setNotice(`The exact ${pending.kind} command has no confirmed receipt yet. No request was resent.`);
+        return;
+      }
+      const deletion = deleteCommandOwner.current;
+      if (pending.kind === 'chat.conversation.delete' && deletion?.commandId === pending.commandId && receipt.kind === 'chat.conversation.delete' &&
+          receipt.conversationId === deletion.conversationId && receipt.objectId === deletion.conversationId) {
+        const current = store.getSnapshot().snapshot;
+        if (!current || current.workspaceId !== deletion.workspaceId || current.privacyEpoch !== deletion.privacyEpoch) return;
+        await store.refresh();
+        const latest = store.getSnapshot().snapshot;
+        if (latest?.workspaceId === deletion.workspaceId && latest.privacyEpoch === deletion.privacyEpoch) {
+          deleteCommandOwner.current = undefined;
+          setNotice('Conversation removal is confirmed. No provider account or external data was changed.');
+        }
+        return;
+      }
+      const zone = timeZoneCommandOwner.current;
+      if (pending.kind === 'notes.confirmImportedTimeZone' && zone?.commandId === pending.commandId && receipt.kind === 'notes.confirmImportedTimeZone' &&
+          receipt.noteId === zone.noteId && receipt.noteRevision > zone.noteRevision && receipt.timeZone === zone.timeZone) {
+        const current = store.getSnapshot().snapshot;
+        if (!current || current.workspaceId !== zone.workspaceId || current.privacyEpoch !== zone.privacyEpoch) return;
+        await store.refresh();
+        const latest = store.getSnapshot().snapshot;
+        if (latest?.workspaceId === zone.workspaceId && latest.privacyEpoch === zone.privacyEpoch) {
+          timeZoneCommandOwner.current = undefined;
+          setNotice('Capture time zone confirmation is saved. No request was resent.');
+        }
         return;
       }
       setNotice(pending.kind === 'chat.submit'
@@ -582,17 +685,17 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
 
   return (
     <WorkspaceScreen
-      model={{ activeTab: tab, busy: state.busy, tabBarVisible: true, tabNavigationLocked: Boolean(state.pendingCommand), snapshot, notice }}
+      model={{ activeTab: tab, busy: state.busy, tabBarVisible: true, tabNavigationLocked: Boolean(state.pendingCommand), snapshot, notice: displayedNotice }}
       actions={{ navigation: { selectTab: setTab }, settings: { open: openSettings }, session: { logout: onLogout } }}
     >
-      {notice || state.refreshRequired ? (
+      {displayedNotice || state.refreshRequired ? (
         <View style={s.notice}>
-          <Text style={s.noticeText} accessibilityRole="alert">{notice ?? state.error ?? 'The latest command is recorded, but workspace data must be refreshed.'}</Text>
+          <Text style={s.noticeText} accessibilityRole="alert">{displayedNotice ?? state.error ?? 'The latest command is recorded, but workspace data must be refreshed.'}</Text>
           {state.pendingCommand ? <Button label={`Inspect exact ${state.pendingCommand.kind} command`} tone="quiet" disabled={state.busy} onPress={() => void inspectPendingCommand()} /> : null}
           {state.refreshRequired ? <Button label="Refresh workspace" tone="quiet" disabled={state.busy} onPress={() => void refresh()} /> : null}
         </View>
       ) : null}
-      {state.pendingCommand && !notice && !state.refreshRequired ? (
+      {state.pendingCommand && !displayedNotice && !state.refreshRequired ? (
         <View style={s.notice}>
           <Text style={s.noticeText} accessibilityRole="alert">A {state.pendingCommand.kind} command is awaiting its exact receipt. It will not be sent again automatically.</Text>
           <Button label={`Inspect exact ${state.pendingCommand.kind} command`} tone="quiet" disabled={state.busy} onPress={() => void inspectPendingCommand()} />
@@ -635,6 +738,15 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
           recoveryMessage={state.pendingCommand ? 'Check the exact pending command before sending another request.' : undefined}
           knowledgeChoices={knowledgeChoices}
           onSelectConversation={setSelectedConversationId}
+          onDeleteReviewChange={(open) => {
+            if (open && selectedConversationId) {
+              const current = store.getSnapshot().snapshot;
+              if (current && `${current.workspaceId}:${current.privacyEpoch}` === workspaceOwner) deleteReviewOwner.current = Object.freeze({
+                workspaceId: current.workspaceId, privacyEpoch: current.privacyEpoch, revision: current.revision, conversationId: selectedConversationId,
+              });
+            } else if (!open && !store.getSnapshot().pendingCommand) deleteReviewOwner.current = undefined;
+          }}
+          onDeleteConversation={deleteChatConversation}
           onCreateConversation={() => void createConversation()}
           onSendAttempt={sendAttempt}
           onInspectUnconfirmedSend={inspectAttempt}
@@ -724,7 +836,9 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
             projects={dto.knowledge.projects.map((project) => ({ id: project.id, name: project.name, revision: project.revision, archivedAt: project.archivedAt, importOrigin: project.importOrigin }))}
             actionCapabilities={{
               delete: { available: false, reason: 'Note deletion is not connected to a server command.' },
-              confirmImportedTimeZone: { available: false, reason: 'Imported time zone confirmation is not connected to a server command.' },
+              confirmImportedTimeZone: selectedNote.importOrigin?.originalTimeZoneUnknown === true
+                ? { available: !state.busy && !state.pendingCommand && !state.refreshRequired, reason: 'Resolve the current workspace request before confirming this imported note.' }
+                : { available: false, reason: 'This note does not need an imported time zone confirmation.' },
               attachRecording: { available: false, reason: 'Attaching a replacement recording is not connected to the server workspace.' },
               playback: selectedMediaId ? { available: true } : { available: false, reason: 'This saved recording has no validated server media reference for playback.' },
               exportAudio: { available: false, reason: 'Recording export is not available in this browser workspace yet.' },
@@ -736,7 +850,7 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
                 ? { available: true }
                 : { available: false, reason: 'Enable OpenRouter provider analysis in Settings to queue this note.' },
               memorySuggestion: { available: false, reason: 'Saving a memory suggestion is not connected to a server command.' },
-              chatTransfer: { available: false, reason: 'Transcript transfer review is not connected to the browser workspace yet.' },
+              chatTransfer: { available: true },
               sourceCheck: { available: false, reason: 'Source rechecks are not connected to the browser workspace yet.' },
               openProposals: { available: true },
             }}
@@ -744,7 +858,7 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
             onRetryStatus={() => setNotice('Source rechecks are not connected to this browser workspace yet.')}
             onClose={() => setSelectedNoteId(undefined)}
             onUpdate={(text) => void updateNote(selectedNote, text)}
-            onConfirmImportedTimeZone={() => setNotice('Imported time zone confirmation is not connected to a server command.')}
+            onConfirmImportedTimeZone={(timeZone, expectedRevision) => void confirmImportedTimeZone(selectedNote, timeZone, expectedRevision)}
             onAssist={(options) => {
               const owner = `${snapshot.workspaceId}:${snapshot.privacyEpoch}:${selectedNote.id}:${selectedNote.revision}`;
               const current = store.getSnapshot();
@@ -782,6 +896,29 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
             onPausePlayback={() => audioPlayback.pause()}
             onExportAudio={() => setNotice('Recording export is not available in this browser workspace yet.')}
             onDelete={() => setNotice('Note deletion is not connected to a server command.')}
+            voiceChatTransfer={{
+              ...(transcriptTransferState.planOwner === `${workspaceOwner}:${selectedNote.id}:${selectedNote.revision}` && transcriptTransferPlan ? { plan: transcriptTransferPlan } : {}),
+              conversations,
+              selectedConversationId,
+              blocked: state.refreshRequired,
+              busy: state.busy,
+              providerReady: dto.settings.mode === 'provider' && dto.settings.llmProvider === 'openrouter' && Boolean(credentials?.presence?.openrouter),
+              onPrepare: () => void prepareTranscriptTransfer(selectedNote),
+              onSelectConversation: setSelectedConversationId,
+              onCreateConversation: async () => {
+                const current = store.getSnapshot();
+                if (current.busy || current.pendingCommand || current.refreshRequired || !current.snapshot || `${current.snapshot.workspaceId}:${current.snapshot.privacyEpoch}` !== workspaceOwner) return undefined;
+                const response = await store.execute({ kind: 'chat.create' });
+                const receipt = receiptFor(response, 'chat.create');
+                const latest = response.snapshot ?? store.getSnapshot().snapshot;
+                return receipt && latest?.state.assistantChatConversations.find((item) => item.id === receipt.objectId);
+              },
+              onSend: submitTranscriptTransfer,
+              onCancel: (planId) => { void cancelTranscriptTransfer(planId); },
+              ...(state.pendingCommand && transcriptTransferCommand?.commandId === state.pendingCommand.commandId
+                ? { pendingCommand: { label: `The exact ${transcriptTransferCommand.kind} command is awaiting confirmation. It will not be sent again.`, onInspect: () => { void inspectPendingCommand(); } } }
+                : {}),
+            }}
           /> : null}
         </>
       ) : <View style={{ flex: 1 }}>

@@ -21,7 +21,7 @@ import {
 } from '../dist/workspaceCommands.node.mjs';
 
 function fixture({ providerBatchClient, withAudio = false, speechClient, speechEnabled = false, withSpeechCleanup = false,
-  initialNoteId, initialKnowledge, initialDocuments = [], initialAccounts = [], initialCalendars = [], initialProposals = [], initialMailbox = [], integrationOverrides = {},
+  initialNoteId, initialNoteImportOrigin, initialNoteCapturedAt, initialNoteCaptureTimeZone, initialKnowledge, initialDocuments = [], initialAccounts = [], initialCalendars = [], initialProposals = [], initialMailbox = [], integrationOverrides = {},
   writeDocument, captureController } = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'still-workspace-commands-'));
   const kernel = createDurableKernel({ databasePath: join(directory, 'workspace.sqlite'),
@@ -34,7 +34,9 @@ function fixture({ providerBatchClient, withAudio = false, speechClient, speechE
   }
   if (initialNoteId) state.notes.push({ id: initialNoteId, title: 'Imported audio note', transcript: 'Original transcript.',
     audioUri: 'file:///private/imported.wav', durationSeconds: 2, createdAt: '2026-10-15T00:00:00.000Z',
-    status: 'recorded', revision: 1 });
+    status: 'recorded', revision: 1, ...(initialNoteImportOrigin ? { importOrigin: structuredClone(initialNoteImportOrigin) } : {}),
+    ...(initialNoteCapturedAt ? { capturedAt: initialNoteCapturedAt } : {}),
+    ...(initialNoteCaptureTimeZone ? { captureTimeZone: initialNoteCaptureTimeZone } : {}) });
   if (initialKnowledge) state.knowledge = structuredClone(initialKnowledge);
   state.documents.push(...structuredClone(initialDocuments));
   state.accounts.push(...structuredClone(initialAccounts));
@@ -1315,6 +1317,139 @@ test('explicit dispatcher calls only the task/chat allowlist and returns safe du
     assert.ok(chat.snapshot.state.assistantChatConversations.some((item) => item.id === chat.receipt.objectId));
     const changed = { ...command, command: { kind: 'tasks.reopen', taskId: 'legacy task: 1' } };
     await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission, changed), /already bound to different/);
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test('imported time-zone confirmation is revision-bound, and conversation removal uses only the owned workspace', async () => {
+  const noteId = 'legacy imported note: 17';
+  const f = fixture({ initialNoteId: noteId, initialNoteImportOrigin: { kind: 'backup_import', archiveId: randomUUID(),
+    sourceNoteId: 'source-note:17', audioMissing: true, originalTimeZoneUnknown: true } });
+  try {
+    let head = await f.runtime.getSnapshot(f.admission);
+    const imported = head.state.notes.find((note) => note.id === noteId);
+    assert.ok(imported);
+    const invalid = envelope({ kind: 'notes.confirmImportedTimeZone', noteId, expectedNoteRevision: imported.revision, timeZone: 'Mars/Olympus' }, head.revision, head.privacyEpoch);
+    await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission, invalid), /workspace_command_invalid/);
+    assert.equal(inspectWorkspaceCommand(f.runtime, f.admission, invalid.commandId).status, 'unverified');
+
+    const confirmation = envelope({ kind: 'notes.confirmImportedTimeZone', noteId, expectedNoteRevision: imported.revision, timeZone: 'Asia/Singapore' }, head.revision, head.privacyEpoch);
+    const confirmed = await dispatchWorkspaceCommand(f.runtime, f.admission, confirmation);
+    assert.equal(confirmed.receipt.kind, 'notes.confirmImportedTimeZone');
+    assert.deepEqual({ objectId: confirmed.receipt.objectId, noteId: confirmed.receipt.noteId, noteRevision: confirmed.receipt.noteRevision,
+      timeZone: confirmed.receipt.timeZone }, { objectId: noteId, noteId, noteRevision: imported.revision + 1, timeZone: 'Asia/Singapore' });
+    assert.equal(confirmed.snapshot.state.notes.find((note) => note.id === noteId).captureTimeZone, 'Asia/Singapore');
+    assert.deepEqual((await dispatchWorkspaceCommand(f.runtime, f.admission, confirmation)).receipt, confirmed.receipt);
+    head = await f.runtime.refreshSnapshot(f.admission);
+    const stale = envelope({ kind: 'notes.confirmImportedTimeZone', noteId, expectedNoteRevision: imported.revision, timeZone: 'America/Los_Angeles' }, head.revision, head.privacyEpoch);
+    await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission, stale), /current revision|changed before/i);
+    head = await f.runtime.refreshSnapshot(f.admission);
+    assert.equal(head.state.notes.find((note) => note.id === noteId).captureTimeZone, 'Asia/Singapore');
+
+    head = await f.runtime.getSnapshot(f.admission);
+    const created = await dispatchWorkspaceCommand(f.runtime, f.admission, envelope({ kind: 'chat.create', title: 'Remove this conversation' }, head.revision, head.privacyEpoch));
+    const deleteHead = created.snapshot;
+    const deletion = envelope({ kind: 'chat.conversation.delete', conversationId: created.receipt.objectId }, deleteHead.revision, deleteHead.privacyEpoch);
+    const removed = await dispatchWorkspaceCommand(f.runtime, f.admission, deletion);
+    assert.deepEqual(removed.receipt, { schemaVersion: 1, commandId: deletion.commandId, kind: 'chat.conversation.delete',
+      objectId: created.receipt.objectId, conversationId: created.receipt.objectId });
+    assert.equal(removed.snapshot.state.assistantChatConversations.some((item) => item.id === created.receipt.objectId), false);
+    assert.deepEqual((await dispatchWorkspaceCommand(f.runtime, f.admission, deletion)).receipt, removed.receipt);
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test('transcript review is private and non-paid until an explicit one-use Chat submission', async () => {
+  const noteId = 'legacy saved transcript 23';
+  let providerSubmissions = 0;
+  const providerBatchClient = { async submit(_input, onBeforeDispatch) { providerSubmissions += 1; await onBeforeDispatch(); return { batchId: `chat-transfer-${providerSubmissions}` }; },
+    async inspect() { throw new Error('No provider status check is expected here.'); } };
+  const f = fixture({ providerBatchClient, initialNoteId: noteId, initialNoteCapturedAt: '2026-10-14T23:00:00.000Z', initialNoteCaptureTimeZone: 'Asia/Singapore' });
+  try {
+    let head = await f.runtime.getSnapshot(f.admission);
+    const prepare = envelope({ kind: 'chat.transcript.prepare', noteId, expectedNoteRevision: 1 }, head.revision, head.privacyEpoch);
+    const prepared = await dispatchWorkspaceCommand(f.runtime, f.admission, prepare);
+    assert.equal(prepared.status, 'finished');
+    assert.deepEqual({ objectId: prepared.receipt.objectId, noteId: prepared.receipt.noteId, noteRevision: prepared.receipt.noteRevision,
+      capturedAt: prepared.receipt.capturedAt, captureTimeZone: prepared.receipt.captureTimeZone },
+    { objectId: noteId, noteId, noteRevision: 1, capturedAt: '2026-10-14T23:00:00.000Z', captureTimeZone: 'Asia/Singapore' });
+    assert.equal(Object.hasOwn(prepared.receipt, 'transcript'), false, 'the transcript is never copied into the command receipt');
+    assert.equal(providerSubmissions, 0, 'prepare is local review only');
+    assert.deepEqual((await dispatchWorkspaceCommand(f.runtime, f.admission, prepare)).receipt, prepared.receipt,
+      'duplicate preparation returns the same private plan receipt');
+    assert.equal(providerSubmissions, 0);
+
+    const cancelHead = await f.runtime.getSnapshot(f.admission);
+    const cancellation = envelope({ kind: 'chat.transcript.cancel', planId: prepared.receipt.planId }, cancelHead.revision, cancelHead.privacyEpoch);
+    const canceled = await dispatchWorkspaceCommand(f.runtime, f.admission, cancellation);
+    assert.deepEqual(canceled.receipt, { schemaVersion: 1, commandId: cancellation.commandId, kind: 'chat.transcript.cancel',
+      objectId: prepared.receipt.planId, planId: prepared.receipt.planId });
+    const canceledSubmit = envelope({ kind: 'chat.transcript.submit', planId: prepared.receipt.planId, conversationId: randomUUID() },
+      canceled.snapshot.revision, canceled.snapshot.privacyEpoch);
+    await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission, canceledSubmit), /expired|review again/i);
+    assert.equal(providerSubmissions, 0, 'a canceled plan cannot trigger paid work');
+
+    head = await f.runtime.refreshSnapshot(f.admission);
+    const conversation = await dispatchWorkspaceCommand(f.runtime, f.admission, envelope({ kind: 'chat.create', title: 'Transcript review target' }, head.revision, head.privacyEpoch));
+    const nextHead = conversation.snapshot;
+    const nextPlanCommand = envelope({ kind: 'chat.transcript.prepare', noteId, expectedNoteRevision: 1 }, nextHead.revision, nextHead.privacyEpoch);
+    const nextPlan = await dispatchWorkspaceCommand(f.runtime, f.admission, nextPlanCommand);
+    const submitHead = nextPlan.snapshot;
+    const submit = envelope({ kind: 'chat.transcript.submit', planId: nextPlan.receipt.planId, conversationId: conversation.receipt.objectId }, submitHead.revision, submitHead.privacyEpoch);
+    const sent = await dispatchWorkspaceCommand(f.runtime, f.admission, submit);
+    assert.equal(sent.receipt.kind, 'chat.transcript.submit');
+    assert.deepEqual({ objectId: sent.receipt.objectId, conversationId: sent.receipt.conversationId, planId: sent.receipt.planId },
+      { objectId: conversation.receipt.objectId, conversationId: conversation.receipt.objectId, planId: nextPlan.receipt.planId });
+    assert.ok(sent.receipt.turnId && sent.receipt.jobId);
+    assert.equal(providerSubmissions, 1, 'only the explicit final submission reaches Batch');
+    assert.deepEqual((await dispatchWorkspaceCommand(f.runtime, f.admission, submit)).receipt, sent.receipt);
+    assert.equal(providerSubmissions, 1, 'the same command id never causes a second paid submission');
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test('a transcript review cannot submit after its saved source note changes', async () => {
+  const noteId = 'legacy transcript source 24';
+  let providerSubmissions = 0;
+  const providerBatchClient = { async submit(_input, onBeforeDispatch) { providerSubmissions += 1; await onBeforeDispatch(); return { batchId: `stale-chat-transfer-${providerSubmissions}` }; },
+    async inspect() { throw new Error('No provider status check is expected here.'); } };
+  const f = fixture({ providerBatchClient, initialNoteId: noteId, initialNoteCapturedAt: '2026-10-14T23:00:00.000Z', initialNoteCaptureTimeZone: 'Asia/Singapore' });
+  try {
+    let head = await f.runtime.getSnapshot(f.admission);
+    const prepared = await dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'chat.transcript.prepare', noteId, expectedNoteRevision: 1 }, head.revision, head.privacyEpoch));
+    head = await f.runtime.getSnapshot(f.admission);
+    const edit = envelope({ kind: 'notes.updateTranscript', noteId, expectedNoteRevision: 1, text: 'A newer saved transcript.' }, head.revision, head.privacyEpoch);
+    const edited = await dispatchWorkspaceCommand(f.runtime, f.admission, edit);
+    const staleSubmit = envelope({ kind: 'chat.transcript.submit', planId: prepared.receipt.planId, conversationId: randomUUID() },
+      edited.snapshot.revision, edited.snapshot.privacyEpoch);
+    await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission, staleSubmit), /changed|revision|review again/i);
+    assert.equal(providerSubmissions, 0, 'the paid provider is not called with a transcript from an older note revision');
+  } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test('a lost Chat transcript submission acknowledgement remains exact-inspect only and never submits twice', async () => {
+  const noteId = 'legacy transcript uncertain 25';
+  let providerSubmissions = 0;
+  const providerBatchClient = { async submit(_input, onBeforeDispatch) { providerSubmissions += 1; await onBeforeDispatch(); f.loseNextWorkspaceCommitAck(); return { batchId: `uncertain-chat-transfer-${providerSubmissions}` }; },
+    async inspect() { throw new Error('No provider status check is expected here.'); } };
+  const f = fixture({ providerBatchClient, initialNoteId: noteId, initialNoteCapturedAt: '2026-10-14T23:00:00.000Z', initialNoteCaptureTimeZone: 'Asia/Singapore' });
+  try {
+    let head = await f.runtime.getSnapshot(f.admission);
+    const conversation = await dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'chat.create', title: 'Uncertain transcript destination' }, head.revision, head.privacyEpoch));
+    head = conversation.snapshot;
+    const prepared = await dispatchWorkspaceCommand(f.runtime, f.admission,
+      envelope({ kind: 'chat.transcript.prepare', noteId, expectedNoteRevision: 1 }, head.revision, head.privacyEpoch));
+    const submit = envelope({ kind: 'chat.transcript.submit', planId: prepared.receipt.planId, conversationId: conversation.receipt.objectId },
+      prepared.snapshot.revision, prepared.snapshot.privacyEpoch);
+    await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission, submit), /acknowledgement|simulated|commit|saved data changed/i);
+    const inspection = inspectWorkspaceCommand(f.runtime, f.admission, submit.commandId);
+    assert.equal(inspection.status, 'inspect_required');
+    assert.equal(Object.hasOwn(inspection, 'receipt'), false);
+    assert.equal(providerSubmissions, 1, 'one explicit submit reached the provider before acknowledgement was lost');
+    await f.runtime.refreshSnapshot(f.admission);
+    const recovered = await dispatchWorkspaceCommand(f.runtime, f.admission, submit);
+    assert.equal(recovered.status, 'inspect_required', 'the exact admitted command remains held for inspection after refresh');
+    assert.equal(Object.hasOwn(recovered, 'receipt'), false);
+    assert.equal(providerSubmissions, 1, 'the original command ID cannot invoke the provider again');
   } finally { await f.runtime.closeAfterDrain(); f.kernel.close(); rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 

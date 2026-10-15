@@ -2,7 +2,8 @@
 export const WORKSPACE_COMMAND_HISTORY_PAGE_SIZE = 50;
 
 export const WORKSPACE_COMMAND_HISTORY_KINDS = Object.freeze([
-  'tasks.complete', 'tasks.reopen', 'chat.create', 'settings.update', 'notes.save', 'notes.capture.adopt',
+  'tasks.complete', 'tasks.reopen', 'chat.create', 'chat.conversation.delete', 'notes.confirmImportedTimeZone',
+  'chat.transcript.prepare', 'chat.transcript.cancel', 'chat.transcript.submit', 'settings.update', 'notes.save', 'notes.capture.adopt',
   'notes.updateTranscript', 'assistant.batch.submitNote', 'assistant.batch.check', 'chat.submit', 'chat.refine',
   'notes.transcribe', 'accounts.installOAuth',
   'accounts.syncCalendars', 'accounts.refreshMail', 'accounts.continueMailBackfill', 'accounts.disconnect',
@@ -37,6 +38,8 @@ const JOURNAL_TO_PUBLIC: Readonly<Record<string, WorkspaceCommandHistoryKind>> =
   'notes.capture.adopt': 'notes.capture.adopt', 'notes.updatetranscript': 'notes.updateTranscript',
   'assistant.batch.submitnote': 'assistant.batch.submitNote', 'assistant.batch.check': 'assistant.batch.check',
   'chat.submit': 'chat.submit', 'chat.refine': 'chat.refine',
+  'chat.conversation.delete': 'chat.conversation.delete', 'notes.confirmimportedtimezone': 'notes.confirmImportedTimeZone',
+  'chat.transcript.prepare': 'chat.transcript.prepare', 'chat.transcript.cancel': 'chat.transcript.cancel', 'chat.transcript.submit': 'chat.transcript.submit',
   'notes.transcribe': 'notes.transcribe',
   'accounts.installoauth': 'accounts.installOAuth',
   'accounts.synccalendars': 'accounts.syncCalendars', 'accounts.refreshmail': 'accounts.refreshMail',

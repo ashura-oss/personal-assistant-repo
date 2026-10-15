@@ -50,6 +50,31 @@ export async function dispatchWorkspaceCommand(runtime: OwnedWorkspaceRuntime, a
       case 'tasks.complete': return receipt(envelope, command, { objectId: (await controller.completeTask(command.taskId)).id });
       case 'tasks.reopen': return receipt(envelope, command, { objectId: (await controller.reopenTask(command.taskId)).id });
       case 'chat.create': return receipt(envelope, command, { objectId: (await controller.createChatConversation(command.title)).id });
+      case 'chat.conversation.delete': {
+        await controller.deleteChatConversation(command.conversationId);
+        return receipt(envelope, command, { objectId: command.conversationId, conversationId: command.conversationId });
+      }
+      case 'notes.confirmImportedTimeZone': {
+        const note = await controller.confirmImportedNoteTimeZone(command.noteId, {
+          timeZone: command.timeZone, expectedRevision: command.expectedNoteRevision,
+        });
+        if (typeof note.captureTimeZone !== 'string') throw new Error('workspace_note_timezone_confirmation_unavailable');
+        return receipt(envelope, command, { objectId: note.id, noteId: note.id, noteRevision: note.revision, timeZone: note.captureTimeZone });
+      }
+      case 'chat.transcript.prepare': {
+        const plan = await controller.prepareChatFromTranscript({ noteId: command.noteId, expectedRevision: command.expectedNoteRevision });
+        return receipt(envelope, command, { objectId: plan.noteId, noteId: plan.noteId, noteRevision: plan.noteRevision,
+          planId: plan.planId, expiresAt: plan.expiresAt, capturedAt: plan.capturedAt, captureTimeZone: plan.captureTimeZone });
+      }
+      case 'chat.transcript.cancel': {
+        await controller.cancelChatFromTranscript(command.planId);
+        return receipt(envelope, command, { objectId: command.planId, planId: command.planId });
+      }
+      case 'chat.transcript.submit': {
+        const accepted = await controller.submitChatFromTranscript({ planId: command.planId, conversationId: command.conversationId });
+        return receipt(envelope, command, { objectId: accepted.conversationId, planId: command.planId,
+          conversationId: accepted.conversationId, turnId: accepted.turnId, jobId: accepted.jobId });
+      }
       case 'notes.save': return receipt(envelope, command, { objectId: (await controller.saveNote({ transcript: command.transcript })).id });
       case 'notes.capture.adopt': return receipt(envelope, command, {
         objectId: (await controller.savePendingCapture({ id: command.captureId, revision: command.captureRevision })).id,
@@ -328,6 +353,8 @@ function receipt(envelope: WorkspaceCommandEnvelope, command: WorkspaceCommand, 
   readonly recordId?: string; readonly recordVersion?: string; readonly disposition?: import('../dispatch').DispatchReconciliation;
   readonly providerOutcome?: import('../dispatch').DispatchOutcome; readonly providerOutcomeAt?: string;
   readonly jobStatus?: import('../services/openRouterBatchJobs').AssistantBatchJobDTO['status']; readonly planId?: string; readonly expiresAt?: string;
+  readonly noteId?: string; readonly noteRevision?: number; readonly timeZone?: string; readonly capturedAt?: string;
+  readonly captureTimeZone?: string; readonly conversationId?: string;
 }) {
   return parseWorkspaceCommandReceipt({ schemaVersion: 1, commandId: envelope.commandId, kind: command.kind, ...fields },
     expectedReceipt(envelope.commandId, command));
@@ -338,6 +365,14 @@ function expectedReceipt(commandId: string, command: WorkspaceCommand) {
     case 'settings.update': return { commandId, kind: command.kind, objectId: 'workspace-settings' };
     case 'tasks.complete': case 'tasks.reopen': return { commandId, kind: command.kind, objectId: command.taskId };
     case 'chat.create': case 'notes.save': return { commandId, kind: command.kind };
+    case 'chat.conversation.delete': return { commandId, kind: command.kind, objectId: command.conversationId, conversationId: command.conversationId };
+    case 'notes.confirmImportedTimeZone': return { commandId, kind: command.kind, objectId: command.noteId, noteId: command.noteId,
+      noteRevision: command.expectedNoteRevision + 1, timeZone: command.timeZone };
+    case 'chat.transcript.prepare': return { commandId, kind: command.kind, objectId: command.noteId, noteId: command.noteId,
+      noteRevision: command.expectedNoteRevision };
+    case 'chat.transcript.cancel': return { commandId, kind: command.kind, objectId: command.planId, planId: command.planId };
+    case 'chat.transcript.submit': return { commandId, kind: command.kind, objectId: command.conversationId,
+      conversationId: command.conversationId, planId: command.planId };
     case 'notes.capture.adopt': return { commandId, kind: command.kind, objectId: command.captureId,
       captureId: command.captureId, captureRevision: command.captureRevision };
     case 'accounts.installOAuth': return { commandId, kind: command.kind, stageId: command.stageId };

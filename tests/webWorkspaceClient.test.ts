@@ -57,8 +57,42 @@ function deferred<T>() {
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers(); });
 
 describe('same-origin web workspace command client', () => {
+  it('round-trips imported-note and transcript-to-Chat commands with closed, source-bound receipts', () => {
+    const legacyNoteId = 'legacy-import-note:opaque';
+    const prepareId = '20000000-0000-4000-8000-000000000001';
+    const planId = '20000000-0000-4000-8000-000000000002';
+    const conversation = '20000000-0000-4000-8000-000000000003';
+    const zone = parseWorkspaceCommandEnvelope({ schemaVersion: 1, commandId, expectedRevision: 4, expectedPrivacyEpoch: 3,
+      command: { kind: 'notes.confirmImportedTimeZone', noteId: legacyNoteId, expectedNoteRevision: 5, timeZone: 'Asia/Singapore' } });
+    expect(zone.command.kind).toBe('notes.confirmImportedTimeZone');
+    const confirmedZone = parseWorkspaceCommandReceipt({ schemaVersion: 1, commandId, kind: 'notes.confirmImportedTimeZone', objectId: legacyNoteId,
+      noteId: legacyNoteId, noteRevision: 6, timeZone: 'Asia/Singapore' }, { commandId, kind: 'notes.confirmImportedTimeZone',
+      objectId: legacyNoteId, noteId: legacyNoteId, noteRevision: 6, timeZone: 'Asia/Singapore' });
+    expect(confirmedZone.kind).toBe('notes.confirmImportedTimeZone');
+    if (confirmedZone.kind === 'notes.confirmImportedTimeZone') expect(confirmedZone.noteId).toBe(legacyNoteId);
+    expect(() => parseWorkspaceCommandEnvelope({ schemaVersion: 1, commandId, expectedRevision: 4, expectedPrivacyEpoch: 3,
+      command: { kind: 'notes.confirmImportedTimeZone', noteId: legacyNoteId, expectedNoteRevision: 5, timeZone: ' Asia/Singapore' } })).toThrow(/invalid/);
+    expect(() => parseWorkspaceCommandEnvelope({ schemaVersion: 1, commandId: `${commandId}\n`, expectedRevision: 4, expectedPrivacyEpoch: 3,
+      command: { kind: 'chat.transcript.submit', planId, conversationId: conversation } })).toThrow(/invalid/);
+    expect(() => parseWorkspaceCommandEnvelope({ schemaVersion: 1, commandId, expectedRevision: 4, expectedPrivacyEpoch: 3,
+      command: { kind: 'chat.transcript.submit', planId: `${planId}\n`, conversationId: conversation } })).toThrow(/invalid/);
+    expect(() => parseWorkspaceCommandEnvelope({ schemaVersion: 1, commandId, expectedRevision: 4, expectedPrivacyEpoch: 3,
+      command: { kind: 'chat.transcript.submit', planId, conversationId: `${conversation}\n` } })).toThrow(/invalid/);
+    const prepared = parseWorkspaceCommandReceipt({ schemaVersion: 1, commandId: prepareId, kind: 'chat.transcript.prepare', objectId: legacyNoteId,
+      noteId: legacyNoteId, noteRevision: 5, planId, expiresAt: '2026-10-15T01:00:00.000Z', capturedAt: '2026-10-14T23:00:00.000Z',
+      captureTimeZone: 'Asia/Singapore' }, { commandId: prepareId, kind: 'chat.transcript.prepare', objectId: legacyNoteId,
+      noteId: legacyNoteId, noteRevision: 5 });
+    expect(prepared.kind).toBe('chat.transcript.prepare');
+    expect(parseWorkspaceCommandReceipt({ schemaVersion: 1, commandId, kind: 'chat.transcript.submit', objectId: conversation,
+      conversationId: conversation, planId, turnId: parentTurnId, jobId }, { commandId, kind: 'chat.transcript.submit',
+      objectId: conversation, conversationId: conversation, planId }).kind).toBe('chat.transcript.submit');
+    expect(() => parseWorkspaceCommandReceipt({ schemaVersion: 1, commandId, kind: 'chat.transcript.submit', objectId: anotherConversationId,
+      conversationId: conversation, planId, turnId: parentTurnId, jobId })).toThrow(/invalid/);
+  });
+
   it('keeps the server projection map and browser history decoder on the same public command kinds', () => {
-    expect(SERVER_HISTORY_KINDS).toEqual(['tasks.complete', 'tasks.reopen', 'chat.create', 'settings.update', 'notes.save', 'notes.capture.adopt',
+    expect(SERVER_HISTORY_KINDS).toEqual(['tasks.complete', 'tasks.reopen', 'chat.create', 'chat.conversation.delete', 'notes.confirmImportedTimeZone',
+      'chat.transcript.prepare', 'chat.transcript.cancel', 'chat.transcript.submit', 'settings.update', 'notes.save', 'notes.capture.adopt',
       'notes.updateTranscript', 'assistant.batch.submitNote', 'assistant.batch.check', 'chat.submit', 'chat.refine', 'notes.transcribe', 'accounts.installOAuth',
       'accounts.syncCalendars', 'accounts.refreshMail', 'accounts.continueMailBackfill', 'accounts.disconnect', 'mail.source.loadText', 'mail.reply.create',
       'proposals.edit', 'proposals.approve', 'proposals.execute', 'proposals.dismiss', 'dispatch.reconcile', 'mail.replyBatch.submit', 'mail.replyBatch.check',

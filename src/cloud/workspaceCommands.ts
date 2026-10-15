@@ -22,6 +22,11 @@ export type WorkspaceCommand =
   | { readonly kind: 'tasks.complete'; readonly taskId: string }
   | { readonly kind: 'tasks.reopen'; readonly taskId: string }
   | { readonly kind: 'chat.create'; readonly title?: string }
+  | { readonly kind: 'chat.conversation.delete'; readonly conversationId: string }
+  | { readonly kind: 'notes.confirmImportedTimeZone'; readonly noteId: string; readonly expectedNoteRevision: number; readonly timeZone: string }
+  | { readonly kind: 'chat.transcript.prepare'; readonly noteId: string; readonly expectedNoteRevision: number }
+  | { readonly kind: 'chat.transcript.cancel'; readonly planId: string }
+  | { readonly kind: 'chat.transcript.submit'; readonly planId: string; readonly conversationId: string }
   | { readonly kind: 'notes.save'; readonly transcript: string }
   | { readonly kind: 'notes.capture.adopt'; readonly captureId: string; readonly captureRevision: string }
   | { readonly kind: 'accounts.installOAuth'; readonly stageId: string }
@@ -108,6 +113,11 @@ export type WorkspaceCommandReceipt =
   | WorkspaceCommandReceiptBase<'tasks.complete'>
   | WorkspaceCommandReceiptBase<'tasks.reopen'>
   | WorkspaceCommandReceiptBase<'chat.create'>
+  | (WorkspaceCommandReceiptBase<'chat.conversation.delete'> & Readonly<{ conversationId: string }>)
+  | (WorkspaceCommandReceiptBase<'notes.confirmImportedTimeZone'> & Readonly<{ noteId: string; noteRevision: number; timeZone: string }>)
+  | (WorkspaceCommandReceiptBase<'chat.transcript.prepare'> & Readonly<{ noteId: string; noteRevision: number; planId: string; expiresAt: string; capturedAt: string; captureTimeZone: string }>)
+  | (WorkspaceCommandReceiptBase<'chat.transcript.cancel'> & Readonly<{ planId: string }>)
+  | (WorkspaceCommandReceiptBase<'chat.transcript.submit'> & Readonly<{ planId: string; conversationId: string; turnId: string; jobId: string }>)
   | WorkspaceCommandReceiptBase<'settings.update'>
   | WorkspaceCommandReceiptBase<'notes.save'>
   | (WorkspaceCommandReceiptBase<'notes.capture.adopt'> & Readonly<{ captureId: string; captureRevision: string }>)
@@ -158,6 +168,11 @@ const ENVELOPE_KEYS = ['command', 'commandId', 'expectedPrivacyEpoch', 'expected
 const COMMAND_KEYS: Record<WorkspaceCommand['kind'], readonly string[]> = {
   'settings.update': ['kind', 'patch'],
   'tasks.complete': ['kind', 'taskId'], 'tasks.reopen': ['kind', 'taskId'], 'chat.create': ['kind', 'title'],
+  'chat.conversation.delete': ['kind', 'conversationId'],
+  'notes.confirmImportedTimeZone': ['kind', 'noteId', 'expectedNoteRevision', 'timeZone'],
+  'chat.transcript.prepare': ['kind', 'noteId', 'expectedNoteRevision'],
+  'chat.transcript.cancel': ['kind', 'planId'],
+  'chat.transcript.submit': ['kind', 'planId', 'conversationId'],
   'notes.save': ['kind', 'transcript'], 'notes.updateTranscript': ['kind', 'noteId', 'text', 'expectedNoteRevision'],
   'notes.capture.adopt': ['kind', 'captureId', 'captureRevision'],
   'accounts.installOAuth': ['kind', 'stageId'],
@@ -197,9 +212,19 @@ const COMMAND_KEYS: Record<WorkspaceCommand['kind'], readonly string[]> = {
 const COMMAND_KINDS = Object.keys(COMMAND_KEYS) as WorkspaceCommand['kind'][];
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const CONTROL = /[\u0000-\u001f\u007f]/;
+const isUuidV4 = (value: unknown): value is string => typeof value === 'string' && value.length === 36 && UUID_V4.test(value);
+
+function validTimeZone(value: unknown): value is string {
+  if (typeof value !== 'string' || !value || value.length > 128 || value.trim() !== value) return false;
+  try { new Intl.DateTimeFormat('en-US', { timeZone: value }); return true; } catch { return false; }
+}
+
+function validIsoDate(value: unknown): value is string {
+  return typeof value === 'string' && value.length <= 64 && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value;
+}
 
 export function parseWorkspaceCommandId(value: unknown): string {
-  if (typeof value !== 'string' || !UUID_V4.test(value)) throw new Error('workspace_command_id_invalid');
+  if (!isUuidV4(value)) throw new Error('workspace_command_id_invalid');
   return value;
 }
 
@@ -536,6 +561,33 @@ function freezeCommand(raw: Record<string, unknown>): WorkspaceCommand {
     if (Object.hasOwn(raw, 'title') && !boundedString(raw.title, 4096, { allowEmpty: true })) throw new Error('workspace_command_invalid');
     return Object.freeze({ kind, ...(Object.hasOwn(raw, 'title') ? { title: raw.title as string } : {}) });
   }
+  if (kind === 'chat.conversation.delete') {
+    assertExactKeys(raw, COMMAND_KEYS[kind], COMMAND_KEYS[kind]);
+    if (!isUuidV4(raw.conversationId)) throw new Error('workspace_command_invalid');
+    return Object.freeze({ kind, conversationId: raw.conversationId });
+  }
+  if (kind === 'notes.confirmImportedTimeZone') {
+    assertExactKeys(raw, COMMAND_KEYS[kind], COMMAND_KEYS[kind]);
+    if (!boundedString(raw.noteId, MAX_ID_BYTES, { identifier: true }) || !positiveRevision(raw.expectedNoteRevision) ||
+        !boundedString(raw.timeZone, 128) || raw.timeZone.trim() !== raw.timeZone) throw new Error('workspace_command_invalid');
+    try { new Intl.DateTimeFormat('en-US', { timeZone: raw.timeZone }); } catch { throw new Error('workspace_command_invalid'); }
+    return Object.freeze({ kind, noteId: raw.noteId, expectedNoteRevision: raw.expectedNoteRevision as number, timeZone: raw.timeZone });
+  }
+  if (kind === 'chat.transcript.prepare') {
+    assertExactKeys(raw, COMMAND_KEYS[kind], COMMAND_KEYS[kind]);
+    if (!boundedString(raw.noteId, MAX_ID_BYTES, { identifier: true }) || !positiveRevision(raw.expectedNoteRevision)) throw new Error('workspace_command_invalid');
+    return Object.freeze({ kind, noteId: raw.noteId, expectedNoteRevision: raw.expectedNoteRevision as number });
+  }
+  if (kind === 'chat.transcript.cancel') {
+    assertExactKeys(raw, COMMAND_KEYS[kind], COMMAND_KEYS[kind]);
+    if (!isUuidV4(raw.planId)) throw new Error('workspace_command_invalid');
+    return Object.freeze({ kind, planId: raw.planId });
+  }
+  if (kind === 'chat.transcript.submit') {
+    assertExactKeys(raw, COMMAND_KEYS[kind], COMMAND_KEYS[kind]);
+    if (!isUuidV4(raw.planId) || !isUuidV4(raw.conversationId)) throw new Error('workspace_command_invalid');
+    return Object.freeze({ kind, planId: raw.planId, conversationId: raw.conversationId });
+  }
   if (kind === 'notes.save') {
     assertExactKeys(raw, COMMAND_KEYS[kind], COMMAND_KEYS[kind]);
     if (!boundedString(raw.transcript, WORKSPACE_TEXT_COMMAND_MAX_BYTES)) throw new Error('workspace_command_invalid');
@@ -543,14 +595,14 @@ function freezeCommand(raw: Record<string, unknown>): WorkspaceCommand {
   }
   if (kind === 'notes.capture.adopt') {
     assertExactKeys(raw, COMMAND_KEYS[kind], COMMAND_KEYS[kind]);
-    if (typeof raw.captureId !== 'string' || !UUID_V4.test(raw.captureId) || typeof raw.captureRevision !== 'string' || !UUID_V4.test(raw.captureRevision)) {
+    if (!isUuidV4(raw.captureId) || !isUuidV4(raw.captureRevision)) {
       throw new Error('workspace_command_invalid');
     }
     return Object.freeze({ kind, captureId: raw.captureId, captureRevision: raw.captureRevision });
   }
   if (kind === 'accounts.installOAuth') {
     assertExactKeys(raw, COMMAND_KEYS[kind], COMMAND_KEYS[kind]);
-    if (typeof raw.stageId !== 'string' || !UUID_V4.test(raw.stageId)) throw new Error('workspace_command_invalid');
+    if (!isUuidV4(raw.stageId)) throw new Error('workspace_command_invalid');
     return Object.freeze({ kind, stageId: raw.stageId });
   }
   if (kind === 'accounts.syncCalendars' || kind === 'accounts.refreshMail' || kind === 'accounts.continueMailBackfill' || kind === 'accounts.disconnect') {
@@ -749,12 +801,12 @@ function freezeCommand(raw: Record<string, unknown>): WorkspaceCommand {
   }
   if (kind === 'assistant.batch.check') {
     assertExactKeys(raw, COMMAND_KEYS[kind], COMMAND_KEYS[kind]);
-    if (typeof raw.jobId !== 'string' || !UUID_V4.test(raw.jobId)) throw new Error('workspace_command_invalid');
+    if (!isUuidV4(raw.jobId)) throw new Error('workspace_command_invalid');
     return Object.freeze({ kind, jobId: raw.jobId });
   }
   if (kind === 'chat.submit') {
     assertExactKeys(raw, COMMAND_KEYS[kind], ['kind', 'conversationId', 'text']);
-    if (typeof raw.conversationId !== 'string' || !UUID_V4.test(raw.conversationId) ||
+    if (!isUuidV4(raw.conversationId) ||
         !boundedString(raw.text, WORKSPACE_TEXT_COMMAND_MAX_BYTES)) throw new Error('workspace_command_invalid');
     const knowledgeSelection = Object.hasOwn(raw, 'knowledgeSelection') ? parseKnowledgeSelection(raw.knowledgeSelection) : undefined;
     return Object.freeze({ kind, conversationId: raw.conversationId, text: raw.text,
@@ -762,8 +814,7 @@ function freezeCommand(raw: Record<string, unknown>): WorkspaceCommand {
   }
   if (kind === 'chat.refine') {
     assertExactKeys(raw, COMMAND_KEYS[kind], COMMAND_KEYS[kind]);
-    if (typeof raw.conversationId !== 'string' || !UUID_V4.test(raw.conversationId) ||
-        typeof raw.parentTurnId !== 'string' || !UUID_V4.test(raw.parentTurnId) ||
+    if (!isUuidV4(raw.conversationId) || !isUuidV4(raw.parentTurnId) ||
         (raw.effort !== 'medium' && raw.effort !== 'high' && raw.effort !== 'max')) throw new Error('workspace_command_invalid');
     return Object.freeze({ kind, conversationId: raw.conversationId, parentTurnId: raw.parentTurnId, effort: raw.effort });
   }
@@ -791,7 +842,7 @@ export function parseWorkspaceCommandEnvelope(value: unknown): WorkspaceCommandE
     'knowledge.person.save', 'knowledge.project.save', 'mail.reply.create', 'proposals.edit', 'mail.replyBatch.submit'].includes(kind)
     ? WORKSPACE_TEXT_COMMAND_MAX_BYTES : WORKSPACE_COMMAND_MAX_BYTES;
   preflightJsonBytes(value, limit);
-  if (value.schemaVersion !== WORKSPACE_COMMAND_SCHEMA_VERSION || !UUID_V4.test(typeof value.commandId === 'string' ? value.commandId : '') ||
+  if (value.schemaVersion !== WORKSPACE_COMMAND_SCHEMA_VERSION || !isUuidV4(value.commandId) ||
       !Number.isSafeInteger(value.expectedRevision) || (value.expectedRevision as number) < 0 ||
       !Number.isSafeInteger(value.expectedPrivacyEpoch) || (value.expectedPrivacyEpoch as number) < 0) throw new Error('workspace_command_invalid');
   const command = freezeCommand(rawCommand);
@@ -833,6 +884,14 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
   readonly proposalId?: string;
   readonly recordId?: string;
   readonly jobStatus?: import('../services/openRouterBatchJobs').AssistantBatchJobDTO['status'];
+  readonly noteId?: string;
+  readonly noteRevision?: number;
+  readonly timeZone?: string;
+  readonly planId?: string;
+  readonly expiresAt?: string;
+  readonly capturedAt?: string;
+  readonly captureTimeZone?: string;
+  readonly conversationId?: string;
 }): WorkspaceCommandReceipt {
   if (!isRecord(value)) throw new Error('workspace_command_receipt_invalid');
   assertPlainDataProperties(value);
@@ -843,6 +902,11 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
     'tasks.complete': ['commandId', 'kind', 'objectId', 'schemaVersion'],
     'tasks.reopen': ['commandId', 'kind', 'objectId', 'schemaVersion'],
     'chat.create': ['commandId', 'kind', 'objectId', 'schemaVersion'],
+    'chat.conversation.delete': ['commandId', 'conversationId', 'kind', 'objectId', 'schemaVersion'],
+    'notes.confirmImportedTimeZone': ['commandId', 'kind', 'noteId', 'noteRevision', 'objectId', 'schemaVersion', 'timeZone'],
+    'chat.transcript.prepare': ['capturedAt', 'captureTimeZone', 'commandId', 'expiresAt', 'kind', 'noteId', 'noteRevision', 'objectId', 'planId', 'schemaVersion'],
+    'chat.transcript.cancel': ['commandId', 'kind', 'objectId', 'planId', 'schemaVersion'],
+    'chat.transcript.submit': ['commandId', 'conversationId', 'jobId', 'kind', 'objectId', 'planId', 'schemaVersion', 'turnId'],
     'notes.save': ['commandId', 'kind', 'objectId', 'schemaVersion'],
     'notes.capture.adopt': ['captureId', 'captureRevision', 'commandId', 'kind', 'objectId', 'schemaVersion'],
     'accounts.installOAuth': ['accountGeneration', 'commandId', 'kind', 'objectId', 'schemaVersion', 'stageId'],
@@ -891,12 +955,18 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
     allowedReceiptKeys.filter((key) => !optionalReceiptKeys[kind as WorkspaceCommand['kind']]?.includes(key));
   assertExactKeys(value, allowedReceiptKeys, requiredReceiptKeys);
   const textId = (candidate: unknown): candidate is string => boundedString(candidate, MAX_ID_BYTES, { identifier: true });
-  const uuidId = (candidate: unknown): candidate is string => typeof candidate === 'string' && UUID_V4.test(candidate);
+  const uuidId = isUuidV4;
   const knowledgeId = (candidate: unknown): candidate is string => isCanonicalKnowledgeId(candidate);
-  if (value.schemaVersion !== WORKSPACE_COMMAND_SCHEMA_VERSION || typeof value.commandId !== 'string' || !UUID_V4.test(value.commandId) ||
+  if (value.schemaVersion !== WORKSPACE_COMMAND_SCHEMA_VERSION || !isUuidV4(value.commandId) ||
       !textId(value.objectId) || (kind === 'documents.save' && (!safeRelativeMarkdownPath(value.objectId) ||
         (isReservedKnowledgeDocumentPath(value.objectId) && !canonicalKnowledgeDocumentParent(value.objectId)))) ||
       ((kind === 'chat.create' || kind === 'assistant.batch.check' || kind === 'chat.submit' || kind === 'chat.refine') && !uuidId(value.objectId)) ||
+      (kind === 'chat.conversation.delete' && (!uuidId(value.objectId) || !uuidId(value.conversationId) || value.objectId !== value.conversationId)) ||
+      (kind === 'chat.transcript.submit' && (!uuidId(value.objectId) || !uuidId(value.conversationId) || value.objectId !== value.conversationId)) ||
+      (kind === 'notes.confirmImportedTimeZone' && (!textId(value.objectId) || value.noteId !== value.objectId || !positiveRevision(value.noteRevision) || !validTimeZone(value.timeZone))) ||
+      (kind === 'chat.transcript.prepare' && (!textId(value.objectId) || value.noteId !== value.objectId || !positiveRevision(value.noteRevision) || !uuidId(value.planId) ||
+        !validIsoDate(value.expiresAt) || !validIsoDate(value.capturedAt) || !validTimeZone(value.captureTimeZone))) ||
+      (kind === 'chat.transcript.cancel' && (!uuidId(value.objectId) || !uuidId(value.planId) || value.objectId !== value.planId)) ||
       (kind === 'settings.update' && value.objectId !== 'workspace-settings') ||
       (Object.hasOwn(value, 'jobId') && !uuidId(value.jobId)) ||
       (Object.hasOwn(value, 'turnId') && !uuidId(value.turnId)) ||
@@ -975,6 +1045,14 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
         (expected.proposalId !== undefined && value.proposalId !== expected.proposalId) ||
         (expected.recordId !== undefined && value.recordId !== expected.recordId) ||
         (expected.jobStatus !== undefined && value.jobStatus !== expected.jobStatus) ||
+        (expected.noteId !== undefined && value.noteId !== expected.noteId) ||
+        (expected.noteRevision !== undefined && value.noteRevision !== expected.noteRevision) ||
+        (expected.timeZone !== undefined && value.timeZone !== expected.timeZone) ||
+        (expected.planId !== undefined && value.planId !== expected.planId) ||
+        (expected.expiresAt !== undefined && value.expiresAt !== expected.expiresAt) ||
+        (expected.capturedAt !== undefined && value.capturedAt !== expected.capturedAt) ||
+        (expected.captureTimeZone !== undefined && value.captureTimeZone !== expected.captureTimeZone) ||
+        (expected.conversationId !== undefined && value.conversationId !== expected.conversationId) ||
         (expected.attemptId !== undefined && value.attemptId !== expected.attemptId) || (expected.sourceRevision !== undefined && value.sourceRevision !== expected.sourceRevision) ||
         (expected.outcome !== undefined && value.outcome !== expected.outcome)))) {
     throw new Error('workspace_command_receipt_invalid');
@@ -990,6 +1068,20 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
     case 'settings.update':
     case 'assistant.batch.check':
       return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId });
+    case 'chat.conversation.delete':
+      return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId, conversationId: jobId(value.conversationId) });
+    case 'notes.confirmImportedTimeZone':
+      return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId,
+        noteId: textId(value.noteId) ? value.noteId : (() => { throw new Error('workspace_command_receipt_invalid'); })(), noteRevision: value.noteRevision as number, timeZone: value.timeZone as string });
+    case 'chat.transcript.prepare':
+      return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId,
+        noteId: textId(value.noteId) ? value.noteId : (() => { throw new Error('workspace_command_receipt_invalid'); })(), noteRevision: value.noteRevision as number, planId: jobId(value.planId),
+        expiresAt: value.expiresAt as string, capturedAt: value.capturedAt as string, captureTimeZone: value.captureTimeZone as string });
+    case 'chat.transcript.cancel':
+      return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId, planId: jobId(value.planId) });
+    case 'chat.transcript.submit':
+      return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId,
+        conversationId: jobId(value.conversationId), planId: jobId(value.planId), turnId: jobId(value.turnId), jobId: jobId(value.jobId) });
     case 'notes.transcribe':
       return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId,
         attemptId: jobId(value.attemptId), sourceRevision: value.sourceRevision as number,

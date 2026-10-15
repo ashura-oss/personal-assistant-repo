@@ -582,6 +582,19 @@ function expectedReceiptFor(envelope: WorkspaceCommandEnvelope) {
       return { commandId: envelope.commandId, kind: command.kind, objectId: command.taskId };
     case 'chat.create': case 'notes.save':
       return { commandId: envelope.commandId, kind: command.kind };
+    case 'chat.conversation.delete':
+      return { commandId: envelope.commandId, kind: command.kind, objectId: command.conversationId, conversationId: command.conversationId };
+    case 'notes.confirmImportedTimeZone':
+      return { commandId: envelope.commandId, kind: command.kind, objectId: command.noteId, noteId: command.noteId,
+        noteRevision: command.expectedNoteRevision + 1, timeZone: command.timeZone };
+    case 'chat.transcript.prepare':
+      return { commandId: envelope.commandId, kind: command.kind, objectId: command.noteId, noteId: command.noteId,
+        noteRevision: command.expectedNoteRevision };
+    case 'chat.transcript.cancel':
+      return { commandId: envelope.commandId, kind: command.kind, objectId: command.planId, planId: command.planId };
+    case 'chat.transcript.submit':
+      return { commandId: envelope.commandId, kind: command.kind, objectId: command.conversationId,
+        conversationId: command.conversationId, planId: command.planId };
     case 'notes.capture.adopt':
       return { commandId: envelope.commandId, kind: command.kind, objectId: command.captureId,
         captureId: command.captureId, captureRevision: command.captureRevision };

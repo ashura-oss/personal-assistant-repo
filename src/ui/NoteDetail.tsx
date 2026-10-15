@@ -110,7 +110,7 @@ export type NoteDetailProps = {
   onRetryStatus: () => void;
   onClose: () => void;
   onUpdate: (text: string) => void;
-  onConfirmImportedTimeZone: (timeZone: string) => void;
+  onConfirmImportedTimeZone: (timeZone: string, expectedRevision: number) => void;
   onAssist: (options: {
     intent: AssistIntent;
     question?: string;
@@ -137,6 +137,7 @@ export type NoteDetailProps = {
     onCreateConversation: (expectedPlanId: string) => Promise<ChatConversationDTO | undefined>;
     onSend: (expectedPlanId: string, conversationId: string) => Promise<unknown>;
     onCancel: (expectedPlanId: string) => void;
+    pendingCommand?: Readonly<{ label: string; onInspect: () => void }>;
   };
   onOpenSpeechSettings: () => void;
   onAttachRecording: () => void;
@@ -326,7 +327,7 @@ export function NoteDetail({
             <Button
               label="Confirm capture time zone"
               disabled={busy || !status(actionCapabilities?.confirmImportedTimeZone).available || !validTimeZone(importedTimeZone)}
-              onPress={() => onConfirmImportedTimeZone(importedTimeZone.trim())}
+              onPress={() => onConfirmImportedTimeZone(importedTimeZone.trim(), note.revision)}
             />
             {actionCapabilities?.confirmImportedTimeZone && !actionCapabilities.confirmImportedTimeZone.available ? <Text style={s.disclaimer}>{actionCapabilities.confirmImportedTimeZone.reason}</Text> : null}
           </View>
@@ -437,6 +438,7 @@ export function NoteDetail({
               onCreateConversation={voiceChatTransfer.onCreateConversation}
               onSend={voiceChatTransfer.onSend}
               onCancel={voiceChatTransfer.onCancel}
+              pendingCommand={voiceChatTransfer.pendingCommand}
             />
           </>
         ) : actionCapabilities?.chatTransfer && !actionCapabilities.chatTransfer.available ? <><Button label="Use saved transcript in Chat" tone="quiet" disabled /><Text style={s.disclaimer}>{actionCapabilities.chatTransfer.reason}</Text></> : null}
