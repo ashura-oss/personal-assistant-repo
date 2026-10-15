@@ -224,6 +224,11 @@ test('OAuth HTTP flow binds callback to per-start cookie, claims once, and insta
     assert.equal(duplicateStartBody.kind, 'existing');
     assert.equal('authorizationUrl' in duplicateStartBody, false);
     assert.equal(duplicateStart.headers.getSetCookie?.().some((value) => value.startsWith(`__Host-still_oauth_google_${google.startAttemptId}=`)), false);
+    const pendingInspectionResponse = await fetch(`${origin}/api/oauth/stages/${google.body.status.attemptId}`, { headers: authHeaders });
+    const pendingInspection = await pendingInspectionResponse.json();
+    assert.deepEqual(Object.keys(pendingInspection), ['stage']);
+    assert.equal(pendingInspection.stage.status, 'authorization_pending');
+    assert.equal(oidc.tokenCount(), 0, 'metadata preview does not contact the provider');
     const googleState = google.authorizationUrl.searchParams.get('state');
     assert.ok(googleState);
     const tokenGate = oidc.gateGoogleToken();
@@ -247,9 +252,12 @@ test('OAuth HTTP flow binds callback to per-start cookie, claims once, and insta
     assert.ok(googleStageId);
     assert.equal(googleRedirect.headers.getSetCookie?.().some((value) => value.startsWith(`${google.cookieHeader.split('=', 1)[0]}=`)), true);
 
-    async function install(stageId, expectedRevision) {
+    async function install(stageId, expectedRevision, expectedDisplayName, expectedEmail) {
       const stageStatus = await (await fetch(`${origin}/api/oauth/stages/${stageId}`, { headers: authHeaders })).json();
-      assert.equal(stageStatus.status, 'verified');
+      assert.equal(stageStatus.stage.status, 'verified');
+      assert.deepEqual(stageStatus.verifiedAccount, { displayName: expectedDisplayName, email: expectedEmail,
+        requestedCapabilities: ['mail.read'], capabilities: ['mail.read'] });
+      assert.deepEqual(Object.keys(stageStatus.verifiedAccount).sort(), ['capabilities', 'displayName', 'email', 'requestedCapabilities']);
       const commandId = randomUUID();
       const response = await fetch(`${origin}/api/workspace/commands`, { method: 'POST', headers: { ...authHeaders, Origin: origin,
         'X-Still-CSRF': auth.csrf, 'Content-Type': 'application/json' }, body: JSON.stringify({ command: { kind: 'accounts.installOAuth', stageId },
@@ -259,13 +267,16 @@ test('OAuth HTTP flow binds callback to per-start cookie, claims once, and insta
       assert.equal(result.receipt.kind, 'accounts.installOAuth');
       return result;
     }
-    await install(googleStageId, expectedRevision);
+    await install(googleStageId, expectedRevision, 'Google Fixture', 'google@example.test');
     let snapshotResponse = await fetch(`${origin}/api/workspace/snapshot`, { headers: authHeaders });
     let snapshot = await snapshotResponse.json();
     expectedRevision = snapshot.revision;
     assert.equal(snapshot.state.accounts.length, 1);
     assert.equal(snapshot.state.accounts[0].identity.subject, 'google-subject');
     assert.equal(snapshot.state.accounts[0].authStatus, 'connected');
+    const consumedInspection = await (await fetch(`${origin}/api/oauth/stages/${googleStageId}`, { headers: authHeaders })).json();
+    assert.equal(consumedInspection.stage.status, 'consumed');
+    assert.equal('verifiedAccount' in consumedInspection, false);
 
     const microsoft = await start('microsoft', expectedRevision);
     const microsoftState = microsoft.authorizationUrl.searchParams.get('state');
@@ -274,7 +285,7 @@ test('OAuth HTTP flow binds callback to per-start cookie, claims once, and insta
     assert.equal(microsoftCallback.status, 303);
     const microsoftStageId = new URL(microsoftCallback.headers.get('location'), origin).searchParams.get('oauth_stage');
     assert.ok(microsoftStageId);
-    await install(microsoftStageId, expectedRevision);
+    await install(microsoftStageId, expectedRevision, 'Microsoft Fixture', 'ms@example.test');
     snapshotResponse = await fetch(`${origin}/api/workspace/snapshot`, { headers: authHeaders });
     snapshot = await snapshotResponse.json();
     assert.equal(snapshot.state.accounts.length, 2);
@@ -484,6 +495,9 @@ test('opaque reconnect IDs and identity-less configured placeholders are preserv
       { redirect: 'manual', headers: { Cookie: oauthCookie } });
     assert.equal(callback.status, 303);
     const stageId = new URL(callback.headers.get('location'), origin).searchParams.get('oauth_stage');
+    const preview = await (await fetch(`${origin}/api/oauth/stages/${stageId}`, { headers })).json();
+    assert.deepEqual(preview.verifiedAccount, { displayName: 'Google Fixture', email: 'google@example.test',
+      requestedCapabilities: ['mail.read'], capabilities: ['mail.read'], reconnectAccountId: placeholderId });
     const install = await fetch(`${origin}/api/workspace/commands`, { method: 'POST', headers: { ...headers, Origin: origin,
       'X-Still-CSRF': auth.csrf, 'Content-Type': 'application/json' }, body: JSON.stringify({ command: { kind: 'accounts.installOAuth', stageId },
       commandId: randomUUID(), expectedPrivacyEpoch: 0, expectedRevision: snapshot.revision, schemaVersion: 1 }) });
@@ -544,6 +558,10 @@ test('session revocation during callback discovery prevents the first token POST
     assert.equal(oidc.tokenCount(), 0);
     assert.equal(testKernel.withTrustedDatabaseTransaction((db) => db.prepare('SELECT status FROM oauth_install_stages WHERE stage_id=?')
       .get(startBody.status.attemptId).status), 'inspect_required');
+    const replacementSession = await login(origin);
+    const replacementInspection = await fetch(`${origin}/api/oauth/stages/${startBody.status.attemptId}`,
+      { headers: { Cookie: replacementSession.session } });
+    assert.notEqual(replacementInspection.status, 200, 'a replacement session cannot inspect the original session-bound stage');
   } finally {
     await host?.close();
     rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
@@ -642,6 +660,9 @@ test('expired builder metadata is terminal and an expired claimed stage can rest
     });
     const builderStatus = await fetch(`${origin}/api/oauth/google/starts/${builderId}`, { headers });
     assert.equal((await builderStatus.json()).status, 'expired');
+    const expiredBuilderInspection = await (await fetch(`${origin}/api/oauth/stages/${builderRow.stage_id}`, { headers })).json();
+    assert.equal(expiredBuilderInspection.stage.status, 'expired');
+    assert.equal('verifiedAccount' in expiredBuilderInspection, false);
     builderGate.release.resolve();
     const expiredBuilder = await builderPromise;
     assert.equal(expiredBuilder.status, 409);
@@ -661,9 +682,67 @@ test('expired builder metadata is terminal and an expired claimed stage can rest
     const freshId = randomUUID();
     const fresh = await start(freshId);
     assert.equal(fresh.status, 201, await fresh.clone().text());
+    const expiredClaimInspection = await (await fetch(`${origin}/api/oauth/stages/${oldStartRow.stage_id}`, { headers })).json();
+    assert.equal(expiredClaimInspection.stage.status, 'expired');
+    assert.equal('verifiedAccount' in expiredClaimInspection, false);
     assert.equal(testKernel.withTrustedDatabaseTransaction((db) => db.prepare('SELECT status FROM oauth_install_stages WHERE stage_id=?')
       .get(oldStartRow.stage_id).status), 'expired');
     assert.equal(oidc.tokenCount(), 0, 'expired claimed stages are cleaned before any fresh flow; no old exchange is replayed');
+  } finally {
+    await host?.close();
+    rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+test('corrupt verified payload inspection terminalizes safely and returns no provider data', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'still-oauth-corrupt-preview-'));
+  const staticRoot = staticFixture(root);
+  const port = await freePort();
+  const origin = `${ORIGIN}:${port}`;
+  const config = loadServerConfig({ STILL_ORIGIN: origin, STILL_DATA_DIR: join(root, 'private', 'data'),
+    STILL_VAULT_KEY_FILE: join(root, 'private', 'keys', 'root.key'), STILL_GOOGLE_CLIENT_ID: 'google-client',
+    STILL_GOOGLE_CLIENT_SECRET: 'synthetic-google-secret' }, { staticRoot, allowLocalHttp: true });
+  let host; let testKernel;
+  try {
+    const foundation = openServerFoundation(config, { initialWorkspaceSnapshot: state });
+    try { await foundation.auth.enrollOwner(PASSWORD, state()); } finally { foundation.close(); }
+    const oidc = await oidcHarness();
+    oidc.active.set('provider', 'google');
+    const owner = createNodeProviderResponseLifetimeOwner({ fetcher: oidc.fetcher, createId: randomUUID });
+    const adapter = createServerOAuthProviderAdapter({ canonicalOrigin: origin, registrations: [{ registrationId: 'google', provider: 'google',
+      clientId: 'google-client', clientSecret: 'synthetic-google-secret' }], responseLifetime: owner.withResponseLifetimeFor('oauth') });
+    host = await startApplicationHost({ config, port, foundation: { initialWorkspaceSnapshot: state },
+      createRuntime: createCloudApplicationRuntimeFactory({ workspacePortsFor: (_context, _vault, kernel) => { testKernel = kernel; return closedPorts(); },
+        oauth: { provider: adapter, responseLifetimeOwner: owner, config } }) });
+    const auth = await login(origin);
+    const headers = { Cookie: auth.session };
+    const snapshot = await (await fetch(`${origin}/api/workspace/snapshot`, { headers })).json();
+    const startId = randomUUID();
+    const started = await fetch(`${origin}/api/oauth/google/start`, { method: 'POST', headers: { ...headers, Origin: origin,
+      'X-Still-CSRF': auth.csrf, 'Content-Type': 'application/json' }, body: JSON.stringify({ startAttemptId: startId,
+      requestedCapabilities: ['mail.read'], expectedRevision: snapshot.revision, expectedPrivacyEpoch: 0 }) });
+    assert.equal(started.status, 201);
+    const startBody = await started.json();
+    const authorizationUrl = new URL(startBody.authorizationUrl);
+    oidc.active.set('google', { nonce: authorizationUrl.searchParams.get('nonce'), scopes: authorizationUrl.searchParams.get('scope') });
+    const callback = await fetch(`${origin}/api/oauth/google/callback?code=synthetic-corrupt-preview&state=${authorizationUrl.searchParams.get('state')}`,
+      { redirect: 'manual', headers: { Cookie: cookie(started, `__Host-still_oauth_google_${startId}`) } });
+    assert.equal(callback.status, 303);
+    assert.equal(oidc.tokenCount(), 1);
+    testKernel.withTrustedDatabaseTransaction((db) => db.prepare('UPDATE oauth_install_stages SET ciphertext=? WHERE stage_id=?')
+      .run(Buffer.from('corrupt-payload'), startBody.status.attemptId));
+    const inspectionResponse = await fetch(`${origin}/api/oauth/stages/${startBody.status.attemptId}`, { headers });
+    assert.equal(inspectionResponse.status, 200);
+    const inspection = await inspectionResponse.json();
+    assert.deepEqual(Object.keys(inspection), ['stage']);
+    assert.equal(inspection.stage.status, 'inspect_required');
+    assert.equal(JSON.stringify(inspection).includes('synthetic-google'), false);
+    assert.equal(JSON.stringify(inspection).includes('google-subject'), false);
+    assert.equal(oidc.tokenCount(), 1, 'stage inspection does not make another provider request');
+    const persisted = testKernel.withTrustedDatabaseTransaction((db) => db.prepare('SELECT status,ciphertext FROM oauth_install_stages WHERE stage_id=?')
+      .get(startBody.status.attemptId));
+    assert.equal(persisted.status, 'inspect_required');
+    assert.equal(persisted.ciphertext, null);
   } finally {
     await host?.close();
     rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });

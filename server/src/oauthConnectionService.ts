@@ -3,7 +3,7 @@ import type { ServerConfig } from './config.js';
 import type { AuthService } from './auth.js';
 import type { DurableKernel, OwnedWorkspaceIdentity } from './kernel.js';
 import type { RuntimeSessionResolver } from './workspaceRegistry.js';
-import type { OAuthHttpApi, OAuthAttemptMetadata, OAuthCallbackInput, OAuthStartRequest, OAuthStartResult } from './oauthHttp.js';
+import type { OAuthHttpApi, OAuthAttemptMetadata, OAuthCallbackInput, OAuthStageInspection, OAuthStartRequest, OAuthStartResult } from './oauthHttp.js';
 import { isValidAccountId } from './accountIds.js';
 import { OAuthInstallStages, type OAuthInstallStageStatus, type OAuthReconnectLifecycle, type OAuthStageCapability, type OAuthStageProvider } from './oauthInstallStages.js';
 import type { ServerOAuthProviderAdapter } from './oauthProviderAdapter.js';
@@ -329,11 +329,18 @@ export class OAuthConnectionService implements OAuthHttpApi {
     admission.assertCurrent(); return results;
   }
 
-  inspectStage(admission: { sessionToken: string; assertCurrent: () => void }, stageId: string): OAuthInstallStageStatus {
+  inspectStage(admission: { sessionToken: string; assertCurrent: () => void }, stageId: string): OAuthStageInspection {
     const identity = this.current(admission); const sessionBinding = sha256(admission.sessionToken);
-    const status = this.options.kernel.withOwnedTransaction(admission.sessionToken, identity.privacyEpoch,
-      (context) => this.options.stages.readStatus(context, stageId, sessionBinding));
-    admission.assertCurrent(); return status;
+    const inspection = this.options.kernel.withOwnedTransaction(admission.sessionToken, identity.privacyEpoch, (context) => {
+      const result = this.options.stages.readVerifiedForInstall(context, stageId, sessionBinding);
+      if (!result.payload) return Object.freeze({ stage: result.status });
+      return Object.freeze({ stage: result.status, verifiedAccount: Object.freeze({ displayName: result.payload.displayName,
+        ...(result.payload.email ? { email: result.payload.email } : {}),
+        requestedCapabilities: Object.freeze([...result.payload.requestedCapabilities]),
+        capabilities: Object.freeze([...result.payload.capabilities]),
+        ...(result.reconnectLifecycle ? { reconnectAccountId: result.reconnectLifecycle.accountId } : {}) }) });
+    });
+    admission.assertCurrent(); return inspection;
   }
 
   private metadata(row: StartRow, status: OAuthInstallStageStatus): OAuthAttemptMetadata {
