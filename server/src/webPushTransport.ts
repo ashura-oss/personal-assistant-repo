@@ -96,7 +96,7 @@ function captureInput(value: unknown): Readonly<{ subscription: PushSubscription
 }
 
 function parseEndpoint(value: string): URL {
-  if (typeof value !== 'string' || /[\u0000-\u0020\u007f]/.test(value)) throw new Error('invalid_endpoint');
+  if (typeof value !== 'string' || /[\u0000-\u0020\u007f]/.test(value) || value.includes('#')) throw new Error('invalid_endpoint');
   const authority = /^https:\/\/([^/?#]*)/i.exec(value)?.[1];
   if (authority === undefined || authority.includes('@')) throw new Error('invalid_endpoint');
   const url = new URL(value);

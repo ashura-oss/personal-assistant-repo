@@ -11,6 +11,7 @@ import type { AuthService } from './auth.js';
 import type { RuntimeSessionResolver } from './workspaceRegistry.js';
 import type { WorkspaceHttpApi } from './workspaceHttp.js';
 import type { OAuthHttpApi } from './oauthHttp.js';
+import type { WebPushHttpApi } from './webPushHttp.js';
 import { AudioColdStartRecovery } from './audioColdStartRecovery.js';
 import { markInterruptedBackgroundWorkForInspection } from './backgroundOccurrences.js';
 import { recoverInterruptedBatchObservations } from './batchObservationIndex.js';
@@ -23,6 +24,8 @@ export interface ApplicationRuntime {
   readonly audioHttpApi?: AudioHttpApi;
   /** Optional confidential OAuth start/callback and metadata-only status bridge. */
   readonly oauthHttpApi?: OAuthHttpApi;
+  /** Optional authenticated, metadata-only Web Push registry bridge. */
+  readonly webPushApi?: WebPushHttpApi;
   stopAdmission(): void;
   drainAndDispose(): Promise<void>;
 }
@@ -264,6 +267,7 @@ export async function startApplicationHost(options: ApplicationHostOptions): Pro
       credentialCommands: opened.foundation.credentialCommands, workspaceApi: runtime.workspaceApi,
       ...(runtime.audioHttpApi ? { audioApi: runtime.audioHttpApi } : {}),
       ...(runtime.oauthHttpApi ? { oauthApi: runtime.oauthHttpApi } : {}),
+      ...(runtime.webPushApi ? { webPushApi: runtime.webPushApi } : {}),
       canonicalOrigin: options.config.canonicalOrigin, staticRoot: options.config.staticRoot,
       ...(options.config.allowLocalHttp ? { allowLocalHttp: true } : {}),
       admissionOpen: () => owner.isAccepting(),

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createECDH, randomBytes, randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { AuthService } from '../dist/auth.js';
 import { createDurableKernel } from '../dist/kernel.js';
@@ -10,6 +10,7 @@ import { SecretVault } from '../dist/vault.js';
 import { WorkspaceEraseService } from '../dist/workspaceErase.js';
 import { DocumentLineage } from '../dist/documentLineage.js';
 import { PeriodSummaryApplicationRuntime } from '../dist/periodSummaryApplication.js';
+import { WebPushSubscriptions } from '../dist/webPushSubscriptions.js';
 
 const ORIGIN = 'http://127.0.0.1:43210';
 const SECRET = Buffer.alloc(32, 0x5a);
@@ -89,6 +90,41 @@ test('confirmed erase atomically advances the epoch, empties the snapshot, prese
     writeFileSync(join(documentRoot, 'secret.md'), 'synthetic private document file');
     const lineage = new DocumentLineage(f.kernel, login.sessionToken);
     new PeriodSummaryApplicationRuntime(f.kernel, login.sessionToken, lineage);
+    const webPush = new WebPushSubscriptions(f.kernel, f.vault, () => {});
+    const provision = webPush.provision(admission, { commandId: randomUUID(), expectedPrivacyEpoch: 0 });
+    const deviceId = randomUUID();
+    const receiver = createECDH('prime256v1');
+    receiver.generateKeys();
+    webPush.register(admission, { commandId: randomUUID(), expectedPrivacyEpoch: 0, deviceId,
+      keyId: provision.result.keyId, expectedPreviousGeneration: 0, subscription: {
+        endpoint: `https://push.example.invalid/send/${randomUUID()}`,
+        keys: { p256dh: receiver.getPublicKey(undefined, 'uncompressed').toString('base64url'),
+          auth: randomBytes(16).toString('base64url') },
+      } });
+    const foreignOwner = randomUUID();
+    const foreignKey = randomUUID();
+    const foreignDevice = randomUUID();
+    const foreignWorkspace = f.kernel.createWorkspace(foreignOwner, EMPTY);
+    const foreignSession = f.kernel.createSession(foreignWorkspace.workspaceId, foreignOwner, 1_800_000_100_000);
+    f.kernel.withOwnedTransaction(foreignSession, 0, (context) => {
+      const nonce = randomBytes(12), tag = randomBytes(16);
+      context.db.prepare(`INSERT INTO web_push_vapid_keys(workspace_id,owner_id,privacy_epoch,key_id,public_key,key_version,nonce,tag,ciphertext,created_at)
+        VALUES(?,?,?,?,?,1,?,?,?,?)`).run(context.workspaceId, context.ownerId, context.privacyEpoch, foreignKey,
+        randomBytes(65).toString('base64url'), nonce, tag, randomBytes(32), context.now);
+      context.db.prepare(`INSERT INTO web_push_vapid_heads(workspace_id,owner_id,privacy_epoch,key_id,updated_at) VALUES(?,?,?,?,?)`)
+        .run(context.workspaceId, context.ownerId, context.privacyEpoch, foreignKey, context.now);
+      context.db.prepare(`INSERT INTO web_push_subscriptions(workspace_id,owner_id,privacy_epoch,device_id,generation,key_id,key_version,nonce,tag,ciphertext,created_at)
+        VALUES(?,?,?,?,1,?,1,?,?,?,?)`).run(context.workspaceId, context.ownerId, context.privacyEpoch, foreignDevice,
+        foreignKey, nonce, tag, randomBytes(32), context.now);
+      context.db.prepare(`INSERT INTO web_push_subscription_heads(workspace_id,owner_id,privacy_epoch,device_id,generation,status,key_id,updated_at)
+        VALUES(?,?,?, ?,1,'active',?,?)`).run(context.workspaceId, context.ownerId, context.privacyEpoch, foreignDevice, foreignKey, context.now);
+      context.db.prepare(`INSERT INTO web_push_commands(workspace_id,owner_id,privacy_epoch,command_id,operation,request_digest,result_json,created_at)
+        VALUES(?,?,?,?,'revoke',?,?,?)`).run(context.workspaceId, context.ownerId, context.privacyEpoch, randomUUID(), 'f'.repeat(64), '{}', context.now);
+      for (const table of ['web_push_vapid_keys', 'web_push_vapid_heads', 'web_push_subscriptions', 'web_push_subscription_heads', 'web_push_commands']) {
+        assert.equal(context.db.prepare(`SELECT count(*) AS count FROM ${table} WHERE workspace_id=? AND owner_id=? AND privacy_epoch=?`)
+          .get(context.workspaceId, context.ownerId, context.privacyEpoch).count, 1, `foreign ${table} seed exists before erase`);
+      }
+    });
     f.kernel.withOwnedTransaction(login.sessionToken, 0, (context) => {
       lineage.captureDestination(context, 'private/secret.md');
       const insert = context.db.prepare(`INSERT INTO period_summary_application_receipts
@@ -129,6 +165,12 @@ test('confirmed erase atomically advances the epoch, empties the snapshot, prese
       lineageScopes: context.db.prepare('SELECT count(*) AS count FROM document_lineage_scopes WHERE workspace_id=? AND owner_id=?').get(context.workspaceId, context.ownerId).count,
       applicationReceipts: context.db.prepare('SELECT count(*) AS count FROM period_summary_application_receipts WHERE workspace_id=? AND owner_id=?').get(context.workspaceId, context.ownerId).count,
       foreignApplicationReceipts: context.db.prepare('SELECT count(*) AS count FROM period_summary_application_receipts WHERE workspace_id=? AND owner_id<>?').get(context.workspaceId, context.ownerId).count,
+      webPushOwned: Object.fromEntries(['web_push_vapid_keys', 'web_push_vapid_heads', 'web_push_subscriptions', 'web_push_subscription_heads', 'web_push_commands']
+        .map((table) => [table, context.db.prepare(`SELECT count(*) AS count FROM ${table} WHERE workspace_id=? AND owner_id=? AND privacy_epoch=?`)
+          .get(context.workspaceId, context.ownerId, 0).count])),
+      webPushForeign: Object.fromEntries(['web_push_vapid_keys', 'web_push_vapid_heads', 'web_push_subscriptions', 'web_push_subscription_heads', 'web_push_commands']
+        .map((table) => [table, context.db.prepare(`SELECT count(*) AS count FROM ${table} WHERE workspace_id=? AND owner_id=? AND privacy_epoch=?`)
+          .get(foreignWorkspace.workspaceId, foreignOwner, 0).count])),
       vaultCiphertexts: context.db.prepare('SELECT count(*) AS count FROM vault_ciphertexts WHERE workspace_id=?').get(context.workspaceId).count,
       vaultMetadata: context.db.prepare("SELECT generation,configured FROM vault_metadata WHERE workspace_id=? AND scope_type='workspace' AND purpose='openrouter'").get(context.workspaceId),
       authOwner: context.db.prepare('SELECT count(*) AS count FROM auth_owner WHERE singleton=1 AND owner_id=?').get(context.ownerId).count,
@@ -137,6 +179,10 @@ test('confirmed erase atomically advances the epoch, empties the snapshot, prese
     assert.equal(state.lineageScopes, 0);
     assert.equal(state.applicationReceipts, 0);
     assert.equal(state.foreignApplicationReceipts, 1, 'erase must preserve receipt rows outside its exact owner scope');
+    assert.deepEqual(state.webPushOwned, { web_push_vapid_keys: 0, web_push_vapid_heads: 0, web_push_subscriptions: 0,
+      web_push_subscription_heads: 0, web_push_commands: 0 }, 'workspace erase removes every scoped registry row');
+    assert.deepEqual(state.webPushForeign, { web_push_vapid_keys: 1, web_push_vapid_heads: 1, web_push_subscriptions: 1,
+      web_push_subscription_heads: 1, web_push_commands: 1 }, 'workspace erase preserves rows with another owner id');
     assert.equal(state.vaultCiphertexts, 0);
     assert.deepEqual(state.vaultMetadata, { generation: 2, configured: 0 });
     assert.equal(state.authOwner, 1);

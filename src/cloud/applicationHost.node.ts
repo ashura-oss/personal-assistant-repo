@@ -16,6 +16,7 @@ import type { NodeProviderResponseLifetimeOwner } from './providerResponseLifeti
 import type { ServerOAuthProviderAdapter } from '../../server/src/oauthProviderAdapter.js';
 import { BackgroundRuntimeOwner } from './backgroundRuntime.node';
 import { WorkspaceEraseService } from '../../server/src/workspaceErase.js';
+import { createWebPushHttpApi } from '../../server/src/webPushHttp.js';
 import { join } from 'node:path';
 
 // Private Node gateway seam: callers must already hold an immutable occurrence claim.
@@ -63,11 +64,13 @@ export function createCloudApplicationRuntimeFactory(options: CloudApplicationRu
       },
       workspacePortsFor: (context) => options.workspacePortsFor(context, vault, kernel),
     });
+    const webPushApi = createWebPushHttpApi(kernel, vault, (admission) => runtime.assertWorkspaceAdmission(admission));
     const oauthService = options.oauth ? new OAuthConnectionService({ kernel, auth, stages: oauthStages,
       provider: options.oauth.provider, config: options.oauth.config, runtimeSessionFor,
       isWorkspaceEraseHeldOrPending: (workspaceId, ownerId) => runtime.isWorkspaceEraseHeldOrPending(workspaceId, ownerId) }) : undefined;
     const background = new BackgroundRuntimeOwner({ kernel, auth, runtime, runtimeSessionFor, listWorkspaceMetadataPage });
     return Object.freeze({ workspaceApi: createWorkspaceHttpApi(runtime, background?.policies, workspaceErase), audioHttpApi: runtime.createAudioHttpApi(),
+      webPushApi,
       ...(oauthService ? { oauthHttpApi: oauthService } : {}),
       stopAdmission: () => { background.stopAdmission(); oauthService?.stopAdmission(); options.oauth?.responseLifetimeOwner.stopAdmission(); runtime.stopAdmission(); },
       drainAndDispose: async () => {

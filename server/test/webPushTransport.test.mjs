@@ -153,6 +153,7 @@ test('rejects malformed endpoints before DNS or TLS', async () => {
     'https://@push.example.test/send/token',
     'https://push.example.test:444/send/token',
     'https://push.example.test/send/token#fragment',
+    'https://push.example.test/send/token#',
     'https://127.0.0.1/send/token',
     'https://[::ffff:127.0.0.1]/send/token',
   ]) {
@@ -162,6 +163,13 @@ test('rejects malformed endpoints before DNS or TLS', async () => {
     assert.equal(calls.dial, 0);
     assert.equal(calls.request, 0);
   }
+});
+
+test('keeps percent-encoded hash path data distinct from a URL fragment', async () => {
+  const { transport, input, calls } = makeFixture({ endpoint: 'https://push.example.test/send/a%23b' });
+  assert.deepEqual(await transport.send(input), { kind: 'accepted' });
+  assert.equal(calls.resolve, 1);
+  assert.equal(calls.request, 1);
 });
 
 test('validates every DNS answer and rejects private, mapped-private, and special-use results', async () => {

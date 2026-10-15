@@ -500,6 +500,12 @@ export class WorkspaceEraseService {
       'background_proactive_preflight_attempts', 'background_proactive_candidates', 'background_proactive_candidate_scopes']) {
       scoped(table, { workspace: 'workspace_id', owner: 'owner_id', epoch: 'privacy_epoch' });
     }
+    // Subscription generations and mutable heads precede VAPID-key parents; command receipts contain metadata only.
+    scoped('web_push_subscriptions', { workspace: 'workspace_id', owner: 'owner_id', epoch: 'privacy_epoch' });
+    scoped('web_push_subscription_heads', { workspace: 'workspace_id', owner: 'owner_id', epoch: 'privacy_epoch' });
+    scoped('web_push_vapid_heads', { workspace: 'workspace_id', owner: 'owner_id', epoch: 'privacy_epoch' });
+    scoped('web_push_vapid_keys', { workspace: 'workspace_id', owner: 'owner_id', epoch: 'privacy_epoch' });
+    scoped('web_push_commands', { workspace: 'workspace_id', owner: 'owner_id', epoch: 'privacy_epoch' });
     // This parent delete cascades the exact workspace/owner/epoch batch ledger rows.
     scoped('batch_observation_workspaces', { workspace: 'workspace_id', owner: 'owner_id', epoch: 'privacy_epoch' });
     if (tableExists(db, 'private_audio_cleanup_intents')) {

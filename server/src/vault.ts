@@ -14,6 +14,8 @@ const MAX_CREDENTIAL_BYTES = 16 * 1024 * 1024;
 const MAX_OAUTH_STAGE_BYTES = 64 * 1024;
 const KEY_CHECK_LABEL = 'still-server-vault-root-key-check:v1';
 const OAUTH_STAGE_DOMAIN = 'still-server:oauth-stage:v1';
+const WEB_PUSH_SECRET_DOMAIN = 'still-server:web-push-secret:v1';
+const MAX_WEB_PUSH_SECRET_BYTES = 32 * 1024;
 const PURPOSES = new Set(['openrouter', 'azureSpeech', 'googleOAuth', 'microsoftOAuth']);
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -42,6 +44,18 @@ export interface OAuthStageBinding {
 
 /** Closed encrypted OAuth-stage value for a trusted stage repository to persist. */
 export interface StageCiphertext {
+  readonly format: 1;
+  readonly nonce: Buffer;
+  readonly tag: Buffer;
+  readonly ciphertext: Buffer;
+}
+
+/** Cryptographic binding for a Web Push secret; it is not subscription or rotation authority. */
+export type WebPushSecretBinding = Readonly<{ kind: 'subscription'; deviceId: string; generation: number; keyId: string }> |
+  Readonly<{ kind: 'vapid'; keyId: string }>;
+
+/** Dedicated encrypted Web Push value for a trusted registry to persist. */
+export interface WebPushSecretCiphertext {
   readonly format: 1;
   readonly nonce: Buffer;
   readonly tag: Buffer;
@@ -172,6 +186,60 @@ function oauthStageAad(context: OwnedTransactionContext, binding: OAuthStageBind
     binding.payloadKind, binding.payloadGeneration]), 'utf8');
 }
 
+function normalizeWebPushSecretBinding(value: unknown): WebPushSecretBinding {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    reject('web_push_secret_invalid_binding', 'The Web Push secret binding is invalid.');
+  }
+  let kind: unknown;
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, 'kind');
+    if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, 'value')) {
+      reject('web_push_secret_invalid_binding', 'The Web Push secret binding is invalid.');
+    }
+    kind = descriptor.value;
+  } catch { reject('web_push_secret_invalid_binding', 'The Web Push secret binding is invalid.'); }
+  if (kind === 'subscription') {
+    const fields = closedDataFields(value, ['kind', 'deviceId', 'generation', 'keyId'], 'web_push_secret_invalid_binding');
+    if (typeof fields.deviceId !== 'string' || !UUID_V4.test(fields.deviceId) ||
+        typeof fields.generation !== 'number' || !Number.isSafeInteger(fields.generation) || fields.generation <= 0 ||
+        typeof fields.keyId !== 'string' || !UUID_V4.test(fields.keyId)) {
+      reject('web_push_secret_invalid_binding', 'The Web Push secret binding is invalid.');
+    }
+    return Object.freeze({ kind: 'subscription', deviceId: fields.deviceId, generation: fields.generation, keyId: fields.keyId });
+  }
+  if (kind === 'vapid') {
+    const fields = closedDataFields(value, ['kind', 'keyId'], 'web_push_secret_invalid_binding');
+    if (typeof fields.keyId !== 'string' || !UUID_V4.test(fields.keyId)) {
+      reject('web_push_secret_invalid_binding', 'The Web Push secret binding is invalid.');
+    }
+    return Object.freeze({ kind: 'vapid', keyId: fields.keyId });
+  }
+  return reject('web_push_secret_invalid_binding', 'The Web Push secret binding is invalid.');
+}
+
+function normalizeWebPushSecretCiphertext(value: unknown): WebPushSecretCiphertext {
+  const fields = closedDataFields(value, ['format', 'nonce', 'tag', 'ciphertext'], 'web_push_secret_invalid_ciphertext');
+  if (fields.format !== 1 || !Buffer.isBuffer(fields.nonce) || fields.nonce.length !== NONCE_BYTES ||
+      !Buffer.isBuffer(fields.tag) || fields.tag.length !== TAG_BYTES || !Buffer.isBuffer(fields.ciphertext) ||
+      fields.ciphertext.length < 1 || fields.ciphertext.length > MAX_WEB_PUSH_SECRET_BYTES) {
+    reject('web_push_secret_invalid_ciphertext', 'The Web Push secret ciphertext is invalid.');
+  }
+  return Object.freeze({ format: 1, nonce: Buffer.from(fields.nonce), tag: Buffer.from(fields.tag), ciphertext: Buffer.from(fields.ciphertext) });
+}
+
+function webPushSecretAad(context: OwnedTransactionContext, binding: WebPushSecretBinding): Buffer {
+  return Buffer.from(JSON.stringify([1, WEB_PUSH_SECRET_DOMAIN, context.ownerId, context.workspaceId, context.privacyEpoch,
+    binding.kind, binding.kind === 'subscription' ? binding.deviceId : null,
+    binding.kind === 'subscription' ? binding.generation : null, binding.keyId]), 'utf8');
+}
+
+function webPushSecretPlaintextBytes(value: unknown): Buffer {
+  if (!(value instanceof Uint8Array) || value.byteLength < 1 || value.byteLength > MAX_WEB_PUSH_SECRET_BYTES) {
+    reject('web_push_secret_invalid_plaintext', 'The Web Push secret plaintext is invalid.');
+  }
+  return Buffer.from(value);
+}
+
 function oauthStagePlaintextBytes(value: unknown): Buffer {
   if (typeof value !== 'string' || value.length === 0 || value.length > MAX_OAUTH_STAGE_BYTES) {
     reject('oauth_stage_invalid_plaintext', 'OAuth stage plaintext is invalid.');
@@ -247,15 +315,19 @@ interface SecretRow {
 export class SecretVault {
   readonly #key: Buffer;
   readonly #oauthStageKey: Buffer;
+  readonly #webPushSecretKey: Buffer;
   readonly #db: Database.Database;
   private closed = false;
 
   constructor(kernel: DurableKernel, rootKey: Uint8Array) {
     this.#key = checkedKeyBytes(rootKey);
     let oauthStageKey: Buffer | undefined;
+    let webPushSecretKey: Buffer | undefined;
     try {
       oauthStageKey = Buffer.from(hkdfSync('sha256', this.#key, Buffer.alloc(0), Buffer.from(OAUTH_STAGE_DOMAIN, 'utf8'), KEY_BYTES));
       this.#oauthStageKey = oauthStageKey;
+      webPushSecretKey = Buffer.from(hkdfSync('sha256', this.#key, Buffer.alloc(0), Buffer.from(WEB_PUSH_SECRET_DOMAIN, 'utf8'), KEY_BYTES));
+      this.#webPushSecretKey = webPushSecretKey;
       this.#db = kernel.withTrustedDatabaseTransaction((db) => {
         this.initialize(db);
         return db;
@@ -263,6 +335,7 @@ export class SecretVault {
     } catch (error) {
       this.#key.fill(0);
       oauthStageKey?.fill(0);
+      webPushSecretKey?.fill(0);
       throw error;
     }
   }
@@ -464,6 +537,52 @@ export class SecretVault {
     }
   }
 
+  /** Encrypts a Web Push subscription or VAPID secret under a purpose-specific HKDF domain. */
+  sealWebPushSecretWithinTransaction(context: OwnedTransactionContext, bindingInput: WebPushSecretBinding,
+    plaintextInput: Uint8Array): WebPushSecretCiphertext {
+    this.validateOAuthStageContext(context);
+    const binding = normalizeWebPushSecretBinding(bindingInput);
+    const cleartext = webPushSecretPlaintextBytes(plaintextInput);
+    try {
+      const nonce = randomBytes(NONCE_BYTES);
+      const cipher = createCipheriv('aes-256-gcm', this.#webPushSecretKey, nonce);
+      cipher.setAAD(webPushSecretAad(context, binding));
+      const ciphertext = Buffer.concat([cipher.update(cleartext), cipher.final()]);
+      return Object.freeze({ format: 1, nonce: Buffer.from(nonce), tag: Buffer.from(cipher.getAuthTag()), ciphertext });
+    } catch {
+      reject('web_push_secret_seal_failed', 'The Web Push secret could not be encrypted.');
+    } finally { cleartext.fill(0); }
+  }
+
+  /** Opens only a Web Push ciphertext with the exact current owner/workspace/epoch and binding. Caller must zero the result. */
+  openWebPushSecretWithinTransaction(context: OwnedTransactionContext, bindingInput: WebPushSecretBinding,
+    ciphertextInput: WebPushSecretCiphertext): Buffer {
+    this.validateOAuthStageContext(context);
+    const binding = normalizeWebPushSecretBinding(bindingInput);
+    const ciphertext = normalizeWebPushSecretCiphertext(ciphertextInput);
+    let cleartext: Buffer | undefined;
+    let partial: Buffer | undefined;
+    let final: Buffer | undefined;
+    try {
+      const decipher = createDecipheriv('aes-256-gcm', this.#webPushSecretKey, ciphertext.nonce);
+      decipher.setAAD(webPushSecretAad(context, binding));
+      decipher.setAuthTag(ciphertext.tag);
+      partial = decipher.update(ciphertext.ciphertext);
+      final = decipher.final();
+      cleartext = Buffer.concat([partial, final]);
+      if (cleartext.length < 1 || cleartext.length > MAX_WEB_PUSH_SECRET_BYTES) {
+        reject('web_push_secret_open_failed', 'The Web Push secret could not be authenticated.');
+      }
+      return cleartext;
+    } catch {
+      cleartext?.fill(0);
+      return reject('web_push_secret_open_failed', 'The Web Push secret could not be authenticated.');
+    } finally {
+      partial?.fill(0);
+      final?.fill(0);
+    }
+  }
+
   setSecretWithinTransaction(context: OwnedTransactionContext, scope: VaultScope, purpose: VaultPurpose,
     expectedGeneration: number, secret: string): VaultCredentialMetadata {
     const normalized = this.validate(context, scope, purpose);
@@ -546,6 +665,7 @@ export class SecretVault {
     this.closed = true;
     this.#key.fill(0);
     this.#oauthStageKey.fill(0);
+    this.#webPushSecretKey.fill(0);
   }
 
   private validateOAuthStageContext(context: OwnedTransactionContext): void {

@@ -14,6 +14,8 @@ import type { OAuthHttpApi } from './oauthHttp.js';
 import { BACKGROUND_POLICIES_PATH, BACKGROUND_POLICY_PAUSE_PATH, BACKGROUND_POLICY_REVOKE_PATH } from './backgroundHttp.js';
 import { OAuthConnectionServiceError } from './oauthConnectionService.js';
 import { registerAcceptedHttpServer, trackAcceptedHttpRequest } from './httpRequestDrain.js';
+import { WebPushRegistryError } from './webPushSubscriptions.js';
+import type { WebPushHttpApi } from './webPushHttp.js';
 
 const BODY_LIMIT = 16 * 1024;
 const WORKSPACE_COMMAND_TEXT_BODY_LIMIT = 1024 * 1024;
@@ -45,6 +47,7 @@ export interface StillHttpOptions {
   readonly workspaceApi?: WorkspaceHttpApi;
   readonly audioApi?: AudioHttpApi;
   readonly oauthApi?: OAuthHttpApi;
+  readonly webPushApi?: WebPushHttpApi;
   /** Trusted host lifecycle fence checked at request admission and after awaited request bodies. */
   readonly admissionOpen?: () => boolean;
 }
@@ -258,6 +261,19 @@ function workspaceMutationAdmission(request: IncomingMessage, auth: AuthService,
 }
 
 function workspaceFailure(error: unknown): { readonly status: number; readonly code: string } {
+  if (error instanceof WebPushRegistryError) {
+    if (['web_push_invalid_request', 'web_push_invalid_subscription'].includes(error.code)) {
+      return { status: 400, code: 'invalid_web_push_request' };
+    }
+    if (error.code === 'web_push_unauthenticated') return { status: 401, code: 'unauthenticated' };
+    if (['web_push_stale_epoch', 'web_push_stale_generation', 'web_push_stale_key', 'web_push_command_conflict',
+      'web_push_already_provisioned', 'web_push_not_provisioned'].includes(error.code)) {
+      return { status: 409, code: 'web_push_conflict' };
+    }
+    if (error.code === 'web_push_storage_budget_exceeded') return { status: 413, code: 'web_push_storage_limit' };
+    if (error.code === 'web_push_command_not_found') return { status: 404, code: 'not_found' };
+    return { status: 503, code: 'service_unavailable' };
+  }
   if (error instanceof Error && /^workspace_erase_/.test(error.message)) {
     const code = error.message;
     if (['workspace_erase_stale', 'workspace_erase_plan_unavailable', 'workspace_erase_command_conflict',
@@ -639,7 +655,7 @@ export function createStillHttpServer(options: StillHttpOptions): Server {
   server = createServer((request, response) => {
     securityHeaders(response);
     const handled = Promise.resolve().then(() => handleRequest(request, response, options.auth, origin, realRoot, paths, index, options.credentialCommands,
-      options.workspaceApi, options.audioApi, options.oauthApi, options.admissionOpen)).catch((error: unknown) => {
+      options.workspaceApi, options.audioApi, options.oauthApi, options.webPushApi, options.admissionOpen)).catch((error: unknown) => {
       if (response.headersSent) { response.destroy(); return; }
       if (isHttpProblem(error)) { sendError(response, error.status, error.code); return; }
       if (error instanceof AuthError) { sendError(response, authStatus(error), error.code); return; }
@@ -657,7 +673,8 @@ export function createStillHttpServer(options: StillHttpOptions): Server {
 
 async function handleRequest(request: IncomingMessage, response: ServerResponse, auth: AuthService, canonicalOrigin: URL,
   staticRoot: string, staticPaths: Set<string>, index: Buffer, credentialCommands?: ServerCredentialCommandService,
-  workspaceApi?: WorkspaceHttpApi, audioApi?: AudioHttpApi, oauthApi?: OAuthHttpApi, admissionOpen?: () => boolean): Promise<void> {
+  workspaceApi?: WorkspaceHttpApi, audioApi?: AudioHttpApi, oauthApi?: OAuthHttpApi, webPushApi?: WebPushHttpApi,
+  admissionOpen?: () => boolean): Promise<void> {
   if (admissionOpen && !admissionOpen()) throw problem(503, 'service_unavailable');
   const host = uniqueHeader(request, 'host', true);
   if (!host || host.toLowerCase() !== canonicalOrigin.host.toLowerCase()) throw problem(403, 'host_rejected');
@@ -1285,6 +1302,73 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
       const mapped = credentialServiceFailure(error);
       sendError(response, mapped.status, mapped.code);
     }
+    return;
+  }
+  if (pathname.startsWith('/api/web-push/')) {
+    if (!webPushApi) throw problem(503, 'service_unavailable');
+    if (pathname === '/api/web-push/status' || pathname === '/api/web-push/vapid-key') {
+      if (request.method !== 'GET') { response.setHeader('Allow', 'GET'); throw problem(405, 'method_not_allowed'); }
+      if (hasQuery) throw problem(400, 'bad_request');
+      const admission = workspaceReadAdmission(request, auth, canonicalOrigin);
+      try {
+        admission.assertCurrent();
+        const result = pathname.endsWith('/status') ? webPushApi.getStatus(admission) : webPushApi.getPublicKey(admission);
+        admission.assertCurrent();
+        sendJson(response, 200, result);
+      } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
+      return;
+    }
+    if (pathname === '/api/web-push/subscriptions') {
+      if (request.method !== 'GET') { response.setHeader('Allow', 'GET'); throw problem(405, 'method_not_allowed'); }
+      let cursor: string | undefined;
+      if (hasQuery) {
+        const query = strictQuery(rawQuery, ['cursor']);
+        if (query.size !== 1) throw problem(400, 'bad_request');
+        cursor = query.get('cursor');
+      }
+      const admission = workspaceReadAdmission(request, auth, canonicalOrigin);
+      try {
+        admission.assertCurrent();
+        const result = webPushApi.listSubscriptions(admission, cursor);
+        admission.assertCurrent();
+        sendJson(response, 200, result);
+      } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
+      return;
+    }
+    const receiptMatch = /^\/api\/web-push\/commands\/([0-9a-f-]{36})$/i.exec(pathname);
+    if (receiptMatch) {
+      if (request.method !== 'GET') { response.setHeader('Allow', 'GET'); throw problem(405, 'method_not_allowed'); }
+      if (hasQuery || !COMMAND_ID_RE.test(receiptMatch[1]!)) throw problem(400, 'bad_request');
+      const admission = workspaceReadAdmission(request, auth, canonicalOrigin);
+      try {
+        admission.assertCurrent();
+        const receipt = webPushApi.inspectCommand(admission, receiptMatch[1]!);
+        admission.assertCurrent();
+        if (!receipt) { sendError(response, 404, 'not_found'); return; }
+        sendJson(response, 200, receipt);
+      } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
+      return;
+    }
+    const mutationRoutes = new Map<string, { readonly method: 'provision' | 'rotate' | 'register' | 'revoke'; readonly run: WebPushHttpApi['provision'] }>([
+      ['/api/web-push/provision', { method: 'provision', run: webPushApi.provision }],
+      ['/api/web-push/rotate', { method: 'rotate', run: webPushApi.rotate }],
+      ['/api/web-push/subscriptions/register', { method: 'register', run: webPushApi.register }],
+      ['/api/web-push/subscriptions/revoke', { method: 'revoke', run: webPushApi.revoke }],
+    ]);
+    const mutation = mutationRoutes.get(pathname);
+    if (!mutation) { sendError(response, 404, 'not_found'); return; }
+    if (request.method !== 'POST') { response.setHeader('Allow', 'POST'); throw problem(405, 'method_not_allowed'); }
+    if (hasQuery) throw problem(400, 'bad_request');
+    const admission = workspaceMutationAdmission(request, auth, canonicalOrigin);
+    try {
+      const input = await readJsonBody(request, response, BODY_LIMIT);
+      admission.assertCurrent();
+      if (admissionOpen && !admissionOpen()) throw problem(503, 'service_unavailable');
+      workspaceApi?.assertWorkspaceAdmission?.(admission);
+      const result = mutation.run.call(webPushApi, admission, input);
+      admission.assertCurrent();
+      if (!response.destroyed) sendJson(response, 200, result);
+    } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
     return;
   }
   const commandMatch = /^\/api\/credential-commands\/([0-9a-f-]{36})$/i.exec(pathname);
