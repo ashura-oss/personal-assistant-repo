@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { Buffer } from 'node:buffer';
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { copyFile, lstat, link, mkdir, mkdtemp, readFile, readdir, rm, unlink, writeFile } from 'node:fs/promises';

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { Buffer } from 'node:buffer';
 import { spawn } from 'node:child_process';
 import { existsSync, mkdtempSync, mkdirSync, rmSync, statSync, symlinkSync, linkSync, writeFileSync } from 'node:fs';
 import { createServer as createNetServer } from 'node:net';

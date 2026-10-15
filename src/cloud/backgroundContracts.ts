@@ -28,4 +28,4 @@ export {
   type BackgroundSourceSelection,
   type ChangeBackgroundPolicyEnvelope,
   type SaveBackgroundPolicyEnvelope,
-} from '../../server/src/backgroundContracts.js';
+} from '../../server/src/backgroundContracts';
