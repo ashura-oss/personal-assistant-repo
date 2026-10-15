@@ -81,11 +81,18 @@ describe('web provider credential facade', () => {
   });
 
   it('sends one atomic multi-key write with command and CSRF headers, then returns metadata only', async () => {
-    const fetch = vi.fn()
-      .mockResolvedValueOnce(response(metadata()))
-      .mockResolvedValueOnce(response(metadata({ configured: true, generation: 1 }, { configured: true, generation: 1 })));
+    const admissionIds: string[] = [];
+    const events: string[] = [];
+    const fetch = vi.fn(async (path: string, init: RequestInit) => {
+      if (init.method === 'PUT') events.push('fetch');
+      return path === '/api/credentials' && init.method === 'GET'
+        ? response(metadata())
+        : response(metadata({ configured: true, generation: 1 }, { configured: true, generation: 1 }));
+    });
     vi.stubGlobal('fetch', fetch);
-    const service = createWebProviderCredentialService(session, () => 'fresh-csrf');
+    const service = createWebProviderCredentialService(session, () => 'fresh-csrf', {
+      onMutationAdmitted(commandId) { admissionIds.push(commandId); events.push('admitted'); },
+    });
     await expect(service.setCredentials({ speechSubscriptionKey: 'speech-secret', openRouterApiKey: 'router-secret' })).resolves.toEqual({
       speechConfigured: true, openAiConfigured: false, openRouterConfigured: true,
     });
@@ -97,11 +104,35 @@ describe('web provider credential facade', () => {
     expect(init).toMatchObject({ method: 'PUT', cache: 'no-store', credentials: 'same-origin', redirect: 'error' });
     expect(init.headers).toMatchObject({ 'Content-Type': 'application/json', 'X-Still-CSRF': 'fresh-csrf' });
     expect(init.headers).toHaveProperty('X-Still-Command', expect.stringMatching(/^[0-9a-f-]{36}$/i));
+    expect(admissionIds).toEqual([new Headers(init.headers).get('X-Still-Command')]);
+    expect(events).toEqual(['admitted', 'fetch']);
     expect(JSON.parse(String(init.body))).toEqual({
       expectedPrivacyEpoch: 4,
       expectedGenerations: { speech: 0, openrouter: 0 },
       keys: { speech: 'speech-secret', openrouter: 'router-secret' },
     });
+    service.dispose();
+  });
+
+  it('does not announce a mutation before metadata preflight and treats admission-callback failure as nondispatch', async () => {
+    const admission = vi.fn();
+    const preflightFetch = vi.fn().mockResolvedValue(response({ error: 'private detail' }, 503));
+    vi.stubGlobal('fetch', preflightFetch);
+    const preflightService = createWebProviderCredentialService(session, () => 'csrf', { onMutationAdmitted: admission });
+    await expect(preflightService.setCredentials({ speechSubscriptionKey: 'secret' })).rejects.toMatchObject({ kind: 'http', status: 503 });
+    expect(preflightFetch).toHaveBeenCalledTimes(1);
+    expect(admission).not.toHaveBeenCalled();
+    preflightService.dispose();
+
+    const fetch = vi.fn().mockResolvedValue(response(metadata()));
+    vi.stubGlobal('fetch', fetch);
+    const callbackError = new Error('admission callback failed');
+    const service = createWebProviderCredentialService(session, () => 'csrf', {
+      onMutationAdmitted() { throw callbackError; },
+    });
+    await service.getCredentials();
+    await expect(service.setCredentials({ speechSubscriptionKey: 'secret' })).rejects.toBe(callbackError);
+    expect(fetch).toHaveBeenCalledTimes(1);
     service.dispose();
   });
 
@@ -116,12 +147,13 @@ describe('web provider credential facade', () => {
   });
 
   it('makes deletes atomic, including the all-supported-credentials operation', async () => {
+    const admissionIds: string[] = [];
     const fetch = vi.fn()
       .mockResolvedValueOnce(response(metadata({ configured: true, generation: 2 }, { configured: true, generation: 7 })))
       .mockResolvedValueOnce(response(metadata({ configured: false, generation: 3 }, { configured: false, generation: 8 })))
       .mockResolvedValueOnce(response(metadata({ configured: false, generation: 4 }, { configured: false, generation: 8 })));
     vi.stubGlobal('fetch', fetch);
-    const service = createWebProviderCredentialService(session, () => 'csrf');
+    const service = createWebProviderCredentialService(session, () => 'csrf', { onMutationAdmitted: (commandId) => admissionIds.push(commandId) });
     await service.getCredentials();
     await service.deleteCredentials();
     await service.deleteCredentials('speech');
@@ -141,6 +173,7 @@ describe('web provider credential facade', () => {
       expect(init.headers).toHaveProperty('X-Still-Command', expect.stringMatching(/^[0-9a-f-]{36}$/i));
       expect(init.headers).toHaveProperty('X-Still-CSRF', 'csrf');
     }
+    expect(admissionIds).toEqual(fetch.mock.calls.slice(1).map(([, init]) => new Headers(init.headers).get('X-Still-Command')));
     service.dispose();
   });
 

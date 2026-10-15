@@ -10,6 +10,11 @@ import type { AuthenticatedSession } from './authClient';
 
 export type WebCredentialKind = 'speech' | 'openrouter';
 
+export type WebCredentialServiceOptions = Readonly<{
+  /** Called with the exact command ID immediately before a credential mutation is dispatched. */
+  onMutationAdmitted?: (commandId: string) => void;
+}>;
+
 export type WebCredentialMetadata = Readonly<{
   workspaceId: string;
   privacyEpoch: number;
@@ -150,6 +155,7 @@ function isUuid(value: string): boolean {
 export function createWebProviderCredentialService(
   session: AuthenticatedSession,
   currentCsrfToken: () => string,
+  options: WebCredentialServiceOptions = {},
 ): ProviderCredentialService & {
   checkCredentialCommand(commandId: string): Promise<CredentialCommandStatus>;
   dispose(): void;
@@ -276,6 +282,7 @@ export function createWebProviderCredentialService(
     let bodyText = canonicalJson(body);
     try {
       const csrfToken = csrfHeader();
+      options.onMutationAdmitted?.(commandId);
       let ack: unknown;
       try {
         ack = await requestJson('/api/credentials', {
@@ -310,6 +317,7 @@ export function createWebProviderCredentialService(
     let bodyText = canonicalJson(body);
     try {
       const csrfToken = csrfHeader();
+      options.onMutationAdmitted?.(commandId);
       let ack: unknown;
       try {
         ack = await requestJson('/api/credentials', {
