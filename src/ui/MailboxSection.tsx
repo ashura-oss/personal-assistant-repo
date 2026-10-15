@@ -1,16 +1,19 @@
 import React from "react";
 import { Pressable, Text, View } from "react-native";
-import type { Account, MailboxSnapshotMessage } from "../core";
+import type { MailboxSnapshotMessage } from "../core";
 import { C } from "./theme";
+import type { WorkspaceActionCapability } from "./workspaceCapabilities";
+import type { DeepReadonly } from "../cloud/workspaceDto";
+import type { InboxAccountDisplay } from "./InboxWorkspaceContent";
 
 export function MailboxSection({
   messages,
   accounts,
   onReply,
 }: {
-  messages: MailboxSnapshotMessage[];
-  accounts: Account[];
-  onReply: (messageId: string) => void;
+  messages: readonly DeepReadonly<MailboxSnapshotMessage>[];
+  accounts: readonly DeepReadonly<InboxAccountDisplay>[];
+  onReply: WorkspaceActionCapability<(messageId: string) => void>;
 }) {
   const activeAccounts = accounts.filter(
     (account) =>
@@ -84,20 +87,20 @@ export function MailboxSection({
                 accessibilityRole="button"
                 accessibilityLabel={`Reply to ${message.subject || "message"}`}
                 accessibilityState={{
-                  disabled: message.replyMetadataComplete !== true,
+                    disabled: message.replyMetadataComplete !== true || !onReply.available,
                 }}
-                disabled={message.replyMetadataComplete !== true}
-                onPress={() => onReply(message.id)}
+                disabled={message.replyMetadataComplete !== true || !onReply.available}
+                onPress={() => { if (onReply.available) onReply.action(message.id); }}
                 style={[
                   styles.replyButton,
-                  message.replyMetadataComplete !== true && styles.replyDisabled,
+                  (message.replyMetadataComplete !== true || !onReply.available) && styles.replyDisabled,
                 ]}
               >
                 <Text style={styles.replyText}>Reply</Text>
               </Pressable>
-              {message.replyMetadataComplete !== true ? (
+              {message.replyMetadataComplete !== true || !onReply.available ? (
                 <Text style={styles.replyHint}>
-                  Reply details are unavailable for this saved message.
+                  {[message.replyMetadataComplete !== true ? "Reply details are unavailable for this saved message." : "", !onReply.available ? onReply.reason : ""].filter(Boolean).join(" ")}
                 </Text>
               ) : null}
             </View>

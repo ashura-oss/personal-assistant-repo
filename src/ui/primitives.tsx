@@ -3,8 +3,8 @@ import { Pressable, Text, TextInput, View } from 'react-native';
 import Ionicons from '@expo/vector-icons/Ionicons';
 import { C, s } from './theme';
 
-export function IconButton({ name, onPress, label, color = C.text }: { name: React.ComponentProps<typeof Ionicons>['name']; onPress: () => void; label: string; color?: string }) {
-  return <Pressable accessibilityRole="button" accessibilityLabel={label} onPress={onPress} style={({ pressed }) => [s.iconButton, pressed && s.pressed]}><Ionicons accessible={false} importantForAccessibility="no" name={name} size={21} color={color} /></Pressable>;
+export function IconButton({ name, onPress, label, color = C.text, disabled = false }: { name: React.ComponentProps<typeof Ionicons>['name']; onPress: () => void; label: string; color?: string; disabled?: boolean }) {
+  return <Pressable accessibilityRole="button" accessibilityLabel={label} disabled={disabled} onPress={onPress} style={({ pressed }) => [s.iconButton, disabled && s.disabled, pressed && !disabled && s.pressed]}><Ionicons accessible={false} importantForAccessibility="no" name={name} size={21} color={color} /></Pressable>;
 }
 
 export function Button({ label, onPress, tone = 'light', disabled = false, icon }: { label: string; onPress: () => void; tone?: 'light' | 'quiet' | 'danger'; disabled?: boolean; icon?: React.ComponentProps<typeof Ionicons>['name'] }) {

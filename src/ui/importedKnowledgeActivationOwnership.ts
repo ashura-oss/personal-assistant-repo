@@ -12,14 +12,14 @@ export type ImportedKnowledgeActivationOwner = {
   operation?: Readonly<{ kind: 'prepare' | 'activate'; token: object }>;
 };
 export type ImportedKnowledgeOperationClaim = Readonly<{ owner: ImportedKnowledgeActivationOwner; token: object; kind: 'prepare' | 'activate' }>;
-export type ImportedKnowledgeRuntimeFence = Readonly<{ controller: ImportedKnowledgeActivationPort; blocked: boolean }>;
+export type ImportedKnowledgeRuntimeFence = Readonly<{ controller?: ImportedKnowledgeActivationPort; blocked: boolean }>;
 
 export function importedKnowledgeSelectionMatches(left: ImportedKnowledgeSelection | null | undefined, right: ImportedKnowledgeSelection | null | undefined): boolean {
   return Boolean(left && right && left.archiveId === right.archiveId && left.cohortId === right.cohortId && left.kind === right.kind && left.entityId === right.entityId);
 }
 
 export function importedKnowledgeOwnerMatchesRuntime(ownership: ImportedKnowledgeActivationOwnership, owner: ImportedKnowledgeActivationOwner, selection: ImportedKnowledgeSelection, runtime: ImportedKnowledgeRuntimeFence): boolean {
-  return !runtime.blocked && runtime.controller === owner.controller && ownership.isCurrent(owner, selection, runtime.controller);
+  return !runtime.blocked && Boolean(runtime.controller) && runtime.controller === owner.controller && ownership.isCurrent(owner, selection, runtime.controller);
 }
 
 /** Attach only after an awaited prepare still belongs to the current controller, view, and exact selection. */

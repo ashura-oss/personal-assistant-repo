@@ -17,7 +17,7 @@ export function BackupImportSheet({
   onImported,
 }: {
   visible: boolean;
-  controller: AppController;
+  controller: Pick<AppController, 'prepareBackupImport' | 'applyBackupImport'>;
   busy: boolean;
   sampleMode?: boolean;
   chooseBackup: () => Promise<PickedBackupFile | null>;

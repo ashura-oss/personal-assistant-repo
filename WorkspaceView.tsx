@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
-import { ActivityIndicator, Alert, KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView, Switch, Text, TextInput, View } from "react-native";
+import { ActivityIndicator, Alert, Modal, Platform, Pressable, ScrollView, Switch, Text, TextInput, View } from "react-native";
 import Ionicons from "@expo/vector-icons/Ionicons";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
-import type { Note, Proposal, AppState, AppSettings, AppController, ContextDocument, AccountCapability, LocalTask, MailboxSnapshotMessage, SavedProactiveRule, ProactiveState, SaveKnowledgeFactInput, SaveKnowledgeContactInput, SaveKnowledgeSourceLinkInput, SaveKnowledgeMemberInput, KnowledgeItemCommand, ReviewKnowledgeSuggestionInput, StartupRecoveryStatus, MailReplyBatchReviewPlan, MailReplyBatchSourcesRefreshResult, MailReplyContextSelection, MailReplyConversationContextDiscovery, ImportedKnowledgeActivationPreview } from "./src/core";
+import type { Note, Proposal, AppState, AppSettings, AppController, AccountCapability, SavedProactiveRule, StartupRecoveryStatus, MailReplyBatchReviewPlan, MailReplyBatchSourcesRefreshResult, MailReplyContextSelection, MailReplyConversationContextDiscovery } from "./src/core";
 import type { ProactiveRecoveryPlan, ProactiveRecoveryStatus } from "./src/proactive/recovery";
 import type { DispatchRecoveryPlan, DispatchRecoveryStatus } from "./src/dispatch/recovery";
 import type { StartupRecoveryPlan } from "./src/storage/startupRecovery";
-import type { KnowledgeChange, KnowledgeEntityKind, KnowledgeReference, KnowledgeSuggestion, KnowledgeSuggestionReview, Person, Project } from "./src/knowledge/types";
+import type { KnowledgeChange, KnowledgeReference, KnowledgeSuggestionReview } from "./src/knowledge/types";
 import { SpeechTranscriptionError } from "./src/transcription/types";
 import { OPENROUTER_SPEECH_DEFAULT_MODEL } from "./src/transcription/openRouterSpeechProfiles";
 import { RecordingAutoStopGate } from "./src/audio/autoStop";
@@ -16,10 +16,8 @@ import type { ProviderCredentialService } from "./src/services/credentials";
 import { ConnectionsSection } from "./src/ui/ConnectionsSection";
 import { ProviderCleanupNotice } from "./src/ui/ProviderCleanupNotice";
 import { OAuthConnectionIntentOwnership, type OAuthConnectionIntentSnapshot } from "./src/ui/oauthConnectionIntent";
-import { MailboxSection } from "./src/ui/MailboxSection";
 import { MailReplyComposer } from "./src/ui/MailReplyComposer";
 import { MailReplyBatchOwnership, mailReplyBatchActivationMatchesOperation, mailReplyBatchIsBlocked, mailReplyBatchPlanMatchesOperation, mailReplyBatchReviewSourceIsBlocked, mailReplyBatchKeyIsReady, rethrowMailReplyBatchError, type MailReplyBatchBlockState, type MailReplyBatchKeyStatus, type MailReplyBatchOwner } from "./src/ui/mailReplyBatchOwnership";
-import { ProactiveCandidatesSection } from "./src/ui/ProactiveCandidatesSection";
 import { ProactiveRulesSection } from "./src/ui/ProactiveRulesSection";
 import { ProactiveMailAlertsSection, type EnableProactiveMailAlertsInput } from "./src/ui/ProactiveMailAlertsSection";
 import { ProactiveRecoverySheet, shouldShowProactiveRecoverySection } from "./src/ui/ProactiveRecoverySheet";
@@ -29,22 +27,16 @@ import { useProactiveClock } from "./src/ui/useProactiveClock";
 import { ReviewSheet } from "./src/ui/ReviewSheet";
 import type { MoreComputeReviewActions } from "./src/ui/MoreComputeReview";
 import { moreComputeConfigurationFingerprint, moreComputeWorkspaceIsBlocked } from "./src/ui/moreComputeOwnership";
-import { NoteDetail as NoteDetailView } from "./src/ui/NoteDetail";
+import { WorkspaceModals } from "./src/ui/WorkspaceModals";
+import { InboxWorkspaceContent, inboxAccountDisplay, inboxDeviceCalendarDisplay } from "./src/ui/InboxWorkspaceContent";
+import { LibraryScreen } from "./src/ui/LibraryScreen";
 import { findCurrentNativeDetailNote } from "./src/ui/nativeDetailSelection";
-import { BackupImportSheet } from "./src/ui/BackupImportSheet";
-import { ImportedBackupsSection } from "./src/ui/ImportedBackupsSection";
 import { RecordingAttachmentSheet } from "./src/ui/RecordingAttachmentSheet";
-import { KnowledgeSection } from "./src/ui/KnowledgeSection";
-import { KnowledgeEntitySheet } from "./src/ui/KnowledgeEntitySheet";
-import type { KnowledgeEntityEditCommand, KnowledgeProjectEditCommand } from "./src/ui/KnowledgeEntitySheet";
-import type { ImportedArchiveDisplay, ImportedKnowledgePreviewDisplay, ImportedKnowledgeSelection, KnowledgeChangeDisplay, KnowledgeDisplay, KnowledgeEntityDisplay, KnowledgeReferenceDisplay, KnowledgeSourceChoiceDisplay, KnowledgeSuggestionDisplay, KnowledgeSuggestionEditCommand } from "./src/ui/knowledgeDisplayTypes";
-import { KnowledgeSuggestionSheet } from "./src/ui/KnowledgeSuggestionSheet";
-import { ImportedKnowledgeReview } from "./src/ui/ImportedKnowledgeReview";
-import { ImportedKnowledgeActivationOwnership, attachImportedKnowledgePreviewForRuntime, importedKnowledgeOwnerMatchesRuntime, importedKnowledgeSelectionMatches } from "./src/ui/importedKnowledgeActivationOwnership";
+import type { KnowledgeReferenceDisplay, KnowledgeSourceChoiceDisplay } from "./src/ui/knowledgeDisplayTypes";
+import { projectKnowledgeDisplay, projectKnowledgeSuggestionDisplay } from "./src/ui/libraryDisplay";
 import { KnowledgeReferenceChoiceOwnership, resolveKnowledgeSourceLinkReference } from "./src/ui/knowledgeReferenceChoiceOwnership";
 import { runWithBusyLock } from "./src/ui/busyActionRunner";
 import { ReminderReview } from "./src/ui/ReminderReview";
-import { RemindersSection } from "./src/ui/RemindersSection";
 import { DeviceCalendarsSection } from "./src/ui/DeviceCalendarsSection";
 import { StartupRecoveryScreen } from "./src/ui/StartupRecoveryScreen";
 import { PendingRecordingRecoveryPanel } from "./src/components/PendingRecordingRecoveryPanel";
@@ -64,20 +56,21 @@ import { MailAlertTapReviewSheet, MailAlertTapStatusCard, type MailAlertTapStatu
 import { createMailAlertTapCoordinator } from "./src/proactiveMailAlerts/taps";
 import type { MailAlertTapBackend, MailAlertTapKey, MailAlertTapResolution, MailAlertTapCoordinator } from "./src/proactiveMailAlerts/taps";
 import type { BackgroundTaskBackend, BackgroundTaskStatus } from "./src/background/backend.types";
-import { TasksSection } from "./src/ui/TasksSection";
 import { IconButton, Button, Field } from "./src/ui/primitives";
+import { WorkspaceScreen, type WorkspaceTab } from "./src/ui/WorkspaceScreen";
+import { ManualNoteComposer, RecordWorkspaceContent, workspaceNoteCardDisplay, workspaceProposalCardDisplay } from "./src/ui/WorkspaceContent";
 import { C, s } from "./src/ui/theme";
 import type { OAuthProvider } from "./src/auth/browser";
 import type { PickedBackupFile } from "./src/backupFiles";
 import type { ProviderCleanupRegistry } from "./src/services/providerResponseLifetime";
-import type { ReminderIntent, ReminderRecord } from "./src/reminders";
+import type { ReminderRecord } from "./src/reminders";
 import { deriveReminderAlertDisplay, toReminderDisplayRecord, type ReminderAlertChannel } from "./src/ui/reminderDisplay";
 import type { ReviewProposalDisplay, ReviewDispatchDisplay, ReviewDeviceEventDisplay } from "./src/ui/ReviewSheet";
 import { projectDeviceEventReconciliationDisplayFacts, resolveLinkedDeviceEventRecord, resolveLinkedDispatchRecord, resolveReviewReplyAllowedOperations } from "./src/ui/reviewSheetAuthority";
 import type { PrivacyService, PrivacyWorkspaceSession } from "./src/privacy/service";
 import type { PrivacyResourceBoundary } from "./src/privacy/resourceBoundary";
 import type { PrivacyAudioBoundary } from "./src/privacy/audioBoundary";
-type Tab = "inbox" | "record" | "chat" | "library";
+type Tab = WorkspaceTab;
 const EMPTY_CHAT_CONVERSATIONS: NonNullable<AppState["assistantChatConversations"]> = [];
 
 const previewScenario =
@@ -318,61 +311,6 @@ function knowledgeReferenceChoices(state: AppState, ownership: KnowledgeReferenc
   return ownership.project(knowledgeReferenceOptions(state), knowledgeReferenceDisplay);
 }
 
-function projectKnowledgeChangeDisplay(change: KnowledgeSuggestion['change']): KnowledgeChangeDisplay {
-  switch (change.type) {
-    case 'add_fact': return { type: change.type, entityKind: change.entityKind, entityId: change.entityId, statement: change.statement };
-    case 'add_contact': return { type: change.type, entityKind: change.entityKind, entityId: change.entityId, address: change.address, label: change.label };
-    case 'add_member': return { type: change.type, entityKind: change.entityKind, entityId: change.entityId, personId: change.personId, personRevision: change.personRevision, role: change.role };
-    case 'add_source_link': return { type: change.type, entityKind: change.entityKind, entityId: change.entityId, reference: knowledgeReferenceDisplay(change.reference), ...(change.referenceRevision !== undefined ? { referenceRevision: change.referenceRevision } : {}), label: change.label };
-  }
-}
-
-function projectKnowledgeSuggestionDisplay(item: KnowledgeSuggestion): KnowledgeSuggestionDisplay {
-  const evidence = (items: KnowledgeSuggestion['evidence']) => items.map((entry) => ({ sourceId: entry.sourceId, sourceVersion: entry.sourceVersion, revision: entry.revision, quote: entry.quote }));
-  return { id: item.id, revision: item.revision, change: projectKnowledgeChangeDisplay(item.change), targetRevision: item.targetRevision,
-    evidence: evidence(item.evidence), status: item.status, createdAt: item.createdAt, updatedAt: item.updatedAt,
-    ...(item.originalChange ? { originalChange: projectKnowledgeChangeDisplay(item.originalChange) } : {}), ...(item.originalEvidence ? { originalEvidence: evidence(item.originalEvidence) } : {}),
-    ...(item.staleReason ? { staleReason: item.staleReason } : {}) };
-}
-
-function projectKnowledgeDisplay(value: AppState['knowledge']): KnowledgeDisplay {
-  const sourceLinks = (items: AppState['knowledge']['people'][number]['sourceLinks']) => items.map((item) => ({ id: item.id, provenance: item.provenance,
-    reference: knowledgeReferenceDisplay(item.reference), label: item.label }));
-  const facts = (items: AppState['knowledge']['people'][number]['facts']) => items.map((item) => ({ id: item.id, provenance: item.provenance, statement: item.statement }));
-  const people = value.people.map((person) => ({ id: person.id, revision: person.revision, name: person.name, aliases: [...person.aliases], narrativePath: person.narrativePath,
-    createdAt: person.createdAt, updatedAt: person.updatedAt, ...(person.archivedAt ? { archivedAt: person.archivedAt } : {}), ...(person.importOrigin ? { importOrigin: { kind: 'backup_knowledge' as const } } : {}),
-    facts: facts(person.facts), sourceLinks: sourceLinks(person.sourceLinks), contacts: person.contacts.map((item) => ({ id: item.id, provenance: item.provenance, address: item.address, label: item.label })) }));
-  const projects = value.projects.map((project) => ({ id: project.id, revision: project.revision, name: project.name, aliases: [...project.aliases], narrativePath: project.narrativePath,
-    createdAt: project.createdAt, updatedAt: project.updatedAt, ...(project.archivedAt ? { archivedAt: project.archivedAt } : {}), ...(project.importOrigin ? { importOrigin: { kind: 'backup_knowledge' as const } } : {}),
-    facts: facts(project.facts), sourceLinks: sourceLinks(project.sourceLinks), status: project.status, goal: project.goal, ...(project.startsOn ? { startsOn: project.startsOn } : {}),
-    ...(project.targetOn ? { targetOn: project.targetOn } : {}), ...(project.dateTimeZone ? { dateTimeZone: project.dateTimeZone } : {}), members: project.members.map((member) => ({ ...member })) }));
-  return { people, projects, suggestions: value.suggestions.map(projectKnowledgeSuggestionDisplay) };
-}
-
-function projectKnowledgeEntityDisplay(entity: Person | Project): KnowledgeEntityDisplay {
-  if ('contacts' in entity) return projectKnowledgeDisplay({ schemaVersion: 1, people: [entity], projects: [], suggestions: [] }).people[0]!;
-  return projectKnowledgeDisplay({ schemaVersion: 1, people: [], projects: [entity], suggestions: [] }).projects[0]!;
-}
-
-function projectImportedKnowledgePreview(preview: ImportedKnowledgeActivationPreview): ImportedKnowledgePreviewDisplay {
-  return { archiveId: preview.archiveId, cohortId: preview.cohortId, kind: preview.kind,
-    sourceEntityId: preview.sourceEntityId, sourceName: preview.sourceName, sourceEntity: projectKnowledgeEntityDisplay(preview.sourceEntity),
-    alreadyActivated: preview.alreadyActivated, narrativeContent: preview.narrativeContent,
-    factCount: preview.factCount, contactCount: preview.contactCount, sourceLinkCount: preview.sourceLinkCount, memberCount: preview.memberCount,
-    unavailableProviderReferenceCount: preview.unavailableProviderReferenceCount, unresolvedMemberCount: preview.unresolvedMemberCount };
-}
-
-function projectImportedKnowledgeArchives(archives: AppState['importedBackups']): readonly ImportedArchiveDisplay[] {
-  return archives.map((archive) => ({ id: archive.id, sourceFormat: archive.sourceFormat, importedAt: archive.importedAt, noteLinks: archive.noteLinks.map((link) => ({ sourceId: link.sourceId, noteId: link.noteId })),
-    taskLinks: archive.taskLinks.map((link) => ({ sourceId: link.sourceId, taskId: link.taskId })),
-    documents: archive.documents.map((item) => ({ path: item.path, content: item.content, revision: item.revision, updatedAt: item.updatedAt, id: item.id,
-      ...(item.activatedPath ? { activatedPath: item.activatedPath } : {}), ...(item.activatedAt ? { activatedAt: item.activatedAt } : {}) })),
-    ...(archive.archivedKnowledge ? { archivedKnowledge: archive.archivedKnowledge.map((cohort) => ({ id: cohort.id, sourceId: cohort.sourceId,
-      knowledge: { state: projectKnowledgeDisplay(cohort.knowledge.state), narratives: cohort.knowledge.narratives.map((item) => ({ entityKind: item.entityKind,
-        entityId: item.entityId, content: item.content, revision: item.revision, updatedAt: item.updatedAt })) },
-      activatedEntities: (cohort.activationLinks ?? []).map((link) => ({ entityKind: link.entityKind, sourceEntityId: link.sourceEntityId })) })) } : {}) }));
-}
-
 function knowledgeEvidenceLabels(state: AppState) {
   const labels: Record<string, string> = Object.create(null) as Record<string, string>;
   labels.transcript = 'Saved note transcript';
@@ -426,129 +364,6 @@ function knowledgeEvidenceLabels(state: AppState) {
     if (!project.archivedAt) labels[`knowledge:project:${project.id}`] = `Project · ${project.name}`;
   }
   return labels;
-}
-
-function NoteCard({ note, onPress }: { note: Note; onPress: () => void }) {
-  const date = new Date(note.capturedAt ?? note.createdAt).toLocaleDateString(
-    undefined,
-    { month: "short", day: "numeric" },
-  );
-  const title =
-    note.transcript.trim() || (note.audioUri ? "Voice note" : "Untitled note");
-  const accessibleTitle =
-    title.length > 100 ? `${title.slice(0, 100)}…` : title;
-  return (
-    <Pressable
-      accessibilityRole="button"
-      accessibilityLabel={`Open note ${accessibleTitle}`}
-      onPress={onPress}
-      style={({ pressed }) => [s.noteCard, pressed && s.pressed]}
-    >
-      <View style={s.noteTop}>
-        <View style={s.noteGlyph}>
-          <Ionicons
-            accessible={false}
-            importantForAccessibility="no"
-            name={note.audioUri ? "mic-outline" : "document-text-outline"}
-            size={16}
-            color={C.muted}
-          />
-        </View>
-        <Text style={s.noteDate}>
-        {note.audioAttachment?.durationStatus === "unknown"
-          ? `${date} · duration unknown`
-          : note.audioUri
-          ? `${date} · ${Math.max(1, Math.round(note.durationSeconds))} sec`
-            : date}
-        </Text>
-        <Ionicons
-          accessible={false}
-          importantForAccessibility="no"
-          name="chevron-forward"
-          size={16}
-          color={C.muted}
-        />
-      </View>
-      <Text numberOfLines={2} style={s.noteTitle}>
-        {title}
-      </Text>
-      <Text style={s.noteSub}>
-        {note.importOrigin?.kind === "backup_import" ? (
-          [
-            "Imported",
-            note.importOrigin.audioMissing ? "recording not included" : "unverified source",
-            note.importOrigin.originalTimeZoneUnknown ? "time zone unknown" : "",
-          ].filter(Boolean).join(" · ")
-        ) : note.status === "processed"
-          ? "Reviewed"
-          : note.status === "error"
-            ? "Needs attention"
-            : note.transcript
-              ? "Transcript saved"
-              : "Audio saved · add a transcript when ready"}
-      </Text>
-    </Pressable>
-  );
-}
-
-function ProposalCard({
-  proposal,
-  accounts,
-  onPress,
-}: {
-  proposal: Proposal;
-  accounts: AppState["accounts"];
-  onPress: () => void;
-}) {
-  const provider = accounts.find(
-    (account) => account.id === proposal.accountId,
-  )?.provider;
-  const status =
-    proposal.status === "dispatching"
-      ? "In progress"
-      : proposal.status === "unknown"
-        ? "Outcome unknown"
-        : proposal.status === "failed"
-          ? "Needs attention"
-          : proposal.status === "simulated"
-            ? "Local preview"
-            : proposal.status === "accepted"
-              ? `Accepted by ${provider === "google" ? "Gmail" : provider === "microsoft" ? "Microsoft" : "provider"}`
-              : proposal.status;
-  return (
-    <Pressable
-      onPress={onPress}
-      style={s.proposalCard}
-      accessibilityRole="button"
-    >
-      <View style={s.proposalHead}>
-        <Text style={s.kind}>
-          {proposal.provenance &&
-          "kind" in proposal.provenance &&
-          proposal.provenance.kind === "mail_reply"
-            ? "REPLY DRAFT"
-            : proposal.kind.toUpperCase()}
-        </Text>
-        <Text style={s.status}>{status}</Text>
-      </View>
-      <Text style={s.proposalTitle}>{proposal.title}</Text>
-      <Text style={s.proposalBody} numberOfLines={2}>
-        {proposal.body}
-      </Text>
-      {proposal.lastError ? (
-        <Text style={s.errorText}>{proposal.lastError}</Text>
-      ) : null}
-      <Text style={s.reviewLink}>
-        Review details{" "}
-        <Ionicons
-          accessible={false}
-          name="arrow-forward"
-          size={13}
-          color={C.text}
-        />
-      </Text>
-    </Pressable>
-  );
 }
 
 export type WorkspaceBindings = {
@@ -3424,20 +3239,13 @@ export function WorkspaceView({ controller, credentials, platform, workspaceGene
   }
 
   return (
-    <SafeAreaProvider>
-      <SafeAreaView style={s.safe}>
-        <View style={s.viewport}>
-          <View style={s.header}>
-            <View>
-              <Text style={s.wordmark}>still</Text>
-              <Text style={s.headerHint}>A quieter way to keep up</Text>
-            </View>
-            <IconButton
-              name="settings-outline"
-              label="Open settings"
-            onPress={openSettings}
-            />
-          </View>
+    <WorkspaceScreen
+      model={{ activeTab: tab, busy, tabBarVisible: !detail && !manualOpen && !settingsOpen && !chatInteractionLocked, tabNavigationLocked: chatInteractionLocked || chatDeleteReviewOpen, notice }}
+      actions={{ navigation: { selectTab: (item) => {
+        if (busyLock.current || chatInteractionLock.current || chatDeleteReviewOpen) return;
+        setTab(item);
+      } }, settings: { open: openSettings } }}
+    >
           {!isIsolatedDemo && resources ? <ProviderCleanupNotice registry={platform.privacy.providerCleanup} scope="all" /> : null}
           {isIsolatedDemo ? (
             <View style={s.notice}>
@@ -3573,7 +3381,7 @@ export function WorkspaceView({ controller, credentials, platform, workspaceGene
                 }
               />
             ) : detail ? (
-              <NoteDetailView
+              <WorkspaceModals
                 key={`${detail.id}:${detail.revision}`}
                 note={activeDetailNote ?? detail}
                 recordingAvailable={Boolean((activeDetailNote ?? detail).audioUri)}
@@ -3864,36 +3672,23 @@ export function WorkspaceView({ controller, credentials, platform, workspaceGene
                 onReviewMemorySuggestion={openChatMemorySuggestion}
               />
             ) : tab === "record" ? (
-              <RecordScreen
-                audio={audio}
+              <RecordWorkspaceContent
+                audio={{ status: audio.status, canResume: audio.canResume, statusLabel: audio.statusLabel, durationSeconds: audio.durationSeconds, meter: audio.meter, hasPending: audio.hasPending }}
+                recording={isIsolatedDemo ? { available: false, reason: "Sample preview keeps microphone access off." } : Platform.OS !== "web" && !captureJournal ? { available: false, reason: "Recording recovery is not connected in this workspace." } : { available: true, action: {
+                  start: () => void run(async () => { await audio.start(); }), pause: () => void run(async () => { await audio.pause(); }),
+                  resume: () => void run(async () => { await audio.resume(); }), stop: () => { void run(saveRecording); }, cancel: confirmCancel,
+                  startDisabled: Boolean(captureJournal && (pendingCaptureLoading || !pendingCaptureStatus || pendingCaptureStatus.kind !== "empty")),
+                  savePendingDisabled: Boolean(captureJournal && (pendingCaptureLoading || !pendingCaptureStatus || pendingCaptureStatus.kind !== "empty")),
+                } }}
+                recovery={captureJournal && !isIsolatedDemo ? { available: true, action: { status: pendingCaptureStatus, loading: pendingCaptureLoading, busy: busy || pendingCaptureBusy, error: pendingCaptureError,
+                  actions: { refresh: () => void run(refreshPendingCaptureStatus), inspect: inspectPendingCapture, save: savePendingFromPanel, export: exportPendingCapture, discard: discardPendingCapture, retryCleanup: retryPendingCaptureCleanup } } }
+                  : { available: false, reason: isIsolatedDemo ? "Sample preview does not inspect saved microphone data." : "Recording recovery is not connected in this workspace." }}
                 busy={busy}
-                demoMode={isIsolatedDemo}
-                startDisabled={Boolean((Platform.OS !== "web" && !captureJournal) || (captureJournal && (pendingCaptureLoading || !pendingCaptureStatus || pendingCaptureStatus.kind !== "empty")))}
-                recoveryStatus={captureJournal ? pendingCaptureStatus : Platform.OS !== "web" ? { kind: "blocked", reason: "unsupported" } : null}
-                recoveryLoading={Boolean(captureJournal && pendingCaptureLoading)}
-                recoveryBusy={busy || pendingCaptureBusy}
-                recoveryError={pendingCaptureError}
-                onRefreshRecovery={() => void run(refreshPendingCaptureStatus)}
-                onInspectRecovery={inspectPendingCapture}
-                onSaveRecovery={savePendingFromPanel}
-                onExportRecovery={exportPendingCapture}
-                onDiscardRecovery={discardPendingCapture}
-                onRetryRecoveryCleanup={retryPendingCaptureCleanup}
-                recent={notes.slice(0, 3)}
-                onOpen={openNote}
+                recent={notes.slice(0, 3).map((note) => workspaceNoteCardDisplay({ ...note, recordingAvailable: Boolean(note.audioUri) }))}
+                onOpenNote={(id, revision) => { const current = state.notes.find((note) => note.id === id && note.revision === revision); if (current) openNote(current); }}
                 onSeeAll={() => setTab("library")}
                 onWrite={() => setManualOpen(true)}
-                onStart={() =>
-                  isIsolatedDemo
-                    ? setNotice(
-                        "Microphone recording is disabled in the sample preview.",
-                      )
-                    : void run(async () => { await audio.start(); })
-                }
-                onPause={() => void run(async () => { await audio.pause(); })}
-                onResume={() => void run(async () => { await audio.resume(); })}
-                onStop={() => run(saveRecording)}
-                onCancel={confirmCancel}
+                unavailableTitle={isIsolatedDemo ? "Recording disabled" : "Recording unavailable"}
               />
             ) : tab === "inbox" ? (
               <>
@@ -3903,26 +3698,29 @@ export function WorkspaceView({ controller, credentials, platform, workspaceGene
                     <Button label="View all actions" tone="quiet" onPress={() => setChatActionFilterNoteId(undefined)} />
                   </View>
                 ) : null}
-                <InboxScreen
-                proposals={proposals}
-                accounts={state.accounts}
+                <InboxWorkspaceContent
+                proposals={proposals.map(workspaceProposalCardDisplay)}
+                accounts={state.accounts.map(inboxAccountDisplay)}
                 mailbox={state.mailbox}
-                deviceCalendars={state.deviceCalendars}
+                deviceCalendars={inboxDeviceCalendarDisplay(state.deviceCalendars)}
                 deviceCalendarAccess={state.deviceCalendarAccess.status}
-                onReplyMessage={openMailReply}
+                onReplyMessage={{ available: true, action: openMailReply }}
                 proactive={state.proactive}
                 filter={inboxFilter}
                 setFilter={setInboxFilter}
                 mode={state.settings.mode}
-                onOpen={(proposal) => void openProposal(proposal)}
+                onOpen={{ available: true, action: (proposalId, expectedRevision) => {
+                  const proposal = proposals.find((item) => item.id === proposalId && item.revision === expectedRevision);
+                  if (proposal) void openProposal(proposal);
+                } }}
                 busy={busy}
-                onDismissCandidate={(candidateId) =>
+                onDismissCandidate={{ available: true, action: (candidateId) =>
                   void run(async () => {
                     await controller.dismissProactiveCandidate(candidateId);
                     setNotice("Attention item dismissed.");
                   })
-                }
-                onSnoozeCandidate={(candidateId, until) =>
+                }}
+                onSnoozeCandidate={{ available: true, action: (candidateId, until) =>
                   void run(async () => {
                     await controller.snoozeProactiveCandidate(
                       candidateId,
@@ -3930,23 +3728,27 @@ export function WorkspaceView({ controller, credentials, platform, workspaceGene
                     );
                     setNotice("Attention item snoozed.");
                   })
-                }
-                onRemindCandidate={(candidateId) => void createReminder(candidateId)}
-                onGetCandidateSource={(candidateId) =>
-                  controller.getProactiveCandidateSource(candidateId)
-                }
+                }}
+                onRemindCandidate={{ available: true, action: (candidateId) => void createReminder(candidateId) }}
+                onGetCandidateSource={{ available: true, action: (candidateId) => controller.getProactiveCandidateSource(candidateId) }}
+                chatActionFilterNoteId={chatActionFilterNoteId}
+                onClearChatFilter={() => setChatActionFilterNoteId(undefined)}
                 />
               </>
             ) : (
               <LibraryScreen
-                notes={filteredNotes}
+                notes={filteredNotes.map((note) => workspaceNoteCardDisplay({ ...note, recordingAvailable: Boolean(note.audioUri) }))}
                 query={query}
                 setQuery={setQuery}
                 docs={state.documents}
                 tasks={state.tasks}
                 busy={busy}
-                controller={controller}
-                chooseBackup={() => platform.files.chooseBackup()}
+                archiveActions={{
+                  importedKnowledge: { available: true, action: controller },
+                  documents: { available: true, action: controller },
+                  backupImport: { available: true, action: { controller, chooseBackup: () => platform.files.chooseBackup() } },
+                  importedChat: { available: true, action: controller },
+                }}
                 importedBackups={state.importedBackups}
                 archiveActionsBlocked={!startupReady || loading || isolatedPreviewFailed || privacyReviewOpen || privacyOutcomeUnknown ||
                   Boolean(state.mailAlertRefreshRequired || state.proactive.integrityError || state.assistantChatRecoveryStatus || state.assistantBatchRecoveryStatus ||
@@ -3963,41 +3765,49 @@ export function WorkspaceView({ controller, credentials, platform, workspaceGene
                 previewMode={isIsolatedDemo}
                 sampleBackupMode={isBackupImportDemo}
                 knowledgeDemoMode={isKnowledgeDemo}
-                reminderRecords={state.reminders.records}
-                reminderIntents={state.reminders.intents}
+                reminderRecords={state.reminders.records.map(toReminderDisplayRecord)}
+                reminderAlerts={Object.fromEntries(state.reminders.records.map((record) => [record.id, deriveReminderAlertDisplay(record, state.reminders.intents, reminderAlertChannel, isReminderDemo)]))}
                 reminderRecoveryStatus={state.reminderRecoveryStatus}
                 reminderDemoMode={isReminderDemo}
                 reminderAlertChannel={reminderAlertChannel}
-                onCreateReminder={() => void createReminder()}
-                onOpenReminder={(id, expectedRevision) => {
-                  const current = state.reminders.records.find((item) => item.id === id && item.revision === expectedRevision);
-                  if (current) openReminder(current);
-                }}
-                onRetryReminder={(id, expectedRevision) => run(() => controller.retryReminderAlert(id, { expectedRevision }))}
-                onDoneReminder={(id, expectedRevision) => run(() => controller.completeReminder(id, { expectedRevision }))}
-                onCancelReminder={(id, expectedRevision) => run(() => controller.cancelReminder(id, { expectedRevision }))}
-                onDeleteReminder={(id, expectedRevision) => run(() => controller.deleteReminder(id, { expectedRevision }))}
-                onComplete={(id) =>
+                reminderActions={{ available: true, action: {
+                  create: () => void createReminder(),
+                  open: (id, expectedRevision) => {
+                    const current = state.reminders.records.find((item) => item.id === id && item.revision === expectedRevision);
+                    if (current) openReminder(current);
+                  },
+                  retry: (id, expectedRevision) => run(() => controller.retryReminderAlert(id, { expectedRevision })),
+                  done: (id, expectedRevision) => run(() => controller.completeReminder(id, { expectedRevision })),
+                  cancel: (id, expectedRevision) => run(() => controller.cancelReminder(id, { expectedRevision })),
+                  delete: (id, expectedRevision) => run(() => controller.deleteReminder(id, { expectedRevision })),
+                }}}
+                onComplete={{ available: true, action: (id) =>
                   run(async () => {
                     await controller.completeTask(id);
                     setNotice("Task marked complete.");
                   })
-                }
-                onReopen={(id) =>
+                }}
+                onReopen={{ available: true, action: (id) =>
                   run(async () => {
                     await controller.reopenTask(id);
                     setNotice("Task reopened.");
                   })
-                }
-                onOpenNote={openNote}
-                onSavePerson={(input) => run(() => controller.savePerson({ ...input, aliases: [...input.aliases] }))}
-                onSaveProject={(input) => run(() => controller.saveProject({ ...input, aliases: [...input.aliases] }))}
-                onSetKnowledgeArchived={(input) => run(() => controller.setKnowledgeEntityArchived(input))}
-                onSaveKnowledgeFact={(input) => run(() => controller.saveKnowledgeFact(input))}
-                onRemoveKnowledgeFact={(input) => run(async () => { await controller.removeKnowledgeFact(input); return true; })}
-                onSaveKnowledgeContact={(input) => run(() => controller.saveKnowledgeContact(input))}
-                onRemoveKnowledgeContact={(input) => run(async () => { await controller.removeKnowledgeContact(input); return true; })}
-                onSaveKnowledgeSourceLink={(input) => {
+                }}
+                onOpenNote={(id, expectedRevision) => {
+                  const current = state.notes.find((note) => note.id === id && note.revision === expectedRevision);
+                  if (current) openNote(current);
+                }}
+                knowledgeEntityActions={{ available: true, action: {
+                  archive: (kind, id, expectedRevision, archived) => {
+                    void run(() => controller.setKnowledgeEntityArchived({ kind, id, expectedRevision, archived }));
+                  },
+                  savePerson: (input) => run(() => controller.savePerson({ ...input, aliases: [...input.aliases] })),
+                  saveProject: (input) => run(() => controller.saveProject({ ...input, aliases: [...input.aliases] })),
+                  saveFact: (input) => run(() => controller.saveKnowledgeFact(input)),
+                  removeFact: (input) => run(async () => { await controller.removeKnowledgeFact(input); return true; }),
+                  saveContact: (input) => run(() => controller.saveKnowledgeContact(input)),
+                  removeContact: (input) => run(async () => { await controller.removeKnowledgeContact(input); return true; }),
+                  saveSourceLink: (input) => {
                   const entity = input.entityKind === 'person'
                     ? state.knowledge.people.find((item) => item.id === input.entityId && item.revision === input.expectedEntityRevision)
                     : state.knowledge.projects.find((item) => item.id === input.entityId && item.revision === input.expectedEntityRevision);
@@ -4006,12 +3816,14 @@ export function WorkspaceView({ controller, credentials, platform, workspaceGene
                   const { referenceChoiceId: _referenceChoiceId, ...command } = input;
                   if (!entity || (input.itemId && !existing) || !selectedReference) return Promise.resolve(undefined);
                   return run(() => controller.saveKnowledgeSourceLink({ ...command, reference: selectedReference }));
-                }}
-                onRemoveKnowledgeSourceLink={(input) => run(async () => { await controller.removeKnowledgeSourceLink(input); return true; })}
-                onSaveKnowledgeMember={(input) => run(() => controller.saveKnowledgeMember(input))}
-                onRemoveKnowledgeMember={(input) => run(async () => { await controller.removeKnowledgeMember(input); return true; })}
-                onReviewKnowledgeSuggestion={(id, input) => run(() => controller.reviewKnowledgeSuggestion(id, input))}
-                onEditKnowledgeSuggestion={async (id, input) => {
+                  },
+                  removeSourceLink: (input) => run(async () => { await controller.removeKnowledgeSourceLink(input); return true; }),
+                  saveMember: (input) => run(() => controller.saveKnowledgeMember(input)),
+                  removeMember: (input) => run(async () => { await controller.removeKnowledgeMember(input); return true; }),
+                }}}
+                knowledgeSuggestionActions={{ available: true, action: {
+                  review: (id, input) => run(() => controller.reviewKnowledgeSuggestion(id, input)),
+                  edit: async (id, input) => {
                   const current = state.knowledge.suggestions.find((item) => item.id === id && item.revision === input.expectedRevision);
                   if (!current || current.status !== 'pending' || current.change.type !== input.change.type) return undefined;
                   let change: KnowledgeChange;
@@ -4028,17 +3840,20 @@ export function WorkspaceView({ controller, credentials, platform, workspaceGene
                   } else change = { ...input.change };
                   const result = await run(() => controller.editKnowledgeSuggestion(id, { expectedRevision: input.expectedRevision, change, evidence: input.evidence.map((item) => ({ ...item })) }));
                   return result ? projectKnowledgeSuggestionDisplay(result) : undefined;
-                }}
-                onPrepareKnowledgeSuggestionReview={prepareKnowledgeSuggestionReview}
+                  },
+                  prepare: prepareKnowledgeSuggestionReview,
+                }}}
                 onRun={(action) => run(action)}
-                onOpenDoc={(d) => {
+                documentActions={{ available: true, action: (d) => {
                   const existing = state.documents.find(
                     (x) => x.path === d.path,
                   );
                   setDoc(existing ?? d);
                   setDocDraft(existing?.content ?? d.content);
-                }}
-                onExport={() => {
+                }}}
+                onExport={isIsolatedDemo && !isBackupImportDemo
+                  ? { available: false, reason: "Export is disabled in this sample preview." }
+                  : { available: true, action: () => {
                   if (isIsolatedDemo && !isBackupImportDemo) return;
                   void run(async () => {
                     const data = await controller.exportData();
@@ -4049,48 +3864,10 @@ export function WorkspaceView({ controller, credentials, platform, workspaceGene
                       await privacy.withWriter(session.epoch, { kind: "internal_export", namespace: "internal_export" }, exportAndShare);
                     } else await exportAndShare();
                   });
-                }}
+                } }}
               />
             )}
           </View>
-          {!detail && !manualOpen && !settingsOpen && !chatInteractionLocked && (
-            <View style={s.tabBar} accessibilityRole="tablist">
-              {(["inbox", "record", "chat", "library"] as Tab[]).map((item) => (
-                <Pressable
-                  key={item}
-                  accessibilityRole="tab"
-                  accessibilityLabel={`${item[0].toUpperCase() + item.slice(1)} tab`}
-                  accessibilityState={{ selected: tab === item }}
-                  disabled={busy || chatInteractionLocked || chatDeleteReviewOpen}
-                  onPress={() => {
-                    if (busyLock.current || chatInteractionLock.current || chatDeleteReviewOpen) return;
-                    setTab(item);
-                  }}
-                  style={s.tab}
-                >
-                  <Ionicons
-                    accessible={false}
-                    importantForAccessibility="no"
-                    name={
-                      item === "inbox"
-                        ? "file-tray-outline"
-                        : item === "record"
-                          ? "mic-outline"
-                          : item === "chat"
-                            ? "chatbubble-outline"
-                            : "book-outline"
-                    }
-                    size={19}
-                    color={tab === item ? C.text : C.muted}
-                  />
-                  <Text style={[s.tabLabel, tab === item && s.tabSelected]}>
-                    {item[0].toUpperCase() + item.slice(1)}
-                  </Text>
-                </Pressable>
-              ))}
-            </View>
-          )}
-        </View>
         <Modal
           visible={settingsOpen}
           animationType="slide"
@@ -4539,8 +4316,7 @@ export function WorkspaceView({ controller, credentials, platform, workspaceGene
             />
           </SafeAreaView>
         </Modal>
-      </SafeAreaView>
-    </SafeAreaProvider>
+    </WorkspaceScreen>
   );
 }
 
@@ -4687,858 +4463,6 @@ export function BackgroundRefreshPreview() {
         </ScrollView>
       </SafeAreaView>
     </SafeAreaProvider>
-  );
-}
-
-function RecordScreen({
-  audio,
-  busy,
-  demoMode,
-  startDisabled,
-  recoveryStatus,
-  recoveryLoading,
-  recoveryBusy,
-  recoveryError,
-  onRefreshRecovery,
-  onInspectRecovery,
-  onSaveRecovery,
-  onExportRecovery,
-  onDiscardRecovery,
-  onRetryRecoveryCleanup,
-  recent,
-  onOpen,
-  onSeeAll,
-  onWrite,
-  onStart,
-  onPause,
-  onResume,
-  onStop,
-  onCancel,
-}: {
-  audio: AudioCapture;
-  busy: boolean;
-  demoMode: boolean;
-  startDisabled: boolean;
-  recoveryStatus: PendingCaptureSafeStatus | null;
-  recoveryLoading: boolean;
-  recoveryBusy: boolean;
-  recoveryError: string;
-  onRefreshRecovery: () => void;
-  onInspectRecovery: (receipt: PendingCaptureReceipt) => void;
-  onSaveRecovery: (receipt: PendingCaptureReceipt) => void;
-  onExportRecovery: (receipt: PendingCaptureReceipt) => void;
-  onDiscardRecovery: (receipt?: PendingCaptureReceipt) => void;
-  onRetryRecoveryCleanup: () => void;
-  recent: Note[];
-  onOpen: (n: Note) => void;
-  onSeeAll: () => void;
-  onWrite: () => void;
-  onStart: () => void;
-  onPause: () => void;
-  onResume: () => void;
-  onStop: () => void;
-  onCancel: () => void;
-}) {
-  const recording = audio.status === "recording" || audio.status === "paused";
-  return (
-    <ScrollView
-      contentContainerStyle={s.scroll}
-      showsVerticalScrollIndicator={false}
-    >
-      <Text style={s.kicker}>RECORD</Text>
-      <Text style={s.h1}>Make space{"\n"}for a thought.</Text>
-      <Text style={s.intro}>
-        Capture it first. Decide what to do with it later.
-      </Text>
-      <View style={s.recorder}>
-        {demoMode ? (
-          <>
-            <View style={[s.micOuter, { opacity: 0.45 }]}>
-              <View style={s.micInner}>
-                <Ionicons
-                  accessible={false}
-                  name="mic-off-outline"
-                  size={28}
-                  color={C.bg}
-                />
-              </View>
-            </View>
-            <Text style={s.micTitle}>Recording disabled</Text>
-            <Text style={s.micSub}>
-              Sample preview keeps microphone access off.
-            </Text>
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel="Write a note instead"
-              onPress={onWrite}
-              disabled={busy}
-              style={s.writeInstead}
-            >
-              <Ionicons
-                accessible={false}
-                name="create-outline"
-                size={16}
-                color={C.text}
-              />
-              <Text style={s.writeText}>Write a note instead</Text>
-            </Pressable>
-          </>
-        ) : recording ? (
-          <>
-            <View style={s.liveRow}>
-              <View
-                style={[s.liveDot, audio.status === "paused" && s.pausedDot]}
-              />
-              <Text style={s.liveText}>
-                {audio.statusLabel ?? (audio.status === "paused" ? "Paused" : "Recording")} ·{" "}
-                {formatTime(audio.durationSeconds)}
-              </Text>
-            </View>
-            <View style={s.wave} accessibilityLabel="Audio level meter">
-              {audio.meter.map((v, i) => (
-                <View key={i} style={[s.waveBar, { height: 7 + v * 29 }]} />
-              ))}
-            </View>
-            <View style={s.recordControls}>
-              <Button
-                label={audio.status === "paused" ? "Resume" : "Pause"}
-                tone="quiet"
-                disabled={busy || (audio.status === "paused" && !audio.canResume)}
-                onPress={audio.status === "paused" ? onResume : onPause}
-                icon={audio.status === "paused" ? "play" : "pause"}
-              />
-              <Pressable
-                accessibilityRole="button"
-                accessibilityLabel="Stop and save recording"
-                disabled={busy}
-                onPress={onStop}
-                style={s.stopButton}
-              >
-                <View style={s.stopSquare} />
-              </Pressable>
-              <Button
-                label="Discard"
-                tone="danger"
-                disabled={busy}
-                onPress={onCancel}
-                icon="trash-outline"
-              />
-            </View>
-          </>
-        ) : recoveryLoading || (recoveryStatus && recoveryStatus.kind !== "empty") ? (
-          <PendingRecordingRecoveryPanel
-            status={recoveryStatus}
-            loading={recoveryLoading}
-            busy={recoveryBusy}
-            error={recoveryError}
-            onRefresh={onRefreshRecovery}
-            onInspect={onInspectRecovery}
-            onSave={onSaveRecovery}
-            onExport={onExportRecovery}
-            onDiscard={onDiscardRecovery}
-            onRetryCleanup={onRetryRecoveryCleanup}
-          />
-        ) : audio.hasPending ? (
-          <>
-            <Ionicons name="save-outline" size={29} color={C.sage} />
-            <Text style={s.micTitle}>Recording ready to save</Text>
-            <Text style={s.micSub}>
-              The audio is preserved. Retry if storage was unavailable.
-            </Text>
-            <Button
-              label={busy ? "Saving…" : "Save recording"}
-              disabled={busy || startDisabled}
-              onPress={onStop}
-              icon="save-outline"
-            />
-            <Button
-              label="Discard recording"
-              tone="danger"
-              disabled={busy}
-              onPress={onCancel}
-              icon="trash-outline"
-            />
-          </>
-        ) : (
-          <>
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel="Start recording a voice note"
-              disabled={busy}
-              onPress={onStart}
-              style={s.micOuter}
-            >
-              <View style={s.micInner}>
-                <Ionicons
-                  accessible={false}
-                  name="mic"
-                  size={30}
-                  color={C.bg}
-                />
-              </View>
-            </Pressable>
-            <Text style={s.micTitle}>Tap to record</Text>
-            <Text style={s.micSub}>Nothing starts until you choose.</Text>
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel="Write a note instead"
-              onPress={onWrite}
-              disabled={busy}
-              style={s.writeInstead}
-            >
-              <Ionicons
-                accessible={false}
-                name="create-outline"
-                size={16}
-                color={C.text}
-              />
-              <Text style={s.writeText}>Write a note instead</Text>
-            </Pressable>
-          </>
-        )}
-      </View>
-      <View style={s.localHint}>
-        <Ionicons name="lock-closed-outline" size={15} color={C.sage} />
-        <Text style={s.localHintText}>
-          Your recording is saved locally before any optional processing.
-        </Text>
-      </View>
-      <View style={s.sectionHeader}>
-        <Text style={s.sectionTitle}>Recent notes</Text>
-        <Pressable accessibilityRole="button" onPress={onSeeAll}>
-          <Text style={s.seeAll}>See all</Text>
-        </Pressable>
-      </View>
-      {recent.length ? (
-        recent.map((n) => (
-          <NoteCard key={n.id} note={n} onPress={() => onOpen(n)} />
-        ))
-      ) : (
-        <View style={s.emptySmall}>
-          <Text style={s.emptyTitle}>A little room to begin.</Text>
-          <Text style={s.emptyText}>
-            Your recordings and handwritten notes will live here.
-          </Text>
-        </View>
-      )}
-    </ScrollView>
-  );
-}
-
-function ManualNoteComposer({
-  onCancel,
-  onSave,
-}: {
-  onCancel: () => void;
-  onSave: (text: string) => void;
-}) {
-  const [text, setText] = useState("");
-  return (
-    <KeyboardAvoidingView
-      style={{ flex: 1 }}
-      behavior={Platform.OS === "ios" ? "padding" : undefined}
-    >
-      <ScrollView
-        contentContainerStyle={s.scroll}
-        showsVerticalScrollIndicator={false}
-      >
-        <View style={s.modalHeader}>
-          <IconButton
-            name="chevron-back"
-            label="Back to Record"
-            onPress={onCancel}
-          />
-          <Text style={s.modalTitle}>Write a note</Text>
-          <View style={{ width: 46 }} />
-        </View>
-        <Text style={s.kicker}>LOCAL NOTE</Text>
-        <Text style={s.h1Small}>Put it into words.</Text>
-        <Text style={s.intro}>
-          Saved on this device. Nothing is transcribed or processed until you
-          choose.
-        </Text>
-        <Field
-          label="Your note"
-          multiline
-          value={text}
-          onChangeText={setText}
-          placeholder="What would you like to remember?"
-        />
-        <Button
-          label="Save note"
-          disabled={!text.trim()}
-          onPress={() => onSave(text)}
-        />
-        <Button label="Cancel" tone="quiet" onPress={onCancel} />
-      </ScrollView>
-    </KeyboardAvoidingView>
-  );
-}
-
-function InboxScreen({
-  proposals,
-  accounts,
-  mailbox,
-  deviceCalendars,
-  deviceCalendarAccess,
-  onReplyMessage,
-  proactive,
-  filter,
-  setFilter,
-  mode,
-  onOpen,
-  busy,
-  onDismissCandidate,
-  onSnoozeCandidate,
-  onRemindCandidate,
-  onGetCandidateSource,
-}: {
-  proposals: Proposal[];
-  accounts: AppState["accounts"];
-  mailbox: MailboxSnapshotMessage[];
-  deviceCalendars: AppState["deviceCalendars"];
-  deviceCalendarAccess: AppState["deviceCalendarAccess"]["status"];
-  onReplyMessage: (messageId: string) => void;
-  proactive: ProactiveState;
-  filter: "pending" | "done";
-  setFilter: (v: "pending" | "done") => void;
-  mode: AppSettings["mode"];
-  onOpen: (p: Proposal) => void;
-  busy: boolean;
-  onDismissCandidate: (candidateId: string) => void;
-  onSnoozeCandidate: (candidateId: string, until: string) => void;
-  onRemindCandidate: (candidateId: string) => void;
-  onGetCandidateSource: AppController["getProactiveCandidateSource"];
-}) {
-  return (
-    <ScrollView
-      contentContainerStyle={s.scroll}
-      showsVerticalScrollIndicator={false}
-    >
-      <Text style={s.kicker}>INBOX</Text>
-      <Text style={s.h1}>Review, when ready.</Text>
-      <Text style={s.intro}>
-        Messages and calendar changes wait for your approval.
-      </Text>
-      {mode === "preview" ? (
-        <View style={s.previewBadge}>
-          <Ionicons
-            accessible={false}
-            name="sparkles-outline"
-            size={14}
-            color={C.sage}
-          />
-          <Text style={s.previewText}>Local preview · AI not connected</Text>
-        </View>
-      ) : null}
-      <View style={s.segment}>
-        {(["pending", "done"] as const).map((v) => (
-          <Pressable
-            key={v}
-            accessibilityRole="tab"
-            accessibilityLabel={
-              v === "pending" ? "To review proposals" : "Saved actions"
-            }
-            accessibilityState={{ selected: filter === v }}
-            onPress={() => setFilter(v)}
-            style={[s.segmentOption, filter === v && s.segmentSelected]}
-          >
-            <Text
-              style={[s.segmentText, filter === v && s.segmentTextSelected]}
-            >
-              {v === "pending" ? "To review" : "Saved actions"}
-            </Text>
-          </Pressable>
-        ))}
-      </View>
-      {proposals.length ? (
-        proposals.map((p) => (
-          <ProposalCard
-            key={p.id}
-            proposal={p}
-            accounts={accounts}
-            onPress={() => onOpen(p)}
-          />
-        ))
-      ) : (
-        <View style={s.empty}>
-          <Ionicons
-            accessible={false}
-            name="checkmark-circle-outline"
-            size={28}
-            color={C.sage}
-          />
-          <Text style={s.emptyTitle}>
-            {filter === "pending" ? "All caught up." : "Nothing here yet."}
-          </Text>
-          <Text style={s.emptyText}>
-            {filter === "pending"
-              ? "Saved transcripts with possible next steps will appear here as editable drafts."
-              : "Saved action receipts and dismissed proposals will appear here. Tasks have their own open/completed list in Library."}
-          </Text>
-        </View>
-      )}
-      <ProactiveCandidatesSection
-        proactive={proactive}
-        accounts={accounts}
-        deviceCalendars={deviceCalendars}
-        deviceCalendarAccess={deviceCalendarAccess}
-        busy={busy}
-        onDismiss={onDismissCandidate}
-        onSnooze={onSnoozeCandidate}
-        onRemind={onRemindCandidate}
-        onGetSource={onGetCandidateSource}
-      />
-      <MailboxSection
-        messages={mailbox}
-        accounts={accounts}
-        onReply={onReplyMessage}
-      />
-    </ScrollView>
-  );
-}
-
-function LibraryScreen({
-  notes,
-  query,
-  setQuery,
-  docs,
-  tasks,
-  busy,
-  controller,
-  chooseBackup,
-  importedBackups,
-  archiveActionsBlocked,
-  knowledge,
-  knowledgeRecoveryStatus,
-  references,
-  evidenceLabels,
-  chatEvidenceLabels,
-  memoryReviewBlocked,
-  memoryReviewRequest,
-  onMemoryReviewRequestHandled,
-  previewMode,
-  sampleBackupMode,
-  knowledgeDemoMode,
-  reminderRecords,
-  reminderIntents,
-  reminderRecoveryStatus,
-  reminderDemoMode,
-  reminderAlertChannel,
-  onCreateReminder,
-  onOpenReminder,
-  onRetryReminder,
-  onDoneReminder,
-  onCancelReminder,
-  onDeleteReminder,
-  onComplete,
-  onReopen,
-  onOpenNote,
-  onOpenDoc,
-  onExport,
-  onSavePerson,
-  onSaveProject,
-  onSetKnowledgeArchived,
-  onSaveKnowledgeFact,
-  onRemoveKnowledgeFact,
-  onSaveKnowledgeContact,
-  onRemoveKnowledgeContact,
-  onSaveKnowledgeSourceLink,
-  onRemoveKnowledgeSourceLink,
-  onSaveKnowledgeMember,
-  onRemoveKnowledgeMember,
-  onReviewKnowledgeSuggestion,
-  onEditKnowledgeSuggestion,
-  onPrepareKnowledgeSuggestionReview,
-  onRun,
-}: {
-  notes: Note[];
-  query: string;
-  setQuery: (v: string) => void;
-  docs: ContextDocument[];
-  tasks: LocalTask[];
-  busy: boolean;
-  controller: AppController;
-  chooseBackup: () => Promise<PickedBackupFile | null>;
-  importedBackups: AppState["importedBackups"];
-  archiveActionsBlocked: boolean;
-  knowledge: KnowledgeDisplay;
-  knowledgeRecoveryStatus?: AppState["knowledgeRecoveryStatus"];
-  references: readonly KnowledgeSourceChoiceDisplay[];
-  evidenceLabels: Record<string, string>;
-  chatEvidenceLabels: Record<string, string>;
-  memoryReviewBlocked: boolean;
-  memoryReviewRequest?: { suggestionId: string; requestId: number };
-  onMemoryReviewRequestHandled: (requestId: number) => void;
-  previewMode: boolean;
-  sampleBackupMode: boolean;
-  knowledgeDemoMode: boolean;
-  reminderRecords: ReminderRecord[];
-  reminderIntents: ReminderIntent[];
-  reminderRecoveryStatus?: AppState["reminderRecoveryStatus"];
-  reminderDemoMode: boolean;
-  reminderAlertChannel: ReminderAlertChannel;
-  onCreateReminder: () => void;
-  onOpenReminder: (id: string, expectedRevision: number) => void;
-  onRetryReminder: (id: string, expectedRevision: number) => Promise<unknown>;
-  onDoneReminder: (id: string, expectedRevision: number) => Promise<unknown>;
-  onCancelReminder: (id: string, expectedRevision: number) => Promise<unknown>;
-  onDeleteReminder: (id: string, expectedRevision: number) => Promise<unknown>;
-  onComplete: (id: string) => void;
-  onReopen: (id: string) => void;
-  onOpenNote: (n: Note) => void;
-  onOpenDoc: (d: { path: string; content: string }) => void;
-  onExport: () => void;
-  onSavePerson: (input: KnowledgeEntityEditCommand) => Promise<unknown>;
-  onSaveProject: (input: KnowledgeProjectEditCommand) => Promise<unknown>;
-  onSetKnowledgeArchived: (input: { kind: KnowledgeEntityKind; id: string; expectedRevision: number; archived: boolean }) => Promise<unknown>;
-  onSaveKnowledgeFact: (input: SaveKnowledgeFactInput) => Promise<unknown>;
-  onRemoveKnowledgeFact: (input: KnowledgeItemCommand) => Promise<unknown>;
-  onSaveKnowledgeContact: (input: SaveKnowledgeContactInput) => Promise<unknown>;
-  onRemoveKnowledgeContact: (input: KnowledgeItemCommand & { entityKind: 'person' }) => Promise<unknown>;
-  onSaveKnowledgeSourceLink: (input: Omit<SaveKnowledgeSourceLinkInput, 'reference'> & { referenceChoiceId?: string }) => Promise<unknown>;
-  onRemoveKnowledgeSourceLink: (input: KnowledgeItemCommand) => Promise<unknown>;
-  onSaveKnowledgeMember: (input: SaveKnowledgeMemberInput) => Promise<unknown>;
-  onRemoveKnowledgeMember: (input: KnowledgeItemCommand & { entityKind: 'project' }) => Promise<unknown>;
-  onReviewKnowledgeSuggestion: (id: string, input: ReviewKnowledgeSuggestionInput) => Promise<unknown>;
-  onEditKnowledgeSuggestion: (id: string, input: KnowledgeSuggestionEditCommand) => Promise<KnowledgeSuggestionDisplay | undefined>;
-  onPrepareKnowledgeSuggestionReview: (id: string, input: { expectedRevision: number }) => Promise<KnowledgeSuggestionReview>;
-  onRun: <T>(action: () => Promise<T>) => Promise<T | undefined>;
-}) {
-  const [importOpen, setImportOpen] = useState(false);
-  const importedOwnershipRef = useRef(new ImportedKnowledgeActivationOwnership());
-  const importedSelectionRef = useRef<ImportedKnowledgeSelection | null>(null);
-  const importedRuntimeRef = useRef({ controller, blocked: memoryReviewBlocked || archiveActionsBlocked, importedBackups });
-  importedRuntimeRef.current = { controller, blocked: memoryReviewBlocked || archiveActionsBlocked, importedBackups };
-  const [importedReviewState, setImportedReviewState] = useState<{ selection: ImportedKnowledgeSelection | null; preview: ImportedKnowledgePreviewDisplay | null; preparing: boolean; applying: boolean; message: string }>({
-    selection: null, preview: null, preparing: false, applying: false, message: '',
-  });
-  const invalidateImportedReview = useCallback((clearSelection = true) => {
-    importedOwnershipRef.current.invalidate();
-    if (clearSelection) importedSelectionRef.current = null;
-    setImportedReviewState({ selection: clearSelection ? null : importedSelectionRef.current, preview: null, preparing: false, applying: false, message: '' });
-  }, []);
-  const cancelImportedReview = useCallback(() => invalidateImportedReview(), [invalidateImportedReview]);
-  const onImportedSelectionChange = useCallback((selection: ImportedKnowledgeSelection | null) => {
-    importedSelectionRef.current = selection;
-    invalidateImportedReview(false);
-    setImportedReviewState({ selection, preview: null, preparing: false, applying: false, message: '' });
-  }, [invalidateImportedReview]);
-  const prepareImportedKnowledge = useCallback(async (selection: ImportedKnowledgeSelection) => {
-    const runtime = importedRuntimeRef.current;
-    if (busy || runtime.blocked || runtime.controller !== controller || !importedKnowledgeSelectionMatches(importedSelectionRef.current, selection)) return;
-    const archive = runtime.importedBackups.find((item) => item.id === selection.archiveId);
-    const cohort = archive?.archivedKnowledge?.find((item) => item.id === selection.cohortId);
-    const source = selection.kind === 'person'
-      ? cohort?.knowledge.state.people.find((item) => item.id === selection.entityId)
-      : cohort?.knowledge.state.projects.find((item) => item.id === selection.entityId);
-    if (!source) return;
-    const claim = importedOwnershipRef.current.claimPrepare(selection, controller);
-    if (!claim) return;
-    const { owner } = claim;
-    setImportedReviewState({ selection, preview: null, preparing: true, applying: false, message: '' });
-    try {
-      const prepared = await onRun(() => owner.controller.prepareImportedKnowledgeActivation({ archiveId: selection.archiveId, cohortId: selection.cohortId, kind: selection.kind, entityId: selection.entityId }));
-      if (!prepared) return;
-      const currentRuntime = importedRuntimeRef.current;
-      if (!attachImportedKnowledgePreviewForRuntime(importedOwnershipRef.current, owner, selection, prepared, currentRuntime, importedSelectionRef.current)) return;
-      setImportedReviewState({ selection, preview: projectImportedKnowledgePreview(prepared), preparing: false, applying: false, message: '' });
-    } catch (error) {
-      const currentRuntime = importedRuntimeRef.current;
-      if (importedKnowledgeOwnerMatchesRuntime(importedOwnershipRef.current, owner, selection, currentRuntime) && importedKnowledgeSelectionMatches(importedSelectionRef.current, selection)) {
-        setImportedReviewState({ selection, preview: null, preparing: false, applying: false, message: error instanceof Error ? error.message : 'Could not prepare this imported copy. Try again.' });
-      }
-    } finally {
-      importedOwnershipRef.current.release(claim);
-      if (importedOwnershipRef.current.current() === owner) setImportedReviewState((current) => current.selection && importedKnowledgeSelectionMatches(current.selection, selection)
-        ? { ...current, preparing: false } : current);
-    }
-  }, [busy, controller, onRun]);
-  const activateImportedKnowledge = useCallback(async (selection: ImportedKnowledgeSelection, confirmed: true) => {
-    const runtime = importedRuntimeRef.current;
-    if (!confirmed || busy || runtime.blocked || runtime.controller !== controller || !importedKnowledgeSelectionMatches(importedSelectionRef.current, selection)) return;
-    const claim = importedOwnershipRef.current.claimActivation(selection, runtime.controller);
-    if (!claim) return;
-    const { owner, credentials } = claim;
-    setImportedReviewState((current) => ({ ...current, applying: true, message: '' }));
-    try {
-      const result = await onRun(() => owner.controller.activateImportedKnowledgeEntity(credentials));
-      const currentRuntime = importedRuntimeRef.current;
-      if (!importedKnowledgeOwnerMatchesRuntime(importedOwnershipRef.current, owner, selection, currentRuntime) || !importedKnowledgeSelectionMatches(importedSelectionRef.current, selection)) return;
-      if (result) {
-        owner.sessionId = undefined;
-        setImportedReviewState((current) => current.preview ? { ...current, preview: { ...current.preview, alreadyActivated: true }, applying: false,
-          message: `Added ${result.entity.name} as a separate ${selection.kind}.` } : { ...current, applying: false });
-      } else setImportedReviewState((current) => ({ ...current, applying: false }));
-    } catch (error) {
-      const currentRuntime = importedRuntimeRef.current;
-      if (importedKnowledgeOwnerMatchesRuntime(importedOwnershipRef.current, owner, selection, currentRuntime) && importedKnowledgeSelectionMatches(importedSelectionRef.current, selection)) {
-        setImportedReviewState((current) => ({ ...current, applying: false, message: error instanceof Error ? error.message : 'Could not activate this imported copy.' }));
-      }
-    } finally {
-      importedOwnershipRef.current.release(claim);
-      const currentRuntime = importedRuntimeRef.current;
-      if (importedKnowledgeOwnerMatchesRuntime(importedOwnershipRef.current, owner, selection, currentRuntime) && importedKnowledgeSelectionMatches(importedSelectionRef.current, selection)) {
-        setImportedReviewState((current) => ({ ...current, applying: false }));
-      }
-    }
-  }, [busy, controller, onRun]);
-  useEffect(() => {
-    if (memoryReviewBlocked || archiveActionsBlocked) invalidateImportedReview();
-  }, [archiveActionsBlocked, memoryReviewBlocked, invalidateImportedReview]);
-  useEffect(() => {
-    invalidateImportedReview();
-  }, [controller, importedBackups, invalidateImportedReview]);
-  useEffect(() => () => {
-    importedOwnershipRef.current.invalidate();
-  }, []);
-  const [section, setSection] = useState<'notes' | 'people' | 'projects' | 'memory' | 'reminders'>(() =>
-    memoryReviewRequest ? 'memory' : reminderDemoMode ? 'reminders' : knowledgeDemoMode ? 'memory' : 'notes');
-  const [entityKind, setEntityKind] = useState<'person' | 'project'>('person');
-  const [editingEntityId, setEditingEntityId] = useState<string | null>(null);
-  const [editorInstance, setEditorInstance] = useState(0);
-  const [entitySheetOpen, setEntitySheetOpen] = useState(false);
-  const structuredNarrativePaths = new Set([
-    ...knowledge.people.map((entity) => entity.narrativePath),
-    ...knowledge.projects.map((entity) => entity.narrativePath),
-  ]);
-  const libraryDocuments = docs.filter((document) => !structuredNarrativePaths.has(document.path));
-  const editingEntity = entityKind === 'person'
-    ? knowledge.people.find((entity) => entity.id === editingEntityId)
-    : knowledge.projects.find((entity) => entity.id === editingEntityId);
-  return (
-    <ScrollView
-      contentContainerStyle={s.scroll}
-      showsVerticalScrollIndicator={false}
-    >
-      <Text style={s.kicker}>LIBRARY</Text>
-      <Text style={s.h1}>Your own archive.</Text>
-      <Text style={s.intro}>
-        Voice notes, transcripts, and documents saved on this device.
-      </Text>
-      <View style={s.search}>
-        <Ionicons
-          accessible={false}
-          name="search-outline"
-          size={18}
-          color={C.muted}
-        />
-        <TextInput
-          value={query}
-          onChangeText={setQuery}
-          placeholder="Search your library"
-          placeholderTextColor={C.muted}
-          style={s.searchInput}
-          accessibilityLabel="Search library"
-        />
-      </View>
-      <View style={s.librarySegments} accessibilityRole="tablist">
-        {([['notes', 'Notes'], ['people', 'People'], ['projects', 'Projects'], ['memory', 'Memory'], ['reminders', 'Reminders']] as const).map(([key, label]) => (
-          <Pressable key={key} accessibilityRole="tab" accessibilityLabel={`${label} library section`} accessibilityState={{ selected: section === key }} onPress={() => setSection(key)} style={[s.librarySegment, section === key && s.librarySegmentActive]}>
-            <Text style={[s.librarySegmentText, section === key && s.librarySegmentTextActive]}>{label}</Text>
-          </Pressable>
-        ))}
-      </View>
-      {reminderRecoveryStatus ? <View style={s.analysisStale}><Text style={s.analysisText}>{reminderRecoveryStatus.message}</Text></View> : null}
-      {section === 'reminders' ? <RemindersSection
-        records={reminderRecords.map(toReminderDisplayRecord)}
-        alertDisplays={Object.fromEntries(reminderRecords.map((record) => [record.id, deriveReminderAlertDisplay(record, reminderIntents, reminderAlertChannel, reminderDemoMode)]))}
-        query={query}
-        busy={busy}
-        alertChannel={reminderAlertChannel}
-        demoMode={reminderDemoMode}
-        onAdd={onCreateReminder}
-        onOpen={onOpenReminder}
-        onRetry={(id, expectedRevision) => { void onRetryReminder(id, expectedRevision); }}
-        onDone={(id, expectedRevision) => { void onDoneReminder(id, expectedRevision); }}
-        onCancel={(id, expectedRevision) => { void onCancelReminder(id, expectedRevision); }}
-        onDelete={(id, expectedRevision) => { void onDeleteReminder(id, expectedRevision); }}
-      /> : null}
-      {section === 'notes' ? <>
-      <TasksSection
-        tasks={tasks}
-        busy={busy}
-        onComplete={onComplete}
-        onReopen={onReopen}
-      />
-      <Text style={s.sectionTitle}>Notes</Text>
-      {notes.length ? (
-        notes.map((n) => (
-          <NoteCard key={n.id} note={n} onPress={() => onOpenNote(n)} />
-        ))
-      ) : (
-        <Text style={s.emptyText}>No matching notes.</Text>
-      )}
-      <View style={s.sectionHeader}>
-        <Text style={s.sectionTitle}>Documents</Text>
-        <IconButton
-          name="add"
-          label="Create personal document"
-          onPress={() =>
-            onOpenDoc({ path: newDocumentPath(docs), content: "" })
-          }
-        />
-      </View>
-      {libraryDocuments.length ? (
-        libraryDocuments.map((d) => {
-          const title = friendlyDocumentName(d.path);
-          return (
-            <Pressable
-              key={d.path}
-              accessibilityRole="button"
-              accessibilityLabel={`Open document ${title}`}
-              onPress={() => onOpenDoc(d)}
-              style={s.documentRow}
-            >
-              <Ionicons
-                accessible={false}
-                importantForAccessibility="no"
-                name="document-text-outline"
-                size={18}
-                color={C.muted}
-              />
-              <Text style={s.documentTitle}>{title}</Text>
-              <Ionicons
-                accessible={false}
-                importantForAccessibility="no"
-                name="chevron-forward"
-                size={16}
-                color={C.muted}
-              />
-            </Pressable>
-          );
-        })
-      ) : (
-          <Text style={s.emptyText}>
-          No personal documents yet. Add notes or rules here.
-        </Text>
-      )}
-      <View style={{ height: 10 }} />
-      <Button
-        label="Import a backup"
-        tone="quiet"
-        icon="cloud-download-outline"
-        disabled={busy || (previewMode && !sampleBackupMode)}
-        onPress={() => {
-          if (previewMode && !sampleBackupMode) return;
-          setImportOpen(true);
-        }}
-      />
-      <ImportedBackupsSection
-        archives={importedBackups}
-        currentDocuments={docs}
-        controller={controller}
-        busy={busy}
-        archiveActionsBlocked={archiveActionsBlocked}
-        query={query}
-        onDeleteImportedChatConversation={async (archiveId, conversationId) => {
-          const removed = await onRun(async () => {
-            await controller.deleteImportedChatConversation({ archiveId, conversationId });
-            return true;
-          });
-          return removed === true;
-        }}
-      />
-      <View style={{ height: 10 }} />
-      <Button
-        label={sampleBackupMode ? "Export sample backup" : previewMode ? "Export unavailable in sample mode" : "Export local data"}
-        tone="quiet"
-        icon="download-outline"
-        disabled={previewMode && !sampleBackupMode || busy}
-        onPress={onExport}
-      />
-      <Text style={s.disclaimer}>
-        JSON exports include notes, tasks, Markdown documents, People and
-        Projects, imported knowledge archives, and read-only action history.
-        Accounts, credentials, active approvals, and recordings are not included.
-        Imported knowledge stays archived until you activate a separate copy.
-        Protect exported files as private data.
-      </Text>
-      {sampleBackupMode ? (
-        <Text style={s.disclaimer}>
-          Sample preview uses in-memory data. OAuth, provider keys, microphone capture, and external requests are disabled.
-        </Text>
-      ) : null}
-      </> : section === 'people' || section === 'projects' ? (
-        <KnowledgeSection
-          kind={section === 'people' ? 'person' : 'project'}
-          people={knowledge.people}
-          projects={knowledge.projects}
-          query={query}
-          busy={busy}
-          onCreate={() => { setEntityKind(section === 'people' ? 'person' : 'project'); setEditingEntityId(null); setEditorInstance((value) => value + 1); setEntitySheetOpen(true); }}
-          onOpen={(entity) => { setEntityKind(section === 'people' ? 'person' : 'project'); setEditingEntityId(entity.id); setEditorInstance((value) => value + 1); setEntitySheetOpen(true); }}
-          onArchive={(kind, id, revision, archived) => {
-            void onSetKnowledgeArchived({ kind, id, expectedRevision: revision, archived });
-          }}
-        />
-      ) : section === 'memory' ? (
-        <>
-          {knowledgeRecoveryStatus ? <View style={s.analysisStale}><Text style={s.analysisText}>{knowledgeRecoveryStatus.message}</Text></View> : null}
-          <KnowledgeSuggestionSheet
-            suggestions={knowledge.suggestions}
-            people={knowledge.people}
-            projects={knowledge.projects}
-            sourceLabels={{ ...evidenceLabels, ...chatEvidenceLabels }}
-            busy={busy}
-            blocked={memoryReviewBlocked}
-            openRequest={memoryReviewRequest}
-            onRequestHandled={onMemoryReviewRequestHandled}
-            onPrepareReview={async (id, input) => {
-              const review = await onPrepareKnowledgeSuggestionReview(id, input);
-              return { suggestion: projectKnowledgeSuggestionDisplay(review.suggestion), canEdit: review.canEdit, canAccept: review.canAccept, ...(review.reason ? { reason: review.reason } : {}) };
-            }}
-            onReview={onReviewKnowledgeSuggestion}
-            onEdit={onEditKnowledgeSuggestion}
-          />
-          <ImportedKnowledgeReview
-            archives={projectImportedKnowledgeArchives(importedBackups)}
-            busy={busy}
-            blocked={archiveActionsBlocked || memoryReviewBlocked}
-            preparing={importedReviewState.preparing}
-            applying={importedReviewState.applying}
-            preview={importedReviewState.preview}
-            message={importedReviewState.message}
-            canActivate={Boolean(importedReviewState.selection && importedOwnershipRef.current.current()?.preview && importedOwnershipRef.current.current()?.sessionId && importedOwnershipRef.current.current()?.planHash &&
-              importedKnowledgeSelectionMatches(importedReviewState.selection, importedOwnershipRef.current.current()?.selection) && importedKnowledgeSelectionMatches(importedSelectionRef.current, importedOwnershipRef.current.current()?.selection) &&
-              importedOwnershipRef.current.current()?.controller === controller && !importedOwnershipRef.current.current()?.preview?.alreadyActivated && !busy && !memoryReviewBlocked && !archiveActionsBlocked)}
-            onSelectionChange={onImportedSelectionChange}
-            onPrepare={(selection) => { void prepareImportedKnowledge(selection); }}
-            onActivate={(selection, confirmed) => { void activateImportedKnowledge(selection, confirmed); }}
-            onCancel={cancelImportedReview}
-          />
-        </>
-      ) : null}
-      <BackupImportSheet
-        visible={importOpen}
-        controller={controller}
-        busy={busy}
-        sampleMode={sampleBackupMode}
-        chooseBackup={chooseBackup}
-        onClose={() => setImportOpen(false)}
-      />
-      <KnowledgeEntitySheet
-        key={editorInstance}
-        visible={entitySheetOpen}
-        kind={entityKind}
-        entity={editingEntity}
-        people={knowledge.people}
-        documents={docs}
-        references={references}
-        busy={busy}
-        onClose={() => { setEntitySheetOpen(false); setEditingEntityId(null); }}
-        onSavePerson={onSavePerson}
-        onSaveProject={onSaveProject}
-        onSaveFact={onSaveKnowledgeFact}
-        onRemoveFact={onRemoveKnowledgeFact}
-        onSaveContact={onSaveKnowledgeContact}
-        onRemoveContact={onRemoveKnowledgeContact}
-        onSaveSourceLink={onSaveKnowledgeSourceLink}
-        onRemoveSourceLink={onRemoveKnowledgeSourceLink}
-        onSaveMember={onSaveKnowledgeMember}
-        onRemoveMember={onRemoveKnowledgeMember}
-      />
-    </ScrollView>
   );
 }
 
@@ -6346,26 +5270,6 @@ function sampleTranscriptionErrorNotice(error: unknown) {
   }
   return "Sample transcription did not complete — Azure was not contacted.";
 }
-function localDateTime(iso?: string) {
-  if (!iso) return { date: "", time: "" };
-  const date = new Date(iso);
-  if (!Number.isFinite(date.getTime())) return { date: "", time: "" };
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return {
-    date: `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`,
-    time: `${pad(date.getHours())}:${pad(date.getMinutes())}`,
-  };
-}
-function newDocumentPath(docs: { path: string }[]) {
-  const base = `notes/${localDateTime(new Date().toISOString()).date}`;
-  let suffix = 1;
-  let candidate = `${base}.md`;
-  while (docs.some((doc) => doc.path === candidate)) {
-    suffix += 1;
-    candidate = `${base}-${suffix}.md`;
-  }
-  return candidate;
-}
 export function friendlyDocumentName(path: string) {
   const file = path.split(/[\\/]/).pop() ?? path;
   return file.replace(/\.md$/i, "").replace(/[-_]/g, " ");
@@ -6383,13 +5287,4 @@ function confirmAction(title: string, message: string, onConfirm: () => void) {
     { text: "Cancel", style: "cancel" },
     { text: "Continue", style: "destructive", onPress: onConfirm },
   ]);
-}
-function formatTime(seconds: number) {
-  const m = Math.floor(seconds / 60)
-    .toString()
-    .padStart(2, "0");
-  const s2 = Math.floor(seconds % 60)
-    .toString()
-    .padStart(2, "0");
-  return `${m}:${s2}`;
 }

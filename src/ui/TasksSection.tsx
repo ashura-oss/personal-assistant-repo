@@ -3,6 +3,7 @@ import { Pressable, Text, View } from "react-native";
 import Ionicons from "@expo/vector-icons/Ionicons";
 import type { WorkspaceSnapshotDTO } from "../cloud/workspaceDto";
 import { C, s } from "./theme";
+import type { WorkspaceActionCapability } from "./workspaceCapabilities";
 
 type WorkspaceTask = WorkspaceSnapshotDTO["state"]["tasks"][number];
 type TaskImportDisplay = Pick<NonNullable<WorkspaceTask["importOrigin"]>, "kind">;
@@ -13,8 +14,8 @@ export type TaskDisplay = Pick<WorkspaceTask, "id" | "status" | "title" | "body"
 type Props = {
   tasks: readonly TaskDisplay[];
   busy: boolean;
-  onComplete: (id: string) => void;
-  onReopen: (id: string) => void;
+  onComplete: WorkspaceActionCapability<(id: string) => void>;
+  onReopen: WorkspaceActionCapability<(id: string) => void>;
 };
 
 export function TasksSection({ tasks, busy, onComplete, onReopen }: Props) {
@@ -73,13 +74,11 @@ export function TasksSection({ tasks, busy, onComplete, onReopen }: Props) {
                   ? `Complete ${task.title}`
                   : `Reopen ${task.title}`
               }
-              disabled={busy}
-              onPress={() =>
-                filter === "open" ? onComplete(task.id) : onReopen(task.id)
-              }
+              disabled={busy || !(filter === "open" ? onComplete.available : onReopen.available)}
+              onPress={() => { const action = filter === "open" ? onComplete : onReopen; if (action.available) action.action(task.id); }}
               style={({ pressed }) => [
                 s.iconButton,
-                busy && s.disabled,
+                (busy || !(filter === "open" ? onComplete.available : onReopen.available)) && s.disabled,
                 pressed && !busy && s.pressed,
               ]}
             >
@@ -95,6 +94,7 @@ export function TasksSection({ tasks, busy, onComplete, onReopen }: Props) {
                 color={filter === "open" ? C.sage : C.muted}
               />
             </Pressable>
+            {!onComplete.available && filter === "open" ? <Text style={s.noteSub}>{onComplete.reason}</Text> : !onReopen.available && filter === "completed" ? <Text style={s.noteSub}>{onReopen.reason}</Text> : null}
           </View>
         ))
       ) : (

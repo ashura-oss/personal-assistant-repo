@@ -44,7 +44,7 @@ export function canUseSavedTranscriptInChat(note: Pick<NoteDetailDisplayNote, "t
     note.importOrigin?.originalTimeZoneUnknown !== true && validTimeZone(note.captureTimeZone ?? "");
 }
 
-type Props = {
+export type NoteDetailProps = {
   note: NoteDetailDisplayNote;
   recordingAvailable: boolean;
   importedAudioMissing?: boolean;
@@ -156,7 +156,7 @@ export function NoteDetail({
   onPlay,
   onExportAudio,
   onDelete,
-}: Props) {
+}: NoteDetailProps) {
   const [text, setText] = useState(note.transcript);
   const [importedTimeZone, setImportedTimeZone] = useState(
     Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",

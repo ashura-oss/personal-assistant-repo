@@ -37,11 +37,12 @@ export type ChatSectionProps = {
   onSelectConversation: (conversationId: string) => void;
   onDeleteConversation?: (conversationId: string) => Promise<unknown> | unknown;
   onCreateConversation: () => void;
-  onSend: (text: string, knowledgeSelection?: readonly ChatKnowledgeSelectionBinding[]) => Promise<unknown>;
+  onSend?: (text: string, knowledgeSelection?: readonly ChatKnowledgeSelectionBinding[]) => Promise<unknown>;
+  onSendAttempt?: (attempt: ChatSendAttempt) => Promise<unknown>;
   onInspectUnconfirmedSend?: (attempt: ChatSendAttempt) => Promise<ChatSendInspectionResult>;
-  onOpenActions: (noteId: string) => void;
+  onOpenActions?: (noteId: string) => void;
   onCheckJob: (jobId: string) => Promise<unknown> | unknown;
-  onRetryJobCleanup: (jobId: string) => Promise<unknown> | unknown;
+  onRetryJobCleanup?: (jobId: string) => Promise<unknown> | unknown;
   onRefineTurn?: (request: ChatRefinementRequest) => Promise<unknown>;
   onReviewMemorySuggestion?: (suggestionId: string, conversation: ChatConversation, turn: ChatTurn) => void;
   moreComputeActions?: MoreComputeReviewActions;
@@ -142,6 +143,7 @@ export function ChatSection({
   onDeleteConversation,
   onCreateConversation,
   onSend,
+  onSendAttempt,
   onInspectUnconfirmedSend,
   onOpenActions,
   onCheckJob,
@@ -371,7 +373,9 @@ export function ChatSection({
     notifyInteractionLock(true);
     setSendError(undefined);
     try {
-      const result = capturedKnowledge.length ? await onSend(trimmedDraft, capturedKnowledge) : await onSend(trimmedDraft);
+      const result = onSendAttempt ? await onSendAttempt(attempt)
+        : onSend ? capturedKnowledge.length ? await onSend(trimmedDraft, capturedKnowledge) : await onSend(trimmedDraft)
+          : undefined;
       if (!isAcceptedChatSubmission(result) || result.conversationId !== selectedConversation.id) {
         throw new Error('Submission was not explicitly accepted.');
       }
@@ -611,7 +615,7 @@ export function ChatSection({
                   moreCompute={moreComputeActions && selectedConversation ? { ...moreComputeActions, ownerKey: JSON.stringify(['chat', selectedConversation.id, turn.id, turn.job.id, turn.job.updatedAt, turn.job.status, moreComputeActions.ownerKey]) } : undefined}
                 />
               ) : null}
-              {turn.noteId && turn.operation !== 'chat_refinement' ? (
+              {turn.noteId && turn.operation !== 'chat_refinement' && onOpenActions ? (
                 <SuggestedActionsButton
                   noteId={turn.noteId}
                   disabled={navigationBlocked}
@@ -620,7 +624,7 @@ export function ChatSection({
                   refinementLock={refinementReviewLock}
                   onOpenActions={onOpenActions}
                 />
-              ) : null}
+              ) : turn.noteId && turn.operation !== 'chat_refinement' ? <Text style={styles.meta}>Suggested-action review is unavailable in this workspace.</Text> : null}
               {selectedConversation && onReviewMemorySuggestion &&
                 chatMemoryReviewSuggestionIds(turn).map((suggestionId, index, ids) => (
                   <Button

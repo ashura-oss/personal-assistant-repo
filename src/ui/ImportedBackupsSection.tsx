@@ -4,6 +4,8 @@ import * as Crypto from "expo-crypto";
 import { SafeAreaView } from "react-native-safe-area-context";
 import type { AppController, ContextDocument } from "../core";
 import type { ImportedBackupArchive } from "../backup";
+import type { DeepReadonly } from "../cloud/workspaceDto";
+import type { WorkspaceActionCapability } from "./workspaceCapabilities";
 import { Button, Field, IconButton } from "./primitives";
 import { ImportedChatHistoryView } from "./ImportedChatHistoryView";
 import { C, s } from "./theme";
@@ -11,15 +13,15 @@ import { C, s } from "./theme";
 export function ImportedBackupsSection({
   archives,
   currentDocuments,
-  controller,
+  onActivateDocument,
   busy,
   archiveActionsBlocked = false,
   query,
   onDeleteImportedChatConversation,
 }: {
-  archives: ImportedBackupArchive[];
-  currentDocuments: ContextDocument[];
-  controller: AppController;
+  archives: readonly DeepReadonly<ImportedBackupArchive>[];
+  currentDocuments: readonly DeepReadonly<ContextDocument>[];
+  onActivateDocument: WorkspaceActionCapability<Pick<AppController, 'activateImportedDocument'>>;
   busy: boolean;
   archiveActionsBlocked?: boolean;
   query: string;
@@ -110,7 +112,7 @@ export function ImportedBackupsSection({
     return () => { active = false; };
   }, [digestKey, selectedDocument]);
 
-  const openDocument = (archive: ImportedBackupArchive, documentId: string) => {
+  const openDocument = (archive: DeepReadonly<ImportedBackupArchive>, documentId: string) => {
     const document = archive.documents.find((item) => item.id === documentId);
     if (!document) return;
     setError("");
@@ -138,7 +140,7 @@ export function ImportedBackupsSection({
   };
 
   const activate = async () => {
-    if (!selected || !selectedDocument || !digest || !destinationPath.trim() || activating || busy) return;
+    if (!onActivateDocument.available || !selected || !selectedDocument || !digest || !destinationPath.trim() || activating || busy) return;
     if (existingDocument && existingDocument.content !== selectedDocument.content && !replaceIsConfirmed) return;
     const request = ++activationRequest.current;
     const requestKey = selectionKey;
@@ -146,7 +148,7 @@ export function ImportedBackupsSection({
     setError("");
     setNotice("");
     try {
-      const result = await controller.activateImportedDocument({
+      const result = await onActivateDocument.action.activateImportedDocument({
         archiveId: selected.archiveId,
         documentId: selectedDocument.id,
         destinationPath: destinationPath.trim(),
@@ -211,7 +213,7 @@ export function ImportedBackupsSection({
                         <Text style={styles.documentPath}>{document.path}</Text>
                         <Text style={styles.caption}>Imported document · inactive until you choose to use it as context</Text>
                         {document.activatedPath ? <Text style={styles.caption}>Active context copy · {document.activatedPath}</Text> : null}
-                        <Button label="Use as assistant context" tone="quiet" onPress={() => openDocument(archive, document.id)} />
+                        <Button label="Use as assistant context" tone="quiet" disabled={!onActivateDocument.available || archiveActionsBlocked} onPress={() => openDocument(archive, document.id)} />
                       </View>
                     ))}
                     {shownDocuments.length < documents.length ? (
@@ -281,8 +283,9 @@ export function ImportedBackupsSection({
               {notice ? <Text style={styles.notice}>{notice}</Text> : null}
               {error ? <Text accessibilityRole="alert" style={styles.error}>{error}</Text> : null}
               <Button label={activating ? "Saving context…" : existingDocument?.content === selectedDocument.content ? "Use existing context" : "Activate this document"}
-                disabled={busy || activating || !digest || !destinationPath.trim() || Boolean(existingDocument && existingDocument.content !== selectedDocument.content && !replaceIsConfirmed)}
+                disabled={busy || activating || !onActivateDocument.available || archiveActionsBlocked || !digest || !destinationPath.trim() || Boolean(existingDocument && existingDocument.content !== selectedDocument.content && !replaceIsConfirmed)}
                 onPress={() => void activate()} />
+              {!onActivateDocument.available ? <Text style={styles.caption}>{onActivateDocument.reason}</Text> : null}
             </> : null}
           </ScrollView>
         </SafeAreaView>

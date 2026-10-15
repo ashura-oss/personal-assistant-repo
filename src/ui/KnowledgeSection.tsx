@@ -1,23 +1,27 @@
 import React, { useMemo, useState } from 'react';
 import { Pressable, Text, View } from 'react-native';
 import type { KnowledgeEntityDisplay, KnowledgePersonDisplay, KnowledgeProjectDisplay } from './knowledgeDisplayTypes';
+import type { WorkspaceActionCapability } from './workspaceCapabilities';
 import { Button } from './primitives';
 import { s } from './theme';
 
 type PersonDisplay = KnowledgePersonDisplay;
 type ProjectDisplay = KnowledgeProjectDisplay;
+type KnowledgeEntityListActions = Readonly<{
+  create: (kind: 'person' | 'project') => void;
+  open: (entity: KnowledgeEntityDisplay) => void;
+  archive: (kind: 'person' | 'project', id: string, revision: number, archived: boolean) => void;
+}>;
 type Props = {
   kind: 'person' | 'project';
   people: readonly PersonDisplay[];
   projects: readonly ProjectDisplay[];
   query: string;
   busy: boolean;
-  onCreate: () => void;
-  onOpen: (entity: KnowledgeEntityDisplay) => void;
-  onArchive: (kind: 'person' | 'project', id: string, revision: number, archived: boolean) => void;
+  actions: WorkspaceActionCapability<KnowledgeEntityListActions>;
 };
 
-export function KnowledgeSection({ kind, people, projects, query, busy, onCreate, onOpen, onArchive }: Props) {
+export function KnowledgeSection({ kind, people, projects, query, busy, actions }: Props) {
   const [showArchived, setShowArchived] = useState(false);
   const normalizedQuery = query.trim().toLocaleLowerCase();
   const entities = useMemo(() => {
@@ -34,15 +38,16 @@ export function KnowledgeSection({ kind, people, projects, query, busy, onCreate
     <View style={{ gap: 12 }}>
       <View style={s.sectionHeader}>
         <Text style={s.sectionTitle}>{kind === 'person' ? 'People' : 'Projects'}</Text>
-        <Button label={kind === 'person' ? 'Add person' : 'Add project'} onPress={onCreate} disabled={busy} tone="quiet" icon="add" />
+        <Button label={kind === 'person' ? 'Add person' : 'Add project'} onPress={() => { if (actions.available) actions.action.create(kind); }} disabled={busy || !actions.available} tone="quiet" icon="add" />
       </View>
+      {!actions.available ? <Text style={s.knowledgeFootnote}>{actions.reason}</Text> : null}
       <Pressable accessibilityRole="switch" accessibilityState={{ checked: showArchived }} onPress={() => setShowArchived((value) => !value)} style={s.knowledgeArchiveToggle}>
         <Text style={s.knowledgeFilterText}>{showArchived ? 'Showing archived' : 'Show archived'}</Text>
       </Pressable>
       {entities.length ? entities.map((entity) => {
         return (
           <View key={`${kind}:${entity.id}`} style={s.knowledgeCard}>
-            <Pressable accessibilityRole="button" accessibilityLabel={`Open ${kind} ${entity.name}`} onPress={() => onOpen(entity)} style={{ flex: 1, minHeight: 56, justifyContent: 'center', gap: 4 }}>
+            <Pressable accessibilityRole="button" accessibilityLabel={`Open ${kind} ${entity.name}`} disabled={!actions.available} onPress={() => { if (actions.available) actions.action.open(entity); }} style={{ flex: 1, minHeight: 56, justifyContent: 'center', gap: 4 }}>
               <Text style={s.knowledgeName}>{entity.name}</Text>
               <Text style={s.knowledgeMeta} numberOfLines={2}>
                 {'goal' in entity ? `${entity.status} · ${entity.goal || 'No goal added'}` : entity.aliases.length ? `Also known as ${entity.aliases.join(', ')}` : `${entity.facts.length} saved facts · ${'contacts' in entity ? entity.contacts.length : 0} contact claims`}
@@ -50,7 +55,7 @@ export function KnowledgeSection({ kind, people, projects, query, busy, onCreate
               </Text>
               {entity.importOrigin?.kind === 'backup_knowledge' ? <Text style={s.knowledgeFootnote}>Imported separate copy</Text> : null}
             </Pressable>
-            <Pressable accessibilityRole="button" accessibilityLabel={entity.archivedAt ? `Reopen ${kind} ${entity.name}` : `Archive ${kind} ${entity.name}`} disabled={busy} onPress={() => onArchive(kind, entity.id, entity.revision, !entity.archivedAt)} style={s.knowledgeSmallAction}>
+            <Pressable accessibilityRole="button" accessibilityLabel={entity.archivedAt ? `Reopen ${kind} ${entity.name}` : `Archive ${kind} ${entity.name}`} disabled={busy || !actions.available} onPress={() => { if (actions.available) actions.action.archive(kind, entity.id, entity.revision, !entity.archivedAt); }} style={s.knowledgeSmallAction}>
               <Text style={s.knowledgeActionText}>{entity.archivedAt ? 'Reopen' : 'Archive'}</Text>
             </Pressable>
           </View>

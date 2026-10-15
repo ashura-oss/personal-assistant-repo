@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   Modal,
   Pressable,
@@ -8,28 +8,29 @@ import {
   View,
 } from "react-native";
 import type {
-  Account,
-  AppController,
   ProactiveCandidateEntry,
   ProactiveCandidateSourceResult,
   ProactiveState,
 } from "../core";
-import type { DeviceCalendarAccessStatus, DeviceCalendarState } from "../deviceCalendars/types";
+import type { DeviceCalendarAccessStatus } from "../deviceCalendars/types";
 import type { ProactiveSource } from "../proactive";
+import type { DeepReadonly } from "../cloud/workspaceDto";
+import type { WorkspaceActionCapability } from "./workspaceCapabilities";
+import type { InboxAccountDisplay, InboxDeviceCalendarDisplay } from "./InboxWorkspaceContent";
 import Ionicons from "@expo/vector-icons/Ionicons";
 import { Button } from "./primitives";
 import { C, s } from "./theme";
 
 type Props = {
-  proactive: ProactiveState;
-  accounts: Account[];
-  deviceCalendars: DeviceCalendarState;
+  proactive: DeepReadonly<ProactiveState>;
+  accounts: readonly DeepReadonly<InboxAccountDisplay>[];
+  deviceCalendars?: DeepReadonly<InboxDeviceCalendarDisplay>;
   deviceCalendarAccess: DeviceCalendarAccessStatus;
   busy: boolean;
-  onDismiss: (candidateId: string) => void;
-  onSnooze: (candidateId: string, until: string) => void;
-  onRemind: (candidateId: string) => void;
-  onGetSource: AppController["getProactiveCandidateSource"];
+  onDismiss: WorkspaceActionCapability<(candidateId: string) => void>;
+  onSnooze: WorkspaceActionCapability<(candidateId: string, until: string) => void>;
+  onRemind: WorkspaceActionCapability<(candidateId: string) => void>;
+  onGetSource: WorkspaceActionCapability<(candidateId: string) => Promise<ProactiveCandidateSourceResult>>;
 };
 
 const reasonLabel = (entry: ProactiveCandidateEntry) => {
@@ -106,7 +107,7 @@ function parseDeviceProviderId(value: string) {
 
 function resolveDeviceSourcePresentation(
   binding: { installationId: string; generation: number; calendarId: string; nativeEventId: string; occurrenceStart: string } | undefined,
-  device: DeviceCalendarState,
+  device: DeepReadonly<InboxDeviceCalendarDisplay>,
   access: DeviceCalendarAccessStatus,
 ): DeviceSourcePresentation | undefined {
   if (!binding || access !== "full_access" || !device.enabled || device.installationId !== binding.installationId || device.generation !== binding.generation || !device.selectedCalendarIds.includes(binding.calendarId)) return undefined;
@@ -150,6 +151,20 @@ export function ProactiveCandidatesSection({
   >();
   const [loadingSource, setLoadingSource] = useState(false);
   const [sourceError, setSourceError] = useState("");
+  const sourceRequest = useRef(0);
+  const [openedOwner, setOpenedOwner] = useState<Readonly<{ proactive: DeepReadonly<ProactiveState>; accounts: readonly DeepReadonly<InboxAccountDisplay>[]; candidateId: string; sourceVersion: string }>>();
+  const closeSource = () => {
+    sourceRequest.current += 1;
+    setOpened(undefined);
+    setOpenedOwner(undefined);
+    setSourceResult(undefined);
+    setSourceError("");
+    setLoadingSource(false);
+  };
+  useEffect(() => () => { sourceRequest.current += 1; }, []);
+  useEffect(() => {
+    sourceRequest.current += 1;
+  }, [proactive, accounts]);
   const enabledRules = proactive.rules.filter((rule) => rule.enabled);
   const active = (
     enabledRules.length
@@ -172,29 +187,34 @@ export function ProactiveCandidatesSection({
     if (entry.presentation === "uncertain") return "Saved source · needs recheck";
     if (entry.candidate.namespace === "device_calendar") {
       const tuple = parseDeviceProviderId(entry.candidate.providerId);
-      const binding = tuple ? { ...tuple, generation: deviceCalendars.generation } : undefined;
-      const source = resolveDeviceSourcePresentation(binding, deviceCalendars, deviceCalendarAccess);
+      const binding = tuple && deviceCalendars ? { ...tuple, generation: deviceCalendars.generation } : undefined;
+      const source = deviceCalendars ? resolveDeviceSourcePresentation(binding, deviceCalendars, deviceCalendarAccess) : undefined;
       return source ? `${source.calendarTitle} · On this iPhone` : "On this iPhone · original calendar unavailable";
     }
     return accountName(entry.candidate.accountId);
   };
 
   const openSource = async (entry: ProactiveCandidateEntry) => {
+    const request = ++sourceRequest.current;
+    setOpenedOwner({ proactive, accounts, candidateId: entry.candidate.id, sourceVersion: entry.candidate.sourceVersion });
     setOpened(entry);
     setSourceResult(undefined);
     setSourceError("");
     setLoadingSource(true);
     try {
-      const result = await onGetSource(entry.candidate.id);
+      if (!onGetSource.available) return;
+      const result = await onGetSource.action(entry.candidate.id);
+      if (sourceRequest.current !== request) return;
       setSourceResult(result);
     } catch (error) {
+      if (sourceRequest.current !== request) return;
       setSourceError(
         error instanceof Error
           ? error.message
           : "The saved source could not be checked.",
       );
     } finally {
-      setLoadingSource(false);
+      if (sourceRequest.current === request) setLoadingSource(false);
     }
   };
 
@@ -210,9 +230,11 @@ export function ProactiveCandidatesSection({
         (entry) => entry.candidate.id === opened.candidate.id,
       )
     : undefined;
+  const openedOwnerIsCurrent = Boolean(opened && openedOwner?.proactive === proactive && openedOwner.accounts === accounts &&
+    openedOwner.candidateId === opened.candidate.id && latestOpenedEntry?.candidate.sourceVersion === openedOwner.sourceVersion);
   const openedNeedsRecheck = Boolean(
     opened &&
-    (!latestOpenedEntry || latestOpenedEntry.presentation === "uncertain"),
+    (!openedOwnerIsCurrent || !latestOpenedEntry || latestOpenedEntry.presentation === "uncertain" || latestOpenedEntry.candidate.sourceVersion !== opened.candidate.sourceVersion),
   );
 
   return (
@@ -270,19 +292,20 @@ export function ProactiveCandidatesSection({
                   label="Open saved source"
                   tone="quiet"
                   onPress={() => void openSource(entry)}
-                  disabled={busy}
+                  disabled={busy || !onGetSource.available}
                 />
+                {!onGetSource.available ? <Text style={s.accountSub}>{onGetSource.reason}</Text> : null}
                 <Button
                   label="Remind me"
                   tone="quiet"
-                  onPress={() => onRemind(entry.candidate.id)}
-                  disabled={busy}
+                  onPress={() => { if (onRemind.available) onRemind.action(entry.candidate.id); }}
+                  disabled={busy || !onRemind.available}
                 />
                 <Button
                   label="Dismiss"
                   tone="quiet"
-                  onPress={() => onDismiss(entry.candidate.id)}
-                  disabled={busy}
+                  onPress={() => { if (onDismiss.available) onDismiss.action(entry.candidate.id); }}
+                  disabled={busy || !onDismiss.available}
                 />
               </View>
               <View style={styles.actions}>
@@ -290,23 +313,23 @@ export function ProactiveCandidatesSection({
                   label="Snooze 1 hour"
                   tone="quiet"
                   onPress={() =>
-                    onSnooze(
+                    onSnooze.available && onSnooze.action(
                       entry.candidate.id,
                       new Date(Date.now() + 60 * 60_000).toISOString(),
                     )
                   }
-                  disabled={busy}
+                  disabled={busy || !onSnooze.available}
                 />
                 <Button
                   label="Snooze 1 day"
                   tone="quiet"
                   onPress={() =>
-                    onSnooze(
+                    onSnooze.available && onSnooze.action(
                       entry.candidate.id,
                       new Date(Date.now() + 24 * 60 * 60_000).toISOString(),
                     )
                   }
-                  disabled={busy}
+                  disabled={busy || !onSnooze.available}
                 />
               </View>
             </View>
@@ -347,13 +370,14 @@ export function ProactiveCandidatesSection({
                       label="Check saved source"
                       tone="quiet"
                       onPress={() => void openSource(entry)}
-                      disabled={busy}
+                      disabled={busy || !onGetSource.available}
                     />
+                    {!onGetSource.available ? <Text style={s.accountSub}>{onGetSource.reason}</Text> : null}
                     <Button
                       label="Dismiss"
                       tone="quiet"
-                      onPress={() => onDismiss(entry.candidate.id)}
-                      disabled={busy}
+                      onPress={() => { if (onDismiss.available) onDismiss.action(entry.candidate.id); }}
+                      disabled={busy || !onDismiss.available}
                     />
                   </View>
                 </View>
@@ -361,11 +385,11 @@ export function ProactiveCandidatesSection({
             : null}
         </>
       ) : null}
-      <Modal
+      {opened && openedOwnerIsCurrent ? <Modal
         visible={Boolean(opened)}
         animationType="slide"
         transparent
-        onRequestClose={() => setOpened(undefined)}
+        onRequestClose={closeSource}
       >
         <View style={styles.modalBackdrop}>
           <View style={styles.modalCard}>
@@ -374,7 +398,7 @@ export function ProactiveCandidatesSection({
               <Pressable
                 accessibilityRole="button"
                 accessibilityLabel="Close source details"
-                onPress={() => setOpened(undefined)}
+                onPress={closeSource}
                 style={styles.closeButton}
               >
                 <Ionicons
@@ -443,7 +467,7 @@ export function ProactiveCandidatesSection({
                         <SourceDetails
                           source={sourceResult.source}
                           deviceSourcePresentation={sourceResult.source.kind === "meeting"
-                            ? resolveDeviceSourcePresentation(sourceResult.source.deviceBinding, deviceCalendars, deviceCalendarAccess)
+                            && deviceCalendars ? resolveDeviceSourcePresentation(sourceResult.source.deviceBinding, deviceCalendars, deviceCalendarAccess)
                             : undefined}
                         />
                       ) : null}
@@ -458,11 +482,11 @@ export function ProactiveCandidatesSection({
             <Button
               label="Close"
               tone="quiet"
-              onPress={() => setOpened(undefined)}
+              onPress={closeSource}
             />
           </View>
         </View>
-      </Modal>
+      </Modal> : null}
     </View>
   );
 }

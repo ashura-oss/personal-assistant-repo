@@ -51,7 +51,7 @@ describe('ImportedBackupsSection', () => {
       noteLinks: [], taskLinks: [], documents: [], history: [], chatHistory: [],
     } as unknown as ImportedBackupArchive;
     act(() => root.render(React.createElement(ImportedBackupsSection, {
-      archives: [archive], currentDocuments: [], controller: {} as never, busy: false, query: '',
+      archives: [archive], currentDocuments: [], onActivateDocument: { available: false, reason: 'Unavailable in this test.' }, busy: false, query: '',
     })));
     expect(host.textContent).toContain('Imported backup · Still v4');
     expect(host.textContent).not.toContain('Unknown backup version');

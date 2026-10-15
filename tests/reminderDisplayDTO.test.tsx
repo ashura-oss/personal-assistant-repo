@@ -74,8 +74,10 @@ describe("readonly reminder display", () => {
     act(() => root.render(<RemindersSection
       records={dto.state.reminders.records}
       alertDisplays={{ [safe.id]: summary }}
-      query="" busy={false} alertChannel="device" demoMode={false} onAdd={() => undefined}
-      onOpen={onOpen} onRetry={() => undefined} onDone={() => undefined} onCancel={() => undefined} onDelete={() => undefined}
+      query="" busy={false} alertChannel="device" demoMode={false} actions={{ available: true, action: {
+        create: () => undefined, open: onOpen, retry: async () => undefined, done: async () => undefined,
+        cancel: async () => undefined, delete: async () => undefined,
+      } }}
     />));
     expect(host.textContent).toContain(record.title);
     expect(host.textContent).toContain("Saved reminder");
