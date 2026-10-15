@@ -10,6 +10,7 @@ import {
   type WorkspaceCommandResponse,
   type WorkspaceCommandStatus,
 } from './workspaceCommands';
+import { workspaceCommandKindFromJournal } from './workspaceCommandHistory';
 
 export * from './workspaceCommands';
 
@@ -83,8 +84,10 @@ export function inspectWorkspaceCommand(runtime: OwnedWorkspaceRuntime, admissio
   const commandId = parseWorkspaceCommandId(rawCommandId);
   const admissionResult = runtime.inspectCommandReceipt(admission, commandId);
   if (!admissionResult) return Object.freeze({ schemaVersion: 1, commandId, status: 'unverified' });
+  const kind = workspaceCommandKindFromJournal(admissionResult.commandKind);
+  if (!kind) throw new Error('workspace_command_unexposed');
   if (admissionResult.status === 'finished') {
-    const commandReceipt = parseWorkspaceCommandReceipt(admissionResult.receipt, { commandId });
+    const commandReceipt = parseWorkspaceCommandReceipt(admissionResult.receipt, { commandId, kind });
     return Object.freeze({ schemaVersion: 1, commandId, status: 'finished', receipt: commandReceipt });
   }
   return Object.freeze({ schemaVersion: 1, commandId, status: admissionResult.status as WorkspaceCommandStatus });

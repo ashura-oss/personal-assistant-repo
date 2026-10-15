@@ -65,7 +65,7 @@ function inside(root: string, candidate: string): boolean {
   return rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel));
 }
 
-function safePath(rawUrl: string | undefined): { readonly pathname: string; readonly hasQuery: boolean } {
+function safePath(rawUrl: string | undefined): { readonly pathname: string; readonly hasQuery: boolean; readonly rawQuery?: string } {
   if (typeof rawUrl !== 'string' || rawUrl.length === 0 || rawUrl.length > 4096 || !rawUrl.startsWith('/') || rawUrl.startsWith('//')) {
     throw problem(400, 'bad_request');
   }
@@ -76,7 +76,7 @@ function safePath(rawUrl: string | undefined): { readonly pathname: string; read
   try { pathname = decodeURIComponent(rawPath); } catch { throw problem(400, 'bad_request'); }
   if (!pathname.startsWith('/') || pathname.includes('\\') || pathname.includes('\0') || pathname.startsWith('//') ||
     pathname.split('/').some((segment) => segment === '.' || segment === '..')) throw problem(400, 'bad_request');
-  return { pathname, hasQuery: q >= 0 };
+  return { pathname, hasQuery: q >= 0, ...(q >= 0 ? { rawQuery: rawUrl.slice(q + 1) } : {}) };
 }
 
 function uniqueHeader(request: IncomingMessage, name: string, required = false): string | undefined {
@@ -235,6 +235,7 @@ function workspaceFailure(error: unknown): { readonly status: number; readonly c
     return { status: 503, code: 'service_unavailable' };
   }
   if (error instanceof Error) {
+    if (error.message === 'command_history_cursor_invalid') return { status: 400, code: 'bad_request' };
     if (['workspace_command_invalid', 'workspace_command_id_invalid', 'workspace_command_receipt_invalid'].includes(error.message)) {
       return { status: 400, code: 'invalid_workspace_command' };
     }
@@ -589,7 +590,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
   if (admissionOpen && !admissionOpen()) throw problem(503, 'service_unavailable');
   const host = uniqueHeader(request, 'host', true);
   if (!host || host.toLowerCase() !== canonicalOrigin.host.toLowerCase()) throw problem(403, 'host_rejected');
-  const { pathname, hasQuery } = safePath(request.url);
+  const { pathname, hasQuery, rawQuery } = safePath(request.url);
   if (pathname.startsWith('/auth/') || pathname.startsWith('/api/') || pathname === '/healthz') {
     response.setHeader('Cache-Control', 'no-store');
     response.setHeader('Pragma', 'no-cache');
@@ -672,6 +673,24 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
       const snapshot = await workspaceApi.getSnapshot(admission);
       admission.assertCurrent();
       if (!response.destroyed) sendJson(response, 200, snapshot);
+    } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
+    return;
+  }
+  if (pathname === '/api/workspace/command-history') {
+    if (request.method !== 'GET') { response.setHeader('Allow', 'GET'); throw problem(405, 'method_not_allowed'); }
+    let cursor: string | undefined;
+    if (hasQuery) {
+      const match = /^cursor=([A-Za-z0-9_-]{1,2048})$/.exec(rawQuery ?? '');
+      if (!match) throw problem(400, 'bad_request');
+      cursor = match[1];
+    }
+    if (!workspaceApi) throw problem(503, 'service_unavailable');
+    const admission = workspaceReadAdmission(request, auth, canonicalOrigin);
+    try {
+      admission.assertCurrent();
+      const result = workspaceApi.listCommandHistory(admission, cursor);
+      admission.assertCurrent();
+      if (!response.destroyed) sendJson(response, 200, result);
     } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
     return;
   }

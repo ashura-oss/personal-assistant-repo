@@ -3,6 +3,8 @@ import { createInitialWorkspaceState } from '../src/services/controller.shared';
 import { createWorkspaceSnapshotDTO, type WorkspaceSnapshotDTO } from '../src/cloud/workspaceDto';
 import { parseWorkspaceCommandEnvelope } from '../src/cloud/workspaceCommands';
 import { createWebWorkspaceClient, WorkspaceClientError, WorkspaceCommandNotStartedError, WorkspaceCommandUnknownError } from '../src/web/workspaceClient';
+import { parseWorkspaceCommandHistoryPage } from '../src/cloud/workspaceCommandHistory';
+import { WORKSPACE_COMMAND_HISTORY_KINDS as SERVER_HISTORY_KINDS, workspaceCommandKindFromJournal as serverJournalKind } from '../server/src/workspaceCommandHistory';
 import type { AuthenticatedSession } from '../src/web/authClient';
 
 const workspaceId = '7b906fca-65c1-4bd2-b18e-1b56cc6f48a8';
@@ -54,6 +56,124 @@ function deferred<T>() {
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers(); });
 
 describe('same-origin web workspace command client', () => {
+  it('keeps the server projection map and browser history decoder on the same ten public command kinds', () => {
+    expect(SERVER_HISTORY_KINDS).toEqual(['tasks.complete', 'tasks.reopen', 'chat.create', 'notes.save', 'notes.capture.adopt',
+      'notes.updateTranscript', 'assistant.batch.submitNote', 'assistant.batch.check', 'chat.submit', 'chat.refine']);
+    for (const kind of SERVER_HISTORY_KINDS) expect(serverJournalKind(kind.toLowerCase())).toBe(kind);
+    expect(parseWorkspaceCommandHistoryPage({ entries: [{ updatedAt: 2, createdAt: 1, status: 'finished',
+      kind: 'tasks.complete', commandId }], schemaVersion: 1 }).entries[0]?.commandId).toBe(commandId);
+  });
+
+  it('decodes bounded history and explicitly inspects a recovered receipt without clearing unrelated pending work', async () => {
+    const dto = snapshot(1);
+    const recoveredId = nextCommandId;
+    const historyEntry = { commandId: recoveredId, kind: 'notes.save', status: 'finished', createdAt: 100, updatedAt: 120 } as const;
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(body(dto))
+      .mockRejectedValueOnce(new Error('lost command response'))
+      .mockResolvedValueOnce(body({ schemaVersion: 1, entries: [historyEntry], nextCursor: 'YXNk' }))
+      .mockResolvedValueOnce(body({ schemaVersion: 1, entries: [] }))
+      .mockResolvedValueOnce(body({ schemaVersion: 1, commandId: recoveredId, status: 'finished', receipt: {
+        schemaVersion: 1, commandId: recoveredId, kind: 'notes.save', objectId: 'note-safe-id',
+      } }));
+    const client = makeClient(fetcher, () => true, [commandId, nextCommandId]);
+    await client.getSnapshot();
+    await expect(client.execute({ kind: 'chat.create' })).rejects.toBeInstanceOf(WorkspaceCommandUnknownError);
+    const page = await client.listCommandHistory();
+    expect(page.entries).toEqual([historyEntry]);
+    expect(fetcher.mock.calls[2]?.[0]).toBe('/api/workspace/command-history');
+    await expect(client.listCommandHistory(page.nextCursor)).resolves.toMatchObject({ entries: [] });
+    expect(fetcher.mock.calls[3]?.[0]).toBe('/api/workspace/command-history?cursor=YXNk');
+    // The selected row is explicit authority for the receipt kind and does not clear the unrelated pending command.
+    await expect(client.inspectRecoveredCommand(page.entries[0]!)).resolves.toMatchObject({ status: 'finished', receipt: { kind: 'notes.save' } });
+    expect(fetcher.mock.calls[4]?.[0]).toBe(`/api/workspace/commands/${recoveredId}`);
+    expect(client.getPendingCommand()?.commandId).toBe(commandId);
+    client.dispose();
+  });
+
+  it('rejects recovered kind mismatches and history responses after owner generation changes', async () => {
+    const entry = { commandId: nextCommandId, kind: 'tasks.complete', status: 'finished', createdAt: 1, updatedAt: 1 } as const;
+    const mismatch = makeClient(vi.fn().mockResolvedValue(body({ schemaVersion: 1, commandId: nextCommandId, status: 'finished', receipt: {
+      schemaVersion: 1, commandId: nextCommandId, kind: 'tasks.reopen', objectId: 'task-safe-id',
+    } })));
+    await expect(mismatch.inspectRecoveredCommand(entry)).rejects.toMatchObject({ kind: 'malformed' });
+    mismatch.dispose();
+
+    let current = true;
+    const response = deferred<ReturnType<typeof body>>();
+    const client = makeClient(vi.fn().mockReturnValueOnce(response.promise), () => current);
+    const pending = client.listCommandHistory();
+    current = false;
+    response.resolve(body({ schemaVersion: 1, entries: [entry] }));
+    await expect(pending).rejects.toMatchObject({ kind: 'stale' });
+    client.dispose();
+    expect(() => parseWorkspaceCommandHistoryPage({ schemaVersion: 1, entries: [entry, entry] })).toThrow();
+    const accessor = Object.defineProperty({}, 'schemaVersion', { enumerable: true, get() { throw new Error('must not execute'); } });
+    expect(() => parseWorkspaceCommandHistoryPage(accessor)).toThrow();
+  });
+
+  it('keeps a same-ID recovered capture unresolved when its receipt names another capture revision', async () => {
+    const dto = snapshot(1);
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(body(dto))
+      .mockRejectedValueOnce(new Error('lost capture response'))
+      .mockResolvedValueOnce(body({ schemaVersion: 1, commandId, status: 'finished', receipt: {
+        schemaVersion: 1, commandId, kind: 'notes.capture.adopt', objectId: conversationId,
+        captureId: conversationId, captureRevision: anotherTurnId,
+      } }));
+    const client = makeClient(fetcher, () => true, [commandId]);
+    await client.getSnapshot();
+    await expect(client.execute({ kind: 'notes.capture.adopt', captureId: conversationId, captureRevision: parentTurnId }))
+      .rejects.toBeInstanceOf(WorkspaceCommandUnknownError);
+    await expect(client.inspectRecoveredCommand({ commandId, kind: 'notes.capture.adopt', status: 'finished', createdAt: 1, updatedAt: 1 }))
+      .rejects.toMatchObject({ kind: 'malformed' });
+    expect(client.getPendingCommand()?.command).toEqual({ kind: 'notes.capture.adopt', captureId: conversationId, captureRevision: parentTurnId });
+    client.dispose();
+  });
+
+  it('rejects snapshots on both receipt GET paths before decoding or mutating pending and revision state', async () => {
+    const first = snapshot(1);
+    const later = snapshot(2);
+    const impossible = snapshot(99);
+    const decodeSnapshot = vi.fn((value: unknown) => {
+      if (JSON.stringify(value) === JSON.stringify(first)) return first;
+      if (JSON.stringify(value) === JSON.stringify(later)) return later;
+      if (JSON.stringify(value) === JSON.stringify(impossible)) return impossible;
+      throw new Error('unexpected snapshot');
+    });
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(body(first))
+      .mockRejectedValueOnce(new Error('lost command response'))
+      .mockResolvedValueOnce(body({ schemaVersion: 1, commandId: commandId, status: 'finished',
+        receipt: receipt(commandId, 'tasks.complete', 'task-safe-id'), snapshot: impossible }))
+      .mockResolvedValueOnce(body({ schemaVersion: 1, commandId, status: 'finished',
+        receipt: receipt(commandId, 'tasks.complete', 'task-safe-id'), snapshot: impossible }))
+      .mockResolvedValueOnce(body(later))
+      .mockResolvedValueOnce(body({ schemaVersion: 1, commandId, status: 'finished', receipt: receipt(commandId, 'tasks.complete', 'task-safe-id') }))
+      .mockResolvedValueOnce(body(later))
+      .mockResolvedValueOnce(body({ schemaVersion: 1, commandId: nextCommandId, status: 'finished', receipt: receipt(nextCommandId, 'chat.create') }));
+    const client = createWebWorkspaceClient(session, { assertCurrent: () => undefined, decodeSnapshot, fetcher,
+      makeCommandId: () => fetcher.mock.calls.length <= 2 ? commandId : nextCommandId });
+
+    await client.getSnapshot();
+    await expect(client.execute({ kind: 'tasks.complete', taskId: 'task-safe-id' })).rejects.toBeInstanceOf(WorkspaceCommandUnknownError);
+    const recoveredEntry = { commandId: nextCommandId, kind: 'chat.create', status: 'finished', createdAt: 1, updatedAt: 1 } as const;
+    await expect(client.inspectRecoveredCommand(recoveredEntry)).rejects.toMatchObject({ kind: 'malformed' });
+    expect(client.getPendingCommand()?.commandId).toBe(commandId);
+    await expect(client.inspectCommand()).rejects.toMatchObject({ kind: 'malformed' });
+    expect(client.getPendingCommand()?.commandId).toBe(commandId);
+    await expect(client.getSnapshot()).resolves.toBe(later);
+    expect(client.getPendingCommand()?.commandId).toBe(commandId);
+    expect(decodeSnapshot).toHaveBeenCalledTimes(2);
+    await client.inspectCommand();
+    expect(client.getPendingCommand()).toBeUndefined();
+    await expect(client.getSnapshot()).resolves.toBe(later);
+    await client.execute({ kind: 'chat.create' });
+    expect(JSON.parse(String(fetcher.mock.calls[7]?.[1].body))).toMatchObject({ expectedRevision: 2,
+      command: { kind: 'chat.create' } });
+    client.dispose();
+  });
+
   it('binds capture adoption receipts to the exact capture revision and reports only pre-fetch admission failures as not started', async () => {
     const dto = snapshot(1);
     const captureId = conversationId;
@@ -128,11 +248,10 @@ describe('same-origin web workspace command client', () => {
       .mockResolvedValueOnce(body(dto))
       .mockRejectedValueOnce(new Error('connection dropped after dispatch'))
       .mockResolvedValueOnce(body(dto))
-      .mockResolvedValueOnce(body({ schemaVersion: 1, commandId, status: 'finished', receipt: receipt(commandId, 'tasks.complete', 'task-safe-id'), snapshot: updatedDto }))
+      .mockResolvedValueOnce(body({ schemaVersion: 1, commandId, status: 'finished', receipt: receipt(commandId, 'tasks.complete', 'task-safe-id') }))
       .mockResolvedValueOnce(body({ schemaVersion: 1, commandId: nextCommandId, status: 'claimed' }));
     const decodeSnapshot = (value: unknown) => {
       if (JSON.stringify(value) === JSON.stringify(dto)) return dto;
-      if (JSON.stringify(value) === JSON.stringify(updatedDto)) return updatedDto;
       throw new Error('invalid safe DTO');
     };
     const client = createWebWorkspaceClient(session, { assertCurrent: () => undefined, decodeSnapshot, fetcher, makeCommandId: () => fetcher.mock.calls.length === 1 ? commandId : nextCommandId });
@@ -232,6 +351,7 @@ describe('same-origin web workspace command client', () => {
     const fetcher = vi.fn()
       .mockResolvedValueOnce(body(dto))
       .mockResolvedValueOnce(body({ schemaVersion: 1, commandId, status: 'finished', receipt: receipt(commandId, 'tasks.complete', 'another-task-id') }))
+      .mockResolvedValueOnce(body({ schemaVersion: 1, commandId, status: 'finished', receipt: receipt(commandId, 'tasks.complete', 'another-task-id') }))
       .mockResolvedValueOnce(body({ schemaVersion: 1, commandId, status: 'finished', receipt: receipt(commandId, 'tasks.complete', 'another-task-id') }));
     const client = createWebWorkspaceClient(session, {
       assertCurrent: () => undefined,
@@ -246,7 +366,10 @@ describe('same-origin web workspace command client', () => {
     expect(client.getPendingCommand()).toEqual({ commandId, command: { kind: 'tasks.complete', taskId: 'task-safe-id' } });
     await expect(client.inspectCommand()).rejects.toMatchObject({ kind: 'malformed' });
     expect(client.getPendingCommand()).toEqual({ commandId, command: { kind: 'tasks.complete', taskId: 'task-safe-id' } });
-    expect(fetcher).toHaveBeenCalledTimes(3);
+    await expect(client.inspectRecoveredCommand({ commandId, kind: 'tasks.complete', status: 'finished', createdAt: 1, updatedAt: 1 }))
+      .rejects.toMatchObject({ kind: 'malformed' });
+    expect(client.getPendingCommand()?.command).toEqual({ kind: 'tasks.complete', taskId: 'task-safe-id' });
+    expect(fetcher).toHaveBeenCalledTimes(4);
     client.dispose();
   });
 

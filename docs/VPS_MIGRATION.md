@@ -1,12 +1,12 @@
 # Still PWA and portable server migration
 
-Status: the selected product is a complete iPhone Home Screen PWA backed by a portable, server-owned workspace. The cloud migration is in progress. No VPS or GCP VM has been selected or provisioned, and the existing PWA export is not the completed product.
+Status: the selected product target is an iPhone Home Screen PWA backed by a portable, server-owned workspace. The cloud migration is in progress. No VPS or GCP VM has been selected or provisioned, and the existing PWA export is not the completed product.
 
 ## Current implementation
 
-The server has a recursive closed workspace DTO codec with a generated schema, plus same-origin HTTP routes for session authentication, workspace snapshot/refresh, the current command allowlist and receipt inspection, and credential management. The server-owned runtime, private credential reader, and browser command transport are implemented. Strict command dispatch currently supports `tasks.complete`, `tasks.reopen`, and `chat.create`. Selected readonly note, transcription, task, mail, history, and reminder leaves have been adapted for reuse.
+The server has a recursive closed workspace DTO codec with a generated schema, authenticated same-origin routes for session authentication, workspace snapshot/refresh, explicit commands, receipt inspection, bounded command history, credential management, and audio upload and media access. The Node host composition wires private upload reservation, no-follow file publication, ready-upload capture adoption, scoped media responses, provider-response ownership, and OpenRouter Batch submit/check operations through the server-owned runtime. The dispatcher supports `tasks.complete`, `tasks.reopen`, `chat.create`, `notes.save`, `notes.capture.adopt`, `notes.updateTranscript`, `assistant.batch.submitNote`, `assistant.batch.check`, `chat.submit`, and `chat.refine`. Journal history returns only public command IDs, kinds, statuses, and integer epoch-millisecond timestamps, with a scoped cursor and no request bodies, receipts, or workspace snapshot. These backend paths have focused server coverage, but do not establish live provider registration or deployment behavior.
 
-The full authenticated workspace is not mounted in the normal app. `npm run export:pwa` still packages the existing legacy web app, so its successful export is not evidence of the cloud composition or server-backed saves. The auth mount and full-screen cloud workspace, including its review sheet, remain in progress. The Node raw-response ownership/lifetime foundation is also not yet wired through the host controller, audio, or speech-transcription continuations.
+The full authenticated workspace is not mounted in the normal app. `npm run export:pwa` still packages the existing legacy web app, so its successful export is not evidence of the cloud composition or server-backed saves. The cloud screen and its review sheet remain in progress. Browser upload integration, fresh OAuth onboarding, scheduler/Web Push, live provider registration, deployment, and iPhone installation remain unverified.
 
 New Batch submissions use input policy 2, removing the former per-source and source-count ceilings, selected-context ceiling, 48 KiB chat-history selection ceiling, and reply-text ceilings. Already saved policy-1 jobs retain their captured legacy behavior through recovery and refinement. Aggregate physical request, storage, response, and file limits remain. Note transcripts and Markdown content can use the existing 24 MiB aggregate backup restore allowance within the 32 MiB backup file bound; workspace snapshots retain a 16 MiB physical limit. These are storage and transport bounds, not AI usage quotas. Provider-reported cost and usage remain the only reported values; missing values stay unknown.
 
@@ -19,7 +19,7 @@ The target is an installable iPhone Home Screen app with saved workspace data, p
 Before the target can be mounted or deployed, the remaining work includes:
 
 - Mount the authenticated cloud screen and finish the full reusable workspace composition, review flow, and auth-to-workspace lifecycle.
-- Connect server-backed capture save and private-media read/export paths, then wire the permitted production provider composition and OAuth flows without exposing browser token material.
+- Connect browser capture upload, save, and private-media read/export flows to the implemented server endpoints; complete fresh OAuth onboarding without exposing browser token material.
 - Move scheduled work and delivery to server-owned scheduling and Web Push, with explicit unknown-outcome and recovery handling.
 - Define backup, restore, retention, deletion, and privacy-erasure behavior for server-owned data and media.
 - Produce portable deployment and operations runbooks covering TLS, secure cookies, secret protection, persistent storage, encrypted off-host backups, monitoring, upgrades, and tested restore.
@@ -38,8 +38,8 @@ The service worker does not call `skipWaiting`, claim open clients, or force a r
 
 ## Migration sequence
 
-1. Mount the authenticated workspace over the implemented HTTP routes and verify snapshot decoding, command receipts, and revision/privacy fences end to end.
-2. Connect capture saves, private media, supported providers, and OAuth to explicit server-owned actions; preserve unknown outcomes for receipt inspection and never automatically replay paid or external work.
+1. Mount the authenticated workspace over the implemented HTTP routes and verify snapshot decoding, command receipts, history inspection, and revision/privacy fences end to end.
+2. Connect browser capture upload and private-media flows, complete fresh OAuth onboarding, and verify supported providers through explicit server-owned actions; preserve unknown outcomes for receipt inspection and never automatically replay paid or external work.
 3. Move scheduled due work and delivery to server-owned jobs and Web Push; verify duplicate delivery, delayed execution, reconnect, and recovery behavior.
 4. Define and test backup, restore, retention, and deletion, then prepare deployment and operations runbooks for the chosen VPS or GCP VM.
 5. Deploy a private test instance, verify the full PWA on iPhone, reconcile migrated data, and review a concrete production cutover and rollback plan before any production switch.

@@ -20,6 +20,12 @@ export function createWorkspaceHttpApi(runtime: OwnedWorkspaceRuntime): Workspac
     inspectCommand(admission: WorkspaceHttpAdmission, commandId: string): JsonValue {
       return serializeCommandResponse(inspectWorkspaceCommand(runtime, admission, commandId));
     },
+    listCommandHistory(admission: WorkspaceHttpAdmission, cursor?: string) {
+      admission.assertCurrent();
+      const page = runtime.listCommandHistory(admission, cursor);
+      admission.assertCurrent();
+      return JSON.parse(JSON.stringify(page)) as JsonValue;
+    },
   });
 }
 

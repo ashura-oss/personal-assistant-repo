@@ -147,6 +147,18 @@ test('host serves authenticated workspace and credential APIs through required p
       Cookie: cookieHeader, 'X-Still-CSRF': authDto.csrfToken, 'Content-Type': 'application/json' }, body: JSON.stringify(command) });
     assert.equal(completed.status, 200);
     assert.equal((await completed.json()).snapshot.state.tasks[0].status, 'completed');
+    const historyUnauthenticated = await fetch(`${origin}/api/workspace/command-history`);
+    assert.equal(historyUnauthenticated.status, 401);
+    const history = await fetch(`${origin}/api/workspace/command-history`, { headers: { Cookie: cookieHeader } });
+    assert.equal(history.status, 200);
+    const historyPage = await history.json();
+    assert.deepEqual(historyPage.entries.map(({ commandId, kind, status }) => ({ commandId, kind, status })),
+      [{ commandId, kind: 'tasks.complete', status: 'finished' }]);
+    assert.equal(Object.hasOwn(historyPage.entries[0], 'receipt'), false);
+    assert.equal((await fetch(`${origin}/api/workspace/command-history?other=x`, { headers: { Cookie: cookieHeader } })).status, 400);
+    assert.equal((await fetch(`${origin}/api/workspace/command-history?cursor=x`, { headers: { Cookie: cookieHeader } })).status, 400);
+    assert.equal((await fetch(`${origin}/api/workspace/command-history?cursor=x&cursor=y`, { headers: { Cookie: cookieHeader } })).status, 400);
+    assert.equal((await fetch(`${origin}/api/workspace/command-history?cursor=x`, { method: 'POST', headers: { Cookie: cookieHeader } })).status, 405);
     assert.equal(factoryCalls, 1);
     await host.close();
     host = undefined;

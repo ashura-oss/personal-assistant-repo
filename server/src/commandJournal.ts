@@ -2,8 +2,11 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type Database from 'better-sqlite3';
 import type { DurableKernel, JsonValue, OwnedTransactionContext } from './kernel.js';
+import { WORKSPACE_COMMAND_HISTORY_KINDS, WORKSPACE_COMMAND_HISTORY_PAGE_SIZE, isWorkspaceCommandId,
+  workspaceCommandKindFromJournal, workspaceCommandKindToJournal, type WorkspaceCommandHistoryEntry,
+  type WorkspaceCommandHistoryPage } from './workspaceCommandHistory.js';
 
-const JOURNAL_SCHEMA_VERSION = 1;
+const JOURNAL_SCHEMA_VERSION = 2;
 const MAX_RECEIPT_BYTES = 1024 * 1024;
 const MAX_REQUEST_BYTES = 1024 * 1024;
 const KEY = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -30,6 +33,49 @@ export interface CommandAdmission {
   readonly ticket?: CommandTicket;
   readonly receipt?: JsonValue;
   readonly checkpointRevision?: number;
+  /** Server-trusted journal kind, included only by authenticated inspection. */
+  readonly commandKind?: string;
+}
+
+interface HistoryCursor { readonly v: 1; readonly scope: string; readonly createdAt: number; readonly commandId: string }
+interface HistoryRow { idempotency_key: string; command_kind: string; status: JournalStatus; created_at: number; updated_at: number }
+
+function historyUuidGlob(): string {
+  const hex = '[0-9a-fA-F]';
+  return `${hex.repeat(8)}-${hex.repeat(4)}-4${hex.repeat(3)}-[89aAbB]${hex.repeat(3)}-${hex.repeat(12)}`;
+}
+
+function historyScope(ownerId: string, workspaceId: string, privacyEpoch: number): string {
+  return digest(JSON.stringify({ ownerId, workspaceId, privacyEpoch }));
+}
+
+function encodeHistoryCursor(cursor: HistoryCursor): string {
+  return Buffer.from(JSON.stringify(cursor), 'utf8').toString('base64url');
+}
+
+function decodeHistoryCursor(value: unknown, expectedScope: string): HistoryCursor {
+  if (typeof value !== 'string' || value.length < 1 || value.length > 2048 || !/^[A-Za-z0-9_-]+$/.test(value)) {
+    throw new Error('command_history_cursor_invalid');
+  }
+  let json: string;
+  let parsed: unknown;
+  try {
+    const bytes = Buffer.from(value, 'base64url');
+    json = bytes.toString('utf8');
+    if (bytes.toString('base64url') !== value) throw new Error('noncanonical');
+    parsed = JSON.parse(json);
+  } catch { throw new Error('command_history_cursor_invalid'); }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || Object.getPrototypeOf(parsed) !== Object.prototype) {
+    throw new Error('command_history_cursor_invalid');
+  }
+  const row = parsed as Record<string, unknown>;
+  if (Reflect.ownKeys(row).length !== 4 || Reflect.ownKeys(row).some((key) => typeof key !== 'string' || !['v', 'scope', 'createdAt', 'commandId'].includes(key)) ||
+      JSON.stringify({ v: row.v, scope: row.scope, createdAt: row.createdAt, commandId: row.commandId }) !== json ||
+      row.v !== 1 || row.scope !== expectedScope || typeof row.scope !== 'string' || !/^[a-f0-9]{64}$/.test(row.scope) ||
+      !Number.isSafeInteger(row.createdAt) || (row.createdAt as number) < 0 || !isWorkspaceCommandId(row.commandId)) {
+    throw new Error('command_history_cursor_invalid');
+  }
+  return row as unknown as HistoryCursor;
 }
 
 export interface OwnedObjectIds {
@@ -149,6 +195,7 @@ export class CommandJournal {
           CHECK ((status='finished' AND receipt_json IS NOT NULL) OR (status!='finished' AND receipt_json IS NULL))
         ) STRICT;
         CREATE INDEX async_command_journal_status_idx ON async_command_journal(workspace_id,status,updated_at);
+        CREATE INDEX async_command_journal_history_idx ON async_command_journal(workspace_id,owner_id,privacy_epoch,created_at DESC,idempotency_key DESC);
         INSERT INTO command_journal_schema(singleton,version) VALUES(1,${JOURNAL_SCHEMA_VERSION});
       `);
       return;
@@ -157,7 +204,12 @@ export class CommandJournal {
     const version = db.prepare('SELECT version FROM command_journal_schema WHERE singleton=1').get() as { version: number } | undefined;
     if (!version || !Number.isSafeInteger(version.version) || version.version < 1) throw new Error('The asynchronous command journal schema version is invalid.');
     if (version.version > JOURNAL_SCHEMA_VERSION) throw new Error('The asynchronous command journal was created by a newer server.');
-    if (version.version !== JOURNAL_SCHEMA_VERSION) throw new Error('The asynchronous command journal requires an unavailable migration.');
+    if (version.version === 1) {
+      db.exec(`CREATE INDEX IF NOT EXISTS async_command_journal_history_idx ON async_command_journal(workspace_id,owner_id,privacy_epoch,created_at DESC,idempotency_key DESC);
+        UPDATE command_journal_schema SET version=${JOURNAL_SCHEMA_VERSION} WHERE singleton=1;`);
+    } else if (version.version !== JOURNAL_SCHEMA_VERSION) {
+      throw new Error('The asynchronous command journal requires an unavailable migration.');
+    }
   }
 
   admit(input: { admissionSessionToken: string; expectedRevision: number; expectedPrivacyEpoch: number; idempotencyKey: string; kind: string; canonicalBody: string }): CommandAdmission {
@@ -388,8 +440,50 @@ export class CommandJournal {
       if (!row) return undefined;
       if (row.owner_id !== context.ownerId || row.workspace_id !== context.workspaceId || row.privacy_epoch !== context.privacyEpoch) throw new Error('The command receipt belongs to another workspace or privacy epoch.');
       return Object.freeze({ fresh: false, status: row.status,
+        commandKind: row.command_kind,
         ...(row.receipt_json ? { receipt: parseJson(row.receipt_json) } : {}),
         ...(row.checkpoint_revision === null ? {} : { checkpointRevision: row.checkpoint_revision }) });
+    });
+  }
+
+  /** Authenticated, bounded history projection; never exposes request or receipt bodies. */
+  historyPage(sessionToken: string, rawCursor?: unknown): WorkspaceCommandHistoryPage {
+    const identity = this.kernel.getOwnedIdentity(sessionToken);
+    const scope = historyScope(identity.ownerId, identity.workspaceId, identity.privacyEpoch);
+    const cursor = rawCursor === undefined ? undefined : decodeHistoryCursor(rawCursor, scope);
+    const publicKinds = WORKSPACE_COMMAND_HISTORY_KINDS.map(workspaceCommandKindToJournal);
+    const placeholders = publicKinds.map(() => '?').join(',');
+    const uuidGlob = historyUuidGlob();
+    return this.kernel.withOwnedTransaction(sessionToken, identity.privacyEpoch, (context) => {
+      if (context.workspaceId !== identity.workspaceId || context.ownerId !== identity.ownerId || context.privacyEpoch !== identity.privacyEpoch) {
+        throw new Error('workspace_ownership_changed');
+      }
+      if (cursor) {
+        const anchor = context.db.prepare(`SELECT created_at FROM async_command_journal
+          WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND idempotency_key=? AND created_at=?
+            AND command_kind IN (${placeholders}) AND idempotency_key GLOB ?`)
+          .get(context.workspaceId, context.ownerId, context.privacyEpoch, cursor.commandId, cursor.createdAt,
+            ...publicKinds, uuidGlob) as { created_at: number } | undefined;
+        if (!anchor) throw new Error('command_history_cursor_invalid');
+      }
+      const rows = context.db.prepare(`SELECT idempotency_key,command_kind,status,created_at,updated_at FROM async_command_journal
+        WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND command_kind IN (${placeholders}) AND idempotency_key GLOB ?
+          ${cursor ? 'AND (created_at<? OR (created_at=? AND idempotency_key<?))' : ''}
+        ORDER BY created_at DESC,idempotency_key DESC LIMIT ?`)
+        .all(context.workspaceId, context.ownerId, context.privacyEpoch, ...publicKinds, uuidGlob,
+          ...(cursor ? [cursor.createdAt, cursor.createdAt, cursor.commandId] : []), WORKSPACE_COMMAND_HISTORY_PAGE_SIZE + 1) as HistoryRow[];
+      const hasMore = rows.length > WORKSPACE_COMMAND_HISTORY_PAGE_SIZE;
+      const pageRows = rows.slice(0, WORKSPACE_COMMAND_HISTORY_PAGE_SIZE);
+      const entries: WorkspaceCommandHistoryEntry[] = pageRows.map((row) => {
+        const kind = workspaceCommandKindFromJournal(row.command_kind);
+        if (!kind || !isWorkspaceCommandId(row.idempotency_key) || !['claimed', 'checkpointed', 'finished', 'inspect_required'].includes(row.status) ||
+            !Number.isSafeInteger(row.created_at) || !Number.isSafeInteger(row.updated_at)) throw new Error('command_history_projection_invalid');
+        return Object.freeze({ commandId: row.idempotency_key, kind, status: row.status,
+          createdAt: row.created_at, updatedAt: row.updated_at });
+      });
+      const last = hasMore ? pageRows.at(-1) : undefined;
+      const nextCursor = last ? encodeHistoryCursor({ v: 1, scope, createdAt: last.created_at, commandId: last.idempotency_key }) : undefined;
+      return Object.freeze({ schemaVersion: 1 as const, entries: Object.freeze(entries), ...(nextCursor ? { nextCursor } : {}) });
     });
   }
 

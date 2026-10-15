@@ -433,9 +433,8 @@ test('a finished journal receipt with the right command ID but a different allow
     } finally { db.close(); }
 
     await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission, command), /workspace_command_receipt_invalid/);
-    assert.equal(inspectWorkspaceCommand(f.runtime, f.admission, command.commandId).status, 'finished');
-    assert.equal(inspectWorkspaceCommand(f.runtime, f.admission, command.commandId).receipt.kind, 'tasks.reopen',
-      'the invalid durable receipt is not silently repaired or replaced');
+    assert.throws(() => inspectWorkspaceCommand(f.runtime, f.admission, command.commandId), /workspace_command_receipt_invalid/,
+      'inspection also binds the stored receipt to its trusted journal kind');
     const snapshot = await f.runtime.refreshSnapshot(f.admission);
     assert.equal(snapshot.state.activity.filter((item) => item.message === 'Task completed: A task.').length, 1,
       'the controller operation remains applied exactly once despite the invalid duplicate receipt');
@@ -477,8 +476,9 @@ test('read-only receipt inspection distinguishes missing, pending, finished and 
     const created = await dispatchWorkspaceCommand(f.runtime, f.admission, finished);
     const entered = deferred();
     const hold = deferred();
+    const busyCommandId = randomUUID();
     const busyCommand = f.runtime.executeCommand({ ...f.admission, expectedRevision: created.snapshot.revision,
-      expectedPrivacyEpoch: created.snapshot.privacyEpoch, idempotencyKey: randomUUID(), kind: 'test.wait', canonicalBody: '{}' }, async () => {
+      expectedPrivacyEpoch: created.snapshot.privacyEpoch, idempotencyKey: busyCommandId, kind: 'test.wait', canonicalBody: '{}' }, async () => {
       entered.resolve();
       await hold.promise;
       return 'done';
@@ -486,6 +486,9 @@ test('read-only receipt inspection distinguishes missing, pending, finished and 
     await entered.promise;
     assert.equal(inspectWorkspaceCommand(f.runtime, f.admission, finished.commandId).status, 'finished',
       'read-only receipt inspection remains available while another owned command is busy');
+    assert.ok(f.runtime.listCommandHistory(f.admission).entries.some((entry) => entry.commandId === finished.commandId),
+      'history reads bypass busy controller state');
+    assert.throws(() => inspectWorkspaceCommand(f.runtime, f.admission, busyCommandId), /workspace_command_unexposed/);
     hold.resolve();
     await busyCommand;
 
@@ -508,6 +511,10 @@ test('read-only receipt inspection distinguishes missing, pending, finished and 
     assert.equal(inspectWorkspaceCommand(f.runtime, f.admission, finished.commandId).snapshot, undefined,
       'receipt inspection returns no cached or unfenced workspace snapshot');
     assert.equal(inspectWorkspaceCommand(f.runtime, f.admission, uncertain.commandId).status, 'inspect_required');
+    assert.ok(f.runtime.listCommandHistory(f.admission).entries.some((entry) => entry.commandId === uncertain.commandId),
+      'history reads remain available while the loaded snapshot requires refresh');
+    assert.equal(f.runtime.listCommandHistory(f.admission).entries.some((entry) => entry.kind === 'test.wait'), false,
+      'internal journal kinds are never projected');
     assert.equal(inspectWorkspaceCommand(f.runtime, f.admission, randomUUID()).status, 'unverified');
     await assert.rejects(f.runtime.getSnapshot(f.admission), /workspace_refresh_required/);
     await assert.rejects(dispatchWorkspaceCommand(f.runtime, f.admission, uncertain), /workspace_refresh_required/);

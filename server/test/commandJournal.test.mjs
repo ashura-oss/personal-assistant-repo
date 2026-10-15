@@ -126,6 +126,82 @@ test('opening another journal does not invalidate live claims; interrupted recov
   } finally { close(f); }
 });
 
+test('history pages use a stable tied cursor, re-evaluate status, and filter private/internal rows before pagination', () => {
+  const f = setup();
+  try {
+    const ids = Array.from({ length: 52 }, () => randomUUID());
+    const internalId = randomUUID();
+    f.kernel.withTrustedDatabaseTransaction((db) => {
+      const insert = db.prepare(`INSERT INTO async_command_journal(workspace_id,idempotency_key,owner_id,session_digest,request_digest,command_kind,
+        privacy_epoch,ticket_id,ticket_digest,status,created_at,updated_at,checkpoint_revision,snapshot_digest,owned_object_ids_json,receipt_json)
+        VALUES(?,?,?,?,?,?,0,?,?,'claimed',1000,1000,NULL,NULL,NULL,NULL)`);
+      ids.forEach((id, index) => insert.run(f.workspace.workspaceId, id, f.ownerId, 's'.repeat(64), 'r'.repeat(64),
+        index % 2 ? 'chat.create' : 'notes.save', randomUUID(), 't'.repeat(64)));
+      insert.run(f.workspace.workspaceId, internalId, f.ownerId, 's'.repeat(64), 'r'.repeat(64), 'workspace.snapshot.write', randomUUID(), 't'.repeat(64));
+      insert.run(f.workspace.workspaceId, 'not-a-uuid-command', f.ownerId, 's'.repeat(64), 'r'.repeat(64), 'notes.save', randomUUID(), 't'.repeat(64));
+    });
+    const first = f.journal.historyPage(f.admissionSessionA);
+    assert.equal(first.entries.length, 50);
+    assert.ok(first.nextCursor);
+    assert.deepEqual(first.entries.map((entry) => entry.commandId), [...ids].sort().reverse().slice(0, 50));
+    const second = f.journal.historyPage(f.admissionSessionA, first.nextCursor);
+    assert.equal(second.entries.length, 2);
+    assert.equal(second.nextCursor, undefined);
+    assert.equal(new Set([...first.entries, ...second.entries].map((entry) => entry.commandId)).size, 52);
+
+    const dbCursor = Buffer.from(first.nextCursor, 'base64url').toString('utf8');
+    const cursor = JSON.parse(dbCursor);
+    f.kernel.withTrustedDatabaseTransaction((db) => {
+      db.prepare(`INSERT INTO async_command_journal(workspace_id,idempotency_key,owner_id,session_digest,request_digest,command_kind,
+        privacy_epoch,ticket_id,ticket_digest,status,created_at,updated_at,checkpoint_revision,snapshot_digest,owned_object_ids_json,receipt_json)
+        VALUES(?,?,?,?,?,?,0,?,?,'claimed',2000,2000,NULL,NULL,NULL,NULL)`)
+        .run(f.workspace.workspaceId, randomUUID(), f.ownerId, 's'.repeat(64), 'r'.repeat(64), 'notes.save', randomUUID(), 't'.repeat(64));
+      db.prepare(`UPDATE async_command_journal SET status='inspect_required',updated_at=1200
+        WHERE workspace_id=? AND idempotency_key=?`).run(f.workspace.workspaceId, second.entries[0].commandId);
+    });
+    const afterChange = f.journal.historyPage(f.admissionSessionA, first.nextCursor);
+    assert.equal(afterChange.entries.length, 2, 'rows inserted ahead of the cursor do not duplicate prior results');
+    assert.equal(afterChange.entries.find((entry) => entry.commandId === second.entries[0].commandId).status, 'inspect_required');
+    assert.equal(cursor.createdAt, 1000);
+
+    const otherOwner = randomUUID();
+    const otherWorkspace = f.kernel.createWorkspace(otherOwner, { accounts: [], notes: [] });
+    const otherSession = f.kernel.createSession(otherWorkspace.workspaceId, otherOwner, Date.now() + 60 * 60_000);
+    assert.throws(() => f.journal.historyPage(otherSession, first.nextCursor), /cursor_invalid/);
+    for (const badCursor of ['', `${first.nextCursor}=`, Buffer.from(JSON.stringify({ ...cursor, extra: true })).toString('base64url'),
+      Buffer.from(JSON.stringify({ ...cursor, createdAt: cursor.createdAt + 1 })).toString('base64url'),
+      Buffer.from(JSON.stringify({ ...cursor, commandId: internalId })).toString('base64url')]) {
+      assert.throws(() => f.journal.historyPage(f.admissionSessionA, badCursor), /cursor_invalid/);
+    }
+    f.kernel.runLocalCommand(f.runtimeSession, { expectedRevision: 0, expectedPrivacyEpoch: 0,
+      idempotencyKey: randomUUID(), type: 'workspace.erase', canonicalRequest: '{}' }, () => ({
+      snapshot: { accounts: [], notes: [] }, receipt: { kind: 'erase' }, privacyEpoch: 1,
+    }));
+    const newEpochSession = f.kernel.createSession(f.workspace.workspaceId, f.ownerId, Date.now() + 60 * 60_000);
+    assert.throws(() => f.journal.historyPage(newEpochSession, first.nextCursor), /cursor_invalid/);
+    assert.throws(() => f.journal.historyPage(f.admissionSessionA), /session|auth/i);
+  } finally { close(f); }
+});
+
+test('journal schema v1 migrates in place and preserves prior rows', () => {
+  const f = setup();
+  try {
+    const id = randomUUID();
+    f.kernel.withTrustedDatabaseTransaction((db) => {
+      db.prepare(`INSERT INTO async_command_journal(workspace_id,idempotency_key,owner_id,session_digest,request_digest,command_kind,
+        privacy_epoch,ticket_id,ticket_digest,status,created_at,updated_at,checkpoint_revision,snapshot_digest,owned_object_ids_json,receipt_json)
+        VALUES(?,?,?,?,?,?,0,?,?,'claimed',10,10,NULL,NULL,NULL,NULL)`)
+        .run(f.workspace.workspaceId, id, f.ownerId, 's'.repeat(64), 'r'.repeat(64), 'notes.save', randomUUID(), 't'.repeat(64));
+      db.prepare('DROP INDEX async_command_journal_history_idx').run();
+      db.prepare('UPDATE command_journal_schema SET version=1 WHERE singleton=1').run();
+    });
+    new CommandJournal(f.kernel);
+    const version = f.kernel.withTrustedDatabaseTransaction((db) => db.prepare('SELECT version FROM command_journal_schema WHERE singleton=1').get());
+    assert.equal(version.version, 2);
+    assert.equal(f.journal.historyPage(f.admissionSessionA).entries[0].commandId, id);
+  } finally { close(f); }
+});
+
 test('a checkpointed command recovered after restart becomes inspection-only and is never replayed', async () => {
   const f = setup();
   let restartedKernel;

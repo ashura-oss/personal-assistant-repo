@@ -13,6 +13,7 @@ import { SpeechCleanupChildren } from '../../server/src/speechCleanupChildren.js
 import { WorkspaceControllerFactoryInitializationError, WorkspaceRegistry,
   type RuntimeSessionResolver, type WorkspaceRuntimeContext } from '../../server/src/workspaceRegistry.js';
 import type { LoadedWorkspaceIdentity } from '../../server/src/workspaceStore.js';
+import type { WorkspaceCommandHistoryPage } from './workspaceCommandHistory';
 
 export type OwnedWorkspaceFactoryContext = WorkspaceRuntimeContext<AppState> & {
   readonly speechCleanupChildren: SpeechCleanupChildren;
@@ -431,6 +432,19 @@ export class OwnedWorkspaceRuntime {
     this.assertAdmission(admission);
     const identity = this.options.kernel.getOwnedIdentity(admission.sessionToken);
     const result = this.journal.inspectIfExists(admission.sessionToken, idempotencyKey);
+    admission.assertCurrent();
+    const current = this.options.kernel.getOwnedIdentity(admission.sessionToken);
+    if (current.workspaceId !== identity.workspaceId || current.ownerId !== identity.ownerId || current.privacyEpoch !== identity.privacyEpoch) {
+      throw new Error('workspace_ownership_changed');
+    }
+    return result;
+  }
+
+  /** Bounded read-only journal projection; bypasses busy/refresh/controller state. */
+  listCommandHistory(admission: OwnedWorkspaceAdmission, cursor?: unknown): WorkspaceCommandHistoryPage {
+    this.assertAdmission(admission);
+    const identity = this.options.kernel.getOwnedIdentity(admission.sessionToken);
+    const result = this.journal.historyPage(admission.sessionToken, cursor);
     admission.assertCurrent();
     const current = this.options.kernel.getOwnedIdentity(admission.sessionToken);
     if (current.workspaceId !== identity.workspaceId || current.ownerId !== identity.ownerId || current.privacyEpoch !== identity.privacyEpoch) {

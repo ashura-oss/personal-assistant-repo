@@ -9,6 +9,8 @@ import {
   type WorkspaceCommandResponse,
 } from '../cloud/workspaceCommands';
 import type { AuthenticatedSession } from './authClient';
+import { parseWorkspaceCommandHistoryPage, type WorkspaceCommandHistoryEntry, type WorkspaceCommandHistoryKind,
+  type WorkspaceCommandHistoryPage } from '../cloud/workspaceCommandHistory';
 
 export const WORKSPACE_REQUEST_TIMEOUT_MS = 30_000;
 
@@ -34,6 +36,8 @@ export type WorkspaceClient = Readonly<{
   refresh(): Promise<WorkspaceSnapshotDTO>;
   execute(command: WorkspaceCommand, onAdmitted?: (envelope: WorkspaceCommandAdmission) => void): Promise<WorkspaceCommandResponse>;
   inspectCommand(commandId?: string): Promise<WorkspaceCommandResponse>;
+  inspectRecoveredCommand(entry: WorkspaceCommandHistoryEntry): Promise<WorkspaceCommandResponse>;
+  listCommandHistory(cursor?: string): Promise<WorkspaceCommandHistoryPage>;
   getPendingCommand(): PendingWorkspaceCommand | undefined;
   dispose(): void;
 }>;
@@ -226,7 +230,7 @@ export function createWebWorkspaceClient(session: AuthenticatedSession, options:
     return next;
   }
 
-  function parseResponse(value: unknown, expectedCommand?: WorkspaceCommandEnvelope): WorkspaceCommandResponse {
+  function parseResponse(value: unknown, expectedCommand?: WorkspaceCommandEnvelope, expectedHistoryKind?: WorkspaceCommandHistoryKind): WorkspaceCommandResponse {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       throw new WorkspaceClientError('malformed', 'The workspace command receipt could not be confirmed.');
     }
@@ -242,9 +246,11 @@ export function createWebWorkspaceClient(session: AuthenticatedSession, options:
       const commandId = parseWorkspaceCommandId(record.commandId);
       const statuses = ['finished', 'claimed', 'checkpointed', 'inspect_required', 'unverified'] as const;
       if (record.schemaVersion !== 1 || !statuses.includes(record.status as (typeof statuses)[number]) ||
-          (expectedCommand && commandId !== expectedCommand.commandId)) throw new Error('response_invalid');
+          (expectedCommand && commandId !== expectedCommand.commandId) ||
+          (expectedCommand && expectedHistoryKind && expectedCommand.command.kind !== expectedHistoryKind)) throw new Error('response_invalid');
       const status = record.status as WorkspaceCommandResponse['status'];
-      const expectedReceipt = expectedCommand ? expectedReceiptFor(expectedCommand) : undefined;
+      const expectedReceipt = expectedCommand ? expectedReceiptFor(expectedCommand) :
+        expectedHistoryKind ? { commandId, kind: expectedHistoryKind } : undefined;
       const receipt = Object.hasOwn(record, 'receipt')
         ? parseWorkspaceCommandReceipt(record.receipt, expectedReceipt)
         : undefined;
@@ -334,9 +340,10 @@ export function createWebWorkspaceClient(session: AuthenticatedSession, options:
     }
   }
 
-  async function inspectCommand(commandId?: string): Promise<WorkspaceCommandResponse> {
+  async function inspect(commandId: string | undefined, expectedHistoryKind?: WorkspaceCommandHistoryKind,
+    allowOtherPending = false, clearPendingOnSuccess = true): Promise<WorkspaceCommandResponse> {
     assertUsable();
-    if (pending && commandId && commandId !== pending.envelope.commandId) {
+    if (!allowOtherPending && pending && commandId && commandId !== pending.envelope.commandId) {
       throw new WorkspaceClientError('busy', 'Check the pending workspace command receipt first.');
     }
     let inspectedId: string;
@@ -345,7 +352,7 @@ export function createWebWorkspaceClient(session: AuthenticatedSession, options:
     } catch {
       throw new WorkspaceClientError('malformed', 'The workspace command identifier is invalid.');
     }
-    if (pending && inspectedId !== pending.envelope.commandId) {
+    if (!allowOtherPending && pending && inspectedId !== pending.envelope.commandId) {
       throw new WorkspaceClientError('busy', 'Check the pending workspace command receipt first.');
     }
     const ticket = beginOperation();
@@ -358,17 +365,42 @@ export function createWebWorkspaceClient(session: AuthenticatedSession, options:
     assertOperation(ticket);
     let response: WorkspaceCommandResponse;
     try {
-      response = parseResponse(raw, pending?.envelope.commandId === inspectedId ? pending.envelope : undefined);
+      if (raw && typeof raw === 'object' && !Array.isArray(raw) && Object.hasOwn(raw, 'snapshot')) throw new Error('inspection_snapshot_forbidden');
+      const pendingEnvelope = pending?.envelope.commandId === inspectedId ? pending.envelope : undefined;
+      response = parseResponse(raw, pendingEnvelope, expectedHistoryKind);
       if (response.commandId !== inspectedId) throw new Error('command_id_mismatch');
     } catch {
       throw new WorkspaceClientError('malformed', 'The workspace command receipt could not be confirmed.');
     }
-    if (response.snapshot) snapshot = response.snapshot;
-    if (pending?.envelope.commandId === inspectedId && response.status === 'finished' && response.receipt) {
+    if (clearPendingOnSuccess && response.snapshot) snapshot = response.snapshot;
+    if (clearPendingOnSuccess && pending?.envelope.commandId === inspectedId && response.status === 'finished' && response.receipt) {
       pending = undefined;
       if (!response.snapshot) snapshot = undefined;
     }
     return response;
+  }
+
+  function inspectCommand(commandId?: string): Promise<WorkspaceCommandResponse> {
+    return inspect(commandId);
+  }
+
+  async function inspectRecoveredCommand(entry: WorkspaceCommandHistoryEntry): Promise<WorkspaceCommandResponse> {
+    let selected: WorkspaceCommandHistoryEntry;
+    try { selected = parseWorkspaceCommandHistoryPage({ schemaVersion: 1, entries: [entry] }).entries[0]!; }
+    catch { throw new WorkspaceClientError('malformed', 'The selected command history entry is invalid.'); }
+    return inspect(selected.commandId, selected.kind, true, false);
+  }
+
+  async function listCommandHistory(cursor?: string): Promise<WorkspaceCommandHistoryPage> {
+    assertUsable();
+    if (cursor !== undefined && (typeof cursor !== 'string' || !/^[A-Za-z0-9_-]{1,2048}$/.test(cursor))) {
+      throw new WorkspaceClientError('malformed', 'The command history cursor is invalid.');
+    }
+    const ticket = beginOperation();
+    const raw = await request(`/api/workspace/command-history${cursor === undefined ? '' : `?cursor=${cursor}`}`, { method: 'GET' }, ticket);
+    assertOperation(ticket);
+    try { return parseWorkspaceCommandHistoryPage(raw); }
+    catch { throw new WorkspaceClientError('malformed', 'The command history could not be confirmed.'); }
   }
 
   return Object.freeze({
@@ -376,6 +408,8 @@ export function createWebWorkspaceClient(session: AuthenticatedSession, options:
     refresh: () => readSnapshot('/api/workspace/refresh', 'POST'),
     execute,
     inspectCommand,
+    inspectRecoveredCommand,
+    listCommandHistory,
     getPendingCommand: () => pending ? Object.freeze({ commandId: pending.envelope.commandId, command: pending.envelope.command }) : undefined,
     dispose: () => {
       disposed = true;
