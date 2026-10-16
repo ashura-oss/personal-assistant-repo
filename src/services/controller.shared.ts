@@ -82,6 +82,7 @@ import type { ImportedBackupArchive, PortableBackup, PortableKnowledgeCohort } f
 import { createPortableChatHistory, materializeInertChatHistory } from '../chat/portable';
 import { SpeechTranscriptionError, validateTranscriptionState, validateSpeechAudioSnapshot } from '../transcription';
 export { SpeechTranscriptionError };
+export { OpenRouterBatchDispatchError } from './openRouter';
 import type { AnySpeechTranscriptionResult, OpenRouterSpeechTranscriptionResult, SpeechAudioSnapshot, SpeechAttemptCode, TranscriptionAttempt, TranscriptionState } from '../transcription';
 import { OPENROUTER_SPEECH_DEFAULT_MODEL, OPENROUTER_SPEECH_DEFAULT_PROFILE_VERSION } from '../transcription/openRouterSpeechProfiles';
 import type { PreparedSpeechAudio, SpeechAudioService } from '../audio/speechUpload.types';
@@ -99,6 +100,7 @@ import {
 } from './openRouter';
 import { parseOpenRouterPeriodSummaryResult, isOpenRouterPeriodSummaryRequestBody, isOpenRouterPeriodSummaryRecoveryRequestBody,
   validateOpenRouterPeriodSummarySubmission, buildOpenRouterPeriodSummaryRecoveryRequest, higherOpenRouterPeriodSummaryEfforts,
+  isOpenRouterPeriodSummaryBindingShape,
   type OpenRouterPeriodSummaryBinding, type OpenRouterSummaryEffort, type OpenRouterTruncatedPeriodSummaryJob } from './openRouterPeriodSummary';
 import type { OpenRouterSpeechAdapterPort } from './openRouterSpeechAdapter.shared';
 import { emptyChatLedger, selectCompletedChatContext, validateChatLedger } from '../chat/ledger';
@@ -6241,6 +6243,12 @@ export class AppControllerImpl implements AppController {
     return job.status === 'result_truncated' && job.failureCode === 'result_truncated' && !job.resultText && !job.resultSha256 && !job.sourceRemoved;
   }
 
+  private isPeriodSummaryContentJob(job: OpenRouterBatchJob): job is PeriodSummaryContentJob {
+    return job.kind === 'period_summary' && job.sourceRemoved === undefined && job.status !== 'source_removed' &&
+      job.operation === 'period_summary' && job.requestProfileVersion === 6 && job.inputPolicyVersion === 2 &&
+      job.outputPolicyVersion === 2 && isOpenRouterPeriodSummaryBindingShape(job.summaryBinding, job.summaryRecoveryBinding !== undefined);
+  }
+
   async refreshMailReplyBatchSources(jobId: string): Promise<MailReplyBatchSourcesRefreshResult> {
     if (this.activeMailReplyContextRefreshes.has(jobId)) throw new Error('A source refresh for this mail reply is already running.');
     this.mailReplyContextProofs.delete(jobId);
@@ -7398,6 +7406,11 @@ export class AppControllerImpl implements AppController {
         catch { /* Preserve the original provider error when its receipt cannot be safely committed. */ }
         throw error;
       }
+      if (this.isPeriodSummaryContentJob(staged) && error instanceof OpenRouterBatchDispatchError) {
+        try { await this.settlePeriodSummaryDispatchPhase(staged, error.phase, capturedPrivacyEpoch, capturedBootstrapGeneration); }
+        catch { /* Keep the retained submitting state when current ownership cannot be proved. */ }
+        throw error;
+      }
       if (!submittedContextIsCurrent()) throw error;
       if (error instanceof OpenRouterBatchDispatchError && error.phase === 'pre_dispatch') {
         await this.updateOpenRouterBatchJob(staged.id, (job) => ({ ...job, status: 'failed', unknownCharge: false, failureCode: 'not_submitted', updatedAt: now() }), { state: this.state, generation: capturedBootstrapGeneration }).catch(() => undefined);
@@ -7406,6 +7419,43 @@ export class AppControllerImpl implements AppController {
       }
       throw error;
     }
+  }
+
+  private async settlePeriodSummaryDispatchPhase(
+    staged: PeriodSummaryContentJob,
+    phase: OpenRouterBatchDispatchError['phase'],
+    capturedPrivacyEpoch: string | undefined,
+    capturedBootstrapGeneration: number,
+  ): Promise<void> {
+    if (capturedPrivacyEpoch !== this.integration.privacySession?.epoch || capturedBootstrapGeneration !== this.bootstrapGeneration ||
+        !this.loaded || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired) return;
+    await this.assertPrivacySessionCurrent();
+    await this.store.assertCurrent?.();
+    if (capturedPrivacyEpoch !== this.integration.privacySession?.epoch || capturedBootstrapGeneration !== this.bootstrapGeneration ||
+        !this.loaded || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired || this.assistantBatchLedgerMalformed) return;
+
+    const currentState = this.state;
+    const currentJob = this.assistantBatchLedger.jobs.find((job) => job.id === staged.id);
+    const frozenProjection = (job: PeriodSummaryContentJob): string => {
+      const { status: _status, updatedAt: _updatedAt, unknownCharge: _unknownCharge, failureCode: _failureCode, ...frozen } = job;
+      return stableJson(frozen);
+    };
+    if (!currentJob || !this.isPeriodSummaryContentJob(currentJob) || !['preparing', 'submitting'].includes(currentJob.status) ||
+        currentJob.batchId !== undefined || currentJob.sourceRemoved !== undefined || currentJob.customId !== staged.customId ||
+        currentJob.requestProfileVersion !== 6 || currentJob.requestSha256 !== staged.requestSha256 ||
+        currentJob.requestBody !== staged.requestBody || frozenProjection(currentJob) !== frozenProjection(staged)) return;
+
+    const nextStatus = phase === 'pre_dispatch' ? 'failed' : 'submission_unknown';
+    await this.updateOpenRouterBatchJob(staged.id, (job) => {
+      if (!this.isPeriodSummaryContentJob(job) || !['preparing', 'submitting'].includes(job.status) || job.batchId !== undefined ||
+          job.customId !== staged.customId || job.requestProfileVersion !== 6 || job.requestSha256 !== staged.requestSha256 ||
+          job.requestBody !== staged.requestBody || frozenProjection(job) !== frozenProjection(staged)) {
+        throw new Error('The saved period summary changed before its dispatch outcome was retained.');
+      }
+      return phase === 'pre_dispatch'
+        ? { ...job, status: nextStatus, unknownCharge: false, failureCode: 'not_submitted', updatedAt: now() }
+        : { ...job, status: nextStatus, unknownCharge: true, updatedAt: now() };
+    }, { state: currentState, generation: capturedBootstrapGeneration });
   }
 
   private moreComputeChild(parentJobId: string): OpenRouterBatchJob | undefined {

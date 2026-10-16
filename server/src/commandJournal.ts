@@ -394,6 +394,19 @@ export class CommandJournal {
     if (row.status !== 'claimed' && row.status !== 'checkpointed') throw new Error('period_summary_application_ticket_not_active');
   }
 
+  /** Exact active scheduled-summary submission ticket; never accepts a browser workspace command. */
+  assertScheduledPeriodSummarySubmissionWithinTransaction(context: OwnedTransactionContext, ticket: CommandTicketContext): void {
+    if (!context || !ticket || currentTicket.getStore() !== ticket ||
+        ticket.kind !== 'assistant.periodsummary.scheduled.submit') {
+      throw new Error('scheduled_period_summary_ticket_invalid');
+    }
+    this.kernel.assertOwnedTransactionContext(context);
+    const row = this.getTicketRow(context, ticket);
+    if (row.status !== 'claimed' && row.status !== 'checkpointed') {
+      throw new Error('scheduled_period_summary_ticket_not_active');
+    }
+  }
+
   /** Atomically promotes one verified OAuth stage into the workspace and exact encrypted account slot. */
   checkpointOAuthInstall(ticket: CommandTicketContext, stateFence: { workspaceId: string; revision: number; privacyEpoch: number },
     serializedSnapshot: string, accountGenerations: Readonly<Record<string, number>>, install: OAuthInstallCheckpoint): number {

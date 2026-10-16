@@ -2,11 +2,12 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { createDurableKernel } from '../dist/kernel.js';
 import { DocumentLineage } from '../dist/documentLineage.js';
 import { ServerWorkspaceStore, composeSnapshotCommitParticipants } from '../dist/workspaceStore.js';
+import { AppControllerImpl, createInitialWorkspaceState } from '../dist/sharedControllerNode.mjs';
 import { capturePeriodSummarySources, revalidatePeriodSummarySourceCapture, periodSummaryCaptureHasPrivateProof } from '../dist/periodSummarySources.node.mjs';
 
 const START = '2026-06-30T00:00:00.000Z';
@@ -37,6 +38,33 @@ function setup(initial = baseState()) {
 function request(selection = baseSelection(), overrides = {}) {
   return { expectedPrivacyEpoch: 0, period: 'daily', timeZone: 'UTC', localPeriodStart: '2026-06-30', localDeliveryTime: '08:00',
     preparedAt: PREPARED, selection, ...overrides };
+}
+
+async function producedMailSourceDigest(f) {
+  const unavailable = async () => 'unavailable';
+  const controller = new AppControllerImpl({ store: f.store,
+    crypto: { randomUUID, async sha256(value) { return createHash('sha256').update(value).digest('hex'); } },
+    providers: {
+      speech: { async transcribe() { throw new Error('unexpected provider call'); }, async releaseUploadLease() {}, disposeMemory() {} },
+      openAi: { async prepare() { throw new Error('unexpected provider call'); }, async analyze() { throw new Error('unexpected provider call'); },
+        async generateReply() { throw new Error('unexpected provider call'); } },
+    },
+    integration: { tokenStore: { async get() { return { identity: { providerNamespace: 'google', clientId: 'client', subject: 'subject' } }; } },
+      reminderBackend: { platform: 'web', getPermission: unavailable, requestPermission: unavailable, async listPending() { return []; },
+      async schedule() {}, async cancel() {}, async cancelLegacy() {}, async installForegroundHandler() {} },
+      mailAlertBackend: { platform: 'web', getPermission: unavailable, requestPermission: unavailable, async present() { return 'unavailable'; }, async cancel() { return 'unknown'; } },
+      deviceCalendarBackend: { platform: 'web', getPermission: unavailable, requestPermission: unavailable, async listCalendars() { return []; },
+        async getCalendar() { return undefined; }, async readEvents() { return []; }, async createApprovedEvent() { throw new Error('unsupported'); },
+        async lookupRecord() { return undefined; } },
+      async writeDocument() {}, async removeAudio() {}, async loadRecordingRecovery() { return { async pickAndStage() { return null; },
+        async inspect() { throw new Error('unsupported'); }, async remove() {} }; }, bindRecordingRecovery(service) { return service; },
+    },
+  });
+  await controller.load();
+  const result = await controller.getMailReplySource('local-excerpt-message');
+  assert.equal(result.status, 'current');
+  assert.ok(result.source);
+  return result.source;
 }
 
 test('capture resolves a completed DST period and produces private, frozen, stable no-event output', () => {
@@ -114,6 +142,47 @@ test('selected mail distinguishes incomplete coverage from missing complete body
       assert.equal(noBody.outcome, 'deferred_sources');
       assert.equal(noBody.omissions.some((item) => item.reason === 'mail_body_missing'), true);
     } finally { g.close(); }
+  } finally { f.close(); }
+});
+
+test('email excerpts stay deferred by default and require the explicit extracted-text mode', async () => {
+  const accountId = 'account.excerpt';
+  const identity = { providerNamespace: 'google', clientId: 'client', subject: 'subject' };
+  const identityKey = 'google:client:subject:';
+  const account = { id: accountId, provider: 'google', displayName: 'Synthetic', email: 'person@example.test', connected: true, authStatus: 'connected',
+    identity, tokenRef: 'synthetic-ref', grantedScopes: ['https://www.googleapis.com/auth/gmail.readonly'], capabilities: ['mail.read'], connectionGeneration: 4 };
+  const row = { id: 'local-excerpt-message', accountId, providerMessageId: 'provider-excerpt-message', idFormat: 'gmail',
+    identityKey: `${identityKey}:provider-excerpt-message`, verifiedIdentityKey: identityKey, connectionGeneration: 4,
+    internetMessageId: '<excerpt@example.test>', receivedAt: '2026-06-30T12:00:00.000Z', observedAt: new Date().toISOString(),
+    replyMetadataComplete: true, subject: 'A retained excerpt', from: 'sender@example.test' };
+  const producerState = createInitialWorkspaceState(randomUUID, { mode: 'provider', llmProvider: 'openrouter', openRouterModel: 'openai/gpt-6-luna:batch' });
+  Object.assign(producerState, { accounts: [account], mailbox: [row], selectedMailTexts: [], syncStates: {
+    [accountId]: { accountId, status: 'idle', mailHead: { status: 'idle', completeWindow: { from: START, through: END } },
+      mailBackfill: { status: 'idle' }, messagesPartial: false, calendarsPartial: false, eventCursors: {}, eventsCompletedAt: {} },
+  } });
+  const producerFixture = setup(producerState);
+  let producedSource;
+  try { producedSource = await producedMailSourceDigest(producerFixture); }
+  finally { producerFixture.close(); }
+  const text = 'Retained extracted excerpt text.';
+  const body = { version: 1, messageId: row.id, accountId, identityKey, identity, connectionGeneration: 4,
+    providerMessageId: row.providerMessageId, idFormat: 'gmail', sourceDigest: producedSource.sourceDigest, checkedAt: row.observedAt, text,
+    textDigest: createHash('sha256').update(text, 'utf8').digest('hex'), bytes: Buffer.byteLength(text), extractionVersion: 'mail-text-v2',
+    representation: 'snippet', completeness: 'excerpt', omissionReasons: ['body_truncated'] };
+  const syncStates = { [accountId]: { accountId, status: 'idle', mailHead: { status: 'idle', completeWindow: { from: START, through: END } },
+    mailBackfill: { status: 'idle' }, messagesPartial: false, calendarsPartial: false, eventCursors: {}, eventsCompletedAt: {} } };
+  const f = setup(baseState({ accounts: [account], mailbox: [row], selectedMailTexts: [body], syncStates }));
+  try {
+    const selection = { ...baseSelection(), mailAccounts: [{ accountId, expectedConnectionGeneration: 4 }] };
+    const deferred = capturePeriodSummarySources(f.kernel, f.sessionToken, f.lineage, request(selection));
+    assert.equal(deferred.outcome, 'deferred_sources');
+    assert.equal(deferred.omissions.some((item) => item.reason === 'mail_body_incomplete'), true);
+
+    const allowed = capturePeriodSummarySources(f.kernel, f.sessionToken, f.lineage, request(selection,
+      { emailTextMode: 'available_extracted_email_text' }));
+    assert.equal(allowed.outcome, 'ready');
+    assert.match(allowed.sources[0].content, /Retained extracted email text is an excerpt; omissions: body_truncated/);
+    assert.match(allowed.sources[0].content, /Retained extracted excerpt text\./);
   } finally { f.close(); }
 });
 

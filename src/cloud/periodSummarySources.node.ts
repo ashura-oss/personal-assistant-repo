@@ -26,6 +26,7 @@ export interface PeriodSummaryCaptureRequest {
   readonly localPeriodStart: string;
   readonly localDeliveryTime: string;
   readonly preparedAt: string;
+  readonly emailTextMode?: 'complete_body' | 'available_extracted_email_text';
   readonly selection: BackgroundSourceSelection;
 }
 
@@ -56,7 +57,8 @@ type Scope = Readonly<{ workspaceId: string; ownerId: string; privacyEpoch: numb
 type SourceProof = Readonly<{ kind: OpenRouterPeriodSummarySourceKind; locator: string; version: string; contentSha256: string;
   document?: CapturedDocumentDestination; accountId?: string; accountIdentity?: string; generation?: number;
   providerId?: string; containerId?: string; entityId?: string; itemId?: string; sourceRevision?: number; linkedNoteId?: string; linkedNoteRevision?: number;
-  linkedTranscriptSha256?: string; childRefs?: readonly string[] }>;
+  linkedTranscriptSha256?: string; childRefs?: readonly string[]; mailBodyProvenance?: Readonly<{ representation: string; completeness: string;
+    extractionVersion: string; omissionReasons: readonly string[] }> }>;
 type CaptureProof = Readonly<{ scope: Scope; request: PeriodSummaryCaptureRequest; interval: PeriodSummaryCaptureInterval;
   sources: readonly SourceProof[]; destination: CapturedDocumentDestination }>;
 type RawSnapshot = AppState & { assistantChatLedger?: unknown; openRouterBatchLedger?: unknown };
@@ -375,7 +377,8 @@ function buildSources(state: RawSnapshot, lineage: DocumentLineage, context: Own
           !body.text || !HEX.test(body.textDigest ?? '') || sha(body.text) !== body.textDigest) {
         sourceDeferred = true; omissions.push(Object.freeze({ sourceId: `mail:${row.id}`, reason: 'mail_body_missing' })); continue;
       }
-      if (body.completeness !== 'complete_text') {
+      const extractedExcerptAllowed = request.emailTextMode === 'available_extracted_email_text' && body.completeness === 'excerpt';
+      if (body.completeness !== 'complete_text' && !extractedExcerptAllowed) {
         sourceDeferred = true;
         omissions.push(Object.freeze({ sourceId: `mail:${row.id}`, reason: 'mail_body_incomplete', mailBodyProvenance: Object.freeze({
           representation: body.representation, completeness: body.completeness, extractionVersion: body.extractionVersion,
@@ -383,7 +386,12 @@ function buildSources(state: RawSnapshot, lineage: DocumentLineage, context: Own
         continue;
       }
       const receivedAt = row.receivedAt!;
-      const content = `Subject: ${row.subject ?? ''}\nFrom: ${row.from ?? ''}\nReceived: ${receivedAt}\n\n${body.text}`;
+      const excerptLabel = extractedExcerptAllowed
+        ? `\n[Retained extracted email text is an excerpt; omissions: ${body.omissionReasons.join(', ') || 'unspecified'}]\n`
+        : '';
+      const content = `Subject: ${row.subject ?? ''}\nFrom: ${row.from ?? ''}\nReceived: ${receivedAt}${excerptLabel}\n${body.text}`;
+      const mailBodyProvenance = Object.freeze({ representation: body.representation, completeness: body.completeness,
+        extractionVersion: body.extractionVersion, omissionReasons: Object.freeze([...body.omissionReasons]) });
       const version = sha(canonical({ sourceDigest, textDigest: body.textDigest,
         representation: body.representation, completeness: body.completeness, extractionVersion: body.extractionVersion,
         omissionReasons: [...body.omissionReasons] }));
@@ -392,7 +400,7 @@ function buildSources(state: RawSnapshot, lineage: DocumentLineage, context: Own
       add(item, Object.freeze({ ...sourceProofFor(item, row.id, canonical({ sourceDigest, textDigest: body.textDigest,
         representation: body.representation, completeness: body.completeness, extractionVersion: body.extractionVersion,
         omissionReasons: [...body.omissionReasons] })), providerId: row.providerMessageId,
-        accountId: selected.accountId, accountIdentity: resolved.identity, generation: selected.expectedConnectionGeneration }));
+        accountId: selected.accountId, accountIdentity: resolved.identity, generation: selected.expectedConnectionGeneration, mailBodyProvenance }));
     }
   }
 
@@ -459,14 +467,15 @@ function covers(value: unknown, interval: PeriodSummaryCaptureInterval): boolean
 }
 
 function validateRequest(raw: unknown): PeriodSummaryCaptureRequest {
-  const value = closedRecord(raw, ['expectedPrivacyEpoch', 'period', 'timeZone', 'localPeriodStart', 'localDeliveryTime', 'preparedAt', 'selection']);
+  const value = closedRecord(raw, ['expectedPrivacyEpoch', 'period', 'timeZone', 'localPeriodStart', 'localDeliveryTime', 'preparedAt', 'selection'], ['emailTextMode']);
   if (!Number.isSafeInteger(value.expectedPrivacyEpoch) || (value.expectedPrivacyEpoch as number) < 0 ||
       !['daily', 'weekly', 'monthly', 'yearly'].includes(String(value.period)) || typeof value.timeZone !== 'string' ||
-      typeof value.localPeriodStart !== 'string' || typeof value.localDeliveryTime !== 'string' || !canonicalTime(value.preparedAt)) fail('period_summary_capture_invalid');
+      typeof value.localPeriodStart !== 'string' || typeof value.localDeliveryTime !== 'string' || !canonicalTime(value.preparedAt) ||
+      (value.emailTextMode !== undefined && value.emailTextMode !== 'complete_body' && value.emailTextMode !== 'available_extracted_email_text')) fail('period_summary_capture_invalid');
   const selection = cloneSelection(value.selection);
   return Object.freeze({ expectedPrivacyEpoch: value.expectedPrivacyEpoch as number, period: value.period as BackgroundPeriodKind,
     timeZone: value.timeZone, localPeriodStart: value.localPeriodStart, localDeliveryTime: value.localDeliveryTime,
-    preparedAt: value.preparedAt, selection });
+    preparedAt: value.preparedAt, ...(value.emailTextMode === undefined ? {} : { emailTextMode: value.emailTextMode as PeriodSummaryCaptureRequest['emailTextMode'] }), selection });
 }
 
 export function capturePeriodSummarySources(kernel: DurableKernel, sessionToken: string, lineage: DocumentLineage,
@@ -551,7 +560,8 @@ function sourceStillExists(state: RawSnapshot, proof: SourceProof, interval: Per
         !row.providerDeletedAt && row.verifiedIdentityKey === proof.accountIdentity && row.identityKey === `${proof.accountIdentity}:${proof.providerId}` &&
         accountIdentity(account) === proof.accountIdentity && row.connectionGeneration === proof.generation) &&
         state.selectedMailTexts.some((body) => body.accountId === proof.accountId && body.messageId === proof.locator && body.providerMessageId === proof.providerId &&
-          body.identityKey === proof.accountIdentity && body.connectionGeneration === proof.generation && validSelectedMailTextSnapshot(body) && body.completeness === 'complete_text'));
+          body.identityKey === proof.accountIdentity && body.connectionGeneration === proof.generation && validSelectedMailTextSnapshot(body) &&
+          (body.completeness === 'complete_text' || proof.mailBodyProvenance?.completeness === 'excerpt' && body.completeness === 'excerpt')));
     }
     case 'calendar': {
       const calendarId = proof.containerId!; const eventId = proof.providerId!;
@@ -601,43 +611,75 @@ export function revalidatePeriodSummarySourceCapture(kernel: DurableKernel, sess
   const proof = capture && typeof capture === 'object' ? proofs.get(capture) : undefined;
   if (!proof || (mode !== 'exact' && mode !== 'membership')) fail('period_summary_capture_proof_invalid');
   return kernel.withOwnedTransaction(sessionToken, proof.scope.privacyEpoch, (context) => {
-    if (context.workspaceId !== proof.scope.workspaceId || context.ownerId !== proof.scope.ownerId || context.privacyEpoch !== proof.scope.privacyEpoch) {
-      fail('period_summary_capture_scope_changed');
-    }
-    const state = stateFrom(kernel.readOwnedSnapshotWithinTransaction(context));
-    lineage.assertDestination(context, proof.destination);
-    const omitted: PeriodSummaryCaptureOmission[] = [];
-    const rebuilt = proof.interval.empty ? { sources: [], proofs: [], omissions: [], coverageDeferred: false, sourceDeferred: false } :
-      buildSources(state, lineage, context, proof.request, proof.interval);
-    if (mode === 'exact') {
-      const capturedIds = new Set(capture.sources.map((item) => item.id));
-      const rebuiltIds = new Set(rebuilt.sources.map((item) => item.id));
-      if (rebuilt.coverageDeferred || rebuilt.sourceDeferred || capturedIds.size !== rebuiltIds.size ||
-          [...capturedIds].some((id) => !rebuiltIds.has(id))) fail('period_summary_capture_stale');
-    }
-    const currentById = new Map(rebuilt.sources.map((item) => [item.id, item]));
-    for (const item of proof.sources) {
-      const present = sourceStillExists(state, item, proof.interval);
-      if (!present) omitted.push(Object.freeze({ sourceId: `${item.kind}:${item.locator}`, reason: 'selected_context_missing' }));
-      const sourceId = sourceIdForProof(item);
-      const current = currentById.get(sourceId);
-      if (present && mode === 'exact' && !current) omitted.push(Object.freeze({ sourceId, reason: 'selected_context_ineligible' }));
-      if (item.document && present) {
-        const currentDocument = lineage.captureDestination(context, item.document.path);
-        if (currentDocument.documentId !== item.document.documentId) omitted.push(Object.freeze({ sourceId, reason: 'selected_context_ineligible' }));
-      }
-      if (present && mode === 'exact') {
-        const capturedSource = capture.sources.find((candidate) => candidate.id === sourceId);
-        if (!current || !capturedSource || canonical(current) !== canonical(capturedSource)) {
-          omitted.push(Object.freeze({ sourceId, reason: 'selected_context_ineligible' }));
-        }
-      }
-    }
-    if (omitted.length) fail(mode === 'exact' ? 'period_summary_capture_stale' : 'period_summary_capture_source_removed');
-    const refreshed = deepFreeze({ ...capture });
-    proofs.set(refreshed, proof);
-    return refreshed;
+    return revalidateCaptureWithinTransaction(kernel, context, lineage, capture, mode, proof);
   });
+}
+
+/** Same-transaction source fence for trusted snapshot participants; never opens a nested kernel transaction. */
+export function revalidatePeriodSummarySourceCaptureWithinTransaction(kernel: DurableKernel, context: OwnedTransactionContext,
+  lineage: DocumentLineage, capture: PeriodSummarySourceCapture, mode: 'exact' | 'membership'): PeriodSummarySourceCapture {
+  kernel.assertOwnedTransactionContext(context);
+  const proof = capture && typeof capture === 'object' ? proofs.get(capture) : undefined;
+  if (!proof || (mode !== 'exact' && mode !== 'membership')) fail('period_summary_capture_proof_invalid');
+  return revalidateCaptureWithinTransaction(kernel, context, lineage, capture, mode, proof);
+}
+
+/** Extracts only immutable, non-capability metadata from a capture already authenticated by this module's WeakMap. */
+export function periodSummaryCaptureCheckpointEvidence(capture: PeriodSummarySourceCapture): Readonly<{
+  readonly workspaceId: string;
+  readonly ownerId: string;
+  readonly privacyEpoch: number;
+  readonly request: PeriodSummaryCaptureRequest;
+  readonly interval: PeriodSummaryCaptureInterval;
+  readonly destination: CapturedDocumentDestination;
+  readonly sourceProofs: readonly SourceProof[];
+  readonly sourceManifestSha256: string;
+}> {
+  const proof = capture && typeof capture === 'object' ? proofs.get(capture) : undefined;
+  if (!proof) fail('period_summary_capture_proof_invalid');
+  const sourceManifestSha256 = sha(canonical(capture.sources.map(({ content: _content, ...entry }) => entry)));
+  return Object.freeze({ workspaceId: proof.scope.workspaceId, ownerId: proof.scope.ownerId, privacyEpoch: proof.scope.privacyEpoch,
+    request: proof.request, interval: proof.interval, destination: proof.destination, sourceProofs: proof.sources, sourceManifestSha256 });
+}
+
+function revalidateCaptureWithinTransaction(kernel: DurableKernel, context: OwnedTransactionContext, lineage: DocumentLineage,
+  capture: PeriodSummarySourceCapture, mode: 'exact' | 'membership', proof: CaptureProof): PeriodSummarySourceCapture {
+  if (context.workspaceId !== proof.scope.workspaceId || context.ownerId !== proof.scope.ownerId || context.privacyEpoch !== proof.scope.privacyEpoch) {
+    fail('period_summary_capture_scope_changed');
+  }
+  const state = stateFrom(kernel.readOwnedSnapshotWithinTransaction(context));
+  lineage.assertDestination(context, proof.destination);
+  const omitted: PeriodSummaryCaptureOmission[] = [];
+  const rebuilt = proof.interval.empty ? { sources: [], proofs: [], omissions: [], coverageDeferred: false, sourceDeferred: false } :
+    buildSources(state, lineage, context, proof.request, proof.interval);
+  if (mode === 'exact') {
+    const capturedIds = new Set(capture.sources.map((item) => item.id));
+    const rebuiltIds = new Set(rebuilt.sources.map((item) => item.id));
+    if (rebuilt.coverageDeferred || rebuilt.sourceDeferred || capturedIds.size !== rebuiltIds.size ||
+        [...capturedIds].some((id) => !rebuiltIds.has(id))) fail('period_summary_capture_stale');
+  }
+  const currentById = new Map(rebuilt.sources.map((item) => [item.id, item]));
+  for (const item of proof.sources) {
+    const present = sourceStillExists(state, item, proof.interval);
+    if (!present) omitted.push(Object.freeze({ sourceId: `${item.kind}:${item.locator}`, reason: 'selected_context_missing' }));
+    const sourceId = sourceIdForProof(item);
+    const current = currentById.get(sourceId);
+    if (present && mode === 'exact' && !current) omitted.push(Object.freeze({ sourceId, reason: 'selected_context_ineligible' }));
+    if (item.document && present) {
+      const currentDocument = lineage.captureDestination(context, item.document.path);
+      if (currentDocument.documentId !== item.document.documentId) omitted.push(Object.freeze({ sourceId, reason: 'selected_context_ineligible' }));
+    }
+    if (present && mode === 'exact') {
+      const capturedSource = capture.sources.find((candidate) => candidate.id === sourceId);
+      if (!current || !capturedSource || canonical(current) !== canonical(capturedSource)) {
+        omitted.push(Object.freeze({ sourceId, reason: 'selected_context_ineligible' }));
+      }
+    }
+  }
+  if (omitted.length) fail(mode === 'exact' ? 'period_summary_capture_stale' : 'period_summary_capture_source_removed');
+  const refreshed = deepFreeze({ ...capture });
+  proofs.set(refreshed, proof);
+  return refreshed;
 }
 
 export function periodSummaryCaptureHasPrivateProof(value: unknown): value is PeriodSummarySourceCapture {
