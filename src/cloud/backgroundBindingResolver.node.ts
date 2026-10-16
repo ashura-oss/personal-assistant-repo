@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { canonicalVerifiedProviderIdentity, projectBackgroundAuthorityAccounts, type BackgroundAuthorityAccount } from '../core';
 import { scopeGrantsCapability } from '../connectors/oauth';
 import { evaluateProactive, type ProactiveRule } from '../proactive';
+import type { ReminderRecord, ReminderIntent } from '../reminders';
 import { canonicalBackgroundJson } from '../../server/src/backgroundContracts.js';
 import type { BackgroundBindingResolver, ResolvedBackgroundBinding } from '../../server/src/backgroundPolicies.js';
 import type { AccountCapability } from '../core';
@@ -53,8 +54,9 @@ export class ProductionBackgroundBindingResolver implements BackgroundBindingRes
   }
 
   resolve(context: OwnedTransactionContext, specification: BackgroundPolicySpecification): ResolvedBackgroundBinding {
-    if (specification.kind !== 'account_sync' && specification.kind !== 'proactive_draft') throw new Error('background_policy_kind_unavailable');
     const canonical = this.kernel.readOwnedSnapshotWithinTransaction(context).snapshot;
+    if (specification.kind === 'approved_reminder_delivery') return resolveReminderSnapshot(canonical, context, specification);
+    if (specification.kind !== 'account_sync' && specification.kind !== 'proactive_draft') throw new Error('background_policy_kind_unavailable');
     let projectedAccounts: readonly BackgroundAuthorityAccount[];
     try { projectedAccounts = projectBackgroundAuthorityAccounts(canonical); }
     catch { return fail('background_snapshot_invalid'); }
@@ -90,4 +92,50 @@ export class ProductionBackgroundBindingResolver implements BackgroundBindingRes
     return Object.freeze({ accounts: Object.freeze(bound), rule: Object.freeze({ ruleId: rule.id, revision: rule.revision,
       specificationDigest: backgroundProactiveRuleDigest(rule) }) });
   }
+
+  resolveReminderSnapshotTransitionWithinTransaction(context: OwnedTransactionContext, nextRevision: number, candidate: unknown,
+    specification: Extract<BackgroundPolicySpecification, { kind: 'approved_reminder_delivery' }>): ResolvedBackgroundBinding {
+    this.kernel.assertOwnedTransactionContext(context);
+    if (!specification || specification.kind !== 'approved_reminder_delivery' || !Number.isSafeInteger(nextRevision) ||
+        nextRevision !== context.revision + 1 || !candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+      return fail('background_reminder_transition_invalid');
+    }
+    context.assertActive();
+    const row = context.db.prepare('SELECT id,owner_id,revision,privacy_epoch,snapshot_json FROM workspaces WHERE id=?')
+      .get(context.workspaceId) as { id: unknown; owner_id: unknown; revision: unknown; privacy_epoch: unknown; snapshot_json: unknown } | undefined;
+    if (!row || row.id !== context.workspaceId || row.owner_id !== context.ownerId || row.privacy_epoch !== context.privacyEpoch ||
+        row.revision !== nextRevision || typeof row.snapshot_json !== 'string') return fail('background_reminder_transition_stale');
+    let persisted: unknown;
+    try { persisted = JSON.parse(row.snapshot_json); } catch { return fail('background_snapshot_invalid'); }
+    const storedCanonical = canonicalBackgroundJson(persisted, 16 * 1024 * 1024);
+    if (storedCanonical !== row.snapshot_json || canonicalBackgroundJson(candidate, 16 * 1024 * 1024) !== storedCanonical) {
+      return fail('background_reminder_transition_mismatch');
+    }
+    context.assertActive();
+    return resolveReminderSnapshot(persisted, context, specification);
+  }
+}
+
+function resolveReminderSnapshot(canonical: unknown, context: OwnedTransactionContext,
+  specification: Extract<BackgroundPolicySpecification, { kind: 'approved_reminder_delivery' }>): ResolvedBackgroundBinding {
+  const remindersState = (canonical as Record<string, unknown>).reminders;
+  if (!remindersState || typeof remindersState !== 'object' || Array.isArray(remindersState)) return fail('background_reminder_changed');
+  const state = remindersState as Record<string, unknown>;
+  if (!Array.isArray(state.records) || !Array.isArray(state.intents)) return fail('background_reminder_changed');
+  const record = state.records.find((item) => item && typeof item === 'object' && !Array.isArray(item) &&
+    (item as Record<string, unknown>).id === specification.reminderId) as ReminderRecord | undefined;
+  if (!record || record.revision !== specification.expectedReminderRevision || record.status !== 'saved' ||
+      record.approvedRevision !== record.revision || typeof record.approvedPayloadDigest !== 'string' ||
+      !/^[0-9a-f]{64}$/.test(record.approvedPayloadDigest) || !record.currentIntentId ||
+      !Number.isFinite(Date.parse(record.dueAt))) return fail('background_reminder_changed');
+  const intent = state.intents.find((item) => item && typeof item === 'object' && !Array.isArray(item) &&
+    (item as Record<string, unknown>).id === record.currentIntentId) as ReminderIntent | undefined;
+  if (!intent || intent.reminderId !== record.id || intent.reminderRevision !== record.revision ||
+      !Number.isSafeInteger(intent.epoch) || intent.epoch < 1 || intent.desired !== 'scheduled' || !/^[0-9a-f]{64}$/.test(intent.payloadDigest) ||
+      !intent.payload || intent.payload.dueAt !== record.dueAt || intent.payload.title !== record.title ||
+      intent.payload.body !== record.body || intent.payload.displayTimeZone !== record.displayTimeZone ||
+      intent.payload.privacyMode !== record.privacyMode) return fail('background_reminder_changed');
+  return Object.freeze({ reminder: Object.freeze({ reminderId: record.id, revision: record.revision,
+    approvedDigest: record.approvedPayloadDigest, dueAt: Date.parse(record.dueAt), privacyEpoch: context.privacyEpoch,
+    intentId: intent.id, privacyMode: record.privacyMode, deviceSelection: specification.devices }) });
 }

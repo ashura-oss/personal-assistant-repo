@@ -700,6 +700,31 @@ test('transcription command and receipt bind a strict note revision and generate
     /workspace_command_receipt_invalid/);
 });
 
+test('server reminder save binds exact reviewed subscription generations with closed command input', () => {
+  const reminderId = randomUUID();
+  const subscriptionId = randomUUID();
+  const valid = envelope({ kind: 'reminders.serverSave', reminderId, expectedReminderRevision: 4,
+    deviceSelection: { subscriptions: [{ subscriptionId, generation: 7 }] } });
+  assert.deepEqual(parseWorkspaceCommandEnvelope(valid).command.deviceSelection,
+    { subscriptions: [{ subscriptionId, generation: 7 }] });
+  assert.deepEqual(parseWorkspaceCommandEnvelope(envelope({ kind: 'reminders.serverSave', reminderId,
+    expectedReminderRevision: 4, deviceSelection: 'all_current' })).command.deviceSelection, 'all_current');
+  for (const deviceSelection of [
+    { subscriptions: [{ subscriptionId, generation: 0 }] },
+    { subscriptions: [{ subscriptionId, generation: 1 }, { subscriptionId, generation: 2 }] },
+    { subscriptions: [{ subscriptionId, generation: 1, endpoint: 'https://secret.invalid' }] },
+    { subscriptionIds: [subscriptionId] },
+  ]) {
+    assert.throws(() => parseWorkspaceCommandEnvelope(envelope({ kind: 'reminders.serverSave', reminderId,
+      expectedReminderRevision: 4, deviceSelection })), /workspace_command_invalid/);
+  }
+  let getterCalls = 0;
+  const accessor = { subscriptions: [{ subscriptionId, get generation() { getterCalls += 1; return 1; } }] };
+  assert.throws(() => parseWorkspaceCommandEnvelope(envelope({ kind: 'reminders.serverSave', reminderId,
+    expectedReminderRevision: 4, deviceSelection: accessor })), /workspace_command_invalid/);
+  assert.equal(getterCalls, 0);
+});
+
 test('settings.update is rejected while an owned transcription command holds the workspace command lane', async () => {
   const started = deferred();
   const release = deferred();

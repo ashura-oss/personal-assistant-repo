@@ -23,7 +23,8 @@ export type BackgroundPaidConsent = Readonly<{
   model: 'openai/gpt-6-luna:batch';
   effort: 'none' | 'low';
 }>;
-export type BackgroundReminderDevices = 'all_current' | Readonly<{ subscriptionIds: readonly string[] }>;
+export type BackgroundReminderDevices = 'all_current' | Readonly<{ subscriptionIds: readonly string[] }> |
+  Readonly<{ subscriptions: readonly Readonly<{ subscriptionId: string; generation: number }>[] }>;
 
 export type BackgroundPolicySpecification =
   | Readonly<{
@@ -268,8 +269,17 @@ function parseSpecification(raw: unknown): BackgroundPolicySpecification {
     if (raw.devices === 'all_current') devices = 'all_current';
     else {
       if (!plainRecord(raw.devices)) return invalid();
-      exactKeys(raw.devices, ['subscriptionIds']);
-      devices = Object.freeze({ subscriptionIds: uniqueArray(raw.devices.subscriptionIds, uuidV4, 1) });
+      if (Object.hasOwn(raw.devices, 'subscriptionIds')) {
+        exactKeys(raw.devices, ['subscriptionIds']);
+        devices = Object.freeze({ subscriptionIds: uniqueArray(raw.devices.subscriptionIds, uuidV4, 1) });
+      } else {
+        exactKeys(raw.devices, ['subscriptions']);
+        devices = Object.freeze({ subscriptions: uniqueArray(raw.devices.subscriptions, (item) => {
+          if (!plainRecord(item)) return invalid();
+          exactKeys(item, ['subscriptionId', 'generation']);
+          return Object.freeze({ subscriptionId: uuidV4(item.subscriptionId), generation: integer(item.generation, 1) });
+        }, 1) });
+      }
     }
     return Object.freeze({ kind: 'approved_reminder_delivery', reminderId: opaqueId(raw.reminderId),
       expectedReminderRevision: integer(raw.expectedReminderRevision, 1), channel: 'web_push', devices });

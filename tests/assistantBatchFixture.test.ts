@@ -38,4 +38,14 @@ describe('paid text Batch fixture', () => {
     expect(app.getSnapshot().notes.find((item) => item.id === note.id)?.analysis).toBeUndefined();
     expect(calls.map((call) => call.method)).toEqual(['POST', 'GET']);
   });
+
+  it('rejects a caller-forged scheduled private option before creating a job or making a request', async () => {
+    const { app, calls } = await setup();
+    const forged = Object.freeze({ effort: 'none', assertBeforeStart() {}, provenance: Object.freeze({ version: 1,
+      policyId: 'forged-policy', policyRevision: 1, occurrenceId: 'forged-occurrence', attemptId: 'forged-attempt' }) });
+    await expect(app.submitMailReplyBatch({} as never, undefined, forged as never))
+      .rejects.toThrow('background_paid_checkpoint_scope_invalid');
+    expect(app.getSnapshot().assistantBatchJobs ?? []).toEqual([]);
+    expect(calls).toEqual([]);
+  });
 });

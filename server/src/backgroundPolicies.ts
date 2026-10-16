@@ -1,11 +1,14 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import type { DurableKernel, OwnedTransactionContext } from './kernel.js';
 import type { AuthService } from './auth.js';
+import { currentCommandTicket } from './commandJournal.js';
+import type { SnapshotCommitParticipant, SnapshotCommitParticipantInput } from './workspaceStore.js';
+import { consumeReminderSavePolicyCapture, readReminderSavePolicyCapture } from './reminderPolicyCapture.js';
 import { ensureBackgroundSchema } from './backgroundSchema.js';
 import {
   canonicalBackgroundJson, parsePauseBackgroundPolicyEnvelope, parseRevokeBackgroundPolicyEnvelope,
-  parseSaveBackgroundPolicyEnvelope, parseBackgroundPolicyDisplay, parseBackgroundPolicyReceipt,
+  parseSaveBackgroundPolicyEnvelope, parseBackgroundPolicyDisplay, parseBackgroundPolicyReceipt, parseBackgroundSpecification,
   isBackgroundUuidV4, type BackgroundAccountDisplay, type BackgroundPolicyDisplay,
   type BackgroundPolicyReceipt, type BackgroundPolicySpecification, type ChangeBackgroundPolicyEnvelope,
   type SaveBackgroundPolicyEnvelope,
@@ -29,12 +32,17 @@ export type ResolvedBackgroundBinding = Readonly<{
   accounts?: readonly ResolvedBackgroundAccount[];
   rule?: Readonly<{ ruleId: string; revision: number; specificationDigest: string }>;
   reminder?: Readonly<{ reminderId: string; revision: number; approvedDigest: string; dueAt: number; privacyEpoch: number;
-    intentId: string; privacyMode: 'private' | 'full'; deviceSelection: 'all_current' | Readonly<{ subscriptionIds: readonly string[] }> }>;
+    intentId: string; privacyMode: 'private' | 'full'; deviceSelection: 'all_current' |
+      Readonly<{ subscriptionIds: readonly string[] }> |
+      Readonly<{ subscriptions: readonly Readonly<{ subscriptionId: string; generation: number }>[] }> }>;
 }>;
 
 /** Must resolve only exact current saved identities/revisions from the owned context. */
 export interface BackgroundBindingResolver {
   resolve(context: OwnedTransactionContext, specification: BackgroundPolicySpecification): ResolvedBackgroundBinding;
+  /** Resolves only reminder authority against the exact persisted post-commit snapshot in this transaction. */
+  resolveReminderSnapshotTransitionWithinTransaction?(context: OwnedTransactionContext, nextRevision: number, candidate: unknown,
+    specification: Extract<BackgroundPolicySpecification, { kind: 'approved_reminder_delivery' }>): ResolvedBackgroundBinding;
   /** Captures currently eligible devices at the due instant; never called while saving policy authorization. */
   captureReminderTargets?(context: OwnedTransactionContext, specification: Extract<BackgroundPolicySpecification, { kind: 'approved_reminder_delivery' }>,
     reminder: NonNullable<ResolvedBackgroundBinding['reminder']>): readonly Readonly<{ subscriptionId: string; generation: number }>[];
@@ -127,15 +135,31 @@ export function normalizeResolvedBackgroundBinding(value: unknown, specification
       if (specification.devices !== 'all_current') return fail('background_binding_changed');
     } else {
       const selection = reminder.deviceSelection;
-      if (!selection || Object.keys(selection as object).join(',') !== 'subscriptionIds' || !Array.isArray(selection.subscriptionIds) ||
-          selection.subscriptionIds.some((id) => typeof id !== 'string' || id.length === 0 || Buffer.byteLength(id, 'utf8') > 1024 || /[\u0000-\u001f\u007f]/.test(id)) ||
-          new Set(selection.subscriptionIds).size !== selection.subscriptionIds.length || specification.devices === 'all_current' ||
-          canonicalBackgroundJson([...selection.subscriptionIds].sort()) !== canonicalBackgroundJson([...specification.devices.subscriptionIds].sort())) return fail('background_binding_changed');
+      if (!selection || specification.devices === 'all_current') return fail('background_binding_changed');
+      if ('subscriptionIds' in selection) {
+        if (Object.keys(selection as object).join(',') !== 'subscriptionIds' || !Array.isArray(selection.subscriptionIds) ||
+            selection.subscriptionIds.some((id) => typeof id !== 'string' || id.length === 0 || Buffer.byteLength(id, 'utf8') > 1024 || /[\u0000-\u001f\u007f]/.test(id)) ||
+            new Set(selection.subscriptionIds).size !== selection.subscriptionIds.length || !('subscriptionIds' in specification.devices) ||
+            canonicalBackgroundJson([...selection.subscriptionIds].sort()) !== canonicalBackgroundJson([...specification.devices.subscriptionIds].sort())) return fail('background_binding_changed');
+      } else {
+        if (Object.keys(selection as object).join(',') !== 'subscriptions' || !Array.isArray(selection.subscriptions) ||
+            selection.subscriptions.some((item) => !item || Object.keys(item).sort().join(',') !== 'generation,subscriptionId' ||
+              typeof item.subscriptionId !== 'string' || item.subscriptionId.length > 1024 ||
+              /[\u0000-\u001f\u007f]/.test(item.subscriptionId) || !Number.isSafeInteger(item.generation) || item.generation < 1) ||
+            new Set(selection.subscriptions.map((item) => item.subscriptionId)).size !== selection.subscriptions.length ||
+            !('subscriptions' in specification.devices) ||
+            canonicalBackgroundJson([...selection.subscriptions].sort((a, b) => a.subscriptionId.localeCompare(b.subscriptionId))) !==
+              canonicalBackgroundJson([...specification.devices.subscriptions].sort((a, b) => a.subscriptionId.localeCompare(b.subscriptionId)))) return fail('background_binding_changed');
+      }
     }
   } else if (parsed.reminder !== undefined) return fail('background_binding_invalid');
   return Object.freeze({ ...(expectedMap.size ? { accounts: Object.freeze([...actualMap.values()].sort((a, b) => a.accountId.localeCompare(b.accountId)).map((item) => Object.freeze({ ...item }))) } : {}),
     ...(parsed.rule ? { rule: Object.freeze({ ...parsed.rule }) } : {}), ...(parsed.reminder ? { reminder: Object.freeze({ ...parsed.reminder,
-      deviceSelection: parsed.reminder.deviceSelection === 'all_current' ? 'all_current' : Object.freeze({ subscriptionIds: Object.freeze([...parsed.reminder.deviceSelection.subscriptionIds].sort()) }) }) } : {}) });
+      deviceSelection: parsed.reminder.deviceSelection === 'all_current' ? 'all_current' :
+        'subscriptionIds' in parsed.reminder.deviceSelection
+          ? Object.freeze({ subscriptionIds: Object.freeze([...parsed.reminder.deviceSelection.subscriptionIds].sort()) })
+          : Object.freeze({ subscriptions: Object.freeze([...parsed.reminder.deviceSelection.subscriptions]
+            .sort((a, b) => a.subscriptionId.localeCompare(b.subscriptionId)).map((item) => Object.freeze({ ...item }))) }) }) } : {}) });
 }
 
 export function backgroundBindingAuthority(binding: ResolvedBackgroundBinding): unknown {
@@ -189,6 +213,7 @@ export class BackgroundPolicyStore {
   save(admissionSessionToken: string, raw: unknown): BackgroundPolicyReceipt {
     if (typeof admissionSessionToken !== 'string' || !admissionSessionToken) return fail('background_admission_required');
     const envelope = parseSaveBackgroundPolicyEnvelope(raw);
+    if (envelope.specification.kind === 'approved_reminder_delivery') return fail('background_reminder_command_required');
     const result = this.#kernel.withOwnedTransaction(admissionSessionToken, envelope.expectedPrivacyEpoch, (context) => {
       this.#auth.bindInitiatingSessionWithinTransaction(context, admissionSessionToken);
       ensureBackgroundSchema(context.db);
@@ -246,21 +271,26 @@ export class BackgroundPolicyStore {
     });
   }
 
-  list(admissionSessionToken: string, input: { readonly expectedPrivacyEpoch: number; readonly afterPolicyId?: string; readonly limit?: number }): readonly BackgroundPolicyDisplay[] {
-    if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some((key) => !['expectedPrivacyEpoch', 'afterPolicyId', 'limit'].includes(key))) {
+  list(admissionSessionToken: string, input: { readonly expectedPrivacyEpoch: number; readonly afterPolicyId?: string;
+    readonly atOrAfterPolicyId?: string; readonly limit?: number }): readonly BackgroundPolicyDisplay[] {
+    if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some((key) => !['expectedPrivacyEpoch', 'afterPolicyId', 'atOrAfterPolicyId', 'limit'].includes(key)) ||
+        (input.afterPolicyId !== undefined && input.atOrAfterPolicyId !== undefined)) {
       throw new TypeError('background_policy_query_invalid');
     }
     const limit = input?.limit ?? 100;
     if (!Number.isSafeInteger(input?.expectedPrivacyEpoch) || input.expectedPrivacyEpoch < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 100 ||
-        (input.afterPolicyId !== undefined && !isBackgroundUuidV4(input.afterPolicyId))) throw new TypeError('background_policy_query_invalid');
+        (input.afterPolicyId !== undefined && !isBackgroundUuidV4(input.afterPolicyId)) ||
+        (input.atOrAfterPolicyId !== undefined && !isBackgroundUuidV4(input.atOrAfterPolicyId))) throw new TypeError('background_policy_query_invalid');
     return this.#kernel.withOwnedTransaction(admissionSessionToken, input.expectedPrivacyEpoch, (context) => {
       ensureBackgroundSchema(context.db);
       const rows = context.db.prepare(`SELECT h.policy_id,h.current_revision,h.status,h.suspension,h.updated_at,
         r.revision,r.enabled,r.specification_json,r.binding_json,r.binding_digest,r.policy_digest,r.effective_from,r.created_at
         FROM background_policy_heads h JOIN background_policy_revisions r ON r.workspace_id=h.workspace_id AND r.owner_id=h.owner_id
           AND r.privacy_epoch=h.privacy_epoch AND r.policy_id=h.policy_id AND r.revision=h.current_revision
-        WHERE h.workspace_id=? AND h.owner_id=? AND h.privacy_epoch=? AND (? IS NULL OR h.policy_id>?) ORDER BY h.policy_id LIMIT ?`)
-        .all(context.workspaceId, context.ownerId, context.privacyEpoch, input.afterPolicyId ?? null, input.afterPolicyId ?? null, limit) as (PolicyHeadRow & PolicyRevisionRow)[];
+        WHERE h.workspace_id=? AND h.owner_id=? AND h.privacy_epoch=?
+          AND (? IS NULL OR h.policy_id>?) AND (? IS NULL OR h.policy_id>=?) ORDER BY h.policy_id LIMIT ?`)
+        .all(context.workspaceId, context.ownerId, context.privacyEpoch, input.afterPolicyId ?? null, input.afterPolicyId ?? null,
+          input.atOrAfterPolicyId ?? null, input.atOrAfterPolicyId ?? null, limit) as (PolicyHeadRow & PolicyRevisionRow)[];
       return Object.freeze(rows.map((row) => projection(row, row, context)));
     });
   }
@@ -285,7 +315,8 @@ export class BackgroundPolicyStore {
   }
 
   /** Private scheduler metadata page for enabled proactive-draft policy heads. */
-  listProactiveDraftCandidatePage(actorSessionToken: string, input: { readonly expectedPrivacyEpoch: number; readonly afterPolicyId?: string; readonly limit?: number }): Readonly<{ candidates: readonly BackgroundProactiveDraftCandidate[]; nextCursor?: string }> {
+  listProactiveDraftCandidatePage(actorSessionToken: string, input: { readonly expectedPrivacyEpoch: number; readonly afterPolicyId?: string;
+    readonly atOrAfterPolicyId?: string; readonly limit?: number }): Readonly<{ candidates: readonly BackgroundProactiveDraftCandidate[]; nextCursor?: string }> {
     const policies = this.list(actorSessionToken, input);
     return this.#kernel.withOwnedTransaction(actorSessionToken, input.expectedPrivacyEpoch, (context) => {
       ensureBackgroundSchema(context.db);
@@ -301,6 +332,26 @@ export class BackgroundPolicyStore {
       const nextCursor = policies.length === (input.limit ?? 100) ? policies.at(-1)?.policyId : undefined;
       return Object.freeze({ candidates: Object.freeze(candidates), ...(nextCursor ? { nextCursor } : {}) });
     });
+  }
+
+  assertProactiveDraftPreflightCurrentWithinTransaction(context: OwnedTransactionContext, input: Readonly<{ policyId: string; policyRevision: number }>): void {
+    this.#kernel.assertOwnedTransactionContext(context);
+    if (!input || !isBackgroundUuidV4(input.policyId) || !Number.isSafeInteger(input.policyRevision) || input.policyRevision < 1) {
+      return fail('background_policy_query_invalid');
+    }
+    ensureBackgroundSchema(context.db);
+    const head = this.#head(context.db, context, input.policyId);
+    if (!head || head.current_revision !== input.policyRevision || head.status !== 'enabled') return fail('background_occurrence_policy_stale');
+    const row = context.db.prepare(`SELECT revision,enabled,specification_json,binding_json,binding_digest,policy_digest,effective_from,created_at
+      FROM background_policy_revisions WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND policy_id=? AND revision=?`)
+      .get(context.workspaceId, context.ownerId, context.privacyEpoch, input.policyId, input.policyRevision) as PolicyRevisionRow | undefined;
+    if (!row || row.enabled !== 1) return fail('background_occurrence_policy_stale');
+    const displayed = projection(head, row, context);
+    if (displayed.specification.kind !== 'proactive_draft') return fail('background_policy_kind_unavailable');
+    const stored = normalizeResolvedBackgroundBinding(parseStored<ResolvedBackgroundBinding>(row.binding_json), displayed.specification, context.privacyEpoch);
+    const current = normalizeResolvedBackgroundBinding(this.#resolver.resolve(context, displayed.specification), displayed.specification, context.privacyEpoch);
+    if (canonicalBackgroundJson(backgroundBindingAuthority(current), MAX_PRIVATE_BYTES) !==
+        canonicalBackgroundJson(backgroundBindingAuthority(stored), MAX_PRIVATE_BYTES)) return fail('background_binding_changed');
   }
 
   /** Trusted scheduler hold for an exact account-sync revision whose live identity no longer matches consent. */
@@ -403,4 +454,163 @@ export class BackgroundPolicyStore {
       VALUES(?,?,?,?,?,?,?)`).run(context.workspaceId, context.ownerId, context.privacyEpoch, commandId, digest(request), json, epoch(this.#clock()));
     return Object.freeze(receipt);
   }
+
+  /**
+   * Couples reminder policy creation/revocation to the canonical snapshot commit.
+   * Only the exact server-save command capture can create delivery consent.
+   */
+  createReminderSnapshotCommitParticipant<TState extends object>(): SnapshotCommitParticipant<TState> {
+    return Object.freeze({
+      beforeCommit: (_context: OwnedTransactionContext, input: SnapshotCommitParticipantInput<TState>) => {
+        const ticket = currentCommandTicket();
+        if (ticket?.kind === 'reminders.serversave' && (!input.commandId || input.commandId !== ticket.idempotencyKey)) {
+          return fail('background_reminder_command_capture_invalid');
+        }
+      },
+      commit: (context: OwnedTransactionContext, input: SnapshotCommitParticipantInput<TState>) => {
+        const ticket = currentCommandTicket();
+        if (ticket?.kind === 'reminders.serversave') {
+          if (!input.commandId || input.commandId !== ticket.idempotencyKey) return fail('background_reminder_command_capture_invalid');
+          const capturePreview = readReminderSavePolicyCapture(context, input.commandId);
+          const after = reminderSnapshotRecord(input.nextSnapshot, capturePreview.reminderId);
+          const before = reminderSnapshotRecord(input.previousSnapshot, capturePreview.reminderId);
+          if (!before || !after || before.status !== 'approved' || after.status !== 'saved' || before.revision !== after.revision ||
+              after.revision !== capturePreview.reminderRevision ||
+              before.approvedRevision !== after.revision || after.approvedRevision !== after.revision ||
+              before.approvedPayloadDigest !== after.approvedPayloadDigest || !after.currentIntentId) {
+            return fail('background_reminder_snapshot_transition_invalid');
+          }
+          const capture = consumeReminderSavePolicyCapture(context, capturePreview);
+          const specification = parseBackgroundSpecification({ kind: 'approved_reminder_delivery', reminderId: after.id,
+            expectedReminderRevision: after.revision, channel: 'web_push', devices: capture.devices });
+          if (specification.kind !== 'approved_reminder_delivery') return fail('background_reminder_policy_invalid');
+          this.#insertReminderPolicy(context, capture.policyId, specification, input.commandId, input.nextRevision, input.nextSnapshot);
+          return Object.freeze([reminderPolicyWake(context)]);
+        }
+
+        return this.#revokeChangedReminderPolicies(context, input) ? Object.freeze([reminderPolicyWake(context)]) : undefined;
+      },
+      afterAcknowledged: (intentIds: readonly string[]) => {
+        for (const value of intentIds) {
+          const identity = parseReminderPolicyWake(value);
+          if (identity) {
+            try { this.#onCommitted?.(identity); } catch { /* The durable policy is authoritative; scheduler polling remains safe. */ }
+          }
+        }
+      },
+    });
+  }
+
+  #insertReminderPolicy(context: OwnedTransactionContext, policyId: string, specification: Extract<BackgroundPolicySpecification, { kind: 'approved_reminder_delivery' }>,
+    commandId: string, nextRevision: number, nextSnapshot: object): void {
+    if (!isBackgroundUuidV4(policyId) || !isBackgroundUuidV4(commandId)) return fail('background_reminder_policy_invalid');
+    ensureBackgroundSchema(context.db);
+    if (this.#head(context.db, context, policyId)) return fail('background_policy_id_conflict');
+    const binding = this.#resolveReminderSnapshotTransition(context, nextRevision, nextSnapshot, specification);
+    if (!binding.reminder || binding.reminder.deviceSelection !== 'all_current' &&
+        !('subscriptions' in binding.reminder.deviceSelection)) return fail('background_reminder_generation_required');
+    const bindingJson = canonicalBackgroundJson(binding, MAX_PRIVATE_BYTES);
+    const specificationJson = canonicalBackgroundJson(specification);
+    const now = epoch(this.#clock());
+    const bindingDigest = digest(canonicalBackgroundJson(backgroundBindingAuthority(binding), MAX_PRIVATE_BYTES));
+    const policyDigest = digest(canonicalBackgroundJson({ workspaceId: context.workspaceId, ownerId: context.ownerId,
+      privacyEpoch: context.privacyEpoch, policyId, revision: 1, enabled: true, specification: JSON.parse(specificationJson), bindingDigest,
+      effectiveFrom: now }));
+    context.db.prepare(`INSERT INTO background_policy_revisions(workspace_id,owner_id,privacy_epoch,policy_id,revision,enabled,
+      specification_json,binding_json,binding_digest,policy_digest,effective_from,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(context.workspaceId, context.ownerId, context.privacyEpoch, policyId, 1, 1,
+        specificationJson, bindingJson, bindingDigest, policyDigest, now, now);
+    context.db.prepare(`INSERT INTO background_policy_heads(workspace_id,owner_id,privacy_epoch,policy_id,current_revision,status,suspension,updated_at)
+      VALUES(?,?,?,?,1,'enabled',NULL,?)`).run(context.workspaceId, context.ownerId, context.privacyEpoch, policyId, now);
+    this.#saveReceipt(context, commandId, canonicalBackgroundJson({ operation: 'reminder_snapshot_save', policyId, specification }),
+      { schemaVersion: 1, commandId, operation: 'save', policyId, policyRevision: 1, status: 'enabled', effectiveFrom: now });
+  }
+
+  #resolveReminderSnapshotTransition(context: OwnedTransactionContext, nextRevision: number, candidate: object,
+    specification: Extract<BackgroundPolicySpecification, { kind: 'approved_reminder_delivery' }>): ResolvedBackgroundBinding {
+    const resolve = this.#resolver.resolveReminderSnapshotTransitionWithinTransaction;
+    if (!resolve || !candidate || typeof candidate !== 'object') return fail('background_reminder_transition_resolver_required');
+    return normalizeResolvedBackgroundBinding(resolve.call(this.#resolver, context, nextRevision, candidate, specification), specification, context.privacyEpoch);
+  }
+
+  #revokeChangedReminderPolicies<TState extends object>(context: OwnedTransactionContext, input: SnapshotCommitParticipantInput<TState>): boolean {
+    ensureBackgroundSchema(context.db);
+    const heads = context.db.prepare(`SELECT policy_id,current_revision,status,suspension,updated_at FROM background_policy_heads
+      WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND status!='revoked'`)
+      .all(context.workspaceId, context.ownerId, context.privacyEpoch) as PolicyHeadRow[];
+    let changed = false;
+    for (const head of heads) {
+      const row = context.db.prepare(`SELECT revision,enabled,specification_json,binding_json,binding_digest,policy_digest,effective_from,created_at
+        FROM background_policy_revisions WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND policy_id=? AND revision=?`)
+        .get(context.workspaceId, context.ownerId, context.privacyEpoch, head.policy_id, head.current_revision) as PolicyRevisionRow | undefined;
+      if (!row) return fail('background_policy_storage_invalid');
+      const display = projection(head, row, context);
+      if (display.specification.kind !== 'approved_reminder_delivery') continue;
+      let stillCurrent = false;
+      try {
+        const current = this.#resolveReminderSnapshotTransition(context, input.nextRevision, input.nextSnapshot, display.specification);
+        const stored = parseStored<ResolvedBackgroundBinding>(row.binding_json);
+        stillCurrent = canonicalBackgroundJson(backgroundBindingAuthority(current), MAX_PRIVATE_BYTES) ===
+          canonicalBackgroundJson(backgroundBindingAuthority(stored), MAX_PRIVATE_BYTES);
+      } catch (error) {
+        if (!(error instanceof Error) || !['background_reminder_changed', 'background_binding_changed'].includes(error.message)) throw error;
+      }
+      if (!stillCurrent) { this.#appendReminderRevocation(context, head, row, input.commandId); changed = true; }
+    }
+    return changed;
+  }
+
+  #appendReminderRevocation(context: OwnedTransactionContext, head: PolicyHeadRow, current: PolicyRevisionRow, causeCommandId?: string): void {
+    const revision = current.revision + 1;
+    if (!Number.isSafeInteger(revision)) return fail('background_policy_revision_overflow');
+    const now = epoch(this.#clock());
+    const policyDigest = digest(canonicalBackgroundJson({ workspaceId: context.workspaceId, ownerId: context.ownerId,
+      privacyEpoch: context.privacyEpoch, policyId: head.policy_id, revision, enabled: 0,
+      previousPolicyDigest: current.policy_digest, operation: 'reminder_changed', causeCommandId: causeCommandId ?? null }));
+    context.db.prepare(`INSERT INTO background_policy_revisions(workspace_id,owner_id,privacy_epoch,policy_id,revision,enabled,
+      specification_json,binding_json,binding_digest,policy_digest,effective_from,created_at) VALUES(?,?,?,?,?,0,?,?,?,?,?,?)`)
+      .run(context.workspaceId, context.ownerId, context.privacyEpoch, head.policy_id, revision,
+        current.specification_json, current.binding_json, current.binding_digest, policyDigest, now, now);
+    context.db.prepare(`UPDATE background_policy_heads SET current_revision=?,status='revoked',suspension='reminder_changed',updated_at=?
+      WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND policy_id=? AND current_revision=?`)
+      .run(revision, now, context.workspaceId, context.ownerId, context.privacyEpoch, head.policy_id, current.revision);
+    const commandId = randomUUID();
+    const request = canonicalBackgroundJson({ operation: 'reminder_changed', causeCommandId: causeCommandId ?? null,
+      policyId: head.policy_id, revision });
+    this.#saveReceipt(context, commandId, request, { schemaVersion: 1, commandId, operation: 'revoke', policyId: head.policy_id,
+      policyRevision: revision, status: 'revoked', effectiveFrom: now });
+  }
+}
+
+function reminderSnapshotRecord(snapshot: object, reminderId: string): Readonly<Record<string, unknown>> | undefined {
+  if (!snapshot || typeof snapshot !== 'object' || !reminderId) return undefined;
+  const reminders = (snapshot as Record<string, unknown>).reminders;
+  if (!reminders || typeof reminders !== 'object' || Array.isArray(reminders)) return undefined;
+  const records = (reminders as Record<string, unknown>).records;
+  if (!Array.isArray(records)) return undefined;
+  const found = records.find((item) => item && typeof item === 'object' && !Array.isArray(item) && (item as Record<string, unknown>).id === reminderId);
+  return found && typeof found === 'object' && !Array.isArray(found) ? found as Readonly<Record<string, unknown>> : undefined;
+}
+
+function reminderPolicyWake(context: OwnedTransactionContext): string {
+  const body = canonicalBackgroundJson({ workspaceId: context.workspaceId, ownerId: context.ownerId, privacyEpoch: context.privacyEpoch });
+  return `reminder-policy-wake:${Buffer.from(body, 'utf8').toString('base64url')}`;
+}
+
+function parseReminderPolicyWake(value: string): Readonly<{ workspaceId: string; ownerId: string; privacyEpoch: number }> | undefined {
+  const prefix = 'reminder-policy-wake:';
+  if (typeof value !== 'string' || !value.startsWith(prefix)) return undefined;
+  const encoded = value.slice(prefix.length);
+  if (!/^[A-Za-z0-9_-]+$/.test(encoded)) return undefined;
+  try {
+    const bytes = Buffer.from(encoded, 'base64url');
+    if (bytes.toString('base64url') !== encoded) return undefined;
+    const text = bytes.toString('utf8');
+    const parsed = JSON.parse(text) as Record<string, unknown>;
+    if (canonicalBackgroundJson(parsed) !== text || Object.keys(parsed).sort().join(',') !== 'ownerId,privacyEpoch,workspaceId' ||
+        typeof parsed.workspaceId !== 'string' || !isBackgroundUuidV4(parsed.workspaceId) ||
+        typeof parsed.ownerId !== 'string' || !isBackgroundUuidV4(parsed.ownerId) ||
+        !Number.isSafeInteger(parsed.privacyEpoch) || (parsed.privacyEpoch as number) < 0) return undefined;
+    return Object.freeze({ workspaceId: parsed.workspaceId, ownerId: parsed.ownerId, privacyEpoch: parsed.privacyEpoch as number });
+  } catch { return undefined; }
 }

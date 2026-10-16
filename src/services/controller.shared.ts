@@ -116,6 +116,7 @@ import { parseOpenRouterMailReplyResult, validOpenRouterMailReplyBinding, validR
 
 export interface ControllerCryptoPort { randomUUID(): string; sha256(value: string | Uint8Array): Promise<string> }
 const now = () => new Date().toISOString();
+const scheduledProactiveRequestAsOf = new WeakMap<object, string>();
 const ASSIST_CONTRACT_VERSION = 'assist-v3';
 function validTimezone(value?: string): string {
   const candidate = value?.trim() || Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Singapore';
@@ -1471,6 +1472,13 @@ export interface ControllerIntegrationDependencies {
   openRouterBatchClient?: OpenRouterBatchClient;
   openRouterSpeechAdapter?: OpenRouterSpeechAdapterPort;
   periodSummaryApplication?: PeriodSummaryApplicationPort;
+  /** Private Node composition proof for the one standing-consent mail-reply checkpoint path. */
+  assertProactiveMailCheckpoint?: (input: Readonly<{ policyId: string; policyRevision: number; occurrenceId: string; attemptId: string;
+    accountId: string; expectedConnectionGeneration: number; messageId: string }>) => string;
+  /** Resolves scheduled mail jobs only through their exact private durable checkpoint link. */
+  resolveProactiveMailReplyJobAuthority?: (job: OpenRouterMailReplyContentJob) => Promise<Readonly<
+    { status: 'foreground' } | { status: 'scheduled'; effort: 'none' | 'low' } |
+    { status: 'certified_not_submitted'; effort: 'none' | 'low' }>>;
 }
 
 interface BackupImportSession {
@@ -3780,6 +3788,18 @@ export class AppControllerImpl implements AppController {
 
   private async assertMailReplyBatchJobIntegrity(job: OpenRouterMailReplyContentJob, requireResult: boolean): Promise<void> {
     const binding = job.mailReplyBinding;
+    let scheduledEffort: 'none' | 'low' | undefined;
+    if (this.integration.resolveProactiveMailReplyJobAuthority) {
+      const authority = await this.integration.resolveProactiveMailReplyJobAuthority(job);
+      if (authority.status === 'scheduled') scheduledEffort = authority.effort;
+      else if (authority.status === 'certified_not_submitted') {
+        if (job.status !== 'failed' || job.failureCode !== 'not_submitted' || job.unknownCharge !== false || job.batchId !== undefined) {
+          throw new Error('The saved Batch result failed private scheduled-work verification.');
+        }
+        // This certificate classifies an inert, provably unsubmitted job only. It never grants submission authority.
+      }
+      else if (job.proactiveMailReply) throw new Error('The saved Batch result failed private scheduled-work verification.');
+    } else if (job.proactiveMailReply) throw new Error('The saved Batch result failed private scheduled-work verification.');
     const recovery = job.requestProfileVersion === 4 ? job.recoveryBinding : undefined;
     const recoveryBaseProfile = recovery?.baseRequestProfileVersion;
     if (!binding || !validOpenRouterMailReplyBinding(binding, job.inputPolicyVersion === 2 ? 2 : 1) ||
@@ -3795,7 +3815,9 @@ export class AppControllerImpl implements AppController {
     if (!isRecord(settingsValue) || !settingKeys.every((key) => Object.hasOwn(settingsValue, key)) ||
         Object.keys(settingsValue).some((key) => !settingKeys.includes(key)) || settingsValue.mode !== 'provider' || settingsValue.llmProvider !== 'openrouter' ||
         settingsValue.openRouterModel !== OPENROUTER_BATCH_MODEL || typeof settingsValue.openRouterReasoningEffort !== 'string' ||
-        !['none', 'low'].includes(settingsValue.openRouterReasoningEffort) || settingsValue.llmRequestContractVersion !== OPENROUTER_BATCH_REQUEST_PROFILE_VERSION ||
+        !['none', 'low'].includes(settingsValue.openRouterReasoningEffort) ||
+        (scheduledEffort !== undefined && settingsValue.openRouterReasoningEffort !== scheduledEffort) ||
+        settingsValue.llmRequestContractVersion !== OPENROUTER_BATCH_REQUEST_PROFILE_VERSION ||
         settingsValue.timezone !== binding.timeZone) throw new Error('The frozen reply settings are invalid.');
     const frozenSettings = { ...this.state.settings, ...settingsValue, ...(job.requestProfileVersion === 4 ? { openRouterReasoningEffort: job.effort } : {}) } as AppSettings;
     const policyContext = binding.policy.map((item) => `### ${item.path} (revision ${item.revision})\n${item.content}`).join('\n\n');
@@ -5929,7 +5951,10 @@ export class AppControllerImpl implements AppController {
     return this.dispatchPreparedBatch(staged, capturedGeneration, this.state, undefined, authorityCheck);
   }
 
-  async submitMailReplyBatch(input: Omit<MailReplyTextGenerationInput, 'forceRefresh'>, commandFence?: { accountId: string; expectedConnectionGeneration: number }): Promise<AssistantBatchJobDTO> {
+  async submitMailReplyBatch(input: Omit<MailReplyTextGenerationInput, 'forceRefresh'>, commandFence?: { accountId: string; expectedConnectionGeneration: number },
+    privateSchedule?: Readonly<{ effort: 'none' | 'low'; assertBeforeStart: () => void; provenance: Readonly<{ version: 1; policyId: string;
+      policyRevision: number; occurrenceId: string; attemptId: string }> }>): Promise<AssistantBatchJobDTO> {
+    if (privateSchedule && !scheduledProactiveRequestAsOf.has(privateSchedule)) throw new Error('background_paid_checkpoint_scope_invalid');
     if (!input || !['reply', 'reply_all'].includes(input.mode) || !Number.isSafeInteger(input.composerRevision) || input.composerRevision < 0 ||
         typeof input.messageId !== 'string' || !input.messageId || input.messageId.length > 256 || typeof input.sourceDigest !== 'string' ||
         typeof input.textDigest !== 'string' || !Array.isArray(input.to) || !Array.isArray(input.cc) || typeof input.brief !== 'string' ||
@@ -5945,7 +5970,7 @@ export class AppControllerImpl implements AppController {
       ...(input.contextSelectionIds ? { contextSelectionIds: Object.freeze([...input.contextSelectionIds]) } : {}),
       ...(input.contextExcerptSelectionIds ? { contextExcerptSelectionIds: Object.freeze([...input.contextExcerptSelectionIds]) } : {}) });
     this.activeMailReplyBatchSubmissions.set(capturedInput.messageId, undefined);
-    try { return await this.submitMailReplyBatchCaptured(capturedInput, commandFence); }
+    try { return await this.submitMailReplyBatchCaptured(capturedInput, commandFence, privateSchedule); }
     finally { this.activeMailReplyBatchSubmissions.delete(capturedInput.messageId); }
   }
 
@@ -5954,8 +5979,27 @@ export class AppControllerImpl implements AppController {
     return this.submitMailReplyBatch(request, { accountId, expectedConnectionGeneration });
   }
 
+  /** Private Node-only scheduled path. The ALS checkpoint scope and one-use claim are required. */
+  async submitScheduledProactiveMailReply(input: Omit<MailReplyTextGenerationInput, 'forceRefresh' | 'noteId' | 'noteRevision' |
+    'contextSelectionIds' | 'contextExcerptSelectionIds'> & { accountId: string; expectedConnectionGeneration: number },
+    options: Readonly<{ effort: 'none' | 'low'; assertBeforeStart: () => void;
+      provenance: Readonly<{ version: 1; policyId: string; policyRevision: number; occurrenceId: string; attemptId: string }> }>): Promise<AssistantBatchJobDTO> {
+    if (!options || typeof options.assertBeforeStart !== 'function' || !options.provenance || !this.integration.assertProactiveMailCheckpoint) {
+      throw new Error('background_paid_checkpoint_scope_invalid');
+    }
+    const frozenRequestAsOf = this.integration.assertProactiveMailCheckpoint({ ...options.provenance, accountId: input.accountId,
+      expectedConnectionGeneration: input.expectedConnectionGeneration, messageId: input.messageId });
+    if (typeof frozenRequestAsOf !== 'string' || !Number.isFinite(Date.parse(frozenRequestAsOf)) ||
+        new Date(frozenRequestAsOf).toISOString() !== frozenRequestAsOf) throw new Error('background_paid_checkpoint_scope_invalid');
+    const trustedSchedule = Object.freeze({ ...options });
+    scheduledProactiveRequestAsOf.set(trustedSchedule, frozenRequestAsOf);
+    return this.submitMailReplyBatch(input, { accountId: input.accountId, expectedConnectionGeneration: input.expectedConnectionGeneration }, trustedSchedule);
+  }
+
   private async submitMailReplyBatchCaptured(input: Omit<MailReplyTextGenerationInput, 'forceRefresh' | 'to' | 'cc'> & { to: readonly string[]; cc: readonly string[] },
-    commandFence?: { accountId: string; expectedConnectionGeneration: number }): Promise<AssistantBatchJobDTO> {
+    commandFence?: { accountId: string; expectedConnectionGeneration: number },
+    privateSchedule?: Readonly<{ effort: 'none' | 'low'; assertBeforeStart: () => void; provenance: Readonly<{ version: 1; policyId: string;
+      policyRevision: number; occurrenceId: string; attemptId: string }> }>): Promise<AssistantBatchJobDTO> {
     await this.load();
     if (this.assistantBatchLedgerMalformed || !this.loaded || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired) {
       throw new Error('Refresh local data before submitting a mail reply Batch request.');
@@ -5970,7 +6014,10 @@ export class AppControllerImpl implements AppController {
     const privacyEpoch = this.integration.privacySession?.epoch;
     const staged = await this.mutate(async (draft) => {
       if (this.bootstrapGeneration !== capturedGeneration || this.startupRecoveryPhase !== 'ready' || this.mailAlertRefreshRequired ||
-          draft.settings.mode !== 'provider' || draft.settings.llmProvider !== 'openrouter') throw new Error('Select OpenRouter in Provider mode before submitting a mail reply.');
+          (!privateSchedule && (draft.settings.mode !== 'provider' || draft.settings.llmProvider !== 'openrouter'))) throw new Error('Select OpenRouter in Provider mode before submitting a mail reply.');
+      const requestSettings = privateSchedule ? { ...draft.settings, mode: 'provider' as const, llmProvider: 'openrouter' as const,
+        openRouterModel: OPENROUTER_BATCH_MODEL, openRouterReasoningEffort: privateSchedule.effort,
+        llmRequestContractVersion: OPENROUTER_BATCH_REQUEST_PROFILE_VERSION } : draft.settings;
       const sourceResult = await this.currentMailReplySource(draft, input.messageId);
       if (sourceResult.status !== 'current' || !sourceResult.source || !sourceResult.defaults || sourceResult.source.sourceDigest !== input.sourceDigest) {
         throw new Error('Refresh the selected message before submitting a reply.');
@@ -6002,7 +6049,7 @@ export class AppControllerImpl implements AppController {
         if (!note || note.revision !== input.noteRevision || note.origin === 'assistant_chat' || !note.transcript.trim()) throw new Error('The selected note changed or has no transcript. Reopen the picker and select it again.');
         this.requireConfirmedCaptureTimeZone(note);
         const capturedAt = note.capturedAt ?? note.createdAt;
-        const captureTimeZone = note.captureTimeZone ?? draft.settings.timezone;
+        const captureTimeZone = note.captureTimeZone ?? requestSettings.timezone;
         frozenNote = Object.freeze({ id: note.id, revision: note.revision, text: note.transcript,
           textSha256: await this.crypto.sha256( note.transcript),
           capturedAt, captureTimeZone });
@@ -6011,8 +6058,13 @@ export class AppControllerImpl implements AppController {
       } else if (input.noteRevision !== undefined) throw new Error('A note revision was supplied without a selected note.');
       const policies = draft.documents.filter((doc) => /^memory\/(?:RULES|ROUTINES)\.md$/i.test(doc.path));
       const policyContext = policies.map((doc) => `### ${doc.path} (revision ${doc.revision})\n${doc.content}`).join('\n\n');
-      const asOf = now();
-      const timeZone = validTimezone(draft.settings.timezone);
+      let asOf = now();
+      if (privateSchedule) {
+        const frozenScheduledRequestAsOf = scheduledProactiveRequestAsOf.get(privateSchedule);
+        if (!frozenScheduledRequestAsOf) throw new Error('background_paid_checkpoint_scope_invalid');
+        asOf = frozenScheduledRequestAsOf;
+      }
+      const timeZone = validTimezone(requestSettings.timezone);
       let context: OpenRouterMailReplyContextSource[] | undefined;
       const selectionIds = input.contextSelectionIds ?? [];
       const excerptIds = input.contextExcerptSelectionIds ?? [];
@@ -6045,18 +6097,18 @@ export class AppControllerImpl implements AppController {
         ? this.createOpenRouterBatchRequestBuilder().prepareReplyWithContext({ ...replyInput, contextMessages: context.map((item) => ({ text: item.body.text,
             subject: item.source.subject, ...(item.source.senderEmail ? { sender: item.source.senderEmail } : {}),
             ...(item.receivedAt ? { receivedAt: item.receivedAt } : {}), ...(item.sentAt ? { sentAt: item.sentAt } : {}),
-            representation: item.body.representation, completeness: item.body.completeness, omissionReasons: item.body.omissionReasons })) }, draft.settings, 2)
-        : await this.createOpenRouterBatchRequestBuilder().prepareReply(replyInput, draft.settings, 2);
+            representation: item.body.representation, completeness: item.body.completeness, omissionReasons: item.body.omissionReasons })) }, requestSettings, 2)
+        : await this.createOpenRouterBatchRequestBuilder().prepareReply(replyInput, requestSettings, 2);
       const policy: OpenRouterMailReplyFrozenPolicy[] = [];
       for (const doc of policies) policy.push(Object.freeze({ path: doc.path as OpenRouterMailReplyFrozenPolicy['path'], revision: doc.revision,
         content: doc.content, sha256: await this.crypto.sha256( doc.content) }));
-      const settingsFingerprint = await this.crypto.sha256( stableJson(openRouterSettingsBinding(draft.settings)));
+      const settingsFingerprint = await this.crypto.sha256( stableJson(openRouterSettingsBinding(requestSettings)));
       const binding: OpenRouterMailReplyBinding = Object.freeze({ version: context ? 2 : 1, messageId: input.messageId, mode: input.mode, source: clone(source),
         body: Object.freeze({ text: body.text, textDigest: body.textDigest, bytes: body.bytes, extractionVersion: body.extractionVersion,
           representation: body.representation, completeness: body.completeness, omissionReasons: [...body.omissionReasons] }),
         subject: source.subject, to: Object.freeze([...input.to]), cc: Object.freeze([...input.cc]), brief: input.brief,
         ...(frozenNote ? { note: frozenNote } : {}), policy: Object.freeze(policy), settingsFingerprint,
-        settingsSnapshot: stableJson(openRouterSettingsBinding(draft.settings)), requestAsOf: asOf, timeZone, ...(context ? { context: Object.freeze(context) } : {}) });
+        settingsSnapshot: stableJson(openRouterSettingsBinding(requestSettings)), requestAsOf: asOf, timeZone, ...(context ? { context: Object.freeze(context) } : {}) });
       if (!validOpenRouterMailReplyBinding(binding, 2)) throw new Error('The reply context could not be frozen safely. Refresh the message and try again.');
       const requestSha256 = await this.crypto.sha256( prepared.body);
       const sourceFingerprint = await this.crypto.sha256(
@@ -6068,7 +6120,7 @@ export class AppControllerImpl implements AppController {
       const timestamp = now();
       const job: OpenRouterBatchJob = Object.freeze({ id, customId: id, kind: 'mail_reply', status: 'preparing', createdAt: timestamp, updatedAt: timestamp,
         model: OPENROUTER_BATCH_MODEL, effort: preparedRequest.reasoning.effort, requestSha256, unknownCharge: false,
-        ...(context ? { operation: 'mail_reply_context' as const } : {}), settingsFingerprint, sourceFingerprint,
+        ...(context ? { operation: 'mail_reply_context' as const } : {}), ...(privateSchedule ? { proactiveMailReply: privateSchedule.provenance } : {}), settingsFingerprint, sourceFingerprint,
         requestProfileVersion: context ? 3 : OPENROUTER_BATCH_REQUEST_PROFILE_VERSION,
         inputPolicyVersion: 2,
         outputPolicyVersion: 2,
@@ -6082,7 +6134,7 @@ export class AppControllerImpl implements AppController {
     if (!currentJob || !isOpenRouterMailReplyContentJob(currentJob)) throw new Error('The prepared reply request could not be retained.');
     this.activeMailReplyBatchSubmissions.set(input.messageId, currentJob.id);
     this.activeBatchJobInspections.add(currentJob.id);
-    try { return await this.dispatchPreparedBatch(currentJob, capturedGeneration, this.state); }
+    try { return await this.dispatchPreparedBatch(currentJob, capturedGeneration, this.state, undefined, privateSchedule?.assertBeforeStart); }
     finally { this.activeBatchJobInspections.delete(currentJob.id); }
   }
 
@@ -11010,6 +11062,113 @@ export class AppControllerImpl implements AppController {
     try { return await job; } finally { if (this.reminderJobs.get(jobKey) === job) this.reminderJobs.delete(jobKey); }
   }
 
+  /** Server-owned reminder draft command. It never invokes the device notification backend. */
+  async createReminderDraftForCommand(input: import('../core').ReminderDraftInput): Promise<ReminderRecord> {
+    return this.createReminderDraft(input);
+  }
+
+  /** Server-owned edit path; saved reminders are revoked by the private snapshot participant. */
+  async updateReminderDraftForCommand(id: string, input: import('../core').ReminderDraftPatch): Promise<ReminderRecord> {
+    const updated = await this.mutate((state) => {
+      this.assertReminderWritable();
+      const record = this.reminder(state, id);
+      if (record.revision !== input.expectedRevision) throw new Error('This reminder changed. Reopen it before editing.');
+      if (record.status !== 'draft' && record.status !== 'approved' && record.status !== 'saved') throw new Error('This reminder can no longer be edited.');
+      if (record.status === 'saved') this.cancellationForCurrentIntent(state, record);
+      const payload = validateReminderPayload({ title: input.title ?? record.title, body: input.body ?? record.body,
+        dueAt: input.dueAt ?? record.dueAt, displayTimeZone: input.displayTimeZone ?? record.displayTimeZone,
+        privacyMode: input.privacyMode ?? record.privacyMode });
+      Object.assign(record, payload, { revision: record.revision + 1, status: 'draft' as const, updatedAt: now() });
+      delete record.approvedRevision; delete record.approvedPayloadDigest; delete record.currentIntentId;
+      addActivity(state, 'local_action', 'Reminder edited. Approve the updated version before saving it.', this.newId);
+      return record;
+    });
+    return this.reminder(this.snapshot, updated.id);
+  }
+
+  async approveReminderForCommand(id: string, input: { expectedRevision: number }): Promise<ReminderRecord> {
+    return this.approveReminder(id, input);
+  }
+
+  /** Saves server delivery consent without requesting OS permission or reconciling local notifications. */
+  async saveApprovedReminderForCommand(id: string, input: { expectedRevision: number }): Promise<ReminderRecord> {
+    await this.load(); this.assertReminderWritable();
+    const before = this.reminder(this.snapshot, id);
+    if (before.revision !== input.expectedRevision || before.status !== 'approved' || before.approvedRevision !== input.expectedRevision ||
+        !before.approvedPayloadDigest) throw new Error('Approve the current reminder version before saving it.');
+    const verifiedDeviceProjection = before.origin.kind === 'proactive' && !before.firstSavedAt
+      ? await this.verifyProactiveReminderOrigin(before.origin) : undefined;
+    const saved = await this.mutate(async (state) => {
+      this.assertReminderWritable();
+      const record = this.reminder(state, id);
+      if (record.revision !== input.expectedRevision || record.status !== 'approved' || record.approvedRevision !== input.expectedRevision ||
+          !record.approvedPayloadDigest || record.approvedPayloadDigest !== before.approvedPayloadDigest) {
+        throw new Error('This reminder changed while it was being saved. Review and approve it again.');
+      }
+      this.assertReminderOriginCurrent(state, record.origin, Boolean(record.firstSavedAt), verifiedDeviceProjection);
+      if (record.origin.kind === 'proactive' && !record.firstSavedAt && stableJson(record.origin) !== stableJson(before.origin)) {
+        throw new Error('The proactive source changed while the reminder was being saved.');
+      }
+      const noteOrigin = record.origin.kind === 'note' && !record.firstSavedAt ? record.origin : undefined;
+      if (noteOrigin) {
+        const sourceProposal = state.proposals.find((item) => item.id === noteOrigin.proposalId);
+        if (!sourceProposal || (sourceProposal.status !== 'dispatching' && sourceProposal.status !== 'approved')) {
+          throw new Error('The source proposal is no longer available for this reminder save.');
+        }
+        await this.validateProposalProvenance(state, sourceProposal);
+      }
+      this.validateReminderDue(record);
+      if (await this.reminderApprovalDigest(record) !== record.approvedPayloadDigest) {
+        throw new Error('The approved reminder payload changed. Review and approve it again.');
+      }
+      const intent = await this.setReminderIntent(state, record, 'scheduled', 'unconfirmed');
+      record.status = 'saved'; record.currentIntentId = intent.id; record.updatedAt = now(); record.firstSavedAt ??= record.updatedAt;
+      addActivity(state, 'local_action', 'Reminder saved for server notifications.', this.newId);
+      return record;
+    });
+    return this.reminder(this.snapshot, saved.id);
+  }
+
+  async cancelReminderForCommand(id: string, input: { expectedRevision: number }): Promise<ReminderRecord> {
+    const updated = await this.mutate((state) => {
+      this.assertReminderWritable();
+      const record = this.reminder(state, id);
+      if (record.revision !== input.expectedRevision) throw new Error('This reminder changed. Reopen it before cancelling.');
+      if (record.status === 'cancelled' || record.status === 'completed') return record;
+      this.cancellationForCurrentIntent(state, record);
+      record.revision += 1; record.status = 'cancelled'; record.updatedAt = now(); delete record.currentIntentId;
+      return record;
+    });
+    return this.reminder(this.snapshot, updated.id);
+  }
+
+  async completeReminderForCommand(id: string, input: { expectedRevision: number }): Promise<ReminderRecord> {
+    const updated = await this.mutate((state) => {
+      this.assertReminderWritable();
+      const record = this.reminder(state, id);
+      if (record.revision !== input.expectedRevision) throw new Error('This reminder changed. Reopen it before marking it done.');
+      if (record.status === 'completed') return record;
+      if (record.status !== 'saved' && record.status !== 'approved') throw new Error('Only an approved or saved reminder can be marked done.');
+      this.cancellationForCurrentIntent(state, record);
+      record.revision += 1; record.status = 'completed'; record.updatedAt = now(); delete record.currentIntentId;
+      return record;
+    });
+    return this.reminder(this.snapshot, updated.id);
+  }
+
+  async deleteReminderForCommand(id: string, input: { expectedRevision: number }): Promise<Readonly<{ id: string; revision: number }>> {
+    const deleted = await this.mutate((state) => {
+      this.assertReminderWritable();
+      const record = this.reminder(state, id);
+      if (record.revision !== input.expectedRevision) throw new Error('This reminder changed. Reopen it before deleting.');
+      this.cancellationForCurrentIntent(state, record);
+      state.reminders.records = state.reminders.records.filter((item) => item.id !== id);
+      addActivity(state, 'local_action', 'Reminder deleted.', this.newId);
+      return { id: record.id, revision: record.revision };
+    });
+    return deleted;
+  }
+
   private async saveApprovedReminderInternal(id: string, expectedRevision: number): Promise<ReminderRecord> {
     await this.load(); this.assertReminderWritable();
     const before = this.reminder(this.snapshot, id);
@@ -12912,7 +13071,8 @@ export class AppControllerImpl implements AppController {
     return this.loadMailReplyTextInternal(input);
   }
 
-  async loadMailReplyTextForCommand(input: { messageId: string; accountId: string; expectedConnectionGeneration: number; sourceDigest: string }): Promise<MailReplyTextLoadResult> {
+  async loadMailReplyTextForCommand(input: { messageId: string; accountId: string; expectedConnectionGeneration: number; sourceDigest: string },
+    privateBeforeProviderRead?: () => void): Promise<MailReplyTextLoadResult> {
     await this.load();
     const message = this.snapshot.mailbox.find((item) => item.id === input.messageId);
     const account = this.snapshot.accounts.find((item) => item.id === input.accountId);
@@ -12920,10 +13080,11 @@ export class AppControllerImpl implements AppController {
         (account.connectionGeneration ?? 0) !== input.expectedConnectionGeneration || message.connectionGeneration !== account.connectionGeneration) {
       throw new Error('The source mailbox connection changed. Refresh the message before loading its text.');
     }
-    return this.loadMailReplyTextInternal(input);
+    return this.loadMailReplyTextInternal(input, undefined, privateBeforeProviderRead);
   }
 
-  private async loadMailReplyTextInternal(input: { messageId: string; sourceDigest: string; accountId?: string; expectedConnectionGeneration?: number }, ownActiveMailReviewJobId?: string): Promise<MailReplyTextLoadResult> {
+  private async loadMailReplyTextInternal(input: { messageId: string; sourceDigest: string; accountId?: string; expectedConnectionGeneration?: number },
+    ownActiveMailReviewJobId?: string, privateBeforeProviderRead?: () => void): Promise<MailReplyTextLoadResult> {
     await this.load();
     if (!input || typeof input.messageId !== 'string' || !/^[a-f\d]{64}$/i.test(input.sourceDigest)) return { status: 'unavailable' };
     const captured = this.snapshot;
@@ -12944,6 +13105,7 @@ export class AppControllerImpl implements AppController {
     if (!expectedFence) return { status: 'unavailable' };
     const ensureCurrent: RequestGuard = () => {
       if (this.selectedMailFence(this.snapshot, input.messageId) !== expectedFence) throw new Error('Selected message or connection changed during text loading.');
+      privateBeforeProviderRead?.();
     };
     ensureCurrent();
     let result: SelectedMessageTextResult;

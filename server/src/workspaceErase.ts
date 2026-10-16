@@ -497,7 +497,9 @@ export class WorkspaceEraseService {
     scoped('server_oauth_token_bindings', { workspace: 'workspace_id', epoch: 'privacy_epoch' });
     for (const table of ['background_occurrence_attempts', 'background_occurrence_targets', 'background_occurrences',
       'background_policy_commands', 'background_policy_revisions', 'background_policy_heads', 'background_paid_batch_links',
-      'background_proactive_preflight_attempts', 'background_proactive_candidates', 'background_proactive_candidate_scopes']) {
+      'background_proactive_reauthorization_lineage',
+      'background_proactive_not_submitted_certificates', 'background_proactive_preflight_attempts',
+      'background_proactive_candidates', 'background_proactive_candidate_scopes']) {
       scoped(table, { workspace: 'workspace_id', owner: 'owner_id', epoch: 'privacy_epoch' });
     }
     // Subscription generations and mutable heads precede VAPID-key parents; command receipts contain metadata only.

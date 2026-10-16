@@ -22,6 +22,12 @@ export interface BackgroundPaidBatchLinkInput {
   readonly createdAt: number;
 }
 
+export interface BackgroundPaidBatchJobLookup {
+  readonly jobId: string;
+  readonly customId: string;
+  readonly requestSha256: string;
+}
+
 const COLUMNS = Object.freeze([
   ['workspace_id', 'TEXT', 1, 1], ['owner_id', 'TEXT', 1, 2], ['privacy_epoch', 'INTEGER', 1, 3],
   ['occurrence_id', 'TEXT', 1, 4], ['attempt_id', 'TEXT', 1, 0], ['command_id', 'TEXT', 1, 0], ['ticket_id', 'TEXT', 1, 0],
@@ -89,6 +95,35 @@ function ensureSchema(db: Database.Database): void {
 export class BackgroundBatchLinkStore {
   constructor(private readonly kernel: DurableKernel) {
     if (!kernel) throw new TypeError('background_paid_link_kernel_required');
+  }
+
+  /** Looks up a durable job link without creating schema or trusting job metadata. */
+  readByJobWithinTransaction(context: OwnedTransactionContext, lookup: BackgroundPaidBatchJobLookup): BackgroundPaidBatchLinkInput | undefined {
+    this.kernel.readOwnedSnapshotWithinTransaction(context);
+    if (!lookup || !UUID_V4.test(lookup.jobId) || lookup.customId !== lookup.jobId || !SHA256.test(lookup.requestSha256)) {
+      return fail('background_paid_link_invalid');
+    }
+    if (!tableExists(context.db, 'background_paid_batch_links')) return undefined;
+    ensureSchema(context.db);
+    const row = context.db.prepare(`SELECT occurrence_id,attempt_id,command_id,ticket_id,policy_id,policy_revision,policy_digest,job_id,custom_id,
+      request_sha256,source_digest,source_version_digest,request_digest,created_at FROM background_paid_batch_links
+      WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND job_id=?`)
+      .get(context.workspaceId, context.ownerId, context.privacyEpoch, lookup.jobId) as Record<string, unknown> | undefined;
+    if (!row) return undefined;
+    if (row.job_id !== lookup.jobId || row.custom_id !== lookup.customId || row.request_sha256 !== lookup.requestSha256 ||
+        typeof row.occurrence_id !== 'string' || !UUID_V4.test(row.occurrence_id) || typeof row.attempt_id !== 'string' || !UUID_V4.test(row.attempt_id) ||
+        typeof row.command_id !== 'string' || !UUID_V4.test(row.command_id) || typeof row.ticket_id !== 'string' || !UUID_V4.test(row.ticket_id) ||
+        typeof row.policy_id !== 'string' || !UUID_V4.test(row.policy_id) || !Number.isSafeInteger(row.policy_revision) || (row.policy_revision as number) < 1 ||
+        typeof row.policy_digest !== 'string' || !SHA256.test(row.policy_digest) || typeof row.source_digest !== 'string' || !SHA256.test(row.source_digest) ||
+        (row.source_version_digest !== null && (typeof row.source_version_digest !== 'string' || !SHA256.test(row.source_version_digest))) ||
+        typeof row.request_digest !== 'string' || !SHA256.test(row.request_digest) || !Number.isSafeInteger(row.created_at) || (row.created_at as number) < 0) {
+      return fail('background_paid_link_storage_invalid');
+    }
+    return Object.freeze({ occurrenceId: row.occurrence_id, attemptId: row.attempt_id, commandId: row.command_id,
+      ticketId: row.ticket_id, policyId: row.policy_id, policyRevision: row.policy_revision as number, policyDigest: row.policy_digest,
+      jobId: row.job_id as string, customId: row.custom_id as string, requestSha256: row.request_sha256 as string,
+      sourceDigest: row.source_digest, ...(row.source_version_digest === null ? {} : { sourceVersionDigest: row.source_version_digest as string }),
+      requestDigest: row.request_digest, createdAt: row.created_at as number });
   }
 
   linkWithinTransaction(context: OwnedTransactionContext, input: BackgroundPaidBatchLinkInput): void {

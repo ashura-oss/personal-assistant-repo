@@ -18,6 +18,8 @@ import { BackgroundRuntimeOwner } from './backgroundRuntime.node';
 import { WorkspaceEraseService } from '../../server/src/workspaceErase.js';
 import { createWebPushHttpApi } from '../../server/src/webPushHttp.js';
 import { join } from 'node:path';
+import { recoverProactivePreflights } from './backgroundProactiveRecovery.node';
+import type { BackgroundPolicyStore } from '../../server/src/backgroundPolicies.js';
 
 // Private Node gateway seam: callers must already hold an immutable occurrence claim.
 // This export shares the exact AsyncLocalStorage instance used by the production participant.
@@ -27,7 +29,8 @@ export { NodeVaultOAuthTokenStore } from './nodeOAuthTokenStore.node';
 export { createProductionWorkspacePortsFor } from './productionWorkspacePorts.node';
 
 export type ApplicationWorkspacePortsFactory =
-  (context: OwnedWorkspaceFactoryContext, vault: SecretVault, kernel: DurableKernel) => OwnedWorkspaceFactoryPorts | Promise<OwnedWorkspaceFactoryPorts>;
+  (context: OwnedWorkspaceFactoryContext, vault: SecretVault, kernel: DurableKernel, policies: BackgroundPolicyStore,
+    onBackgroundMetadataCommitted: () => void) => OwnedWorkspaceFactoryPorts | Promise<OwnedWorkspaceFactoryPorts>;
 
 export interface CloudApplicationRuntimeOptions {
   /** Required concrete per-workspace provider/integration composition. */
@@ -52,6 +55,8 @@ export function createCloudApplicationRuntimeFactory(options: CloudApplicationRu
       ...(options.privateAudioRoot ? { privateAudioRoot: options.privateAudioRoot } : {}),
       ...(options.privateDocumentsRoot ? { privateDocumentsRoot: options.privateDocumentsRoot } : {}) });
     await workspaceErase.resumePendingPhysicalCleanup();
+    let backgroundPolicyStore: BackgroundPolicyStore | undefined;
+    let backgroundRuntime: BackgroundRuntimeOwner | undefined;
     const runtime = new OwnedWorkspaceRuntime({ kernel, runtimeSessionFor, processInstanceId,
       isWorkspaceErasePending: (workspaceId, ownerId) => workspaceErase.isWorkspaceErasePending(workspaceId, ownerId),
       isWorkspaceEraseCommandPending: (workspaceId, ownerId, commandId) => workspaceErase.isWorkspaceEraseCommandPending(workspaceId, ownerId, commandId),
@@ -62,14 +67,20 @@ export function createCloudApplicationRuntimeFactory(options: CloudApplicationRu
         randomUUID,
         async sha256(value) { return createHash('sha256').update(value).digest('hex'); },
       },
-      workspacePortsFor: (context) => options.workspacePortsFor(context, vault, kernel),
+      workspacePortsFor: (context) => {
+        if (!backgroundPolicyStore || !backgroundRuntime) throw new Error('background_policy_store_not_initialized');
+        return options.workspacePortsFor(context, vault, kernel, backgroundPolicyStore,
+          () => backgroundRuntime?.wakeForMetadataCommit());
+      },
     });
     const webPushApi = createWebPushHttpApi(kernel, vault, (admission) => runtime.assertWorkspaceAdmission(admission));
     const oauthService = options.oauth ? new OAuthConnectionService({ kernel, auth, stages: oauthStages,
       provider: options.oauth.provider, config: options.oauth.config, runtimeSessionFor,
       isWorkspaceEraseHeldOrPending: (workspaceId, ownerId) => runtime.isWorkspaceEraseHeldOrPending(workspaceId, ownerId) }) : undefined;
     const background = new BackgroundRuntimeOwner({ kernel, auth, runtime, runtimeSessionFor, listWorkspaceMetadataPage });
-    return Object.freeze({ workspaceApi: createWorkspaceHttpApi(runtime, background?.policies, workspaceErase), audioHttpApi: runtime.createAudioHttpApi(),
+    backgroundRuntime = background;
+    backgroundPolicyStore = background.policies;
+    return Object.freeze({ workspaceApi: createWorkspaceHttpApi(runtime, background.policies, workspaceErase), audioHttpApi: runtime.createAudioHttpApi(),
       webPushApi,
       ...(oauthService ? { oauthHttpApi: oauthService } : {}),
       stopAdmission: () => { background.stopAdmission(); oauthService?.stopAdmission(); options.oauth?.responseLifetimeOwner.stopAdmission(); runtime.stopAdmission(); },
@@ -81,7 +92,8 @@ export function createCloudApplicationRuntimeFactory(options: CloudApplicationRu
       },
     });
   };
-  return factory;
+  Object.defineProperty(factory, 'recoverProactivePreflights', { value: recoverProactivePreflights, enumerable: false, writable: false, configurable: false });
+  return Object.freeze(factory);
 }
 
 /** Real Node per-epoch composition; external adapters remain injectable for closed-network tests. */
@@ -101,7 +113,7 @@ export function createProductionApplicationRuntimeFactory(config: ServerConfig,
         ...(adapters.fetcher ? { fetcher: adapters.fetcher } : {}),
       ...(adapters.documentFileOperations ? { documentFileOperations: adapters.documentFileOperations } : {}),
       });
-  return ({ kernel, vault, auth, runtimeSessionFor, listWorkspaceMetadataPage, processInstanceId, createEmptyWorkspaceSnapshot }) => {
+  const factory: ApplicationRuntimeFactory = ({ kernel, vault, auth, runtimeSessionFor, listWorkspaceMetadataPage, processInstanceId, createEmptyWorkspaceSnapshot }) => {
     const fetcher = adapters.fetcher ?? globalThis.fetch;
     const responseLifetimeOwner = createNodeProviderResponseLifetimeOwner({ fetcher, createId: randomUUID });
     const registrations = [
@@ -113,10 +125,13 @@ export function createProductionApplicationRuntimeFactory(config: ServerConfig,
     const provider = createServerOAuthProviderAdapter({ canonicalOrigin: config.canonicalOrigin, registrations,
       responseLifetime: responseLifetimeOwner.withResponseLifetimeFor('oauth') });
     return createCloudApplicationRuntimeFactory({
-      workspacePortsFor: (context) => makeWorkspacePorts(context, vault, kernel),
+      workspacePortsFor: (context, scopedVault, scopedKernel, policies, onBackgroundMetadataCommitted) =>
+        makeWorkspacePorts(context, scopedVault, scopedKernel, policies, onBackgroundMetadataCommitted),
       oauth: { provider, responseLifetimeOwner, config },
       privateAudioRoot: join(config.dataDirectory, 'private-audio'),
       privateDocumentsRoot: join(config.dataDirectory, 'private-documents'),
     })({ kernel, vault, auth, runtimeSessionFor, listWorkspaceMetadataPage, processInstanceId, createEmptyWorkspaceSnapshot });
   };
+  Object.defineProperty(factory, 'recoverProactivePreflights', { value: recoverProactivePreflights, enumerable: false, writable: false, configurable: false });
+  return Object.freeze(factory);
 }

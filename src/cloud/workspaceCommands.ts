@@ -4,6 +4,8 @@ import { isCanonicalKnowledgeId, KNOWLEDGE_LIMITS } from '../knowledge';
 import { safeRelativeMarkdownPath } from '../privacy/eraseAdapter.shared';
 import type { WorkspaceSnapshotDTO } from './workspaceDto';
 import { validateAzureEndpoint } from '../services/controllerRuntimeContracts';
+import { validateReminderPayload } from '../reminders';
+import type { ReminderPayload, ReminderStatus } from '../reminders';
 
 export const WORKSPACE_COMMAND_SCHEMA_VERSION = 1 as const;
 export const WORKSPACE_COMMAND_MAX_BYTES = 16 * 1024;
@@ -16,6 +18,8 @@ type PersonUpdateInput = Readonly<Omit<SavePersonInput, 'id' | 'expectedRevision
 type ProjectCreateInput = Readonly<Omit<Pick<SaveProjectInput, 'name' | 'aliases' | 'narrative' | 'status' | 'goal' | 'startsOn' | 'targetOn' | 'dateTimeZone'>, 'aliases'> & { aliases: readonly string[] }>;
 type ProjectUpdateInput = Readonly<Omit<SaveProjectInput, 'id' | 'expectedRevision' | 'aliases' | 'expectedDocumentRevision'> & {
   id: string; expectedRevision: number; aliases: readonly string[]; expectedDocumentRevision: number | null }>;
+
+export type ReminderDeviceSelection = 'all_current' | Readonly<{ subscriptions: readonly Readonly<{ subscriptionId: string; generation: number }>[] }>;
 
 export type WorkspaceCommand =
   | { readonly kind: 'settings.update'; readonly patch: WorkspaceSettingsPatch }
@@ -77,6 +81,11 @@ export type WorkspaceCommand =
   | { readonly kind: 'assistant.periodSummary.application.prepare'; readonly jobId: string }
   | { readonly kind: 'assistant.periodSummary.application.cancel'; readonly planId: string }
   | { readonly kind: 'assistant.periodSummary.application.apply'; readonly planId: string; readonly jobId: string }
+  | { readonly kind: 'reminders.createDraft'; readonly payload: ReminderPayload & Readonly<{ candidateId?: string }> }
+  | { readonly kind: 'reminders.editDraft'; readonly reminderId: string; readonly expectedReminderRevision: number; readonly payload: ReminderPayload }
+  | { readonly kind: 'reminders.approve'; readonly reminderId: string; readonly expectedReminderRevision: number }
+  | { readonly kind: 'reminders.serverSave'; readonly reminderId: string; readonly expectedReminderRevision: number; readonly deviceSelection: ReminderDeviceSelection }
+  | { readonly kind: 'reminders.cancel' | 'reminders.complete' | 'reminders.delete'; readonly reminderId: string; readonly expectedReminderRevision: number }
   | { readonly kind: 'chat.submit'; readonly conversationId: string; readonly text: string; readonly knowledgeSelection?: PublicKnowledgeSelection }
   | { readonly kind: 'chat.refine'; readonly conversationId: string; readonly parentTurnId: string; readonly effort: 'medium' | 'high' | 'max' };
 
@@ -162,6 +171,9 @@ export type WorkspaceCommandReceipt =
   | (WorkspaceCommandReceiptBase<'assistant.periodSummary.application.cancel'> & Readonly<{ planId: string }> )
   | (WorkspaceCommandReceiptBase<'assistant.periodSummary.application.apply'> & Readonly<{ jobId: string; path: string;
       documentRevision: number; appliedAt: string }> )
+  | ((WorkspaceCommandReceiptBase<'reminders.createDraft' | 'reminders.editDraft' | 'reminders.approve' | 'reminders.serverSave' |
+      'reminders.cancel' | 'reminders.complete'>) & Readonly<{ reminderId: string; reminderRevision: number; reminderStatus: ReminderStatus }> )
+  | (WorkspaceCommandReceiptBase<'reminders.delete'> & Readonly<{ reminderId: string; reminderRevision: number; deleted: true }> )
   | (WorkspaceCommandReceiptBase<'documents.save'> & Readonly<{ documentRevision: number; entityKind?: KnowledgeEntityKind; entityId?: string; entityRevision?: number }>)
   | ((WorkspaceCommandReceiptBase<'knowledge.person.save'> | WorkspaceCommandReceiptBase<'knowledge.project.save'> |
       WorkspaceCommandReceiptBase<'knowledge.entity.archive'>) & Readonly<{ entityKind: KnowledgeEntityKind; entityRevision: number }>)
@@ -240,6 +252,13 @@ const COMMAND_KEYS: Record<WorkspaceCommand['kind'], readonly string[]> = {
   'assistant.periodSummary.application.prepare': ['kind', 'jobId'],
   'assistant.periodSummary.application.cancel': ['kind', 'planId'],
   'assistant.periodSummary.application.apply': ['kind', 'planId', 'jobId'],
+  'reminders.createDraft': ['kind', 'payload'],
+  'reminders.editDraft': ['kind', 'reminderId', 'expectedReminderRevision', 'payload'],
+  'reminders.approve': ['kind', 'reminderId', 'expectedReminderRevision'],
+  'reminders.serverSave': ['kind', 'reminderId', 'expectedReminderRevision', 'deviceSelection'],
+  'reminders.cancel': ['kind', 'reminderId', 'expectedReminderRevision'],
+  'reminders.complete': ['kind', 'reminderId', 'expectedReminderRevision'],
+  'reminders.delete': ['kind', 'reminderId', 'expectedReminderRevision'],
   'chat.refine': ['kind', 'conversationId', 'parentTurnId', 'effort'],
 };
 const COMMAND_KINDS = Object.keys(COMMAND_KEYS) as WorkspaceCommand['kind'][];
@@ -578,6 +597,43 @@ function parseKnowledgeSuggestionEvidence(value: unknown): readonly KnowledgeEvi
   }));
 }
 
+function parseReminderPayloadCommand(value: unknown, allowCandidate = false): ReminderPayload & Readonly<{ candidateId?: string }> {
+  if (!isRecord(value)) throw new Error('workspace_command_invalid');
+  assertPlainDataProperties(value);
+  const keys = ['title', 'body', 'dueAt', 'displayTimeZone', 'privacyMode'];
+  assertExactKeys(value, allowCandidate ? [...keys, 'candidateId'] : keys, keys);
+  if (allowCandidate && Object.hasOwn(value, 'candidateId') && !isUuidV4(value.candidateId)) throw new Error('workspace_command_invalid');
+  try {
+    const payload = validateReminderPayload(value);
+    return Object.freeze({ ...payload, ...(Object.hasOwn(value, 'candidateId') ? { candidateId: value.candidateId as string } : {}) });
+  } catch { throw new Error('workspace_command_invalid'); }
+}
+
+function parseReminderDeviceSelection(value: unknown): ReminderDeviceSelection {
+  if (value === 'all_current') return value;
+  if (!isRecord(value)) throw new Error('workspace_command_invalid');
+  assertPlainDataProperties(value);
+  assertExactKeys(value, ['subscriptions'], ['subscriptions']);
+  if (!Array.isArray(value.subscriptions)) throw new Error('workspace_command_invalid');
+  const arrayKeys = Reflect.ownKeys(value.subscriptions);
+  if (arrayKeys.some((key) => typeof key !== 'string' || (key !== 'length' && !/^(0|[1-9]\d*)$/.test(key))) ||
+      Object.keys(value.subscriptions).length !== value.subscriptions.length || value.subscriptions.length < 1) throw new Error('workspace_command_invalid');
+  const seen = new Set<string>();
+  const subscriptions = value.subscriptions.map((item, index) => {
+    const descriptor = Object.getOwnPropertyDescriptor(value.subscriptions, String(index));
+    if (!descriptor?.enumerable || !Object.hasOwn(descriptor, 'value') || !isRecord(descriptor.value)) throw new Error('workspace_command_invalid');
+    const row = descriptor.value;
+    assertPlainDataProperties(row);
+    assertExactKeys(row, ['subscriptionId', 'generation'], ['subscriptionId', 'generation']);
+    if (!isUuidV4(row.subscriptionId) || !positiveRevision(row.generation)) throw new Error('workspace_command_invalid');
+    const id = (row.subscriptionId as string).toLowerCase();
+    if (seen.has(id)) throw new Error('workspace_command_invalid');
+    seen.add(id);
+    return Object.freeze({ subscriptionId: id, generation: row.generation as number });
+  });
+  return Object.freeze({ subscriptions: Object.freeze(subscriptions) });
+}
+
 function freezeCommand(raw: Record<string, unknown>): WorkspaceCommand {
   const kind = raw.kind;
   if (kind === 'settings.update') {
@@ -878,6 +934,27 @@ function freezeCommand(raw: Record<string, unknown>): WorkspaceCommand {
     if (!isUuidV4(raw.planId) || !isUuidV4(raw.jobId)) throw new Error('workspace_command_invalid');
     return Object.freeze({ kind, planId: raw.planId, jobId: raw.jobId });
   }
+  if (kind === 'reminders.createDraft') {
+    assertExactKeys(raw, COMMAND_KEYS[kind], COMMAND_KEYS[kind]);
+    return Object.freeze({ kind, payload: parseReminderPayloadCommand(raw.payload, true) });
+  }
+  if (kind === 'reminders.editDraft') {
+    assertExactKeys(raw, COMMAND_KEYS[kind], COMMAND_KEYS[kind]);
+    if (!isUuidV4(raw.reminderId) || !positiveRevision(raw.expectedReminderRevision)) throw new Error('workspace_command_invalid');
+    return Object.freeze({ kind, reminderId: raw.reminderId.toLowerCase(), expectedReminderRevision: raw.expectedReminderRevision as number,
+      payload: parseReminderPayloadCommand(raw.payload) });
+  }
+  if (kind === 'reminders.approve' || kind === 'reminders.cancel' || kind === 'reminders.complete' || kind === 'reminders.delete') {
+    assertExactKeys(raw, COMMAND_KEYS[kind], COMMAND_KEYS[kind]);
+    if (!isUuidV4(raw.reminderId) || !positiveRevision(raw.expectedReminderRevision)) throw new Error('workspace_command_invalid');
+    return Object.freeze({ kind, reminderId: raw.reminderId.toLowerCase(), expectedReminderRevision: raw.expectedReminderRevision as number });
+  }
+  if (kind === 'reminders.serverSave') {
+    assertExactKeys(raw, COMMAND_KEYS[kind], COMMAND_KEYS[kind]);
+    if (!isUuidV4(raw.reminderId) || !positiveRevision(raw.expectedReminderRevision)) throw new Error('workspace_command_invalid');
+    return Object.freeze({ kind, reminderId: raw.reminderId.toLowerCase(), expectedReminderRevision: raw.expectedReminderRevision as number,
+      deviceSelection: parseReminderDeviceSelection(raw.deviceSelection) });
+  }
   if (kind === 'assistant.batch.check') {
     assertExactKeys(raw, COMMAND_KEYS[kind], COMMAND_KEYS[kind]);
     if (!isUuidV4(raw.jobId)) throw new Error('workspace_command_invalid');
@@ -1106,6 +1183,13 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
     'assistant.periodSummary.application.prepare': ['application', 'applicationPlan', 'commandId', 'jobId', 'kind', 'objectId', 'schemaVersion'],
     'assistant.periodSummary.application.cancel': ['commandId', 'kind', 'objectId', 'planId', 'schemaVersion'],
     'assistant.periodSummary.application.apply': ['appliedAt', 'commandId', 'documentRevision', 'jobId', 'kind', 'objectId', 'path', 'schemaVersion'],
+    'reminders.createDraft': ['commandId', 'kind', 'objectId', 'reminderId', 'reminderRevision', 'reminderStatus', 'schemaVersion'],
+    'reminders.editDraft': ['commandId', 'kind', 'objectId', 'reminderId', 'reminderRevision', 'reminderStatus', 'schemaVersion'],
+    'reminders.approve': ['commandId', 'kind', 'objectId', 'reminderId', 'reminderRevision', 'reminderStatus', 'schemaVersion'],
+    'reminders.serverSave': ['commandId', 'kind', 'objectId', 'reminderId', 'reminderRevision', 'reminderStatus', 'schemaVersion'],
+    'reminders.cancel': ['commandId', 'kind', 'objectId', 'reminderId', 'reminderRevision', 'reminderStatus', 'schemaVersion'],
+    'reminders.complete': ['commandId', 'kind', 'objectId', 'reminderId', 'reminderRevision', 'reminderStatus', 'schemaVersion'],
+    'reminders.delete': ['commandId', 'deleted', 'kind', 'objectId', 'reminderId', 'reminderRevision', 'schemaVersion'],
     'chat.submit': ['commandId', 'jobId', 'kind', 'objectId', 'schemaVersion', 'turnId'],
     'chat.refine': ['commandId', 'jobId', 'kind', 'objectId', 'parentTurnId', 'schemaVersion', 'turnId'],
   };
@@ -1197,6 +1281,8 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
         typeof value.path !== 'string' || !/^memory\/summaries\/(daily|weekly|monthly|yearly)\/\d{4}-\d{2}-\d{2}\.md$/.test(value.path) ||
         !positiveRevision(value.documentRevision) || typeof value.appliedAt !== 'string' || !Number.isFinite(Date.parse(value.appliedAt)) ||
         new Date(value.appliedAt).toISOString() !== value.appliedAt)) ||
+      (kind.startsWith('reminders.') && (!uuidId(value.reminderId) || value.reminderId !== value.objectId || !positiveRevision(value.reminderRevision) ||
+        (kind === 'reminders.delete' ? value.deleted !== true : !['draft', 'approved', 'saved', 'cancelled', 'completed'].includes(String(value.reminderStatus))))) ||
       (kind === 'documents.save' && (() => {
         const parent = canonicalKnowledgeDocumentParent(value.objectId);
         const hasParent = Object.hasOwn(value, 'entityKind') || Object.hasOwn(value, 'entityId') || Object.hasOwn(value, 'entityRevision');
@@ -1361,6 +1447,13 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
     case 'assistant.periodSummary.application.apply':
       return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId, jobId: jobId(value.jobId),
         path: value.path as string, documentRevision: value.documentRevision as number, appliedAt: value.appliedAt as string });
+    case 'reminders.createDraft': case 'reminders.editDraft': case 'reminders.approve': case 'reminders.serverSave':
+    case 'reminders.cancel': case 'reminders.complete':
+      return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId, reminderId: jobId(value.reminderId),
+        reminderRevision: value.reminderRevision as number, reminderStatus: value.reminderStatus as ReminderStatus });
+    case 'reminders.delete':
+      return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId, reminderId: jobId(value.reminderId),
+        reminderRevision: value.reminderRevision as number, deleted: true });
     case 'documents.save': {
       const parent = canonicalKnowledgeDocumentParent(objectId);
       return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId,

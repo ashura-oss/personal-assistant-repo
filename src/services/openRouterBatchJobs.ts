@@ -88,6 +88,15 @@ export interface OpenRouterChatBinding {
   }>;
 }
 
+/** Private, content-free marker requiring the durable standing-consent link to resolve before retained-result use. */
+export interface OpenRouterProactiveMailReplyProvenance {
+  readonly version: 1;
+  readonly policyId: string;
+  readonly policyRevision: number;
+  readonly occurrenceId: string;
+  readonly attemptId: string;
+}
+
 /** Private persisted job record. Raw request text never enters AppState/public projections. */
 export interface OpenRouterBatchJob {
   readonly id: string;
@@ -131,6 +140,7 @@ export interface OpenRouterBatchJob {
   readonly chatBinding?: OpenRouterChatBinding;
   readonly recoveryBinding?: OpenRouterBatchRecoveryBinding;
   readonly mailReplyBinding?: OpenRouterMailReplyBinding;
+  readonly proactiveMailReply?: OpenRouterProactiveMailReplyProvenance;
   readonly resultText?: string;
   readonly resultSha256?: string;
   /** Bounded provider cutoff bytes retained only as explicit MoreCompute evidence; never complete Markdown. */
@@ -525,7 +535,7 @@ function validJob(value: unknown): value is OpenRouterBatchJob {
 
 function validMailReplyJob(row: Record<string, unknown>): boolean {
   const commonRequired = ['id', 'customId', 'kind', 'status', 'createdAt', 'updatedAt', 'model', 'effort', 'requestSha256', 'unknownCharge'];
-  const commonOptional = ['batchId', 'accounting', 'failureCode', 'proposalId', 'mailReplyActivationOperation', 'recoveryBinding', 'providerObservation'];
+  const commonOptional = ['batchId', 'accounting', 'failureCode', 'proposalId', 'mailReplyActivationOperation', 'recoveryBinding', 'providerObservation', 'proactiveMailReply'];
   if (!exactKeys(row, commonRequired, [...commonOptional, 'operation', 'sourceRemoved', 'requestProfileVersion', 'inputPolicyVersion', 'outputPolicyVersion', 'settingsFingerprint', 'sourceFingerprint',
       'requestBytes', 'omittedSourceCount', 'requestBody', 'sourceVersions', 'mailReplyBinding', 'resultText', 'resultSha256']) ||
       typeof row.id !== 'string' || row.id.length !== 36 || !UUID_V4.test(row.id) || row.customId !== row.id ||
@@ -539,6 +549,15 @@ function validMailReplyJob(row: Record<string, unknown>): boolean {
       (row.proposalId !== undefined && (typeof row.proposalId !== 'string' || row.proposalId.length !== 36 || !UUID_V4.test(row.proposalId))) ||
       (row.mailReplyActivationOperation !== undefined && row.mailReplyActivationOperation !== 'draft' && row.mailReplyActivationOperation !== 'send') ||
       (row.mailReplyActivationOperation !== undefined && row.proposalId === undefined)) return false;
+  if (row.proactiveMailReply !== undefined) {
+    if (!record(row.proactiveMailReply)) return false;
+    const provenance = row.proactiveMailReply as Record<string, unknown>;
+    if (!exactKeys(provenance, ['version', 'policyId', 'policyRevision', 'occurrenceId', 'attemptId']) ||
+        provenance.version !== 1 || typeof provenance.policyId !== 'string' || !UUID_V4.test(provenance.policyId) ||
+        !Number.isSafeInteger(provenance.policyRevision) || (provenance.policyRevision as number) < 1 ||
+        typeof provenance.occurrenceId !== 'string' || !UUID_V4.test(provenance.occurrenceId) ||
+        typeof provenance.attemptId !== 'string' || !UUID_V4.test(provenance.attemptId) || row.operation !== undefined || row.requestProfileVersion !== 1) return false;
+  }
   if ((row.status === 'result_not_retained') !== (row.failureCode === 'result_not_retained') ||
       (row.status === 'result_truncated') !== (row.failureCode === 'result_truncated') ||
       (row.recoveryBinding !== undefined && !validRecoveryBinding(row.recoveryBinding, row)) ||
@@ -789,6 +808,7 @@ export function tombstoneOpenRouterBatchJob(job: OpenRouterBatchJob, updatedAt: 
     ...(job.accounting ? { accounting: job.accounting } : {}),
     ...(job.kind === 'mail_reply' && job.proposalId ? { proposalId: job.proposalId } : {}),
     ...(job.kind === 'mail_reply' && job.mailReplyActivationOperation ? { mailReplyActivationOperation: job.mailReplyActivationOperation } : {}),
+    ...(job.kind === 'mail_reply' && job.proactiveMailReply ? { proactiveMailReply: Object.freeze({ ...job.proactiveMailReply }) } : {}),
   });
 }
 

@@ -106,7 +106,23 @@ test('confirmed erase atomically advances the epoch, empties the snapshot, prese
     const foreignDevice = randomUUID();
     const foreignWorkspace = f.kernel.createWorkspace(foreignOwner, EMPTY);
     const foreignSession = f.kernel.createSession(foreignWorkspace.workspaceId, foreignOwner, 1_800_000_100_000);
+    const insertReauthorizationLineage = (context, workspaceId, ownerId, digest) => context.db.prepare(`INSERT INTO background_proactive_reauthorization_lineage(
+      workspace_id,owner_id,privacy_epoch,original_logical_digest,generation,policy_id,policy_revision,policy_digest,parent_occurrence_id,
+      child_occurrence_id,consent_command_id,predecessor_set_digest,created_at) VALUES(?,?,0,?,1,?,1,?,?,?,?,?,?)`)
+      .run(workspaceId, ownerId, digest, randomUUID(), 'b'.repeat(64), randomUUID(), randomUUID(), randomUUID(), 'c'.repeat(64), f.now);
+    f.kernel.withOwnedTransaction(login.sessionToken, 0, (context) => {
+      context.db.exec(`CREATE TABLE background_proactive_reauthorization_lineage(
+        workspace_id TEXT NOT NULL,owner_id TEXT NOT NULL,privacy_epoch INTEGER NOT NULL CHECK(privacy_epoch>=0),
+        original_logical_digest TEXT NOT NULL CHECK(length(original_logical_digest)=64),generation INTEGER NOT NULL CHECK(generation>0),
+        policy_id TEXT NOT NULL CHECK(length(policy_id)=36),policy_revision INTEGER NOT NULL CHECK(policy_revision>0),
+        policy_digest TEXT NOT NULL CHECK(length(policy_digest)=64),parent_occurrence_id TEXT NOT NULL CHECK(length(parent_occurrence_id)=36),
+        child_occurrence_id TEXT NOT NULL CHECK(length(child_occurrence_id)=36),consent_command_id TEXT NOT NULL CHECK(length(consent_command_id)=36),
+        predecessor_set_digest TEXT NOT NULL CHECK(length(predecessor_set_digest)=64),created_at INTEGER NOT NULL CHECK(created_at>=0),
+        PRIMARY KEY(workspace_id,owner_id,privacy_epoch,original_logical_digest,generation)) STRICT`);
+      insertReauthorizationLineage(context, context.workspaceId, context.ownerId, 'a'.repeat(64));
+    });
     f.kernel.withOwnedTransaction(foreignSession, 0, (context) => {
+      insertReauthorizationLineage(context, context.workspaceId, context.ownerId, 'd'.repeat(64));
       const nonce = randomBytes(12), tag = randomBytes(16);
       context.db.prepare(`INSERT INTO web_push_vapid_keys(workspace_id,owner_id,privacy_epoch,key_id,public_key,key_version,nonce,tag,ciphertext,created_at)
         VALUES(?,?,?,?,?,1,?,?,?,?)`).run(context.workspaceId, context.ownerId, context.privacyEpoch, foreignKey,
@@ -126,6 +142,14 @@ test('confirmed erase atomically advances the epoch, empties the snapshot, prese
       }
     });
     f.kernel.withOwnedTransaction(login.sessionToken, 0, (context) => {
+      context.db.exec(`CREATE TABLE background_proactive_not_submitted_certificates (
+        workspace_id TEXT NOT NULL, owner_id TEXT NOT NULL, privacy_epoch INTEGER NOT NULL, job_id TEXT NOT NULL,
+        PRIMARY KEY(workspace_id,owner_id,privacy_epoch,job_id)
+      ) STRICT`);
+      const certificate = context.db.prepare(`INSERT INTO background_proactive_not_submitted_certificates
+        (workspace_id,owner_id,privacy_epoch,job_id) VALUES(?,?,?,?)`);
+      certificate.run(context.workspaceId, context.ownerId, context.privacyEpoch, randomUUID());
+      certificate.run(context.workspaceId, randomUUID(), context.privacyEpoch, randomUUID());
       lineage.captureDestination(context, 'private/secret.md');
       const insert = context.db.prepare(`INSERT INTO period_summary_application_receipts
         (workspace_id,owner_id,privacy_epoch,job_id,command_id,request_sha256,result_sha256,destination_path,document_id,document_revision,applied_at)
@@ -165,6 +189,10 @@ test('confirmed erase atomically advances the epoch, empties the snapshot, prese
       lineageScopes: context.db.prepare('SELECT count(*) AS count FROM document_lineage_scopes WHERE workspace_id=? AND owner_id=?').get(context.workspaceId, context.ownerId).count,
       applicationReceipts: context.db.prepare('SELECT count(*) AS count FROM period_summary_application_receipts WHERE workspace_id=? AND owner_id=?').get(context.workspaceId, context.ownerId).count,
       foreignApplicationReceipts: context.db.prepare('SELECT count(*) AS count FROM period_summary_application_receipts WHERE workspace_id=? AND owner_id<>?').get(context.workspaceId, context.ownerId).count,
+      recoveryCertificates: context.db.prepare('SELECT count(*) AS count FROM background_proactive_not_submitted_certificates WHERE workspace_id=? AND owner_id=?').get(context.workspaceId, context.ownerId).count,
+      proactiveLineage: context.db.prepare('SELECT count(*) AS count FROM background_proactive_reauthorization_lineage WHERE workspace_id=? AND owner_id=?').get(context.workspaceId, context.ownerId).count,
+      foreignProactiveLineage: context.db.prepare('SELECT count(*) AS count FROM background_proactive_reauthorization_lineage WHERE workspace_id=? AND owner_id=?').get(foreignWorkspace.workspaceId, foreignOwner).count,
+      foreignRecoveryCertificates: context.db.prepare('SELECT count(*) AS count FROM background_proactive_not_submitted_certificates WHERE workspace_id=? AND owner_id<>?').get(context.workspaceId, context.ownerId).count,
       webPushOwned: Object.fromEntries(['web_push_vapid_keys', 'web_push_vapid_heads', 'web_push_subscriptions', 'web_push_subscription_heads', 'web_push_commands']
         .map((table) => [table, context.db.prepare(`SELECT count(*) AS count FROM ${table} WHERE workspace_id=? AND owner_id=? AND privacy_epoch=?`)
           .get(context.workspaceId, context.ownerId, 0).count])),
@@ -179,6 +207,10 @@ test('confirmed erase atomically advances the epoch, empties the snapshot, prese
     assert.equal(state.lineageScopes, 0);
     assert.equal(state.applicationReceipts, 0);
     assert.equal(state.foreignApplicationReceipts, 1, 'erase must preserve receipt rows outside its exact owner scope');
+    assert.equal(state.recoveryCertificates, 0, 'workspace erase removes its exact proactive recovery certificates');
+    assert.equal(state.proactiveLineage, 0, 'workspace erase removes its exact proactive reauthorization lineage');
+    assert.equal(state.foreignProactiveLineage, 1, 'workspace erase preserves lineage owned by another workspace');
+    assert.equal(state.foreignRecoveryCertificates, 1, 'workspace erase preserves certificate rows outside its exact owner scope');
     assert.deepEqual(state.webPushOwned, { web_push_vapid_keys: 0, web_push_vapid_heads: 0, web_push_subscriptions: 0,
       web_push_subscription_heads: 0, web_push_commands: 0 }, 'workspace erase removes every scoped registry row');
     assert.deepEqual(state.webPushForeign, { web_push_vapid_keys: 1, web_push_vapid_heads: 1, web_push_subscriptions: 1,

@@ -914,6 +914,10 @@ function expectedReceiptFor(envelope: WorkspaceCommandEnvelope) {
       return { commandId: envelope.commandId, kind: command.kind, objectId: command.planId, planId: command.planId };
     case 'assistant.periodSummary.application.apply':
       return { commandId: envelope.commandId, kind: command.kind, objectId: command.jobId, jobId: command.jobId };
+    case 'reminders.createDraft': return { commandId: envelope.commandId, kind: command.kind };
+    case 'reminders.editDraft': case 'reminders.approve': case 'reminders.serverSave':
+    case 'reminders.cancel': case 'reminders.complete': case 'reminders.delete':
+      return { commandId: envelope.commandId, kind: command.kind, objectId: command.reminderId };
     case 'chat.submit':
       return { commandId: envelope.commandId, kind: command.kind, objectId: command.conversationId };
     case 'chat.refine':

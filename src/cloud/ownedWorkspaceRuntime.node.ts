@@ -8,8 +8,9 @@ import type { WorkspaceHttpAdmission } from '../../server/src/workspaceHttp.js';
 import { createWorkspaceSnapshotDTO, type WorkspaceMediaResolver, type WorkspaceSnapshotDTO } from './workspaceDto';
 import { NodeSpeechCleanupAdapter } from './speechCleanupAdapter.node';
 import type { NodeProviderResponseLifetimeOwner } from './providerResponseLifetime.node';
-import { randomUUID } from 'node:crypto';
-import type { DurableKernel, JsonValue, OwnedWorkspaceIdentity } from '../../server/src/kernel.js';
+import { createHash, randomUUID } from 'node:crypto';
+import type { DurableKernel, JsonValue, OwnedTransactionContext, OwnedWorkspaceIdentity } from '../../server/src/kernel.js';
+import { canonicalBackgroundJson } from '../../server/src/backgroundContracts.js';
 import type { AuthService } from '../../server/src/auth.js';
 import type { SecretVault } from '../../server/src/vault.js';
 import type { OAuthInstallStages } from '../../server/src/oauthInstallStages.js';
@@ -23,12 +24,22 @@ import type { ServerWorkspaceStore } from '../../server/src/workspaceStore.js';
 import type { WorkspaceCommandHistoryPage } from './workspaceCommandHistory';
 import { canonicalWorkspaceCommand, parseWorkspaceCommandReceipt, type WorkspaceCommandEnvelope, type WorkspaceCommandReceipt } from './workspaceCommands';
 import type { BackgroundClaim, BackgroundOccurrenceStore } from '../../server/src/backgroundOccurrences.js';
+import { BackgroundBatchLinkStore } from '../../server/src/backgroundBatchLink.js';
+import type { BackgroundProactiveCandidateIndex, BackgroundProactiveCandidateRow, BackgroundProactivePreflightClaim } from '../../server/src/backgroundProactiveCandidates.js';
+import type { BackgroundPolicyStore, BackgroundProactiveDraftCandidate } from '../../server/src/backgroundPolicies.js';
+import { isOpenRouterMailReplyContentJob, validateOpenRouterBatchLedger } from '../services/openRouterBatchJobs';
+import { assertBackgroundPaidMailReplyDispatchAuthorized, runBackgroundPaidMailReplyCheckpoint,
+  prepareBackgroundProactiveMailReplyInputs } from './backgroundPaidWork.node';
+import { readCertifiedNotSubmittedProactiveJob } from './backgroundProactiveRecovery.node';
+
+const MINUTE = 60_000;
+function backgroundSha256(value: string): string { return createHash('sha256').update(value, 'utf8').digest('hex'); }
 import { projectKnowledgeSourceChoiceReference } from '../knowledge/sourceChoices';
 import { projectKnowledgeSuggestionForHttp, type KnowledgeSourceChoicesDTO, type KnowledgeSuggestionReviewDTO } from './knowledgeHttpContracts';
 import { buildCloudKnowledgeSourceChoiceOptions, knowledgeSourceChoiceId } from './knowledgeSourceChoices.node';
 import type { BatchObservationAttempt, BatchObservationIndex } from '../../server/src/batchObservationIndex.js';
 import { projectBatchObservationLedger } from './batchObservationProjection.node';
-import { OpenRouterBatchInspectionReadError } from '../services/openRouter';
+import { OpenRouterBatchDispatchError, OpenRouterBatchInspectionReadError } from '../services/openRouter';
 
 export type OwnedWorkspaceFactoryContext = WorkspaceRuntimeContext<AppState> & {
   readonly speechCleanupChildren: SpeechCleanupChildren;
@@ -41,6 +52,196 @@ export interface OwnedWorkspaceAdmission {
   readonly sessionToken: string;
   /** Rechecks current authentication synchronously after each async ownership lookup. */
   readonly assertCurrent: () => void;
+}
+
+type CertifiedOccurrenceReuse = Readonly<{ status: 'reuse'; request: ReturnType<typeof prepareBackgroundProactiveMailReplyInputs>['request']; scheduledAt: number }>
+  | Readonly<{ status: 'stale' }>;
+
+function reauthorizedMailInputsMatchCurrent(frozen: Readonly<{ source: unknown; request: unknown }>,
+  current: ReturnType<typeof prepareBackgroundProactiveMailReplyInputs>): boolean {
+  if (!frozen || !frozen.request || typeof frozen.request !== 'object' || Array.isArray(frozen.request)) return false;
+  const priorRequest = { ...(frozen.request as Record<string, unknown>) };
+  const currentRequest = { ...(current.request as unknown as Record<string, unknown>) };
+  const priorAsOf = priorRequest.requestAsOf;
+  if (typeof priorAsOf !== 'string' || !Number.isFinite(Date.parse(priorAsOf)) || new Date(priorAsOf).toISOString() !== priorAsOf) return false;
+  delete priorRequest.requestAsOf;
+  delete currentRequest.requestAsOf;
+  return canonicalBackgroundJson(frozen.source) === canonicalBackgroundJson(current.source) &&
+    canonicalBackgroundJson(priorRequest) === canonicalBackgroundJson(currentRequest);
+}
+
+/**
+ * A cold-recovered, provably unsubmitted occurrence may reuse its immutable input bytes once.
+ * This does not authorize dispatch: the current reading claim, policy, source, and body are
+ * revalidated here, and the normal fresh occurrence/attempt link and final POST fence still run.
+ */
+function certifiedOccurrenceReuseWithinTransaction(input: Readonly<{
+  context: OwnedTransactionContext;
+  kernel: DurableKernel;
+  candidateIndex: BackgroundProactiveCandidateIndex;
+  preflightClaim: BackgroundProactivePreflightClaim;
+  policyStore: BackgroundPolicyStore;
+  policyId: string;
+  policyRevision: number;
+  candidate: BackgroundProactiveCandidateRow;
+  prepared: ReturnType<typeof prepareBackgroundProactiveMailReplyInputs>;
+}>): CertifiedOccurrenceReuse | undefined {
+  const { context, kernel, candidateIndex, preflightClaim, policyStore, policyId, policyRevision, candidate, prepared } = input;
+  kernel.assertOwnedTransactionContext(context);
+  policyStore.assertProactiveDraftPreflightCurrentWithinTransaction(context, { policyId, policyRevision });
+  const reading = candidateIndex.assertReadingWithinTransaction(context, preflightClaim);
+  if (reading.candidateId !== candidate.candidateId || reading.ruleId !== candidate.ruleId || reading.ruleRevision !== candidate.ruleRevision ||
+      reading.accountIdentityKey !== candidate.accountIdentityKey || reading.connectionGeneration !== candidate.connectionGeneration ||
+      reading.providerMessageId !== candidate.providerMessageId || reading.localMessageId !== candidate.localMessageId) return { status: 'stale' };
+
+  const current = kernel.readOwnedSnapshotWithinTransaction(context);
+  const rawState = current.snapshot as unknown as Record<string, unknown>;
+  const hasLedger = Object.hasOwn(rawState, 'openRouterBatchLedger');
+  const rawLedger = hasLedger ? rawState.openRouterBatchLedger : { version: 1, jobs: [] };
+  const ledger = validateOpenRouterBatchLedger(rawLedger);
+  const currentClaim = context.db.prepare(`SELECT candidate_id,policy_id,policy_revision,attempt_number,status,paid_occurrence_id,paid_attempt_id,recovery_protocol_version
+    FROM background_proactive_preflight_attempts WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND attempt_id=?`)
+    .get(context.workspaceId, context.ownerId, context.privacyEpoch, preflightClaim.attemptId) as Record<string, unknown> | undefined;
+  if (!currentClaim || currentClaim.candidate_id !== candidate.candidateId || currentClaim.policy_id !== policyId ||
+      currentClaim.policy_revision !== policyRevision || currentClaim.status !== 'reading' || currentClaim.paid_occurrence_id !== null ||
+      currentClaim.paid_attempt_id !== null || currentClaim.recovery_protocol_version !== 1 ||
+      !Number.isSafeInteger(currentClaim.attempt_number) || (currentClaim.attempt_number as number) < 1) return { status: 'stale' };
+  const certifiedJobs = ledger.jobs.flatMap((job) => {
+    const marker = job.proactiveMailReply;
+    if (!marker || marker.policyId !== policyId || marker.policyRevision !== policyRevision) return [];
+    const proof = readCertifiedNotSubmittedProactiveJob(context, job);
+    if (!proof || proof.proofKind !== 'cold_checkpoint' || marker.occurrenceId !== proof.occurrenceId || marker.attemptId !== proof.paidAttemptId || job.status !== 'failed' ||
+        job.failureCode !== 'not_submitted' || job.unknownCharge !== false || job.batchId !== undefined) return [];
+    const recovered = context.db.prepare(`SELECT candidate_id,policy_id,policy_revision,attempt_number,status,result_code FROM background_proactive_preflight_attempts
+      WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND attempt_id=?`)
+      .get(context.workspaceId, context.ownerId, context.privacyEpoch, proof.preflightAttemptId) as Record<string, unknown> | undefined;
+    return recovered?.candidate_id === candidate.candidateId && recovered.policy_id === policyId && recovered.policy_revision === policyRevision &&
+      recovered.status === 'deferred' && recovered.result_code === 'startup_not_submitted_recovered' &&
+      Number.isSafeInteger(recovered.attempt_number) && (recovered.attempt_number as number) < (currentClaim.attempt_number as number)
+      ? [{ job, proof, attemptNumber: recovered.attempt_number as number }] : [];
+  });
+  certifiedJobs.sort((left, right) => right.attemptNumber - left.attemptNumber);
+  const latestCertified = certifiedJobs[0];
+  const latestMappedNoJob = context.db.prepare(`SELECT attempt_id,candidate_id,policy_id,policy_revision,attempt_number,status,result_code,
+      paid_occurrence_id,paid_attempt_id,recovery_protocol_version FROM background_proactive_preflight_attempts
+    WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND candidate_id=? AND policy_id=? AND policy_revision=? AND attempt_id<>?
+      AND result_code='startup_before_submit_recovered' ORDER BY attempt_number DESC LIMIT 1`)
+    .get(context.workspaceId, context.ownerId, context.privacyEpoch, candidate.candidateId, policyId, policyRevision, preflightClaim.attemptId) as
+      Record<string, unknown> | undefined;
+  if (latestMappedNoJob && (!Number.isSafeInteger(latestMappedNoJob.attempt_number) ||
+      typeof latestMappedNoJob.paid_occurrence_id !== 'string' || typeof latestMappedNoJob.paid_attempt_id !== 'string' ||
+      latestMappedNoJob.status !== 'deferred' || latestMappedNoJob.recovery_protocol_version !== 1)) return { status: 'stale' };
+  const certified = latestCertified && (!latestMappedNoJob ||
+    latestCertified.attemptNumber > (latestMappedNoJob.attempt_number as number)) ? latestCertified : undefined;
+  const mappedNoJob = !certified ? latestMappedNoJob : undefined;
+
+  let priorAttempt: Record<string, unknown> | undefined;
+  let expectedRecoveryCode: 'startup_not_submitted_recovered' | 'startup_before_submit_recovered';
+  let occurrenceId: string;
+  let paidAttemptId: string;
+  if (certified) {
+    if (certified.job.status !== 'failed' || certified.job.failureCode !== 'not_submitted' || certified.job.unknownCharge !== false ||
+        certified.job.batchId !== undefined || certified.job.id !== certified.job.customId) return { status: 'stale' };
+    priorAttempt = context.db.prepare(`SELECT attempt_id,candidate_id,policy_id,policy_revision,attempt_number,status,result_code,
+      paid_occurrence_id,paid_attempt_id,recovery_protocol_version FROM background_proactive_preflight_attempts
+      WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND attempt_id=?`)
+      .get(context.workspaceId, context.ownerId, context.privacyEpoch, certified.proof.preflightAttemptId) as Record<string, unknown> | undefined;
+    expectedRecoveryCode = 'startup_not_submitted_recovered';
+    occurrenceId = certified.proof.occurrenceId;
+    paidAttemptId = certified.proof.paidAttemptId;
+    if (certified.proof.commandId !== paidAttemptId) return { status: 'stale' };
+  } else {
+    priorAttempt = mappedNoJob;
+    expectedRecoveryCode = 'startup_before_submit_recovered';
+    if (!priorAttempt || typeof priorAttempt.paid_occurrence_id !== 'string' || typeof priorAttempt.paid_attempt_id !== 'string') return undefined;
+    occurrenceId = priorAttempt.paid_occurrence_id;
+    paidAttemptId = priorAttempt.paid_attempt_id;
+  }
+  if (!priorAttempt || priorAttempt.candidate_id !== candidate.candidateId || priorAttempt.policy_id !== policyId ||
+      priorAttempt.policy_revision !== policyRevision || priorAttempt.status !== 'deferred' || priorAttempt.result_code !== expectedRecoveryCode ||
+      priorAttempt.paid_occurrence_id !== occurrenceId || priorAttempt.paid_attempt_id !== paidAttemptId ||
+      priorAttempt.recovery_protocol_version !== 1 || !Number.isSafeInteger(priorAttempt.attempt_number) ||
+      (priorAttempt.attempt_number as number) >= (currentClaim.attempt_number as number)) return { status: 'stale' };
+
+  const occurrence = context.db.prepare(`SELECT policy_id,policy_revision,policy_kind,policy_digest,status,scheduled_at,source_digest,source_json,
+    descriptor_json,request_json,request_digest,batch_job_id FROM background_occurrences
+    WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND occurrence_id=?`)
+    .get(context.workspaceId, context.ownerId, context.privacyEpoch, occurrenceId) as Record<string, unknown> | undefined;
+  const paid = context.db.prepare(`SELECT status,dispatch_started_at,settled_at,result_code,finalization_operation,finalization_request_json,
+      finalization_receipt_json,finalization_receipt_digest FROM background_occurrence_attempts
+    WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND occurrence_id=? AND attempt_id=?`)
+    .get(context.workspaceId, context.ownerId, context.privacyEpoch, occurrenceId, paidAttemptId) as Record<string, unknown> | undefined;
+  const target = context.db.prepare(`SELECT status,attempt_id,target_id,target_generation FROM background_occurrence_targets
+    WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND occurrence_id=? AND target_id=? AND target_generation=?`)
+    .get(context.workspaceId, context.ownerId, context.privacyEpoch, occurrenceId, candidate.accountIdentityKey, candidate.connectionGeneration) as
+      Record<string, unknown> | undefined;
+  const policy = context.db.prepare(`SELECT h.status AS head_status,h.current_revision,r.enabled,r.policy_digest FROM background_policy_heads h
+    JOIN background_policy_revisions r ON r.workspace_id=h.workspace_id AND r.owner_id=h.owner_id AND r.privacy_epoch=h.privacy_epoch
+      AND r.policy_id=h.policy_id AND r.revision=h.current_revision
+    WHERE h.workspace_id=? AND h.owner_id=? AND h.privacy_epoch=? AND h.policy_id=?`)
+    .get(context.workspaceId, context.ownerId, context.privacyEpoch, policyId) as Record<string, unknown> | undefined;
+  if (!occurrence || !paid || !target || !policy || policy.head_status !== 'enabled' || policy.enabled !== 1 ||
+      policy.current_revision !== policyRevision || occurrence.policy_id !== policyId || occurrence.policy_revision !== policyRevision ||
+      occurrence.policy_kind !== 'proactive_draft' || occurrence.policy_digest !== policy.policy_digest || occurrence.status !== 'scheduled' ||
+      occurrence.batch_job_id !== null || paid.status !== 'skipped' || paid.dispatch_started_at !== null || paid.result_code !== expectedRecoveryCode ||
+      paid.finalization_operation !== 'defer' || paid.settled_at === null || target.status !== 'pending' || target.attempt_id !== null) {
+    return { status: 'stale' };
+  }
+  let request: Record<string, unknown>;
+  let receipt: Record<string, unknown>;
+  let occurrenceSource: string;
+  let occurrenceRequest: string;
+  let occurrenceDescriptor: string;
+  let frozenRequest: Record<string, unknown>;
+  try {
+    request = JSON.parse(String(paid.finalization_request_json)) as Record<string, unknown>;
+    receipt = JSON.parse(String(paid.finalization_receipt_json)) as Record<string, unknown>;
+    occurrenceSource = String(occurrence.source_json);
+    occurrenceRequest = String(occurrence.request_json);
+    occurrenceDescriptor = String(occurrence.descriptor_json);
+    frozenRequest = JSON.parse(occurrenceRequest) as Record<string, unknown>;
+    if (canonicalBackgroundJson(receipt) !== String(paid.finalization_receipt_json) ||
+        canonicalBackgroundJson(JSON.parse(occurrenceSource)) !== occurrenceSource ||
+        canonicalBackgroundJson(frozenRequest) !== occurrenceRequest ||
+        canonicalBackgroundJson(JSON.parse(occurrenceDescriptor)) !== occurrenceDescriptor) return { status: 'stale' };
+  } catch { return { status: 'stale' }; }
+  const receiptText = canonicalBackgroundJson(receipt);
+  if (Object.keys(request).sort().join(',') !== 'nextDueAt,operation,resultCode' || request.operation !== 'defer' ||
+      request.resultCode !== expectedRecoveryCode || !Number.isSafeInteger(request.nextDueAt) ||
+      Object.keys(receipt).sort().join(',') !== 'attemptId,nextDueAt,operation,resultCode,schemaVersion,settledAt' ||
+      receipt.schemaVersion !== 1 || receipt.operation !== 'defer' || receipt.attemptId !== paidAttemptId ||
+      receipt.resultCode !== expectedRecoveryCode || receipt.nextDueAt !== request.nextDueAt || receipt.settledAt !== paid.settled_at ||
+      paid.finalization_receipt_digest !== backgroundSha256(receiptText)) return { status: 'stale' };
+  const descriptorText = canonicalBackgroundJson(prepared.descriptor);
+  if (!Number.isSafeInteger(occurrence.scheduled_at) || occurrenceDescriptor !== descriptorText ||
+      occurrence.source_digest !== backgroundSha256(occurrenceSource) || occurrenceSource !== canonicalBackgroundJson(prepared.source)) {
+    return { status: 'stale' };
+  }
+  if (typeof frozenRequest.requestAsOf !== 'string') return { status: 'stale' };
+  const currentRequest = { ...prepared.request, requestAsOf: frozenRequest.requestAsOf };
+  if (canonicalBackgroundJson(currentRequest) !== occurrenceRequest ||
+      backgroundSha256(canonicalBackgroundJson({ sourceDigest: occurrence.source_digest, requestJson: occurrenceRequest,
+        scheduledAt: occurrence.scheduled_at })) !== occurrence.request_digest) return { status: 'stale' };
+
+  if (certified) {
+    const journal = context.db.prepare(`SELECT owner_id,privacy_epoch,command_kind,status FROM async_command_journal
+      WHERE workspace_id=? AND idempotency_key=?`).get(context.workspaceId, paidAttemptId) as Record<string, unknown> | undefined;
+    if (!journal || journal.owner_id !== context.ownerId || journal.privacy_epoch !== context.privacyEpoch ||
+        journal.command_kind !== 'mail.replybatch.submit' || journal.status !== 'inspect_required') return { status: 'stale' };
+  } else {
+    const journalExists = Boolean(context.db.prepare(`SELECT 1 FROM async_command_journal WHERE workspace_id=? AND idempotency_key=?`)
+      .get(context.workspaceId, paidAttemptId));
+      const contradictoryJob = ledger.jobs.some((job) => job.proactiveMailReply?.occurrenceId === occurrenceId &&
+        job.proactiveMailReply.attemptId === paidAttemptId);
+      if (journalExists || contradictoryJob) return { status: 'stale' };
+  }
+  const hasLinkTable = Boolean(context.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='background_paid_batch_links'").get());
+  const linkExists = hasLinkTable && Boolean(context.db.prepare(`SELECT 1 FROM background_paid_batch_links WHERE workspace_id=? AND owner_id=? AND privacy_epoch=?
+    AND (occurrence_id=? OR attempt_id=? OR job_id=?)`).get(context.workspaceId, context.ownerId, context.privacyEpoch,
+    occurrenceId, paidAttemptId, certified?.job.id ?? null));
+  if (linkExists) return { status: 'stale' };
+  return Object.freeze({ status: 'reuse', request: Object.freeze(currentRequest) as typeof prepared.request,
+    scheduledAt: occurrence.scheduled_at as number });
 }
 
 export interface OwnedWorkspaceRuntimePorts {
@@ -672,6 +873,243 @@ export class OwnedWorkspaceRuntime {
     return fullyComplete
       ? Object.freeze({ status: 'completed', commandId: input.claim.attemptId, code: 'sync_complete' })
       : Object.freeze({ status: 'inspect_required', commandId: input.claim.attemptId, code: 'sync_incomplete' });
+  }
+
+  /** Private proactive path: preflight text through the existing mail source command, then one linked reply Batch submission. */
+  async executeScheduledProactiveDraft(input: Readonly<{ sessionToken: string; ownerId: string; privacyEpoch: number;
+    claim: BackgroundProactivePreflightClaim; candidate: BackgroundProactiveCandidateRow; policy: BackgroundProactiveDraftCandidate; candidateIndex: BackgroundProactiveCandidateIndex;
+    occurrences: BackgroundOccurrenceStore; policies: BackgroundPolicyStore }>): Promise<Readonly<{
+      status: 'complete' | 'deferred' | 'inspect_required'; code: string; nextDueAt?: number }>> {
+    const initialIdentity = this.options.kernel.getOwnedIdentity(input.sessionToken);
+    if (!input || !input.claim || !input.candidate || initialIdentity.ownerId !== input.ownerId || initialIdentity.privacyEpoch !== input.privacyEpoch ||
+        input.claim.workspaceId !== initialIdentity.workspaceId || input.claim.ownerId !== input.ownerId || input.claim.privacyEpoch !== input.privacyEpoch ||
+        input.candidate.candidateId !== input.claim.candidateId || input.claim.policyId !== input.policy.policy.policyId) {
+      throw new Error('background_execution_stale');
+    }
+    if (this.busy.has(initialIdentity.workspaceId)) throw new Error('The workspace runtime is busy.');
+    if (this.refreshRequired.has(initialIdentity.workspaceId)) throw new Error('workspace_refresh_required');
+    const admission: OwnedWorkspaceAdmission = Object.freeze({ sessionToken: input.sessionToken,
+      assertCurrent: () => {
+        const current = this.options.kernel.getOwnedIdentity(input.sessionToken);
+        if (current.workspaceId !== initialIdentity.workspaceId || current.ownerId !== input.ownerId || current.privacyEpoch !== input.privacyEpoch) {
+          throw new Error('workspace_ownership_changed');
+        }
+        if (this.closing) throw new Error('background_runtime_stopping');
+      } });
+    const result = await this.track(initialIdentity.workspaceId, () => {
+      this.cache.delete(initialIdentity.workspaceId);
+      this.refreshRequired.add(initialIdentity.workspaceId);
+    }, async () => {
+      this.assertAdmission(admission);
+      const runtime = await this.registry.get(input.sessionToken);
+      this.assertAdmission(admission);
+      const loaded = runtime.store.getLoadedIdentity();
+      let currentIdentity = this.options.kernel.getOwnedIdentity(input.sessionToken);
+      this.assertStillCurrent(admission, initialIdentity, loaded, currentIdentity);
+      if (!loaded || loaded.revision !== currentIdentity.revision) throw new Error('workspace_loaded_revision_mismatch');
+      const policy = input.policy;
+      if (policy.policy.specification.kind !== 'proactive_draft') throw new Error('background_occurrence_policy_stale');
+      const assertPreflightCurrent = (): void => {
+        admission.assertCurrent();
+        this.options.kernel.withOwnedTransaction(input.sessionToken, input.privacyEpoch, (context) => {
+          const owned = this.options.kernel.readOwnedSnapshotWithinTransaction(context);
+          if (owned.workspaceId !== initialIdentity.workspaceId || context.ownerId !== input.ownerId || owned.privacyEpoch !== input.privacyEpoch) {
+            throw new Error('background_execution_stale');
+          }
+          input.policies.assertProactiveDraftPreflightCurrentWithinTransaction(context, {
+            policyId: policy.policy.policyId, policyRevision: policy.policy.revision });
+          const candidate = input.candidateIndex.assertReadingWithinTransaction(context, input.claim);
+          if (candidate.ruleId !== input.candidate.ruleId || candidate.ruleRevision !== input.candidate.ruleRevision ||
+              candidate.accountId !== input.candidate.accountId || candidate.accountIdentityKey !== input.candidate.accountIdentityKey ||
+              candidate.connectionGeneration !== input.candidate.connectionGeneration || candidate.providerMessageId !== input.candidate.providerMessageId ||
+              candidate.localMessageId !== input.candidate.localMessageId) throw new Error('background_mail_binding_changed');
+        });
+      };
+      const initial = runtime.controller.getSnapshot();
+      const initialSource = await runtime.controller.getMailReplySource(input.candidate.localMessageId);
+      admission.assertCurrent();
+      if (initialSource.status !== 'current' || !initialSource.source) {
+        return Object.freeze({ status: 'inspect_required' as const, code: 'source_changed' });
+      }
+      const account = initial.accounts.find((item) => item.id === input.candidate.accountId);
+      if (!account || account.connectionGeneration !== input.candidate.connectionGeneration ||
+          !account.connected || account.authStatus !== 'connected') return Object.freeze({ status: 'inspect_required' as const, code: 'account_changed' });
+      let cached = await runtime.controller.getMailReplyText(input.candidate.localMessageId);
+      admission.assertCurrent();
+      if (cached.status !== 'current' || !cached.snapshot || cached.snapshot.sourceDigest !== initialSource.source.sourceDigest) {
+        assertPreflightCurrent();
+        const envelope: WorkspaceCommandEnvelope = Object.freeze({ schemaVersion: 1, commandId: input.claim.attemptId,
+          expectedRevision: currentIdentity.revision, expectedPrivacyEpoch: currentIdentity.privacyEpoch,
+          command: Object.freeze({ kind: 'mail.source.loadText', messageId: input.candidate.localMessageId, accountId: account.id,
+            expectedConnectionGeneration: input.candidate.connectionGeneration, sourceDigest: initialSource.source.sourceDigest }) });
+        const loadInput: OwnedWorkspaceCommandInput = { ...admission, expectedRevision: currentIdentity.revision,
+          expectedPrivacyEpoch: currentIdentity.privacyEpoch, idempotencyKey: input.claim.attemptId,
+          kind: 'mail.source.loadtext', canonicalBody: canonicalWorkspaceCommand(envelope) };
+        const loadedText = await this.executeWithinReservedWorkspace(loadInput, currentIdentity, async (controller) => {
+          const loadedResult = await controller.loadMailReplyTextForCommand({ messageId: input.candidate.localMessageId, accountId: account.id,
+            expectedConnectionGeneration: input.candidate.connectionGeneration, sourceDigest: initialSource.source!.sourceDigest }, assertPreflightCurrent);
+          return parseWorkspaceCommandReceipt({ schemaVersion: 1, commandId: input.claim.attemptId, kind: 'mail.source.loadText',
+            objectId: input.candidate.localMessageId, accountId: account.id, connectionGeneration: input.candidate.connectionGeneration,
+            sourceDigest: initialSource.source!.sourceDigest, loadStatus: loadedResult.status,
+            ...(loadedResult.snapshot?.textDigest ? { textDigest: loadedResult.snapshot.textDigest } : {}),
+            ...(loadedResult.snapshot ? { bytes: loadedResult.snapshot.bytes } : {}) },
+          { commandId: input.claim.attemptId, kind: 'mail.source.loadText', objectId: input.candidate.localMessageId,
+            accountId: account.id, connectionGeneration: input.candidate.connectionGeneration, sourceDigest: initialSource.source!.sourceDigest });
+        }, (receipt): JsonValue => receipt as unknown as JsonValue);
+        const rawLoadReceipt = loadedText.result ?? (loadedText.admission.status === 'finished' ? loadedText.admission.receipt : undefined);
+        if (!rawLoadReceipt) return Object.freeze({ status: 'inspect_required' as const, code: 'source_load_inspect' });
+        const loadReceipt = parseWorkspaceCommandReceipt(rawLoadReceipt, { commandId: input.claim.attemptId, kind: 'mail.source.loadText',
+          objectId: input.candidate.localMessageId, accountId: account.id, connectionGeneration: input.candidate.connectionGeneration,
+          sourceDigest: initialSource.source.sourceDigest });
+        if (loadReceipt.kind !== 'mail.source.loadText' || loadReceipt.loadStatus !== 'current') {
+          return Object.freeze({ status: 'deferred' as const, code: 'source_text_unavailable', nextDueAt: Date.now() + MINUTE });
+        }
+        cached = await runtime.controller.getMailReplyText(input.candidate.localMessageId);
+        admission.assertCurrent();
+        currentIdentity = this.options.kernel.getOwnedIdentity(input.sessionToken);
+        const loadedAfterText = runtime.store.getLoadedIdentity();
+        this.assertStillCurrent(admission, initialIdentity, loadedAfterText, currentIdentity);
+        if (!loadedAfterText || loadedAfterText.revision !== currentIdentity.revision) throw new Error('workspace_loaded_revision_mismatch');
+      }
+      if (cached.status !== 'current' || !cached.snapshot || cached.snapshot.completeness === 'unavailable') {
+        return Object.freeze({ status: 'deferred' as const, code: 'source_text_unavailable', nextDueAt: Date.now() + MINUTE });
+      }
+      this.options.kernel.withOwnedTransaction(input.sessionToken, input.privacyEpoch, (context) => {
+        const current = this.options.kernel.readOwnedSnapshotWithinTransaction(context);
+        if (current.workspaceId !== initialIdentity.workspaceId || context.ownerId !== input.ownerId || current.privacyEpoch !== input.privacyEpoch) {
+          throw new Error('background_execution_stale');
+        }
+        input.policies.assertProactiveDraftPreflightCurrentWithinTransaction(context, {
+          policyId: policy.policy.policyId, policyRevision: policy.policy.revision });
+      });
+      const currentState = runtime.controller.getSnapshot();
+      const source = await runtime.controller.getMailReplySource(input.candidate.localMessageId);
+      admission.assertCurrent();
+      if (source.status !== 'current' || !source.source) return Object.freeze({ status: 'deferred' as const, code: 'source_changed', nextDueAt: Date.now() + MINUTE });
+      const prepared = prepareBackgroundProactiveMailReplyInputs(currentState, { specification: policy.policy.specification,
+        expectedAccountId: input.candidate.accountId, expectedIdentityKey: input.candidate.accountIdentityKey,
+        expectedGeneration: input.candidate.connectionGeneration, providerMessageId: input.candidate.providerMessageId,
+        localMessageId: input.candidate.localMessageId, now: Date.now() });
+      if (prepared.source.source.sourceDigest !== source.source.sourceDigest || prepared.source.body.textDigest !== cached.snapshot.textDigest) {
+        return Object.freeze({ status: 'deferred' as const, code: 'source_changed', nextDueAt: Date.now() + MINUTE });
+      }
+      const occurrenceStore = input.occurrences;
+      const reuse = this.options.kernel.withOwnedTransaction(input.sessionToken, input.privacyEpoch, (context) =>
+        certifiedOccurrenceReuseWithinTransaction({ context, kernel: this.options.kernel, candidateIndex: input.candidateIndex,
+          preflightClaim: input.claim, policyStore: input.policies, policyId: policy.policy.policyId,
+          policyRevision: policy.policy.revision, candidate: input.candidate, prepared }));
+      if (reuse?.status === 'stale') return Object.freeze({ status: 'inspect_required' as const, code: 'recovered_occurrence_stale' });
+      let reauthorizedInputs: Readonly<{ source: unknown; request: unknown; scheduledAt: number; parentOccurrenceId: string }> | undefined;
+      if (!reuse) {
+        const recovery = this.options.kernel.withOwnedTransaction(input.sessionToken, input.privacyEpoch, (context) =>
+          occurrenceStore.readProactiveReauthorizationInputsWithinTransaction(context, { expectedPrivacyEpoch: input.privacyEpoch,
+            policyId: policy.policy.policyId, expectedPolicyRevision: policy.policy.revision, descriptor: prepared.descriptor,
+            candidateIndex: input.candidateIndex, preflightClaim: input.claim }));
+        if (recovery?.status === 'stale' || recovery && !reauthorizedMailInputsMatchCurrent(recovery, prepared)) {
+          return Object.freeze({ status: 'inspect_required' as const, code: 'reauthorized_occurrence_stale' });
+        }
+        if (recovery?.status === 'reuse') reauthorizedInputs = recovery;
+      }
+      let occurrence;
+      try {
+        const scheduleInput = { expectedPrivacyEpoch: input.privacyEpoch, policyId: policy.policy.policyId,
+          expectedPolicyRevision: policy.policy.revision, descriptor: prepared.descriptor,
+          scheduledAt: reuse?.scheduledAt ?? reauthorizedInputs?.scheduledAt ?? prepared.scheduledAt,
+          source: reauthorizedInputs?.source ?? prepared.source, request: reuse?.request ?? reauthorizedInputs?.request ?? prepared.request };
+        occurrence = reauthorizedInputs ? occurrenceStore.scheduleReauthorizedPaidMailReply(scheduleInput) : occurrenceStore.schedule(scheduleInput);
+      } catch (error) {
+        if (error instanceof Error && error.message === 'background_occurrence_identity_conflict') {
+          return Object.freeze({ status: 'inspect_required' as const, code: 'occurrence_identity_conflict' });
+        }
+        throw error;
+      }
+      if (occurrence.status !== 'scheduled') {
+        return Object.freeze({ status: occurrence.status === 'completed' || occurrence.status === 'suppressed' ? 'complete' as const : 'inspect_required' as const,
+          code: 'occurrence_already_admitted' });
+      }
+      const occurrenceClaim = occurrenceStore.claimProactive({ expectedPrivacyEpoch: input.privacyEpoch, occurrenceId: occurrence.occurrenceId,
+        targetId: input.candidate.accountIdentityKey, targetGeneration: input.candidate.connectionGeneration,
+        preflightIndex: input.candidateIndex, preflightClaim: input.claim });
+      const request = prepared.request;
+      const batchCommand: WorkspaceCommandEnvelope = Object.freeze({ schemaVersion: 1, commandId: occurrenceClaim.claim.attemptId,
+        expectedRevision: currentIdentity.revision, expectedPrivacyEpoch: currentIdentity.privacyEpoch,
+        command: Object.freeze({ kind: 'mail.replyBatch.submit', messageId: prepared.source.messageId, accountId: account.id,
+          expectedConnectionGeneration: input.candidate.connectionGeneration, sourceDigest: prepared.source.source.sourceDigest,
+          textDigest: prepared.source.body.textDigest, mode: request.mode, to: request.to, cc: request.cc,
+          brief: request.brief, composerRevision: 0 }) });
+      const commandInput: OwnedWorkspaceCommandInput = { ...admission, expectedRevision: currentIdentity.revision,
+        expectedPrivacyEpoch: currentIdentity.privacyEpoch, idempotencyKey: occurrenceClaim.claim.attemptId,
+        kind: 'mail.replybatch.submit', canonicalBody: canonicalWorkspaceCommand(batchCommand) };
+      const links = new BackgroundBatchLinkStore(this.options.kernel);
+      let submitted: OwnedWorkspaceCommandResult<WorkspaceCommandReceipt>;
+      try {
+        submitted = await runBackgroundPaidMailReplyCheckpoint({ occurrences: occurrenceStore, links,
+          claim: occurrenceClaim.claim, preflightIndex: input.candidateIndex, preflightClaim: input.claim,
+          privacyEpoch: input.privacyEpoch, sessionToken: input.sessionToken }, () => this.executeWithinReservedWorkspace(commandInput, currentIdentity,
+          async (controller) => {
+            const job = await controller.submitScheduledProactiveMailReply({ messageId: prepared.source.messageId,
+              sourceDigest: prepared.source.source.sourceDigest, textDigest: prepared.source.body.textDigest, mode: request.mode,
+              to: [...request.to], cc: [...request.cc], brief: request.brief, composerRevision: 0, accountId: account.id,
+              expectedConnectionGeneration: input.candidate.connectionGeneration }, { effort: policy.policy.specification.kind === 'proactive_draft'
+                ? policy.policy.specification.paidConsent.effort : 'low', provenance: { version: 1,
+                policyId: policy.policy.policyId, policyRevision: policy.policy.revision, occurrenceId: occurrence.occurrenceId,
+                attemptId: occurrenceClaim.claim.attemptId }, assertBeforeStart: () => assertBackgroundPaidMailReplyDispatchAuthorized(this.options.kernel, {
+                  sessionToken: input.sessionToken, privacyEpoch: input.privacyEpoch, loadedStateProof: runtime.store.getLoadedStateProof() }) });
+            return parseWorkspaceCommandReceipt({ schemaVersion: 1, commandId: occurrenceClaim.claim.attemptId,
+              kind: 'mail.replyBatch.submit', objectId: job.id, jobId: job.id, jobStatus: job.status },
+            { commandId: occurrenceClaim.claim.attemptId, kind: 'mail.replyBatch.submit' });
+          }, (receipt): JsonValue => receipt as unknown as JsonValue));
+      } catch (error) {
+        if (!(error instanceof OpenRouterBatchDispatchError) || error.phase !== 'pre_dispatch') throw error;
+        const certified = this.options.kernel.withOwnedTransaction(input.sessionToken, input.privacyEpoch, (context) => {
+          const current = this.options.kernel.readOwnedSnapshotWithinTransaction(context);
+          const raw = current.snapshot as unknown as Record<string, unknown>;
+          if (!Object.hasOwn(raw, 'openRouterBatchLedger')) return false;
+          const ledger = validateOpenRouterBatchLedger(raw.openRouterBatchLedger);
+          const matchingJobs = ledger.jobs.filter((job) => isOpenRouterMailReplyContentJob(job) && job.id === job.customId &&
+            job.proactiveMailReply?.version === 1 && job.proactiveMailReply.policyId === policy.policy.policyId &&
+            job.proactiveMailReply.policyRevision === policy.policy.revision && job.proactiveMailReply.occurrenceId === occurrenceClaim.claim.occurrenceId &&
+            job.proactiveMailReply.attemptId === occurrenceClaim.claim.attemptId);
+          if (matchingJobs.length !== 1) return false;
+          const job = matchingJobs[0]!;
+          const proof = readCertifiedNotSubmittedProactiveJob(context, job);
+          if (!proof || proof.proofKind !== 'live_pre_dispatch' || proof.preflightAttemptId !== input.claim.attemptId ||
+              proof.occurrenceId !== occurrenceClaim.claim.occurrenceId || proof.paidAttemptId !== occurrenceClaim.claim.attemptId ||
+              proof.commandId !== occurrenceClaim.claim.attemptId) return false;
+          links.assertNoLinkWithinTransaction(context, occurrenceClaim.claim.occurrenceId, occurrenceClaim.claim.attemptId);
+          input.occurrences.assertPaidPreDispatchFinalizedWithinTransaction(context, occurrenceClaim.claim, input.privacyEpoch, 'live_not_submitted');
+          const settled = input.candidateIndex.readLiveNotSubmittedSettlementWithinTransaction(context, input.claim);
+          if (settled.occurrenceId !== occurrenceClaim.claim.occurrenceId || settled.paidAttemptId !== occurrenceClaim.claim.attemptId) return false;
+          input.candidateIndex.settleWithinTransaction(context, input.claim, { status: 'complete', code: 'live_not_submitted' }, settled.settledAt);
+          return true;
+        });
+        if (!certified) throw error;
+        return Object.freeze({ status: 'complete' as const, code: 'live_not_submitted' });
+      }
+      const rawReceipt = submitted.result ?? (submitted.admission.status === 'finished' ? submitted.admission.receipt : undefined);
+      if (!rawReceipt) return Object.freeze({ status: 'inspect_required' as const, code: 'paid_submit_inspect' });
+      const receipt = parseWorkspaceCommandReceipt(rawReceipt, { commandId: occurrenceClaim.claim.attemptId, kind: 'mail.replyBatch.submit' });
+      if (receipt.kind !== 'mail.replyBatch.submit' || !receipt.jobId) return Object.freeze({ status: 'inspect_required' as const, code: 'paid_submit_receipt_invalid' });
+      if (receipt.jobStatus === 'failed') {
+        const proof = this.options.kernel.withOwnedTransaction(input.sessionToken, input.privacyEpoch, (context) => {
+          const current = this.options.kernel.readOwnedSnapshotWithinTransaction(context);
+          const raw = current.snapshot as unknown as Record<string, unknown>;
+          const ledger = validateOpenRouterBatchLedger(Object.hasOwn(raw, 'openRouterBatchLedger')
+            ? raw.openRouterBatchLedger : { version: 1, jobs: [] });
+          const retained = ledger.jobs.find((job) => job.id === receipt.jobId);
+          return retained ? readCertifiedNotSubmittedProactiveJob(context, retained) : undefined;
+        });
+        if (proof?.proofKind === 'live_pre_dispatch' && proof.preflightAttemptId === input.claim.attemptId &&
+            proof.occurrenceId === occurrenceClaim.claim.occurrenceId && proof.paidAttemptId === occurrenceClaim.claim.attemptId) {
+          return Object.freeze({ status: 'complete' as const, code: 'live_not_submitted' });
+        }
+        return Object.freeze({ status: 'inspect_required' as const, code: 'paid_failure_unproven' });
+      }
+      occurrenceStore.settle(occurrenceClaim.claim, input.privacyEpoch, { status: 'unknown', batchJobId: receipt.jobId,
+        accounting: { status: 'unknown' }, resultCode: 'batch_submitted' });
+      return Object.freeze({ status: 'complete' as const, code: 'batch_submitted' });
+    });
+    return result;
   }
 
   /** GET-only Batch observation through the existing command journal and workspace reservation. */

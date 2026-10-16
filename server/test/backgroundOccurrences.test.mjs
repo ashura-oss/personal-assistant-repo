@@ -9,7 +9,12 @@ import { AuthService, createDurableKernel } from '../dist/index.js';
 import { acquireApplicationOwnership, reserveApplicationStartup } from '../dist/applicationOwnership.js';
 import { registerApplicationStartup } from '../dist/applicationStartup.js';
 import { BackgroundPolicyStore } from '../dist/backgroundPolicies.js';
+import { CommandJournal } from '../dist/commandJournal.js';
+import { ServerWorkspaceStore } from '../dist/workspaceStore.js';
+import { withReminderSavePolicyCapture } from '../dist/reminderPolicyCapture.js';
+import { BackgroundProactiveCandidateIndex } from '../dist/backgroundProactiveCandidates.js';
 import { BackgroundOccurrenceStore, markInterruptedBackgroundWorkForInspection } from '../dist/backgroundOccurrences.js';
+import { createInitialWorkspaceState } from '../dist/sharedControllerNode.mjs';
 
 const authSecret = Buffer.from(Array.from({ length: 32 }, (_, index) => index + 11));
 const origin = 'https://still.example';
@@ -21,7 +26,7 @@ async function setup() {
     assert.ok(value && typeof value === 'object' && !Array.isArray(value));
   } });
   const auth = new AuthService(kernel, { canonicalOrigin: origin, authSecret, now: () => now });
-  const { ownerId, workspaceId } = await auth.enrollOwner('correct horse battery staple', { notes: [] });
+  const { ownerId, workspaceId } = await auth.enrollOwner('correct horse battery staple', createInitialWorkspaceState(randomUUID));
   const challenge = auth.createLoginChallenge(origin);
   const browserSessionToken = (await auth.login({ password: 'correct horse battery staple', origin,
     preAuthToken: challenge.preAuthToken, csrfToken: challenge.csrfToken })).sessionToken;
@@ -38,18 +43,56 @@ async function setup() {
       connectionGeneration: accountGeneration ?? entry.expectedConnectionGeneration, label: 'Account', connected: true })) } : {}),
     ...(specification.kind === 'proactive_draft' ? { rule: { ruleId: specification.ruleId, revision: savedRuleRevision, specificationDigest: 'd'.repeat(64) } } : {}),
     ...(specification.kind === 'approved_reminder_delivery' ? { reminder: { reminderId: specification.reminderId, revision: specification.expectedReminderRevision,
-      approvedDigest: 'c'.repeat(64), dueAt: 1_800_000_000_000, privacyEpoch: 0, intentId: 'intent-approved', privacyMode: 'private', deviceSelection: 'all_current' } } : {}) };
+      approvedDigest: 'c'.repeat(64), dueAt: 1_800_000_000_000, privacyEpoch: 0, intentId: 'intent-saved', privacyMode: 'private', deviceSelection: specification.devices } } : {}) };
+  }, resolveReminderSnapshotTransitionWithinTransaction(context, _nextRevision, candidate, specification) {
+    const record = candidate.reminders?.records?.find((item) => item.id === specification.reminderId);
+    const intent = candidate.reminders?.intents?.find((item) => item.id === record?.currentIntentId);
+    if (!record || !intent) throw new Error('background_reminder_changed');
+    return { reminder: { reminderId: record.id, revision: record.revision, approvedDigest: record.approvedPayloadDigest,
+      dueAt: Date.parse(record.dueAt), privacyEpoch: context.privacyEpoch, intentId: intent.id, privacyMode: record.privacyMode,
+      deviceSelection: specification.devices } };
   }, captureReminderTargets() { targetCaptureCount += 1; return devices.map((item) => ({ ...item })); } };
   const clock = () => now++;
   const policies = new BackgroundPolicyStore({ kernel, auth, resolver, clock });
   const occurrences = new BackgroundOccurrenceStore({ kernel, actorSessionToken, resolver, clock });
   return { directory, kernel, auth, ownerId, workspace, browserSessionToken, actorSessionToken, resolver, policies, occurrences,
+    get now() { return now; },
     setNow(value) { now = value; },
     setDevices(value) { devices = value; }, setSavedRuleRevision(value) { savedRuleRevision = value; },
     setAccountIdentityKey(value) { accountIdentityKey = value; }, setAccountGeneration(value) { accountGeneration = value; },
     get targetCaptureCount() { return targetCaptureCount; } };
 }
 function cleanup(f) { try { f.auth.close(); } catch {} try { f.kernel.close(); } catch {} rmSync(f.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 }); }
+
+async function saveReminderPolicy(f, policy) {
+  const reminderId = policy.specification.reminderId;
+  const reminderRevision = policy.specification.expectedReminderRevision;
+  const devices = policy.specification.devices;
+  const journal = new CommandJournal(f.kernel);
+  const workspace = new ServerWorkspaceStore({ kernel: f.kernel, sessionToken: f.actorSessionToken, journal,
+    snapshotCommitParticipant: f.policies.createReminderSnapshotCommitParticipant() });
+  const initial = await workspace.load();
+  const createdAt = '2029-12-31T00:00:00.000Z';
+  const dueAt = new Date(1_800_000_000_000).toISOString();
+  const payload = { title: 'Reminder', body: 'Private details', dueAt, displayTimeZone: 'UTC', privacyMode: 'private' };
+  const before = { ...payload, id: reminderId, revision: reminderRevision, origin: { kind: 'manual' }, status: 'approved',
+    createdAt, updatedAt: createdAt, approvedRevision: reminderRevision, approvedPayloadDigest: 'c'.repeat(64), currentIntentId: 'intent-approved' };
+  const approvedIntent = { id: 'intent-approved', reminderId, reminderRevision, epoch: 1, identifier: 'still:reminder:approved',
+    payloadDigest: 'd'.repeat(64), payload, desired: 'scheduled', observed: 'unconfirmed', createdAt, updatedAt: createdAt };
+  const seeded = { ...initial, reminders: { ...initial.reminders, records: [before], intents: [approvedIntent] } };
+  await workspace.save(seeded);
+  const after = { ...before, status: 'saved', currentIntentId: 'intent-saved' };
+  const savedIntent = { ...approvedIntent, id: 'intent-saved', identifier: 'still:reminder:saved', createdAt: dueAt, updatedAt: dueAt };
+  const next = { ...seeded, reminders: { ...seeded.reminders, records: [after], intents: [...seeded.reminders.intents, savedIntent] } };
+  const commandId = policy.commandId ?? randomUUID();
+  const command = { deviceSelection: devices, expectedReminderRevision: reminderRevision, kind: 'reminders.serverSave', reminderId };
+  const canonicalBody = JSON.stringify({ command, commandId, expectedPrivacyEpoch: 0, expectedRevision: 1, schemaVersion: 1 });
+  const admission = journal.admit({ admissionSessionToken: f.actorSessionToken, expectedRevision: 1, expectedPrivacyEpoch: 0,
+    idempotencyKey: commandId, kind: 'reminders.serversave', canonicalBody });
+  await journal.run(admission.ticket, f.actorSessionToken, () => withReminderSavePolicyCapture({ canonicalCommandBody: canonicalBody,
+    commandId, reminderId, expectedReminderRevision: reminderRevision, deviceSelection: devices }, () => workspace.save(next)));
+  return { ...policy, commandId, policyId: f.policies.list(f.browserSessionToken, { expectedPrivacyEpoch: 0 })[0].policyId, intentId: 'intent-saved' };
+}
 function accountPolicy() {
   return { commandId: randomUUID(), expectedPrivacyEpoch: 0, policyId: randomUUID(), expectedPolicyRevision: 0, enabled: true,
     specification: { kind: 'account_sync', accounts: [{ accountId: 'google:acct-1', expectedConnectionGeneration: 3 }], resources: ['mail'] } };
@@ -369,10 +412,26 @@ test('dispatch rejects a changed authoritative saved rule revision instead of tr
         paidConsent: { authorized: true, model: 'openai/gpt-6-luna:batch', effort: 'none' } } };
     f.policies.save(f.browserSessionToken, policy);
     const identityKey = createHash('sha256').update(JSON.stringify({ accountId: 'google:acct-1', provider: 'google' })).digest('hex');
+    const candidateIndex = new BackgroundProactiveCandidateIndex(f.kernel);
+    const candidateProjection = { schemaVersion: 1, valid: true, candidates: [{ ruleId: 'rule-1', ruleRevision: 7,
+      accountId: 'google:acct-1', accountIdentityKey: identityKey, connectionGeneration: 3, providerMessageId: 'provider-message-1',
+      localMessageId: 'local-message-1', sourceVersion: 'e'.repeat(64), eligibleAt: f.now - 1 }] };
+    let preflightClaim;
+    f.kernel.withOwnedTransaction(f.actorSessionToken, 0, (context) => {
+      candidateIndex.reconcile(context, candidateProjection, context.revision, f.now);
+      const candidate = candidateIndex.listDueForPolicy(context, { ruleId: 'rule-1', ruleRevision: 7, policyId: policy.policyId,
+        policyRevision: 1, now: f.now })[0];
+      assert.ok(candidate);
+      preflightClaim = candidateIndex.prepareClaim({ candidateId: candidate.candidateId, policyId: policy.policyId, policyRevision: 1,
+        ruleId: 'rule-1', ruleRevision: 7, workspaceId: context.workspaceId, ownerId: context.ownerId, privacyEpoch: context.privacyEpoch });
+      assert.ok(candidateIndex.claim(context, candidate.candidateId, policy.policyId, 1, 'rule-1', 7, f.now, preflightClaim));
+      candidateIndex.markReadingWithinTransaction(context, preflightClaim, f.now);
+    });
     const occurrence = f.occurrences.schedule({ expectedPrivacyEpoch: 0, policyId: policy.policyId, expectedPolicyRevision: 1,
       descriptor: { kind: 'proactive_draft', accountIdentityKey: identityKey, providerMessageId: 'provider-message-1' },
       scheduledAt: 1_800_000_000_000, source: { messageDigest: 'e'.repeat(64) } });
-    const claim = f.occurrences.claim({ expectedPrivacyEpoch: 0, occurrenceId: occurrence.occurrenceId, targetId: identityKey, targetGeneration: 3 });
+    const claim = f.occurrences.claimProactive({ expectedPrivacyEpoch: 0, occurrenceId: occurrence.occurrenceId, targetId: identityKey,
+      targetGeneration: 3, preflightIndex: candidateIndex, preflightClaim });
     f.setSavedRuleRevision(8);
     assert.throws(() => f.occurrences.beginDispatch(claim.claim, 0), /binding_changed/);
   } finally { cleanup(f); }
@@ -381,14 +440,14 @@ test('dispatch rejects a changed authoritative saved rule revision instead of tr
 test('reminder fanout freezes device generations at due time and never expands on retry', async () => {
   const f = await setup();
   try {
-    const reminderId = 'reminder-1';
+    const reminderId = randomUUID();
     const policy = { commandId: randomUUID(), expectedPrivacyEpoch: 0, policyId: randomUUID(), expectedPolicyRevision: 0, enabled: true,
       specification: { kind: 'approved_reminder_delivery', reminderId, expectedReminderRevision: 4, channel: 'web_push', devices: 'all_current' } };
-    f.policies.save(f.browserSessionToken, policy);
+    const savedPolicy = await saveReminderPolicy(f, policy);
     const original = { subscriptionId: randomUUID(), generation: 2 };
     f.setDevices([original]);
-    const input = { expectedPrivacyEpoch: 0, policyId: policy.policyId, expectedPolicyRevision: 1,
-      descriptor: { kind: 'approved_reminder_delivery', reminderId, reminderRevision: 4, approvedIntentId: 'intent-approved' },
+    const input = { expectedPrivacyEpoch: 0, policyId: savedPolicy.policyId, expectedPolicyRevision: 1,
+      descriptor: { kind: 'approved_reminder_delivery', reminderId, reminderRevision: 4, approvedIntentId: savedPolicy.intentId },
       scheduledAt: 1_800_000_000_000, source: { approvedPayloadDigest: 'c'.repeat(64) } };
     const occurrence = f.occurrences.schedule(input);
     assert.equal(f.targetCaptureCount, 1);
@@ -407,15 +466,15 @@ test('reminder fanout freezes device generations at due time and never expands o
 test('a multi-device reminder stays open until every frozen target settles and preserves reported accounting', async () => {
   const f = await setup();
   try {
-    const reminderId = 'reminder-fanout';
+    const reminderId = randomUUID();
     const policy = { commandId: randomUUID(), expectedPrivacyEpoch: 0, policyId: randomUUID(), expectedPolicyRevision: 0, enabled: true,
       specification: { kind: 'approved_reminder_delivery', reminderId, expectedReminderRevision: 4, channel: 'web_push', devices: 'all_current' } };
-    f.policies.save(f.browserSessionToken, policy);
+    const savedPolicy = await saveReminderPolicy(f, policy);
     const firstDevice = { subscriptionId: randomUUID(), generation: 3 };
     const secondDevice = { subscriptionId: randomUUID(), generation: 8 };
     f.setDevices([firstDevice, secondDevice]);
-    const occurrence = f.occurrences.schedule({ expectedPrivacyEpoch: 0, policyId: policy.policyId, expectedPolicyRevision: 1,
-      descriptor: { kind: 'approved_reminder_delivery', reminderId, reminderRevision: 4, approvedIntentId: 'intent-approved' },
+    const occurrence = f.occurrences.schedule({ expectedPrivacyEpoch: 0, policyId: savedPolicy.policyId, expectedPolicyRevision: 1,
+      descriptor: { kind: 'approved_reminder_delivery', reminderId, reminderRevision: 4, approvedIntentId: savedPolicy.intentId },
       scheduledAt: 1_800_000_000_000, source: { approvedPayloadDigest: 'c'.repeat(64) } });
     const first = f.occurrences.claim({ expectedPrivacyEpoch: 0, occurrenceId: occurrence.occurrenceId,
       targetId: firstDevice.subscriptionId, targetGeneration: firstDevice.generation });
@@ -441,14 +500,14 @@ test('a multi-device reminder stays open until every frozen target settles and p
 test('multi-target aggregate reports only sums backed by every settled target', async () => {
   const f = await setup();
   try {
-    const reminderId = 'reminder-known-fanout';
+    const reminderId = randomUUID();
     const policy = { commandId: randomUUID(), expectedPrivacyEpoch: 0, policyId: randomUUID(), expectedPolicyRevision: 0, enabled: true,
       specification: { kind: 'approved_reminder_delivery', reminderId, expectedReminderRevision: 2, channel: 'web_push', devices: 'all_current' } };
-    f.policies.save(f.browserSessionToken, policy);
+    const savedPolicy = await saveReminderPolicy(f, policy);
     const targets = [{ subscriptionId: randomUUID(), generation: 1 }, { subscriptionId: randomUUID(), generation: 2 }];
     f.setDevices(targets);
-    const occurrence = f.occurrences.schedule({ expectedPrivacyEpoch: 0, policyId: policy.policyId, expectedPolicyRevision: 1,
-      descriptor: { kind: 'approved_reminder_delivery', reminderId, reminderRevision: 2, approvedIntentId: 'intent-approved' },
+    const occurrence = f.occurrences.schedule({ expectedPrivacyEpoch: 0, policyId: savedPolicy.policyId, expectedPolicyRevision: 1,
+      descriptor: { kind: 'approved_reminder_delivery', reminderId, reminderRevision: 2, approvedIntentId: savedPolicy.intentId },
       scheduledAt: 1_800_000_000_000, source: { approvedPayloadDigest: 'a'.repeat(64) } });
     for (const [index, target] of targets.entries()) {
       const claimed = f.occurrences.claim({ expectedPrivacyEpoch: 0, occurrenceId: occurrence.occurrenceId,
@@ -483,14 +542,14 @@ test('reported usage remains visible when actual provider cost is missing', asyn
 test('multi-target usage sums remain visible when any settled target lacks reported cost', async () => {
   const f = await setup();
   try {
-    const reminderId = 'reminder-partial-cost';
+    const reminderId = randomUUID();
     const policy = { commandId: randomUUID(), expectedPrivacyEpoch: 0, policyId: randomUUID(), expectedPolicyRevision: 0, enabled: true,
       specification: { kind: 'approved_reminder_delivery', reminderId, expectedReminderRevision: 2, channel: 'web_push', devices: 'all_current' } };
-    f.policies.save(f.browserSessionToken, policy);
+    const savedPolicy = await saveReminderPolicy(f, policy);
     const targets = [{ subscriptionId: randomUUID(), generation: 1 }, { subscriptionId: randomUUID(), generation: 2 }];
     f.setDevices(targets);
-    const occurrence = f.occurrences.schedule({ expectedPrivacyEpoch: 0, policyId: policy.policyId, expectedPolicyRevision: 1,
-      descriptor: { kind: 'approved_reminder_delivery', reminderId, reminderRevision: 2, approvedIntentId: 'intent-approved' },
+    const occurrence = f.occurrences.schedule({ expectedPrivacyEpoch: 0, policyId: savedPolicy.policyId, expectedPolicyRevision: 1,
+      descriptor: { kind: 'approved_reminder_delivery', reminderId, reminderRevision: 2, approvedIntentId: savedPolicy.intentId },
       scheduledAt: 1_800_000_000_000, source: { approvedPayloadDigest: 'b'.repeat(64) } });
     for (const [index, target] of targets.entries()) {
       const claimed = f.occurrences.claim({ expectedPrivacyEpoch: 0, occurrenceId: occurrence.occurrenceId,
@@ -509,14 +568,14 @@ test('multi-target usage sums remain visible when any settled target lacks repor
 test('an already-dispatched sibling can record its result after aggregate inspection begins', async () => {
   const f = await setup();
   try {
-    const reminderId = 'reminder-inspection-hold';
+    const reminderId = randomUUID();
     const policy = { commandId: randomUUID(), expectedPrivacyEpoch: 0, policyId: randomUUID(), expectedPolicyRevision: 0, enabled: true,
       specification: { kind: 'approved_reminder_delivery', reminderId, expectedReminderRevision: 2, channel: 'web_push', devices: 'all_current' } };
-    f.policies.save(f.browserSessionToken, policy);
+    const savedPolicy = await saveReminderPolicy(f, policy);
     const targets = [{ subscriptionId: randomUUID(), generation: 2 }, { subscriptionId: randomUUID(), generation: 4 }];
     f.setDevices(targets);
-    const occurrence = f.occurrences.schedule({ expectedPrivacyEpoch: 0, policyId: policy.policyId, expectedPolicyRevision: 1,
-      descriptor: { kind: 'approved_reminder_delivery', reminderId, reminderRevision: 2, approvedIntentId: 'intent-approved' },
+    const occurrence = f.occurrences.schedule({ expectedPrivacyEpoch: 0, policyId: savedPolicy.policyId, expectedPolicyRevision: 1,
+      descriptor: { kind: 'approved_reminder_delivery', reminderId, reminderRevision: 2, approvedIntentId: savedPolicy.intentId },
       scheduledAt: 1_800_000_000_000, source: { approvedPayloadDigest: 'e'.repeat(64) } });
     const claims = targets.map((target) => f.occurrences.claim({ expectedPrivacyEpoch: 0, occurrenceId: occurrence.occurrenceId,
       targetId: target.subscriptionId, targetGeneration: target.generation }));

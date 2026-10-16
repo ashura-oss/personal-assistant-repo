@@ -12,7 +12,12 @@ import { PrivateAudioRepository } from '../../server/src/privateAudioRepository.
 import { BatchObservationIndex } from '../../server/src/batchObservationIndex.js';
 import { composeSnapshotCommitParticipants } from '../../server/src/workspaceStore.js';
 import { createBatchObservationSnapshotParticipant } from './batchObservationProjection.node';
-import { createBackgroundPaidMailReplySnapshotParticipant } from './backgroundPaidWork.node';
+import { assertBackgroundPaidMailReplyCheckpoint, createBackgroundPaidMailReplySnapshotParticipant,
+  resolveBackgroundPaidMailReplyJobAuthority } from './backgroundPaidWork.node';
+import { BackgroundOccurrenceStore } from '../../server/src/backgroundOccurrences.js';
+import type { BackgroundPolicyStore } from '../../server/src/backgroundPolicies.js';
+import { BackgroundBatchLinkStore } from '../../server/src/backgroundBatchLink.js';
+import { ProductionBackgroundBindingResolver } from './backgroundBindingResolver.node';
 import { BackgroundProactiveCandidateIndex } from '../../server/src/backgroundProactiveCandidates.js';
 import { createBackgroundProactiveCandidateSnapshotParticipant } from './backgroundProactiveCandidateProjection.node';
 import { ensurePrivateDirectory } from '../../server/src/config.js';
@@ -144,7 +149,9 @@ export function createProductionWorkspacePortsFor(config: Pick<ServerConfig,
   if (!config || typeof config.dataDirectory !== 'string' || !config.dataDirectory || config.dataDirectory.includes('\0')) {
     throw new TypeError('production_workspace_data_directory_required');
   }
-  return async (context: FactoryContext, vault: SecretVault, kernel: DurableKernel): Promise<OwnedWorkspaceFactoryPorts> => {
+  return async (context: FactoryContext, vault: SecretVault, kernel: DurableKernel, policies: BackgroundPolicyStore,
+    onBackgroundMetadataCommitted: () => void = () => {}): Promise<OwnedWorkspaceFactoryPorts> => {
+    if (!policies || typeof policies.createReminderSnapshotCommitParticipant !== 'function') throw new Error('background_policy_store_not_initialized');
     const identity = Object.freeze({ workspaceId: context.identity.workspaceId, ownerId: context.identity.ownerId,
       privacyEpoch: context.identity.privacyEpoch });
     const actorToken = context.runtimeSessionToken;
@@ -252,12 +259,17 @@ export function createProductionWorkspacePortsFor(config: Pick<ServerConfig,
     });
     const documentLineage = new DocumentLineage(kernel, actorToken);
     const summaryApplication = new PeriodSummaryApplicationRuntime(kernel, actorToken, documentLineage, context.journal);
+    const paidAuthorityOccurrences = new BackgroundOccurrenceStore({ kernel, actorSessionToken: context.runtimeSessionToken,
+      resolver: new ProductionBackgroundBindingResolver(kernel) });
+    const paidAuthorityLinks = new BackgroundBatchLinkStore(kernel);
     context.store.installSnapshotCommitParticipant(composeSnapshotCommitParticipants<AppState>([
       { name: 'period_summary_application', participant: summaryApplication.createSnapshotCommitParticipant<AppState>() },
       { name: 'audio', participant: audioRepo.createSnapshotCommitParticipant<AppState>() },
       { name: 'batch_observation', participant: createBatchObservationSnapshotParticipant<AppState>(new BatchObservationIndex(), Date.now) },
-      { name: 'proactive_candidates', participant: createBackgroundProactiveCandidateSnapshotParticipant(new BackgroundProactiveCandidateIndex(kernel), Date.now) },
+      { name: 'proactive_candidates', participant: createBackgroundProactiveCandidateSnapshotParticipant(
+        new BackgroundProactiveCandidateIndex(kernel), Date.now, onBackgroundMetadataCommitted) },
       { name: 'background_paid_mail_reply', participant: createBackgroundPaidMailReplySnapshotParticipant(kernel, context.journal) },
+      { name: 'background_reminders', participant: policies.createReminderSnapshotCommitParticipant<AppState>() },
     ]));
     const speechAudio = createNodeSpeechAudioService(audioRepo);
     const azureSpeech = new SharedAzureSpeechClient({ fetcher, audio: speechAudio,
@@ -331,6 +343,11 @@ export function createProductionWorkspacePortsFor(config: Pick<ServerConfig,
         invalidateAll: () => summaryApplication.invalidateAll(),
         apply: (input) => summaryApplication.apply(input),
       } satisfies PeriodSummaryApplicationPort),
+      assertProactiveMailCheckpoint: (input) => assertBackgroundPaidMailReplyCheckpoint(kernel, input),
+      resolveProactiveMailReplyJobAuthority: async (job) => resolveBackgroundPaidMailReplyJobAuthority(kernel, {
+        sessionToken: context.runtimeSessionToken, privacyEpoch: context.identity.privacyEpoch, job,
+        occurrences: paidAuthorityOccurrences, links: paidAuthorityLinks,
+      }),
       speechAudioService: speechAudio, openRouterSpeechAdapter: openRouterSpeech,
       writeDocument: async (path, content) => {
         assertActor();

@@ -36,7 +36,7 @@ export function projectBackgroundProactiveCandidates(snapshot: unknown, now: num
         account.authStatus !== 'connected' || !account.identity || !account.capabilities?.includes('mail.read') ||
         !account.grantedScopes || !scopeGrantsCapability(account.provider, account.grantedScopes, 'mail.read') ||
         (account.capabilityLimits && !account.capabilityLimits.includes('mail.read')) || !Number.isSafeInteger(account.connectionGeneration) ||
-        (account.connectionGeneration ?? 0) < 1 || !rule.accountIds.includes(account.id)) continue;
+        (account.connectionGeneration ?? 0) < 1 || (rule.accountIds.length > 0 && !rule.accountIds.includes(account.id))) continue;
     let identityKey: string;
     try { identityKey = sha256(canonicalVerifiedProviderIdentity(account)); } catch { continue; }
     const verifiedIdentityKey = [account.identity.providerNamespace, account.identity.clientId, account.identity.subject,
@@ -56,17 +56,41 @@ export function projectBackgroundProactiveCandidates(snapshot: unknown, now: num
 }
 
 export function createBackgroundProactiveCandidateSnapshotParticipant(index: BackgroundProactiveCandidateIndex,
-  now: () => number = Date.now): SnapshotCommitParticipant<AppState> {
-  if (!index || typeof index.reconcile !== 'function' || typeof now !== 'function' || now.constructor?.name === 'AsyncFunction') {
+  now: () => number = Date.now, onMetadataCommitted: () => void = () => {}): SnapshotCommitParticipant<AppState> {
+  if (!index || typeof index.reconcile !== 'function' || typeof now !== 'function' || now.constructor?.name === 'AsyncFunction' ||
+      typeof onMetadataCommitted !== 'function' || onMetadataCommitted.constructor?.name === 'AsyncFunction') {
     throw new Error('background_proactive_candidate_participant_unavailable');
   }
+  const signature = (projection: BackgroundProactiveCandidateProjection): string => JSON.stringify({
+    schemaVersion: projection.schemaVersion,
+    valid: projection.valid,
+    candidates: projection.candidates.map((candidate) => [candidate.ruleId, candidate.ruleRevision, candidate.accountId,
+      candidate.accountIdentityKey, candidate.connectionGeneration, candidate.providerMessageId, candidate.localMessageId,
+      candidate.sourceVersion, candidate.eligibleAt] as const).sort((left, right) => {
+        for (let index = 0; index < left.length; index += 1) {
+          const a = String(left[index]);
+          const b = String(right[index]);
+          if (a < b) return -1;
+          if (a > b) return 1;
+        }
+        return 0;
+      }),
+  });
   return Object.freeze({
     commit(context: OwnedTransactionContext, input: SnapshotCommitParticipantInput<AppState>) {
       context.assertActive();
       if (input.nextRevision !== context.revision + 1) throw new Error('background_proactive_snapshot_revision_changed');
       const current = now();
       if (!Number.isSafeInteger(current) || current < 0) throw new Error('background_proactive_candidate_time_invalid');
-      index.reconcile(context, projectBackgroundProactiveCandidates(input.nextSnapshot, current), input.nextRevision, current);
+      const previous = projectBackgroundProactiveCandidates(input.previousSnapshot, current);
+      const next = projectBackgroundProactiveCandidates(input.nextSnapshot, current);
+      index.reconcile(context, next, input.nextRevision, current);
+      return signature(previous) === signature(next) ? undefined : Object.freeze(['changed']);
+    },
+    afterAcknowledged(intentIds: readonly string[]) {
+      if (intentIds.includes('changed')) {
+        try { onMetadataCommitted(); } catch { /* Durable candidate metadata and periodic reconciliation remain authoritative. */ }
+      }
     },
   });
 }

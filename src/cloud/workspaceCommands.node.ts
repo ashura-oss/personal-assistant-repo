@@ -13,6 +13,7 @@ import {
   type WorkspaceCommandStatus,
 } from './workspaceCommands';
 import { workspaceCommandKindFromJournal } from './workspaceCommandHistory';
+import { withReminderSavePolicyCapture } from '../../server/src/reminderPolicyCapture.js';
 import { resolveKnowledgeSourceChoice } from './knowledgeSourceChoices.node';
 import type { OwnedWorkspaceIdentity } from '../../server/src/kernel.js';
 
@@ -333,6 +334,38 @@ export async function dispatchWorkspaceCommand(runtime: OwnedWorkspaceRuntime, a
         return receipt(envelope, command, { objectId: command.jobId, jobId: command.jobId,
           path: applied.path, documentRevision: applied.documentRevision, appliedAt: applied.appliedAt });
       }
+      case 'reminders.createDraft': {
+        const record = await controller.createReminderDraftForCommand(command.payload);
+        return receipt(envelope, command, { objectId: record.id, reminderId: record.id, reminderRevision: record.revision, reminderStatus: record.status });
+      }
+      case 'reminders.editDraft': {
+        const record = await controller.updateReminderDraftForCommand(command.reminderId,
+          { ...command.payload, expectedRevision: command.expectedReminderRevision });
+        return receipt(envelope, command, { objectId: record.id, reminderId: record.id, reminderRevision: record.revision, reminderStatus: record.status });
+      }
+      case 'reminders.approve': {
+        const record = await controller.approveReminderForCommand(command.reminderId, { expectedRevision: command.expectedReminderRevision });
+        return receipt(envelope, command, { objectId: record.id, reminderId: record.id, reminderRevision: record.revision, reminderStatus: record.status });
+      }
+      case 'reminders.serverSave': {
+        const record = await withReminderSavePolicyCapture({ canonicalCommandBody: canonicalWorkspaceCommand(envelope),
+          commandId: envelope.commandId, reminderId: command.reminderId, expectedReminderRevision: command.expectedReminderRevision,
+          deviceSelection: command.deviceSelection }, () => controller.saveApprovedReminderForCommand(command.reminderId,
+          { expectedRevision: command.expectedReminderRevision }));
+        return receipt(envelope, command, { objectId: record.id, reminderId: record.id, reminderRevision: record.revision, reminderStatus: record.status });
+      }
+      case 'reminders.cancel': {
+        const record = await controller.cancelReminderForCommand(command.reminderId, { expectedRevision: command.expectedReminderRevision });
+        return receipt(envelope, command, { objectId: record.id, reminderId: record.id, reminderRevision: record.revision, reminderStatus: record.status });
+      }
+      case 'reminders.complete': {
+        const record = await controller.completeReminderForCommand(command.reminderId, { expectedRevision: command.expectedReminderRevision });
+        return receipt(envelope, command, { objectId: record.id, reminderId: record.id, reminderRevision: record.revision, reminderStatus: record.status });
+      }
+      case 'reminders.delete': {
+        const deleted = await controller.deleteReminderForCommand(command.reminderId, { expectedRevision: command.expectedReminderRevision });
+        return receipt(envelope, command, { objectId: deleted.id, reminderId: deleted.id, reminderRevision: deleted.revision, deleted: true });
+      }
       case 'chat.submit': {
         const accepted = await controller.submitChatTurn({ conversationId: command.conversationId, text: command.text,
           knowledgeSelection: command.knowledgeSelection?.map(({ kind, id }) => ({ kind, id })) });
@@ -405,6 +438,8 @@ function receipt(envelope: WorkspaceCommandEnvelope, command: WorkspaceCommand, 
   readonly applicationPlan?: import('../core').PeriodSummaryApplicationPlan;
   readonly application?: import('../core').PeriodSummaryApplicationReceipt;
   readonly path?: string; readonly appliedAt?: string;
+  readonly reminderId?: string; readonly reminderRevision?: number; readonly reminderStatus?: import('../reminders').ReminderStatus;
+  readonly deleted?: true;
 }) {
   return parseWorkspaceCommandReceipt({ schemaVersion: 1, commandId: envelope.commandId, kind: command.kind, ...fields },
     expectedReceipt(envelope.commandId, command));
@@ -478,6 +513,10 @@ function expectedReceipt(commandId: string, command: WorkspaceCommand) {
     case 'assistant.periodSummary.application.prepare': return { commandId, kind: command.kind, objectId: command.jobId, jobId: command.jobId };
     case 'assistant.periodSummary.application.cancel': return { commandId, kind: command.kind, objectId: command.planId, planId: command.planId };
     case 'assistant.periodSummary.application.apply': return { commandId, kind: command.kind, objectId: command.jobId, jobId: command.jobId };
+    case 'reminders.createDraft': return { commandId, kind: command.kind };
+    case 'reminders.editDraft': case 'reminders.approve': case 'reminders.serverSave':
+    case 'reminders.cancel': case 'reminders.complete': case 'reminders.delete':
+      return { commandId, kind: command.kind, objectId: command.reminderId };
     case 'chat.submit': return { commandId, kind: command.kind, objectId: command.conversationId };
     case 'chat.refine': return { commandId, kind: command.kind, objectId: command.conversationId, parentTurnId: command.parentTurnId };
     default: return assertNever(command);

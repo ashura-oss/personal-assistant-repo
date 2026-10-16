@@ -9,7 +9,7 @@ import test from 'node:test';
 import { AuthService, createDurableKernel } from '../dist/index.js';
 import { BackgroundProactiveCandidateIndex } from '../dist/backgroundProactiveCandidates.js';
 import { BackgroundPolicyStore } from '../dist/backgroundPolicies.js';
-import { ServerWorkspaceStore } from '../dist/workspaceRuntime.js';
+import { ServerWorkspaceStore, composeSnapshotCommitParticipants } from '../dist/workspaceRuntime.js';
 import { validatePhysicalWorkspaceSnapshot } from '../dist/bootstrap.js';
 import { createInitialWorkspaceState } from '../dist/sharedControllerNode.mjs';
 import { build } from 'esbuild';
@@ -149,9 +149,12 @@ test('terminal preflight settlements replay exactly after acknowledgement loss a
       f.policyId, 1, 'rule-1', 7, f.now));
     assert.ok(claim);
     const deferred = { status: 'deferred', code: 'body_read_retry', nextDueAt: f.now + 60_000 };
-    f.kernel.withOwnedTransaction(f.actorToken, 0, (context) => f.index.settleWithinTransaction(context, claim, deferred, f.now + 1));
+    const settledAt = f.now + 1;
+    f.kernel.withOwnedTransaction(f.actorToken, 0, (context) => f.index.settleWithinTransaction(context, claim, deferred, settledAt));
     assert.doesNotThrow(() => f.kernel.withOwnedTransaction(f.actorToken, 0,
-      (context) => f.index.settleWithinTransaction(context, claim, deferred, f.now + 5 * 60_000)));
+      (context) => f.index.settleWithinTransaction(context, claim, deferred, settledAt)));
+    assert.throws(() => f.kernel.withOwnedTransaction(f.actorToken, 0,
+      (context) => f.index.settleWithinTransaction(context, claim, deferred, settledAt + 1)), /settlement_conflict/);
     assert.throws(() => f.kernel.withOwnedTransaction(f.actorToken, 0, (context) => f.index.settleWithinTransaction(context, claim,
       { ...deferred, code: 'different_read_error' }, f.now + 6 * 60_000)), /settlement_conflict/);
     assert.throws(() => f.kernel.withOwnedTransaction(f.actorToken, 0, (context) => f.index.settleWithinTransaction(context, claim,
@@ -221,6 +224,28 @@ test('real AppState snapshot participant indexes existing mail and saved consent
     assert.deepEqual(Object.keys(projected.candidates[0]).sort(), ['accountId', 'accountIdentityKey', 'connectionGeneration',
       'eligibleAt', 'localMessageId', 'providerMessageId', 'ruleId', 'ruleRevision', 'sourceVersion']);
 
+    let reorderedWakeCount = 0;
+    const reorderParticipant = createBackgroundProactiveCandidateSnapshotParticipant({ reconcile(_context, projection) {
+      assert.equal(projection.valid, true);
+      assert.equal(projection.candidates.length, 2);
+    } }, () => now, () => { reorderedWakeCount += 1; });
+    const twoCandidateSnapshot = structuredClone(state);
+    const secondEntry = structuredClone(twoCandidateSnapshot.proactive.candidates[0]);
+    secondEntry.candidate.providerId = 'provider-message-2';
+    secondEntry.candidate.sourceId = JSON.stringify(['google', accountId, 'provider-message-2']);
+    secondEntry.candidate.sourceVersion = 'c'.repeat(64);
+    secondEntry.candidate.id = JSON.stringify([ruleId, 7, secondEntry.candidate.sourceId, secondEntry.candidate.sourceVersion]);
+    twoCandidateSnapshot.proactive.candidates.push(secondEntry);
+    twoCandidateSnapshot.mailbox.push({ ...twoCandidateSnapshot.mailbox[0], id: 'local-message-2', providerMessageId: 'provider-message-2',
+      identityKey: `${verifiedIdentityKey}:provider-message-2` });
+    const reorderedSnapshot = structuredClone(twoCandidateSnapshot);
+    reorderedSnapshot.proactive.candidates.reverse();
+    reorderedSnapshot.mailbox.reverse();
+    const reorderedIntent = reorderParticipant.commit({ revision: 1, assertActive() {} },
+      { previousSnapshot: twoCandidateSnapshot, nextSnapshot: reorderedSnapshot, nextRevision: 2 });
+    reorderParticipant.afterAcknowledged(reorderedIntent ?? []);
+    assert.equal(reorderedWakeCount, 0, 'reordering equivalent content-free candidate metadata does not wake the scheduler');
+
     kernel = createDurableKernel({ databasePath: join(directory, 'workspace.sqlite'), now: () => now,
       validateSnapshot: validatePhysicalWorkspaceSnapshot });
     auth = new AuthService(kernel, { canonicalOrigin: origin, authSecret, now: () => now });
@@ -230,8 +255,9 @@ test('real AppState snapshot participant indexes existing mail and saved consent
       preAuthToken: challenge.preAuthToken, csrfToken: challenge.csrfToken })).sessionToken;
     const actorToken = kernel.createSession(workspaceId, ownerId, now + 24 * 60 * 60_000);
     const index = new BackgroundProactiveCandidateIndex(kernel);
-    const store = new ServerWorkspaceStore({ kernel, sessionToken: actorToken,
-      snapshotCommitParticipant: createBackgroundProactiveCandidateSnapshotParticipant(index, () => now) });
+    let wakeCount = 0;
+    const candidateParticipant = createBackgroundProactiveCandidateSnapshotParticipant(index, () => now, () => { wakeCount += 1; });
+    const store = new ServerWorkspaceStore({ kernel, sessionToken: actorToken, snapshotCommitParticipant: candidateParticipant });
     const policies = new BackgroundPolicyStore({ kernel, auth, resolver: { resolve(_context, specification) {
       assert.equal(specification.kind, 'proactive_draft');
       return { accounts: [{ accountId, provider: 'google', identityKey: projected.candidates[0].accountIdentityKey,
@@ -253,12 +279,26 @@ test('real AppState snapshot participant indexes existing mail and saved consent
     const removed = structuredClone(loaded);
     removed.mailbox = [];
     removed.proactive.candidates = [];
+    const failingStore = new ServerWorkspaceStore({ kernel, sessionToken: actorToken,
+      snapshotCommitParticipant: composeSnapshotCommitParticipants([
+        { name: 'proactive_candidates', participant: candidateParticipant },
+        { name: 'test_failure', participant: { commit() { throw new Error('test_after_candidate_commit_failure'); } } },
+      ]) });
+    await failingStore.load();
+    await assert.rejects(failingStore.save(removed), /test_after_candidate_commit_failure/);
+    assert.equal(wakeCount, 0, 'a rolled-back candidate projection never wakes the scheduler');
+    assert.equal(kernel.withOwnedTransaction(actorToken, 0, (context) => index.listDue(context, now)).length, 1,
+      'candidate rows roll back with the snapshot');
     await store.save(removed);
+    assert.equal(wakeCount, 1, 'a changed projection wakes only after snapshot acknowledgement');
     assert.equal(kernel.withOwnedTransaction(actorToken, 0, (context) => index.listDue(context, now)).length, 0,
       'a valid projection that no longer contains the message deactivates it');
     assert.equal(kernel.withOwnedTransaction(actorToken, 0, (context) => index.claim(context, candidateId, randomUUID(), 1, ruleId, 7, now)), undefined,
       'inactive candidates cannot be claimed');
     await store.save(loaded);
+    assert.equal(wakeCount, 2, 'a reappearing candidate wakes after acknowledgement');
+    await store.save(structuredClone(loaded));
+    assert.equal(wakeCount, 2, 'an unchanged content-free projection does not wake the scheduler');
     const restored = kernel.withOwnedTransaction(actorToken, 0, (context) => index.listDue(context, now));
     assert.equal(restored.length, 1);
     assert.equal(restored[0].candidateId, candidateId, 'reappearance restores the same logical candidate without deleting policy attempt history');

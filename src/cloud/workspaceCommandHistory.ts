@@ -15,6 +15,7 @@ export const WORKSPACE_COMMAND_HISTORY_KINDS = Object.freeze([
   'knowledge.fact.save', 'knowledge.fact.remove', 'knowledge.contact.save', 'knowledge.contact.remove',
   'knowledge.member.save', 'knowledge.member.remove',
   'knowledge.sourceLink.save', 'knowledge.sourceLink.remove', 'knowledge.suggestion.edit', 'knowledge.suggestion.review',
+  'reminders.createDraft', 'reminders.editDraft', 'reminders.approve', 'reminders.serverSave', 'reminders.cancel', 'reminders.complete', 'reminders.delete',
 ] as const);
 
 export type WorkspaceCommandHistoryKind = (typeof WORKSPACE_COMMAND_HISTORY_KINDS)[number];
@@ -63,6 +64,9 @@ const JOURNAL_TO_PUBLIC: Readonly<Record<string, WorkspaceCommandHistoryKind>> =
   'knowledge.member.save': 'knowledge.member.save', 'knowledge.member.remove': 'knowledge.member.remove',
   'knowledge.sourcelink.save': 'knowledge.sourceLink.save', 'knowledge.sourcelink.remove': 'knowledge.sourceLink.remove',
   'knowledge.suggestion.edit': 'knowledge.suggestion.edit', 'knowledge.suggestion.review': 'knowledge.suggestion.review',
+  'reminders.createdraft': 'reminders.createDraft', 'reminders.editdraft': 'reminders.editDraft', 'reminders.approve': 'reminders.approve',
+  'reminders.serversave': 'reminders.serverSave', 'reminders.cancel': 'reminders.cancel', 'reminders.complete': 'reminders.complete',
+  'reminders.delete': 'reminders.delete',
 });
 
 function readPlainDataRecord(value: unknown, allowed: readonly string[], required: readonly string[]): Record<string, unknown> {

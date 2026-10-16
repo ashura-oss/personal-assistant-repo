@@ -1,6 +1,6 @@
 import type { DurableKernel, OwnedWorkspaceIdentity } from '../../server/src/kernel.js';
 import { BackgroundOccurrenceStore, type BackgroundClaim } from '../../server/src/backgroundOccurrences.js';
-import { BackgroundPolicyStore, type BackgroundAccountSyncCandidate } from '../../server/src/backgroundPolicies.js';
+import { BackgroundPolicyStore, type BackgroundAccountSyncCandidate, type BackgroundProactiveDraftCandidate } from '../../server/src/backgroundPolicies.js';
 import { BackgroundScheduler, type BackgroundSchedulerClaim, type BackgroundSchedulerOutcome, type BackgroundSchedulerPorts,
 } from '../../server/src/backgroundScheduler.js';
 import type { AuthService } from '../../server/src/auth.js';
@@ -11,7 +11,7 @@ import { ProductionBackgroundBindingResolver } from './backgroundBindingResolver
 import { BatchObservationIndex, type BatchObservationAttempt } from '../../server/src/batchObservationIndex.js';
 import { projectBatchObservationLedger } from './batchObservationProjection.node';
 import { OpenRouterBatchInspectionReadError } from '../services/openRouter';
-import { BackgroundProactiveCandidateIndex } from '../../server/src/backgroundProactiveCandidates.js';
+import { BackgroundProactiveCandidateIndex, type BackgroundProactiveCandidateRow, type BackgroundProactivePreflightClaim } from '../../server/src/backgroundProactiveCandidates.js';
 import { projectBackgroundProactiveCandidates } from './backgroundProactiveCandidateProjection.node';
 
 const PAGE = 100;
@@ -31,6 +31,14 @@ interface OwnedBatchClaim {
   readonly identity: Readonly<{ workspaceId: string; ownerId: string; privacyEpoch: number }>;
   readonly actor: string;
 }
+interface OwnedProactiveClaim {
+  readonly claim: BackgroundProactivePreflightClaim;
+  readonly candidate: BackgroundProactiveCandidateRow;
+  readonly policy: BackgroundProactiveDraftCandidate;
+  readonly metadata: WorkspaceActorMetadata;
+  readonly identity: Readonly<{ workspaceId: string; ownerId: string; privacyEpoch: number }>;
+  readonly actor: string;
+}
 
 function parseWorkId(value: string): readonly [string, string, number] {
   let parsed: unknown;
@@ -38,6 +46,22 @@ function parseWorkId(value: string): readonly [string, string, number] {
   if (!Array.isArray(parsed) || parsed.length !== 3 || typeof parsed[0] !== 'string' || typeof parsed[1] !== 'string' ||
       !Number.isSafeInteger(parsed[2]) || JSON.stringify(parsed) !== value) throw new Error('background_scheduler_metadata_invalid');
   return Object.freeze([parsed[0], parsed[1], parsed[2] as number]);
+}
+
+function proactiveWorkId(policyId: string, policyRevision: number, candidateId: string): string {
+  return JSON.stringify([policyId, policyRevision, candidateId]);
+}
+
+function parseProactiveWorkId(value: string): readonly [string, number, string] {
+  let parsed: unknown;
+  try { parsed = JSON.parse(value); } catch { throw new Error('background_scheduler_metadata_invalid'); }
+  if (!Array.isArray(parsed) || parsed.length !== 3 || typeof parsed[0] !== 'string' || !Number.isSafeInteger(parsed[1]) ||
+      typeof parsed[2] !== 'string' ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(parsed[0]) ||
+      !/^[0-9a-f]{64}$/.test(parsed[2]) || (parsed[1] as number) < 1 || JSON.stringify(parsed) !== value) {
+    throw new Error('background_scheduler_metadata_invalid');
+  }
+  return Object.freeze([parsed[0], parsed[1] as number, parsed[2]]);
 }
 
 function identityOf(metadata: WorkspaceActorMetadata): OwnedWorkspaceIdentity {
@@ -55,7 +79,12 @@ export class BackgroundRuntimeOwner {
   readonly #resolver: ProductionBackgroundBindingResolver;
   readonly #claims = new WeakMap<object, OwnedClaim>();
   readonly #batchClaims = new WeakMap<object, OwnedBatchClaim>();
+  readonly #proactiveClaims = new WeakMap<object, OwnedProactiveClaim>();
+  readonly #proactiveClaimReservations = new Map<string, BackgroundProactivePreflightClaim>();
   readonly #batchFinalizations = new WeakMap<object, Readonly<{ readonly final: { readonly kind: 'deferred' | 'completed' | 'inspect_required'; readonly code: string; readonly nextDueAt: number; readonly terminal: boolean }; readonly settledAt: number }>>();
+  readonly #proactiveFinalizations = new WeakMap<object, Readonly<{ readonly final: Readonly<{
+    readonly status: 'complete' | 'deferred' | 'inspect_required'; readonly code: string; readonly nextDueAt?: number }>;
+    readonly settledAt: number }>>();
   readonly #batchIndex = new BatchObservationIndex();
   readonly #proactiveCandidateIndex: BackgroundProactiveCandidateIndex;
   #stopped = false;
@@ -92,6 +121,11 @@ export class BackgroundRuntimeOwner {
     if (this.#stopped) return;
     this.#stopped = true;
     this.#scheduler.stopAdmission();
+  }
+
+  /** Private Node composition signal for durable metadata changes; coalesces through the existing timer. */
+  wakeForMetadataCommit(): void {
+    if (!this.#stopped) this.#scheduler.wake();
   }
 
   drainAndDispose(): Promise<void> { this.stopAdmission(); return this.#scheduler.drainAndDispose(); }
@@ -152,6 +186,36 @@ export class BackgroundRuntimeOwner {
     }
   }
 
+  #forEachProactiveCandidate(metadata: WorkspaceActorMetadata, visit: (candidate: BackgroundProactiveDraftCandidate) => boolean | void,
+    start?: Readonly<{ policyId: string; inclusive: boolean }>): void {
+    const actor = this.#actor(metadata);
+    let afterPolicyId: string | undefined;
+    let atOrAfterPolicyId: string | undefined = start?.inclusive ? start.policyId : undefined;
+    if (start && !start.inclusive) afterPolicyId = start.policyId;
+    for (;;) {
+      const page = this.policies.listProactiveDraftCandidatePage(actor, { expectedPrivacyEpoch: metadata.privacyEpoch,
+        ...(afterPolicyId ? { afterPolicyId } : {}), ...(atOrAfterPolicyId ? { atOrAfterPolicyId } : {}), limit: PAGE });
+      for (const candidate of page.candidates) if (visit(candidate) === false) return;
+      if (!page.nextCursor) break;
+      if (page.nextCursor === afterPolicyId) throw new Error('background_policy_cursor_invalid');
+      afterPolicyId = page.nextCursor;
+      atOrAfterPolicyId = undefined;
+    }
+  }
+
+  #proactiveDueAt(metadata: WorkspaceActorMetadata): number | null {
+    let earliest: number | null = null;
+    this.#forEachProactiveCandidate(metadata, (candidate) => {
+      const spec = candidate.policy.specification;
+      if (spec.kind !== 'proactive_draft') return;
+      const due = this.#kernel.withOwnedTransaction(this.#actor(metadata), metadata.privacyEpoch, (context) =>
+        this.#proactiveCandidateIndex.readNextDueAtForPolicy(context, { ruleId: spec.ruleId, ruleRevision: spec.expectedRuleRevision,
+          policyId: candidate.policy.policyId, policyRevision: candidate.policy.revision }));
+      if (due !== null && (earliest === null || due < earliest)) earliest = due;
+    });
+    return earliest;
+  }
+
   #ensureOccurrences(metadata: WorkspaceActorMetadata, now: number): BackgroundOccurrenceStore {
     const store = this.#occurrences(metadata);
     this.#forEachCandidate(metadata, (candidate) => {
@@ -202,6 +266,8 @@ export class BackgroundRuntimeOwner {
             if (due !== null && (earliest === null || due < earliest)) earliest = due;
             const batchDue = this.#batchDue(metadata, now);
             if (batchDue !== null && (earliest === null || batchDue < earliest)) earliest = batchDue;
+            const proactiveDue = this.#proactiveDueAt(metadata);
+            if (proactiveDue !== null && (earliest === null || proactiveDue < earliest)) earliest = proactiveDue;
           } catch (error) {
             if (error instanceof Error && ['unauthenticated', 'stale_epoch', 'workspace_binding_rejected'].includes(error.message)) return;
             throw error;
@@ -216,7 +282,9 @@ export class BackgroundRuntimeOwner {
           try {
             const store = this.#ensureOccurrences(item, now);
             const batchDue = this.#batchDue(item, now);
-            if (store.listDueAccountSyncWork(item.privacyEpoch, now, undefined, 1).length || batchDue !== null && batchDue <= now) found.push(item.workspaceId);
+            const proactiveDue = this.#proactiveDueAt(item);
+            if (store.listDueAccountSyncWork(item.privacyEpoch, now, undefined, 1).length || batchDue !== null && batchDue <= now ||
+                proactiveDue !== null && proactiveDue <= now) found.push(item.workspaceId);
           } catch (error) {
             if (error instanceof Error && ['unauthenticated', 'stale_epoch', 'workspace_binding_rejected'].includes(error.message)) return;
             throw error;
@@ -229,10 +297,12 @@ export class BackgroundRuntimeOwner {
         const metadata = this.#findMetadata(workspaceId);
         if (!metadata) return Object.freeze([]);
         try {
-          const lanes: ('account_sync' | 'batch_observation')[] = [];
+          const lanes: ('account_sync' | 'batch_observation' | 'proactive_draft')[] = [];
           const batchDue = this.#batchDue(metadata, now);
+          const proactiveDue = this.#proactiveDueAt(metadata);
           if (this.#occurrences(metadata).listDueAccountSyncWork(metadata.privacyEpoch, now, undefined, 1).length) lanes.push('account_sync');
           if (batchDue !== null && batchDue <= now) lanes.push('batch_observation');
+          if (proactiveDue !== null && proactiveDue <= now) lanes.push('proactive_draft');
           return Object.freeze(lanes);
         }
         catch (error) { if (error instanceof Error && ['unauthenticated', 'stale_epoch'].includes(error.message)) return Object.freeze([]); throw error; }
@@ -244,6 +314,26 @@ export class BackgroundRuntimeOwner {
           return Object.freeze(this.#batchIndex.listDue(context, metadata.privacyEpoch, now, afterWorkId, limit)
             .map((item) => Object.freeze({ workspaceId, workId: item.job_id, lane, dueAt: item.next_due_at })));
         });
+        if (lane === 'proactive_draft') {
+          const cursorTuple = afterWorkId === undefined ? undefined : parseProactiveWorkId(afterWorkId);
+          const output: { workspaceId: string; workId: string; lane: 'proactive_draft'; dueAt: number }[] = [];
+          this.#forEachProactiveCandidate(metadata, (policy) => {
+            if (output.length >= limit) return false;
+            if (policy.policy.specification.kind !== 'proactive_draft') return;
+            if (cursorTuple && (policy.policy.policyId < cursorTuple[0] ||
+                (policy.policy.policyId === cursorTuple[0] && policy.policy.revision < cursorTuple[1]))) return;
+            const spec = policy.policy.specification;
+            const samePolicyCursor = cursorTuple && policy.policy.policyId === cursorTuple[0] && policy.policy.revision === cursorTuple[1];
+            const page = this.#kernel.withOwnedTransaction(this.#actor(metadata), metadata.privacyEpoch, (context) =>
+              this.#proactiveCandidateIndex.listDueForPolicy(context, { ruleId: spec.ruleId, ruleRevision: spec.expectedRuleRevision,
+                policyId: policy.policy.policyId, policyRevision: policy.policy.revision, now,
+                ...(samePolicyCursor ? { afterCandidateId: cursorTuple[2] } : {}), limit: Math.min(PAGE, limit - output.length) }));
+            for (const candidate of page) output.push(Object.freeze({ workspaceId, lane, workId: proactiveWorkId(policy.policy.policyId,
+              policy.policy.revision, candidate.candidateId), dueAt: Math.max(candidate.eligibleAt, candidate.nextDueAt) }));
+            if (output.length >= limit) return false;
+          }, cursorTuple ? { policyId: cursorTuple[0], inclusive: true } : undefined);
+          return Object.freeze(output.slice(0, limit));
+        }
         if (lane !== 'account_sync') return Object.freeze([]);
         return this.#occurrences(metadata).listDueAccountSyncWork(metadata.privacyEpoch, now, afterWorkId, limit)
           .map((item) => Object.freeze({ workspaceId, workId: item.workId, lane, dueAt: item.dueAt }));
@@ -264,6 +354,36 @@ export class BackgroundRuntimeOwner {
           this.#batchClaims.set(opaque as object, Object.freeze({ attempt, identity, actor }));
           return opaque;
         }
+        if (work.lane === 'proactive_draft') {
+          const [policyId, policyRevision, candidateId] = parseProactiveWorkId(work.workId);
+          let policyCandidate: BackgroundProactiveDraftCandidate | undefined;
+          this.#forEachProactiveCandidate(metadata, (candidate) => {
+            if (candidate.policy.policyId === policyId && candidate.policy.revision === policyRevision) policyCandidate = candidate;
+          });
+          if (!policyCandidate || policyCandidate.policy.specification.kind !== 'proactive_draft') return undefined;
+          const spec = policyCandidate.policy.specification;
+          const actor = this.#actor(metadata);
+          const reservation = this.#proactiveClaimReservations.get(work.workId) ?? this.#proactiveCandidateIndex.prepareClaim({
+            candidateId, policyId, policyRevision, ruleId: spec.ruleId, ruleRevision: spec.expectedRuleRevision,
+            workspaceId: metadata.workspaceId, ownerId: metadata.ownerId, privacyEpoch: metadata.privacyEpoch });
+          this.#proactiveClaimReservations.set(work.workId, reservation);
+          let admitted: Readonly<{ candidate: BackgroundProactiveCandidateRow; claim: BackgroundProactivePreflightClaim }> | undefined;
+          try { admitted = this.#kernel.withOwnedTransaction(actor, metadata.privacyEpoch, (context) => {
+            const candidate = this.#proactiveCandidateIndex.readCandidateForPolicy(context, { candidateId, ruleId: spec.ruleId,
+              ruleRevision: spec.expectedRuleRevision, policyId, policyRevision, now });
+            if (!candidate) return undefined;
+            const claim = this.#proactiveCandidateIndex.claim(context, candidateId, policyId, policyRevision,
+              spec.ruleId, spec.expectedRuleRevision, now, reservation);
+            return claim ? Object.freeze({ candidate, claim }) : undefined;
+          }); } catch (error) { throw error; }
+          if (!admitted) { this.#proactiveClaimReservations.delete(work.workId); return undefined; }
+          this.#proactiveClaimReservations.delete(work.workId);
+          const { candidate, claim } = admitted;
+          const opaque = Object.freeze({}) as BackgroundSchedulerClaim;
+          const identity = Object.freeze({ workspaceId: metadata.workspaceId, ownerId: metadata.ownerId, privacyEpoch: metadata.privacyEpoch });
+          this.#proactiveClaims.set(opaque as object, Object.freeze({ claim, candidate, policy: policyCandidate, metadata, identity, actor }));
+          return opaque;
+        }
         if (work.lane !== 'account_sync') return undefined;
     const [occurrenceId, targetId, generation] = parseWorkId(work.workId);
         const store = this.#occurrences(metadata);
@@ -276,6 +396,28 @@ export class BackgroundRuntimeOwner {
         return opaque;
       },
       executeClaim: async (opaque) => {
+        const proactive = this.#proactiveClaims.get(opaque as object);
+        if (proactive) {
+          try {
+            this.#kernel.withOwnedTransaction(proactive.actor, proactive.identity.privacyEpoch, (context) =>
+              this.#proactiveCandidateIndex.markReadingWithinTransaction(context, proactive.claim, Date.now()));
+            const outcome = await this.#runtime.executeScheduledProactiveDraft({ sessionToken: proactive.actor, ownerId: proactive.identity.ownerId,
+              privacyEpoch: proactive.identity.privacyEpoch, claim: proactive.claim, candidate: proactive.candidate, policy: proactive.policy,
+              candidateIndex: this.#proactiveCandidateIndex, occurrences: this.#occurrences(proactive.metadata), policies: this.policies });
+            if (outcome.status === 'complete') return Object.freeze({ kind: 'terminal', code: outcome.code });
+            if (outcome.status === 'deferred') return Object.freeze({ kind: 'deferred', code: outcome.code, nextDueAt: outcome.nextDueAt });
+            return Object.freeze({ kind: 'inspect_required', code: outcome.code });
+          } catch (error) {
+            if (error instanceof Error && error.message === 'The workspace runtime is busy.') {
+              return Object.freeze({ kind: 'deferred', code: 'foreground_mail_busy', nextDueAt: Date.now() + MINUTE });
+            }
+            if (error instanceof Error && ['background_execution_stale', 'background_occurrence_policy_stale', 'background_mail_binding_changed',
+              'background_mail_source_changed', 'background_mail_rule_not_currently_eligible'].includes(error.message)) {
+              return Object.freeze({ kind: 'inspect_required', code: 'binding_changed' });
+            }
+            throw error;
+          }
+        }
         const batch = this.#batchClaims.get(opaque as object);
         if (batch) {
           try {
@@ -317,6 +459,29 @@ export class BackgroundRuntimeOwner {
         }
       },
       recordOutcome: async (opaque, outcome: BackgroundSchedulerOutcome) => {
+        const proactive = this.#proactiveClaims.get(opaque as object);
+        if (proactive) {
+          let pending = this.#proactiveFinalizations.get(opaque as object);
+          if (!pending) {
+            let now = Date.now();
+            if (outcome.kind === 'terminal' && outcome.code === 'live_not_submitted') {
+              now = this.#kernel.withOwnedTransaction(proactive.actor, proactive.identity.privacyEpoch, (context) =>
+                this.#proactiveCandidateIndex.readLiveNotSubmittedSettlementWithinTransaction(context, proactive.claim).settledAt);
+            }
+            const final = outcome.kind === 'deferred'
+              ? { status: 'deferred' as const, code: outcome.code, nextDueAt: outcome.nextDueAt ?? now + MINUTE }
+              : outcome.kind === 'held'
+                ? { status: 'deferred' as const, code: outcome.reason, nextDueAt: now + MINUTE }
+                : outcome.kind === 'inspect_required'
+                  ? { status: 'inspect_required' as const, code: outcome.code }
+                  : { status: 'complete' as const, code: outcome.code };
+            pending = Object.freeze({ final: Object.freeze(final), settledAt: now });
+            this.#proactiveFinalizations.set(opaque as object, pending);
+          }
+          this.#kernel.withOwnedTransaction(proactive.actor, proactive.identity.privacyEpoch, (context) =>
+            this.#proactiveCandidateIndex.settleWithinTransaction(context, proactive.claim, pending!.final, pending!.settledAt));
+          return;
+        }
         const batch = this.#batchClaims.get(opaque as object);
         if (batch) {
           let pending = this.#batchFinalizations.get(opaque as object);
@@ -360,6 +525,14 @@ export class BackgroundRuntimeOwner {
           });
           return;
         }
+        const proactive = this.#proactiveClaims.get(opaque as object);
+        if (proactive) {
+          const now = Date.now();
+          this.#kernel.withOwnedTransaction(proactive.actor, proactive.identity.privacyEpoch, (context) =>
+            this.#proactiveCandidateIndex.settleWithinTransaction(context, proactive.claim,
+              { status: 'inspect_required', code: 'execution_outcome_unknown' }, now));
+          return;
+        }
         const owned = claimFor(opaque);
         owned.occurrences.inspectClaimForRecovery(owned.claim, owned.identity.privacyEpoch, 'execution_outcome_unknown');
       },
@@ -373,6 +546,15 @@ export class BackgroundRuntimeOwner {
             this.#batchIndex.reconcile(context, projectBatchObservationLedger(current.snapshot), now);
             this.#batchIndex.holdUnacknowledged(context, metadata.privacyEpoch, work.workId, now);
           });
+          return;
+        }
+        if (metadata && work.lane === 'proactive_draft') {
+          const reservation = this.#proactiveClaimReservations.get(work.workId);
+          if (!reservation) return;
+          const now = Date.now();
+          this.#kernel.withOwnedTransaction(this.#actor(metadata), metadata.privacyEpoch, (context) =>
+            this.#proactiveCandidateIndex.reconcileUnacknowledgedClaim(context, reservation, now, now + MINUTE));
+          this.#proactiveClaimReservations.delete(work.workId);
           return;
         }
         if (!metadata || work.lane !== 'account_sync') return;

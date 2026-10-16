@@ -24,6 +24,7 @@ import { CloudMailCoordinator, type CloudMailCoordinatorState } from './cloudMai
 import { CloudTranscriptTransferCoordinator, type CloudTranscriptTransferState } from './cloudTranscriptTransferCoordinator';
 import { CloudBackgroundPolicyCoordinator, type CloudBackgroundPolicyState } from './cloudBackgroundPolicyCoordinator';
 import { createWebPushBrowserCoordinator, type WebPushBrowserCoordinator, type WebPushBrowserState } from './webPushBrowser';
+import { createCloudReminderCoordinator, type CloudReminderCoordinator, type CloudReminderState } from './cloudReminderCoordinator';
 
 export type CloudWorkspaceSessionState = Readonly<{
   status: 'loading' | 'ready' | 'error';
@@ -38,6 +39,7 @@ export type CloudWorkspaceSessionState = Readonly<{
   transcriptTransfer?: CloudTranscriptTransferState;
   backgroundPolicies?: CloudBackgroundPolicyState;
   webPush?: WebPushBrowserState;
+  reminders?: CloudReminderState;
   refreshRequired: boolean;
   error?: string;
 }>;
@@ -62,6 +64,8 @@ export class CloudWorkspaceSessionStore {
   private unsubscribeBackgroundPolicies?: () => void;
   private webPushCoordinator?: WebPushBrowserCoordinator;
   private unsubscribeWebPush?: () => void;
+  private reminderCoordinator?: CloudReminderCoordinator;
+  private unsubscribeReminders?: () => void;
   private ownerGeneration = 0;
   private active = false;
   private operationInFlight = false;
@@ -95,13 +99,14 @@ export class CloudWorkspaceSessionStore {
 
   private publish(next: CloudWorkspaceSessionState): void {
     const { voice: _callerVoice, oauth: _callerOAuth, mail: _callerMail, transcriptTransfer: _callerTranscriptTransfer,
-      backgroundPolicies: _callerBackgroundPolicies, webPush: _callerWebPush, ...withoutCallerOwnedState } = next;
+      backgroundPolicies: _callerBackgroundPolicies, webPush: _callerWebPush, reminders: _callerReminders, ...withoutCallerOwnedState } = next;
     void _callerVoice;
     void _callerOAuth;
     void _callerMail;
     void _callerTranscriptTransfer;
     void _callerBackgroundPolicies;
     void _callerWebPush;
+    void _callerReminders;
     const coordinator = this.active ? this.voiceCoordinator : undefined;
     const voice = coordinator?.getSnapshot();
     const oauth = this.active ? this.oauthCoordinator?.getSnapshot() : undefined;
@@ -109,9 +114,10 @@ export class CloudWorkspaceSessionStore {
     const transcriptTransfer = this.active ? this.transcriptTransferCoordinator?.getSnapshot() : undefined;
     const backgroundPolicies = this.active ? this.backgroundPolicyCoordinator?.getSnapshot() : undefined;
     const webPush = this.active ? this.webPushCoordinator?.getSnapshot() : undefined;
+    const reminders = this.active ? this.reminderCoordinator?.getSnapshot() : undefined;
     this.value = Object.freeze({ ...withoutCallerOwnedState, ...(voice ? { voice } : {}), ...(oauth ? { oauth } : {}), ...(mail ? { mail } : {}),
       ...(transcriptTransfer ? { transcriptTransfer } : {}), ...(backgroundPolicies ? { backgroundPolicies } : {}),
-      ...(webPush ? { webPush } : {}) });
+      ...(webPush ? { webPush } : {}), ...(reminders ? { reminders } : {}) });
     for (const listener of this.listeners) listener();
   }
 
@@ -148,6 +154,17 @@ export class CloudWorkspaceSessionStore {
     this.unsubscribeWebPush = webPushCoordinator.subscribe(() => {
       if (this.isCurrent(owner) && this.webPushCoordinator === webPushCoordinator) {
         this.publish({ ...this.value, webPush: webPushCoordinator.getSnapshot() });
+      }
+    });
+    const reminderCoordinator = createCloudReminderCoordinator({ readSnapshot: () => this.isCurrent(owner) ? this.value.snapshot : undefined,
+      execute: (command, onAdmitted) => this.execute(command, (envelope) => onAdmitted?.(envelope.commandId)),
+      inspect: (commandId) => this.inspect(commandId),
+      assertCurrent: () => { if (!this.isCurrent(owner)) throw new WorkspaceClientError('stale', 'The reminder workspace owner changed.'); },
+    });
+    this.reminderCoordinator = reminderCoordinator;
+    this.unsubscribeReminders = reminderCoordinator.subscribe(() => {
+      if (this.isCurrent(owner) && this.reminderCoordinator === reminderCoordinator) {
+        this.publish({ ...this.value, reminders: reminderCoordinator.getSnapshot() });
       }
     });
     const oauthCoordinator = new CloudOAuthCoordinator(this.session, { workspace: {
@@ -256,6 +273,10 @@ export class CloudWorkspaceSessionStore {
     this.unsubscribeWebPush = undefined;
     this.webPushCoordinator?.dispose();
     this.webPushCoordinator = undefined;
+    this.unsubscribeReminders?.();
+    this.unsubscribeReminders = undefined;
+    this.reminderCoordinator?.dispose();
+    this.reminderCoordinator = undefined;
     this.unsubscribeMail?.();
     this.unsubscribeMail = undefined;
     this.mailCoordinator?.dispose();
@@ -339,6 +360,11 @@ export class CloudWorkspaceSessionStore {
   getWebPushCoordinator(): WebPushBrowserCoordinator | undefined {
     if (!this.active) return undefined;
     return this.webPushCoordinator;
+  }
+
+  getReminderCoordinator(): CloudReminderCoordinator | undefined {
+    if (!this.active) return undefined;
+    return this.reminderCoordinator;
   }
 
   async cancelTranscription(commandId: string): Promise<'cancellation_requested' | 'not_running'> {

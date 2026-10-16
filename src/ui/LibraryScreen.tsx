@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { ReactNode } from 'react';
 import { Pressable, ScrollView, Text, TextInput, View } from "react-native";
 import Ionicons from "@expo/vector-icons/Ionicons";
 import type { AppController, ContextDocument, LocalTask, SaveKnowledgeFactInput, SaveKnowledgeContactInput, SaveKnowledgeSourceLinkInput, SaveKnowledgeMemberInput, KnowledgeItemCommand } from "../core";
@@ -86,6 +87,7 @@ export function LibraryScreen({
   reminderDemoMode,
   reminderAlertChannel,
   reminderActions,
+  serverReminderPanel,
   onComplete,
   onReopen,
   onOpenNote,
@@ -123,6 +125,7 @@ export function LibraryScreen({
   reminderDemoMode: boolean;
   reminderAlertChannel: ReminderAlertChannel;
   reminderActions: WorkspaceActionCapability<LibraryReminderActions>;
+  serverReminderPanel?: ReactNode;
   onComplete: WorkspaceActionCapability<(id: string) => void>;
   onReopen: WorkspaceActionCapability<(id: string) => void>;
   onOpenNote: (id: string, expectedRevision: number) => void;
@@ -285,7 +288,7 @@ export function LibraryScreen({
         ))}
       </View>
       {reminderRecoveryStatus ? <View style={s.analysisStale}><Text style={s.analysisText}>{reminderRecoveryStatus.message}</Text></View> : null}
-      {section === 'reminders' ? <RemindersSection
+      {section === 'reminders' && serverReminderPanel ? serverReminderPanel : section === 'reminders' ? <RemindersSection
         records={reminderRecords}
         alertDisplays={reminderAlerts}
         query={query}

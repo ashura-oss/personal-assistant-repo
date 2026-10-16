@@ -16,6 +16,7 @@ import { AudioColdStartRecovery } from './audioColdStartRecovery.js';
 import { markInterruptedBackgroundWorkForInspection } from './backgroundOccurrences.js';
 import { recoverInterruptedBatchObservations } from './batchObservationIndex.js';
 import { join } from 'node:path';
+import type { ApplicationStartupCapability } from './applicationStartup.js';
 
 /** Trusted runtime owner contract. It contains no caller supplied workspace authority. */
 export interface ApplicationRuntime {
@@ -43,8 +44,17 @@ export interface ApplicationRuntimeFactoryContext {
   readonly createEmptyWorkspaceSnapshot: () => unknown;
 }
 
+export interface ProactivePreflightRecoveryInput {
+  readonly kernel: DurableKernel;
+  readonly startupCapability: ApplicationStartupCapability;
+}
+
+/** Fixed, private cold-start hook for the proactive preflight metadata protocol. */
+export type ProactivePreflightRecovery = (input: ProactivePreflightRecoveryInput) => unknown;
+
 export type ApplicationRuntimeFactory =
-  (context: ApplicationRuntimeFactoryContext) => ApplicationRuntime | Promise<ApplicationRuntime>;
+  ((context: ApplicationRuntimeFactoryContext) => ApplicationRuntime | Promise<ApplicationRuntime>) &
+  Readonly<{ recoverProactivePreflights?: ProactivePreflightRecovery }>;
 
 export interface ApplicationHostOptions {
   readonly config: ServerConfig;
@@ -226,6 +236,24 @@ export async function startApplicationHost(options: ApplicationHostOptions): Pro
       capability: startup.capability, privateRoot: join(options.config.dataDirectory, 'private-audio'),
       processInstanceId: opened.privateContext.processInstanceId });
     await recovery.run();
+    const recoveryDescriptor = Object.getOwnPropertyDescriptor(options.createRuntime, 'recoverProactivePreflights');
+    if (recoveryDescriptor && (!Object.hasOwn(recoveryDescriptor, 'value') || recoveryDescriptor.writable !== false || recoveryDescriptor.configurable !== false)) {
+      throw new Error('proactive_preflight_recovery_hook_invalid');
+    }
+    const proactiveRecovery = recoveryDescriptor?.value as ProactivePreflightRecovery | undefined;
+    const hasProactivePreflightState = opened.privateContext.kernel.withColdStartDatabaseTransaction(startup.capability, (db) =>
+      Boolean(db.prepare("SELECT 1 AS present FROM sqlite_master WHERE type='table' AND name LIKE 'background_proactive_%' LIMIT 1").get()));
+    if (proactiveRecovery !== undefined && typeof proactiveRecovery !== 'function') throw new Error('proactive_preflight_recovery_hook_invalid');
+    if (proactiveRecovery) {
+      if (proactiveRecovery.constructor?.name === 'AsyncFunction') throw new Error('proactive_preflight_recovery_must_be_synchronous');
+      const result: unknown = proactiveRecovery(Object.freeze({ kernel: opened.privateContext.kernel, startupCapability: startup.capability }));
+      if (result && typeof (result as unknown as { then?: unknown }).then === 'function') {
+        await Promise.resolve(result).then(() => undefined, () => undefined);
+        throw new Error('proactive_preflight_recovery_must_be_synchronous');
+      }
+    } else if (hasProactivePreflightState) {
+      throw new Error('proactive_preflight_recovery_required');
+    }
     markInterruptedBackgroundWorkForInspection(opened.privateContext.kernel, startup.capability);
     recoverInterruptedBatchObservations(opened.privateContext.kernel, startup.capability);
     recoverySettled = true;

@@ -37,6 +37,7 @@ import { InboxWorkspaceContent, inboxAccountDisplay } from '../ui/InboxWorkspace
 import { AssistantBatchJobCard } from '../ui/AssistantBatchJobCard';
 import type { WorkspaceEraseActions } from './WorkspaceErasePanel';
 import type { WebPushBrowserCoordinator } from './webPushBrowser';
+import { CloudReminderPanel } from './CloudReminderPanel';
 
 export type CloudWorkspaceActions = Readonly<{
   tasks: Readonly<{ complete: (taskId: string) => Promise<WorkspaceCommandResponse>; reopen: (taskId: string) => Promise<WorkspaceCommandResponse> }>;
@@ -94,7 +95,7 @@ type CloudWorkspaceEraseStoreMethods = 'discoverWorkspaceErase' | 'prepareWorksp
   'cancelWorkspaceErase' | 'retryWorkspaceEraseReview' | 'retryWorkspaceEraseCleanup';
 type CloudWorkspaceStorePort = Pick<CloudWorkspaceSessionStore, 'getSnapshot' | 'execute' | 'inspect' | 'refresh'> &
   Partial<Pick<CloudWorkspaceSessionStore, 'readKnowledgeSourceChoices' | 'readKnowledgeSuggestionReview' | 'readPeriodSummaryResult' | 'readPeriodSummaryApplicationPreview'>> &
-  Partial<Pick<CloudWorkspaceSessionStore, 'getWebPushCoordinator'>> &
+  Partial<Pick<CloudWorkspaceSessionStore, 'getWebPushCoordinator' | 'getReminderCoordinator'>> &
   Partial<Pick<CloudWorkspaceSessionStore, CloudWorkspaceEraseStoreMethods>>;
 
 function projectSettingsBaseline(settings: WorkspaceSettingsDTO): WorkspaceSettingsBaseline {
@@ -441,6 +442,7 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
     accounts: dto.accounts, busy: state.busy, blocked: Boolean(state.pendingCommand || state.refreshRequired),
   } : { available: false as const, reason: 'Background policy controls are unavailable in this workspace session.' };
   const webPushCoordinator = store.getWebPushCoordinator?.();
+  const reminderCoordinator = store.getReminderCoordinator?.();
   const saveSettings = async () => {
     const draft = settingsDraft;
     const baseline = settingsBaseline;
@@ -887,6 +889,9 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
             reminderRecords={dto.reminders.records} reminderAlerts={{}} reminderDemoMode={false}
             reminderAlertChannel="browser_unavailable"
             reminderActions={{ available: false, reason: 'Reminder creation and management are not connected to server commands yet.' }}
+            serverReminderPanel={<CloudReminderPanel records={dto.reminders.records} webPush={state.webPush}
+              coordinator={reminderCoordinator} state={state.reminders}
+              blocked={state.busy || state.refreshRequired || Boolean(state.pendingCommand)} />}
             onComplete={{ available: true, action: (id) => { void actions.tasks.complete(id).catch((error) => setNotice(errText(error))); } }}
             onReopen={{ available: true, action: (id) => { void actions.tasks.reopen(id).catch((error) => setNotice(errText(error))); } }}
             onOpenNote={(id, expectedRevision) => {
