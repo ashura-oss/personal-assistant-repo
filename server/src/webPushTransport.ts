@@ -42,7 +42,7 @@ export type WebPushTransportResult =
   | Readonly<{ kind: 'accepted' }>
   | Readonly<{ kind: 'expired'; statusCode: 404 | 410 }>
   | Readonly<{ kind: 'rejected'; statusCode: number }>
-  | Readonly<{ kind: 'not_started'; reason: 'stopping' | 'invalid_request' | 'invalid_endpoint' | 'unsafe_destination' | 'dns_failure' | 'tls_failure' | 'authorization_changed' | 'cancelled' | 'timeout' | 'transport_failure' }>
+  | Readonly<{ kind: 'not_started'; reason: 'stopping' | 'invalid_request' | 'invalid_endpoint' | 'unsafe_destination' | 'dns_failure' | 'tls_failure' | 'authorization_changed' | 'cancelled' | 'timeout' | 'transport_failure' | 'subscription_unavailable' }>
   | Readonly<{ kind: 'ambiguous'; reason: 'cancelled' | 'timeout' | 'transport_failure' }>;
 
 export type WebPushTransportInput = Readonly<{

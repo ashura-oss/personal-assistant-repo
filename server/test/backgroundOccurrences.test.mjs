@@ -37,7 +37,7 @@ async function setup() {
   let accountIdentityKey;
   let accountGeneration;
   let targetCaptureCount = 0;
-  const resolver = { resolve(_context, specification) {
+  const resolver = { assertReminderDeliveryAvailableWithinTransaction() {}, resolve(_context, specification) {
     const selections = specification.kind === 'account_sync' || specification.kind === 'proactive_draft' ? specification.accounts : [];
     return { ...(selections.length ? { accounts: selections.map((entry) => ({ accountId: entry.accountId, provider: 'google', identityKey: accountIdentityKey ?? createHash('sha256').update(JSON.stringify({ accountId: entry.accountId, provider: 'google' })).digest('hex'),
       connectionGeneration: accountGeneration ?? entry.expectedConnectionGeneration, label: 'Account', connected: true })) } : {}),
@@ -275,34 +275,37 @@ function replaceAttemptTableWithLegacyVersion(f, version, includeTargetUnique = 
         claimed_at INTEGER NOT NULL CHECK(claimed_at>=0), dispatch_started_at INTEGER CHECK(dispatch_started_at IS NULL OR dispatch_started_at>=0),
         settled_at INTEGER CHECK(settled_at IS NULL OR settled_at>=0), accounting_json TEXT NOT NULL CHECK(length(accounting_json)>0),
         result_code TEXT CHECK(result_code IS NULL OR length(result_code)>0),
-        ${version === 2 ? `finalization_operation TEXT,finalization_request_json TEXT,finalization_receipt_json TEXT,
+        ${version >= 2 ? `finalization_operation TEXT,finalization_request_json TEXT,finalization_receipt_json TEXT,
           finalization_receipt_digest TEXT CHECK(finalization_receipt_digest IS NULL OR length(finalization_receipt_digest)=64),` : ''}
         PRIMARY KEY(workspace_id,owner_id,privacy_epoch,attempt_id)
-        ${includeTargetUnique ? ',UNIQUE(workspace_id,owner_id,privacy_epoch,occurrence_id,target_id,target_generation)' : ''}
+        ${includeTargetUnique && version < 3 ? ',UNIQUE(workspace_id,owner_id,privacy_epoch,occurrence_id,target_id,target_generation)' : ''}
       ) STRICT;
-      INSERT INTO background_occurrence_attempts(${columns}${version === 2 ? finalization : ''})
-        SELECT ${columns}${version === 2 ? finalization : ''} FROM background_occurrence_attempts_new;
+      INSERT INTO background_occurrence_attempts(${columns}${version >= 2 ? finalization : ''})
+        SELECT ${columns}${version >= 2 ? finalization : ''} FROM background_occurrence_attempts_new;
       DROP TABLE background_occurrence_attempts_new;
+      ${version === 3 ? `CREATE UNIQUE INDEX background_occurrence_active_attempt_unique
+        ON background_occurrence_attempts(workspace_id,owner_id,privacy_epoch,occurrence_id,target_id,target_generation)
+        WHERE status IN ('claimed','dispatching');` : ''}
       UPDATE background_schema SET version=${version} WHERE singleton=1;`);
   });
 }
 
-test('v1 and v2 attempt-history migrations preserve every existing row and install active-only target uniqueness', async () => {
-  for (const version of [1, 2]) {
+test('v1, v2, and v3 attempt-history migrations preserve rows and install exact v4 admission metadata', async () => {
+  for (const version of [1, 2, 3]) {
     const f = await setup();
     try {
       const policy = accountPolicy(); f.policies.save(f.browserSessionToken, policy);
       const occurrence = f.occurrences.schedule(occurrenceInput(policy.policyId));
       const claimed = f.occurrences.claim({ expectedPrivacyEpoch: 0, occurrenceId: occurrence.occurrenceId,
         targetId: 'google:acct-1', targetGeneration: 3 });
-      if (version === 2) {
+      if (version >= 2) {
         f.occurrences.beginDispatch(claimed.claim, 0);
-        f.occurrences.settle(claimed.claim, 0, { status: 'completed', accounting: { status: 'not_applicable' }, resultCode: 'sync_complete' });
+        if (version === 2) f.occurrences.settle(claimed.claim, 0, { status: 'completed', accounting: { status: 'not_applicable' }, resultCode: 'sync_complete' });
       }
       const before = f.kernel.withTrustedDatabaseTransaction((db) => db.prepare(`SELECT * FROM background_occurrence_attempts WHERE attempt_id=?`)
         .get(claimed.claim.attemptId));
       const beforeCount = f.kernel.withTrustedDatabaseTransaction((db) => db.prepare('SELECT count(*) AS count FROM background_occurrence_attempts').get().count);
-      replaceAttemptTableWithLegacyVersion(f, version);
+      replaceAttemptTableWithLegacyVersion(f, version, version < 3);
       f.policies.list(f.actorSessionToken, { expectedPrivacyEpoch: 0 });
       const after = f.kernel.withTrustedDatabaseTransaction((db) => ({
         row: db.prepare(`SELECT * FROM background_occurrence_attempts WHERE attempt_id=?`).get(claimed.claim.attemptId),
@@ -311,10 +314,10 @@ test('v1 and v2 attempt-history migrations preserve every existing row and insta
         index: db.prepare("SELECT sql FROM sqlite_master WHERE type='index' AND name='background_occurrence_active_attempt_unique'").get()?.sql,
       }));
       const expected = { ...before, ...(version === 1 ? { finalization_operation: null, finalization_request_json: null,
-        finalization_receipt_json: null, finalization_receipt_digest: null } : {}) };
+        finalization_receipt_json: null, finalization_receipt_digest: null } : {}), dispatch_admission_id: null };
       assert.deepEqual(after.row, expected);
       assert.equal(after.count, beforeCount);
-      assert.equal(after.version, 3);
+      assert.equal(after.version, 4);
       assert.match(after.index, /WHERE status IN \('claimed','dispatching'\)/i);
     } finally { cleanup(f); }
   }
@@ -327,15 +330,15 @@ test('failed legacy attempt-index validation rolls migration back without replac
     const occurrence = f.occurrences.schedule(occurrenceInput(policy.policyId));
     const claimed = f.occurrences.claim({ expectedPrivacyEpoch: 0, occurrenceId: occurrence.occurrenceId,
       targetId: 'google:acct-1', targetGeneration: 3 });
-    const before = f.kernel.withTrustedDatabaseTransaction((db) => db.prepare(`SELECT * FROM background_occurrence_attempts WHERE attempt_id=?`)
-      .get(claimed.claim.attemptId));
     replaceAttemptTableWithLegacyVersion(f, 2, false);
+    const beforeMigration = f.kernel.withTrustedDatabaseTransaction((db) => db.prepare(`SELECT * FROM background_occurrence_attempts WHERE attempt_id=?`)
+      .get(claimed.claim.attemptId));
     assert.throws(() => f.policies.list(f.actorSessionToken, { expectedPrivacyEpoch: 0 }), /background_schema_invalid/);
     const after = f.kernel.withTrustedDatabaseTransaction((db) => ({
       row: db.prepare(`SELECT * FROM background_occurrence_attempts WHERE attempt_id=?`).get(claimed.claim.attemptId),
       version: db.prepare('SELECT version FROM background_schema').get().version,
     }));
-    assert.deepEqual(after.row, before);
+    assert.deepEqual(after.row, beforeMigration);
     assert.equal(after.version, 2);
   } finally { cleanup(f); }
 });
@@ -460,6 +463,60 @@ test('reminder fanout freezes device generations at due time and never expands o
     assert.equal(claim.claim.targetId, original.subscriptionId);
     assert.throws(() => f.occurrences.claim({ expectedPrivacyEpoch: 0, occurrenceId: occurrence.occurrenceId,
       targetId: addedAfterDue.subscriptionId, targetGeneration: addedAfterDue.generation }), /target_not_bound/);
+  } finally { cleanup(f); }
+});
+
+test('reminder scheduling copies a frozen multi-device capture before sorting it', async () => {
+  const f = await setup();
+  try {
+    const reminderId = randomUUID();
+    const policy = { commandId: randomUUID(), expectedPrivacyEpoch: 0, policyId: randomUUID(), expectedPolicyRevision: 0, enabled: true,
+      specification: { kind: 'approved_reminder_delivery', reminderId, expectedReminderRevision: 4, channel: 'web_push', devices: 'all_current' } };
+    const savedPolicy = await saveReminderPolicy(f, policy);
+    const captured = Object.freeze([Object.freeze({ subscriptionId: 'device-z', generation: 3 }),
+      Object.freeze({ subscriptionId: 'device-a', generation: 8 })]);
+    f.resolver.captureReminderTargets = () => captured;
+    const occurrence = f.occurrences.schedule({ expectedPrivacyEpoch: 0, policyId: savedPolicy.policyId, expectedPolicyRevision: 1,
+      descriptor: { kind: 'approved_reminder_delivery', reminderId, reminderRevision: 4, approvedIntentId: savedPolicy.intentId },
+      scheduledAt: 1_800_000_000_000, source: { approvedPayloadDigest: 'f'.repeat(64) } });
+    const targets = f.kernel.withTrustedDatabaseTransaction((db) => db.prepare(`SELECT target_id,target_generation FROM background_occurrence_targets
+      WHERE occurrence_id=? ORDER BY target_id`).all(occurrence.occurrenceId));
+    assert.deepEqual(targets, [{ target_id: 'device-a', target_generation: 8 }, { target_id: 'device-z', target_generation: 3 }]);
+  } finally { cleanup(f); }
+});
+
+test('reminder settlement replays its exact durable receipt and rejects a conflicting replay', async () => {
+  const f = await setup();
+  try {
+    const reminderId = randomUUID();
+    const savedPolicy = await saveReminderPolicy(f, { commandId: randomUUID(), expectedPrivacyEpoch: 0, policyId: randomUUID(),
+      expectedPolicyRevision: 0, enabled: true, specification: { kind: 'approved_reminder_delivery', reminderId,
+        expectedReminderRevision: 4, channel: 'web_push', devices: 'all_current' } });
+    const device = { subscriptionId: randomUUID(), generation: 2 };
+    f.setDevices([device]);
+    const occurrence = f.occurrences.schedule({ expectedPrivacyEpoch: 0, policyId: savedPolicy.policyId, expectedPolicyRevision: 1,
+      descriptor: { kind: 'approved_reminder_delivery', reminderId, reminderRevision: 4, approvedIntentId: savedPolicy.intentId },
+      scheduledAt: 1_800_000_000_000, source: { approvedPayloadDigest: 'd'.repeat(64) } });
+    const claim = f.occurrences.claim({ expectedPrivacyEpoch: 0, occurrenceId: occurrence.occurrenceId,
+      targetId: device.subscriptionId, targetGeneration: device.generation });
+    const admissionId = randomUUID();
+    f.kernel.withOwnedTransaction(f.actorSessionToken, 0, (context) => f.occurrences.admitReminderDeliveryDispatchWithinTransaction(context,
+      claim.claim, { deviceId: device.subscriptionId, generation: device.generation, keyId: randomUUID(), admissionId }));
+    const accepted = Object.freeze({ kind: 'accepted' });
+    const settle = (outcome) => f.kernel.withOwnedTransaction(f.actorSessionToken, 0, (context) =>
+      f.occurrences.settleReminderDeliveryWithinTransaction(context, claim.claim, outcome, { admissionId }));
+    settle(accepted);
+    const readReceipt = () => f.kernel.withTrustedDatabaseTransaction((db) => db.prepare(`SELECT status,result_code,dispatch_admission_id,
+      finalization_request_json,finalization_receipt_json,finalization_receipt_digest FROM background_occurrence_attempts WHERE attempt_id=?`)
+      .get(claim.claim.attemptId));
+    const firstReceipt = readReceipt();
+    assert.equal(firstReceipt.status, 'completed');
+    assert.equal(firstReceipt.result_code, 'push_accepted');
+    assert.doesNotThrow(() => settle(accepted), 'an identical settlement returns the already durable receipt');
+    assert.deepEqual(readReceipt(), firstReceipt, 'exact replay leaves the durable attempt receipt unchanged');
+    assert.throws(() => settle(Object.freeze({ kind: 'rejected', statusCode: 503 })), /background_claim_finalization_conflict/,
+      'a conflicting settlement cannot replace the prior receipt');
+    assert.deepEqual(readReceipt(), firstReceipt);
   } finally { cleanup(f); }
 });
 

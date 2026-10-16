@@ -117,6 +117,18 @@ interface AttemptRow {
   status: AttemptStatus; claimed_at: number; dispatch_started_at: number | null; settled_at: number | null;
   accounting_json: string; result_code: string | null; finalization_operation: string | null;
   finalization_request_json: string | null; finalization_receipt_json: string | null; finalization_receipt_digest: string | null;
+  dispatch_admission_id: string | null;
+}
+
+export type BackgroundReminderDeliveryAttemptRecord = Readonly<{ state: 'ready' }> |
+  Readonly<{ state: 'dispatch_admitted'; admissionId: string }> |
+  Readonly<{ state: 'settled'; outcome: import('./webPushTransport.js').WebPushTransportResult }>;
+
+export interface BackgroundReminderDeliveryClaimMetadata {
+  readonly workspaceId: string; readonly ownerId: string; readonly privacyEpoch: number;
+  readonly occurrenceId: string; readonly attemptId: string; readonly targetId: string; readonly generation: number;
+  readonly policyId: string; readonly policyRevision: number; readonly reminderId: string; readonly reminderRevision: number;
+  readonly approvedIntentId: string; readonly dueAt: number;
 }
 
 interface FrozenTarget { readonly targetId: string; readonly generation: number }
@@ -141,6 +153,48 @@ function priorFinalization(attempt: AttemptRow, operation: string, requestJson: 
   return attempt.finalization_receipt_json!;
 }
 function hash(text: string): string { return createHash('sha256').update(text, 'utf8').digest('hex'); }
+type ReminderTransportOutcome = import('./webPushTransport.js').WebPushTransportResult;
+function reminderOutcomeCode(outcome: ReminderTransportOutcome): string {
+  if (outcome.kind === 'accepted') return 'push_accepted';
+  if (outcome.kind === 'expired') return `push_expired_${outcome.statusCode}`;
+  if (outcome.kind === 'rejected') return `push_rejected_${outcome.statusCode}`;
+  if (outcome.kind === 'not_started') return `push_not_started_${outcome.reason}`;
+  return `push_ambiguous_${outcome.reason}`;
+}
+function parseReminderTransportOutcome(raw: unknown): ReminderTransportOutcome {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw) || Object.getPrototypeOf(raw) !== Object.prototype) return fail('background_occurrence_storage_invalid');
+  const value = raw as Record<string, unknown>;
+  const keys = Object.keys(value).sort().join(',');
+  if (value.kind === 'accepted' && keys === 'kind') return Object.freeze({ kind: 'accepted' });
+  if (value.kind === 'expired' && keys === 'kind,statusCode' && (value.statusCode === 404 || value.statusCode === 410)) {
+    return Object.freeze({ kind: 'expired', statusCode: value.statusCode });
+  }
+  if (value.kind === 'rejected' && keys === 'kind,statusCode' && Number.isSafeInteger(value.statusCode) &&
+      (value.statusCode as number) >= 100 && (value.statusCode as number) <= 599) {
+    return Object.freeze({ kind: 'rejected', statusCode: value.statusCode as number });
+  }
+  const notStartedReasons = ['stopping', 'invalid_request', 'invalid_endpoint', 'unsafe_destination', 'dns_failure', 'tls_failure',
+    'authorization_changed', 'cancelled', 'timeout', 'transport_failure', 'subscription_unavailable'] as const;
+  if (value.kind === 'not_started' && keys === 'kind,reason' && notStartedReasons.includes(value.reason as typeof notStartedReasons[number])) {
+    return Object.freeze({ kind: 'not_started', reason: value.reason as typeof notStartedReasons[number] });
+  }
+  const ambiguousReasons = ['cancelled', 'timeout', 'transport_failure'] as const;
+  if (value.kind === 'ambiguous' && keys === 'kind,reason' && ambiguousReasons.includes(value.reason as typeof ambiguousReasons[number])) {
+    return Object.freeze({ kind: 'ambiguous', reason: value.reason as typeof ambiguousReasons[number] });
+  }
+  return fail('background_occurrence_storage_invalid');
+}
+function reminderOutcomeFromAttempt(attempt: AttemptRow): ReminderTransportOutcome {
+  if (attempt.finalization_operation !== 'settle' || !attempt.finalization_receipt_json ||
+      hash(attempt.finalization_receipt_json) !== attempt.finalization_receipt_digest) return fail('background_occurrence_storage_invalid');
+  const receipt = safeStored<Record<string, unknown>>(attempt.finalization_receipt_json);
+  if (Object.keys(receipt).sort().join(',') !== 'admissionId,attemptId,outcome,resultCode,schemaVersion,settledAt' || receipt.schemaVersion !== 1 ||
+      receipt.attemptId !== attempt.attempt_id || receipt.resultCode !== attempt.result_code || !Number.isSafeInteger(receipt.settledAt) ||
+      receipt.admissionId !== (attempt.dispatch_admission_id ?? null)) return fail('background_occurrence_storage_invalid');
+  const outcome = parseReminderTransportOutcome(receipt.outcome);
+  if (reminderOutcomeCode(outcome) !== attempt.result_code) return fail('background_occurrence_storage_invalid');
+  return outcome;
+}
 function normalizedSql(value: string): string { return value.toLowerCase().replace(/[\s"`\[\]]/g, ''); }
 function ensureProactiveReauthorizationSchema(db: Database.Database): void {
   const hasMeta = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='background_proactive_reauthorization_schema'").get());
@@ -594,7 +648,7 @@ export class BackgroundOccurrenceStore {
             if (capturedTargets.length !== ids.size || capturedTargets.some((target) => !ids.has(target.subscriptionId))) return fail('background_reminder_targets_changed');
           }
         }
-        capturedTargets.sort((a, b) => a.subscriptionId.localeCompare(b.subscriptionId))
+        [...capturedTargets].sort((a, b) => a.subscriptionId.localeCompare(b.subscriptionId))
           .forEach((target) => targets.push({ targetId: target.subscriptionId, generation: target.generation }));
       }
       const targetJson = canonicalBackgroundJson({ targets }, PRIVATE_MAX);
@@ -923,6 +977,218 @@ export class BackgroundOccurrenceStore {
     });
   }
 
+  /** Exact reminder authority captured from an actual private claim, never from attempt IDs alone. */
+  readReminderDeliveryClaimMetadataWithinTransaction(context: OwnedTransactionContext, claim: BackgroundClaim): BackgroundReminderDeliveryClaimMetadata {
+    const { occurrence, attempt, descriptor, verified } = this.#assertReminderDeliveryClaim(context, claim, 'claimed');
+    if (verified.spec.kind !== 'approved_reminder_delivery' || !verified.binding.reminder) return fail('background_reminder_claim_invalid');
+    const reminder = verified.binding.reminder;
+    return Object.freeze({ workspaceId: context.workspaceId, ownerId: context.ownerId, privacyEpoch: context.privacyEpoch,
+      occurrenceId: occurrence.occurrence_id, attemptId: attempt.attempt_id, targetId: attempt.target_id,
+      generation: attempt.target_generation, policyId: occurrence.policy_id, policyRevision: occurrence.policy_revision,
+      reminderId: descriptor.reminderId, reminderRevision: descriptor.reminderRevision,
+      approvedIntentId: descriptor.approvedIntentId, dueAt: reminder.dueAt });
+  }
+
+  assertReminderDeliveryDispatchAuthorizedWithinTransaction(context: OwnedTransactionContext, claim: BackgroundClaim): void {
+    this.#assertReminderDeliveryClaim(context, claim, 'claimed');
+  }
+
+  readReminderDeliveryAttemptWithinTransaction(context: OwnedTransactionContext, claim: BackgroundClaim): BackgroundReminderDeliveryAttemptRecord {
+    const attempt = this.#readClaimRows(context, claim).attempt;
+    if (attempt.status === 'claimed' && attempt.dispatch_started_at === null && attempt.dispatch_admission_id === null &&
+        attempt.finalization_operation === null) return Object.freeze({ state: 'ready' });
+    if (attempt.status === 'dispatching' && attempt.dispatch_started_at !== null && attempt.dispatch_admission_id &&
+        attempt.finalization_operation === null) return Object.freeze({ state: 'dispatch_admitted', admissionId: attempt.dispatch_admission_id });
+    if (attempt.status === 'completed' || attempt.status === 'unknown' || attempt.status === 'inspect_required' || attempt.status === 'skipped') {
+      return Object.freeze({ state: 'settled', outcome: reminderOutcomeFromAttempt(attempt) });
+    }
+    return fail('background_reminder_attempt_unavailable');
+  }
+
+  admitReminderDeliveryDispatchWithinTransaction(context: OwnedTransactionContext, claim: BackgroundClaim,
+    input: Readonly<{ deviceId: string; generation: number; keyId: string; admissionId: string }>): void {
+    if (!input || input.deviceId !== claim?.targetId || input.generation !== claim?.targetGeneration ||
+        !isBackgroundUuidV4(input.keyId) || !isBackgroundUuidV4(input.admissionId)) return fail('background_reminder_admission_invalid');
+    const { occurrence, attempt } = this.#assertReminderDeliveryClaim(context, claim, 'claimed');
+    const now = timestamp(this.#clock());
+    const changed = context.db.prepare(`UPDATE background_occurrence_attempts SET status='dispatching',dispatch_started_at=?,dispatch_admission_id=?
+      WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND attempt_id=? AND status='claimed'
+        AND dispatch_started_at IS NULL AND dispatch_admission_id IS NULL AND finalization_operation IS NULL`)
+      .run(now, input.admissionId, context.workspaceId, context.ownerId, context.privacyEpoch, attempt.attempt_id);
+    const targetChanged = context.db.prepare(`UPDATE background_occurrence_targets SET status='dispatching',updated_at=?
+      WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND occurrence_id=? AND target_id=? AND target_generation=?
+        AND attempt_id=? AND status='claimed'`)
+      .run(now, context.workspaceId, context.ownerId, context.privacyEpoch, occurrence.occurrence_id, attempt.target_id,
+        attempt.target_generation, attempt.attempt_id);
+    const occurrenceChanged = context.db.prepare(`UPDATE background_occurrences SET status='dispatching',updated_at=?
+      WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND occurrence_id=? AND status='claimed'`)
+      .run(now, context.workspaceId, context.ownerId, context.privacyEpoch, occurrence.occurrence_id);
+    if (changed.changes !== 1 || targetChanged.changes !== 1 || occurrenceChanged.changes !== 1) return fail('background_reminder_admission_invalid');
+  }
+
+  settleReminderDeliveryWithinTransaction(context: OwnedTransactionContext, claim: BackgroundClaim,
+    outcome: import('./webPushTransport.js').WebPushTransportResult, binding: Readonly<{ admissionId?: string }>): void {
+    const { occurrence, attempt } = this.#readClaimRows(context, claim);
+    const resultCode = reminderOutcomeCode(outcome);
+    const admitted = binding?.admissionId;
+    const outcomeRecord = parseReminderTransportOutcome(outcome);
+    const requestJson = canonicalBackgroundJson({ operation: 'settle', resultCode, admissionId: admitted ?? null, outcome: outcomeRecord }, 64 * 1024);
+    const prior = priorFinalization(attempt, 'settle', requestJson);
+    if (prior !== undefined) return;
+    if (outcome.kind === 'not_started') {
+      if (admitted !== undefined || attempt.status !== 'claimed' || attempt.dispatch_started_at !== null || attempt.dispatch_admission_id !== null ||
+          occurrence.status !== 'claimed') return fail('background_reminder_settlement_invalid');
+    } else if (!isBackgroundUuidV4(admitted) || attempt.status !== 'dispatching' || attempt.dispatch_started_at === null ||
+        attempt.dispatch_admission_id !== admitted || occurrence.status !== 'dispatching') return fail('background_reminder_settlement_invalid');
+    const now = timestamp(this.#clock());
+    const status: AttemptStatus = outcome.kind === 'ambiguous' ? 'inspect_required'
+      : outcome.kind === 'not_started' ? 'skipped' : 'completed';
+    const nextAccounting = canonicalBackgroundJson({ status: 'not_applicable' }, 64 * 1024);
+    const receiptJson = canonicalBackgroundJson({ schemaVersion: 1, attemptId: attempt.attempt_id, resultCode, admissionId: admitted ?? null,
+      outcome: outcomeRecord, settledAt: now }, 64 * 1024);
+    const changed = context.db.prepare(`UPDATE background_occurrence_attempts SET status=?,settled_at=?,accounting_json=?,result_code=?,
+      finalization_operation='settle',finalization_request_json=?,finalization_receipt_json=?,finalization_receipt_digest=?
+      WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND attempt_id=? AND status=? AND finalization_operation IS NULL`)
+      .run(status, now, nextAccounting, resultCode, requestJson, receiptJson, hash(receiptJson),
+        context.workspaceId, context.ownerId, context.privacyEpoch, attempt.attempt_id, outcome.kind === 'not_started' ? 'claimed' : 'dispatching');
+    const targetStatus = status;
+    const targetChanged = context.db.prepare(`UPDATE background_occurrence_targets SET status=?,accounting_json=?,updated_at=?
+      WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND occurrence_id=? AND target_id=? AND target_generation=?
+        AND attempt_id=? AND status=?`)
+      .run(targetStatus, nextAccounting, now, context.workspaceId, context.ownerId, context.privacyEpoch, occurrence.occurrence_id,
+        attempt.target_id, attempt.target_generation, attempt.attempt_id, outcome.kind === 'not_started' ? 'claimed' : 'dispatching');
+    if (changed.changes !== 1 || targetChanged.changes !== 1) return fail('background_reminder_settlement_invalid');
+    const targets = context.db.prepare(`SELECT target_id,target_generation,status,attempt_id,accounting_json,updated_at FROM background_occurrence_targets
+      WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND occurrence_id=?`)
+      .all(context.workspaceId, context.ownerId, context.privacyEpoch, occurrence.occurrence_id) as TargetRow[];
+    const active = targets.some((target) => target.status === 'claimed' || target.status === 'dispatching');
+    const pending = targets.some((target) => target.status === 'pending');
+    const finalStatus: OccurrenceStatus = targets.some((target) => target.status === 'inspect_required') ? 'inspect_required'
+      : pending || active ? (active ? 'dispatching' : 'scheduled')
+        : targets.some((target) => target.status === 'unknown') ? 'unknown'
+          : targets.length > 0 && targets.every((target) => target.status === 'skipped') ? 'suppressed' : 'completed';
+    const aggregate = aggregateTargetAccounting(targets, finalStatus);
+    context.db.prepare(`UPDATE background_occurrences SET status=?,actual_at=COALESCE(actual_at,?),accounting_json=?,updated_at=?
+      WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND occurrence_id=?`)
+      .run(finalStatus, outcome.kind === 'not_started' ? null : now, canonicalBackgroundJson(aggregate), now,
+        context.workspaceId, context.ownerId, context.privacyEpoch, occurrence.occurrence_id);
+  }
+
+  /** Closes a frozen exact target that no longer has its reviewed active generation, before transport admission. */
+  settleUnavailableReminderTargetWithinTransaction(context: OwnedTransactionContext, claim: BackgroundClaim): void {
+    this.#assertReminderDeliveryClaim(context, claim, 'claimed');
+    this.settleReminderDeliveryWithinTransaction(context, claim,
+      Object.freeze({ kind: 'not_started', reason: 'subscription_unavailable' }), Object.freeze({}));
+  }
+
+  #readClaimRows(context: OwnedTransactionContext, claim: BackgroundClaim): Readonly<{ occurrence: OccurrenceRow; attempt: AttemptRow }> {
+    this.#kernel.assertOwnedTransactionContext(context);
+    if (!context.db.inTransaction || !claim || !isBackgroundUuidV4(claim.occurrenceId) || !isBackgroundUuidV4(claim.attemptId) ||
+        !isBackgroundUuidV4(claim.capability)) return fail('background_claim_invalid');
+    ensureBackgroundSchema(context.db);
+    const occurrence = readOccurrence(context.db, context, claim.occurrenceId);
+    const attempt = context.db.prepare(`SELECT attempt_id,occurrence_id,target_id,target_generation,capability_hash,status,claimed_at,
+      dispatch_started_at,settled_at,accounting_json,result_code,finalization_operation,finalization_request_json,finalization_receipt_json,
+      finalization_receipt_digest,dispatch_admission_id FROM background_occurrence_attempts
+      WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND attempt_id=? AND occurrence_id=?`)
+      .get(context.workspaceId, context.ownerId, context.privacyEpoch, claim.attemptId, claim.occurrenceId) as AttemptRow | undefined;
+    if (!occurrence || !attempt || attempt.capability_hash !== hash(claim.capability) || attempt.target_id !== claim.targetId ||
+        attempt.target_generation !== (claim.targetGeneration ?? 0)) return fail('background_claim_invalid');
+    return Object.freeze({ occurrence, attempt });
+  }
+
+  #assertReminderDeliveryClaim(context: OwnedTransactionContext, claim: BackgroundClaim, requiredAttemptStatus: 'claimed'):
+    Readonly<{ occurrence: OccurrenceRow; attempt: AttemptRow; descriptor: Extract<BackgroundOccurrenceDescriptor, { kind: 'approved_reminder_delivery' }>;
+      verified: ReturnType<typeof verifyPolicy> }> {
+    const rows = this.#readClaimRows(context, claim);
+    const { occurrence, attempt } = rows;
+    if (occurrence.policy_kind !== 'approved_reminder_delivery' || occurrence.status !== 'claimed' || attempt.status !== requiredAttemptStatus ||
+        attempt.dispatch_started_at !== null || attempt.dispatch_admission_id !== null || attempt.finalization_operation !== null) {
+      return fail('background_reminder_claim_invalid');
+    }
+    const verified = verifyPolicy(context, context.db, this.#resolver, occurrence);
+    if (verified.spec.kind !== 'approved_reminder_delivery' || !verified.binding.reminder) return fail('background_occurrence_policy_stale');
+    const descriptor = safeStored<BackgroundOccurrenceDescriptor>(occurrence.descriptor_json);
+    if (descriptor.kind !== 'approved_reminder_delivery' || descriptor.reminderId !== verified.binding.reminder.reminderId ||
+        descriptor.reminderRevision !== verified.binding.reminder.revision || descriptor.approvedIntentId !== verified.binding.reminder.intentId ||
+        attempt.target_generation < 1 || !allowedTarget(verified.spec, verified.binding, occurrence, attempt.target_id, attempt.target_generation)) {
+      return fail('background_target_not_bound');
+    }
+    const target = context.db.prepare(`SELECT status,attempt_id FROM background_occurrence_targets WHERE workspace_id=? AND owner_id=? AND privacy_epoch=?
+      AND occurrence_id=? AND target_id=? AND target_generation=?`)
+      .get(context.workspaceId, context.ownerId, context.privacyEpoch, occurrence.occurrence_id, attempt.target_id, attempt.target_generation) as
+      { status: string; attempt_id: string | null } | undefined;
+    if (!target || target.status !== 'claimed' || target.attempt_id !== attempt.attempt_id) return fail('background_reminder_claim_invalid');
+    return Object.freeze({ ...rows, descriptor, verified });
+  }
+
+  /** Metadata-only due timestamp query for the trusted scheduler. */
+  hasReminderOccurrenceForPolicy(expectedPrivacyEpoch: number, policyId: string, policyRevision: number): boolean {
+    if (!isBackgroundUuidV4(policyId) || !Number.isSafeInteger(policyRevision) || policyRevision < 1) return fail('background_occurrence_query_invalid');
+    return this.#kernel.withOwnedTransaction(this.#actor, expectedPrivacyEpoch, (context) => {
+      ensureBackgroundSchema(context.db);
+      const row = context.db.prepare(`SELECT 1 AS present FROM background_occurrences WHERE workspace_id=? AND owner_id=? AND privacy_epoch=?
+        AND policy_id=? AND policy_revision=? AND policy_kind='approved_reminder_delivery' LIMIT 1`)
+        .get(context.workspaceId, context.ownerId, context.privacyEpoch, policyId, policyRevision) as { present: number } | undefined;
+      return row?.present === 1;
+    });
+  }
+
+  /** Metadata-only due timestamp query for the trusted scheduler. */
+  readNextReminderDueAt(expectedPrivacyEpoch: number): number | null {
+    return this.#kernel.withOwnedTransaction(this.#actor, expectedPrivacyEpoch, (context) => {
+      ensureBackgroundSchema(context.db);
+      const row = context.db.prepare(`SELECT MIN(max(o.scheduled_at,t.updated_at)) AS dueAt FROM background_occurrences o
+        JOIN background_occurrence_targets t ON t.workspace_id=o.workspace_id AND t.owner_id=o.owner_id AND t.privacy_epoch=o.privacy_epoch
+          AND t.occurrence_id=o.occurrence_id AND t.status='pending'
+        JOIN background_policy_heads h ON h.workspace_id=o.workspace_id AND h.owner_id=o.owner_id AND h.privacy_epoch=o.privacy_epoch
+          AND h.policy_id=o.policy_id AND h.current_revision=o.policy_revision AND h.status='enabled'
+        JOIN background_policy_revisions r ON r.workspace_id=o.workspace_id AND r.owner_id=o.owner_id AND r.privacy_epoch=o.privacy_epoch
+          AND r.policy_id=o.policy_id AND r.revision=o.policy_revision AND r.enabled=1 AND r.policy_digest=o.policy_digest
+        WHERE o.workspace_id=? AND o.owner_id=? AND o.privacy_epoch=? AND o.policy_kind='approved_reminder_delivery' AND o.status='scheduled'`)
+        .get(context.workspaceId, context.ownerId, context.privacyEpoch) as { dueAt: number | null };
+      return row.dueAt;
+    });
+  }
+
+  /** Closed keyset page containing only due reminder occurrence and exact device-generation metadata. */
+  listDueReminderWork(expectedPrivacyEpoch: number, now: number, afterWorkId?: string, limit = PAGE_MAX): readonly Readonly<{ workId: string; dueAt: number }>[] {
+    if (!Number.isSafeInteger(now) || now < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > PAGE_MAX ||
+        (afterWorkId !== undefined && (afterWorkId.length > 256 || /[\u0000-\u001f\u007f]/.test(afterWorkId)))) return fail('background_occurrence_query_invalid');
+    let cursor: readonly [string, string, number] | undefined;
+    if (afterWorkId !== undefined) {
+      try {
+        const parsed = JSON.parse(afterWorkId) as unknown;
+        if (!Array.isArray(parsed) || parsed.length !== 3 || !isBackgroundUuidV4(parsed[0]) || typeof parsed[1] !== 'string' ||
+            !isBackgroundUuidV4(parsed[1]) || !Number.isSafeInteger(parsed[2]) || (parsed[2] as number) < 1 || JSON.stringify(parsed) !== afterWorkId) {
+          return fail('background_occurrence_query_invalid');
+        }
+        cursor = [parsed[0], parsed[1], parsed[2] as number];
+      } catch { return fail('background_occurrence_query_invalid'); }
+    }
+    return this.#kernel.withOwnedTransaction(this.#actor, expectedPrivacyEpoch, (context) => {
+      ensureBackgroundSchema(context.db);
+      const rows = context.db.prepare(`SELECT o.occurrence_id,max(o.scheduled_at,t.updated_at) AS scheduled_at,t.target_id,t.target_generation
+        FROM background_occurrences o JOIN background_occurrence_targets t ON t.workspace_id=o.workspace_id AND t.owner_id=o.owner_id
+          AND t.privacy_epoch=o.privacy_epoch AND t.occurrence_id=o.occurrence_id
+        JOIN background_policy_heads h ON h.workspace_id=o.workspace_id AND h.owner_id=o.owner_id AND h.privacy_epoch=o.privacy_epoch
+          AND h.policy_id=o.policy_id AND h.current_revision=o.policy_revision AND h.status='enabled'
+        JOIN background_policy_revisions r ON r.workspace_id=o.workspace_id AND r.owner_id=o.owner_id AND r.privacy_epoch=o.privacy_epoch
+          AND r.policy_id=o.policy_id AND r.revision=o.policy_revision AND r.enabled=1 AND r.policy_digest=o.policy_digest
+        WHERE o.workspace_id=? AND o.owner_id=? AND o.privacy_epoch=? AND o.policy_kind='approved_reminder_delivery' AND o.status='scheduled'
+          AND o.scheduled_at<=? AND t.status='pending' AND t.updated_at<=?
+          AND (? IS NULL OR o.occurrence_id>? OR (o.occurrence_id=? AND t.target_id>?) OR
+            (o.occurrence_id=? AND t.target_id=? AND t.target_generation>?))
+        ORDER BY o.occurrence_id,t.target_id,t.target_generation LIMIT ?`)
+        .all(context.workspaceId, context.ownerId, context.privacyEpoch, now, now,
+          cursor?.[0] ?? null, cursor?.[0] ?? null, cursor?.[0] ?? null, cursor?.[1] ?? null,
+          cursor?.[0] ?? null, cursor?.[1] ?? null, cursor?.[2] ?? null, limit) as
+        { occurrence_id: string; scheduled_at: number; target_id: string; target_generation: number }[];
+      return Object.freeze(rows.map((row) => Object.freeze({
+        workId: JSON.stringify([row.occurrence_id, row.target_id, row.target_generation]), dueAt: row.scheduled_at })));
+    });
+  }
+
   /** Metadata-only due timestamp query for the trusted scheduler. */
   readNextDueAt(expectedPrivacyEpoch: number): number | null {
     return this.#kernel.withOwnedTransaction(this.#actor, expectedPrivacyEpoch, (context) => {
@@ -1023,6 +1289,16 @@ export class BackgroundOccurrenceStore {
 
   /** Fences a target when claim commit acknowledgement was ambiguous and its capability was not returned. */
   inspectUnacknowledgedAccountSyncWork(expectedPrivacyEpoch: number, occurrenceId: string, targetId: string, generation: number): void {
+    this.#inspectUnacknowledgedTargetWork(expectedPrivacyEpoch, occurrenceId, targetId, generation);
+  }
+
+  /** Fences an exact reminder target if the scheduler cannot acknowledge the committed claim. */
+  inspectUnacknowledgedReminderWork(expectedPrivacyEpoch: number, occurrenceId: string, targetId: string, generation: number): void {
+    this.#inspectUnacknowledgedTargetWork(expectedPrivacyEpoch, occurrenceId, targetId, generation, true);
+  }
+
+  #inspectUnacknowledgedTargetWork(expectedPrivacyEpoch: number, occurrenceId: string, targetId: string, generation: number,
+    terminalIsNoop = false): void {
     if (!isBackgroundUuidV4(occurrenceId) || typeof targetId !== 'string' || !targetId || Buffer.byteLength(targetId, 'utf8') > 1024 ||
         /[\u0000-\u001f\u007f]/.test(targetId) || !Number.isSafeInteger(generation) || generation < 1) return fail('background_claim_invalid');
     this.#kernel.withOwnedTransaction(this.#actor, expectedPrivacyEpoch, (context) => {
@@ -1031,6 +1307,7 @@ export class BackgroundOccurrenceStore {
         WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND occurrence_id=? AND target_id=? AND target_generation=?`)
         .get(context.workspaceId, context.ownerId, context.privacyEpoch, occurrenceId, targetId, generation) as { status: string; attempt_id: string | null } | undefined;
       if (!row || !row.attempt_id) return;
+      if (terminalIsNoop && !['claimed', 'dispatching'].includes(row.status)) return;
       const attempt = context.db.prepare(`SELECT attempt_id,occurrence_id,target_id,target_generation,capability_hash,status,claimed_at,
         dispatch_started_at,settled_at,accounting_json,result_code,finalization_operation,finalization_request_json,finalization_receipt_json,finalization_receipt_digest
         FROM background_occurrence_attempts WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND attempt_id=?`)
@@ -1505,7 +1782,8 @@ export class BackgroundOccurrenceStore {
       ensureBackgroundSchema(context.db);
       const occurrence = readOccurrence(context.db, context, claim.occurrenceId);
       const attempt = context.db.prepare(`SELECT attempt_id,occurrence_id,target_id,target_generation,capability_hash,status,claimed_at,
-        dispatch_started_at,settled_at,accounting_json,result_code,finalization_operation,finalization_request_json,finalization_receipt_json,finalization_receipt_digest FROM background_occurrence_attempts
+        dispatch_started_at,settled_at,accounting_json,result_code,finalization_operation,finalization_request_json,finalization_receipt_json,finalization_receipt_digest,
+        dispatch_admission_id FROM background_occurrence_attempts
         WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND attempt_id=? AND occurrence_id=?`)
         .get(context.workspaceId, context.ownerId, context.privacyEpoch, claim.attemptId, claim.occurrenceId) as AttemptRow | undefined;
       if (!occurrence || !attempt || attempt.capability_hash !== hash(claim.capability) || attempt.target_id !== claim.targetId ||

@@ -15,11 +15,34 @@ import { OAuthConnectionService } from '../../server/src/oauthConnectionService.
 import type { NodeProviderResponseLifetimeOwner } from './providerResponseLifetime.node';
 import type { ServerOAuthProviderAdapter } from '../../server/src/oauthProviderAdapter.js';
 import { BackgroundRuntimeOwner } from './backgroundRuntime.node';
+import { createWebPushTransport } from '../../server/src/webPushTransport.js';
 import { WorkspaceEraseService } from '../../server/src/workspaceErase.js';
 import { createWebPushHttpApi } from '../../server/src/webPushHttp.js';
 import { join } from 'node:path';
 import { recoverProactivePreflights } from './backgroundProactiveRecovery.node';
 import type { BackgroundPolicyStore } from '../../server/src/backgroundPolicies.js';
+
+function requireWebPushOrigin(origin: string | undefined): string | undefined {
+  if (origin === undefined) return undefined;
+  let parsed: URL;
+  try { parsed = new URL(origin); } catch { throw new TypeError('background_reminder_delivery_origin_invalid'); }
+  if (parsed.protocol !== 'https:' || parsed.origin !== origin || parsed.username || parsed.password || parsed.hash || parsed.search ||
+      parsed.pathname !== '/') throw new TypeError('background_reminder_delivery_origin_invalid');
+  return origin;
+}
+
+function productionWebPushOrigin(config: ServerConfig): string | undefined {
+  let parsed: URL;
+  try { parsed = new URL(config.canonicalOrigin); } catch { throw new TypeError('production_application_config_required'); }
+  if (parsed.origin !== config.canonicalOrigin || parsed.username || parsed.password || parsed.hash || parsed.search || parsed.pathname !== '/') {
+    throw new TypeError('production_application_config_required');
+  }
+  if (parsed.protocol === 'https:') return config.canonicalOrigin;
+  const localHttp = config.allowLocalHttp === true && parsed.protocol === 'http:' &&
+    (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1');
+  if (localHttp) return undefined;
+  throw new TypeError('production_application_config_required');
+}
 
 // Private Node gateway seam: callers must already hold an immutable occurrence claim.
 // This export shares the exact AsyncLocalStorage instance used by the production participant.
@@ -35,6 +58,11 @@ export type ApplicationWorkspacePortsFactory =
 export interface CloudApplicationRuntimeOptions {
   /** Required concrete per-workspace provider/integration composition. */
   readonly workspacePortsFor: ApplicationWorkspacePortsFactory;
+  /** Trusted server origin used only for fixed generic Web Push presentation. */
+  readonly canonicalOrigin?: string;
+  readonly webPushUnavailableCode?: 'web_push_requires_https';
+  /** Trusted Node dependency seam for deterministic transport lifecycle tests. */
+  readonly createWebPushTransport?: typeof createWebPushTransport;
   readonly oauth?: Readonly<{ provider: ServerOAuthProviderAdapter; responseLifetimeOwner: NodeProviderResponseLifetimeOwner;
     config: Pick<ServerConfig, 'googleClientId' | 'googleClientSecret' | 'microsoftClientId' | 'microsoftClientSecret' |
       'googleRedirectUri' | 'microsoftRedirectUri'> }>;
@@ -47,6 +75,7 @@ export function createCloudApplicationRuntimeFactory(options: CloudApplicationRu
   if (!options || typeof options !== 'object' || typeof options.workspacePortsFor !== 'function') {
     throw new TypeError('application_workspace_ports_factory_required');
   }
+  const webPushOrigin = requireWebPushOrigin(options.canonicalOrigin);
   const factory: ApplicationRuntimeFactory = async ({ kernel, vault, auth, runtimeSessionFor, listWorkspaceMetadataPage, processInstanceId,
     createEmptyWorkspaceSnapshot }) => {
     const oauthStages = new OAuthInstallStages(kernel, vault, auth);
@@ -73,15 +102,18 @@ export function createCloudApplicationRuntimeFactory(options: CloudApplicationRu
           () => backgroundRuntime?.wakeForMetadataCommit());
       },
     });
-    const webPushApi = createWebPushHttpApi(kernel, vault, (admission) => runtime.assertWorkspaceAdmission(admission));
+    const webPushApi = webPushOrigin ? createWebPushHttpApi(kernel, vault, (admission) => runtime.assertWorkspaceAdmission(admission)) : undefined;
     const oauthService = options.oauth ? new OAuthConnectionService({ kernel, auth, stages: oauthStages,
       provider: options.oauth.provider, config: options.oauth.config, runtimeSessionFor,
       isWorkspaceEraseHeldOrPending: (workspaceId, ownerId) => runtime.isWorkspaceEraseHeldOrPending(workspaceId, ownerId) }) : undefined;
-    const background = new BackgroundRuntimeOwner({ kernel, auth, runtime, runtimeSessionFor, listWorkspaceMetadataPage });
+    const background = new BackgroundRuntimeOwner({ kernel, auth, runtime, runtimeSessionFor, listWorkspaceMetadataPage,
+      ...(webPushApi && webPushOrigin ? { webPush: webPushApi, canonicalOrigin: webPushOrigin } : {}),
+      ...(options.createWebPushTransport ? { createWebPushTransport: options.createWebPushTransport } : {}) });
     backgroundRuntime = background;
     backgroundPolicyStore = background.policies;
     return Object.freeze({ workspaceApi: createWorkspaceHttpApi(runtime, background.policies, workspaceErase), audioHttpApi: runtime.createAudioHttpApi(),
-      webPushApi,
+      ...(webPushApi ? { webPushApi } : {}),
+      ...(!webPushApi && options.webPushUnavailableCode ? { webPushUnavailableCode: options.webPushUnavailableCode } : {}),
       ...(oauthService ? { oauthHttpApi: oauthService } : {}),
       stopAdmission: () => { background.stopAdmission(); oauthService?.stopAdmission(); options.oauth?.responseLifetimeOwner.stopAdmission(); runtime.stopAdmission(); },
       drainAndDispose: async () => {
@@ -98,10 +130,12 @@ export function createCloudApplicationRuntimeFactory(options: CloudApplicationRu
 
 /** Real Node per-epoch composition; external adapters remain injectable for closed-network tests. */
 export function createProductionApplicationRuntimeFactory(config: ServerConfig,
-  adapters: Pick<ProductionWorkspacePortsOptions, 'ffmpegPath' | 'ffprobePath' | 'fetcher' | 'documentFileOperations'> = {}): ApplicationRuntimeFactory {
+  adapters: Pick<ProductionWorkspacePortsOptions, 'ffmpegPath' | 'ffprobePath' | 'fetcher' | 'documentFileOperations'> &
+    Readonly<{ createWebPushTransport?: typeof createWebPushTransport }> = {}): ApplicationRuntimeFactory {
   if (!config || typeof config !== 'object' || typeof config.dataDirectory !== 'string') {
     throw new TypeError('production_application_config_required');
   }
+  const webPushOrigin = productionWebPushOrigin(config);
   const makeWorkspacePorts = createProductionWorkspacePortsFor({ dataDirectory: config.dataDirectory,
       ...(config.googleClientId ? { googleClientId: config.googleClientId } : {}),
       ...(config.googleClientSecret ? { googleClientSecret: config.googleClientSecret } : {}),
@@ -125,9 +159,12 @@ export function createProductionApplicationRuntimeFactory(config: ServerConfig,
     const provider = createServerOAuthProviderAdapter({ canonicalOrigin: config.canonicalOrigin, registrations,
       responseLifetime: responseLifetimeOwner.withResponseLifetimeFor('oauth') });
     return createCloudApplicationRuntimeFactory({
+      ...(webPushOrigin ? { canonicalOrigin: webPushOrigin } : {}),
+      ...(config.allowLocalHttp === true && webPushOrigin === undefined ? { webPushUnavailableCode: 'web_push_requires_https' as const } : {}),
       workspacePortsFor: (context, scopedVault, scopedKernel, policies, onBackgroundMetadataCommitted) =>
         makeWorkspacePorts(context, scopedVault, scopedKernel, policies, onBackgroundMetadataCommitted),
       oauth: { provider, responseLifetimeOwner, config },
+      ...(adapters.createWebPushTransport ? { createWebPushTransport: adapters.createWebPushTransport } : {}),
       privateAudioRoot: join(config.dataDirectory, 'private-audio'),
       privateDocumentsRoot: join(config.dataDirectory, 'private-documents'),
     })({ kernel, vault, auth, runtimeSessionFor, listWorkspaceMetadataPage, processInstanceId, createEmptyWorkspaceSnapshot });

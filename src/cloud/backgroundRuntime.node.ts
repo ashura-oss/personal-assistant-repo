@@ -1,18 +1,25 @@
-import type { DurableKernel, OwnedWorkspaceIdentity } from '../../server/src/kernel.js';
+import type { DurableKernel, OwnedTransactionContext, OwnedWorkspaceIdentity } from '../../server/src/kernel.js';
 import { BackgroundOccurrenceStore, type BackgroundClaim } from '../../server/src/backgroundOccurrences.js';
-import { BackgroundPolicyStore, type BackgroundAccountSyncCandidate, type BackgroundProactiveDraftCandidate } from '../../server/src/backgroundPolicies.js';
+import { BackgroundPolicyStore, type BackgroundAccountSyncCandidate,
+  type BackgroundProactiveDraftCandidate } from '../../server/src/backgroundPolicies.js';
 import { BackgroundScheduler, type BackgroundSchedulerClaim, type BackgroundSchedulerOutcome, type BackgroundSchedulerPorts,
 } from '../../server/src/backgroundScheduler.js';
 import type { AuthService } from '../../server/src/auth.js';
 import type { WorkspaceActorMetadata } from '../../server/src/runtimeActors.js';
 import type { RuntimeSessionResolver } from '../../server/src/workspaceRegistry.js';
 import type { OwnedWorkspaceRuntime } from './ownedWorkspaceRuntime.node';
+import type { OwnedWorkspaceAdmission } from './ownedWorkspaceRuntime.node';
 import { ProductionBackgroundBindingResolver } from './backgroundBindingResolver.node';
 import { BatchObservationIndex, type BatchObservationAttempt } from '../../server/src/batchObservationIndex.js';
 import { projectBatchObservationLedger } from './batchObservationProjection.node';
 import { OpenRouterBatchInspectionReadError } from '../services/openRouter';
 import { BackgroundProactiveCandidateIndex, type BackgroundProactiveCandidateRow, type BackgroundProactivePreflightClaim } from '../../server/src/backgroundProactiveCandidates.js';
 import { projectBackgroundProactiveCandidates } from './backgroundProactiveCandidateProjection.node';
+import { BackgroundReminderFinalization } from '../../server/src/backgroundReminderFinalization.js';
+import { createWebPushDeliveryDispatcher, type WebPushAttemptClaim, type WebPushAttemptRecord,
+  type WebPushDeliveryAttemptOwner, type WebPushDeliveryDispatcher, type WebPushDeliveryResult } from '../../server/src/webPushDelivery.js';
+import type { WebPushSubscriptions } from '../../server/src/webPushSubscriptions.js';
+import { createWebPushTransport, type WebPushTransportResult } from '../../server/src/webPushTransport.js';
 
 const PAGE = 100;
 const MINUTE = 60_000;
@@ -37,6 +44,14 @@ interface OwnedProactiveClaim {
   readonly policy: BackgroundProactiveDraftCandidate;
   readonly metadata: WorkspaceActorMetadata;
   readonly identity: Readonly<{ workspaceId: string; ownerId: string; privacyEpoch: number }>;
+  readonly actor: string;
+}
+interface OwnedReminderClaim {
+  readonly claim: BackgroundClaim;
+  readonly metadata: import('../../server/src/backgroundOccurrences.js').BackgroundReminderDeliveryClaimMetadata;
+  readonly keyId: string;
+  readonly store: BackgroundOccurrenceStore;
+  readonly identity: Readonly<{ workspaceId: string; ownerId: string; privacyEpoch: number; revision: number }>;
   readonly actor: string;
 }
 
@@ -80,6 +95,9 @@ export class BackgroundRuntimeOwner {
   readonly #claims = new WeakMap<object, OwnedClaim>();
   readonly #batchClaims = new WeakMap<object, OwnedBatchClaim>();
   readonly #proactiveClaims = new WeakMap<object, OwnedProactiveClaim>();
+  readonly #reminderClaims = new WeakMap<object, OwnedReminderClaim>();
+  readonly #reminderHeldFinalizations = new BackgroundReminderFinalization();
+  readonly #reminderDeliveryClaims = new Map<string, OwnedReminderClaim>();
   readonly #proactiveClaimReservations = new Map<string, BackgroundProactivePreflightClaim>();
   readonly #batchFinalizations = new WeakMap<object, Readonly<{ readonly final: { readonly kind: 'deferred' | 'completed' | 'inspect_required'; readonly code: string; readonly nextDueAt: number; readonly terminal: boolean }; readonly settledAt: number }>>();
   readonly #proactiveFinalizations = new WeakMap<object, Readonly<{ readonly final: Readonly<{
@@ -87,16 +105,36 @@ export class BackgroundRuntimeOwner {
     readonly settledAt: number }>>();
   readonly #batchIndex = new BatchObservationIndex();
   readonly #proactiveCandidateIndex: BackgroundProactiveCandidateIndex;
+  readonly #webPush?: WebPushSubscriptions;
+  readonly #deliveryDispatcher?: WebPushDeliveryDispatcher;
   #stopped = false;
 
   constructor(input: Readonly<{ kernel: DurableKernel; auth: AuthService; runtime: OwnedWorkspaceRuntime;
     runtimeSessionFor: RuntimeSessionResolver;
-    listWorkspaceMetadataPage: (afterWorkspaceId?: string, limit?: number) => readonly WorkspaceActorMetadata[] }>) {
+    listWorkspaceMetadataPage: (afterWorkspaceId?: string, limit?: number) => readonly WorkspaceActorMetadata[];
+    webPush?: WebPushSubscriptions; canonicalOrigin?: string;
+    createWebPushTransport?: typeof createWebPushTransport }>) {
     this.#kernel = input.kernel;
     this.#runtime = input.runtime;
     this.#runtimeSessionFor = input.runtimeSessionFor;
     this.#metadataPage = input.listWorkspaceMetadataPage;
-    this.#resolver = new ProductionBackgroundBindingResolver(input.kernel);
+    this.#webPush = input.webPush;
+    this.#resolver = new ProductionBackgroundBindingResolver(input.kernel, input.webPush);
+    if ((input.webPush && !input.canonicalOrigin) || (!input.webPush && input.canonicalOrigin)) {
+      throw new TypeError('background_reminder_delivery_ports_invalid');
+    }
+    if (input.webPush && input.canonicalOrigin) {
+      const transport = (input.createWebPushTransport ?? createWebPushTransport)();
+      let then: unknown;
+      try { then = transport && (typeof transport === 'object' || typeof transport === 'function') ? (transport as { then?: unknown }).then : undefined; }
+      catch { throw new TypeError('background_reminder_transport_invalid'); }
+      if (typeof then === 'function') {
+        Promise.resolve(transport).then((late) => late?.stopAdmission?.(), () => undefined).catch(() => undefined);
+        throw new TypeError('background_reminder_transport_invalid');
+      }
+      this.#deliveryDispatcher = createWebPushDeliveryDispatcher({ canonicalOrigin: input.canonicalOrigin,
+        subscriptions: input.webPush, owner: this.#reminderDeliveryOwner(), transport });
+    }
     this.#proactiveCandidateIndex = new BackgroundProactiveCandidateIndex(input.kernel);
     this.policies = new BackgroundPolicyStore({ kernel: input.kernel, auth: input.auth, resolver: this.#resolver,
       onProactivePolicyEnabledWithinTransaction: (context, now) => {
@@ -120,6 +158,7 @@ export class BackgroundRuntimeOwner {
   stopAdmission(): void {
     if (this.#stopped) return;
     this.#stopped = true;
+    this.#deliveryDispatcher?.stopAdmission();
     this.#scheduler.stopAdmission();
   }
 
@@ -128,7 +167,11 @@ export class BackgroundRuntimeOwner {
     if (!this.#stopped) this.#scheduler.wake();
   }
 
-  drainAndDispose(): Promise<void> { this.stopAdmission(); return this.#scheduler.drainAndDispose(); }
+  async drainAndDispose(): Promise<void> {
+    this.stopAdmission();
+    await this.#scheduler.drainAndDispose();
+    await this.#deliveryDispatcher?.drain();
+  }
 
   #actor(metadata: WorkspaceActorMetadata): string {
     return this.#runtimeSessionFor(identityOf(metadata));
@@ -250,6 +293,132 @@ export class BackgroundRuntimeOwner {
     return store;
   }
 
+  #forEachReminderCandidate(metadata: WorkspaceActorMetadata, visit: (candidate: import('../../server/src/backgroundPolicies.js').BackgroundReminderDeliveryCandidate) => boolean | void): void {
+    const actor = this.#actor(metadata);
+    let afterPolicyId: string | undefined;
+    for (;;) {
+      const page = this.policies.listReminderDeliveryCandidatePage(actor, { expectedPrivacyEpoch: metadata.privacyEpoch,
+        ...(afterPolicyId ? { afterPolicyId } : {}), limit: PAGE });
+      for (const candidate of page.candidates) if (visit(candidate) === false) return;
+      if (!page.nextCursor) break;
+      if (page.nextCursor === afterPolicyId) throw new Error('background_policy_cursor_invalid');
+      afterPolicyId = page.nextCursor;
+    }
+  }
+
+  #reminderDueAt(metadata: WorkspaceActorMetadata, now: number): number | null {
+    if (!this.#webPush || !this.#deliveryDispatcher) return null;
+    const store = this.#occurrences(metadata);
+    let earliest = store.readNextReminderDueAt(metadata.privacyEpoch);
+    this.#forEachReminderCandidate(metadata, (candidate) => {
+      if (store.hasReminderOccurrenceForPolicy(metadata.privacyEpoch, candidate.policyId, candidate.policyRevision)) return;
+      if (candidate.dueAt <= now) {
+        try {
+          store.schedule({ expectedPrivacyEpoch: metadata.privacyEpoch, policyId: candidate.policyId,
+            expectedPolicyRevision: candidate.policyRevision,
+            descriptor: { kind: 'approved_reminder_delivery', reminderId: candidate.reminderId,
+              reminderRevision: candidate.reminderRevision, approvedIntentId: candidate.approvedIntentId },
+            scheduledAt: candidate.dueAt, source: {}, request: {} });
+        } catch (error) {
+          const code = error instanceof Error ? error.message : '';
+          if (!['background_occurrence_policy_stale', 'background_occurrence_policy_corrupt', 'background_occurrence_binding_changed',
+            'background_binding_changed', 'background_reminder_not_due', 'background_target_not_bound',
+            'background_reminder_targets_changed'].includes(code)) throw error;
+          return;
+        }
+        const scheduledDue = store.readNextReminderDueAt(metadata.privacyEpoch);
+        if (scheduledDue !== null && (earliest === null || scheduledDue < earliest)) earliest = scheduledDue;
+      } else if (earliest === null || candidate.dueAt < earliest) earliest = candidate.dueAt;
+    });
+    return earliest;
+  }
+
+  #reminderDeliveryOwner(): WebPushDeliveryAttemptOwner {
+    const entryFor = (claim: WebPushAttemptClaim): OwnedReminderClaim => {
+      const entry = this.#reminderDeliveryClaims.get(claim.attemptId);
+      if (!entry || claim.kind !== 'reminder' || claim.workspaceId !== entry.identity.workspaceId || claim.ownerId !== entry.identity.ownerId ||
+          claim.privacyEpoch !== entry.identity.privacyEpoch || claim.attemptId !== entry.metadata.attemptId ||
+          claim.deviceId !== entry.metadata.targetId || claim.generation !== entry.metadata.generation || claim.keyId !== entry.keyId) {
+        throw new Error('background_reminder_claim_invalid');
+      }
+      return entry;
+    };
+    const assertScope = (context: OwnedTransactionContext, claim: WebPushAttemptClaim): OwnedReminderClaim => {
+      const entry = entryFor(claim);
+      if (context.workspaceId !== entry.identity.workspaceId || context.ownerId !== entry.identity.ownerId ||
+          context.privacyEpoch !== entry.identity.privacyEpoch) throw new Error('background_reminder_claim_invalid');
+      return entry;
+    };
+    const assertCurrent = (entry: OwnedReminderClaim): void => {
+      const current = this.#kernel.getOwnedIdentity(entry.actor);
+      const actor = this.#runtimeSessionFor(entry.identity);
+      if (actor !== entry.actor || current.workspaceId !== entry.identity.workspaceId || current.ownerId !== entry.identity.ownerId ||
+          current.privacyEpoch !== entry.identity.privacyEpoch) {
+        throw new Error('background_reminder_claim_stale');
+      }
+    };
+    const owner: WebPushDeliveryAttemptOwner = {
+      withOwnedAttemptTransaction: (claim, callback) => {
+        const entry = entryFor(claim);
+        return this.#kernel.withOwnedTransaction(entry.actor, entry.identity.privacyEpoch, (context) => callback(context));
+      },
+      withDispatchAdmission: (claim, operation) => {
+        const entry = entryFor(claim);
+        const admission: OwnedWorkspaceAdmission = Object.freeze({ sessionToken: entry.actor, assertCurrent: () => assertCurrent(entry) });
+        return this.#runtime.withReminderDispatchAdmission({ ...admission, ownerId: entry.identity.ownerId,
+          privacyEpoch: entry.identity.privacyEpoch }, operation);
+      },
+      assertAttemptCurrentWithinTransaction: (context, claim) => {
+        const entry = assertScope(context, claim);
+        entry.store.assertReminderDeliveryDispatchAuthorizedWithinTransaction(context, entry.claim);
+        const currentKeyId = this.#webPush?.readDeliveryKeyIdWithinTransaction(context,
+          { deviceId: entry.metadata.targetId, generation: entry.metadata.generation });
+        if (currentKeyId !== entry.keyId) throw new Error('background_reminder_generation_changed');
+        const current = entry.store.readReminderDeliveryClaimMetadataWithinTransaction(context, entry.claim);
+        if (current.occurrenceId !== entry.metadata.occurrenceId || current.policyId !== entry.metadata.policyId ||
+            current.policyRevision !== entry.metadata.policyRevision || current.reminderId !== entry.metadata.reminderId ||
+            current.reminderRevision !== entry.metadata.reminderRevision || current.approvedIntentId !== entry.metadata.approvedIntentId ||
+            current.dueAt !== entry.metadata.dueAt) throw new Error('background_reminder_binding_changed');
+      },
+      readAttemptWithinTransaction: (context, claim): WebPushAttemptRecord => {
+        const entry = assertScope(context, claim);
+        const current = entry.store.readReminderDeliveryAttemptWithinTransaction(context, entry.claim);
+        return current.state === 'ready' ? Object.freeze({ state: 'ready' })
+          : current.state === 'dispatch_admitted' ? Object.freeze({ state: 'dispatch_admitted', admissionId: current.admissionId })
+            : Object.freeze({ state: 'settled', outcome: current.outcome });
+      },
+      admitDispatchWithinTransaction: (context, claim, binding) => {
+        const entry = assertScope(context, claim);
+        if (binding.deviceId !== entry.metadata.targetId || binding.generation !== entry.metadata.generation || binding.keyId !== entry.keyId) {
+          throw new Error('background_reminder_admission_invalid');
+        }
+        owner.assertAttemptCurrentWithinTransaction(context, claim);
+        entry.store.admitReminderDeliveryDispatchWithinTransaction(context, entry.claim, binding);
+      },
+      settleWithinTransaction: (context, claim, outcome, binding) => {
+        const entry = assertScope(context, claim);
+        entry.store.settleReminderDeliveryWithinTransaction(context, entry.claim, outcome, binding);
+      },
+    };
+    return Object.freeze(owner);
+  }
+
+  #settleReminderClaim(entry: OwnedReminderClaim, outcome: WebPushTransportResult): void {
+    this.#kernel.withOwnedTransaction(entry.actor, entry.identity.privacyEpoch, (context) => {
+      const attempt = entry.store.readReminderDeliveryAttemptWithinTransaction(context, entry.claim);
+      if (attempt.state === 'settled') return;
+      if (attempt.state === 'ready' && outcome.kind === 'not_started') {
+        entry.store.settleReminderDeliveryWithinTransaction(context, entry.claim, outcome, Object.freeze({}));
+      } else if (attempt.state === 'dispatch_admitted') {
+        const conservative: WebPushTransportResult = outcome.kind === 'ambiguous' ? outcome : Object.freeze({ kind: 'ambiguous', reason: 'transport_failure' });
+        entry.store.settleReminderDeliveryWithinTransaction(context, entry.claim, conservative, Object.freeze({ admissionId: attempt.admissionId }));
+      } else if (attempt.state === 'ready') {
+        entry.store.settleReminderDeliveryWithinTransaction(context, entry.claim,
+          Object.freeze({ kind: 'not_started', reason: 'authorization_changed' }), Object.freeze({}));
+      }
+    });
+  }
+
   #ports(): BackgroundSchedulerPorts {
     const claimFor = (opaque: BackgroundSchedulerClaim): OwnedClaim => {
       const entry = this.#claims.get(opaque as object);
@@ -268,6 +437,8 @@ export class BackgroundRuntimeOwner {
             if (batchDue !== null && (earliest === null || batchDue < earliest)) earliest = batchDue;
             const proactiveDue = this.#proactiveDueAt(metadata);
             if (proactiveDue !== null && (earliest === null || proactiveDue < earliest)) earliest = proactiveDue;
+            const reminderDue = this.#reminderDueAt(metadata, now);
+            if (reminderDue !== null && (earliest === null || reminderDue < earliest)) earliest = reminderDue;
           } catch (error) {
             if (error instanceof Error && ['unauthenticated', 'stale_epoch', 'workspace_binding_rejected'].includes(error.message)) return;
             throw error;
@@ -283,8 +454,9 @@ export class BackgroundRuntimeOwner {
             const store = this.#ensureOccurrences(item, now);
             const batchDue = this.#batchDue(item, now);
             const proactiveDue = this.#proactiveDueAt(item);
+            const reminderDue = this.#reminderDueAt(item, now);
             if (store.listDueAccountSyncWork(item.privacyEpoch, now, undefined, 1).length || batchDue !== null && batchDue <= now ||
-                proactiveDue !== null && proactiveDue <= now) found.push(item.workspaceId);
+                proactiveDue !== null && proactiveDue <= now || reminderDue !== null && reminderDue <= now) found.push(item.workspaceId);
           } catch (error) {
             if (error instanceof Error && ['unauthenticated', 'stale_epoch', 'workspace_binding_rejected'].includes(error.message)) return;
             throw error;
@@ -297,12 +469,14 @@ export class BackgroundRuntimeOwner {
         const metadata = this.#findMetadata(workspaceId);
         if (!metadata) return Object.freeze([]);
         try {
-          const lanes: ('account_sync' | 'batch_observation' | 'proactive_draft')[] = [];
           const batchDue = this.#batchDue(metadata, now);
           const proactiveDue = this.#proactiveDueAt(metadata);
+          const reminderDue = this.#reminderDueAt(metadata, now);
+          const lanes: ('account_sync' | 'batch_observation' | 'proactive_draft' | 'approved_reminder_delivery')[] = [];
           if (this.#occurrences(metadata).listDueAccountSyncWork(metadata.privacyEpoch, now, undefined, 1).length) lanes.push('account_sync');
           if (batchDue !== null && batchDue <= now) lanes.push('batch_observation');
           if (proactiveDue !== null && proactiveDue <= now) lanes.push('proactive_draft');
+          if (reminderDue !== null && reminderDue <= now && this.#deliveryDispatcher) lanes.push('approved_reminder_delivery');
           return Object.freeze(lanes);
         }
         catch (error) { if (error instanceof Error && ['unauthenticated', 'stale_epoch'].includes(error.message)) return Object.freeze([]); throw error; }
@@ -333,6 +507,11 @@ export class BackgroundRuntimeOwner {
             if (output.length >= limit) return false;
           }, cursorTuple ? { policyId: cursorTuple[0], inclusive: true } : undefined);
           return Object.freeze(output.slice(0, limit));
+        }
+        if (lane === 'approved_reminder_delivery') {
+          if (!this.#deliveryDispatcher) return Object.freeze([]);
+          return this.#occurrences(metadata).listDueReminderWork(metadata.privacyEpoch, now, afterWorkId, limit)
+            .map((item) => Object.freeze({ workspaceId, workId: item.workId, lane, dueAt: item.dueAt }));
         }
         if (lane !== 'account_sync') return Object.freeze([]);
         return this.#occurrences(metadata).listDueAccountSyncWork(metadata.privacyEpoch, now, afterWorkId, limit)
@@ -384,6 +563,28 @@ export class BackgroundRuntimeOwner {
           this.#proactiveClaims.set(opaque as object, Object.freeze({ claim, candidate, policy: policyCandidate, metadata, identity, actor }));
           return opaque;
         }
+        if (work.lane === 'approved_reminder_delivery') {
+          const store = this.#occurrences(metadata);
+          const [occurrenceId, targetId, generation] = parseWorkId(work.workId);
+          const owned = store.claim({ expectedPrivacyEpoch: metadata.privacyEpoch, occurrenceId, targetId, targetGeneration: generation });
+          const actor = this.#actor(metadata);
+          const identity = identityOf(metadata);
+          const secured = this.#kernel.withOwnedTransaction(actor, metadata.privacyEpoch, (context) => {
+            const claimMetadata = store.readReminderDeliveryClaimMetadataWithinTransaction(context, owned.claim);
+            const keyId = this.#webPush?.readDeliveryKeyIdWithinTransaction(context, { deviceId: targetId, generation });
+            if (!keyId) {
+              store.settleUnavailableReminderTargetWithinTransaction(context, owned.claim);
+              return Object.freeze({ claimMetadata, keyId: undefined, unavailable: true as const });
+            }
+            return Object.freeze({ claimMetadata, keyId, unavailable: false as const });
+          });
+          if (secured.unavailable || !secured.keyId) return undefined;
+          const entry: OwnedReminderClaim = Object.freeze({ claim: owned.claim, metadata: secured.claimMetadata, keyId: secured.keyId,
+            store, identity, actor });
+          const opaque = Object.freeze({}) as BackgroundSchedulerClaim;
+          this.#reminderClaims.set(opaque as object, entry);
+          return opaque;
+        }
         if (work.lane !== 'account_sync') return undefined;
     const [occurrenceId, targetId, generation] = parseWorkId(work.workId);
         const store = this.#occurrences(metadata);
@@ -396,6 +597,36 @@ export class BackgroundRuntimeOwner {
         return opaque;
       },
       executeClaim: async (opaque) => {
+        const reminder = this.#reminderClaims.get(opaque as object);
+        if (reminder) {
+          if (!this.#deliveryDispatcher) return Object.freeze({ kind: 'inspect_required', code: 'reminder_delivery_unavailable' });
+          const attempt: WebPushAttemptClaim = Object.freeze({ attemptId: reminder.metadata.attemptId,
+            workspaceId: reminder.identity.workspaceId, ownerId: reminder.identity.ownerId, privacyEpoch: reminder.identity.privacyEpoch,
+            deviceId: reminder.metadata.targetId, generation: reminder.metadata.generation, keyId: reminder.keyId, kind: 'reminder' });
+          if (this.#reminderDeliveryClaims.has(attempt.attemptId)) return Object.freeze({ kind: 'inspect_required', code: 'reminder_attempt_already_active' });
+          this.#reminderDeliveryClaims.set(attempt.attemptId, reminder);
+          let delivered: WebPushDeliveryResult;
+          try { delivered = await this.#deliveryDispatcher.dispatchClaimedNotification(attempt); }
+          catch {
+            try {
+              const state = this.#kernel.withOwnedTransaction(reminder.actor, reminder.identity.privacyEpoch, (context) =>
+                reminder.store.readReminderDeliveryAttemptWithinTransaction(context, reminder.claim));
+              this.#settleReminderClaim(reminder, state.state === 'dispatch_admitted'
+                ? Object.freeze({ kind: 'ambiguous', reason: 'transport_failure' })
+                : Object.freeze({ kind: 'not_started', reason: 'transport_failure' }));
+            } catch { /* Retained claim remains inspect-only after an uncertain local failure. */ }
+            return Object.freeze({ kind: 'inspect_required', code: 'reminder_outcome_unknown' });
+          } finally { this.#reminderDeliveryClaims.delete(attempt.attemptId); }
+          if (delivered.kind === 'deferred') return Object.freeze({ kind: 'deferred',
+            code: delivered.reason === 'workspace_busy' ? 'foreground_reminder_busy' : 'workspace_refresh_required',
+            nextDueAt: Date.now() + (delivered.reason === 'workspace_busy' ? 1_000 : MINUTE) });
+          const outcome = delivered.kind === 'already_settled' ? delivered.outcome : delivered;
+          if (outcome.kind === 'accepted') return Object.freeze({ kind: 'terminal', code: 'push_accepted' });
+          if (outcome.kind === 'expired') return Object.freeze({ kind: 'terminal', code: 'subscription_expired' });
+          if (outcome.kind === 'rejected') return Object.freeze({ kind: 'terminal', code: 'push_rejected' });
+          if (outcome.kind === 'ambiguous') return Object.freeze({ kind: 'inspect_required', code: 'push_outcome_unknown' });
+          return Object.freeze({ kind: 'terminal', code: 'push_not_started' });
+        }
         const proactive = this.#proactiveClaims.get(opaque as object);
         if (proactive) {
           try {
@@ -459,6 +690,16 @@ export class BackgroundRuntimeOwner {
         }
       },
       recordOutcome: async (opaque, outcome: BackgroundSchedulerOutcome) => {
+        const reminder = this.#reminderClaims.get(opaque as object);
+        if (reminder) {
+          if (outcome.kind === 'deferred') reminder.store.deferClaimBeforeDispatch(reminder.claim, reminder.identity.privacyEpoch,
+            outcome.code === 'workspace_refresh_required' ? 'workspace_refresh_required' : 'foreground_reminder_busy', outcome.nextDueAt);
+          else if (outcome.kind === 'held') {
+            this.#reminderHeldFinalizations.persist(opaque as object, outcome.reason, Date.now(), (pending) =>
+              reminder.store.deferClaimBeforeDispatch(reminder.claim, reminder.identity.privacyEpoch, pending.reason, pending.nextDueAt));
+          }
+          return;
+        }
         const proactive = this.#proactiveClaims.get(opaque as object);
         if (proactive) {
           let pending = this.#proactiveFinalizations.get(opaque as object);
@@ -516,6 +757,17 @@ export class BackgroundRuntimeOwner {
           accounting: { status: 'not_applicable' }, resultCode: outcome.code });
       },
       reconcileAmbiguousClaim: async (opaque) => {
+        const reminder = this.#reminderClaims.get(opaque as object);
+        if (reminder) {
+          try {
+            const state = this.#kernel.withOwnedTransaction(reminder.actor, reminder.identity.privacyEpoch, (context) =>
+              reminder.store.readReminderDeliveryAttemptWithinTransaction(context, reminder.claim));
+            this.#settleReminderClaim(reminder, state.state === 'dispatch_admitted'
+              ? Object.freeze({ kind: 'ambiguous', reason: 'transport_failure' })
+              : Object.freeze({ kind: 'not_started', reason: 'transport_failure' }));
+          } catch { /* Inspection failures never create a new reminder send. */ }
+          return;
+        }
         const batch = this.#batchClaims.get(opaque as object);
         if (batch) {
           const now = Date.now();
@@ -538,6 +790,11 @@ export class BackgroundRuntimeOwner {
       },
       reconcileUnacknowledgedClaim: async (work) => {
         const metadata = this.#findMetadata(work.workspaceId);
+        if (metadata && work.lane === 'approved_reminder_delivery') {
+          const [occurrenceId, targetId, generation] = parseWorkId(work.workId);
+          this.#occurrences(metadata).inspectUnacknowledgedReminderWork(metadata.privacyEpoch, occurrenceId, targetId, generation);
+          return;
+        }
         if (metadata && work.lane === 'batch_observation') {
           // An unacknowledged claim may have committed. Never mint a replacement GET attempt here.
           const now = Date.now();

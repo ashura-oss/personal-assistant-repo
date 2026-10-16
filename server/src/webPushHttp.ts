@@ -53,6 +53,6 @@ export interface WebPushHttpApi {
 
 /** Concrete production adapter; key generation and registry changes remain in the owned service transaction. */
 export function createWebPushHttpApi(kernel: DurableKernel, vault: SecretVault,
-  assertWorkspaceAdmission: (admission: WorkspaceHttpAdmission) => void): WebPushHttpApi {
+  assertWorkspaceAdmission: (admission: WorkspaceHttpAdmission) => void): WebPushSubscriptions {
   return new WebPushSubscriptions(kernel, vault, assertWorkspaceAdmission);
 }

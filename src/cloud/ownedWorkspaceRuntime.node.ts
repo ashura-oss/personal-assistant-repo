@@ -822,7 +822,6 @@ export class OwnedWorkspaceRuntime {
       }
   }
 
-
   /** Named private scheduler gateway. The journal command ID is the exact persisted attempt ID. */
   async executeScheduledAccountSync(input: Readonly<{ sessionToken: string; ownerId: string; privacyEpoch: number;
     claim: BackgroundClaim; occurrences: BackgroundOccurrenceStore }>): Promise<Readonly<{ status: 'completed' | 'inspect_required'; commandId: string; code: string }>> {
@@ -1370,6 +1369,39 @@ export class OwnedWorkspaceRuntime {
 
   /** Used by the host HTTP fence for APIs that bypass the controller runtime (credentials/OAuth). */
   assertWorkspaceAdmission(admission: OwnedWorkspaceAdmission): void { this.assertAdmission(admission); }
+
+  /** Holds the workspace lane only while a reminder's final durable push admission is recorded. */
+  withReminderDispatchAdmission<T>(input: OwnedWorkspaceAdmission & Readonly<{ ownerId: string; privacyEpoch: number }>,
+    operation: () => T): T {
+    if (!input || typeof input !== 'object' || typeof operation !== 'function' || typeof input.ownerId !== 'string' ||
+        !Number.isSafeInteger(input.privacyEpoch) || input.privacyEpoch < 0) throw new Error('background_reminder_admission_invalid');
+    this.assertAdmission(input);
+    const initial = this.options.kernel.getOwnedIdentity(input.sessionToken);
+    if (initial.ownerId !== input.ownerId || initial.privacyEpoch !== input.privacyEpoch) throw new Error('background_reminder_admission_stale');
+    if (this.busy.has(initial.workspaceId)) throw new Error('The workspace runtime is busy.');
+    if (this.refreshRequired.has(initial.workspaceId)) throw new Error('workspace_refresh_required');
+    this.busy.add(initial.workspaceId);
+    try {
+      input.assertCurrent();
+      const current = this.options.kernel.getOwnedIdentity(input.sessionToken);
+      if (current.workspaceId !== initial.workspaceId || current.ownerId !== initial.ownerId ||
+          current.privacyEpoch !== initial.privacyEpoch) throw new Error('background_reminder_admission_stale');
+      input.assertCurrent();
+      const result = operation();
+      let then: unknown;
+      try { then = result && (typeof result === 'object' || typeof result === 'function') ? (result as { then?: unknown }).then : undefined; }
+      catch { throw new Error('background_reminder_async_admission_rejected'); }
+      if (typeof then === 'function') {
+        Promise.resolve(result).catch(() => undefined);
+        throw new Error('background_reminder_async_admission_rejected');
+      }
+      input.assertCurrent();
+      const after = this.options.kernel.getOwnedIdentity(input.sessionToken);
+      if (after.workspaceId !== initial.workspaceId || after.ownerId !== initial.ownerId || after.privacyEpoch !== initial.privacyEpoch ||
+          this.refreshRequired.has(initial.workspaceId)) throw new Error('background_reminder_admission_stale');
+      return result;
+    } finally { this.releaseBusy(initial.workspaceId); }
+  }
 
   /** Metadata-only recovery view for the authenticated owner after an app refresh. */
   getWorkspaceEraseHoldStatus(admission: OwnedWorkspaceAdmission): Readonly<{ commandId: string; status: 'draining' | 'drain_failed' | 'drained';

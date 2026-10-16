@@ -70,6 +70,15 @@ export type WebPushBrowserOptions = Readonly<{ port?: BrowserPushPort; assertCur
 type PendingAction = Readonly<{ commandId: string; action: 'provision' | 'register' | 'revoke' }>;
 type LocalScope = Readonly<{ deviceId?: string; pending?: PendingAction }>;
 type ResponseLike = Pick<Response, 'ok' | 'status' | 'json'>;
+const REQUIRES_HTTPS_MESSAGE = 'Server notifications require HTTPS in this development setup.';
+class WebPushRequiresHttpsError extends Error { constructor() { super(REQUIRES_HTTPS_MESSAGE); this.name = 'WebPushRequiresHttpsError'; } }
+function responseErrorCode(value: unknown): string | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype) return undefined;
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const keys = Reflect.ownKeys(descriptors);
+  if (keys.length !== 1 || keys[0] !== 'error' || !descriptors.error?.enumerable || !Object.hasOwn(descriptors.error, 'value')) return undefined;
+  return typeof descriptors.error.value === 'string' ? descriptors.error.value : undefined;
+}
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const BASE64URL = /^[A-Za-z0-9_-]+$/;
@@ -265,7 +274,12 @@ export function createWebPushBrowserCoordinator(session: AuthenticatedSession, o
     const response: ResponseLike = await fetcher(path, { method, credentials: 'same-origin', redirect: 'error', cache: 'no-store',
       ...(method === 'POST' ? { headers: { 'Content-Type': 'application/json', 'X-Still-CSRF': session.csrfToken }, body: JSON.stringify(body) } : {}) });
     assertOperation(ticket);
-    if (!response.ok) throw Object.assign(new Error('The notification service could not confirm this action.'), { status: response.status });
+    if (!response.ok) {
+      const failure = await response.json().catch(() => undefined);
+      assertOperation(ticket);
+      if (response.status === 503 && responseErrorCode(failure) === 'web_push_requires_https') throw new WebPushRequiresHttpsError();
+      throw Object.assign(new Error('The notification service could not confirm this action.'), { status: response.status });
+    }
     const json = await response.json();
     assertOperation(ticket);
     return json;
@@ -454,7 +468,8 @@ export function createWebPushBrowserCoordinator(session: AuthenticatedSession, o
     catch (error) {
       if (!disposed && ticket === operation) {
         try { assertCurrent(); } catch { return; }
-        publish({ ...state, phase: state.phase === 'local_cleanup_pending' || state.phase === 'unmatched_local' ? state.phase : 'error',
+        publish({ ...state, phase: error instanceof WebPushRequiresHttpsError ? 'unsupported' :
+          state.phase === 'local_cleanup_pending' || state.phase === 'unmatched_local' ? state.phase : 'error',
           busy: false, message: safeMessage(error) });
       }
     }
@@ -498,6 +513,7 @@ export function createWebPushBrowserCoordinator(session: AuthenticatedSession, o
     }),
     enable: async () => {
       requireIdle();
+      if (state.phase === 'unsupported') return;
       const reason = unsupportedReason();
       if (reason) { publish({ phase: 'unsupported', busy: false, permission, message: reason }); return; }
       if (local.pending || state.phase === 'registration_unknown' || state.phase === 'disable_unknown') {

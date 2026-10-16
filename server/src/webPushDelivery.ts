@@ -21,6 +21,8 @@ export type WebPushAttemptRecord =
 
 export interface WebPushDeliveryAttemptOwner {
   withOwnedAttemptTransaction<T>(claim: WebPushAttemptClaim, callback: (context: OwnedTransactionContext) => T): T;
+  /** Reserves the actual owner workspace lane only for the synchronous final pre-POST admission transaction. */
+  withDispatchAdmission<T>(claim: WebPushAttemptClaim, operation: () => T): T;
   assertAttemptCurrentWithinTransaction(context: OwnedTransactionContext, claim: WebPushAttemptClaim): void;
   readAttemptWithinTransaction(context: OwnedTransactionContext, claim: WebPushAttemptClaim): WebPushAttemptRecord;
   /** Must atomically recheck claim, consent, source, and exact attempt ownership before persisting dispatch admission. */
@@ -30,7 +32,8 @@ export interface WebPushDeliveryAttemptOwner {
     binding: Readonly<{ admissionId?: string }>): void;
 }
 
-export type WebPushDeliveryResult = WebPushTransportResult | Readonly<{ kind: 'already_settled'; outcome: WebPushTransportResult }>;
+export type WebPushDeliveryResult = WebPushTransportResult | Readonly<{ kind: 'already_settled'; outcome: WebPushTransportResult }> |
+  Readonly<{ kind: 'deferred'; reason: 'workspace_busy' | 'workspace_refresh_required' }>;
 
 export interface WebPushDeliveryDispatcher {
   dispatchClaimedNotification(input: unknown): Promise<WebPushDeliveryResult>;
@@ -133,7 +136,7 @@ function copyAttemptRecord(value: unknown): WebPushAttemptRecord {
       return Object.freeze({ state: 'settled', outcome: Object.freeze({ kind: 'rejected', statusCode: outcome.statusCode }) });
     }
     if (outcome.kind === 'not_started' && Reflect.ownKeys(outcome).length === 2 && ['stopping', 'invalid_request', 'invalid_endpoint', 'unsafe_destination', 'dns_failure',
-      'tls_failure', 'authorization_changed', 'cancelled', 'timeout', 'transport_failure'].includes(String(outcome.reason))) {
+      'tls_failure', 'authorization_changed', 'cancelled', 'timeout', 'transport_failure', 'subscription_unavailable'].includes(String(outcome.reason))) {
       return Object.freeze({ state: 'settled', outcome: Object.freeze({ kind: 'not_started', reason: outcome.reason as Extract<WebPushTransportResult, { kind: 'not_started' }>['reason'] }) });
     }
     if (outcome.kind === 'ambiguous' && Reflect.ownKeys(outcome).length === 2 && ['cancelled', 'timeout', 'transport_failure'].includes(String(outcome.reason))) {
@@ -164,7 +167,7 @@ export function createWebPushDeliveryDispatcher(options: Readonly<{
   if (!subscriptions || typeof subscriptions.readDeliveryMaterialWithinTransaction !== 'function' ||
       typeof subscriptions.expireDeliveryGenerationWithinTransaction !== 'function' || !owner ||
       ['withOwnedAttemptTransaction', 'assertAttemptCurrentWithinTransaction', 'readAttemptWithinTransaction',
-        'admitDispatchWithinTransaction', 'settleWithinTransaction'].some((key) => typeof (owner as unknown as Record<string, unknown>)[key] !== 'function') ||
+        'withDispatchAdmission', 'admitDispatchWithinTransaction', 'settleWithinTransaction'].some((key) => typeof (owner as unknown as Record<string, unknown>)[key] !== 'function') ||
       !transport || typeof transport.send !== 'function' || typeof transport.stopAdmission !== 'function' || typeof transport.drain !== 'function') {
     throw new TypeError('web_push_delivery_ports_invalid');
   }
@@ -175,6 +178,7 @@ export function createWebPushDeliveryDispatcher(options: Readonly<{
     let material: WebPushDeliveryMaterial | undefined;
     let admissionCommitted = false;
     let fenceEntered = false;
+    let deferredReason: 'workspace_busy' | 'workspace_refresh_required' | undefined;
     let admissionId: string | undefined;
     let result: WebPushTransportResult = Object.freeze({ kind: 'not_started', reason: 'authorization_changed' });
     try {
@@ -210,8 +214,9 @@ export function createWebPushDeliveryDispatcher(options: Readonly<{
             assertBeforeDispatch: () => {
               fenceEntered = true;
               if (claim.signal?.aborted) throw new Error('web_push_delivery_cancelled');
-              ownedTransaction(owner, claim, (context) => {
+              try { requireSynchronous(owner.withDispatchAdmission(claim, () => ownedTransaction(owner, claim, (context) => {
                 assertClaimScope(context, claim);
+                if (claim.signal?.aborted) throw new Error('web_push_delivery_cancelled');
                 requireSynchronous(owner.assertAttemptCurrentWithinTransaction(context, claim), 'web_push_delivery_async_authority');
                 const current = requireSynchronous(subscriptions.readDeliveryMaterialWithinTransaction(context,
                   { deviceId: claim.deviceId, generation: claim.generation }), 'web_push_delivery_async_material_read');
@@ -224,7 +229,12 @@ export function createWebPushDeliveryDispatcher(options: Readonly<{
                     'web_push_delivery_async_attempt_read'));
                   if (admitted.state !== 'dispatch_admitted' || admitted.admissionId !== admissionId) throw new Error('web_push_delivery_admission_missing');
                 } finally { zeroMaterial(current); }
-              });
+              })), 'web_push_delivery_async_workspace_admission'); }
+              catch (error) {
+                if (error instanceof Error && error.message === 'The workspace runtime is busy.') deferredReason = 'workspace_busy';
+                else if (error instanceof Error && error.message === 'workspace_refresh_required') deferredReason = 'workspace_refresh_required';
+                throw error;
+              }
               admissionCommitted = true;
               if (claim.signal?.aborted) throw new Error('web_push_delivery_cancelled');
             } });
@@ -238,6 +248,7 @@ export function createWebPushDeliveryDispatcher(options: Readonly<{
               admissionCommitted = true;
             }
             else if (observed.state === 'settled') return Object.freeze({ kind: 'already_settled', outcome: observed.outcome });
+            else if (observed.state === 'ready' && deferredReason) return Object.freeze({ kind: 'deferred', reason: deferredReason });
           }
           if (admissionCommitted && result.kind === 'not_started') {
             result = Object.freeze({ kind: 'ambiguous', reason: result.reason === 'cancelled' ? 'cancelled' :
@@ -254,6 +265,7 @@ export function createWebPushDeliveryDispatcher(options: Readonly<{
             admissionCommitted = true;
           }
           if (observed.state === 'settled') return Object.freeze({ kind: 'already_settled', outcome: observed.outcome });
+          if (observed.state === 'ready' && deferredReason) return Object.freeze({ kind: 'deferred', reason: deferredReason });
         } catch { admissionCommitted = true; }
       }
       result = admissionCommitted ? Object.freeze({ kind: 'ambiguous', reason: 'transport_failure' }) :

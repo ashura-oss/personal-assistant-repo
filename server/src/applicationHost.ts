@@ -27,6 +27,7 @@ export interface ApplicationRuntime {
   readonly oauthHttpApi?: OAuthHttpApi;
   /** Optional authenticated, metadata-only Web Push registry bridge. */
   readonly webPushApi?: WebPushHttpApi;
+  readonly webPushUnavailableCode?: 'web_push_requires_https';
   stopAdmission(): void;
   drainAndDispose(): Promise<void>;
 }
@@ -296,6 +297,7 @@ export async function startApplicationHost(options: ApplicationHostOptions): Pro
       ...(runtime.audioHttpApi ? { audioApi: runtime.audioHttpApi } : {}),
       ...(runtime.oauthHttpApi ? { oauthApi: runtime.oauthHttpApi } : {}),
       ...(runtime.webPushApi ? { webPushApi: runtime.webPushApi } : {}),
+      ...(runtime.webPushUnavailableCode ? { webPushUnavailableCode: runtime.webPushUnavailableCode } : {}),
       canonicalOrigin: options.config.canonicalOrigin, staticRoot: options.config.staticRoot,
       ...(options.config.allowLocalHttp ? { allowLocalHttp: true } : {}),
       admissionOpen: () => owner.isAccepting(),

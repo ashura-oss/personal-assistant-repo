@@ -8,6 +8,7 @@ import type { BackgroundBindingResolver, ResolvedBackgroundBinding } from '../..
 import type { AccountCapability } from '../core';
 import type { BackgroundPolicySpecification } from '../../server/src/backgroundContracts.js';
 import type { DurableKernel, OwnedTransactionContext } from '../../server/src/kernel.js';
+import type { WebPushSubscriptions } from '../../server/src/webPushSubscriptions.js';
 
 function fail(code: string): never { throw new Error(code); }
 function sha256(text: string): string { return createHash('sha256').update(text, 'utf8').digest('hex'); }
@@ -49,7 +50,7 @@ export function backgroundProactiveRuleDigest(rule: ProactiveRule & { readonly r
 
 /** Resolves saved consent against the exact canonical DB snapshot in the same owned transaction. */
 export class ProductionBackgroundBindingResolver implements BackgroundBindingResolver {
-  constructor(private readonly kernel: DurableKernel) {
+  constructor(private readonly kernel: DurableKernel, private readonly webPush?: WebPushSubscriptions) {
     if (!kernel) throw new TypeError('background_binding_kernel_required');
   }
 
@@ -91,6 +92,28 @@ export class ProductionBackgroundBindingResolver implements BackgroundBindingRes
     }
     return Object.freeze({ accounts: Object.freeze(bound), rule: Object.freeze({ ruleId: rule.id, revision: rule.revision,
       specificationDigest: backgroundProactiveRuleDigest(rule) }) });
+  }
+
+  assertReminderDeliveryAvailableWithinTransaction(context: OwnedTransactionContext): void {
+    this.kernel.assertOwnedTransactionContext(context);
+    if (!this.webPush) return fail('background_reminder_delivery_unavailable');
+  }
+
+  captureReminderTargets(context: OwnedTransactionContext, specification: Extract<BackgroundPolicySpecification, { kind: 'approved_reminder_delivery' }>,
+    reminder: NonNullable<ResolvedBackgroundBinding['reminder']>): readonly Readonly<{ subscriptionId: string; generation: number }>[] {
+    this.kernel.assertOwnedTransactionContext(context);
+    if (!this.webPush || specification.kind !== 'approved_reminder_delivery' || reminder.reminderId !== specification.reminderId ||
+        reminder.revision !== specification.expectedReminderRevision || reminder.privacyEpoch !== context.privacyEpoch) {
+      return fail('background_reminder_target_resolver_unavailable');
+    }
+    if (reminder.deviceSelection === 'all_current') {
+      return this.webPush.listActiveDeliveryTargetsWithinTransaction(context);
+    }
+    if (typeof reminder.deviceSelection === 'string' || typeof specification.devices === 'string' ||
+        !('subscriptions' in reminder.deviceSelection) || !('subscriptions' in specification.devices)) {
+      return fail('background_reminder_generation_required');
+    }
+    return Object.freeze(reminder.deviceSelection.subscriptions.map((item) => Object.freeze({ subscriptionId: item.subscriptionId, generation: item.generation })));
   }
 
   resolveReminderSnapshotTransitionWithinTransaction(context: OwnedTransactionContext, nextRevision: number, candidate: unknown,

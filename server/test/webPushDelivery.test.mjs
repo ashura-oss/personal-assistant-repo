@@ -74,6 +74,7 @@ function createHarness(f, options = {}) {
   const transaction = (inputClaim, callback) => f.kernel.withOwnedTransaction(f.login.sessionToken, inputClaim.privacyEpoch, callback);
   const owner = {
     withOwnedAttemptTransaction: transaction,
+    withDispatchAdmission(_inputClaim, operation) { return operation(); },
     assertAttemptCurrentWithinTransaction(context, inputClaim) {
       const row = context.db.prepare(`SELECT * FROM web_push_delivery_test_attempts WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND attempt_id=?`)
         .get(inputClaim.workspaceId, inputClaim.ownerId, inputClaim.privacyEpoch, inputClaim.attemptId);

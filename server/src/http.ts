@@ -49,6 +49,7 @@ export interface StillHttpOptions {
   readonly audioApi?: AudioHttpApi;
   readonly oauthApi?: OAuthHttpApi;
   readonly webPushApi?: WebPushHttpApi;
+  readonly webPushUnavailableCode?: 'web_push_requires_https';
   /** Trusted host lifecycle fence checked at request admission and after awaited request bodies. */
   readonly admissionOpen?: () => boolean;
 }
@@ -656,7 +657,7 @@ export function createStillHttpServer(options: StillHttpOptions): Server {
   server = createServer((request, response) => {
     securityHeaders(response);
     const handled = Promise.resolve().then(() => handleRequest(request, response, options.auth, origin, realRoot, paths, index, options.credentialCommands,
-      options.workspaceApi, options.audioApi, options.oauthApi, options.webPushApi, options.admissionOpen)).catch((error: unknown) => {
+      options.workspaceApi, options.audioApi, options.oauthApi, options.webPushApi, options.webPushUnavailableCode, options.admissionOpen)).catch((error: unknown) => {
       if (response.headersSent) { response.destroy(); return; }
       if (isHttpProblem(error)) { sendError(response, error.status, error.code); return; }
       if (error instanceof AuthError) { sendError(response, authStatus(error), error.code); return; }
@@ -675,7 +676,7 @@ export function createStillHttpServer(options: StillHttpOptions): Server {
 async function handleRequest(request: IncomingMessage, response: ServerResponse, auth: AuthService, canonicalOrigin: URL,
   staticRoot: string, staticPaths: Set<string>, index: Buffer, credentialCommands?: ServerCredentialCommandService,
   workspaceApi?: WorkspaceHttpApi, audioApi?: AudioHttpApi, oauthApi?: OAuthHttpApi, webPushApi?: WebPushHttpApi,
-  admissionOpen?: () => boolean): Promise<void> {
+  webPushUnavailableCode?: 'web_push_requires_https', admissionOpen?: () => boolean): Promise<void> {
   if (admissionOpen && !admissionOpen()) throw problem(503, 'service_unavailable');
   const host = uniqueHeader(request, 'host', true);
   if (!host || host.toLowerCase() !== canonicalOrigin.host.toLowerCase()) throw problem(403, 'host_rejected');
@@ -1152,6 +1153,13 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
       });
       admission.assertCurrent();
       if (admissionOpen && !admissionOpen()) throw problem(503, 'service_unavailable');
+      if (webPushUnavailableCode === 'web_push_requires_https') {
+        const command = envelope && typeof envelope === 'object' && !Array.isArray(envelope)
+          ? (envelope as Record<string, unknown>).command : undefined;
+        const kind = command && typeof command === 'object' && !Array.isArray(command)
+          ? (command as Record<string, unknown>).kind : undefined;
+        if (kind === 'reminders.serverSave') { sendError(response, 503, webPushUnavailableCode); return; }
+      }
       const result = await workspaceApi.dispatchCommand(admission, envelope);
       admission.assertCurrent();
       if (!response.destroyed) sendJson(response, 200, result);
@@ -1313,7 +1321,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     return;
   }
   if (pathname.startsWith('/api/web-push/')) {
-    if (!webPushApi) throw problem(503, 'service_unavailable');
+    if (!webPushApi) throw problem(503, webPushUnavailableCode ?? 'service_unavailable');
     if (pathname === '/api/web-push/status' || pathname === '/api/web-push/vapid-key') {
       if (request.method !== 'GET') { response.setHeader('Allow', 'GET'); throw problem(405, 'method_not_allowed'); }
       if (hasQuery) throw problem(400, 'bad_request');

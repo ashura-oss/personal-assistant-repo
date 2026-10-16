@@ -552,6 +552,23 @@ describe('browser Web Push coordinator', () => {
     owner.dispose(); other.dispose();
   });
 
+  it('treats the closed local-development HTTPS capability response as unavailable without prompting', async () => {
+    const { fetcher } = fetchForStart(() => reply({ error: 'web_push_requires_https' }, 503));
+    const requestPermission = vi.fn(async () => 'granted' as NotificationPermission);
+    const subscribe = vi.fn(async () => makeSubscription());
+    const { port, storage } = makePort({ fetcher, requestPermission, subscribe });
+    const coordinator = createWebPushBrowserCoordinator(SESSION, { port, assertCurrent: () => undefined });
+    await coordinator.start();
+    expect(coordinator.getSnapshot().phase).toBe('unsupported');
+    expect(coordinator.getSnapshot().message).toBe('Server notifications require HTTPS in this development setup.');
+    await coordinator.enable();
+    expect(requestPermission).not.toHaveBeenCalled();
+    expect(subscribe).not.toHaveBeenCalled();
+    expect(fetcher.mock.calls.some(([, init]) => init?.method === 'POST')).toBe(false);
+    expect(storage.getItem(`still:webpush:${SESSION.workspaceId}:${SESSION.privacyEpoch}`)).toBeNull();
+    coordinator.dispose();
+  });
+
   it('reports unsupported when origin-wide locking is unavailable', async () => {
     const { fetcher } = fetchForStart();
     const { port } = makePort({ fetcher, locksAvailable: false });

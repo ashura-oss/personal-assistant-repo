@@ -1,6 +1,6 @@
 import type Database from 'better-sqlite3';
 
-export const BACKGROUND_SCHEMA_VERSION = 3;
+export const BACKGROUND_SCHEMA_VERSION = 4;
 const TABLES = Object.freeze([
   'background_schema',
   'background_policy_heads',
@@ -98,6 +98,7 @@ const REQUIRED_COLUMNS: Readonly<Record<string, readonly Column[]>> = Object.fre
     { name: 'finalization_request_json', type: 'TEXT', notnull: 0, pk: 0 },
     { name: 'finalization_receipt_json', type: 'TEXT', notnull: 0, pk: 0 },
     { name: 'finalization_receipt_digest', type: 'TEXT', notnull: 0, pk: 0 },
+    { name: 'dispatch_admission_id', type: 'TEXT', notnull: 0, pk: 0 },
   ],
   background_occurrence_targets: [
     { name: 'workspace_id', type: 'TEXT', notnull: 1, pk: 1 },
@@ -184,6 +185,7 @@ CREATE TABLE background_occurrence_attempts (
   result_code TEXT CHECK(result_code IS NULL OR length(result_code)>0),
   finalization_operation TEXT CHECK(finalization_operation IS NULL OR finalization_operation IN ('settle','defer','inspect','inspect_unacknowledged')),
   finalization_request_json TEXT, finalization_receipt_json TEXT, finalization_receipt_digest TEXT CHECK(finalization_receipt_digest IS NULL OR length(finalization_receipt_digest)=64),
+  dispatch_admission_id TEXT CHECK(dispatch_admission_id IS NULL OR length(dispatch_admission_id)=36),
   CHECK((finalization_operation IS NULL AND finalization_request_json IS NULL AND finalization_receipt_json IS NULL AND finalization_receipt_digest IS NULL) OR
     (finalization_operation IS NOT NULL AND finalization_request_json IS NOT NULL AND finalization_receipt_json IS NOT NULL AND finalization_receipt_digest IS NOT NULL)),
   PRIMARY KEY(workspace_id,owner_id,privacy_epoch,attempt_id)
@@ -275,7 +277,15 @@ export function ensureBackgroundSchema(db: Database.Database): void {
   const migratedVersion = (db.prepare('SELECT version FROM background_schema WHERE singleton=1').get() as { version: number } | undefined)?.version;
   if (migratedVersion === 2) {
     migrateAttemptHistoryIndex(db);
-  } else if (migratedVersion !== BACKGROUND_SCHEMA_VERSION) {
+  }
+  const indexedVersion = (db.prepare('SELECT version FROM background_schema WHERE singleton=1').get() as { version: number } | undefined)?.version;
+  if (indexedVersion === 3) {
+    const columns = db.pragma('table_info(background_occurrence_attempts)') as Column[];
+    if (columns.some((column) => column.name === 'dispatch_admission_id')) throw new Error('background_schema_invalid');
+    db.exec(`ALTER TABLE background_occurrence_attempts ADD COLUMN dispatch_admission_id TEXT
+      CHECK(dispatch_admission_id IS NULL OR length(dispatch_admission_id)=36);
+      UPDATE background_schema SET version=4 WHERE singleton=1 AND version=3;`);
+  } else if (indexedVersion !== BACKGROUND_SCHEMA_VERSION) {
     throw new Error('background_schema_unsupported');
   }
   for (const name of TABLES) validateTable(db, name);
@@ -289,7 +299,13 @@ const ATTEMPT_HISTORY_COLUMNS = `workspace_id,owner_id,privacy_epoch,attempt_id,
 function migrateAttemptHistoryIndex(db: Database.Database): void {
   // Validate the known v2 table before rebuilding its autoindex. This preserves every durable attempt byte-for-byte
   // while replacing the lifetime target uniqueness constraint with a uniqueness fence for live attempts only.
-  validateTable(db, 'background_occurrence_attempts');
+  const expectedColumns = REQUIRED_COLUMNS.background_occurrence_attempts!.filter((column) => column.name !== 'dispatch_admission_id');
+  const actualColumns = db.pragma('table_info(background_occurrence_attempts)') as Column[];
+  const strict = db.prepare('SELECT strict FROM pragma_table_list WHERE name=?').get('background_occurrence_attempts') as { strict?: number } | undefined;
+  if (strict?.strict !== 1 || actualColumns.length !== expectedColumns.length || actualColumns.some((column, index) => {
+    const target = expectedColumns[index]!;
+    return column.name !== target.name || column.type.toUpperCase() !== target.type || column.notnull !== target.notnull || column.pk !== target.pk;
+  })) throw new Error('background_schema_invalid');
   const indexes = db.pragma('index_list(background_occurrence_attempts)') as { name: string; unique: number; partial: number }[];
   const legacyTargetIndex = indexes.filter((index) => index.unique === 1 && index.partial === 0 &&
     JSON.stringify((db.pragma(`index_info("${index.name.replaceAll('"', '""')}")`) as { name: string | null }[]).map((column) => column.name)) ===
@@ -322,5 +338,5 @@ function migrateAttemptHistoryIndex(db: Database.Database): void {
     CREATE UNIQUE INDEX background_occurrence_active_attempt_unique
       ON background_occurrence_attempts(workspace_id,owner_id,privacy_epoch,occurrence_id,target_id,target_generation)
       WHERE status IN ('claimed','dispatching');
-    UPDATE background_schema SET version=${BACKGROUND_SCHEMA_VERSION} WHERE singleton=1 AND version=2;`);
+    UPDATE background_schema SET version=3 WHERE singleton=1 AND version=2;`);
 }

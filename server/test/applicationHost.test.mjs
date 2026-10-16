@@ -11,7 +11,7 @@ import { loadServerConfig } from '../dist/config.js';
 import { openServerFoundation } from '../dist/bootstrap.js';
 import { ApplicationHostStartError, ApplicationHostStartupCleanupError, startApplicationHost } from '../dist/applicationHost.js';
 import { createInitialWorkspaceState } from '../dist/sharedControllerNode.mjs';
-import { createCloudApplicationRuntimeFactory } from '../dist/applicationHost.node.mjs';
+import { createCloudApplicationRuntimeFactory, createProductionApplicationRuntimeFactory } from '../dist/applicationHost.node.mjs';
 import { createNodeProviderResponseLifetimeOwner } from '../dist/providerResponseLifetime.node.mjs';
 
 const PASSWORD = 'closed application host fixture password';

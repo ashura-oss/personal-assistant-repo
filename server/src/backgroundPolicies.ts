@@ -44,6 +44,7 @@ export interface BackgroundBindingResolver {
   resolveReminderSnapshotTransitionWithinTransaction?(context: OwnedTransactionContext, nextRevision: number, candidate: unknown,
     specification: Extract<BackgroundPolicySpecification, { kind: 'approved_reminder_delivery' }>): ResolvedBackgroundBinding;
   /** Captures currently eligible devices at the due instant; never called while saving policy authorization. */
+  assertReminderDeliveryAvailableWithinTransaction?(context: OwnedTransactionContext): void;
   captureReminderTargets?(context: OwnedTransactionContext, specification: Extract<BackgroundPolicySpecification, { kind: 'approved_reminder_delivery' }>,
     reminder: NonNullable<ResolvedBackgroundBinding['reminder']>): readonly Readonly<{ subscriptionId: string; generation: number }>[];
 }
@@ -64,6 +65,15 @@ export interface BackgroundAccountSyncCandidate {
   readonly initialEffectiveFrom: number;
 }
 
+export interface BackgroundReminderDeliveryCandidate {
+  readonly policyId: string;
+  readonly policyRevision: number;
+  readonly reminderId: string;
+  readonly reminderRevision: number;
+  readonly approvedIntentId: string;
+  readonly dueAt: number;
+}
+
 export interface BackgroundProactiveDraftCandidate {
   readonly policy: BackgroundPolicyDisplay;
   readonly initialEffectiveFrom: number;
@@ -81,6 +91,18 @@ interface CommandRow { request_digest: string; receipt_json: string }
 
 function fail(code: string): never { throw new Error(code); }
 function digest(text: string): string { return createHash('sha256').update(text, 'utf8').digest('hex'); }
+function invokeReminderDeliveryAvailability(callback: NonNullable<BackgroundBindingResolver['assertReminderDeliveryAvailableWithinTransaction']>,
+  context: OwnedTransactionContext): void {
+  const result = (callback as (context: OwnedTransactionContext) => unknown)(context);
+  if (result !== null && (typeof result === 'object' || typeof result === 'function')) {
+    let then: unknown;
+    try { then = (result as { then?: unknown }).then; } catch { return fail('background_reminder_delivery_availability_async_rejected'); }
+    if (typeof then === 'function') {
+      try { Promise.resolve(result).catch(() => undefined); } catch { /* A hostile thenable is rejected below. */ }
+      return fail('background_reminder_delivery_availability_async_rejected');
+    }
+  }
+}
 function parseStored<T>(text: string, maximum = MAX_PRIVATE_BYTES): T {
   if (Buffer.byteLength(text, 'utf8') > maximum) return fail('background_storage_invalid');
   try { return JSON.parse(text) as T; } catch { return fail('background_storage_invalid'); }
@@ -448,6 +470,32 @@ export class BackgroundPolicyStore {
     return receipt;
   }
 
+    listReminderDeliveryCandidatePage(actorSessionToken: string, input: { readonly expectedPrivacyEpoch: number;
+    readonly afterPolicyId?: string; readonly limit?: number }): Readonly<{ candidates: readonly BackgroundReminderDeliveryCandidate[]; nextCursor?: string }> {
+    const policies = this.list(actorSessionToken, input);
+    return this.#kernel.withOwnedTransaction(actorSessionToken, input.expectedPrivacyEpoch, (context) => {
+      ensureBackgroundSchema(context.db);
+      const candidates: BackgroundReminderDeliveryCandidate[] = [];
+      for (const policy of policies) {
+        if (policy.status !== 'enabled' || !policy.enabled || policy.specification.kind !== 'approved_reminder_delivery') continue;
+        const row = context.db.prepare(`SELECT binding_json FROM background_policy_revisions WHERE workspace_id=? AND owner_id=?
+          AND privacy_epoch=? AND policy_id=? AND revision=? AND enabled=1`)
+          .get(context.workspaceId, context.ownerId, context.privacyEpoch, policy.policyId, policy.revision) as { binding_json: string } | undefined;
+        if (!row) return fail('background_policy_storage_invalid');
+        const stored = parseStored<ResolvedBackgroundBinding>(row.binding_json);
+        const binding = normalizeResolvedBackgroundBinding(stored, policy.specification, context.privacyEpoch);
+        if (canonicalBackgroundJson(binding, MAX_PRIVATE_BYTES) !== canonicalBackgroundJson(stored, MAX_PRIVATE_BYTES) || !binding.reminder ||
+            binding.reminder.reminderId !== policy.specification.reminderId || binding.reminder.revision !== policy.specification.expectedReminderRevision ||
+            !Number.isSafeInteger(binding.reminder.dueAt) || binding.reminder.dueAt < 0) return fail('background_policy_storage_invalid');
+        candidates.push(Object.freeze({ policyId: policy.policyId, policyRevision: policy.revision,
+          reminderId: binding.reminder.reminderId, reminderRevision: binding.reminder.revision,
+          approvedIntentId: binding.reminder.intentId, dueAt: binding.reminder.dueAt }));
+      }
+      const nextCursor = policies.length === (input.limit ?? 100) ? policies.at(-1)?.policyId : undefined;
+      return Object.freeze({ candidates: Object.freeze(candidates), ...(nextCursor ? { nextCursor } : {}) });
+    });
+  }
+
   #saveReceipt(context: OwnedTransactionContext, commandId: string, request: string, receipt: BackgroundPolicyReceipt): BackgroundPolicyReceipt {
     const json = canonicalBackgroundJson(receipt, 64 * 1024);
     context.db.prepare(`INSERT INTO background_policy_commands(workspace_id,owner_id,privacy_epoch,command_id,request_digest,receipt_json,created_at)
@@ -504,6 +552,9 @@ export class BackgroundPolicyStore {
   #insertReminderPolicy(context: OwnedTransactionContext, policyId: string, specification: Extract<BackgroundPolicySpecification, { kind: 'approved_reminder_delivery' }>,
     commandId: string, nextRevision: number, nextSnapshot: object): void {
     if (!isBackgroundUuidV4(policyId) || !isBackgroundUuidV4(commandId)) return fail('background_reminder_policy_invalid');
+    const assertDeliveryAvailable = this.#resolver.assertReminderDeliveryAvailableWithinTransaction;
+    if (!assertDeliveryAvailable) return fail('background_reminder_delivery_unavailable');
+    invokeReminderDeliveryAvailability(assertDeliveryAvailable.bind(this.#resolver), context);
     ensureBackgroundSchema(context.db);
     if (this.#head(context.db, context, policyId)) return fail('background_policy_id_conflict');
     const binding = this.#resolveReminderSnapshotTransition(context, nextRevision, nextSnapshot, specification);

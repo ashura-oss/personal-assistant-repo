@@ -35,7 +35,7 @@ async function setup(options = {}) {
   const approvedReminderDevices = options.reminderDevices ?? 'all_current';
   let savedRuleRevision = options.savedRuleRevision ?? 7;
   let savedReminderRevision = options.savedReminderRevision ?? 2;
-  const resolver = { resolve(_context, specification) {
+  const resolver = { assertReminderDeliveryAvailableWithinTransaction() {}, resolve(_context, specification) {
     const selections = specification.kind === 'account_sync' || specification.kind === 'proactive_draft' ? specification.accounts
       : specification.kind === 'period_summary' ? [...specification.sources.mailAccounts, ...specification.sources.calendarAccounts] : [];
     const unique = new Map(selections.map((entry) => [entry.accountId, entry.expectedConnectionGeneration]));
@@ -274,6 +274,47 @@ test('failed reminder policy participant rolls back the snapshot and policy toge
     assert.deepEqual(f.store.list(f.browserSessionToken, { expectedPrivacyEpoch: 0 }), []);
     assert.deepEqual(f.kernel.getOwnedSnapshot(f.actorSessionToken).snapshot.reminders.records[0].status, 'approved');
   } finally { cleanup(f); }
+});
+
+test('reminder availability authority rejects asynchronous and hostile results and rolls back its transaction', async () => {
+  const invalidResults = [
+    () => Promise.reject(new Error('synthetic async authority rejection')),
+    () => Object.defineProperty({}, 'then', { get() { throw new Error('synthetic then getter'); } }),
+  ];
+  for (const getResult of invalidResults) {
+    const f = await setup();
+    try {
+      const reminderId = randomUUID();
+      const selected = { subscriptions: [{ subscriptionId: randomUUID(), generation: 9 }] };
+      const journal = new CommandJournal(f.kernel);
+      const store = new ServerWorkspaceStore({ kernel: f.kernel, sessionToken: f.actorSessionToken, journal,
+        snapshotCommitParticipant: f.store.createReminderSnapshotCommitParticipant() });
+      const initial = await store.load();
+      const seeded = approvedReminderState(initial, reminderId);
+      await store.save(seeded);
+      const before = seeded.reminders.records[0];
+      const next = { ...seeded, reminders: { ...seeded.reminders, records: [{ ...before, status: 'saved', currentIntentId: 'saved-intent-2' },
+        ...seeded.reminders.records.slice(1)], intents: [...seeded.reminders.intents,
+        { ...seeded.reminders.intents[0], id: 'saved-intent-2', desired: 'scheduled' }] } };
+      let invocations = 0;
+      f.resolver.assertReminderDeliveryAvailableWithinTransaction = () => getResult();
+      const originalAssert = f.resolver.assertReminderDeliveryAvailableWithinTransaction;
+      f.resolver.assertReminderDeliveryAvailableWithinTransaction = () => { invocations += 1; return originalAssert(); };
+      const commandId = randomUUID();
+      const command = { deviceSelection: { subscriptions: [{ generation: 9, subscriptionId: selected.subscriptions[0].subscriptionId }] },
+        expectedReminderRevision: 2, kind: 'reminders.serverSave', reminderId };
+      const canonicalBody = JSON.stringify({ command, commandId, expectedPrivacyEpoch: 0, expectedRevision: 1, schemaVersion: 1 });
+      const admission = journal.admit({ admissionSessionToken: f.actorSessionToken, expectedRevision: 1, expectedPrivacyEpoch: 0,
+        idempotencyKey: commandId, kind: 'reminders.serversave', canonicalBody });
+      await assert.rejects(journal.run(admission.ticket, f.actorSessionToken, async () => withReminderSavePolicyCapture({
+        canonicalCommandBody: canonicalBody, commandId, reminderId, expectedReminderRevision: 2, deviceSelection: selected,
+      }, () => store.save(next))), /background_reminder_delivery_availability_async_rejected/);
+      assert.equal(invocations, 1);
+      assert.equal(f.kernel.getOwnedIdentity(f.actorSessionToken).revision, 1);
+      assert.deepEqual(f.store.list(f.browserSessionToken, { expectedPrivacyEpoch: 0 }), []);
+      assert.equal(f.kernel.getOwnedSnapshot(f.actorSessionToken).snapshot.reminders.records[0].status, 'approved');
+    } finally { cleanup(f); }
+  }
 });
 
 test('standing paid consent rejects a kernel-only runtime actor even for an exact command replay', async () => {

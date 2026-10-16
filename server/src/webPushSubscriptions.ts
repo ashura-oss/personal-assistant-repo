@@ -323,6 +323,30 @@ export class WebPushSubscriptions implements WebPushHttpApi {
     }
   }
 
+  /** Content-free exact targets captured by the reminder occurrence in its due-time transaction. */
+  listActiveDeliveryTargetsWithinTransaction(context: OwnedTransactionContext): readonly Readonly<{ subscriptionId: string; generation: number }>[] {
+    activeContext(this.#kernel, context);
+    const rows = context.db.prepare(`SELECT device_id,generation FROM web_push_subscription_heads
+      WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND status='active' ORDER BY device_id`)
+      .all(context.workspaceId, context.ownerId, context.privacyEpoch) as { device_id: string; generation: number }[];
+    if (rows.some((row) => !UUID_V4.test(row.device_id) || !Number.isSafeInteger(row.generation) || row.generation < 1)) {
+      fail('web_push_registry_corrupt');
+    }
+    return Object.freeze(rows.map((row) => Object.freeze({ subscriptionId: row.device_id, generation: row.generation })));
+  }
+
+  /** Returns only the immutable VAPID binding for an active exact subscription generation. */
+  readDeliveryKeyIdWithinTransaction(context: OwnedTransactionContext, input: unknown): string | undefined {
+    activeContext(this.#kernel, context);
+    const request = closedFields(input, ['deviceId', 'generation']);
+    const deviceId = uuid(request.deviceId);
+    const generation = safeInteger(request.generation, 1);
+    const row = context.db.prepare(`SELECT key_id FROM web_push_subscription_heads
+      WHERE workspace_id=? AND owner_id=? AND privacy_epoch=? AND device_id=? AND generation=? AND status='active'`)
+      .get(context.workspaceId, context.ownerId, context.privacyEpoch, deviceId, generation) as { key_id: string } | undefined;
+    return row ? uuid(row.key_id) : undefined;
+  }
+
   expireDeliveryGenerationWithinTransaction(context: OwnedTransactionContext, input: unknown): boolean {
     activeContext(this.#kernel, context);
     const request = closedFields(input, ['deviceId', 'generation', 'keyId']);
