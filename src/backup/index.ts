@@ -1,5 +1,6 @@
 import type { AppState, NoteAssistResult, Proposal } from '../core';
 import { emptyKnowledgeState, renderKnowledgeMarkdown, validateKnowledgeState, type KnowledgeState } from '../knowledge';
+import { isCanonicalKnowledgeId } from '../../server/src/knowledgeId';
 import { PORTABLE_CHAT_HISTORY_VERSION, PORTABLE_CHAT_HISTORY_V2, projectInertImportedChatHistory, validateInertImportedChatHistory, validatePortableChatHistory,
   type InertImportedChatConversation, type PortableChatHistory } from '../chat/portable';
 
@@ -477,7 +478,7 @@ function normalizePortableKnowledge(value: unknown, allowOutputPolicy2 = false):
   return { state, narratives };
 }
 function validateKnowledgeEntityId(value: unknown): string {
-  if (typeof value !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)) fail('Knowledge entity ID must be a canonical UUID.');
+  if (!isCanonicalKnowledgeId(value)) fail('Knowledge entity ID must be a canonical UUID.');
   return value;
 }
 

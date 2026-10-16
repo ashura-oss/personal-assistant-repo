@@ -14,8 +14,9 @@ const ALLOWED_MIME: Readonly<Record<string, readonly string[]>> = Object.freeze(
 
 export type AudioCapture = Readonly<{ id: string; capturedAt: string; timeZone: string }>;
 export type PendingAudioUpload = Readonly<{ uploadId: string; capture: AudioCapture }>;
+export type DownloadedAudio = Readonly<{ blob: Blob; filename: string }>;
 
-type AudioResponse = Pick<Response, 'ok' | 'status' | 'json'>;
+type AudioResponse = Pick<Response, 'ok' | 'status' | 'json'> & Partial<Pick<Response, 'arrayBuffer' | 'headers'>>;
 export type AudioFetchLike = (input: string, init: RequestInit) => Promise<AudioResponse>;
 export type AudioClientOptions = Readonly<{
   /** Must fail when the authenticated owner, workspace, or privacy epoch is no longer current. */
@@ -29,6 +30,7 @@ export type AudioUploadClient = Readonly<{
   uploadClip(input: Readonly<{ blob: Blob; capture: AudioCapture }>, onAdmitted?: (pending: PendingAudioUpload) => void): Promise<AudioUploadReceiptDTO>;
   inspectUpload(uploadId?: string): Promise<AudioUploadReceiptDTO>;
   listUploads(cursor?: string): Promise<AudioUploadHistoryPageDTO>;
+  downloadMedia(mediaId: string): Promise<DownloadedAudio>;
   getPendingUpload(): PendingAudioUpload | undefined;
   dispose(): void;
 }>;
@@ -272,10 +274,53 @@ export function createWebAudioUploadClient(session: AuthenticatedSession, option
     }
   }
 
+  async function downloadMedia(mediaId: string): Promise<DownloadedAudio> {
+    assertUsable();
+    if (!UUID_V4.test(mediaId)) throw new AudioClientError('malformed', 'The recording reference is invalid.');
+    if (activeWrite || activeRead) throw new AudioClientError('busy', 'Wait for the current audio request before downloading a recording.');
+    activeRead = true;
+    const ticket = generation;
+    const controller = new AbortController();
+    activeReadController = controller;
+    let timedOut = false;
+    let timeoutReject!: (error: Error) => void;
+    const timeoutPromise = new Promise<never>((_, reject) => { timeoutReject = reject; });
+    const timeout = setTimeout(() => { timedOut = true; controller.abort(); timeoutReject(new Error('timeout')); }, timeoutMs);
+    try {
+      assertUsable(ticket);
+      const response = await Promise.race([fetcher(`/api/audio/${encodeURIComponent(mediaId)}?download=1`, {
+        method: 'GET', credentials: 'same-origin', redirect: 'error', cache: 'no-store', signal: controller.signal,
+      }), timeoutPromise]);
+      assertUsable(ticket);
+      if (!response.ok) throw new AudioClientError('http', response.status === 404 ? 'This recording is no longer available.' : 'The recording could not be downloaded.', undefined, response.status);
+      if (typeof response.arrayBuffer !== 'function' || !response.headers) throw new AudioClientError('malformed', 'The recording response could not be confirmed.');
+      const mime = response.headers.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase();
+      if (!mime || !['audio/mp4', 'audio/mpeg', 'audio/wav', 'audio/webm', 'audio/ogg'].includes(mime)) {
+        throw new AudioClientError('malformed', 'The recording response could not be confirmed.');
+      }
+      const bytes = await Promise.race([response.arrayBuffer(), timeoutPromise]);
+      assertUsable(ticket);
+      const disposition = response.headers.get('content-disposition') ?? '';
+      const filename = /^attachment; filename="([A-Za-z0-9 _.-]{1,72}\.(?:m4a|mp3|wav|webm|ogg))"$/i.exec(disposition)?.[1];
+      if (!filename) throw new AudioClientError('malformed', 'The recording download filename could not be confirmed.');
+      return Object.freeze({ blob: new Blob([bytes], { type: mime }), filename });
+    } catch (error) {
+      if (error instanceof AudioClientError) throw error;
+      if (timedOut) throw new AudioClientError('timeout', 'The recording download timed out.');
+      if (controller.signal.aborted) throw new AudioClientError('disposed', 'The recording download was cancelled.');
+      throw new AudioClientError('network', 'The recording could not be downloaded.');
+    } finally {
+      clearTimeout(timeout);
+      if (activeReadController === controller) activeReadController = undefined;
+      activeRead = false;
+    }
+  }
+
   return Object.freeze({
     uploadClip: sendUpload,
     inspectUpload,
     listUploads,
+    downloadMedia,
     getPendingUpload: () => pending,
     dispose: () => { if (disposed) return; disposed = true; generation += 1; activeController?.abort(); activeController = undefined;
       activeReadController?.abort(); activeReadController = undefined; activeRead = false; activeWrite = false; pending = undefined; },

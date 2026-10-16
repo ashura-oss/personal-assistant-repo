@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer as createNetServer } from 'node:net';
+import { request as createNetRequest } from 'node:http';
 import test from 'node:test';
 import { AuthService } from '../dist/auth.js';
 import { createDurableKernel } from '../dist/kernel.js';
@@ -33,7 +34,8 @@ async function freePort() {
   throw new Error('unable_to_allocate_fetch_compatible_port');
 }
 
-async function fixture({ withWorkspaceApi = true, wrapWorkspaceApi, withAudioApi = false, exposeAudioHistory = false, gateAudioSource = false } = {}) {
+async function fixture({ withWorkspaceApi = true, wrapWorkspaceApi, withAudioApi = false, exposeAudioHistory = false, gateAudioSource = false,
+  seedState } = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'still-workspace-http-'));
   const staticRoot = join(directory, 'public');
   mkdirSync(join(staticRoot, 'assets'), { recursive: true });
@@ -47,6 +49,7 @@ async function fixture({ withWorkspaceApi = true, wrapWorkspaceApi, withAudioApi
   const kernel = createDurableKernel({ databasePath: join(directory, 'workspace.sqlite'), now: () => now,
     validateSnapshot: (value) => assert.ok(value && typeof value === 'object' && !Array.isArray(value)) });
   const state = createInitialWorkspaceState(randomUUID);
+  seedState?.(state);
   state.tasks.push({ id: 'legacy opaque task', title: 'Inbox task', body: '', status: 'open', createdAt: '2026-10-14T00:00:00.000Z',
     importOrigin: { kind: 'backup_import', archiveId: randomUUID(), sourceTaskId: 'legacy opaque task' } });
   const auth = new AuthService(kernel, { canonicalOrigin, allowLocalHttp: true, authSecret, now: () => now });
@@ -56,6 +59,7 @@ async function fixture({ withWorkspaceApi = true, wrapWorkspaceApi, withAudioApi
   let runtime;
   let attachedMedia;
   let audioUploadId;
+  const audioDownloadRequests = [];
   const audioSourceStarted = deferred();
   const releaseAudioSource = deferred();
   const audioRepository = withAudioApi ? new PrivateAudioRepository({ kernel, actorSessionToken: runtimeSession,
@@ -82,6 +86,7 @@ async function fixture({ withWorkspaceApi = true, wrapWorkspaceApi, withAudioApi
     },
     async inspectUpload(_admission, uploadId) { return projectAudioReceipt(audioRepository.inspectCaptureUpload(uploadId)); },
     async openMedia(admission, mediaId, input) {
+      audioDownloadRequests.push(input.download === true);
       if (!audioUploadId) throw new Error('audio_unavailable');
       const receipt = audioRepository.inspectCaptureUpload(audioUploadId);
       const noteId = receipt.status === 'consumed' && receipt.consumption?.noteId;
@@ -140,6 +145,7 @@ async function fixture({ withWorkspaceApi = true, wrapWorkspaceApi, withAudioApi
   await new Promise((resolve, reject) => server.listen(port, '127.0.0.1', (error) => error ? reject(error) : resolve()));
   const request = (path, init = {}) => fetch(`${canonicalOrigin}${path}`, init);
   return { directory, canonicalOrigin, enrolled, kernel, auth, runtime, server, request, workspaceApi, audioRepository,
+    audioDownloadRequests,
     audioSourceStarted: audioSourceStarted.promise, releaseAudioSource: () => releaseAudioSource.resolve(),
     setTime(value) { now = value; },
     async close() {
@@ -234,6 +240,205 @@ test('authenticated workspace snapshot, refresh, command dispatch, and receipt i
     const refreshedResponse = await f.request('/api/workspace/refresh', { method: 'POST', headers: mutationHeaders(f, auth), body: '{}' });
     assert.equal(refreshedResponse.status, 200);
     assert.equal((await refreshedResponse.json()).state.tasks[0].status, 'completed');
+  } finally { await f.close(); }
+});
+
+test('portable backup routes require authenticated same-origin access and preserve an exact lost-ack import receipt', async () => {
+  let loseImportAck = true;
+  let importAdmissions = 0;
+  const f = await fixture({ wrapWorkspaceApi(api) {
+    return { ...api, async dispatchCommand(admission, envelope) {
+      const result = await api.dispatchCommand(admission, envelope);
+      if (envelope?.command?.kind === 'backup.import.apply') {
+        importAdmissions += 1;
+        if (loseImportAck) { loseImportAck = false; throw new Error('synthetic backup acknowledgement loss'); }
+      }
+      return result;
+    } };
+  } });
+  try {
+    assert.equal((await f.request('/api/workspace/backup/export?expectedRevision=0&expectedPrivacyEpoch=0')).status, 401);
+    const auth = await login(f);
+    const initial = await (await f.request('/api/workspace/snapshot', { headers: { Cookie: auth.cookie } })).json();
+    const exportResponse = await f.request(`/api/workspace/backup/export?expectedRevision=${initial.revision}&expectedPrivacyEpoch=${initial.privacyEpoch}`,
+      { headers: { Cookie: auth.cookie } });
+    assert.equal(exportResponse.status, 200);
+    assert.match(exportResponse.headers.get('content-disposition') ?? '', /^attachment; filename="still-backup\.json"$/);
+    assert.equal(exportResponse.headers.get('cache-control'), 'no-store');
+    const backupBytes = Buffer.from(await exportResponse.arrayBuffer());
+    assert.doesNotThrow(() => JSON.parse(backupBytes.toString('utf8')));
+
+    const previewPath = `/api/workspace/backup/import/preview?expectedRevision=${initial.revision}&expectedPrivacyEpoch=${initial.privacyEpoch}`;
+    const denied = await f.request(previewPath, { method: 'POST', headers: { Cookie: auth.cookie, Origin: f.canonicalOrigin,
+      'Content-Type': 'application/json' }, body: backupBytes });
+    assert.equal(denied.status, 403, 'mutation requires the authenticated browser CSRF token');
+    const wrongType = await f.request(previewPath, { method: 'POST', headers: { ...mutationHeaders(f, auth), 'Content-Type': 'text/plain' }, body: backupBytes });
+    assert.equal(wrongType.status, 415);
+    const invalidUtf8 = await f.request(previewPath, { method: 'POST', headers: mutationHeaders(f, auth), body: Buffer.from([0xff, 0xfe]) });
+    assert.equal(invalidUtf8.status, 400);
+    const extraQuery = await f.request(`${previewPath}&unexpected=1`, { method: 'POST', headers: mutationHeaders(f, auth), body: backupBytes });
+    assert.equal(extraQuery.status, 400);
+
+    const previewResponse = await f.request(previewPath, { method: 'POST', headers: mutationHeaders(f, auth), body: backupBytes });
+    assert.equal(previewResponse.status, 200);
+    assert.equal(previewResponse.headers.get('cache-control'), 'no-store');
+    const preview = await previewResponse.json();
+    assert.equal(preview.schemaVersion, 1);
+    assert.equal(preview.workspaceId, f.enrolled.workspaceId);
+    assert.equal(preview.privacyEpoch, initial.privacyEpoch);
+    assert.ok(preview.preview?.sessionId && preview.preview?.planHash);
+
+    const commandId = randomUUID();
+    const command = { schemaVersion: 1, commandId, expectedRevision: preview.revision, expectedPrivacyEpoch: preview.privacyEpoch,
+      command: { kind: 'backup.import.apply', sessionId: preview.preview.sessionId, planHash: preview.preview.planHash } };
+    const headers = { ...mutationHeaders(f, auth), 'X-Still-Command': commandId };
+    const lostAck = await f.request('/api/workspace/commands', { method: 'POST', headers, body: JSON.stringify(command) });
+    assert.equal(lostAck.status, 503, 'the test loses only the response after the real command transaction commits');
+    assert.deepEqual(await lostAck.json(), { error: 'service_unavailable' });
+    assert.equal(importAdmissions, 1);
+
+    const inspectedResponse = await f.request(`/api/workspace/commands/${commandId}`, { headers: { Cookie: auth.cookie } });
+    assert.equal(inspectedResponse.status, 200);
+    const inspected = await inspectedResponse.json();
+    assert.equal(inspected.status, 'finished');
+    assert.equal(inspected.receipt.kind, 'backup.import.apply');
+    assert.equal(inspected.receipt.commandId, commandId);
+    assert.equal(inspected.receipt.imported, true);
+
+    const exactRetry = await f.request('/api/workspace/commands', { method: 'POST', headers, body: JSON.stringify(command) });
+    assert.equal(exactRetry.status, 200);
+    const replay = await exactRetry.json();
+    assert.deepEqual(replay.receipt, inspected.receipt);
+    const currentSnapshot = await (await f.request('/api/workspace/snapshot', { headers: { Cookie: auth.cookie } })).json();
+    assert.equal(currentSnapshot.state.importedBackups.filter((archive) => archive.id === inspected.receipt.archiveId).length, 1,
+      'journal replay returns the stored archive receipt without creating a duplicate archive');
+    assert.equal(importAdmissions, 2, 'the duplicate HTTP request is admitted for receipt replay but does not rerun the underlying import mutation');
+  } finally { await f.close(); }
+});
+
+test('a held backup preview body is rejected after its authenticated session logs out', async () => {
+  let prepareCalls = 0;
+  const f = await fixture({ wrapWorkspaceApi(api) {
+    return { ...api, async preparePortableBackupImport(...args) { prepareCalls += 1; return api.preparePortableBackupImport(...args); } };
+  } });
+  let markBodyStarted;
+  const bodyStarted = new Promise((resolve) => { markBodyStarted = resolve; });
+  let pendingResponse;
+  try {
+    const auth = await login(f);
+    const snapshot = await (await f.request('/api/workspace/snapshot', { headers: { Cookie: auth.cookie } })).json();
+    const bytes = new TextEncoder().encode('{"format":"still-backup-v5"}');
+    const path = `/api/workspace/backup/import/preview?expectedRevision=${snapshot.revision}&expectedPrivacyEpoch=${snapshot.privacyEpoch}`;
+    let observeRequest;
+    const routeStarted = new Promise((resolve) => { observeRequest = resolve; });
+    const onRequest = (request) => {
+      if (request.url?.startsWith('/api/workspace/backup/import/preview')) {
+        request.once('data', () => markBodyStarted());
+        observeRequest();
+      }
+    };
+    f.server.on('request', onRequest);
+    const responsePromise = new Promise((resolve, reject) => {
+      const outgoing = createNetRequest(`${f.canonicalOrigin}${path}`, { method: 'POST', headers: {
+        ...mutationHeaders(f, auth), 'Content-Length': String(bytes.byteLength),
+      } }, (response) => {
+        const chunks = [];
+        response.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+        response.on('end', () => resolve({ status: response.statusCode, body: Buffer.concat(chunks).toString('utf8') }));
+      });
+      outgoing.on('error', reject);
+      outgoing.write(bytes.subarray(0, 8));
+      pendingResponse = outgoing;
+    });
+    let timeout;
+    try { await Promise.race([routeStarted, bodyStarted, new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('backup body was not read')), 5000); })]); }
+    finally { if (timeout) clearTimeout(timeout); f.server.off('request', onRequest); }
+    await bodyStarted;
+    const logout = await f.request('/auth/logout', { method: 'POST', headers: mutationHeaders(f, auth), body: '{}' });
+    assert.equal(logout.status, 200, await logout.clone().text());
+    pendingResponse.write(bytes.subarray(8));
+    pendingResponse.end();
+    const response = await responsePromise;
+    assert.equal(response.status, 401, response.body);
+    assert.equal(prepareCalls, 0, 'the body is not allowed to create a private preview after logout');
+  } finally { pendingResponse?.destroy(); await f.close(); }
+});
+
+test('portable backup archive document, UUIDv7 knowledge, and imported chat actions use exact journaled commands', async () => {
+  const sourceEntityId = '018f47f6-6c2a-7abc-8def-123456789abc';
+  const sourceStamp = '2026-10-15T00:00:00.000Z';
+  const narrative = 'Portable source narrative.';
+  const f = await fixture({ seedState(state) {
+    state.knowledge.people.push({ id: sourceEntityId, revision: 1, name: 'UUID v7 source', aliases: [],
+      narrativePath: `people/${sourceEntityId}.md`, createdAt: sourceStamp, updatedAt: sourceStamp, facts: [], contacts: [], sourceLinks: [] });
+    state.documents.push({ path: `people/${sourceEntityId}.md`, content: narrative, revision: 1, updatedAt: sourceStamp });
+  } });
+  try {
+    const auth = await login(f);
+    let current = await (await f.request('/api/workspace/snapshot', { headers: { Cookie: auth.cookie } })).json();
+    const sendCommand = async (command) => {
+      const commandId = randomUUID();
+      const response = await f.request('/api/workspace/commands', { method: 'POST',
+        headers: { ...mutationHeaders(f, auth), 'X-Still-Command': commandId },
+        body: JSON.stringify({ schemaVersion: 1, commandId, expectedRevision: current.revision,
+          expectedPrivacyEpoch: current.privacyEpoch, command }) });
+      assert.equal(response.status, 200, await response.clone().text());
+      const result = await response.json();
+      assert.equal(result.status, 'finished');
+      assert.equal(result.receipt.commandId, commandId);
+      current = result.snapshot;
+      return result;
+    };
+
+    const sourceDocument = await sendCommand({ kind: 'documents.save', path: 'memory/portable-source.md', content: '# Portable source', expectedRevision: null });
+    assert.equal(sourceDocument.receipt.kind, 'documents.save');
+    await sendCommand({ kind: 'chat.create', title: 'Imported review history' });
+
+    const exported = await f.request(`/api/workspace/backup/export?expectedRevision=${current.revision}&expectedPrivacyEpoch=${current.privacyEpoch}`,
+      { headers: { Cookie: auth.cookie } });
+    assert.equal(exported.status, 200, await exported.clone().text());
+    const bytes = Buffer.from(await exported.arrayBuffer());
+    const parsedBackup = JSON.parse(bytes.toString('utf8'));
+    assert.ok(parsedBackup.knowledge.state.people.some((entry) => entry.id === sourceEntityId));
+    assert.ok(parsedBackup.documents.some((entry) => entry.path === 'memory/portable-source.md'));
+    assert.ok(parsedBackup.chatHistory.conversations.length > 0);
+
+    const preview = await f.request(`/api/workspace/backup/import/preview?expectedRevision=${current.revision}&expectedPrivacyEpoch=${current.privacyEpoch}`,
+      { method: 'POST', headers: mutationHeaders(f, auth), body: bytes });
+    assert.equal(preview.status, 200, await preview.clone().text());
+    const prepared = await preview.json();
+    const imported = await sendCommand({ kind: 'backup.import.apply', sessionId: prepared.preview.sessionId, planHash: prepared.preview.planHash });
+    const archiveId = imported.receipt.archiveId;
+    const archive = current.state.importedBackups.find((item) => item.id === archiveId);
+    assert.ok(archive);
+    const cohort = archive.archivedKnowledge.find((item) => item.knowledge.state.people.some((person) => person.id === sourceEntityId));
+    assert.ok(cohort, 'the source UUIDv7 entity remains inert in the imported archive until explicitly activated');
+
+    const activationPreviewResponse = await f.request('/api/workspace/backup/knowledge/preview', { method: 'POST',
+      headers: mutationHeaders(f, auth), body: JSON.stringify({ archiveId, cohortId: cohort.id, kind: 'person', entityId: sourceEntityId,
+        expectedRevision: current.revision, expectedPrivacyEpoch: current.privacyEpoch }) });
+    assert.equal(activationPreviewResponse.status, 200, await activationPreviewResponse.clone().text());
+    const activation = await activationPreviewResponse.json();
+    assert.equal(activation.preview.sourceEntityId, sourceEntityId);
+    const activated = await sendCommand({ kind: 'backup.knowledge.activate', sessionId: activation.preview.sessionId,
+      planHash: activation.preview.planHash });
+    assert.equal(activated.receipt.kind, 'backup.knowledge.activate');
+    assert.ok(current.state.knowledge.people.some((item) => item.id === activated.receipt.objectId &&
+      item.importOrigin?.sourceEntityId === sourceEntityId));
+
+    const archivedDocument = current.state.importedBackups.find((item) => item.id === archiveId)?.documents.find((item) => item.path === 'memory/portable-source.md');
+    assert.ok(archivedDocument);
+    const documentDigest = createHash('sha256').update(archivedDocument.content, 'utf8').digest('hex');
+    const documentActivation = await sendCommand({ kind: 'backup.document.activate', archiveId, documentId: archivedDocument.id,
+      destinationPath: 'memory/activated-copy.md', contentDigest: documentDigest, replaceConfirmed: false });
+    assert.equal(documentActivation.receipt.kind, 'backup.document.activate');
+    assert.equal(current.state.documents.find((item) => item.path === 'memory/activated-copy.md')?.content, archivedDocument.content);
+
+    const importedConversation = current.state.importedBackups.find((item) => item.id === archiveId)?.chatHistory?.[0];
+    assert.ok(importedConversation);
+    const deleted = await sendCommand({ kind: 'backup.chat.delete', archiveId, conversationId: importedConversation.id });
+    assert.equal(deleted.receipt.kind, 'backup.chat.delete');
+    assert.equal(current.state.importedBackups.find((item) => item.id === archiveId)?.chatHistory?.length, 0);
   } finally { await f.close(); }
 });
 
@@ -422,6 +627,10 @@ test('authenticated raw audio upload, inspect, adoption and range playback use t
     assert.equal(head.status, 206);
     assert.equal(head.headers.get('content-length'), '4');
     assert.equal((await head.arrayBuffer()).byteLength, 0);
+    const downloaded = await f.request(`/api/audio/${rawMediaId}?download=1`, { headers: { Cookie: auth.cookie } });
+    assert.equal(downloaded.status, 200, await downloaded.clone().text());
+    assert.equal(f.audioDownloadRequests.at(-1), true, 'the authenticated HTTP route forwards download mode to its private owner');
+    assert.deepEqual(Buffer.from(await downloaded.arrayBuffer()), bytes);
     assert.equal((await f.request(`/api/audio/${rawMediaId}`)).status, 401);
   } finally { await f.close(); }
 });

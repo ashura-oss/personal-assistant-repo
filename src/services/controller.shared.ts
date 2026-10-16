@@ -1597,6 +1597,8 @@ class MailReplyContextRefreshRequiredError extends Error {
 
 export interface ControllerRuntimePorts {
   store: StateStore; crypto: ControllerCryptoPort;
+  /** Private storage-owner bound; defaults to the core saved-state limit on local platforms. */
+  persistedSnapshotMaxBytes?: number;
   providers: { speech: ControllerSpeechPort; speechOpenRouter?: OpenRouterSpeechAdapterPort; openAi: AssistantModelClient };
   speechCleanup?: ControllerSpeechCleanupPort;
   integration: ControllerIntegrationDependencies & { reminderBackend: NotificationBackend; mailAlertBackend: MailAlertNotificationBackend; deviceCalendarBackend: DeviceCalendarBackend; writeDocument(path: string, content: string): Promise<void>; removeAudio(uri: string): Promise<void>; loadRecordingRecovery(): Promise<RecordingRecoveryService>; bindRecordingRecovery(service: RecordingRecoveryService): RecordingRecoveryService };
@@ -1654,6 +1656,7 @@ export class AppControllerImpl implements AppController {
     return new OpenRouterBatchRequestBuilder((value) => this.crypto.sha256(value));
   }
   private readonly store: StateStore;
+  private readonly persistedSnapshotMaxBytes: number;
   private readonly integration: ControllerRuntimePorts['integration'];
   private readonly pendingCapture?: PendingCaptureControllerPort;
   private readonly speechCleanup?: ControllerSpeechCleanupPort;
@@ -1802,7 +1805,10 @@ export class AppControllerImpl implements AppController {
   private readonly deviceCalendarBackend: DeviceCalendarBackend;
 
   constructor(ports: ControllerRuntimePorts) {
-    this.store = ports.store; this.crypto = ports.crypto; this.integration = ports.integration; this.pendingCapture = ports.pendingCapture; this.speechCleanup = ports.speechCleanup;
+    const persistedSnapshotMaxBytes = ports.persistedSnapshotMaxBytes ?? STATE_SNAPSHOT_READ_MAX_BYTES;
+    if (!Number.isSafeInteger(persistedSnapshotMaxBytes) || persistedSnapshotMaxBytes <= 0) throw new TypeError('invalid_persisted_snapshot_limit');
+    this.store = ports.store; this.persistedSnapshotMaxBytes = persistedSnapshotMaxBytes;
+    this.crypto = ports.crypto; this.integration = ports.integration; this.pendingCapture = ports.pendingCapture; this.speechCleanup = ports.speechCleanup;
     this.state = initialState(this.newId); this.snapshot = deepFreeze(clone(this.state));
     this.speechClient = ports.providers.speech; this.openRouterSpeechAdapter = ports.providers.speechOpenRouter ?? ports.integration.openRouterSpeechAdapter;
     this.openAiClient = new AssistantClientRouter(ports.providers.openAi);
@@ -14245,16 +14251,131 @@ export class AppControllerImpl implements AppController {
       chatConversationCount: summary.chatConversationCount,
       chatTurnCount: summary.chatTurnCount,
       alreadyImported: Boolean(existingArchive),
+      prospectivePersistedBytes: 0,
+      withinPersistedSnapshotLimit: false,
     };
-    this.backupImportSessions.set(sessionId, {
+    const session: BackupImportSession = {
       preview, backup, capturedState: capturedSnapshot, capturedStateJson, preparedAtMs, archiveId,
       existingArchiveId: existingArchive?.id, noteIds, taskIds, taskLinkRepairs,
       missingNoteSourceIds: missingNotes.map((item) => item.sourceId), missingTaskSourceIds: missingTasks.map((item) => item.sourceId),
       documentIds, historyIds,
       knowledgeCohortIds, knowledgeCohorts,
       chatHistory,
-    });
+    };
+    const candidate = this.materializeBackupImportCandidate(clone(capturedSnapshot), session);
+    preview.prospectivePersistedBytes = candidate.persistedBytes;
+    preview.withinPersistedSnapshotLimit = candidate.persistedBytes <= this.persistedSnapshotMaxBytes;
+    this.backupImportSessions.set(sessionId, session);
     return clone(preview);
+  }
+
+  private materializeBackupImportCandidate(state: AppState, session: BackupImportSession): {
+    changed: boolean; result: ImportedBackupArchive; persistedBytes: number;
+  } {
+    const alreadyImported = (session.existingArchiveId ? state.importedBackups.find((item) => item.id === session.existingArchiveId) : undefined) ??
+      state.importedBackups.find((item) => item.contentHash === session.preview.contentHash);
+    const complete = Boolean(alreadyImported && session.backup.notes.every((item) => {
+      const link = alreadyImported.noteLinks.find((candidate) => candidate.sourceId === item.sourceId);
+      const note = link && state.notes.find((candidate) => candidate.id === link.noteId);
+      return Boolean(note && note.importOrigin?.kind === 'backup_import' && note.importOrigin.archiveId === alreadyImported.id && note.importOrigin.sourceNoteId === item.sourceId);
+    }) && session.backup.tasks.every((item) => {
+      const link = alreadyImported.taskLinks.find((candidate) => candidate.sourceId === item.sourceId);
+      const task = link && state.tasks.find((candidate) => candidate.id === link.taskId);
+      return Boolean(task && task.importOrigin?.kind === 'backup_import' && task.importOrigin.archiveId === alreadyImported.id && task.importOrigin.sourceTaskId === item.sourceId);
+    }) && session.knowledgeCohorts.every((cohort) => alreadyImported.archivedKnowledge?.some((item) => item.sourceId === cohort.sourceId)));
+    const chatHistoryAlreadyPresent = Boolean(alreadyImported && stableJson(alreadyImported.chatHistory ?? []) === stableJson(session.chatHistory));
+    if (complete && chatHistoryAlreadyPresent) {
+      const persisted = JSON.stringify(this.persistedStateWithBatchLedger(state));
+      const persistedBytes = new TextEncoder().encode(persisted).byteLength;
+      return { changed: false, result: alreadyImported!, persistedBytes };
+    }
+    if (stableJson(this.publicState(state)) !== session.capturedStateJson || this.snapshot !== session.capturedState) {
+      throw new Error('App data changed after the backup preview. Prepare a new preview before restoring.');
+    }
+    if (!alreadyImported && state.importedBackups.length + this.backupImportQuarantine.length >= 50) {
+      throw new Error('The imported archive limit is 50. Export your existing backups or resolve the backup recovery issue before importing another.');
+    }
+    const backup = session.backup;
+    const currentArchive = alreadyImported;
+    const noteLinks = currentArchive ? [...currentArchive.noteLinks] : [];
+    for (const item of backup.notes) if (!noteLinks.some((link) => link.sourceId === item.sourceId)) noteLinks.push({ sourceId: item.sourceId, noteId: session.noteIds[item.sourceId] });
+    for (const item of backup.notes) {
+      const existingLink = noteLinks.find((link) => link.sourceId === item.sourceId)!;
+      if (session.missingNoteSourceIds.includes(item.sourceId)) existingLink.noteId = session.noteIds[item.sourceId];
+    }
+    const noteIdMap = new Map(noteLinks.map((link) => [link.sourceId, link.noteId]));
+    const notes: Note[] = backup.notes.filter((item) => session.missingNoteSourceIds.includes(item.sourceId)).map((item) => {
+      const originalTimeZoneUnknown = item.originalTimeZoneUnknown === true || !item.captureTimeZone;
+      return {
+        id: session.noteIds[item.sourceId], title: item.title, transcript: item.transcript, durationSeconds: item.durationSeconds,
+        createdAt: item.createdAt, capturedAt: item.capturedAt ?? item.createdAt,
+        captureTimeZone: item.captureTimeZone ?? 'UTC', status: 'recorded', revision: 1,
+        importOrigin: { kind: 'backup_import', archiveId: session.archiveId, sourceNoteId: item.sourceId,
+          audioMissing: item.audioMissing === true, ...(originalTimeZoneUnknown ? { originalTimeZoneUnknown: true as const } : {}) },
+      };
+    });
+    const taskLinks = currentArchive ? [...currentArchive.taskLinks] : [];
+    for (const item of backup.tasks) if (!taskLinks.some((link) => link.sourceId === item.sourceId)) taskLinks.push({ sourceId: item.sourceId, taskId: session.taskIds[item.sourceId] });
+    for (const item of backup.tasks) if (session.missingTaskSourceIds.includes(item.sourceId)) {
+      taskLinks.find((link) => link.sourceId === item.sourceId)!.taskId = session.taskIds[item.sourceId];
+    }
+    const tasks: LocalTask[] = backup.tasks.filter((item) => session.missingTaskSourceIds.includes(item.sourceId)).map((item) => ({
+      id: session.taskIds[item.sourceId], title: item.title, body: item.body, status: item.status, createdAt: item.createdAt,
+      ...(item.completedAt ? { completedAt: item.completedAt } : {}), ...(item.dueAt ? { dueAt: item.dueAt } : {}),
+      ...(item.sourceNoteId && noteIdMap.has(item.sourceNoteId) ? { sourceNoteId: noteIdMap.get(item.sourceNoteId)! } : {}),
+      importOrigin: { kind: 'backup_import', archiveId: session.archiveId, sourceTaskId: item.sourceId,
+        ...(item.unresolvedSourceNoteId || item.sourceNoteId ? { originalSourceNoteId: item.unresolvedSourceNoteId ?? item.sourceNoteId } : {}) },
+    }));
+    const documents = [
+      ...backup.documents.map((item) => ({ ...item, id: session.documentIds[`document:${item.path}`] })),
+      ...backup.archivedDocuments.map((item) => ({ path: item.path, content: item.content, revision: item.revision, updatedAt: item.updatedAt, id: session.documentIds[`archived:${item.sourceId}`] })),
+    ];
+    const history: ImportedBackupArchive['history'] = backup.history.map((item) => ({
+      ...item, id: session.historyIds[item.sourceId], ...(item.sourceNoteId && noteIdMap.has(item.sourceNoteId) ? { localNoteId: noteIdMap.get(item.sourceNoteId)! } : {}),
+    }));
+    const created: ImportedBackupArchive = currentArchive ?? {
+      id: session.archiveId, contentHash: session.preview.contentHash, fileHash: session.preview.fileHash,
+      sourceFormat: session.preview.sourceFormat, exportedAt: backup.exportedAt, importedAt: now(),
+      noteLinks: [], taskLinks: [], documents: [], history: [], ...((session.preview.sourceFormat === PORTABLE_BACKUP_FORMAT || session.preview.sourceFormat === PORTABLE_BACKUP_V5_FORMAT) ? { chatHistory: clone(session.chatHistory) } : {}),
+    };
+    if (currentArchive) {
+      currentArchive.noteLinks = noteLinks;
+      currentArchive.taskLinks = taskLinks;
+      if ((session.preview.sourceFormat === PORTABLE_BACKUP_FORMAT || session.preview.sourceFormat === PORTABLE_BACKUP_V5_FORMAT) &&
+          (currentArchive.sourceFormat === PORTABLE_BACKUP_FORMAT || currentArchive.sourceFormat === PORTABLE_BACKUP_V5_FORMAT) && !currentArchive.chatHistory) {
+        currentArchive.chatHistory = clone(session.chatHistory);
+      }
+    } else {
+      created.noteLinks = noteLinks;
+      created.taskLinks = taskLinks;
+      created.documents = documents;
+      created.history = history;
+    }
+    created.archivedKnowledge ??= [];
+    for (const cohort of session.knowledgeCohorts) if (!created.archivedKnowledge.some((item) => item.sourceId === cohort.sourceId)) {
+      created.archivedKnowledge.push({ id: session.knowledgeCohortIds[cohort.sourceId], sourceId: cohort.sourceId, knowledge: clone(cohort.knowledge) });
+    }
+    const restoredNoteIds = new Set(notes.map((note) => note.id));
+    for (const [sourceTaskId, repair] of Object.entries(session.taskLinkRepairs)) {
+      const item = backup.tasks.find((candidate) => candidate.sourceId === sourceTaskId);
+      const taskLink = taskLinks.find((candidate) => candidate.sourceId === sourceTaskId);
+      const task = taskLink && state.tasks.find((candidate) => candidate.id === taskLink.taskId);
+      const restoredNoteId = noteIdMap.get(repair.sourceNoteId);
+      if (!item || item.sourceNoteId !== repair.sourceNoteId || !task || task.importOrigin?.kind !== 'backup_import' ||
+          task.importOrigin.archiveId !== created.id || task.importOrigin.sourceTaskId !== sourceTaskId || !restoredNoteId || !restoredNoteIds.has(restoredNoteId)) continue;
+      const repairStillSafe = task.sourceNoteId === undefined || (repair.oldNoteId === task.sourceNoteId && !state.notes.some((note) => note.id === repair.oldNoteId));
+      if (repairStillSafe) task.sourceNoteId = restoredNoteId;
+    }
+    state.notes.unshift(...notes);
+    state.tasks.unshift(...tasks);
+    if (!currentArchive) state.importedBackups.push(created);
+    if (notes.length || tasks.length || Object.keys(session.taskLinkRepairs).length || session.knowledgeCohorts.length) {
+      addActivity(state, 'local_action', `Restored ${notes.length} note${notes.length === 1 ? '' : 's'} and ${tasks.length} task${tasks.length === 1 ? '' : 's'} from an imported backup; knowledge entries remain in the inert archive until activated.`, this.newId);
+    }
+    assertPortableBackupFits(state, this.newId);
+    const persisted = JSON.stringify(this.persistedStateWithBatchLedger(state));
+    const persistedBytes = new TextEncoder().encode(persisted).byteLength;
+    return { changed: true, result: created, persistedBytes };
   }
 
   async applyBackupImport(input: { sessionId: string; planHash: string }): Promise<ImportedBackupArchive> {
@@ -14267,107 +14388,11 @@ export class AppControllerImpl implements AppController {
     const archive = await this.mutateIfChanged((state) => {
       const applyTime = Date.now();
       if (applyTime < session.preparedAtMs || applyTime - session.preparedAtMs >= 15 * 60_000) throw new Error('Backup preview expired. Prepare a new preview.');
-      const alreadyImported = (session.existingArchiveId ? state.importedBackups.find((item) => item.id === session.existingArchiveId) : undefined) ?? state.importedBackups.find((item) => item.contentHash === session.preview.contentHash);
-      // A second click on the same plan (or an equivalent preview) is an idempotent no-op
-      // once every linked item is again present with its matching import origin.
-      const complete = Boolean(alreadyImported && session.backup.notes.every((item) => {
-        const link = alreadyImported.noteLinks.find((candidate) => candidate.sourceId === item.sourceId);
-        const note = link && state.notes.find((candidate) => candidate.id === link.noteId);
-        return Boolean(note && note.importOrigin?.kind === 'backup_import' && note.importOrigin.archiveId === alreadyImported.id && note.importOrigin.sourceNoteId === item.sourceId);
-      }) && session.backup.tasks.every((item) => {
-        const link = alreadyImported.taskLinks.find((candidate) => candidate.sourceId === item.sourceId);
-        const task = link && state.tasks.find((candidate) => candidate.id === link.taskId);
-        return Boolean(task && task.importOrigin?.kind === 'backup_import' && task.importOrigin.archiveId === alreadyImported.id && task.importOrigin.sourceTaskId === item.sourceId);
-      }) && session.knowledgeCohorts.every((cohort) => alreadyImported.archivedKnowledge?.some((item) => item.sourceId === cohort.sourceId)));
-      const chatHistoryAlreadyPresent = Boolean(alreadyImported && stableJson(alreadyImported.chatHistory ?? []) === stableJson(session.chatHistory));
-      const completeWithChat = complete && chatHistoryAlreadyPresent;
-      if (completeWithChat) return { changed: false, result: alreadyImported! };
-      if (stableJson(this.publicState(state)) !== session.capturedStateJson) throw new Error('App data changed after the backup preview. Prepare a new preview before restoring.');
-      if (this.snapshot !== session.capturedState) throw new Error('App data changed after the backup preview. Prepare a new preview before restoring.');
-      if (!alreadyImported && state.importedBackups.length + this.backupImportQuarantine.length >= 50) throw new Error('The imported archive limit is 50. Export your existing backups or resolve the backup recovery issue before importing another.');
-      const backup = session.backup;
-      const currentArchive = alreadyImported;
-      const noteLinks = currentArchive ? [...currentArchive.noteLinks] : [];
-      for (const item of backup.notes) if (!noteLinks.some((link) => link.sourceId === item.sourceId)) noteLinks.push({ sourceId: item.sourceId, noteId: session.noteIds[item.sourceId] });
-      for (const item of backup.notes) {
-        const existingLink = noteLinks.find((link) => link.sourceId === item.sourceId)!;
-        if (session.missingNoteSourceIds.includes(item.sourceId)) existingLink.noteId = session.noteIds[item.sourceId];
-      }
-      const noteIdMap = new Map(noteLinks.map((link) => [link.sourceId, link.noteId]));
-      const notes: Note[] = backup.notes.filter((item) => session.missingNoteSourceIds.includes(item.sourceId)).map((item) => {
-        const originalTimeZoneUnknown = item.originalTimeZoneUnknown === true || !item.captureTimeZone;
-        return {
-          id: session.noteIds[item.sourceId], title: item.title, transcript: item.transcript, durationSeconds: item.durationSeconds,
-          createdAt: item.createdAt, capturedAt: item.capturedAt ?? item.createdAt,
-          captureTimeZone: item.captureTimeZone ?? 'UTC', status: 'recorded', revision: 1,
-          importOrigin: { kind: 'backup_import', archiveId: session.archiveId, sourceNoteId: item.sourceId,
-            audioMissing: item.audioMissing === true, ...(originalTimeZoneUnknown ? { originalTimeZoneUnknown: true as const } : {}) },
-        };
-      });
-      const taskLinks = currentArchive ? [...currentArchive.taskLinks] : [];
-      for (const item of backup.tasks) if (!taskLinks.some((link) => link.sourceId === item.sourceId)) taskLinks.push({ sourceId: item.sourceId, taskId: session.taskIds[item.sourceId] });
-      for (const item of backup.tasks) if (session.missingTaskSourceIds.includes(item.sourceId)) {
-        taskLinks.find((link) => link.sourceId === item.sourceId)!.taskId = session.taskIds[item.sourceId];
-      }
-      const tasks: LocalTask[] = backup.tasks.filter((item) => session.missingTaskSourceIds.includes(item.sourceId)).map((item) => ({
-        id: session.taskIds[item.sourceId], title: item.title, body: item.body, status: item.status, createdAt: item.createdAt,
-        ...(item.completedAt ? { completedAt: item.completedAt } : {}), ...(item.dueAt ? { dueAt: item.dueAt } : {}),
-          ...(item.sourceNoteId && noteIdMap.has(item.sourceNoteId) ? { sourceNoteId: noteIdMap.get(item.sourceNoteId)! } : {}),
-        importOrigin: { kind: 'backup_import', archiveId: session.archiveId, sourceTaskId: item.sourceId,
-          ...(item.unresolvedSourceNoteId || item.sourceNoteId ? { originalSourceNoteId: item.unresolvedSourceNoteId ?? item.sourceNoteId } : {}) },
-      }));
-      const documents = [
-        ...backup.documents.map((item) => ({ ...item, id: session.documentIds[`document:${item.path}`] })),
-        ...backup.archivedDocuments.map((item) => ({ path: item.path, content: item.content, revision: item.revision, updatedAt: item.updatedAt, id: session.documentIds[`archived:${item.sourceId}`] })),
-      ];
-      const history: ImportedBackupArchive['history'] = backup.history.map((item) => ({
-        ...item, id: session.historyIds[item.sourceId], ...(item.sourceNoteId && noteIdMap.has(item.sourceNoteId) ? { localNoteId: noteIdMap.get(item.sourceNoteId)! } : {}),
-      }));
-      const created: ImportedBackupArchive = currentArchive ?? {
-        id: session.archiveId, contentHash: session.preview.contentHash, fileHash: session.preview.fileHash,
-        sourceFormat: session.preview.sourceFormat, exportedAt: backup.exportedAt, importedAt: now(),
-        noteLinks: [], taskLinks: [], documents: [], history: [], ...((session.preview.sourceFormat === PORTABLE_BACKUP_FORMAT || session.preview.sourceFormat === PORTABLE_BACKUP_V5_FORMAT) ? { chatHistory: clone(session.chatHistory) } : {}),
-      };
-      if (currentArchive) {
-        currentArchive.noteLinks = noteLinks;
-        currentArchive.taskLinks = taskLinks;
-        if ((session.preview.sourceFormat === PORTABLE_BACKUP_FORMAT || session.preview.sourceFormat === PORTABLE_BACKUP_V5_FORMAT) &&
-            (currentArchive.sourceFormat === PORTABLE_BACKUP_FORMAT || currentArchive.sourceFormat === PORTABLE_BACKUP_V5_FORMAT) && !currentArchive.chatHistory) {
-          currentArchive.chatHistory = clone(session.chatHistory);
-        }
-      } else {
-        created.noteLinks = noteLinks;
-        created.taskLinks = taskLinks;
-        created.documents = documents;
-        created.history = history;
-      }
-      created.archivedKnowledge ??= [];
-      for (const cohort of session.knowledgeCohorts) if (!created.archivedKnowledge.some((item) => item.sourceId === cohort.sourceId)) {
-        created.archivedKnowledge.push({ id: session.knowledgeCohortIds[cohort.sourceId], sourceId: cohort.sourceId, knowledge: clone(cohort.knowledge) });
-      }
-      const restoredNoteIds = new Set(notes.map((note) => note.id));
-      for (const [sourceTaskId, repair] of Object.entries(session.taskLinkRepairs)) {
-        const item = backup.tasks.find((candidate) => candidate.sourceId === sourceTaskId);
-        const taskLink = taskLinks.find((candidate) => candidate.sourceId === sourceTaskId);
-        const task = taskLink && state.tasks.find((candidate) => candidate.id === taskLink.taskId);
-        const restoredNoteId = noteIdMap.get(repair.sourceNoteId);
-        if (!item || item.sourceNoteId !== repair.sourceNoteId || !task || task.importOrigin?.kind !== 'backup_import' ||
-            task.importOrigin.archiveId !== created.id || task.importOrigin.sourceTaskId !== sourceTaskId || !restoredNoteId || !restoredNoteIds.has(restoredNoteId)) continue;
-        const repairStillSafe = task.sourceNoteId === undefined || (repair.oldNoteId === task.sourceNoteId && !state.notes.some((note) => note.id === repair.oldNoteId));
-        if (repairStillSafe) task.sourceNoteId = restoredNoteId;
-      }
-      state.notes.unshift(...notes);
-      state.tasks.unshift(...tasks);
-      if (!currentArchive) state.importedBackups.push(created);
-      if (notes.length || tasks.length || Object.keys(session.taskLinkRepairs).length || session.knowledgeCohorts.length) {
-        addActivity(state, 'local_action', `Restored ${notes.length} note${notes.length === 1 ? '' : 's'} and ${tasks.length} task${tasks.length === 1 ? '' : 's'} from an imported backup; knowledge entries remain in the inert archive until activated.`, this.newId);
-      }
-      assertPortableBackupFits(state, this.newId);
-      const persistedCandidate = JSON.stringify(this.persistedStateWithBatchLedger(state));
-      if (typeof persistedCandidate !== 'string' || recoveryUtf8Bytes(persistedCandidate, STATE_SNAPSHOT_READ_MAX_BYTES) > STATE_SNAPSHOT_READ_MAX_BYTES) {
+      const candidate = this.materializeBackupImportCandidate(state, session);
+      if (candidate.changed && candidate.persistedBytes > this.persistedSnapshotMaxBytes) {
         throw new Error('The complete restored data would exceed the saved-data limit. No backup content was imported.');
       }
-      return { changed: true, result: created };
+      return { changed: candidate.changed, result: candidate.result };
     });
     session.appliedArchiveId = archive.id;
     return archive;

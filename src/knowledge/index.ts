@@ -3,6 +3,7 @@ import type {
   KnowledgeSourceLink, KnowledgeState, KnowledgeSuggestion, Person, Project, ProjectMember,
 } from './types';
 import type { AssistantSourceInput } from '../assistant/types';
+import { isCanonicalKnowledgeId } from '../../server/src/knowledgeId';
 
 export * from './types';
 
@@ -15,7 +16,6 @@ export const KNOWLEDGE_LIMITS = Object.freeze({
   statementBytes: 1_024, goalBytes: 4 * 1_024, labelChars: 120, addressChars: 512,
 });
 
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const CONTROL = /[\u0000-\u001f\u007f]/;
 const INVALID_MULTILINE_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 const encoder = new TextEncoder();
@@ -43,7 +43,7 @@ function id(value: unknown, label: string): string {
   if (!isCanonicalKnowledgeId(value)) fail(`${label} must be a canonical UUID.`);
   return value;
 }
-export function isCanonicalKnowledgeId(value: unknown): value is string { return typeof value === 'string' && UUID.test(value); }
+export { isCanonicalKnowledgeId };
 function revision(value: unknown, label: string): number {
   if (!Number.isSafeInteger(value) || (value as number) < 1) fail(`${label} is invalid.`);
   return value as number;

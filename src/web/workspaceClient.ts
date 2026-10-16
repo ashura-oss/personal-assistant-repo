@@ -1,7 +1,7 @@
 /** Same-origin, receipt-aware transport for the authenticated browser workspace. */
 import type { WorkspaceSnapshotDTO } from '../cloud/workspaceDto';
 import { parseKnowledgeSourceChoicesDTO, parseKnowledgeSuggestionReviewDTO, type KnowledgeSourceChoicesDTO, type KnowledgeSuggestionReviewDTO } from '../cloud/knowledgeHttpContracts';
-import { isCanonicalKnowledgeId } from '../knowledge';
+import { isCanonicalKnowledgeId } from '../../server/src/knowledgeId';
 import {
   parseWorkspaceCommandEnvelope,
   parseWorkspaceCommandId,
@@ -13,7 +13,7 @@ import {
 } from '../cloud/workspaceCommands';
 import type { AuthenticatedSession } from './authClient';
 import { parsePeriodSummaryApplicationPreviewEnvelope, parsePeriodSummaryReadEnvelope, periodSummaryApplicationPreviewPath, periodSummaryResultPath } from '../cloud/periodSummaryHttpContracts';
-import type { PeriodSummaryApplicationPreview, PeriodSummaryResultReview } from '../core';
+import type { BackupImportPreview, ImportedKnowledgeActivationPreview, PeriodSummaryApplicationPreview, PeriodSummaryResultReview } from '../core';
 import { parseWorkspaceCommandHistoryPage, type WorkspaceCommandHistoryEntry, type WorkspaceCommandHistoryKind,
   type WorkspaceCommandHistoryPage } from '../cloud/workspaceCommandHistory';
 import { cloudDispatchReviewPath, cloudMailReadPath, cloudProposalReviewPath, cloudReplyBatchReviewPath,
@@ -27,6 +27,7 @@ import { parseWorkspaceEraseCancellation, parseWorkspaceErasePlan, parseWorkspac
   type WorkspaceEraseCancellation, type WorkspaceErasePlan, type WorkspaceEraseReceipt, type WorkspaceEraseStatus } from '../cloud/workspaceEraseContracts';
 
 export const WORKSPACE_REQUEST_TIMEOUT_MS = 30_000;
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export type WorkspaceClientOptions = Readonly<{
   /** Must recursively validate the complete safe WorkspaceSnapshotDTO projection. */
@@ -57,6 +58,10 @@ export type WorkspaceClient = Readonly<{
   readReplyBatchReview(plan: ReplyBatchPlanRead, expectedRevision: number): Promise<MailReplyBatchReviewReadDto>;
   readPeriodSummaryResult(jobId: string, expectedRevision: number): Promise<PeriodSummaryResultReview>;
   readPeriodSummaryApplicationPreview(planId: string, jobId: string, expectedRevision: number): Promise<PeriodSummaryApplicationPreview>;
+  exportPortableBackup(expectedRevision: number): Promise<Uint8Array>;
+  preparePortableBackupImport(bytes: Uint8Array, expectedRevision: number): Promise<BackupImportPreview>;
+  prepareImportedKnowledgeActivation(input: Readonly<{ archiveId: string; cohortId: string; kind: 'person' | 'project'; entityId: string; expectedRevision: number }>): Promise<ImportedKnowledgeActivationPreview>;
+  cancelImportedKnowledgeActivation(sessionId: string): Promise<void>;
   listBackgroundPolicies(expectedPrivacyEpoch: number, afterPolicyId?: string): Promise<readonly BackgroundPolicyDisplay[]>;
   saveBackgroundPolicy(envelope: SaveBackgroundPolicyEnvelope): Promise<BackgroundPolicyReceipt>;
   pauseBackgroundPolicy(envelope: ChangeBackgroundPolicyEnvelope): Promise<BackgroundPolicyReceipt>;
@@ -102,7 +107,7 @@ export class WorkspaceCommandNotStartedError extends Error {
   constructor(message = 'The command was not sent. Review the workspace and try again.') { super(message); }
 }
 
-type SafeResponse = Pick<Response, 'ok' | 'status' | 'json'>;
+type SafeResponse = Pick<Response, 'ok' | 'status' | 'json'> & Partial<Pick<Response, 'arrayBuffer'>>;
 type FetchLike = (input: string, init: RequestInit) => Promise<SafeResponse>;
 type HeldCommand = Readonly<{ envelope: WorkspaceCommandEnvelope }>;
 type ParsedCommandResponse = Readonly<{
@@ -143,6 +148,79 @@ function fixedHttpMessage(status: number): string {
   if (status === 429) return 'Workspace actions are temporarily limited. Try again later.';
   if (status >= 500 || status === 408 || status === 425) return 'The workspace service is busy. Check the command receipt before continuing.';
   return 'The workspace request could not be completed.';
+}
+
+function plainRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value) &&
+    (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null));
+}
+
+function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const own = Reflect.ownKeys(value);
+  return own.length === keys.length && own.every((key) => typeof key === 'string' && keys.includes(key) &&
+    Object.getOwnPropertyDescriptor(value, key)?.enumerable === true && Object.hasOwn(Object.getOwnPropertyDescriptor(value, key) ?? {}, 'value'));
+}
+
+function parseBackupPreviewEnvelope(value: unknown, expected: { workspaceId: string; privacyEpoch: number; revision: number }): BackupImportPreview {
+  const outerKeys = ['schemaVersion', 'workspaceId', 'privacyEpoch', 'revision', 'preview'] as const;
+  const previewKeys = ['sessionId', 'fileHash', 'contentHash', 'planHash', 'sourceFormat', 'exportedAt', 'noteCount', 'taskCount', 'documentCount',
+    'historyCount', 'chatConversationCount', 'chatTurnCount', 'personCount', 'projectCount', 'knowledgeCohortCount', 'missingAudioCount',
+    'missingNoteCount', 'missingTaskCount', 'missingNoteLabels', 'missingTaskLabels', 'taskLinkRepairCount', 'taskLinkRepairLabels',
+    'documentConflicts', 'warnings', 'ignoredFieldCount', 'alreadyImported', 'prospectivePersistedBytes', 'withinPersistedSnapshotLimit'] as const;
+  if (!plainRecord(value) || !exactKeys(value, outerKeys) || value.schemaVersion !== 1 || value.workspaceId !== expected.workspaceId ||
+      value.privacyEpoch !== expected.privacyEpoch || value.revision !== expected.revision || !plainRecord(value.preview) || !exactKeys(value.preview, previewKeys)) {
+    throw new WorkspaceClientError('malformed', 'The backup preview could not be confirmed.');
+  }
+  const preview = value.preview;
+  const countFields = ['noteCount', 'taskCount', 'documentCount', 'historyCount', 'chatConversationCount', 'chatTurnCount', 'personCount', 'projectCount',
+    'knowledgeCohortCount', 'missingAudioCount', 'missingNoteCount', 'missingTaskCount', 'taskLinkRepairCount', 'ignoredFieldCount', 'prospectivePersistedBytes'] as const;
+  const sourceFormats = ['voice-assistant-export-v1', 'still-backup-v2', 'still-backup-v3', 'still-backup-v4', 'still-backup-v5'];
+  const digest = (item: unknown) => typeof item === 'string' && /^[a-f\d]{64}$/i.test(item);
+  const labels = (item: unknown) => Array.isArray(item) && item.every((label) => typeof label === 'string');
+  if (typeof preview.sessionId !== 'string' || !UUID_V4.test(preview.sessionId) || !digest(preview.fileHash) || !digest(preview.contentHash) || !digest(preview.planHash) ||
+      typeof preview.sourceFormat !== 'string' || !sourceFormats.includes(preview.sourceFormat) || typeof preview.exportedAt !== 'string' ||
+      !Number.isFinite(Date.parse(preview.exportedAt)) || countFields.some((field) => !Number.isSafeInteger(preview[field]) || (preview[field] as number) < 0) ||
+      !labels(preview.missingNoteLabels) || !labels(preview.missingTaskLabels) || !labels(preview.taskLinkRepairLabels) || !labels(preview.warnings) ||
+      !Array.isArray(preview.documentConflicts) || !preview.documentConflicts.every((entry) => plainRecord(entry) &&
+        exactKeys(entry, ['path', 'identical']) && typeof entry.path === 'string' && typeof entry.identical === 'boolean') ||
+      typeof preview.alreadyImported !== 'boolean' || typeof preview.withinPersistedSnapshotLimit !== 'boolean') {
+    throw new WorkspaceClientError('malformed', 'The backup preview could not be confirmed.');
+  }
+  return Object.freeze({ ...preview }) as unknown as BackupImportPreview;
+}
+
+function parseImportedKnowledgePreviewEnvelope(value: unknown, expected: { workspaceId: string; privacyEpoch: number; revision: number;
+  archiveId: string; cohortId: string; kind: 'person' | 'project'; entityId: string }): ImportedKnowledgeActivationPreview {
+  if (!plainRecord(value) || !exactKeys(value, ['schemaVersion', 'workspaceId', 'privacyEpoch', 'revision', 'preview']) || value.schemaVersion !== 1 ||
+      value.workspaceId !== expected.workspaceId || value.privacyEpoch !== expected.privacyEpoch || value.revision !== expected.revision || !plainRecord(value.preview)) {
+    throw new WorkspaceClientError('malformed', 'The imported knowledge preview could not be confirmed.');
+  }
+  const preview = value.preview;
+  const nonnegative = (field: string) => Number.isSafeInteger(preview[field]) && (preview[field] as number) >= 0;
+  const previewKeys = ['sessionId', 'planHash', 'expiresAt', 'archiveId', 'cohortId', 'kind', 'sourceEntityId', 'sourceName', 'sourceEntity',
+    'alreadyActivated', 'targetId', 'narrativePath', 'narrativeContent', 'factCount', 'contactCount', 'sourceLinkCount', 'memberCount',
+    'unavailableProviderReferenceCount', 'unresolvedMemberCount'] as const;
+  const entityKeys = expected.kind === 'person'
+    ? ['id', 'revision', 'name', 'aliases', 'narrativePath', 'createdAt', 'updatedAt', 'archivedAt', 'importOrigin', 'facts', 'sourceLinks', 'contacts']
+    : ['id', 'revision', 'name', 'aliases', 'narrativePath', 'createdAt', 'updatedAt', 'archivedAt', 'importOrigin', 'facts', 'sourceLinks',
+      'status', 'goal', 'startsOn', 'targetOn', 'dateTimeZone', 'members'];
+  const expiresAt = typeof preview.expiresAt === 'string' ? Date.parse(preview.expiresAt) : NaN;
+  const sourceEntity = preview.sourceEntity;
+  const entityKeysValid = plainRecord(sourceEntity) && Reflect.ownKeys(sourceEntity).every((key) => typeof key === 'string' && entityKeys.includes(key)) &&
+    entityKeys.filter((key) => !['archivedAt', 'importOrigin', 'startsOn', 'targetOn', 'dateTimeZone'].includes(key)).every((key) => Object.hasOwn(sourceEntity, key));
+  if (!exactKeys(preview, previewKeys) || preview.archiveId !== expected.archiveId || preview.cohortId !== expected.cohortId || preview.kind !== expected.kind ||
+      preview.sourceEntityId !== expected.entityId || typeof preview.sessionId !== 'string' || !UUID_V4.test(preview.sessionId) ||
+      typeof preview.planHash !== 'string' || !/^[a-f\d]{64}$/i.test(preview.planHash) ||
+      typeof preview.expiresAt !== 'string' || !Number.isFinite(expiresAt) || new Date(expiresAt).toISOString() !== preview.expiresAt || expiresAt <= Date.now() ||
+      !entityKeysValid || sourceEntity.id !== expected.entityId || sourceEntity.name !== preview.sourceName || typeof preview.sourceName !== 'string' ||
+      typeof preview.targetId !== 'string' || !isCanonicalKnowledgeId(preview.targetId) ||
+      preview.narrativePath !== `${expected.kind === 'person' ? 'people' : 'projects'}/${preview.targetId}.md` || typeof preview.narrativeContent !== 'string' ||
+      !Array.isArray(sourceEntity.aliases) || !Array.isArray(sourceEntity.facts) || !Array.isArray(sourceEntity.sourceLinks) ||
+      (expected.kind === 'person' ? !Array.isArray(sourceEntity.contacts) : !Array.isArray(sourceEntity.members)) ||
+      typeof preview.alreadyActivated !== 'boolean' || ['factCount', 'contactCount', 'sourceLinkCount', 'memberCount', 'unavailableProviderReferenceCount', 'unresolvedMemberCount'].some((field) => !nonnegative(field))) {
+    throw new WorkspaceClientError('malformed', 'The imported knowledge preview could not be confirmed.');
+  }
+  return Object.freeze({ ...preview }) as unknown as ImportedKnowledgeActivationPreview;
 }
 
 function statusFromError(error: unknown): number | undefined {
@@ -237,6 +315,29 @@ export function createWebWorkspaceClient(session: AuthenticatedSession, options:
     } finally {
       clearTimeout(timeout);
     }
+  }
+
+  async function requestBinary(path: string, ticket: number): Promise<Uint8Array> {
+    assertOperation(ticket);
+    const controller = new AbortController();
+    cancellationControllers.add(controller);
+    let timedOut = false;
+    let timeoutReject!: (error: Error) => void;
+    const timeoutPromise = new Promise<never>((_, reject) => { timeoutReject = reject; });
+    const timeout = setTimeout(() => { timedOut = true; controller.abort(); timeoutReject(new WorkspaceClientError('timeout', 'The backup export timed out.')); }, timeoutMs);
+    try {
+      const response = await Promise.race([fetcher(path, { method: 'GET', credentials: 'same-origin', redirect: 'error', cache: 'no-store', signal: controller.signal }), timeoutPromise]);
+      assertOperation(ticket);
+      if (!response.ok) throw new WorkspaceClientError('http', fixedHttpMessage(response.status), response.status);
+      if (typeof response.arrayBuffer !== 'function') throw new WorkspaceClientError('malformed', 'The backup file could not be read.');
+      const buffer = await Promise.race([response.arrayBuffer(), timeoutPromise]);
+      assertOperation(ticket);
+      return new Uint8Array(buffer);
+    } catch (error) {
+      if (error instanceof WorkspaceClientError) throw error;
+      if (timedOut) throw new WorkspaceClientError('timeout', 'The backup export timed out.');
+      throw new WorkspaceClientError('network', 'The workspace connection was interrupted.');
+    } finally { clearTimeout(timeout); cancellationControllers.delete(controller); }
   }
 
   function beginOperation(): number {
@@ -363,6 +464,52 @@ export function createWebWorkspaceClient(session: AuthenticatedSession, options:
     return readSavedWorkflow(periodSummaryApplicationPreviewPath(planId, jobId, { expectedRevision, expectedPrivacyEpoch: privacyEpoch }), expectedRevision,
       (raw) => parsePeriodSummaryApplicationPreviewEnvelope(raw, { workspaceId, privacyEpoch, revision: expectedRevision, planId, jobId }).review,
       'Period summary application preview');
+  }
+
+  async function exportPortableBackup(expectedRevision: number): Promise<Uint8Array> {
+    assertSavedReadRevision(expectedRevision);
+    const ticket = beginOperation();
+    return requestBinary(`/api/workspace/backup/export?expectedRevision=${expectedRevision}&expectedPrivacyEpoch=${privacyEpoch}`, ticket);
+  }
+
+  async function preparePortableBackupImport(bytes: Uint8Array, expectedRevision: number): Promise<BackupImportPreview> {
+    assertSavedReadRevision(expectedRevision);
+    if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0 || bytes.byteLength > 32 * 1024 * 1024) {
+      throw new WorkspaceClientError('malformed', 'Choose a supported backup file no larger than 32 MiB.');
+    }
+    const ticket = beginOperation();
+    const frozenBytes = new Uint8Array(bytes);
+    const raw = await request(`/api/workspace/backup/import/preview?expectedRevision=${expectedRevision}&expectedPrivacyEpoch=${privacyEpoch}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json; charset=utf-8', 'X-Still-CSRF': session.csrfToken }, body: frozenBytes,
+    }, ticket);
+    assertOperation(ticket);
+    return parseBackupPreviewEnvelope(raw, { workspaceId, privacyEpoch, revision: expectedRevision });
+  }
+
+  async function prepareImportedKnowledgeActivation(input: Readonly<{ archiveId: string; cohortId: string; kind: 'person' | 'project'; entityId: string; expectedRevision: number }>): Promise<ImportedKnowledgeActivationPreview> {
+    assertSavedReadRevision(input.expectedRevision);
+    if (!UUID_V4.test(input.archiveId) || !UUID_V4.test(input.cohortId) || !isCanonicalKnowledgeId(input.entityId) ||
+        (input.kind !== 'person' && input.kind !== 'project')) throw new WorkspaceClientError('malformed', 'Select a valid archived knowledge item.');
+    const ticket = beginOperation();
+    const raw = await request('/api/workspace/backup/knowledge/preview', { method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Still-CSRF': session.csrfToken },
+      body: JSON.stringify({ ...input, expectedPrivacyEpoch: privacyEpoch }) }, ticket);
+    assertOperation(ticket);
+    return parseImportedKnowledgePreviewEnvelope(raw, { workspaceId, privacyEpoch, revision: input.expectedRevision,
+      archiveId: input.archiveId, cohortId: input.cohortId, kind: input.kind, entityId: input.entityId });
+  }
+
+  async function cancelImportedKnowledgeActivation(sessionId: string): Promise<void> {
+    const current = snapshot;
+    if (!current || current.workspaceId !== workspaceId || current.privacyEpoch !== privacyEpoch || !UUID_V4.test(sessionId)) return;
+    const ticket = beginOperation();
+    const raw = await request('/api/workspace/backup/knowledge/cancel', { method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Still-CSRF': session.csrfToken },
+      body: JSON.stringify({ sessionId, expectedRevision: current.revision, expectedPrivacyEpoch: privacyEpoch }) }, ticket);
+    assertOperation(ticket);
+    if (!plainRecord(raw) || !exactKeys(raw, ['schemaVersion', 'status']) || raw.schemaVersion !== 1 || raw.status !== 'cancelled') {
+      throw new WorkspaceClientError('malformed', 'The imported knowledge preview cancellation could not be confirmed.');
+    }
   }
 
   async function listBackgroundPolicies(expectedPrivacyEpoch: number, afterPolicyId?: string): Promise<readonly BackgroundPolicyDisplay[]> {
@@ -799,6 +946,10 @@ export function createWebWorkspaceClient(session: AuthenticatedSession, options:
     readReplyBatchReview,
     readPeriodSummaryResult,
     readPeriodSummaryApplicationPreview,
+    exportPortableBackup,
+    preparePortableBackupImport,
+    prepareImportedKnowledgeActivation,
+    cancelImportedKnowledgeActivation,
     listBackgroundPolicies,
     saveBackgroundPolicy,
     pauseBackgroundPolicy,
@@ -830,6 +981,13 @@ export function createWebWorkspaceClient(session: AuthenticatedSession, options:
 function expectedReceiptFor(envelope: WorkspaceCommandEnvelope) {
   const { command } = envelope;
   switch (command.kind) {
+    case 'backup.import.apply': case 'backup.knowledge.activate':
+      return { commandId: envelope.commandId, kind: command.kind };
+    case 'backup.document.activate':
+      return { commandId: envelope.commandId, kind: command.kind, objectId: command.destinationPath, archiveId: command.archiveId, documentId: command.documentId };
+    case 'backup.chat.delete':
+      return { commandId: envelope.commandId, kind: command.kind, objectId: command.conversationId, archiveId: command.archiveId,
+        conversationId: command.conversationId };
     case 'settings.update':
       return { commandId: envelope.commandId, kind: command.kind, objectId: 'workspace-settings' };
     case 'tasks.complete': case 'tasks.reopen':

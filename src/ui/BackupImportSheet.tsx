@@ -43,6 +43,10 @@ export function BackupImportSheet({
     visibleRef.current = visible;
     if (!visible) {
       sequence.current += 1;
+      setPreview(null);
+      setFileName("");
+      setSelecting(false);
+      setApplying(false);
     }
   }, [visible]);
 
@@ -87,7 +91,7 @@ export function BackupImportSheet({
     const prepared = preview;
     const missingNotes = prepared.alreadyImported ? prepared.missingNoteCount : prepared.noteCount;
     const missingTasks = prepared.alreadyImported ? prepared.missingTaskCount : prepared.taskCount;
-    const restorable = missingNotes > 0 || missingTasks > 0;
+    const restorable = missingNotes > 0 || missingTasks > 0 || prepared.taskLinkRepairCount > 0;
     if (prepared.alreadyImported && !restorable) return;
     const request = sequence.current;
     setApplying(true);
@@ -132,7 +136,7 @@ export function BackupImportSheet({
 
           {complete ? (
             <View style={styles.card}>
-              <Text style={styles.cardTitle}>{complete.restored ? "Missing content restored" : "Backup added"}</Text>
+              <Text style={styles.cardTitle}>{complete.restored ? "Backup repair applied" : "Backup added"}</Text>
               <Text style={styles.body}>{complete.restored ? "Restored" : "Added"} {complete.notes} note{complete.notes === 1 ? "" : "s"} and {complete.tasks} task{complete.tasks === 1 ? "" : "s"}. Existing notes, tasks, documents, archives, and settings were kept. Imported Chat history, if present, remains read-only.</Text>
               {complete.taskLinksRepaired ? <Text style={styles.body}>{complete.taskLinksRepaired} imported task source link{complete.taskLinksRepaired === 1 ? " was" : "s were"} repaired.</Text> : null}
               {(complete.archive.archivedKnowledge?.length ?? 0) > 0 ? <Text style={styles.body}>{complete.archive.archivedKnowledge!.length} knowledge cohort{complete.archive.archivedKnowledge!.length === 1 ? " remains" : "s remain"} archived. Review in Library → Memory to activate separate copies.</Text> : null}
@@ -155,7 +159,7 @@ export function BackupImportSheet({
               {fileName ? <Text style={styles.caption}>Selected file · {fileName}</Text> : null}
               {preview ? (
                 <View style={styles.card}>
-                  <Text style={styles.cardTitle}>{preview.sourceFormat === "voice-assistant-export-v1" ? "Legacy export · v1" : preview.sourceFormat === "still-backup-v2" ? "Still backup · v2" : preview.sourceFormat === "still-backup-v3" ? "Still backup · v3" : "Unknown backup version"}</Text>
+                  <Text style={styles.cardTitle}>{preview.sourceFormat === "voice-assistant-export-v1" ? "Legacy export · v1" : preview.sourceFormat === "still-backup-v2" ? "Still backup · v2" : preview.sourceFormat === "still-backup-v3" ? "Still backup · v3" : preview.sourceFormat === "still-backup-v4" ? "Still backup · v4" : preview.sourceFormat === "still-backup-v5" ? "Still backup · v5" : "Unknown backup version"}</Text>
                   <Text style={styles.caption}>Exported {new Date(preview.exportedAt).toLocaleString()}</Text>
                   <View style={styles.counts}>
                     <Text style={styles.count}>{preview.noteCount} notes</Text>
@@ -178,6 +182,10 @@ export function BackupImportSheet({
                   ) : null}
                   {preview.warnings.map((warning, index) => <Text key={`${index}-${warning}`} style={styles.caption}>{warning}</Text>)}
                   {preview.ignoredFieldCount ? <Text style={styles.caption}>{preview.ignoredFieldCount} legacy authority or unsupported field{preview.ignoredFieldCount === 1 ? " was" : "s were"} ignored.</Text> : null}
+                  <Text style={preview.withinPersistedSnapshotLimit ? styles.caption : styles.warning}>
+                    The complete saved workspace after this import would use {preview.prospectivePersistedBytes.toLocaleString()} bytes.
+                    {preview.withinPersistedSnapshotLimit ? " This fits the current workspace storage limit." : " This exceeds the current workspace storage limit, so it cannot be applied."}
+                  </Text>
                   {preview.alreadyImported && (preview.missingNoteCount > 0 || preview.missingTaskCount > 0 || preview.taskLinkRepairCount > 0) ? (
                     <View style={styles.subsection}>
                       <Text style={styles.warning}>This backup is already in your archive. You can restore only missing items; existing notes, tasks, documents, archives, and settings stay in place.</Text>
@@ -188,7 +196,7 @@ export function BackupImportSheet({
                   ) : preview.alreadyImported ? <Text style={styles.warning}>This backup has already been imported and nothing is missing.</Text> : null}
                   <Text style={styles.disclaimer}>Imported analyses and action history are historical claims. People and Projects remain in an archived knowledge cohort; nothing is activated or merged automatically. Review it in Library → Memory, where you can add a separate copy.</Text>
                   <Text style={styles.disclaimer}>Documents stay inactive until you review and choose to use them as context.</Text>
-                  <Button label={applying ? preview.alreadyImported ? "Restoring missing items…" : "Adding backup…" : preview.alreadyImported ? preview.missingNoteCount + preview.missingTaskCount > 0 ? "Restore missing items" : "Already imported" : "Import this backup"} disabled={applying || busy || (preview.alreadyImported && preview.missingNoteCount + preview.missingTaskCount === 0)} onPress={() => void apply()} />
+                  <Button label={applying ? preview.alreadyImported ? "Applying backup repair…" : "Adding backup…" : preview.alreadyImported ? preview.missingNoteCount + preview.missingTaskCount > 0 ? "Restore missing items" : preview.taskLinkRepairCount > 0 ? "Repair task links" : "Already imported" : "Import this backup"} disabled={!preview.withinPersistedSnapshotLimit || applying || busy || (preview.alreadyImported && preview.missingNoteCount + preview.missingTaskCount === 0 && preview.taskLinkRepairCount === 0)} onPress={() => void apply()} />
                 </View>
               ) : null}
             </>

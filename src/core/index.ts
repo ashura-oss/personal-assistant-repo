@@ -969,6 +969,10 @@ export interface BackupImportPreview {
   warnings: string[];
   ignoredFieldCount: number;
   alreadyImported: boolean;
+  /** Exact UTF-8 bytes of the complete prospective persisted workspace snapshot, including private ledgers. */
+  prospectivePersistedBytes: number;
+  /** Whether the prospective snapshot fits the current storage owner's hard byte limit. */
+  withinPersistedSnapshotLimit: boolean;
 }
 
 export interface ImportedKnowledgeActivationPreview {

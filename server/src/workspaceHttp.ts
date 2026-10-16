@@ -30,4 +30,9 @@ export interface WorkspaceHttpApi extends Partial<KnowledgeHttpApi>, Partial<Bac
   readMailReplyBatchReview?(admission: WorkspaceHttpAdmission, input: Readonly<{ planId: string; jobId: string; accountId: string; expectedConnectionGeneration: number; expectedRevision: number; expectedPrivacyEpoch: number }>): Promise<JsonValue>;
   readPeriodSummaryResult?(admission: WorkspaceHttpAdmission, input: Readonly<{ jobId: string; expectedRevision: number; expectedPrivacyEpoch: number }>): Promise<JsonValue>;
   readPeriodSummaryApplicationPreview?(admission: WorkspaceHttpAdmission, input: Readonly<{ planId: string; jobId: string; expectedRevision: number; expectedPrivacyEpoch: number }>): Promise<JsonValue>;
+  exportPortableBackup?(admission: WorkspaceHttpAdmission, input: Readonly<{ expectedRevision: number; expectedPrivacyEpoch: number }>): Promise<JsonValue>;
+  preparePortableBackupImport?(admission: WorkspaceHttpAdmission, input: Readonly<{ bytes: Uint8Array; expectedRevision: number; expectedPrivacyEpoch: number }>): Promise<JsonValue>;
+  prepareImportedKnowledgeActivation?(admission: WorkspaceHttpAdmission, input: Readonly<{ archiveId: string; cohortId: string;
+    kind: 'person' | 'project'; entityId: string; expectedRevision: number; expectedPrivacyEpoch: number }>): Promise<JsonValue>;
+  cancelImportedKnowledgeActivation?(admission: WorkspaceHttpAdmission, input: Readonly<{ sessionId: string; expectedRevision: number; expectedPrivacyEpoch: number }>): Promise<void>;
 }

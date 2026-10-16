@@ -155,6 +155,7 @@ describe('same-origin web workspace command client', () => {
 
   it('keeps the server projection map and browser history decoder on the same public command kinds', () => {
     expect(SERVER_HISTORY_KINDS).toEqual(['tasks.complete', 'tasks.reopen', 'chat.create', 'chat.conversation.delete', 'notes.confirmImportedTimeZone',
+      'backup.import.apply', 'backup.document.activate', 'backup.knowledge.activate', 'backup.chat.delete',
       'chat.transcript.prepare', 'chat.transcript.cancel', 'chat.transcript.submit', 'settings.update', 'notes.save', 'notes.capture.adopt',
       'notes.updateTranscript', 'assistant.batch.submitNote', 'assistant.batch.check', 'chat.submit', 'chat.refine', 'notes.transcribe',
       'assistant.periodSummary.moreCompute.prepare', 'assistant.periodSummary.moreCompute.submit', 'assistant.periodSummary.moreCompute.cancel',
@@ -165,7 +166,8 @@ describe('same-origin web workspace command client', () => {
       'mail.replyBatch.review', 'mail.replyBatch.activate',
       'documents.save', 'knowledge.person.save', 'knowledge.project.save', 'knowledge.entity.archive', 'knowledge.fact.save', 'knowledge.fact.remove',
       'knowledge.contact.save', 'knowledge.contact.remove', 'knowledge.member.save', 'knowledge.member.remove',
-      'knowledge.sourceLink.save', 'knowledge.sourceLink.remove', 'knowledge.suggestion.edit', 'knowledge.suggestion.review']);
+      'knowledge.sourceLink.save', 'knowledge.sourceLink.remove', 'knowledge.suggestion.edit', 'knowledge.suggestion.review',
+      'reminders.createDraft', 'reminders.editDraft', 'reminders.approve', 'reminders.serverSave', 'reminders.cancel', 'reminders.complete', 'reminders.delete']);
     expect(CLIENT_HISTORY_KINDS).toEqual(SERVER_HISTORY_KINDS);
     for (const kind of SERVER_HISTORY_KINDS) {
       expect(serverJournalKind(kind.toLowerCase())).toBe(kind);

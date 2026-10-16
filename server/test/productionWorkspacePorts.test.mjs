@@ -84,6 +84,12 @@ test('production workspace factory composes the real Node controller, Batch-only
     assert.equal(range.status, 206);
     const returned = Buffer.concat(await Array.fromAsync((async function* () { for await (const part of range.body) yield part; })()));
     assert.deepEqual(returned, audio.subarray(0, 4));
+    const downloaded = await runtime.audioHttpApi.openMedia(admission, note.audio.mediaId,
+      { method: 'GET', download: true });
+    assert.match(downloaded.headers['content-disposition'] ?? '', /^attachment; filename="[^"\\/]+\.wav"$/,
+      'the production owner derives a safe attachment filename from the attached note');
+    const downloadedBytes = Buffer.concat(await Array.fromAsync((async function* () { for await (const part of downloaded.body) yield part; })()));
+    assert.deepEqual(downloadedBytes, audio);
     let admissionChecks = 0;
     const revokedAfterOpen = { sessionToken: userSession, assertCurrent() {
       admissionChecks += 1;

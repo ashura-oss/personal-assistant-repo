@@ -416,7 +416,17 @@ export function createProductionWorkspacePortsFor(config: Pick<ServerConfig,
         if (!note || !resolveCurrentAttachedMedia({ ...identity, noteId: note.id, noteRevision: note.revision })) throw new Error('audio_unavailable');
         const response = await audioRepo.openAttachedMedia({ noteId: note.id, noteRevision: note.revision,
           method: input.method, ...(input.range ? { range: input.range } : {}), ...(input.signal ? { signal: input.signal } : {}) });
-        try { assertActor(); return response; }
+        try {
+          assertActor();
+          if (!input.download) return response;
+          const mime = new Headers(response.headers).get('content-type')?.split(';', 1)[0]?.toLowerCase();
+          const extension = mime === 'audio/mp4' ? 'm4a' : mime === 'audio/mpeg' ? 'mp3' : mime === 'audio/wav' ? 'wav' :
+            mime === 'audio/webm' ? 'webm' : mime === 'audio/ogg' ? 'ogg' : undefined;
+          if (!extension) throw new Error('audio_unavailable');
+          const base = note.title.normalize('NFKC').replace(/[^A-Za-z0-9 _.-]/g, '').trim().replace(/[. ]+$/g, '').slice(0, 72) || 'recording';
+          return Object.freeze({ ...response, headers: Object.freeze({ ...response.headers,
+            'content-disposition': `attachment; filename="${base}.${extension}"` }) });
+        }
         catch (error) { await closeOpenedMediaResponse(response); throw error; }
       },
     });

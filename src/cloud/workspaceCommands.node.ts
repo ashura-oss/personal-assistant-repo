@@ -55,6 +55,28 @@ export async function dispatchWorkspaceCommand(runtime: OwnedWorkspaceRuntime, a
         await controller.deleteChatConversation(command.conversationId);
         return receipt(envelope, command, { objectId: command.conversationId, conversationId: command.conversationId });
       }
+      case 'backup.import.apply': {
+        const archive = await controller.applyBackupImport({ sessionId: command.sessionId, planHash: command.planHash });
+        return receipt(envelope, command, { objectId: archive.id, archiveId: archive.id, imported: true });
+      }
+      case 'backup.document.activate': {
+        const result = await controller.activateImportedDocument({ archiveId: command.archiveId, documentId: command.documentId,
+          destinationPath: command.destinationPath, contentDigest: command.contentDigest,
+          ...(command.expectedCurrentRevision === undefined ? {} : { expectedCurrentRevision: command.expectedCurrentRevision }),
+          replaceConfirmed: command.replaceConfirmed });
+        return receipt(envelope, command, { objectId: result.document.path, archiveId: command.archiveId, documentId: command.documentId,
+          documentRevision: result.document.revision, status: result.status, mirrorPending: result.mirrorPending });
+      }
+      case 'backup.knowledge.activate': {
+        const result = await controller.activateImportedKnowledgeEntity({ sessionId: command.sessionId, planHash: command.planHash,
+          ...(command.expectedDocumentRevision === undefined ? {} : { expectedDocumentRevision: command.expectedDocumentRevision }) });
+        return receipt(envelope, command, { objectId: result.entity.id, documentPath: result.document.path, documentRevision: result.document.revision });
+      }
+      case 'backup.chat.delete': {
+        await controller.deleteImportedChatConversation({ archiveId: command.archiveId, conversationId: command.conversationId });
+        return receipt(envelope, command, { objectId: command.conversationId, archiveId: command.archiveId,
+          conversationId: command.conversationId, deleted: true });
+      }
       case 'notes.confirmImportedTimeZone': {
         const note = await controller.confirmImportedNoteTimeZone(command.noteId, {
           timeZone: command.timeZone, expectedRevision: command.expectedNoteRevision,
@@ -420,7 +442,7 @@ function receipt(envelope: WorkspaceCommandEnvelope, command: WorkspaceCommand, 
   readonly stageId?: string; readonly accountGeneration?: number;
   readonly documentRevision?: number; readonly entityKind?: 'person' | 'project'; readonly entityId?: string;
   readonly entityRevision?: number; readonly itemId?: string;
-  readonly suggestionId?: string; readonly suggestionRevision?: number; readonly status?: 'pending' | 'accepted' | 'dismissed';
+  readonly suggestionId?: string; readonly suggestionRevision?: number; readonly status?: 'pending' | 'accepted' | 'dismissed' | 'activated' | 'unchanged';
   readonly accountId?: string; readonly connectionGeneration?: number; readonly syncStatus?: string; readonly calendarsPartial?: boolean;
   readonly lane?: string; readonly laneStatus?: string; readonly connected?: false; readonly cleanup?: 'complete' | 'pending';
   readonly sourceDigest?: string; readonly textDigest?: string; readonly bytes?: number; readonly proposalId?: string; readonly proposalRevision?: number; readonly parentProposalId?: string;
@@ -439,6 +461,8 @@ function receipt(envelope: WorkspaceCommandEnvelope, command: WorkspaceCommand, 
   readonly application?: import('../core').PeriodSummaryApplicationReceipt;
   readonly path?: string; readonly appliedAt?: string;
   readonly reminderId?: string; readonly reminderRevision?: number; readonly reminderStatus?: import('../reminders').ReminderStatus;
+  readonly archiveId?: string; readonly imported?: true; readonly documentId?: string; readonly documentPath?: string;
+  readonly mirrorPending?: boolean;
   readonly deleted?: true;
 }) {
   return parseWorkspaceCommandReceipt({ schemaVersion: 1, commandId: envelope.commandId, kind: command.kind, ...fields },
@@ -451,6 +475,12 @@ function expectedReceipt(commandId: string, command: WorkspaceCommand) {
     case 'tasks.complete': case 'tasks.reopen': return { commandId, kind: command.kind, objectId: command.taskId };
     case 'chat.create': case 'notes.save': return { commandId, kind: command.kind };
     case 'chat.conversation.delete': return { commandId, kind: command.kind, objectId: command.conversationId, conversationId: command.conversationId };
+    case 'backup.import.apply': return { commandId, kind: command.kind };
+    case 'backup.document.activate': return { commandId, kind: command.kind, objectId: command.destinationPath,
+      archiveId: command.archiveId, documentId: command.documentId };
+    case 'backup.knowledge.activate': return { commandId, kind: command.kind };
+    case 'backup.chat.delete': return { commandId, kind: command.kind, objectId: command.conversationId,
+      archiveId: command.archiveId, conversationId: command.conversationId };
     case 'notes.confirmImportedTimeZone': return { commandId, kind: command.kind, objectId: command.noteId, noteId: command.noteId,
       noteRevision: command.expectedNoteRevision + 1, timeZone: command.timeZone };
     case 'chat.transcript.prepare': return { commandId, kind: command.kind, objectId: command.noteId, noteId: command.noteId,

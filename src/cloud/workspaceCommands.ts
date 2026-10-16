@@ -27,6 +27,11 @@ export type WorkspaceCommand =
   | { readonly kind: 'tasks.reopen'; readonly taskId: string }
   | { readonly kind: 'chat.create'; readonly title?: string }
   | { readonly kind: 'chat.conversation.delete'; readonly conversationId: string }
+  | { readonly kind: 'backup.import.apply'; readonly sessionId: string; readonly planHash: string }
+  | { readonly kind: 'backup.document.activate'; readonly archiveId: string; readonly documentId: string; readonly destinationPath: string;
+      readonly contentDigest: string; readonly expectedCurrentRevision?: number; readonly replaceConfirmed: boolean }
+  | { readonly kind: 'backup.knowledge.activate'; readonly sessionId: string; readonly planHash: string; readonly expectedDocumentRevision?: number }
+  | { readonly kind: 'backup.chat.delete'; readonly archiveId: string; readonly conversationId: string }
   | { readonly kind: 'notes.confirmImportedTimeZone'; readonly noteId: string; readonly expectedNoteRevision: number; readonly timeZone: string }
   | { readonly kind: 'chat.transcript.prepare'; readonly noteId: string; readonly expectedNoteRevision: number }
   | { readonly kind: 'chat.transcript.cancel'; readonly planId: string }
@@ -133,6 +138,11 @@ export type WorkspaceCommandReceipt =
   | WorkspaceCommandReceiptBase<'tasks.reopen'>
   | WorkspaceCommandReceiptBase<'chat.create'>
   | (WorkspaceCommandReceiptBase<'chat.conversation.delete'> & Readonly<{ conversationId: string }>)
+  | (WorkspaceCommandReceiptBase<'backup.import.apply'> & Readonly<{ archiveId: string; imported: true }> )
+  | (WorkspaceCommandReceiptBase<'backup.document.activate'> & Readonly<{ archiveId: string; documentId: string; documentRevision: number;
+      status: 'activated' | 'unchanged'; mirrorPending: boolean }> )
+  | (WorkspaceCommandReceiptBase<'backup.knowledge.activate'> & Readonly<{ documentPath: string; documentRevision: number }> )
+  | (WorkspaceCommandReceiptBase<'backup.chat.delete'> & Readonly<{ archiveId: string; conversationId: string; deleted: true }> )
   | (WorkspaceCommandReceiptBase<'notes.confirmImportedTimeZone'> & Readonly<{ noteId: string; noteRevision: number; timeZone: string }>)
   | (WorkspaceCommandReceiptBase<'chat.transcript.prepare'> & Readonly<{ noteId: string; noteRevision: number; planId: string; expiresAt: string; capturedAt: string; captureTimeZone: string }>)
   | (WorkspaceCommandReceiptBase<'chat.transcript.cancel'> & Readonly<{ planId: string }>)
@@ -206,6 +216,10 @@ const COMMAND_KEYS: Record<WorkspaceCommand['kind'], readonly string[]> = {
   'settings.update': ['kind', 'patch'],
   'tasks.complete': ['kind', 'taskId'], 'tasks.reopen': ['kind', 'taskId'], 'chat.create': ['kind', 'title'],
   'chat.conversation.delete': ['kind', 'conversationId'],
+  'backup.import.apply': ['kind', 'sessionId', 'planHash'],
+  'backup.document.activate': ['kind', 'archiveId', 'documentId', 'destinationPath', 'contentDigest', 'expectedCurrentRevision', 'replaceConfirmed'],
+  'backup.knowledge.activate': ['kind', 'sessionId', 'planHash', 'expectedDocumentRevision'],
+  'backup.chat.delete': ['kind', 'archiveId', 'conversationId'],
   'notes.confirmImportedTimeZone': ['kind', 'noteId', 'expectedNoteRevision', 'timeZone'],
   'chat.transcript.prepare': ['kind', 'noteId', 'expectedNoteRevision'],
   'chat.transcript.cancel': ['kind', 'planId'],
@@ -654,6 +668,34 @@ function freezeCommand(raw: Record<string, unknown>): WorkspaceCommand {
     assertExactKeys(raw, COMMAND_KEYS[kind], COMMAND_KEYS[kind]);
     if (!isUuidV4(raw.conversationId)) throw new Error('workspace_command_invalid');
     return Object.freeze({ kind, conversationId: raw.conversationId });
+  }
+  if (kind === 'backup.import.apply') {
+    assertExactKeys(raw, COMMAND_KEYS[kind], COMMAND_KEYS[kind]);
+    if (!isUuidV4(raw.sessionId) || typeof raw.planHash !== 'string' || !/^[a-f\d]{64}$/i.test(raw.planHash)) throw new Error('workspace_command_invalid');
+    return Object.freeze({ kind, sessionId: raw.sessionId, planHash: raw.planHash.toLowerCase() });
+  }
+  if (kind === 'backup.document.activate') {
+    assertExactKeys(raw, COMMAND_KEYS[kind], ['kind', 'archiveId', 'documentId', 'destinationPath', 'contentDigest', 'replaceConfirmed']);
+    if (!isUuidV4(raw.archiveId) || !isUuidV4(raw.documentId) || !boundedString(raw.destinationPath, 1024) ||
+        !safeRelativeMarkdownPath(raw.destinationPath) || typeof raw.contentDigest !== 'string' || !/^[a-f\d]{64}$/i.test(raw.contentDigest) ||
+        (Object.hasOwn(raw, 'expectedCurrentRevision') && !positiveRevision(raw.expectedCurrentRevision)) || typeof raw.replaceConfirmed !== 'boolean') {
+      throw new Error('workspace_command_invalid');
+    }
+    return Object.freeze({ kind, archiveId: raw.archiveId, documentId: raw.documentId, destinationPath: raw.destinationPath,
+      contentDigest: raw.contentDigest.toLowerCase(), ...(Object.hasOwn(raw, 'expectedCurrentRevision') ? { expectedCurrentRevision: raw.expectedCurrentRevision as number } : {}),
+      replaceConfirmed: raw.replaceConfirmed });
+  }
+  if (kind === 'backup.knowledge.activate') {
+    assertExactKeys(raw, COMMAND_KEYS[kind], ['kind', 'sessionId', 'planHash']);
+    if (!isUuidV4(raw.sessionId) || typeof raw.planHash !== 'string' || !/^[a-f\d]{64}$/i.test(raw.planHash) ||
+        (Object.hasOwn(raw, 'expectedDocumentRevision') && !positiveRevision(raw.expectedDocumentRevision))) throw new Error('workspace_command_invalid');
+    return Object.freeze({ kind, sessionId: raw.sessionId, planHash: raw.planHash.toLowerCase(),
+      ...(Object.hasOwn(raw, 'expectedDocumentRevision') ? { expectedDocumentRevision: raw.expectedDocumentRevision as number } : {}) });
+  }
+  if (kind === 'backup.chat.delete') {
+    assertExactKeys(raw, COMMAND_KEYS[kind], COMMAND_KEYS[kind]);
+    if (!isUuidV4(raw.archiveId) || !isUuidV4(raw.conversationId)) throw new Error('workspace_command_invalid');
+    return Object.freeze({ kind, archiveId: raw.archiveId, conversationId: raw.conversationId });
   }
   if (kind === 'notes.confirmImportedTimeZone') {
     assertExactKeys(raw, COMMAND_KEYS[kind], COMMAND_KEYS[kind]);
@@ -1122,6 +1164,8 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
   readonly capturedAt?: string;
   readonly captureTimeZone?: string;
   readonly conversationId?: string;
+  readonly archiveId?: string;
+  readonly documentId?: string;
 }): WorkspaceCommandReceipt {
   if (!isRecord(value)) throw new Error('workspace_command_receipt_invalid');
   assertPlainDataProperties(value);
@@ -1133,6 +1177,10 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
     'tasks.reopen': ['commandId', 'kind', 'objectId', 'schemaVersion'],
     'chat.create': ['commandId', 'kind', 'objectId', 'schemaVersion'],
     'chat.conversation.delete': ['commandId', 'conversationId', 'kind', 'objectId', 'schemaVersion'],
+    'backup.import.apply': ['archiveId', 'commandId', 'imported', 'kind', 'objectId', 'schemaVersion'],
+    'backup.document.activate': ['archiveId', 'commandId', 'documentId', 'documentRevision', 'kind', 'mirrorPending', 'objectId', 'schemaVersion', 'status'],
+    'backup.knowledge.activate': ['commandId', 'documentPath', 'documentRevision', 'kind', 'objectId', 'schemaVersion'],
+    'backup.chat.delete': ['archiveId', 'commandId', 'conversationId', 'deleted', 'kind', 'objectId', 'schemaVersion'],
     'notes.confirmImportedTimeZone': ['commandId', 'kind', 'noteId', 'noteRevision', 'objectId', 'schemaVersion', 'timeZone'],
     'chat.transcript.prepare': ['capturedAt', 'captureTimeZone', 'commandId', 'expiresAt', 'kind', 'noteId', 'noteRevision', 'objectId', 'planId', 'schemaVersion'],
     'chat.transcript.cancel': ['commandId', 'kind', 'objectId', 'planId', 'schemaVersion'],
@@ -1215,6 +1263,12 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
         (isReservedKnowledgeDocumentPath(value.objectId) && !canonicalKnowledgeDocumentParent(value.objectId)))) ||
       ((kind === 'chat.create' || kind === 'assistant.batch.check' || kind === 'chat.submit' || kind === 'chat.refine') && !uuidId(value.objectId)) ||
       (kind === 'chat.conversation.delete' && (!uuidId(value.objectId) || !uuidId(value.conversationId) || value.objectId !== value.conversationId)) ||
+      (kind === 'backup.import.apply' && (!uuidId(value.objectId) || value.archiveId !== value.objectId || value.imported !== true)) ||
+      (kind === 'backup.document.activate' && (!uuidId(value.archiveId) || !uuidId(value.documentId) || typeof value.objectId !== 'string' || !safeRelativeMarkdownPath(value.objectId) ||
+        !positiveRevision(value.documentRevision) || (value.status !== 'activated' && value.status !== 'unchanged') || typeof value.mirrorPending !== 'boolean')) ||
+      (kind === 'backup.knowledge.activate' && (!knowledgeId(value.objectId) || typeof value.documentPath !== 'string' || !safeRelativeMarkdownPath(value.documentPath) ||
+        !positiveRevision(value.documentRevision))) ||
+      (kind === 'backup.chat.delete' && (!uuidId(value.archiveId) || !uuidId(value.conversationId) || value.objectId !== value.conversationId || value.deleted !== true)) ||
       (kind === 'chat.transcript.submit' && (!uuidId(value.objectId) || !uuidId(value.conversationId) || value.objectId !== value.conversationId ||
         !uuidId(value.planId) || (value.outcome === 'submitted' && (!uuidId(value.turnId) || !uuidId(value.jobId) || Object.hasOwn(value, 'reason'))) ||
         (value.outcome === 'not_submitted' && (value.reason !== 'plan_unavailable' || Object.hasOwn(value, 'turnId') || Object.hasOwn(value, 'jobId'))) ||
@@ -1337,6 +1391,8 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
         (expected.capturedAt !== undefined && value.capturedAt !== expected.capturedAt) ||
         (expected.captureTimeZone !== undefined && value.captureTimeZone !== expected.captureTimeZone) ||
         (expected.conversationId !== undefined && value.conversationId !== expected.conversationId) ||
+        (expected.archiveId !== undefined && value.archiveId !== expected.archiveId) ||
+        (expected.documentId !== undefined && value.documentId !== expected.documentId) ||
         (expected.attemptId !== undefined && value.attemptId !== expected.attemptId) || (expected.sourceRevision !== undefined && value.sourceRevision !== expected.sourceRevision) ||
         (expected.outcome !== undefined && value.outcome !== expected.outcome)))) {
     throw new Error('workspace_command_receipt_invalid');
@@ -1354,6 +1410,18 @@ export function parseWorkspaceCommandReceipt(value: unknown, expected?: {
       return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId });
     case 'chat.conversation.delete':
       return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId, conversationId: jobId(value.conversationId) });
+    case 'backup.import.apply':
+      return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId, archiveId: jobId(value.archiveId), imported: true });
+    case 'backup.document.activate':
+      return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId, archiveId: jobId(value.archiveId),
+        documentId: jobId(value.documentId), documentRevision: value.documentRevision as number,
+        status: value.status as 'activated' | 'unchanged', mirrorPending: value.mirrorPending as boolean });
+    case 'backup.knowledge.activate':
+      return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId,
+        documentPath: value.documentPath as string, documentRevision: value.documentRevision as number });
+    case 'backup.chat.delete':
+      return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId,
+        archiveId: jobId(value.archiveId), conversationId: jobId(value.conversationId), deleted: true });
     case 'notes.confirmImportedTimeZone':
       return Object.freeze({ schemaVersion: WORKSPACE_COMMAND_SCHEMA_VERSION, commandId, kind, objectId,
         noteId: textId(value.noteId) ? value.noteId : (() => { throw new Error('workspace_command_receipt_invalid'); })(), noteRevision: value.noteRevision as number, timeZone: value.timeZone as string });

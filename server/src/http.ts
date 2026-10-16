@@ -16,6 +16,7 @@ import { OAuthConnectionServiceError } from './oauthConnectionService.js';
 import { registerAcceptedHttpServer, trackAcceptedHttpRequest } from './httpRequestDrain.js';
 import { WebPushRegistryError } from './webPushSubscriptions.js';
 import type { WebPushHttpApi } from './webPushHttp.js';
+import { handlePortableBackupHttpRoute } from './backupHttp.js';
 
 const BODY_LIMIT = 16 * 1024;
 const WORKSPACE_COMMAND_TEXT_BODY_LIMIT = 1024 * 1024;
@@ -943,6 +944,12 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     } catch (error) { if (!response.destroyed) sendWorkspaceFailure(response, error); }
     return;
   }
+  if (await handlePortableBackupHttpRoute({ pathname, ...(rawQuery === undefined ? {} : { rawQuery }), hasQuery, request, response }, {
+    ...(workspaceApi ? { workspaceApi } : {}), ...(admissionOpen ? { admissionOpen } : {}),
+    readAdmission: () => workspaceReadAdmission(request, auth, canonicalOrigin),
+    mutationAdmission: () => workspaceMutationAdmission(request, auth, canonicalOrigin),
+    strictQuery, exactObject, readJsonBody, uniqueHeader, problem, sendJson, sendWorkspaceFailure,
+  })) return;
   if (pathname === '/api/workspace/snapshot') {
     if (request.method !== 'GET') { response.setHeader('Allow', 'GET'); throw problem(405, 'method_not_allowed'); }
     if (hasQuery) throw problem(400, 'bad_request');
@@ -1245,7 +1252,8 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
   const mediaMatch = /^\/api\/audio\/([0-9a-f-]{36})$/i.exec(pathname);
   if (mediaMatch) {
     if (request.method !== 'GET' && request.method !== 'HEAD') { response.setHeader('Allow', 'GET, HEAD'); throw problem(405, 'method_not_allowed'); }
-    if (hasQuery) throw problem(400, 'bad_request');
+    const mediaQuery = hasQuery ? strictQuery(rawQuery, ['download']) : new Map<string, string>();
+    if (mediaQuery.size && mediaQuery.get('download') !== '1') throw problem(400, 'bad_request');
     if (!audioApi) throw problem(503, 'service_unavailable');
     if (!COMMAND_ID_RE.test(mediaMatch[1]!)) throw problem(400, 'bad_request');
     const admission = workspaceReadAdmission(request, auth, canonicalOrigin);
@@ -1258,7 +1266,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
       admission.assertCurrent();
       const range = uniqueHeader(request, 'range');
       const media = openedMedia = await audioApi.openMedia(admission, mediaMatch[1]!, { method: request.method,
-        ...(range === undefined ? {} : { range }), signal: abort.signal });
+        ...(range === undefined ? {} : { range }), ...(mediaQuery.get('download') === '1' ? { download: true } : {}), signal: abort.signal });
       admission.assertCurrent();
       assertSafeAudioHeaders(media.headers);
       response.writeHead(media.status, media.headers);

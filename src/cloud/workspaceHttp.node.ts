@@ -136,6 +136,33 @@ export function createWorkspaceHttpApi(runtime: OwnedWorkspaceRuntime, backgroun
       admission.assertCurrent();
       return serializeWorkflowRead({ ...readEnvelope(value), ...(value.value ? { review: value.value } : {}) });
     },
+    async exportPortableBackup(admission: WorkspaceHttpAdmission, input: { expectedRevision: number; expectedPrivacyEpoch: number }) {
+      admission.assertCurrent();
+      const value = await runtime.exportPortableBackup(admission, input);
+      admission.assertCurrent();
+      if (typeof value.value !== 'string') throw new Error('portable_backup_export_invalid');
+      return serializeWorkflowRead({ ...readEnvelope(value), content: value.value });
+    },
+    async preparePortableBackupImport(admission: WorkspaceHttpAdmission,
+      input: { bytes: Uint8Array; expectedRevision: number; expectedPrivacyEpoch: number }) {
+      admission.assertCurrent();
+      const value = await runtime.preparePortableBackupImport(admission, input);
+      admission.assertCurrent();
+      return serializeWorkflowRead({ ...readEnvelope(value), preview: value.value });
+    },
+    async prepareImportedKnowledgeActivation(admission: WorkspaceHttpAdmission,
+      input: { archiveId: string; cohortId: string; kind: 'person' | 'project'; entityId: string; expectedRevision: number; expectedPrivacyEpoch: number }) {
+      admission.assertCurrent();
+      const value = await runtime.prepareImportedKnowledgeActivation(admission, input);
+      admission.assertCurrent();
+      return serializeWorkflowRead({ ...readEnvelope(value), preview: value.value });
+    },
+    async cancelImportedKnowledgeActivation(admission: WorkspaceHttpAdmission,
+      input: { sessionId: string; expectedRevision: number; expectedPrivacyEpoch: number }) {
+      admission.assertCurrent();
+      await runtime.cancelImportedKnowledgeActivation(admission, input);
+      admission.assertCurrent();
+    },
     inspectCommand(admission: WorkspaceHttpAdmission, commandId: string): JsonValue {
       return serializeCommandResponse(inspectWorkspaceCommand(runtime, admission, commandId));
     },

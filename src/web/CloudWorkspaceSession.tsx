@@ -4,7 +4,7 @@ import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import type { WorkspaceSnapshotDTO } from '../cloud/workspaceDto';
 import type { KnowledgeSourceChoicesDTO, KnowledgeSuggestionReviewDTO } from '../cloud/knowledgeHttpContracts';
 import type { WorkspaceCommand, WorkspaceCommandResponse } from '../cloud/workspaceCommands';
-import type { PeriodSummaryApplicationPreview, PeriodSummaryResultReview } from '../core';
+import type { BackupImportPreview, ImportedKnowledgeActivationPreview, PeriodSummaryApplicationPreview, PeriodSummaryResultReview } from '../core';
 import type { DispatchReviewReadDto, MailReplyBatchReviewReadDto, MailReplySourceReadDto, MailReplyTextReadDto, ProposalReviewReadDto } from './mailWorkflowDtos';
 import type { ReplyBatchPlanRead } from './cloudMailClient';
 import { decodeWorkspaceSnapshotDTO } from '../cloud/workspaceSnapshotCodec';
@@ -618,6 +618,32 @@ export class CloudWorkspaceSessionStore {
 
   readPeriodSummaryApplicationPreview(planId: string, jobId: string, expectedRevision: number): Promise<PeriodSummaryApplicationPreview> {
     return this.readSavedMail(expectedRevision, (client) => client.readPeriodSummaryApplicationPreview(planId, jobId, expectedRevision));
+  }
+
+  exportPortableBackup(expectedRevision: number): Promise<Uint8Array> {
+    return this.readSavedMail(expectedRevision, (client) => client.exportPortableBackup(expectedRevision));
+  }
+
+  preparePortableBackupImport(bytes: Uint8Array, expectedRevision: number): Promise<BackupImportPreview> {
+    return this.readSavedMail(expectedRevision, (client) => client.preparePortableBackupImport(bytes, expectedRevision));
+  }
+
+  prepareImportedKnowledgeActivation(input: Readonly<{ archiveId: string; cohortId: string; kind: 'person' | 'project'; entityId: string; expectedRevision: number }>): Promise<ImportedKnowledgeActivationPreview> {
+    return this.readSavedMail(input.expectedRevision, (client) => client.prepareImportedKnowledgeActivation(input));
+  }
+
+  cancelImportedKnowledgeActivation(sessionId: string): Promise<void> {
+    const client = this.currentClient();
+    return client.cancelImportedKnowledgeActivation(sessionId);
+  }
+
+  async downloadAudio(mediaId: string): Promise<Readonly<{ blob: Blob; filename: string }>> {
+    const owner = this.ownerGeneration;
+    const client = this.audioClient;
+    if (!client || !this.isCurrent(owner)) throw new WorkspaceClientError('stale', 'The audio workspace is not current.');
+    const downloaded = await client.downloadMedia(mediaId);
+    if (!this.isCurrent(owner)) throw new WorkspaceClientError('stale', 'The audio workspace changed during download.');
+    return downloaded;
   }
 
   async refresh(): Promise<WorkspaceSnapshotDTO | undefined> {

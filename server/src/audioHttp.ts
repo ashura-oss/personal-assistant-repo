@@ -48,6 +48,7 @@ export interface AudioStorageHttpApi {
   openMedia(admission: WorkspaceHttpAdmission, mediaId: string, input: Readonly<{
     method: 'GET' | 'HEAD';
     range?: string;
+    download?: boolean;
     signal?: AbortSignal;
   }>): Promise<AudioHttpMediaResponse>;
 }

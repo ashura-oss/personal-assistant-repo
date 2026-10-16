@@ -519,6 +519,25 @@ describe('controller portable backup workflow', () => {
     expect(app.getSnapshot().tasks.find((item) => item.importOrigin?.sourceTaskId === 'linked-task')).toMatchObject({ status: 'open', title: 'Pack cables' });
   });
 
+  it('previews the full persisted candidate size and rejects an over-capacity apply without changing state', async () => {
+    const store = new MemoryStore();
+    const app = new AppControllerImpl(store);
+    await app.load();
+    const before = structuredClone(app.getSnapshot());
+    const priorStoreValue = structuredClone(store.value);
+    const priorSaveCount = store.saves;
+    (app as unknown as { persistedSnapshotMaxBytes: number }).persistedSnapshotMaxBytes = 1;
+
+    const preview = await app.prepareBackupImport(JSON.stringify(fixture()));
+    expect(preview.prospectivePersistedBytes).toBeGreaterThan(1);
+    expect(preview.withinPersistedSnapshotLimit).toBe(false);
+    await expect(app.applyBackupImport({ sessionId: preview.sessionId, planHash: preview.planHash }))
+      .rejects.toThrow(/saved-data limit/i);
+    expect(app.getSnapshot()).toEqual(before);
+    expect(store.value).toEqual(priorStoreValue);
+    expect(store.saves).toBe(priorSaveCount);
+  });
+
   it('copies byte input before async hashing and fails closed on an expired or clock-rolled-back preview', async () => {
     const store = new MemoryStore();
     const app = new AppControllerImpl(store);
@@ -621,8 +640,7 @@ describe('controller portable backup workflow', () => {
     expect(loaded.getSnapshot().tasks.find((task) => task.id === 'kept-task')).toMatchObject({
       body: 'Still locally useful.', importOrigin: { originUnverified: true },
     });
-    const blocked = await loaded.prepareBackupImport(JSON.stringify(fixture()));
-    await expect(loaded.applyBackupImport({ sessionId: blocked.sessionId, planHash: blocked.planHash })).rejects.toThrow(/archive limit is 50/i);
+    await expect(loaded.prepareBackupImport(JSON.stringify(fixture()))).rejects.toThrow(/archive limit is 50/i);
     await loaded.saveSettings({ timezone: 'Asia/Singapore' });
     const rawAfterSave = JSON.stringify(store.value);
     expect(rawAfterSave).toContain('private-invalid-archive-data');

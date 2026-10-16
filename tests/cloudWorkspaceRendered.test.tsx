@@ -1971,8 +1971,8 @@ describe('CloudWorkspace safe DTO presentation', () => {
     act(() => root.render(<CloudWorkspace store={store} state={{ status: 'ready', snapshot, busy: false, refreshRequired: false }} onLogout={vi.fn()} />));
     click('Library');
     click('Reminders');
-    expect(host.textContent).toContain('Reminder creation and management are not connected to server commands yet.');
-    expect([...host.querySelectorAll('button')].find((button) => button.textContent?.includes('Add reminder'))?.disabled).toBe(true);
+    expect(host.textContent).toContain('Reminder changes are unavailable in this workspace session.');
+    expect([...host.querySelectorAll('button')].find((button) => button.textContent?.includes('Create server reminder'))?.disabled).toBe(true);
     click('People');
     expect([...host.querySelectorAll('button')].find((button) => button.textContent?.includes('Add person'))?.disabled).toBe(false);
     expect(store.execute).not.toHaveBeenCalled();

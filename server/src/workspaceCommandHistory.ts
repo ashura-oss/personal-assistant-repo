@@ -2,6 +2,7 @@
 export const WORKSPACE_COMMAND_HISTORY_PAGE_SIZE = 50;
 export const WORKSPACE_COMMAND_HISTORY_KINDS = Object.freeze([
   'tasks.complete', 'tasks.reopen', 'chat.create', 'chat.conversation.delete', 'notes.confirmImportedTimeZone',
+  'backup.import.apply', 'backup.document.activate', 'backup.knowledge.activate', 'backup.chat.delete',
   'chat.transcript.prepare', 'chat.transcript.cancel', 'chat.transcript.submit', 'settings.update', 'notes.save', 'notes.capture.adopt',
   'notes.updateTranscript', 'assistant.batch.submitNote', 'assistant.batch.check', 'chat.submit', 'chat.refine',
   'notes.transcribe', 'assistant.periodSummary.moreCompute.prepare', 'assistant.periodSummary.moreCompute.submit',
@@ -13,6 +14,7 @@ export const WORKSPACE_COMMAND_HISTORY_KINDS = Object.freeze([
   'knowledge.entity.archive', 'knowledge.fact.save', 'knowledge.fact.remove', 'knowledge.contact.save', 'knowledge.contact.remove',
   'knowledge.member.save', 'knowledge.member.remove',
   'knowledge.sourceLink.save', 'knowledge.sourceLink.remove', 'knowledge.suggestion.edit', 'knowledge.suggestion.review',
+  'reminders.createDraft', 'reminders.editDraft', 'reminders.approve', 'reminders.serverSave', 'reminders.cancel', 'reminders.complete', 'reminders.delete',
 ] as const);
 export type WorkspaceCommandHistoryKind = (typeof WORKSPACE_COMMAND_HISTORY_KINDS)[number];
 export type WorkspaceCommandHistoryStatus = 'claimed' | 'checkpointed' | 'finished' | 'inspect_required';
@@ -36,6 +38,8 @@ const JOURNAL_TO_PUBLIC: Readonly<Record<string, WorkspaceCommandHistoryKind>> =
   'assistant.periodsummary.application.apply': 'assistant.periodSummary.application.apply',
   'chat.submit': 'chat.submit', 'chat.refine': 'chat.refine',
   'chat.conversation.delete': 'chat.conversation.delete', 'notes.confirmimportedtimezone': 'notes.confirmImportedTimeZone',
+  'backup.import.apply': 'backup.import.apply', 'backup.document.activate': 'backup.document.activate',
+  'backup.knowledge.activate': 'backup.knowledge.activate', 'backup.chat.delete': 'backup.chat.delete',
   'chat.transcript.prepare': 'chat.transcript.prepare', 'chat.transcript.cancel': 'chat.transcript.cancel', 'chat.transcript.submit': 'chat.transcript.submit',
   'notes.transcribe': 'notes.transcribe',
   'accounts.installoauth': 'accounts.installOAuth',
@@ -52,6 +56,8 @@ const JOURNAL_TO_PUBLIC: Readonly<Record<string, WorkspaceCommandHistoryKind>> =
   'knowledge.member.save': 'knowledge.member.save', 'knowledge.member.remove': 'knowledge.member.remove',
   'knowledge.sourcelink.save': 'knowledge.sourceLink.save', 'knowledge.sourcelink.remove': 'knowledge.sourceLink.remove',
   'knowledge.suggestion.edit': 'knowledge.suggestion.edit', 'knowledge.suggestion.review': 'knowledge.suggestion.review',
+  'reminders.createdraft': 'reminders.createDraft', 'reminders.editdraft': 'reminders.editDraft', 'reminders.approve': 'reminders.approve',
+  'reminders.serversave': 'reminders.serverSave', 'reminders.cancel': 'reminders.cancel', 'reminders.complete': 'reminders.complete', 'reminders.delete': 'reminders.delete',
 });
 export function isWorkspaceCommandId(value: unknown): value is string { return typeof value === 'string' && UUID_V4.test(value); }
 export function workspaceCommandKindFromJournal(value: unknown): WorkspaceCommandHistoryKind | undefined {

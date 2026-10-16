@@ -19,8 +19,7 @@ import { CommandJournal, currentCommandTicket, type CommandAdmission } from '../
 import { SpeechCleanupChildren } from '../../server/src/speechCleanupChildren.js';
 import { WorkspaceControllerFactoryInitializationError, WorkspaceRegistry,
   type RuntimeSessionResolver, type WorkspaceRuntimeContext } from '../../server/src/workspaceRegistry.js';
-import type { LoadedWorkspaceIdentity } from '../../server/src/workspaceStore.js';
-import type { ServerWorkspaceStore } from '../../server/src/workspaceStore.js';
+import { SERVER_SNAPSHOT_MAX_BYTES, type LoadedWorkspaceIdentity, type ServerWorkspaceStore } from '../../server/src/workspaceStore.js';
 import type { WorkspaceCommandHistoryPage } from './workspaceCommandHistory';
 import { canonicalWorkspaceCommand, parseWorkspaceCommandReceipt, type WorkspaceCommandEnvelope, type WorkspaceCommandReceipt } from './workspaceCommands';
 import type { BackgroundClaim, BackgroundOccurrenceStore } from '../../server/src/backgroundOccurrences.js';
@@ -393,7 +392,8 @@ export class OwnedWorkspaceRuntime {
           validateRuntimePorts(options);
           const adapter = options.responseLifetimeOwner ? makeAdapter(options.responseLifetimeOwner) : undefined;
           const controller = new AppControllerImpl({ store: context.store, crypto: options.crypto,
-            providers: options.providers, integration: this.withOAuthInstallLifecycle(options.integration), ...(adapter ? { speechCleanup: adapter.controllerPort } : {}),
+            providers: options.providers, integration: this.withOAuthInstallLifecycle(options.integration), persistedSnapshotMaxBytes: SERVER_SNAPSHOT_MAX_BYTES,
+            ...(adapter ? { speechCleanup: adapter.controllerPort } : {}),
             ...(options.pendingCapture ? { pendingCapture: options.pendingCapture } : {}) });
           if (options.mediaResolver) this.mediaResolvers.set(controller, options.mediaResolver);
           if (options.audioHttpApi) this.audioApis.set(controller, options.audioHttpApi);
@@ -444,7 +444,8 @@ export class OwnedWorkspaceRuntime {
           validateResponseLifetimeOwner(returned.responseLifetimeOwner);
           const adapter = makeAdapter(returned.responseLifetimeOwner);
           controller = new AppControllerImpl({ store: context.store, crypto: options.crypto,
-            providers: returned.providers, integration: this.withOAuthInstallLifecycle(returned.integration), speechCleanup: adapter.controllerPort, pendingCapture: returned.pendingCapture });
+            providers: returned.providers, integration: this.withOAuthInstallLifecycle(returned.integration), persistedSnapshotMaxBytes: SERVER_SNAPSHOT_MAX_BYTES,
+            speechCleanup: adapter.controllerPort, pendingCapture: returned.pendingCapture });
           returned.attachController?.(controller);
           if (returned.mediaResolver) this.mediaResolvers.set(controller, returned.mediaResolver);
           if (returned.audioHttpApi) this.audioApis.set(controller, returned.audioHttpApi);
@@ -506,7 +507,7 @@ export class OwnedWorkspaceRuntime {
         invoke(admission, (api) => api.upload(admission, input)),
       inspectUpload: (admission: WorkspaceHttpAdmission, uploadId: string): Promise<AudioUploadReceiptDTO> =>
         invoke(admission, (api) => api.inspectUpload(admission, uploadId)),
-      openMedia: (admission: WorkspaceHttpAdmission, mediaId: string, input: Readonly<{ method: 'GET' | 'HEAD'; range?: string; signal?: AbortSignal }>): Promise<AudioHttpMediaResponse> =>
+      openMedia: (admission: WorkspaceHttpAdmission, mediaId: string, input: Readonly<{ method: 'GET' | 'HEAD'; range?: string; download?: boolean; signal?: AbortSignal }>): Promise<AudioHttpMediaResponse> =>
         invoke(admission, (api) => api.openMedia(admission, mediaId, input), closeOpenedMediaResponse),
     });
   }
@@ -580,6 +581,25 @@ export class OwnedWorkspaceRuntime {
   readPeriodSummaryApplicationPreview(admission: OwnedWorkspaceAdmission,
     input: { planId: string; jobId: string; expectedRevision: number; expectedPrivacyEpoch: number }) {
     return this.readController(admission, input, (controller) => controller.readPeriodSummaryApplicationPreview({ planId: input.planId, jobId: input.jobId }));
+  }
+
+  exportPortableBackup(admission: OwnedWorkspaceAdmission, input: { expectedRevision: number; expectedPrivacyEpoch: number }) {
+    return this.readController(admission, input, (controller) => controller.exportData());
+  }
+
+  preparePortableBackupImport(admission: OwnedWorkspaceAdmission, input: { bytes: Uint8Array; expectedRevision: number; expectedPrivacyEpoch: number }) {
+    return this.readController(admission, input, (controller) => controller.prepareBackupImport(input.bytes));
+  }
+
+  prepareImportedKnowledgeActivation(admission: OwnedWorkspaceAdmission, input: { archiveId: string; cohortId: string;
+    kind: 'person' | 'project'; entityId: string; expectedRevision: number; expectedPrivacyEpoch: number }) {
+    return this.readController(admission, input, (controller) => controller.prepareImportedKnowledgeActivation({
+      archiveId: input.archiveId, cohortId: input.cohortId, kind: input.kind, entityId: input.entityId,
+    }));
+  }
+
+  cancelImportedKnowledgeActivation(admission: OwnedWorkspaceAdmission, input: { sessionId: string; expectedRevision: number; expectedPrivacyEpoch: number }) {
+    return this.readController(admission, input, async (controller) => { await controller.cancelImportedKnowledgeActivation(input.sessionId); });
   }
 
   /** Reads only safe source-choice projections and never publishes or caches a workspace snapshot. */

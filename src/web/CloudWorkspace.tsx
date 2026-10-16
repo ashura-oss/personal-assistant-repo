@@ -1,9 +1,10 @@
-import React, { useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { Pressable, ScrollView, Text, View } from 'react-native';
 import type { WorkspaceCommand, WorkspaceCommandReceipt, WorkspaceCommandResponse, WorkspaceSettingsPatch } from '../cloud/workspaceCommands';
 import type { WorkspaceSettingsDTO } from '../cloud/workspaceDto';
-import type { PeriodSummaryApplicationPlan, PeriodSummaryApplicationPreview, PeriodSummaryApplicationReceipt,
-  PeriodSummaryMoreComputePlan, PeriodSummaryResultReview } from '../core';
+import type { AppController, ContextDocument, BackupImportPreview, PeriodSummaryApplicationPlan, PeriodSummaryApplicationPreview,
+  PeriodSummaryApplicationReceipt, PeriodSummaryMoreComputePlan, PeriodSummaryResultReview } from '../core';
+import type { ImportedBackupArchive } from '../backup';
 import type { CloudWorkspaceSessionState, CloudWorkspaceSessionStore, CloudWorkspaceVoiceActions } from './CloudWorkspaceSession';
 import { WorkspaceClientError, WorkspaceCommandNotStartedError, type WorkspaceCommandAdmission } from './workspaceClient';
 import { WorkspaceScreen, type WorkspaceTab } from '../ui/WorkspaceScreen';
@@ -36,8 +37,8 @@ import { CloudMailWorkspace } from './CloudMailWorkspace';
 import { InboxWorkspaceContent, inboxAccountDisplay } from '../ui/InboxWorkspaceContent';
 import { AssistantBatchJobCard } from '../ui/AssistantBatchJobCard';
 import type { WorkspaceEraseActions } from './WorkspaceErasePanel';
-import type { WebPushBrowserCoordinator } from './webPushBrowser';
 import { CloudReminderPanel } from './CloudReminderPanel';
+import { pickPortableBackup } from './portableBackupPicker';
 
 export type CloudWorkspaceActions = Readonly<{
   tasks: Readonly<{ complete: (taskId: string) => Promise<WorkspaceCommandResponse>; reopen: (taskId: string) => Promise<WorkspaceCommandResponse> }>;
@@ -94,7 +95,8 @@ type WorkspaceSettingsBaseline = Readonly<{
 type CloudWorkspaceEraseStoreMethods = 'discoverWorkspaceErase' | 'prepareWorkspaceErase' | 'confirmWorkspaceErase' | 'executeWorkspaceErase' |
   'cancelWorkspaceErase' | 'retryWorkspaceEraseReview' | 'retryWorkspaceEraseCleanup';
 type CloudWorkspaceStorePort = Pick<CloudWorkspaceSessionStore, 'getSnapshot' | 'execute' | 'inspect' | 'refresh'> &
-  Partial<Pick<CloudWorkspaceSessionStore, 'readKnowledgeSourceChoices' | 'readKnowledgeSuggestionReview' | 'readPeriodSummaryResult' | 'readPeriodSummaryApplicationPreview'>> &
+  Partial<Pick<CloudWorkspaceSessionStore, 'readKnowledgeSourceChoices' | 'readKnowledgeSuggestionReview' | 'readPeriodSummaryResult' | 'readPeriodSummaryApplicationPreview' |
+    'exportPortableBackup' | 'preparePortableBackupImport' | 'prepareImportedKnowledgeActivation' | 'cancelImportedKnowledgeActivation' | 'downloadAudio'>> &
   Partial<Pick<CloudWorkspaceSessionStore, 'getWebPushCoordinator' | 'getReminderCoordinator'>> &
   Partial<Pick<CloudWorkspaceSessionStore, CloudWorkspaceEraseStoreMethods>>;
 
@@ -151,6 +153,7 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
   const deleteReviewOwner = useRef<Readonly<{ workspaceId: string; privacyEpoch: number; revision: number; conversationId: string }> | undefined>(undefined);
   const deleteCommandOwner = useRef<Readonly<{ commandId: string; workspaceId: string; privacyEpoch: number; revision: number; conversationId: string }> | undefined>(undefined);
   const timeZoneCommandOwner = useRef<Readonly<{ commandId: string; workspaceId: string; privacyEpoch: number; noteId: string; noteRevision: number; timeZone: string }> | undefined>(undefined);
+  const backupPickerController = useRef<AbortController | undefined>(undefined);
   const [manualOpen, setManualOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsDraft, setSettingsDraft] = useState<WorkspaceSettingsDraft>();
@@ -181,6 +184,7 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
   const [admittedTranscription, setAdmittedTranscription] = useState<Readonly<{ commandId: string; owner: string }>>();
   const originalChatAttempts = useRef(new Map<number, Readonly<{ attempt: ChatSendAttempt; envelope: WorkspaceCommandAdmission; text: string; conversationId: string; ownerGeneration: number; knowledgeSelection: ChatSendAttempt['knowledgeSelection'] }>>());
   const selectedNote = dto.notes.find((note) => note.id === selectedNoteId);
+  useEffect(() => () => backupPickerController.current?.abort(), [snapshot.workspaceId, snapshot.privacyEpoch]);
   const selectedNoteOwner = useRef<string | undefined>(undefined);
   const selectedNoteOwnerKey = selectedNote ? `${snapshot.workspaceId}:${snapshot.privacyEpoch}:${selectedNote.id}:${selectedNote.revision}` : undefined;
   useLayoutEffect(() => { selectedNoteOwner.current = selectedNoteOwnerKey; }, [selectedNoteOwnerKey]);
@@ -762,6 +766,150 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
     } catch (error) { setNotice(`Could not confirm the exact ${pending.kind} receipt. No request was resent. ${errText(error)}`); }
   };
 
+  const downloadUrls = useRef(new Set<string>());
+  useEffect(() => () => {
+    for (const url of downloadUrls.current) URL.revokeObjectURL(url);
+    downloadUrls.current.clear();
+  }, []);
+  const downloadBlob = (blob: Blob, filename: string) => {
+    const url = URL.createObjectURL(blob);
+    downloadUrls.current.add(url);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = filename;
+    anchor.rel = 'noopener';
+    anchor.click();
+    window.setTimeout(() => { URL.revokeObjectURL(url); downloadUrls.current.delete(url); }, 0);
+  };
+
+  const currentOwnedSnapshot = useCallback(() => {
+    const current = store.getSnapshot();
+    const latest = current.snapshot;
+    if (!latest || `${latest.workspaceId}:${latest.privacyEpoch}` !== workspaceOwner || current.refreshRequired) {
+      throw new Error('Refresh the current workspace before continuing this archive action.');
+    }
+    return latest;
+  }, [store, workspaceOwner]);
+  const archiveCommand = useCallback(async <K extends WorkspaceCommand['kind'],>(command: WorkspaceCommand, kind: K) => {
+    const before = currentOwnedSnapshot();
+    const current = store.getSnapshot();
+    if (current.busy || current.pendingCommand) throw new Error('Resolve the current workspace command before continuing.');
+    const response = await store.execute(command);
+    const receipt = receiptFor(response, kind);
+    const latest = response.snapshot ?? store.getSnapshot().snapshot;
+    if (!receipt || !latest || `${latest.workspaceId}:${latest.privacyEpoch}` !== workspaceOwner ||
+        latest.revision < before.revision) {
+      throw new Error(`The exact ${kind} command has not been confirmed. Inspect its receipt before continuing.`);
+    }
+    return { receipt, latest };
+  }, [store, currentOwnedSnapshot, workspaceOwner]);
+
+  const backupImportCapability = useMemo(() => {
+    if (!store.preparePortableBackupImport) return { available: false as const, reason: 'Backup import is unavailable in this workspace session.' };
+    return { available: true as const, action: {
+      controller: {
+        prepareBackupImport: async (bytes: string | Uint8Array): Promise<BackupImportPreview> => {
+          if (typeof bytes === 'string') throw new Error('Choose a local JSON backup file.');
+          const latest = currentOwnedSnapshot();
+          if (!(bytes instanceof Uint8Array)) throw new Error('The selected backup could not be read. Choose it again.');
+          const prepare = store.preparePortableBackupImport;
+          if (!prepare) throw new Error('Backup import is unavailable in this workspace session.');
+          return prepare.call(store, new Uint8Array(bytes), latest.revision);
+        },
+        applyBackupImport: async (input: { sessionId: string; planHash: string }): Promise<ImportedBackupArchive> => {
+          const { receipt, latest } = await archiveCommand({ kind: 'backup.import.apply', ...input }, 'backup.import.apply');
+          if (receipt.kind !== 'backup.import.apply') throw new Error('The import receipt did not match this command.');
+          const archive = latest.state.importedBackups.find((item) => item.id === receipt.archiveId);
+          if (!archive) throw new Error('The import is confirmed, but its archive is not in the current snapshot. Refresh before continuing.');
+          return archive as unknown as ImportedBackupArchive;
+        },
+      } satisfies Pick<AppController, 'prepareBackupImport' | 'applyBackupImport'>,
+      chooseBackup: async () => {
+        backupPickerController.current?.abort();
+        const controller = new AbortController();
+        backupPickerController.current = controller;
+        try { return await pickPortableBackup(controller.signal); }
+        finally { if (backupPickerController.current === controller) backupPickerController.current = undefined; }
+      },
+    } };
+  }, [store, currentOwnedSnapshot, archiveCommand]);
+
+  const archiveDocumentActions = useMemo(() => ({ available: true as const, action: {
+    activateImportedDocument: async (input: Parameters<AppController['activateImportedDocument']>[0]) => {
+      const { receipt, latest } = await archiveCommand({ kind: 'backup.document.activate', ...input }, 'backup.document.activate');
+      if (receipt.kind !== 'backup.document.activate' || receipt.archiveId !== input.archiveId || receipt.documentId !== input.documentId) {
+        throw new Error('The document activation receipt did not match this selection.');
+      }
+      const document = latest.state.documents.find((item) => item.path === input.destinationPath);
+      if (!document || document.revision !== receipt.documentRevision) throw new Error('The activated document is not present in the current snapshot. Refresh the library.');
+      return { status: receipt.status, document: document as unknown as ContextDocument, mirrorPending: receipt.mirrorPending };
+    },
+  } }), [archiveCommand]);
+
+  const importedKnowledgeActions = useMemo(() => {
+    const kinds = new Map<string, 'person' | 'project'>();
+    const available = store.prepareImportedKnowledgeActivation && store.cancelImportedKnowledgeActivation;
+    if (!available) return { available: false as const, reason: 'Imported knowledge activation is unavailable in this workspace session.' };
+    return { available: true as const, action: {
+      prepareImportedKnowledgeActivation: async (input: Parameters<AppController['prepareImportedKnowledgeActivation']>[0]) => {
+        const latest = currentOwnedSnapshot();
+        const prepare = store.prepareImportedKnowledgeActivation;
+        if (!prepare) throw new Error('Imported knowledge activation is unavailable in this workspace session.');
+        const preview = await prepare.call(store, { ...input, expectedRevision: latest.revision });
+        kinds.set(preview.sessionId, preview.kind);
+        return preview;
+      },
+      cancelImportedKnowledgeActivation: async (sessionId: string) => {
+        await store.cancelImportedKnowledgeActivation!(sessionId);
+        kinds.delete(sessionId);
+      },
+      activateImportedKnowledgeEntity: async (input: Parameters<AppController['activateImportedKnowledgeEntity']>[0]) => {
+        const kind = kinds.get(input.sessionId);
+        if (!kind) throw new Error('The exact imported knowledge preview is no longer available. Prepare it again.');
+        const { receipt, latest } = await archiveCommand({ kind: 'backup.knowledge.activate', ...input }, 'backup.knowledge.activate');
+        if (receipt.kind !== 'backup.knowledge.activate') throw new Error('The knowledge activation receipt did not match this command.');
+        const entity = kind === 'person'
+          ? latest.state.knowledge.people.find((item) => item.id === receipt.objectId)
+          : latest.state.knowledge.projects.find((item) => item.id === receipt.objectId);
+        const document = latest.state.documents.find((item) => item.path === receipt.documentPath);
+        if (!entity || !document || document.revision !== receipt.documentRevision) throw new Error('The activated knowledge is not present in the current snapshot. Refresh the library.');
+        kinds.delete(input.sessionId);
+        return { entity, document } as Awaited<ReturnType<AppController['activateImportedKnowledgeEntity']>>;
+      },
+    } };
+  }, [store, currentOwnedSnapshot, archiveCommand]);
+
+  const importedChatActions = useMemo(() => ({ available: true as const, action: {
+    deleteImportedChatConversation: async (input: Parameters<AppController['deleteImportedChatConversation']>[0]) => {
+      const { receipt } = await archiveCommand({ kind: 'backup.chat.delete', ...input }, 'backup.chat.delete');
+      if (receipt.kind !== 'backup.chat.delete' || !receipt.deleted || receipt.archiveId !== input.archiveId || receipt.conversationId !== input.conversationId) {
+        throw new Error('The archived conversation deletion receipt did not match this selection.');
+      }
+    },
+  } }), [archiveCommand]);
+
+  const exportWorkspace = async () => {
+    try {
+      const current = currentOwnedSnapshot();
+      if (!store.exportPortableBackup) throw new Error('Workspace export is unavailable in this session.');
+      const bytes = await store.exportPortableBackup(current.revision);
+      currentOwnedSnapshot();
+      const copy = new Uint8Array(bytes.byteLength);
+      copy.set(bytes);
+      downloadBlob(new Blob([copy.buffer], { type: 'application/json' }), 'still-backup.json');
+    } catch (error) { setNotice(errText(error)); }
+  };
+
+  const exportSelectedAudio = async () => {
+    if (!selectedMediaId || !store.downloadAudio) return;
+    const owner = selectedNoteOwnerKey;
+    try {
+      const downloaded = await store.downloadAudio(selectedMediaId);
+      if (selectedNoteOwner.current !== owner) return;
+      downloadBlob(downloaded.blob, downloaded.filename);
+    } catch (error) { if (selectedNoteOwner.current === owner) setNotice(errText(error)); }
+  };
+
   return (
     <WorkspaceScreen
       model={{ activeTab: tab, busy: state.busy, tabBarVisible: true, tabNavigationLocked: Boolean(state.pendingCommand), snapshot, notice: displayedNotice }}
@@ -876,12 +1024,12 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
             query={libraryQuery} setQuery={setLibraryQuery} docs={dto.documents} tasks={dto.tasks}
             busy={state.busy}
             archiveActions={{
-              importedKnowledge: { available: false, reason: 'Imported knowledge activation is not connected to server commands yet.' },
-              documents: { available: false, reason: 'Imported document activation is not connected to server commands yet.' },
-              backupImport: { available: false, reason: 'Backup import is not connected to server commands yet.' },
-              importedChat: { available: false, reason: 'Imported conversation deletion is not connected to server commands yet.' },
+              importedKnowledge: importedKnowledgeActions,
+              documents: archiveDocumentActions,
+              backupImport: backupImportCapability,
+              importedChat: importedChatActions,
             }}
-            importedBackups={dto.importedBackups} archiveActionsBlocked={state.refreshRequired}
+            importedBackups={dto.importedBackups} archiveActionsBlocked={state.refreshRequired || Boolean(state.pendingCommand)}
             knowledge={projectKnowledgeDisplay(dto.knowledge)} workspaceRevision={snapshot.revision} references={[]}
             evidenceLabels={{}} chatEvidenceLabels={safeChatMemoryEvidenceLabels(dto.assistantChatConversations)}
             memoryReviewBlocked={state.refreshRequired || Boolean(state.pendingCommand)}
@@ -910,7 +1058,8 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
               },
             } } : libraryMutationActions.entities}
             knowledgeSuggestionActions={libraryMutationActions.suggestions}
-            onExport={{ available: false, reason: 'Workspace export is not connected to the browser workspace yet.' }}
+            onExport={store.exportPortableBackup ? { available: true, action: () => { void exportWorkspace(); } }
+              : { available: false, reason: 'Workspace export is unavailable in this workspace session.' }}
           />
           {selectedNote ? <WorkspaceModals
             key={`${selectedNote.id}:${selectedNote.revision}`}
@@ -935,7 +1084,7 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
                 : { available: false, reason: 'This note does not need an imported time zone confirmation.' },
               attachRecording: { available: false, reason: 'Attaching a replacement recording is not connected to the server workspace.' },
               playback: selectedMediaId ? { available: true } : { available: false, reason: 'This saved recording has no validated server media reference for playback.' },
-              exportAudio: { available: false, reason: 'Recording export is not available in this browser workspace yet.' },
+              exportAudio: selectedMediaId && store.downloadAudio ? { available: true } : { available: false, reason: 'This saved recording has no available server download.' },
               cancelTranscription: { available: false, reason: 'Transcription cancellation is not connected to the browser workspace yet.' },
               retryTranscriptionCleanup: { available: false, reason: 'Transcription cleanup is managed by the workspace service.' },
               transcribe: { available: true },
@@ -988,7 +1137,7 @@ export function CloudWorkspace({ store, state, onLogout, voiceCapability, creden
             onPlay={() => { void audioPlayback.play(); }}
             playbackState={selectedMediaId ? audioPlayback.state : undefined}
             onPausePlayback={() => audioPlayback.pause()}
-            onExportAudio={() => setNotice('Recording export is not available in this browser workspace yet.')}
+            onExportAudio={() => { void exportSelectedAudio(); }}
             onDelete={() => setNotice('Note deletion is not connected to a server command.')}
             voiceChatTransfer={{
               ...(transcriptTransferState.planOwner === `${workspaceOwner}:${selectedNote.id}:${selectedNote.revision}` && transcriptTransferPlan ? { plan: transcriptTransferPlan } : {}),
