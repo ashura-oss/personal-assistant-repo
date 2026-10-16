@@ -51,6 +51,32 @@ describe('cloud reminder coordinator', () => {
     coordinator.dispose();
   });
 
+  it('edits the exact reviewed revision so the server can return the reminder to draft', async () => {
+    const execute = vi.fn(async (command: WorkspaceCommand): Promise<WorkspaceCommandResponse> => response(COMMAND_ID, 'finished'));
+    const coordinator = createCloudReminderCoordinator({ readSnapshot: () => snapshot({ id: REMINDER_ID, revision: 9, status: 'saved', approvedRevision: 9 }),
+      execute, inspect: vi.fn(), assertCurrent: () => undefined });
+    const payload = { title: 'Updated appointment', body: 'Bring the referral', dueAt: '2026-10-20T01:00:00.000Z',
+      displayTimeZone: 'UTC', privacyMode: 'private' } as const;
+    await coordinator.editDraft(REMINDER_ID, 9, payload);
+    expect(execute.mock.calls[0]?.[0]).toEqual({ kind: 'reminders.editDraft', reminderId: REMINDER_ID, expectedReminderRevision: 9, payload });
+    await expect(coordinator.editDraft(REMINDER_ID, 8, payload)).rejects.toThrow(/changed/);
+    coordinator.dispose();
+  });
+
+  it('keeps cancel, complete, and delete mutations tied to the exact revision', async () => {
+    const execute = vi.fn(async (command: WorkspaceCommand): Promise<WorkspaceCommandResponse> => response(COMMAND_ID, 'finished'));
+    const coordinator = createCloudReminderCoordinator({ readSnapshot: () => snapshot({ id: REMINDER_ID, revision: 4, status: 'approved' }),
+      execute, inspect: vi.fn(), assertCurrent: () => undefined });
+    await coordinator.cancel(REMINDER_ID, 4);
+    expect(execute.mock.calls[0]?.[0]).toEqual({ kind: 'reminders.cancel', reminderId: REMINDER_ID, expectedReminderRevision: 4 });
+    await coordinator.complete(REMINDER_ID, 4);
+    expect(execute.mock.calls[1]?.[0]).toEqual({ kind: 'reminders.complete', reminderId: REMINDER_ID, expectedReminderRevision: 4 });
+    await coordinator.delete(REMINDER_ID, 4);
+    expect(execute.mock.calls[2]?.[0]).toEqual({ kind: 'reminders.delete', reminderId: REMINDER_ID, expectedReminderRevision: 4 });
+    await expect(coordinator.delete(REMINDER_ID, 5)).rejects.toThrow(/changed/);
+    coordinator.dispose();
+  });
+
   it('does not publish or keep a deferred result after the owner changes', async () => {
     let live = true;
     let release!: (value: WorkspaceCommandResponse) => void;
